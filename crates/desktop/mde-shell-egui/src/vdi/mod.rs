@@ -46,14 +46,17 @@ use {
     },
     mackes_mesh_types::vdi_clipboard::{
         vdi_clipboard_session_topic, ClipboardEnvelopeV2, VdiClipboardDisclosureV2,
+        VdiClipboardFilesMaterializationRequestV1, VdiClipboardFilesMaterializationResponseV1,
         VdiClipboardLeaseV2, VdiClipboardMessageV2, VdiClipboardReceiptV2, VdiClipboardText,
-        MAX_VDI_CLIPBOARD_LEASE_TTL_MS, VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX,
-        VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX, VDI_CLIPBOARD_LEASE_TOPIC_PREFIX,
-        VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX, VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        MAX_VDI_CLIPBOARD_FILES_MATERIALIZATION_PACKET_BYTES, MAX_VDI_CLIPBOARD_LEASE_TTL_MS,
+        MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES, VDI_CLIPBOARD_FILES_MATERIALIZATION_SOCKET,
+        VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX, VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
+        VDI_CLIPBOARD_LEASE_TOPIC_PREFIX, VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX,
+        VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
     },
     mde_bus::hooks::config::Priority,
     mde_collab_types::ClipboardClipBody,
-    mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
+    mde_vdi_rdp::{ConnectError, PumpOutcome, RdpConfig, RdpConnection},
     mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
     mde_vdi_vnc::{PumpOutcome as VncPumpOutcome, VncConfig, VncConnection},
     std::thread,
@@ -923,6 +926,8 @@ fn vdi_clipboard_lease(
     let generation = next_vdi_clipboard_generation(now_ms);
     let permitted_mime_offers = if protocol.eq_ignore_ascii_case("rdp") {
         vec![
+            "image/png".into(),
+            "image/jpeg".into(),
             "text/html;charset=utf-8".into(),
             "text/html".into(),
             "text/plain;charset=utf-8".into(),
@@ -1125,7 +1130,13 @@ fn read_vdi_clipboard_receipt(
 enum RdpClipboardPayload {
     Text(String),
     Html(String),
+    Image,
 }
+
+// Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 retains this receive-result
+// flag but does not expose a named RecvFlags constant.
+#[cfg(feature = "live-vdi")]
+const RDP_CLIPBOARD_MSG_CTRUNC: u32 = 0x08;
 
 #[cfg(feature = "live-vdi")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1135,7 +1146,8 @@ enum RdpClipboardMaterialization {
     Complete,
 }
 
-/// Keep RDP text and HTML behind the same one-use permission decision. The
+/// Keep RDP text, HTML, and Files-backed images behind the same one-use
+/// permission decision. The
 /// callbacks are invoked only for a ticket that has reached `Materialize`.
 #[cfg(feature = "live-vdi")]
 fn materialize_rdp_host_clipboard<E>(
@@ -1210,8 +1222,9 @@ fn read_latest_vnc_host_clipboard(
     Ok(Some((command, text)))
 }
 
-/// RDP selects only bounded inline Unicode text or HTML admitted by the exact
-/// current typed lease. No preview or Files reference is materialized.
+/// RDP selects bounded inline Unicode text/HTML or one Files-backed PNG/JPEG
+/// admitted by the exact current typed lease. Files bytes remain unresolved
+/// until the one-use permission ticket enters `Materialize`.
 #[cfg(feature = "live-vdi")]
 fn read_latest_rdp_host_clipboard(
     root: &std::path::Path,
@@ -1221,28 +1234,292 @@ fn read_latest_rdp_host_clipboard(
     let Some(command) = read_latest_host_clipboard_command(root, lease, now_ms)? else {
         return Ok(None);
     };
-    let value = command
-        .envelope
-        .inline_text
-        .as_ref()
-        .map(|text| text.as_str().to_owned())
-        .ok_or_else(|| "RDP clipboard command refused: protocol does not carry Files".to_owned())?;
     let payload = if command.selected_mime.eq_ignore_ascii_case("text/html")
         || command
             .selected_mime
             .eq_ignore_ascii_case("text/html;charset=utf-8")
     {
-        RdpClipboardPayload::Html(value)
+        RdpClipboardPayload::Html(
+            command
+                .envelope
+                .inline_text
+                .as_ref()
+                .map(|text| text.as_str().to_owned())
+                .ok_or_else(|| "RDP HTML clipboard command omitted inline text".to_owned())?,
+        )
     } else if command.selected_mime.eq_ignore_ascii_case("text/plain")
         || command
             .selected_mime
             .eq_ignore_ascii_case("text/plain;charset=utf-8")
     {
-        RdpClipboardPayload::Text(value)
+        RdpClipboardPayload::Text(
+            command
+                .envelope
+                .inline_text
+                .as_ref()
+                .map(|text| text.as_str().to_owned())
+                .ok_or_else(|| "RDP text clipboard command omitted inline text".to_owned())?,
+        )
+    } else if command.selected_mime.eq_ignore_ascii_case("image/png")
+        || command.selected_mime.eq_ignore_ascii_case("image/jpeg")
+    {
+        if command.envelope.files_reference.is_none()
+            || command.envelope.inline_text.is_some()
+            || command.envelope.byte_count == 0
+            || command.envelope.byte_count > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES
+        {
+            return Err("RDP image clipboard command has no bounded Files payload".to_owned());
+        }
+        RdpClipboardPayload::Image
     } else {
         return Err("RDP clipboard command refused: unsupported MIME representation".to_owned());
     };
     Ok(Some((command, payload)))
+}
+
+/// Ask the single daemon Files authority for one descriptor after the shell's
+/// one-use permission CAS. The request and response carry metadata only; image
+/// bytes are read from the verified descriptor and re-hashed locally.
+#[cfg(feature = "live-vdi")]
+fn materialize_rdp_image_from_files(
+    root: &Path,
+    command: &VdiClipboardMessageV2,
+) -> Result<Vec<u8>, String> {
+    use rustix::net::{
+        connect_unix, recvmsg, send, socket_with, AddressFamily, RecvAncillaryBuffer,
+        RecvAncillaryMessage, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+    };
+    use std::io::{IoSliceMut, Read as _};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let authorization_id = uuid::Uuid::new_v4().to_string();
+    let request =
+        VdiClipboardFilesMaterializationRequestV1::from_message(command, authorization_id.clone())
+            .map_err(|reason| format!("RDP image materialization request refused: {reason:?}"))?;
+    let body = serde_json::to_vec(&request)
+        .map_err(|_| "RDP image materialization request encoding failed".to_owned())?;
+    if body.is_empty() || body.len() > MAX_VDI_CLIPBOARD_FILES_MATERIALIZATION_PACKET_BYTES {
+        return Err("RDP image materialization request exceeded its packet cap".to_owned());
+    }
+
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|error| format!("RDP image materializer socket failed: {error}"))?;
+    let path = root.join(VDI_CLIPBOARD_FILES_MATERIALIZATION_SOCKET);
+    let address = SocketAddrUnix::new(&path)
+        .map_err(|error| format!("RDP image materializer address failed: {error}"))?;
+    connect_unix(&socket, &address)
+        .map_err(|error| format!("RDP image materializer unavailable: {error}"))?;
+    let stream: UnixStream = socket.into();
+    let peer = rustix::net::sockopt::get_socket_peercred(&stream)
+        .map_err(|error| format!("RDP image materializer credentials failed: {error}"))?;
+    if peer.uid.as_raw() != 0 {
+        return Err("RDP image materializer is not the root daemon authority".to_owned());
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("RDP image materializer timeout failed: {error}"))?;
+    let sent = send(&stream, &body, SendFlags::empty())
+        .map_err(|error| format!("RDP image materialization request failed: {error}"))?;
+    if sent != body.len() {
+        return Err("RDP image materialization request was short".to_owned());
+    }
+
+    let mut response_bytes = [0_u8; MAX_VDI_CLIPBOARD_FILES_MATERIALIZATION_PACKET_BYTES];
+    let mut iov = [IoSliceMut::new(&mut response_bytes)];
+    let mut control = [0_u8; rustix::cmsg_space!(ScmRights(2))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+    let received = recvmsg(&stream, &mut iov, &mut ancillary, RecvFlags::empty())
+        .map_err(|error| format!("RDP image materialization response failed: {error}"))?;
+    if received.bytes == 0
+        || received.flags.contains(RecvFlags::TRUNC)
+        || received.flags.bits() & RDP_CLIPBOARD_MSG_CTRUNC != 0
+    {
+        return Err("RDP image materialization response was truncated".to_owned());
+    }
+    let mut descriptor: Option<OwnedFd> = None;
+    for message in ancillary.drain() {
+        if let RecvAncillaryMessage::ScmRights(mut descriptors) = message {
+            let first = descriptors.next();
+            if descriptor.is_some() || descriptors.next().is_some() {
+                return Err("RDP image materializer returned multiple descriptors".to_owned());
+            }
+            descriptor = first;
+        }
+    }
+    let response: VdiClipboardFilesMaterializationResponseV1 =
+        serde_json::from_slice(&response_bytes[..received.bytes])
+            .map_err(|_| "RDP image materialization response was malformed".to_owned())?;
+    match response {
+        VdiClipboardFilesMaterializationResponseV1::Refused {
+            authorization_id: returned,
+            reason,
+        } => {
+            if descriptor.is_some() || returned != authorization_id {
+                return Err(
+                    "RDP image materialization refusal was not bound to the request".into(),
+                );
+            }
+            return Err(format!("RDP image materialization refused: {reason:?}"));
+        }
+        VdiClipboardFilesMaterializationResponseV1::Ready {
+            authorization_id: returned,
+            selected_mime,
+            content_hash,
+            byte_count,
+        } => {
+            if returned != authorization_id
+                || !selected_mime.eq_ignore_ascii_case(&request.selected_mime)
+                || content_hash != request.content_hash
+                || byte_count != request.byte_count
+            {
+                return Err("RDP image materialization metadata mismatch".to_owned());
+            }
+        }
+    }
+    let descriptor =
+        descriptor.ok_or_else(|| "RDP image materializer omitted its descriptor".to_owned())?;
+    let mut file = std::fs::File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("RDP image descriptor metadata failed: {error}"))?;
+    if !metadata.is_file() || metadata.len() != request.byte_count {
+        return Err("RDP image descriptor size/type mismatch".to_owned());
+    }
+    let capacity = usize::try_from(request.byte_count)
+        .map_err(|_| "RDP image byte count does not fit this seat".to_owned())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(request.byte_count.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("RDP image descriptor read failed: {error}"))?;
+    if bytes.len() != capacity
+        || ClipboardEnvelopeV2::content_hash_for(&bytes) != request.content_hash
+    {
+        return Err("RDP image descriptor digest/length mismatch".to_owned());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "live-vdi")]
+fn rdp_image_to_dibv5(mime: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (width, height, rgba) = if mime.eq_ignore_ascii_case("image/png") {
+        decode_bounded_png_rgba(bytes)?
+    } else if mime.eq_ignore_ascii_case("image/jpeg") {
+        decode_bounded_jpeg_rgba(bytes)?
+    } else {
+        return Err("RDP image MIME is unsupported".to_owned());
+    };
+    encode_dibv5(width, height, &rgba)
+}
+
+#[cfg(feature = "live-vdi")]
+fn bounded_rgba_len(width: u32, height: u32) -> Result<usize, String> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "RDP image geometry overflow".to_owned())?;
+    if width == 0 || height == 0 || bytes.saturating_add(124) > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES {
+        return Err("RDP image expands beyond the DIB ceiling".to_owned());
+    }
+    usize::try_from(bytes).map_err(|_| "RDP image does not fit this seat".to_owned())
+}
+
+#[cfg(feature = "live-vdi")]
+fn decode_bounded_png_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let max = usize::try_from(MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES).unwrap_or(usize::MAX);
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits { bytes: max });
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("RDP PNG header refused: {error}"))?;
+    let width = reader.info().width;
+    let height = reader.info().height;
+    let rgba_len = bounded_rgba_len(width, height)?;
+    let output_len = reader
+        .output_buffer_size()
+        .filter(|length| *length <= max)
+        .ok_or_else(|| "RDP PNG output exceeds its decoder ceiling".to_owned())?;
+    let mut decoded = vec![0_u8; output_len];
+    let info = reader
+        .next_frame(&mut decoded)
+        .map_err(|error| format!("RDP PNG decode refused: {error}"))?;
+    let source = decoded
+        .get(..info.buffer_size())
+        .ok_or_else(|| "RDP PNG decoder returned an invalid size".to_owned())?;
+    let mut rgba = Vec::with_capacity(rgba_len);
+    match info.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(source),
+        png::ColorType::Rgb => source
+            .chunks_exact(3)
+            .for_each(|pixel| rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff])),
+        png::ColorType::Grayscale => source
+            .iter()
+            .for_each(|value| rgba.extend_from_slice(&[*value, *value, *value, 0xff])),
+        png::ColorType::GrayscaleAlpha => source
+            .chunks_exact(2)
+            .for_each(|pixel| rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]])),
+        png::ColorType::Indexed => return Err("RDP PNG palette was not expanded".to_owned()),
+    }
+    if rgba.len() != rgba_len {
+        return Err("RDP PNG pixel count mismatch".to_owned());
+    }
+    Ok((width, height, rgba))
+}
+
+#[cfg(feature = "live-vdi")]
+fn decode_bounded_jpeg_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Jpeg);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES);
+    limits.max_image_width = Some(8_192);
+    limits.max_image_height = Some(8_192);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|error| format!("RDP JPEG decode refused: {error}"))?
+        .to_rgba8();
+    let width = decoded.width();
+    let height = decoded.height();
+    if decoded.as_raw().len() != bounded_rgba_len(width, height)? {
+        return Err("RDP JPEG pixel count mismatch".to_owned());
+    }
+    Ok((width, height, decoded.into_raw()))
+}
+
+#[cfg(feature = "live-vdi")]
+fn encode_dibv5(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let pixel_bytes = bounded_rgba_len(width, height)?;
+    if rgba.len() != pixel_bytes || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return Err("RDP image pixels do not match their geometry".to_owned());
+    }
+    let total = 124_usize
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| "RDP DIB allocation overflow".to_owned())?;
+    let mut dib = vec![0_u8; total];
+    dib[0..4].copy_from_slice(&124_u32.to_le_bytes());
+    dib[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+    dib[8..12].copy_from_slice(&(-(height as i32)).to_le_bytes());
+    dib[12..14].copy_from_slice(&1_u16.to_le_bytes());
+    dib[14..16].copy_from_slice(&32_u16.to_le_bytes());
+    dib[16..20].copy_from_slice(&3_u32.to_le_bytes());
+    dib[20..24].copy_from_slice(&(pixel_bytes as u32).to_le_bytes());
+    dib[40..44].copy_from_slice(&0x00ff_0000_u32.to_le_bytes());
+    dib[44..48].copy_from_slice(&0x0000_ff00_u32.to_le_bytes());
+    dib[48..52].copy_from_slice(&0x0000_00ff_u32.to_le_bytes());
+    dib[52..56].copy_from_slice(&0xff00_0000_u32.to_le_bytes());
+    dib[56..60].copy_from_slice(&0x7352_4742_u32.to_le_bytes());
+    for (source, target) in rgba.chunks_exact(4).zip(dib[124..].chunks_exact_mut(4)) {
+        target.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
+    }
+    Ok(dib)
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1494,6 +1771,18 @@ fn run_live_rdp(
             match materialize_rdp_host_clipboard(readiness, &payload, |payload| match payload {
                 RdpClipboardPayload::Text(text) => conn.send_clipboard_to_guest(text.clone()),
                 RdpClipboardPayload::Html(html) => conn.send_html_clipboard_to_guest(html.clone()),
+                RdpClipboardPayload::Image => {
+                    let root = clipboard_root.as_deref().ok_or_else(|| {
+                        ConnectError::Clipboard(
+                            "RDP image clipboard Bus root is unavailable".to_owned(),
+                        )
+                    })?;
+                    let source = materialize_rdp_image_from_files(root, &command)
+                        .map_err(ConnectError::Clipboard)?;
+                    let dib = rdp_image_to_dibv5(&command.selected_mime, &source)
+                        .map_err(ConnectError::Clipboard)?;
+                    conn.send_dibv5_clipboard_to_guest(dib)
+                }
             }) {
                 Ok(RdpClipboardMaterialization::Pending) => {
                     gated_host_clipboard = Some((command, payload, ticket));

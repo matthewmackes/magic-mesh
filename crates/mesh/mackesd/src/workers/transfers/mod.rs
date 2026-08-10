@@ -56,6 +56,7 @@ use tokio::task::JoinHandle;
 
 use super::{ShutdownToken, Worker};
 
+mod clipboard_materializer;
 pub mod destination;
 pub mod job;
 pub mod lane;
@@ -1039,12 +1040,27 @@ impl Worker for TransfersWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let mut engine = self.engine()?;
+        let mut clipboard_materializer = self
+            .bus_root
+            .enabled()
+            .then(|| {
+                self.bus_root.resolve().and_then(|root| {
+                    clipboard_materializer::ClipboardFilesMaterializer::bind(
+                        root,
+                        Arc::clone(&self.files_resolver),
+                    )
+                })
+            })
+            .transpose()?;
         tracing::info!(
             target: "mackesd::transfers",
             store = %self.store_root.display(), cap = self.cap,
             "transfers worker up (queue/ledger/verb spine; http lane wired, remaining lanes honestly gated)",
         );
         loop {
+            if let Some(materializer) = &mut clipboard_materializer {
+                materializer.drain(now_ms());
+            }
             engine.tick().await;
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),

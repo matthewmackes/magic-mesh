@@ -890,6 +890,16 @@ impl RdpConnection {
         self.announce_clipboard_offer()
     }
 
+    /// Offer one bounded, structurally validated CF_DIBV5 image. The shell
+    /// obtains and decodes the source only after its one-use permission gate;
+    /// this method never resolves Files identities or host paths.
+    pub fn send_dibv5_clipboard_to_guest(&mut self, dib: Vec<u8>) -> Result<(), ConnectError> {
+        self.clipboard
+            .offer_host_dibv5(dib)
+            .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        self.announce_clipboard_offer()
+    }
+
     fn announce_clipboard_offer(&mut self) -> Result<(), ConnectError> {
         let formats = self.clipboard.advertised_formats();
         let messages = self

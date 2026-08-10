@@ -759,6 +759,12 @@ behavioral evidence is not completion.
   negotiation, CF_HTML offset validation, and stale/replacement refusal; four
   focused exact `.50` tests pass:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-cf-html-r125.md`.
+- **RDP image materialization checkpoint (2026-08-10):** host-to-guest PNG/JPEG
+  now crosses the one-use permission gate through an exact lease/command-bound,
+  root-local Files descriptor authority, bounded decode, and validated
+  CF_DIBV5 negotiation. Four focused farm gates passed on `.50`, `.90`, `.170`,
+  and `.196`; guest-to-host images and live Windows proof remain:
+  `docs/platform/evidence/WL-FUNC-016-WL-ARCH-010-2026-08-10-rdp-image-materialization-r138.md`.
 - **Expired consent capacity checkpoint (2026-08-10):** every clipboard consent sweep removes expired authority before admission, including an empty sweep; machine 193
   passed the exact denial regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-consent-capacity-cleanup-r22.md`.
 - **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks

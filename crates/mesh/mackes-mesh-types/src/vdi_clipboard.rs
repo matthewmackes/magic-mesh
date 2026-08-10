@@ -1223,6 +1223,202 @@ pub const MAX_VDI_CLIPBOARD_TRANSPORT_V2_JSON_BYTES: usize =
 /// Maximum lifetime of one VDI clipboard lease. Long-running sessions rotate
 /// leases; they never turn one attachment token into an unbounded capability.
 pub const MAX_VDI_CLIPBOARD_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
+/// Maximum compressed source bytes and maximum expanded CF_DIB/CF_DIBV5 bytes
+/// admitted by the RDP image adapter. This deliberately does not inherit the
+/// generic 4-GiB Files-envelope ceiling: one clipboard image is materialized in
+/// the seat process and must remain comfortably below its cgroup memory limit.
+pub const MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+/// Schema for the root-local, descriptor-backed Files materialization request.
+pub const VDI_CLIPBOARD_FILES_MATERIALIZATION_SCHEMA_VERSION: u16 = 1;
+/// Maximum JSON request or response packet on the local authority socket.
+pub const MAX_VDI_CLIPBOARD_FILES_MATERIALIZATION_PACKET_BYTES: usize = 16 * 1024;
+/// Socket filename below the canonical shared Bus root. Payload bytes never
+/// enter the Bus; successful replies carry one read-only descriptor.
+pub const VDI_CLIPBOARD_FILES_MATERIALIZATION_SOCKET: &str =
+    "vdi-clipboard-files-materializer.sock";
+
+/// One-use, payload-free request for the daemon Files authority to open an
+/// already-admitted image representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VdiClipboardFilesMaterializationRequestV1 {
+    /// Closed request schema.
+    pub schema_version: u16,
+    /// Fresh shell-minted one-use authorization identity.
+    pub authorization_id: String,
+    /// Exact live VDI session.
+    pub session_id: String,
+    /// Exact live attachment generation.
+    pub generation: u64,
+    /// Exact short-lived clipboard lease.
+    pub lease_id: String,
+    /// Exact lease expiry snapshot.
+    pub lease_expires_at_ms: u64,
+    /// Exact command sequence within the lease.
+    pub message_sequence: u64,
+    /// Selected image MIME representation.
+    pub selected_mime: String,
+    /// Digest of the complete Files object.
+    pub content_hash: String,
+    /// Exact Files object byte count.
+    pub byte_count: u64,
+    /// Opaque Files identity; never a path or URL.
+    pub files_reference: String,
+    /// Exact Clipboard V2 envelope expiry.
+    pub envelope_expires_at_ms: u64,
+}
+
+impl VdiClipboardFilesMaterializationRequestV1 {
+    /// Construct the exact payload-free request for an admitted VDI command.
+    pub fn from_message(
+        message: &VdiClipboardMessageV2,
+        authorization_id: impl Into<String>,
+    ) -> Result<Self, VdiClipboardFilesMaterializationErrorV1> {
+        let files_reference = message
+            .envelope
+            .files_reference
+            .clone()
+            .ok_or(VdiClipboardFilesMaterializationErrorV1::UnsupportedPayload)?;
+        let request = Self {
+            schema_version: VDI_CLIPBOARD_FILES_MATERIALIZATION_SCHEMA_VERSION,
+            authorization_id: authorization_id.into(),
+            session_id: message.session_id.clone(),
+            generation: message.generation,
+            lease_id: message.lease_id.clone(),
+            lease_expires_at_ms: message.lease_expires_at_ms,
+            message_sequence: message.message_sequence,
+            selected_mime: message.selected_mime.clone(),
+            content_hash: message.envelope.content_hash.clone(),
+            byte_count: message.envelope.byte_count,
+            files_reference,
+            envelope_expires_at_ms: message.envelope.expires_at_ms,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validate intrinsic bounds before opening Bus state or Files metadata.
+    pub fn validate(&self) -> Result<(), VdiClipboardFilesMaterializationErrorV1> {
+        if self.schema_version != VDI_CLIPBOARD_FILES_MATERIALIZATION_SCHEMA_VERSION {
+            return Err(VdiClipboardFilesMaterializationErrorV1::UnsupportedSchema);
+        }
+        for value in [&self.authorization_id, &self.session_id, &self.lease_id] {
+            validate_clipboard_identity("materialization_identity", value)
+                .map_err(|_| VdiClipboardFilesMaterializationErrorV1::InvalidIdentity)?;
+        }
+        if self.generation == 0
+            || self.message_sequence == 0
+            || self.lease_expires_at_ms == 0
+            || self.envelope_expires_at_ms == 0
+        {
+            return Err(VdiClipboardFilesMaterializationErrorV1::InvalidIdentity);
+        }
+        if !matches!(
+            self.selected_mime.to_ascii_lowercase().as_str(),
+            "image/png" | "image/jpeg"
+        ) {
+            return Err(VdiClipboardFilesMaterializationErrorV1::UnsupportedMime);
+        }
+        if self.byte_count == 0 || self.byte_count > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES {
+            return Err(VdiClipboardFilesMaterializationErrorV1::Oversized);
+        }
+        if !valid_clipboard_sha256(&self.content_hash) {
+            return Err(VdiClipboardFilesMaterializationErrorV1::MetadataMismatch);
+        }
+        if !valid_clipboard_files_reference(&self.files_reference) {
+            return Err(VdiClipboardFilesMaterializationErrorV1::InvalidFilesReference);
+        }
+        Ok(())
+    }
+
+    /// Rebind the request to the exact current command and lease immediately
+    /// before daemon-side Files resolution.
+    pub fn validate_against(
+        &self,
+        message: &VdiClipboardMessageV2,
+        lease: &VdiClipboardLeaseV2,
+        now_ms: u64,
+    ) -> Result<(), VdiClipboardFilesMaterializationErrorV1> {
+        self.validate()?;
+        message
+            .admit(lease, None, now_ms)
+            .map_err(|_| VdiClipboardFilesMaterializationErrorV1::LeaseMismatch)?;
+        if now_ms >= self.envelope_expires_at_ms
+            || self.session_id != message.session_id
+            || self.generation != message.generation
+            || self.lease_id != message.lease_id
+            || self.lease_expires_at_ms != message.lease_expires_at_ms
+            || self.message_sequence != message.message_sequence
+            || !self
+                .selected_mime
+                .eq_ignore_ascii_case(&message.selected_mime)
+            || self.content_hash != message.envelope.content_hash
+            || self.byte_count != message.envelope.byte_count
+            || message.envelope.files_reference.as_deref() != Some(&self.files_reference)
+            || self.envelope_expires_at_ms != message.envelope.expires_at_ms
+        {
+            return Err(VdiClipboardFilesMaterializationErrorV1::MetadataMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Closed refusal vocabulary for descriptor-backed image materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VdiClipboardFilesMaterializationErrorV1 {
+    /// Request schema is not understood.
+    UnsupportedSchema,
+    /// One or more binding identities are malformed or zero.
+    InvalidIdentity,
+    /// The selected MIME is not an admitted PNG/JPEG representation.
+    UnsupportedMime,
+    /// The command does not carry one Files-backed payload.
+    UnsupportedPayload,
+    /// Source or response exceeds the dedicated RDP image ceiling.
+    Oversized,
+    /// The opaque Files identity is malformed.
+    InvalidFilesReference,
+    /// The lease or envelope has expired.
+    Expired,
+    /// Current daemon lease/command state does not match the request.
+    LeaseMismatch,
+    /// Digest, length, MIME, or command metadata changed.
+    MetadataMismatch,
+    /// Authorization or exact command was already consumed.
+    Replayed,
+    /// Files has no readable current generation.
+    FilesUnavailable,
+    /// Files explicitly denied source access.
+    FilesDenied,
+    /// The daemon authority or its bounded ledger is unavailable.
+    AuthorityUnavailable,
+}
+
+/// Payload-free response metadata. A `Ready` response is valid only when the
+/// same local packet carries exactly one read-only descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
+pub enum VdiClipboardFilesMaterializationResponseV1 {
+    /// One verified descriptor accompanies this response packet.
+    Ready {
+        /// Exact one-use authorization identity.
+        authorization_id: String,
+        /// Exact selected image MIME.
+        selected_mime: String,
+        /// Verified descriptor content digest.
+        content_hash: String,
+        /// Verified descriptor byte count.
+        byte_count: u64,
+    },
+    /// No descriptor was released.
+    Refused {
+        /// Authorization identity copied from the request when decodable.
+        authorization_id: String,
+        /// Closed refusal reason.
+        reason: VdiClipboardFilesMaterializationErrorV1,
+    },
+}
 /// Typed host-to-guest command lane. Append the validated session identity with
 /// [`vdi_clipboard_session_topic`].
 pub const VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX: &str = "state/clipboard/vdi-v2/host-to-guest";
@@ -1873,6 +2069,72 @@ mod tests {
             disclosure: VdiClipboardDisclosureV2::Shareable,
             envelope,
         }
+    }
+
+    fn image_transport(now_ms: u64) -> (VdiClipboardLeaseV2, VdiClipboardMessageV2) {
+        let lease = VdiClipboardLeaseV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: "rdp:oak:image-session".into(),
+            generation: 9,
+            lease_id: "rdp-image-lease-9".into(),
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+            permitted_mime_offers: vec!["image/png".into(), "image/jpeg".into()],
+        };
+        let bytes = b"bounded png fixture";
+        let envelope = ClipboardEnvelopeV2::new_files(
+            "node-a",
+            "seat-a",
+            "clipboard-session-a",
+            3,
+            now_ms,
+            vec!["image/png".into()],
+            "image",
+            ClipboardEnvelopeV2::content_hash_for(bytes),
+            bytes.len() as u64,
+            "files:v2:76d9deaf-80d3-4ca7-bfd3-995180ae8362",
+            now_ms + 30_000,
+        )
+        .expect("bounded image envelope");
+        let message = VdiClipboardMessageV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: lease.session_id.clone(),
+            generation: lease.generation,
+            lease_id: lease.lease_id.clone(),
+            lease_expires_at_ms: lease.expires_at_ms,
+            message_sequence: 1,
+            selected_mime: "image/png".into(),
+            disclosure: VdiClipboardDisclosureV2::Shareable,
+            envelope,
+        };
+        (lease, message)
+    }
+
+    #[test]
+    fn files_materialization_request_is_exact_bounded_and_lease_bound() {
+        let now_ms = 1_700_000_000_000;
+        let (lease, message) = image_transport(now_ms);
+        let request = VdiClipboardFilesMaterializationRequestV1::from_message(
+            &message,
+            "31b69cf1-420f-4d10-94c7-61f671b4f313",
+        )
+        .expect("strict image request");
+        request
+            .validate_against(&message, &lease, now_ms + 1)
+            .expect("exact current request");
+
+        let mut changed = request.clone();
+        changed.message_sequence += 1;
+        assert_eq!(
+            changed.validate_against(&message, &lease, now_ms + 1),
+            Err(VdiClipboardFilesMaterializationErrorV1::MetadataMismatch)
+        );
+        let mut oversized = request;
+        oversized.byte_count = MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES + 1;
+        assert_eq!(
+            oversized.validate(),
+            Err(VdiClipboardFilesMaterializationErrorV1::Oversized)
+        );
     }
 
     #[test]

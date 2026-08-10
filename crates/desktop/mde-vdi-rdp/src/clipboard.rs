@@ -9,7 +9,9 @@ use ironrdp_cliprdr::pdu::{
     FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
 use ironrdp_core::impl_as_any;
-use mackes_mesh_types::vdi_clipboard::MAX_VDI_CLIPBOARD_TEXT_BYTES;
+use mackes_mesh_types::vdi_clipboard::{
+    MAX_VDI_CLIPBOARD_TEXT_BYTES, MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES,
+};
 
 /// The standard CLIPRDR text format supported by this backend.
 pub const UNICODE_TEXT_FORMAT: ClipboardFormat =
@@ -20,6 +22,10 @@ pub const UNICODE_TEXT_FORMAT: ClipboardFormat =
 /// Registered IDs are scoped to the advertised format list. The peer requests
 /// this exact ID after mapping the accompanying name into its local registry.
 pub const HTML_FORMAT_ID: ClipboardFormatId = ClipboardFormatId(0xC000);
+/// Standard Windows device-independent bitmap formats carried by CLIPRDR.
+pub const DIB_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId(8));
+/// Standard Windows V5 device-independent bitmap format carried by CLIPRDR.
+pub const DIBV5_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId(17));
 
 const MAX_REMOTE_FORMATS: usize = 256;
 const CF_HTML_HEADER_SLACK_BYTES: usize = 1024;
@@ -54,6 +60,7 @@ struct ClipboardState {
     local_generation: u64,
     local_text: Option<String>,
     local_html: Option<Vec<u8>>,
+    local_dib: Option<Vec<u8>>,
     local_data_request: Option<(FormatDataRequest, u64)>,
     remote_unicode_offer: Option<RemoteFormat>,
     remote_html_offer: Option<RemoteFormat>,
@@ -96,6 +103,7 @@ impl ClipboardBridge {
         state.local_generation = state.local_generation.wrapping_add(1);
         state.local_text = Some(text);
         state.local_html = None;
+        state.local_dib = None;
         Ok(())
     }
 
@@ -113,6 +121,20 @@ impl ClipboardBridge {
         state.local_generation = state.local_generation.wrapping_add(1);
         state.local_text = None;
         state.local_html = Some(wire);
+        state.local_dib = None;
+        Ok(())
+    }
+
+    /// Replace the host offer with one already-encoded, bounded CF_DIBV5.
+    /// Image decoding remains in the shell, which owns the Files descriptor;
+    /// this protocol boundary accepts only a structurally valid DIB allocation.
+    pub fn offer_host_dibv5(&self, dib: Vec<u8>) -> Result<(), ClipboardBridgeError> {
+        validate_dib(&dib, Some(DIBV5_FORMAT.id()))?;
+        let mut state = self.lock();
+        state.local_generation = state.local_generation.wrapping_add(1);
+        state.local_text = None;
+        state.local_html = None;
+        state.local_dib = Some(dib);
         Ok(())
     }
 
@@ -124,6 +146,8 @@ impl ClipboardBridge {
             vec![UNICODE_TEXT_FORMAT]
         } else if state.local_html.is_some() {
             vec![html_format()]
+        } else if state.local_dib.is_some() {
+            vec![DIBV5_FORMAT, DIB_FORMAT]
         } else {
             Vec::new()
         }
@@ -149,6 +173,11 @@ impl ClipboardBridge {
         } else if request.format == HTML_FORMAT_ID {
             match state.local_html.as_ref() {
                 Some(html) => OwnedFormatDataResponse::new_data(html.clone()),
+                None => OwnedFormatDataResponse::new_error(),
+            }
+        } else if request.format == DIBV5_FORMAT.id() || request.format == DIB_FORMAT.id() {
+            match state.local_dib.as_ref() {
+                Some(dib) => OwnedFormatDataResponse::new_data(dib.clone()),
                 None => OwnedFormatDataResponse::new_error(),
             }
         } else {
@@ -205,6 +234,8 @@ pub enum ClipboardBridgeError {
         /// Canonical maximum UTF-8 byte count.
         max_bytes: usize,
     },
+    /// The image was not a bounded, self-consistent CF_DIB/CF_DIBV5 payload.
+    InvalidImage,
 }
 
 impl core::fmt::Display for ClipboardBridgeError {
@@ -214,6 +245,7 @@ impl core::fmt::Display for ClipboardBridgeError {
                 formatter,
                 "RDP clipboard payload is {bytes} bytes; maximum is {max_bytes}"
             ),
+            Self::InvalidImage => formatter.write_str("RDP clipboard DIB is malformed or unsafe"),
         }
     }
 }
@@ -356,6 +388,84 @@ fn decode_unicode_text(data: &[u8]) -> Option<String> {
     (text.len() <= MAX_VDI_CLIPBOARD_TEXT_BYTES).then_some(text)
 }
 
+fn validate_dib(
+    data: &[u8],
+    format: Option<ClipboardFormatId>,
+) -> Result<(), ClipboardBridgeError> {
+    let max = usize::try_from(MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES).unwrap_or(usize::MAX);
+    if data.len() < 40 || data.len() > max {
+        return Err(if data.len() > max {
+            ClipboardBridgeError::TooLarge {
+                bytes: data.len(),
+                max_bytes: max,
+            }
+        } else {
+            ClipboardBridgeError::InvalidImage
+        });
+    }
+    let u16_at = |offset: usize| {
+        data.get(offset..offset + 2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let u32_at = |offset: usize| {
+        data.get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    let i32_at = |offset: usize| {
+        data.get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_le_bytes)
+    };
+    let header = usize::try_from(u32_at(0).ok_or(ClipboardBridgeError::InvalidImage)?)
+        .map_err(|_| ClipboardBridgeError::InvalidImage)?;
+    if !matches!(header, 40 | 108 | 124)
+        || format == Some(DIBV5_FORMAT.id()) && header != 124
+        || header > data.len()
+        || u16_at(12) != Some(1)
+    {
+        return Err(ClipboardBridgeError::InvalidImage);
+    }
+    let width = i32_at(4)
+        .filter(|width| *width > 0)
+        .ok_or(ClipboardBridgeError::InvalidImage)?;
+    let height = i32_at(8)
+        .filter(|height| *height != 0 && *height != i32::MIN)
+        .ok_or(ClipboardBridgeError::InvalidImage)?
+        .unsigned_abs();
+    let bits = u16_at(14)
+        .filter(|bits| matches!(bits, 24 | 32))
+        .ok_or(ClipboardBridgeError::InvalidImage)?;
+    let compression = u32_at(16).ok_or(ClipboardBridgeError::InvalidImage)?;
+    if !matches!(compression, 0 | 3) {
+        return Err(ClipboardBridgeError::InvalidImage);
+    }
+    let row_bits = u64::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(u64::from(bits)))
+        .ok_or(ClipboardBridgeError::InvalidImage)?;
+    let row_bytes = row_bits
+        .checked_add(31)
+        .map(|value| value / 32 * 4)
+        .ok_or(ClipboardBridgeError::InvalidImage)?;
+    let pixels = row_bytes
+        .checked_mul(u64::from(height))
+        .ok_or(ClipboardBridgeError::InvalidImage)?;
+    let total = u64::try_from(header)
+        .ok()
+        .and_then(|header| header.checked_add(pixels))
+        .ok_or(ClipboardBridgeError::InvalidImage)?;
+    if total != data.len() as u64 || total > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES {
+        return Err(ClipboardBridgeError::InvalidImage);
+    }
+    let declared = u32_at(20).ok_or(ClipboardBridgeError::InvalidImage)?;
+    if declared != 0 && u64::from(declared) != pixels {
+        return Err(ClipboardBridgeError::InvalidImage);
+    }
+    Ok(())
+}
+
 fn encode_cf_html(fragment: &str) -> Vec<u8> {
     // Ten decimal digits cover the bounded payload and keep the header width
     // stable while calculating its byte offsets.
@@ -429,13 +539,30 @@ fn decode_cf_html(data: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         decode_cf_html, decode_unicode_text, encode_cf_html, html_format, ClipboardBridge,
-        ClipboardBridgeError, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
+        ClipboardBridgeError, DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
     };
     use ironrdp_cliprdr::pdu::{
         ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FormatDataRequest,
         FormatDataResponse,
     };
     use mackes_mesh_types::vdi_clipboard::MAX_VDI_CLIPBOARD_TEXT_BYTES;
+
+    fn one_pixel_dibv5() -> Vec<u8> {
+        let mut dib = vec![0_u8; 124 + 4];
+        dib[0..4].copy_from_slice(&124_u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1_i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-1_i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32_u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        dib[20..24].copy_from_slice(&4_u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&0x00ff_0000_u32.to_le_bytes());
+        dib[44..48].copy_from_slice(&0x0000_ff00_u32.to_le_bytes());
+        dib[48..52].copy_from_slice(&0x0000_00ff_u32.to_le_bytes());
+        dib[52..56].copy_from_slice(&0xff00_0000_u32.to_le_bytes());
+        dib[124..128].copy_from_slice(&[0x33, 0x22, 0x11, 0xff]);
+        dib
+    }
 
     #[test]
     fn bridge_bounds_host_text_and_decodes_guest_unicode() {
@@ -553,5 +680,35 @@ mod tests {
             .take_local_data_response()
             .expect("fail-closed response")
             .is_error());
+    }
+
+    #[test]
+    fn bounded_dibv5_negotiation_round_trips_and_rejects_hostile_geometry() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        let dib = one_pixel_dibv5();
+        bridge.offer_host_dibv5(dib.clone()).expect("bounded DIBV5");
+        assert_eq!(bridge.advertised_formats(), vec![DIBV5_FORMAT, DIB_FORMAT]);
+        backend.on_format_data_request(FormatDataRequest {
+            format: DIBV5_FORMAT.id(),
+        });
+        assert_eq!(
+            bridge
+                .take_local_data_response()
+                .expect("DIB response")
+                .data(),
+            dib
+        );
+
+        // Guest-to-host image publication still needs a Files write authority;
+        // do not request image bytes merely because the guest advertises them.
+        backend.on_remote_copy(&[DIB_FORMAT, DIBV5_FORMAT]);
+        assert_eq!(bridge.take_remote_format_request(), None);
+
+        let mut hostile = one_pixel_dibv5();
+        hostile[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert_eq!(
+            bridge.offer_host_dibv5(hostile),
+            Err(ClipboardBridgeError::InvalidImage)
+        );
     }
 }

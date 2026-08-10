@@ -737,6 +737,32 @@ fn rdp_html_uses_typed_lease_and_the_same_one_use_materialization_gate() {
     assert_eq!(guest.lease_id, lease.lease_id);
 }
 
+#[cfg(feature = "live-vdi")]
+#[test]
+fn rdp_png_expands_only_into_a_bounded_top_down_dibv5() {
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 2, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("PNG header");
+        writer
+            .write_image_data(&[0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0x80])
+            .expect("PNG pixels");
+    }
+    let dib = super::rdp_image_to_dibv5("image/png", &png_bytes).expect("bounded DIBV5");
+    assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 124);
+    assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 2);
+    assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), -1);
+    assert_eq!(u16::from_le_bytes(dib[14..16].try_into().unwrap()), 32);
+    assert_eq!(
+        &dib[124..132],
+        &[0x33, 0x22, 0x11, 0xff, 0x66, 0x55, 0x44, 0x80]
+    );
+
+    assert!(super::bounded_rgba_len(u32::MAX, u32::MAX).is_err());
+}
+
 #[test]
 fn a_connect_request_carries_the_three_display_choices() {
     // The request-construction fold: the picked target + the three choices

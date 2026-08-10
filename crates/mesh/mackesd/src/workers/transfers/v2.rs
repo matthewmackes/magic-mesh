@@ -14,7 +14,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -666,6 +666,61 @@ fn is_lower_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Resolve, bind, and open one immutable Files source for the daemon-local
+/// clipboard descriptor endpoint. The returned descriptor is rewound and is
+/// still bound to the inode whose size and digest were verified; no path leaves
+/// the daemon process.
+pub(super) fn open_bounded_files_source(
+    resolver: &dyn FilesEndpointResolver,
+    identity: &TransferLocation,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<File, TransferV2ResolutionError> {
+    let role = FilesEndpointRole::Source;
+    require_files_identity(identity, role)?;
+    let record = resolve_once(resolver, identity, role)?;
+    let bound = bind_record(identity, role, &record)?;
+    if bound.size_bytes != expected_size || bound.sha256_hex != expected_sha256 {
+        return Err(TransferV2ResolutionError::MetadataMismatch {
+            role,
+            field: "clipboard",
+        });
+    }
+    ensure_current(resolver, identity, role, &record)?;
+
+    let mut file = open_regular_no_follow(bound.canonical_path())
+        .map_err(|_| TransferV2ResolutionError::MetadataUnavailable(role))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| TransferV2ResolutionError::MetadataUnavailable(role))?;
+    if metadata.len() != expected_size {
+        return Err(TransferV2ResolutionError::MetadataMismatch {
+            role,
+            field: "size",
+        });
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| TransferV2ResolutionError::MetadataUnavailable(role))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    if format!("{:x}", digest.finalize()) != expected_sha256 {
+        return Err(TransferV2ResolutionError::MetadataMismatch {
+            role,
+            field: "sha256",
+        });
+    }
+    file.rewind()
+        .map_err(|_| TransferV2ResolutionError::MetadataUnavailable(role))?;
+    Ok(file)
 }
 
 /// Re-read both Files records and physical metadata immediately before an
