@@ -30,6 +30,9 @@ pub const MAX_SURFACE_ACTION_AGE_MS: u64 = 30_000;
 pub const MAX_SURFACE_ACTION_FUTURE_SKEW_MS: u64 = 5_000;
 /// Exact local phrase an operator must type before one camera functional proof.
 pub const SURFACE_CAMERA_PROOF_ARM_TOKEN: &str = "PROVE CAMERA";
+/// Firmware-apply result schema. Version 2 explicitly replaces the former
+/// private daemon JSON shape that carried unbounded free-form reasons.
+pub const SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION: u64 = 2;
 
 /// Contract admission failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +450,167 @@ pub struct SurfaceFirmwareApplyRequest {
     /// Human-entered firmware apply token.
     #[serde(default)]
     pub arm_token: Option<String>,
+}
+
+/// Exact firmware selection carried from an admitted apply request into its
+/// result. No result can substitute a different release identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceFirmwareApplyTarget {
+    /// Exact fwupd device identity.
+    pub device_id: String,
+    /// Exact inventory generation selected by the operator.
+    pub inventory_published_at_ms: u64,
+    /// Exact selected release version.
+    pub release_version: String,
+    /// Exact selected cabinet SHA-256.
+    pub release_checksum: String,
+}
+
+impl SurfaceFirmwareApplyTarget {
+    fn validate(&self) -> Result<(), SurfaceContractError> {
+        validate_id(&self.device_id, "target.device_id")?;
+        if self.inventory_published_at_ms == 0 {
+            return Err(SurfaceContractError::Invalid(
+                "target.inventory_published_at_ms",
+            ));
+        }
+        validate_id(&self.release_version, "target.release_version")?;
+        validate_sha256(&self.release_checksum, "target.release_checksum")
+    }
+}
+
+/// Closed refusal reason for a firmware apply. Arbitrary parser, authorization,
+/// provider, and subprocess text never enters the shared result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceFirmwareApplyRefusal {
+    /// The Bus message had no request body.
+    MissingBody,
+    /// The request failed the bounded shared request contract.
+    Contract,
+    /// The exact-body privileged capability was absent, invalid, or replayed.
+    Authorization,
+    /// The explicit operator confirmation phrase was absent or incorrect.
+    OperatorArm,
+    /// The inventory timestamp or selected release binding was invalid/stale.
+    SelectionBinding,
+    /// A fresh inventory no longer contained the exact selected release.
+    ReleaseChanged,
+    /// Local DMI was not an admitted exact Surface Pro 5/6 identity.
+    UnsupportedModel,
+}
+
+/// Closed unavailable reason for a firmware apply provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceFirmwareApplyUnavailable {
+    /// The production fwupd apply integration was unavailable.
+    ProviderUnavailable,
+}
+
+/// Closed failure reason after the admitted provider was invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceFirmwareApplyFailure {
+    /// The exact fwupd install/stage operation failed.
+    ProviderFailed,
+}
+
+/// Bounded outcome of one Surface firmware apply request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+pub enum SurfaceFirmwareApplyOutcome {
+    /// fwupd accepted the exact cabinet for install/staging.
+    Applied,
+    /// Admission or explicit arming refused the apply before its effect.
+    Refused(SurfaceFirmwareApplyRefusal),
+    /// The production provider was not available.
+    Unavailable(SurfaceFirmwareApplyUnavailable),
+    /// The admitted provider ran but failed.
+    Failed(SurfaceFirmwareApplyFailure),
+}
+
+impl SurfaceFirmwareApplyOutcome {
+    /// Only an accepted fwupd install/stage triggers the verification refresh.
+    #[must_use]
+    pub const fn triggers_reverify(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// Versioned, bounded Surface firmware-apply result publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceFirmwareApplyResult {
+    /// Result wire schema. Version 2 is an intentional breaking migration from
+    /// the former private daemon shape.
+    pub result_schema_version: u64,
+    /// Shared node, exact model, fwupd source, publication time, and freshness.
+    pub publication: SurfacePublication,
+    /// Stable request identity, or `unadmitted` when no request decoded.
+    pub request_id: String,
+    /// Exact request selection. It is absent only when no request was admitted.
+    #[serde(default)]
+    pub target: Option<SurfaceFirmwareApplyTarget>,
+    /// Closed outcome without arbitrary provider or credential text.
+    pub outcome: SurfaceFirmwareApplyOutcome,
+}
+
+impl SurfaceFirmwareApplyResult {
+    /// Decode untrusted JSON with duplicate-key, size, and semantic admission.
+    pub fn from_json(body: &[u8]) -> Result<Self, SurfaceContractError> {
+        decode(body, |value: &Self| value.validate())
+    }
+
+    /// Validate version, exact model/source/freshness, request identity, and
+    /// outcome-dependent target presence.
+    pub fn validate(&self) -> Result<(), SurfaceContractError> {
+        if self.result_schema_version != SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION {
+            return Err(SurfaceContractError::Invalid("result_schema_version"));
+        }
+        self.publication.validate()?;
+        if self.publication.source != SurfaceObservationSource::Fwupd
+            || !matches!(self.publication.availability, SurfaceAvailability::Fresh)
+        {
+            return Err(SurfaceContractError::Invalid("result publication"));
+        }
+        validate_id(&self.request_id, "request_id")?;
+        match (
+            &*self.publication.model.product,
+            self.publication.model.generation,
+            self.outcome,
+        ) {
+            ("Surface Pro 5", SurfaceProGeneration::Pro5, _)
+            | ("Surface Pro 6", SurfaceProGeneration::Pro6, _) => {}
+            (_, SurfaceProGeneration::Unsupported, SurfaceFirmwareApplyOutcome::Refused(_)) => {}
+            _ => return Err(SurfaceContractError::Invalid("firmware apply model")),
+        }
+        match (&self.target, self.outcome) {
+            (
+                None,
+                SurfaceFirmwareApplyOutcome::Refused(
+                    SurfaceFirmwareApplyRefusal::MissingBody
+                    | SurfaceFirmwareApplyRefusal::Contract,
+                ),
+            ) if self.request_id == "unadmitted" => Ok(()),
+            (Some(target), outcome) => {
+                if self.request_id == "unadmitted"
+                    || matches!(
+                        outcome,
+                        SurfaceFirmwareApplyOutcome::Refused(
+                            SurfaceFirmwareApplyRefusal::MissingBody
+                                | SurfaceFirmwareApplyRefusal::Contract
+                        )
+                    )
+                {
+                    return Err(SurfaceContractError::Invalid("firmware apply target"));
+                }
+                target.validate()
+            }
+            _ => Err(SurfaceContractError::Invalid("firmware apply target")),
+        }
+    }
 }
 
 /// Explicitly armed request for one privacy-safe camera functional proof.
@@ -1077,6 +1241,115 @@ mod tests {
                 NOW,
             ),
             Err(SurfaceContractError::Invalid("release_checksum"))
+        );
+    }
+
+    fn firmware_apply_result() -> SurfaceFirmwareApplyResult {
+        SurfaceFirmwareApplyResult {
+            result_schema_version: SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
+            publication: SurfacePublication {
+                source: SurfaceObservationSource::Fwupd,
+                ..publication()
+            },
+            request_id: "firmware-request-1".into(),
+            target: Some(SurfaceFirmwareApplyTarget {
+                device_id: "uefi-1".into(),
+                inventory_published_at_ms: NOW,
+                release_version: "1.1".into(),
+                release_checksum: "a".repeat(64),
+            }),
+            outcome: SurfaceFirmwareApplyOutcome::Applied,
+        }
+    }
+
+    #[test]
+    fn firmware_apply_result_v2_binds_exact_target_model_source_and_freshness() {
+        let result = firmware_apply_result();
+        let body = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            SurfaceFirmwareApplyResult::from_json(&body),
+            Ok(result.clone())
+        );
+
+        let mut wrong_source = result.clone();
+        wrong_source.publication.source = SurfaceObservationSource::Kernel;
+        assert_eq!(
+            wrong_source.validate(),
+            Err(SurfaceContractError::Invalid("result publication"))
+        );
+        let mut stale = result.clone();
+        stale.publication.availability = SurfaceAvailability::Stale {
+            reason: "old result".into(),
+        };
+        assert_eq!(
+            stale.validate(),
+            Err(SurfaceContractError::Invalid("result publication"))
+        );
+        let mut substituted = result;
+        substituted.publication.model.product = "Surface Pro 5".into();
+        assert_eq!(
+            substituted.validate(),
+            Err(SurfaceContractError::Invalid("firmware apply model"))
+        );
+    }
+
+    #[test]
+    fn firmware_apply_result_rejects_unknown_duplicate_unbounded_and_free_form_reason() {
+        let value = serde_json::to_value(firmware_apply_result()).unwrap();
+        let mut unknown = value.clone();
+        unknown.as_object_mut().unwrap().insert(
+            "detail".into(),
+            serde_json::Value::String("provider stderr".into()),
+        );
+        assert_eq!(
+            SurfaceFirmwareApplyResult::from_json(&serde_json::to_vec(&unknown).unwrap()),
+            Err(SurfaceContractError::Malformed)
+        );
+
+        let raw = serde_json::to_string(&value).unwrap();
+        let duplicate = raw.replacen(
+            "{",
+            r#"{"result_schema_version":2,"result_schema_version":2,"#,
+            1,
+        );
+        assert_eq!(
+            SurfaceFirmwareApplyResult::from_json(duplicate.as_bytes()),
+            Err(SurfaceContractError::Malformed)
+        );
+        assert_eq!(
+            SurfaceFirmwareApplyResult::from_json(&vec![b' '; MAX_SURFACE_WIRE_BYTES + 1]),
+            Err(SurfaceContractError::Oversized)
+        );
+
+        let hostile = raw.replace(
+            r#"{"state":"applied"}"#,
+            r#"{"state":"failed","reason":"raw provider stderr"}"#,
+        );
+        assert_eq!(
+            SurfaceFirmwareApplyResult::from_json(hostile.as_bytes()),
+            Err(SurfaceContractError::Malformed)
+        );
+    }
+
+    #[test]
+    fn firmware_apply_result_target_presence_tracks_admission_state() {
+        let mut missing = firmware_apply_result();
+        missing.target = None;
+        assert_eq!(
+            missing.validate(),
+            Err(SurfaceContractError::Invalid("firmware apply target"))
+        );
+
+        missing.request_id = "unadmitted".into();
+        missing.outcome =
+            SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::Contract);
+        assert!(missing.validate().is_ok());
+
+        let mut bad_checksum = firmware_apply_result();
+        bad_checksum.target.as_mut().unwrap().release_checksum = "A".repeat(64);
+        assert_eq!(
+            bad_checksum.validate(),
+            Err(SurfaceContractError::Invalid("target.release_checksum"))
         );
     }
 

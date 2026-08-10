@@ -44,9 +44,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use mackes_mesh_types::surface_hardware::{
-    SurfaceAvailability, SurfaceFirmwareDevice, SurfaceFirmwareInventory, SurfaceModelIdentity,
-    SurfaceObservationSource, SurfaceProGeneration, SurfacePublication,
-    SURFACE_HARDWARE_SCHEMA_VERSION,
+    SurfaceAvailability, SurfaceFirmwareApplyFailure, SurfaceFirmwareApplyOutcome,
+    SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyUnavailable, SurfaceFirmwareDevice,
+    SurfaceFirmwareInventory, SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration,
+    SurfacePublication, SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 
 use super::{SurfaceDetection, SurfaceModel};
@@ -964,7 +965,7 @@ const EMPTY_DEVICE_LIST: &str = r#"{"Devices":[]}"#;
 // ─────────────────────────── the apply verb (typed-armed) ───────────────────
 
 /// The outcome of a firmware apply against the seam.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
     /// The apply was **refused** because the typed arm didn't match — the
     /// interlock that makes a firmware apply never automatic (lock #8).
@@ -998,9 +999,11 @@ impl ApplyOutcome {
     }
 }
 
-/// The typed result the `fw-apply` verb returns — what the worker publishes
-/// and SURFACE-6's Install tab renders.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Private in-process result of the `fw-apply` verb. The worker projects this
+/// into the bounded shared
+/// [`mackes_mesh_types::surface_hardware::SurfaceFirmwareApplyResult`] v2 wire
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyResult {
     /// The recognised model's product string (empty when skipped).
     pub model: String,
@@ -1011,6 +1014,9 @@ pub struct ApplyResult {
     pub device_id: String,
     /// The apply outcome.
     pub outcome: ApplyOutcome,
+    /// Closed shared-wire outcome. This is the only outcome serialized by the
+    /// worker; private free-form diagnostics never cross the Bus boundary.
+    pub wire_outcome: SurfaceFirmwareApplyOutcome,
     /// Whether this apply triggers a verify re-run (a successful apply does).
     pub reverify: bool,
 }
@@ -1024,6 +1030,9 @@ impl ApplyResult {
             outcome: ApplyOutcome::Refused {
                 reason: reason.to_string(),
             },
+            wire_outcome: SurfaceFirmwareApplyOutcome::Refused(
+                SurfaceFirmwareApplyRefusal::UnsupportedModel,
+            ),
             reverify: false,
         }
     }
@@ -1082,6 +1091,9 @@ pub fn run_apply(
             outcome: ApplyOutcome::Refused {
                 reason: format!("firmware apply not armed — type {FW_ARM_TOKEN} to confirm"),
             },
+            wire_outcome: SurfaceFirmwareApplyOutcome::Refused(
+                SurfaceFirmwareApplyRefusal::OperatorArm,
+            ),
             reverify: false,
         };
     }
@@ -1107,6 +1119,9 @@ pub fn run_apply(
                 reason: "firmware apply selection is stale or has an invalid release binding"
                     .into(),
             },
+            wire_outcome: SurfaceFirmwareApplyOutcome::Refused(
+                SurfaceFirmwareApplyRefusal::SelectionBinding,
+            ),
             reverify: false,
         };
     }
@@ -1118,6 +1133,13 @@ pub fn run_apply(
             && device.available_version.as_deref() == Some(release_version)
             && device.available_checksum.as_deref() == Some(release_checksum)
     }) else {
+        let wire_outcome = if fresh.skipped.is_some() {
+            SurfaceFirmwareApplyOutcome::Unavailable(
+                SurfaceFirmwareApplyUnavailable::ProviderUnavailable,
+            )
+        } else {
+            SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::ReleaseChanged)
+        };
         return ApplyResult {
             model,
             skipped: None,
@@ -1127,17 +1149,27 @@ pub fn run_apply(
                     "firmware release changed or no longer matches the selected SHA-256".into()
                 }),
             },
+            wire_outcome,
             reverify: false,
         };
     };
 
-    let outcome = match fwupd.apply_update(&device.device_id, release_version, release_checksum) {
-        Ok(()) => ApplyOutcome::Applied,
-        Err(FwError::IntegrationGated { action }) => ApplyOutcome::Gated { reason: action },
-        Err(FwError::Failed { action, detail }) => ApplyOutcome::Failed {
-            reason: format!("{action}: {detail}"),
-        },
-    };
+    let (outcome, wire_outcome) =
+        match fwupd.apply_update(&device.device_id, release_version, release_checksum) {
+            Ok(()) => (ApplyOutcome::Applied, SurfaceFirmwareApplyOutcome::Applied),
+            Err(FwError::IntegrationGated { action }) => (
+                ApplyOutcome::Gated { reason: action },
+                SurfaceFirmwareApplyOutcome::Unavailable(
+                    SurfaceFirmwareApplyUnavailable::ProviderUnavailable,
+                ),
+            ),
+            Err(FwError::Failed { action, detail }) => (
+                ApplyOutcome::Failed {
+                    reason: format!("{action}: {detail}"),
+                },
+                SurfaceFirmwareApplyOutcome::Failed(SurfaceFirmwareApplyFailure::ProviderFailed),
+            ),
+        };
     let reverify = outcome.triggers_reverify();
 
     ApplyResult {
@@ -1145,6 +1177,7 @@ pub fn run_apply(
         skipped: None,
         device_id: device_id.to_string(),
         outcome,
+        wire_outcome,
         reverify,
     }
 }
@@ -1164,7 +1197,8 @@ mod worker {
     //! tick it publishes the fwupd inventory to [`inventory_topic`]; it drains
     //! [`fw_apply_topic`] for typed-armed apply requests, runs
     //! [`super::run_apply`] against [`super::LiveFwupd`],
-    //! publishes the [`super::ApplyResult`] to [`fw_result_topic`], and on a
+    //! publishes the shared [`SurfaceFirmwareApplyResult`] v2 contract to
+    //! [`fw_result_topic`], and on a
     //! successful apply re-runs SURFACE-4's verify (reusing
     //! [`crate::surface::verify::run_verify`]) and re-publishes the board +
     //! summary. On a non-Surface node it idles (never touches the Bus).
@@ -1174,6 +1208,12 @@ mod worker {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     pub use mackes_mesh_types::surface_hardware::SurfaceFirmwareApplyRequest as FwApplyRequest;
+    use mackes_mesh_types::surface_hardware::{
+        SurfaceAvailability, SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult,
+        SurfaceFirmwareApplyTarget, SurfaceModelIdentity, SurfaceObservationSource,
+        SurfaceProGeneration, SurfacePublication, SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
+        SURFACE_HARDWARE_SCHEMA_VERSION,
+    };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
@@ -1208,7 +1248,7 @@ mod worker {
         format!("action/hardware/surface/{node}/fw-apply")
     }
 
-    /// The per-node result lane the typed [`ApplyResult`] lands on.
+    /// The per-node result lane the shared [`SurfaceFirmwareApplyResult`] lands on.
     #[must_use]
     pub fn fw_result_topic(node: &str) -> String {
         format!("state/hardware/surface/{node}/fw-apply")
@@ -1301,10 +1341,16 @@ mod worker {
             };
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
-                let result = self.apply_request(msg.body.as_deref());
-                self.publish_result(persist, &result);
+                let (admitted_request, result) =
+                    self.apply_request_with_admission(msg.body.as_deref());
+                self.publish_result(persist, admitted_request.as_ref(), &result);
                 // Verify re-runs after a successful firmware change (lock #8).
-                if result.reverify {
+                debug_assert_eq!(
+                    result.reverify,
+                    result.wire_outcome.triggers_reverify(),
+                    "private and shared outcomes must agree on effects"
+                );
+                if result.wire_outcome.triggers_reverify() {
                     self.reverify(persist);
                 }
             }
@@ -1314,26 +1360,54 @@ mod worker {
         /// human-arm token to the firmware verb. Parsing is deliberately
         /// side-effect free; the shared exact-body gate runs before
         /// [`run_apply`] or any fwupd/backend seam is reached.
+        #[cfg(test)]
         fn apply_request(&self, body: Option<&str>) -> ApplyResult {
+            self.apply_request_with_admission(body).1
+        }
+
+        /// Parse an untrusted request exactly once so the publication identity
+        /// cannot disagree with the request used for authorization/effects at
+        /// the freshness boundary.
+        fn apply_request_with_admission(
+            &self,
+            body: Option<&str>,
+        ) -> (Option<FwApplyRequest>, ApplyResult) {
             let Some(body) = body else {
-                return self.refused_result("", "firmware apply request body is missing");
+                return (
+                    None,
+                    self.refused_result_with_wire(
+                        "",
+                        "firmware apply request body is missing",
+                        SurfaceFirmwareApplyRefusal::MissingBody,
+                    ),
+                );
             };
             let req =
                 match FwApplyRequest::from_json_at(body.as_bytes(), &self.node_id, wall_now_ms()) {
                     Ok(req) => req,
                     Err(error) => {
-                        return self.refused_result(
-                            "",
-                            &format!(
+                        return (
+                            None,
+                            self.refused_result_with_wire(
+                                "",
+                                &format!(
                                 "firmware apply request failed shared contract admission: {error}"
+                            ),
+                                SurfaceFirmwareApplyRefusal::Contract,
                             ),
                         );
                     }
                 };
             let device_id = req.device_id.trim();
             if device_id.is_empty() {
-                return self
-                    .refused_result(device_id, "firmware apply request is missing device_id");
+                return (
+                    None,
+                    self.refused_result_with_wire(
+                        device_id,
+                        "firmware apply request is missing device_id",
+                        SurfaceFirmwareApplyRefusal::Contract,
+                    ),
+                );
             }
             let context = MutationContext {
                 verb: FW_ACTION_AUTH_VERB,
@@ -1348,12 +1422,13 @@ mod worker {
                     %error,
                     "refused unauthorized firmware apply"
                 );
-                return self.refused_result(
+                let result = self.refused_result(
                     device_id,
                     &format!("firmware apply authorization refused: {error}"),
                 );
+                return (Some(req), result);
             }
-            run_apply(
+            let result = run_apply(
                 &LiveFwupd,
                 &self.detection,
                 device_id,
@@ -1362,10 +1437,24 @@ mod worker {
                 wall_now_ms(),
                 &req.release_version,
                 &req.release_checksum,
-            )
+            );
+            (Some(req), result)
         }
 
         fn refused_result(&self, device_id: &str, reason: &str) -> ApplyResult {
+            self.refused_result_with_wire(
+                device_id,
+                reason,
+                SurfaceFirmwareApplyRefusal::Authorization,
+            )
+        }
+
+        fn refused_result_with_wire(
+            &self,
+            device_id: &str,
+            reason: &str,
+            wire_reason: SurfaceFirmwareApplyRefusal,
+        ) -> ApplyResult {
             let model = match &self.detection.model {
                 SurfaceModel::Known(device) => device.product.clone(),
                 SurfaceModel::UnknownSurface { product } => product.clone(),
@@ -1378,13 +1467,67 @@ mod worker {
                 outcome: super::ApplyOutcome::Refused {
                     reason: reason.to_string(),
                 },
+                wire_outcome:
+                    mackes_mesh_types::surface_hardware::SurfaceFirmwareApplyOutcome::Refused(
+                        wire_reason,
+                    ),
                 reverify: false,
             }
         }
 
-        /// Publish the typed apply result to the per-node result lane.
-        fn publish_result(&self, persist: &Persist, result: &ApplyResult) {
-            publish(persist, &fw_result_topic(&self.node_id), result);
+        /// Convert private diagnostics to the bounded shared v2 result. The
+        /// free-form `ApplyResult` is deliberately not serializable.
+        fn publish_result(
+            &self,
+            persist: &Persist,
+            request: Option<&FwApplyRequest>,
+            result: &ApplyResult,
+        ) {
+            let (product, generation) = match &self.detection.model {
+                SurfaceModel::Known(device) => (device.product.clone(), device.contract_generation),
+                SurfaceModel::UnknownSurface { product } => {
+                    (product.clone(), SurfaceProGeneration::Unsupported)
+                }
+                SurfaceModel::NotASurface => (
+                    "not-a-surface".to_string(),
+                    SurfaceProGeneration::Unsupported,
+                ),
+            };
+            let shared = SurfaceFirmwareApplyResult {
+                result_schema_version: SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
+                publication: SurfacePublication {
+                    schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: self.node_id.clone(),
+                    model: SurfaceModelIdentity {
+                        product,
+                        generation,
+                    },
+                    source: SurfaceObservationSource::Fwupd,
+                    published_at_ms: wall_now_ms(),
+                    availability: SurfaceAvailability::Fresh,
+                },
+                request_id: request.map_or_else(
+                    || "unadmitted".to_string(),
+                    |request| request.header.request_id.clone(),
+                ),
+                target: request.map(|request| SurfaceFirmwareApplyTarget {
+                    device_id: request.device_id.clone(),
+                    inventory_published_at_ms: request.inventory_published_at_ms,
+                    release_version: request.release_version.clone(),
+                    release_checksum: request.release_checksum.clone(),
+                }),
+                outcome: result.wire_outcome,
+            };
+            if let Err(error) = shared.validate() {
+                tracing::warn!(
+                    target: "mackesd::surface_firmware",
+                    node = %self.node_id,
+                    %error,
+                    "refusing invalid shared firmware apply result"
+                );
+                return;
+            }
+            publish(persist, &fw_result_topic(&self.node_id), &shared);
         }
 
         /// Re-run SURFACE-4's verify and re-publish the board + compact summary
@@ -1488,6 +1631,10 @@ mod worker {
         use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
         use crate::surface::firmware::ApplyOutcome;
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
+        use mackes_mesh_types::surface_hardware::{
+            SurfaceFirmwareApplyOutcome, SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult,
+            SurfaceFirmwareApplyUnavailable,
+        };
 
         const AUTH_KEY: &[u8] = b"surface-firmware-action-auth-test-key";
         const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -1575,6 +1722,13 @@ mod worker {
             )
         }
 
+        fn decode_result(item: &mde_bus::persist::StoredMessage) -> SurfaceFirmwareApplyResult {
+            SurfaceFirmwareApplyResult::from_json(
+                item.body.as_deref().expect("result body").as_bytes(),
+            )
+            .expect("bounded shared firmware apply result")
+        }
+
         #[test]
         fn publishes_the_inventory_for_a_surface() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1641,13 +1795,12 @@ mod worker {
                 .list_since(&fw_result_topic("node-a"), None)
                 .expect("list results");
             assert_eq!(out.len(), 1, "one apply result published");
-            let result: ApplyResult =
-                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
+            let result = decode_result(&out[0]);
             assert!(matches!(
                 result.outcome,
-                super::super::ApplyOutcome::Refused { .. }
+                SurfaceFirmwareApplyOutcome::Refused(_)
             ));
-            assert!(!result.reverify, "a refused apply does not re-verify");
+            assert!(!result.outcome.triggers_reverify());
 
             // No verify board was re-published (nothing changed).
             let boards = persist
@@ -1685,13 +1838,12 @@ mod worker {
             let out = persist
                 .list_since(&fw_result_topic("node-a"), None)
                 .expect("list results");
-            let result: ApplyResult =
-                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            let ApplyOutcome::Refused { reason } = result.outcome else {
-                panic!("missing authorization refusal");
-            };
-            assert!(reason.contains("shared contract admission"));
-            assert!(!result.reverify);
+            let result = decode_result(&out[0]);
+            assert_eq!(
+                result.outcome,
+                SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::Contract)
+            );
+            assert!(!result.outcome.triggers_reverify());
         }
 
         #[test]
@@ -1757,13 +1909,25 @@ mod worker {
             let out = persist
                 .list_since(&fw_result_topic("node-auth"), None)
                 .expect("list results");
-            let result: ApplyResult =
-                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            let ApplyOutcome::Refused { reason } = result.outcome else {
-                panic!("unbound firmware request was not refused");
-            };
-            assert!(reason.contains("fwupdmgr"));
-            assert!(!result.reverify);
+            let result = decode_result(&out[0]);
+            assert_eq!(
+                result.outcome,
+                SurfaceFirmwareApplyOutcome::Unavailable(
+                    SurfaceFirmwareApplyUnavailable::ProviderUnavailable
+                )
+            );
+            assert!(!result.outcome.triggers_reverify());
+            assert_eq!(
+                result.result_schema_version,
+                SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION
+            );
+            let target = result.target.expect("admitted request target");
+            assert_eq!(target.device_id, "uefi-1");
+            assert_eq!(target.release_version, "1.2.4");
+            assert_eq!(target.release_checksum, "a".repeat(64));
+            let raw = out[0].body.as_deref().unwrap();
+            assert!(!raw.contains("fwupdmgr"));
+            assert!(!raw.contains("integration-gated"));
         }
 
         #[test]
@@ -1786,12 +1950,11 @@ mod worker {
             let out = persist
                 .list_since(&fw_result_topic("node-arm"), None)
                 .expect("list results");
-            let result: ApplyResult =
-                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            let ApplyOutcome::Refused { reason } = result.outcome else {
-                panic!("missing typed-arm refusal");
-            };
-            assert!(reason.contains("not armed"));
+            let result = decode_result(&out[0]);
+            assert_eq!(
+                result.outcome,
+                SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::OperatorArm)
+            );
         }
 
         #[test]
@@ -1823,16 +1986,19 @@ mod worker {
                 .list_since(&fw_result_topic("node-replay"), None)
                 .expect("list results");
             assert_eq!(out.len(), 3);
-            let results: Vec<ApplyResult> = out
-                .iter()
-                .map(|item| serde_json::from_str(item.body.as_deref().unwrap()).unwrap())
-                .collect();
-            assert!(matches!(results[0].outcome, ApplyOutcome::Refused { .. }));
-            assert!(matches!(results[1].outcome, ApplyOutcome::Refused { .. }));
-            let ApplyOutcome::Refused { reason } = &results[2].outcome else {
-                panic!("replay was not refused");
-            };
-            assert!(reason.contains("already used"));
+            let results: Vec<_> = out.iter().map(decode_result).collect();
+            assert_eq!(
+                results[0].outcome,
+                SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::Authorization)
+            );
+            assert_eq!(
+                results[1].outcome,
+                SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::UnsupportedModel)
+            );
+            assert_eq!(
+                results[2].outcome,
+                SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::Authorization)
+            );
         }
 
         #[test]
