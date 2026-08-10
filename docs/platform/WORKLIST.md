@@ -2086,11 +2086,14 @@ behavioral evidence is not completion.
 - **Surface pending-action cancellation checkpoint (2026-08-10):** Surface
   enable/MOK and exact-device firmware apply now accept a separately signed,
   exact-target cancellation only before the local worker claims effects.
-  Durable cancellation claims recover after a daemon crash without reviving
-  expired authority; late/refused cancellation never interrupts effects or
-  replaces the original result. Focused farm gates passed 11 daemon, 3 shared
-  contract, 1 shell, and 1 root-CLI test:
-  `docs/platform/evidence/WL-UX-011-2026-08-10-surface-pending-cancellation-r17.md`.
+  The original r17 Bus-claim architecture was rejected by adversarial review
+  and is retained only as superseded history. Correct-forward r18 uses a
+  root-owned descriptor-anchored journal, terminal publication outbox, and
+  Bus-independent crash recovery; it also makes `prepare`/`seal` the canonical
+  race-free camera acceptance flow and aligns all twelve physical checks.
+  Final farm gates passed 10 journal, 17 shared, 2 daemon recovery, 6 CLI, and
+  1 shell test, plus wrapper and collector/recorder/promotion hostile suites:
+  `docs/platform/evidence/WL-UX-011-2026-08-10-surface-cancellation-journal-acceptance-seal-r18.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.

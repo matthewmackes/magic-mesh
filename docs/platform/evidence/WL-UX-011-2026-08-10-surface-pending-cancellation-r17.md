@@ -1,5 +1,11 @@
 # WL-UX-011 Surface pending-action cancellation checkpoint (r17)
 
+> **SUPERSEDED / CORRECTED FORWARD:** adversarial review after this checkpoint
+> found that its Bus-backed claim/result recovery could treat cross-UID-writable
+> rows as authority and had crash/publication gaps. Commit `5deafa79` replaces
+> that design with a root-owned descriptor-anchored journal. Use r18 for the
+> current result; r17 is retained only as the historical pre-correction record.
+
 Date: 2026-08-10
 Implementation commit: `03f9db21`
 
