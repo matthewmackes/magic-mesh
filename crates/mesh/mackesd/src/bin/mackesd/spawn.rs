@@ -1981,19 +1981,6 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             node_id.clone(),
         )
     });
-    // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
-    // bridges. Drains `action/vdi/clipboard`, applies a per-session policy
-    // (allow/deny + one-way + a size cap) via the pure relay decision
-    // (Forward/Drop/Truncate), and relays each clip into the connected VM desktop
-    // through the injectable ClipboardAccess seam (with an echo guard). Clipboard
-    // relay is per-session + node-local — every serving node must apply ITS
-    // session's clips — so it is NOT leader-gated (unlike session_broker) but is
-    // rank-0-default the same way (runs everywhere). The live OS/guest clipboard
-    // channel (SPICE/RDP vdagent / wl-clipboard) is integration-gated (typed
-    // error, §7); the pure model + relay pipeline ship green behind the seam.
-    spawn_tiered(sup, worker_names, role_rank, "clipboard_bridge", || {
-        mackesd_core::workers::clipboard_bridge::ClipboardBridgeWorker::new()
-    });
     // OV-7.a (v2.6) — health reconciler. Polls each known
     // peer's QNM-Shared heartbeat.json every 5 s, applies the
     // telemetry::health_state_from_age threshold table, writes

@@ -698,17 +698,6 @@ pub mod session_broker;
 // companion replicated layout store and preloads on worker start so saved layouts
 // survive daemon restarts before the next roam.
 pub mod session_roaming;
-// E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
-// bridges. Drains `action/vdi/clipboard`, applies a per-session [`ClipboardPolicy`]
-// (allow/deny + one-way + a size cap) via the pure `relay` decision
-// (Forward/Drop/Truncate), and relays each clip into the connected VM desktop
-// through the injectable `ClipboardAccess` seam — with an echo guard so a re-applied
-// clip doesn't loop. Per-session + node-local, so NOT leader-gated (every serving
-// node relays its own session's clips); rank-0-default like session_broker. The live
-// OS/guest clipboard channel (SPICE/RDP vdagent / wl-clipboard) is integration-gated
-// (typed `ClipboardAccessError::IntegrationGated`, §7); the pure model + relay
-// pipeline ship green behind the seam.
-pub mod clipboard_bridge;
 // CHOOSER-1 — the desktop_sources worker: the mesh-side (§6) desktop-source
 // discovery aggregator behind the Chooser surface (docs/design/desktop-
 // chooser.md). Folds four lanes into one deduped roster published to

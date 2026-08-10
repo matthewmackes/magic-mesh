@@ -50,11 +50,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mackes_mesh_types::vdi_clipboard::{
     ClipboardEnvelopeV2, ClipboardEnvelopeV2ValidationError, ClipboardMaterialization,
     ClipboardSessionConsentV1, ClipboardSessionConsentValidationError, VdiClipboardText,
-    CLIPBOARD_MATERIALIZATION_TOPIC,
+    CLIPBOARD_MATERIALIZATION_TOPIC, MAX_VDI_CLIPBOARD_TEXT_BYTES,
 };
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_collab_types::{
@@ -68,26 +67,15 @@ use tracing::{debug, info, warn};
 pub mod mesh;
 pub mod session;
 
-use super::clipboard_bridge::{ClipDirection, ClipPayload, ClipboardEvent};
-use super::session_broker::{EtcdSessionStore, MeshSessionStore, SessionState, SessionStore};
 use super::{ShutdownToken, Worker};
-use crate::ipc::action_auth::{
-    production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
-    MAX_AUTH_TTL_MS,
-};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION};
 
 pub use mackes_mesh_types::vdi_clipboard::CLIPBOARD_SESSION_CONSENT_TOPIC;
 
-/// The daemon-owned VNC-to-seat handoff is deliberately narrower than the
-/// general clipboard action lane: only the shell's truthful VNC source form is
-/// eligible for conversion, and only an active session record can supply the
-/// destination seat.
-const VNC_SOURCE_PREFIX: &str = "vnc:";
-
 /// The shared text-only clipboard ceiling. Keep mesh history on the same
-/// bounded contract as the VDI bridge; oversized payloads must never become
+/// bounded contract as the canonical VDI protocol; oversized payloads must never become
 /// durable replicated state.
-const MAX_CLIP_BYTES: usize = super::clipboard_bridge::MAX_CLIP_BYTES;
+const MAX_CLIP_BYTES: usize = MAX_VDI_CLIPBOARD_TEXT_BYTES;
 
 /// Non-pinned entries kept in the shared history (O7: pins are exempt +
 /// unlimited, so the real file can be longer than this).
@@ -1413,10 +1401,6 @@ pub struct ClipboardSyncWorker {
     bus_root_override: Option<PathBuf>,
     /// Bus drain cadence.
     poll: Duration,
-    /// Root-only signer for the daemon-authored VNC guest→seat handoff. A
-    /// missing credential disables this handoff honestly; it never publishes
-    /// an unsigned action body.
-    vnc_action_signer: Option<CloudArmSigner>,
     /// Verifier for the root-authenticated clipboard session-consent control
     /// lane. Missing production credentials fail closed.
     consent_authorizer: Arc<ActionAuthorizer>,
@@ -1439,7 +1423,6 @@ impl ClipboardSyncWorker {
             target_seat: local_target_seat(),
             bus_root_override: None,
             poll: CLIP_EVENT_POLL_INTERVAL,
-            vnc_action_signer: production_action_signer().ok(),
             consent_authorizer: Arc::new(ActionAuthorizer::production()),
             mesh_peer_directory: Arc::new(mesh::SqliteMeshClipboardPeerDirectory::new(
                 crate::default_db_path(),
@@ -1726,160 +1709,12 @@ impl ClipboardSyncWorker {
             && envelope.target.seat.as_str() == target_seat
     }
 
-    /// Inject the daemon action signer in unit tests. Production obtains it
-    /// from the root-only systemd credential in [`Self::new`].
-    #[cfg(test)]
-    #[must_use]
-    fn with_vnc_action_signer(mut self, signer: CloudArmSigner) -> Self {
-        self.vnc_action_signer = Some(signer);
-        self
-    }
-
     /// Inject the consent capability verifier in deterministic tests.
     #[cfg(test)]
     #[must_use]
     fn with_consent_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.consent_authorizer = authorizer;
         self
-    }
-
-    /// Decode the shell VNC source identity without trusting it as a route.
-    /// The returned `(serving_peer, session_id)` is checked against the
-    /// authoritative session records before it can become a target seat.
-    fn parse_vnc_source(source: &str) -> Option<(&str, &str)> {
-        let rest = source.strip_prefix(VNC_SOURCE_PREFIX)?;
-        let (serving_peer, session_id) = rest.split_once(':')?;
-        if serving_peer.trim().is_empty() || session_id.trim().is_empty() {
-            return None;
-        }
-        Some((serving_peer, session_id))
-    }
-
-    /// Select the same etcd-first / replicated-file fallback store as the
-    /// session broker. Clipboard routing must not read a different authority
-    /// when the lease-backed session plane is enabled.
-    fn session_store(&self) -> Box<dyn SessionStore + Send + Sync> {
-        let endpoints = crate::substrate::etcd::default_endpoints();
-        if endpoints.is_empty() {
-            Box::new(MeshSessionStore::new(self.workgroup_root.clone()))
-        } else {
-            Box::new(EtcdSessionStore::new(endpoints))
-        }
-    }
-
-    /// Resolve a VNC guest event to the active client's exact local target.
-    /// The canonical event is not itself an authorization envelope, so the
-    /// source is only a lookup hint; the active session roster is the authority.
-    fn vnc_target_seat(&self, clip: &ClipEventBody) -> Result<Option<(String, String)>, String> {
-        let Some((serving_peer, session_id)) = Self::parse_vnc_source(&clip.source) else {
-            return Ok(None);
-        };
-        let sessions = self
-            .session_store()
-            .list()
-            .map_err(|error| format!("read VDI session roster for VNC clipboard: {error}"))?;
-        let Some(session) = sessions.into_iter().find(|session| {
-            session.id == session_id
-                && session.serving_peer == serving_peer
-                && session.state == SessionState::Active
-        }) else {
-            // A stale/disconnected VNC event must never be guessed onto a seat.
-            return Ok(Some((String::new(), String::new())));
-        };
-        super::clipboard_bridge::validate_target_seat(&session.client_peer).map_err(|error| {
-            format!("VNC session client peer is not a safe target seat: {error}")
-        })?;
-        Ok(Some((session.id, session.client_peer)))
-    }
-
-    /// Mint the exact-body capability consumed by `clipboard_bridge` for one
-    /// VNC guest→client event. Each publication attempt gets a fresh nonce:
-    /// authorization consumes a nonce before the adapter write, so retrying a
-    /// failed adapter must be able to obtain a new capability. The bridge's
-    /// session/payload echo guard handles duplicate successful publications.
-    fn signed_vnc_action(
-        clip: &ClipEventBody,
-        session_id: &str,
-        target_seat: &str,
-        signer: &CloudArmSigner,
-    ) -> Result<String, String> {
-        let event = ClipboardEvent {
-            session_id: session_id.to_owned(),
-            target_seat: target_seat.to_owned(),
-            direction: ClipDirection::GuestToClient,
-            payload: ClipPayload::checked(
-                super::clipboard_bridge::ClipFormat::Text,
-                clip.text.clone(),
-            )
-            .map_err(|error| format!("VNC clipboard payload rejected: {error}"))?,
-            source: Some(clip.source.clone()),
-        };
-        let mut document = serde_json::to_value(event)
-            .map_err(|error| format!("serialize VNC clipboard action: {error}"))?;
-        document
-            .as_object_mut()
-            .ok_or_else(|| "VNC clipboard action is not a JSON object".to_string())?
-            .insert(
-                "schema_version".to_string(),
-                serde_json::Value::from(ACTION_SCHEMA_VERSION),
-            );
-        let unsigned = document.to_string();
-        let target = format!("session:{session_id}:seat:{target_seat}");
-        let nonce = uuid::Uuid::new_v4().to_string();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "system clock is before the Unix epoch".to_string())
-            .and_then(|duration| {
-                i64::try_from(duration.as_millis())
-                    .map_err(|_| "system clock is beyond the capability range".to_string())
-            })?;
-        let token = CloudArmedToken::mint(
-            signer,
-            &nonce,
-            now_ms.saturating_add(MAX_AUTH_TTL_MS),
-            super::clipboard_bridge::ACTION_AUTH_VERB,
-            super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
-            &target,
-            &cloud_request_digest(&unsigned).map_err(str::to_string)?,
-        )
-        .encode();
-        document
-            .as_object_mut()
-            .ok_or_else(|| "VNC clipboard action is not a JSON object".to_string())?
-            .insert("armed_token".to_string(), serde_json::Value::String(token));
-        serde_json::to_string(&document)
-            .map_err(|error| format!("serialize signed VNC clipboard action: {error}"))
-    }
-
-    /// Convert one accepted canonical VNC event into the signed action lane.
-    /// `Ok(true)` means the event may be acknowledged; `Ok(false)` is reserved
-    /// for a future deferred route. A missing/stale session is acknowledged but
-    /// never guessed onto another seat.
-    fn publish_vnc_action(
-        &self,
-        persist: &mut Persist,
-        clip: &ClipEventBody,
-    ) -> Result<bool, String> {
-        let Some((session_id, target_seat)) = self.vnc_target_seat(clip)? else {
-            return Ok(true);
-        };
-        if session_id.is_empty() {
-            warn!(source = %clip.source, "discarding VNC clipboard event without an active matching session");
-            return Ok(true);
-        }
-        let Some(signer) = self.vnc_action_signer.as_ref() else {
-            return Err("VNC clipboard action signer is unavailable".to_string());
-        };
-        let body = Self::signed_vnc_action(clip, &session_id, &target_seat, signer)?;
-        persist
-            .write(
-                super::clipboard_bridge::ACTION_TOPIC,
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                Some(&body),
-            )
-            .map(|_| true)
-            .map_err(|error| format!("publish signed VNC clipboard action: {error}"))
     }
 
     /// Whether it is safe to write `clipboard/history.json` under the shared
@@ -2587,7 +2422,6 @@ impl ClipboardSyncWorker {
     /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
     fn process_clip_events(
         &self,
-        persist: &mut Persist,
         msgs: Vec<StoredMessage>,
         cursor: &mut Option<String>,
         checkpoint: Option<&Path>,
@@ -2609,18 +2443,6 @@ impl ClipboardSyncWorker {
                     continue;
                 }
             };
-            // VNC guest copies are canonical history events first, then become
-            // signed target-seat mutations. Do the conversion before the
-            // cursor can acknowledge the source event so a publish failure is
-            // retryable rather than silently losing the guest copy.
-            match self.publish_vnc_action(persist, &clip) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => {
-                    warn!(target: "clipboard_sync", ulid = %msg.ulid, %error, "VNC clipboard action publish deferred");
-                    continue;
-                }
-            }
             match self.handle_clip_event(&clip) {
                 Ok(true) => {
                     if let Some(path) = checkpoint {
@@ -2672,7 +2494,7 @@ impl ClipboardSyncWorker {
         let Ok(messages) = persist.list_since(CLIP_TOPIC, cursor.as_deref()) else {
             return 0;
         };
-        self.process_clip_events(persist, messages, cursor, checkpoint)
+        self.process_clip_events(messages, cursor, checkpoint)
     }
 }
 
@@ -2809,7 +2631,6 @@ impl Worker for ClipboardSyncWorker {
                             now_ms,
                         );
                     self.process_clip_events(
-                        &mut persist,
                         batch.clips,
                         &mut cursor,
                         Some(&checkpoint),
@@ -2850,7 +2671,6 @@ mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
     use ed25519_dalek::SigningKey;
-    use mackes_mesh_types::cloud::CloudArmSigner;
     use mde_bus::hooks::config::Priority;
     use mde_collab_types::{
         ClipboardClipId as CollabClipboardClipId,
@@ -3728,119 +3548,6 @@ mod tests {
     }
 
     #[test]
-    fn vnc_promotion_is_bounded_attributed_and_signed_for_exact_seat() {
-        let key = b"clipboard-sync-vnc-action-test-key";
-        let signer = CloudArmSigner::new(key.to_vec()).expect("test signer");
-        let auth_root = tempfile::tempdir().expect("auth root");
-        let clip = ClipEventBody::from_text(
-            "guest copy",
-            "vnc:serving-peer:session-1",
-            "2026-07-31T12:00:00Z",
-        );
-        let body = ClipboardSyncWorker::signed_vnc_action(&clip, "session-1", "seat:dell", &signer)
-            .expect("signed VNC action");
-        let event: ClipboardEvent = serde_json::from_str(&body).expect("action event");
-        assert_eq!(event.direction, ClipDirection::GuestToClient);
-        assert_eq!(event.target_seat, "seat:dell");
-        assert_eq!(event.source.as_deref(), Some("vnc:serving-peer:session-1"));
-        assert!(event.payload.len() <= MAX_CLIP_BYTES);
-
-        let signed_now = CloudArmedToken::parse(
-            serde_json::from_str::<serde_json::Value>(&body).expect("action JSON")["armed_token"]
-                .as_str()
-                .expect("armed token"),
-        )
-        .expect("parse armed token")
-        .expires_at_ms
-        .saturating_sub(MAX_AUTH_TTL_MS);
-        let authorizer =
-            ActionAuthorizer::for_test(key, auth_root.path().to_path_buf(), signed_now);
-        authorizer
-            .authorize(
-                &body,
-                MutationContext {
-                    verb: super::super::clipboard_bridge::ACTION_AUTH_VERB,
-                    node: super::super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
-                    target: "session:session-1:seat:seat:dell",
-                },
-            )
-            .expect("exact target-seat capability verifies");
-        assert!(authorizer
-            .authorize(
-                &body,
-                MutationContext {
-                    verb: super::super::clipboard_bridge::ACTION_AUTH_VERB,
-                    node: super::super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
-                    target: "session:session-1:seat:seat:other",
-                },
-            )
-            .is_err());
-
-        // Authorization is consumed before the adapter write. A second
-        // publication therefore needs a fresh nonce so a failed first write
-        // remains retryable; the bridge's payload echo guard handles the
-        // duplicate if the first write actually succeeded.
-        let retry_body =
-            ClipboardSyncWorker::signed_vnc_action(&clip, "session-1", "seat:dell", &signer)
-                .expect("retry action is signed");
-        let retry_now_ms = CloudArmedToken::parse(
-            serde_json::from_str::<serde_json::Value>(&retry_body).expect("retry action JSON")
-                ["armed_token"]
-                .as_str()
-                .expect("retry armed token"),
-        )
-        .expect("parse retry armed token")
-        .expires_at_ms
-        .saturating_sub(MAX_AUTH_TTL_MS);
-        ActionAuthorizer::for_test(key, auth_root.path().to_path_buf(), retry_now_ms)
-            .authorize(
-                &retry_body,
-                MutationContext {
-                    verb: super::super::clipboard_bridge::ACTION_AUTH_VERB,
-                    node: super::super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
-                    target: "session:session-1:seat:seat:dell",
-                },
-            )
-            .expect("retry gets a fresh capability nonce");
-    }
-
-    #[test]
-    fn vnc_source_routes_only_through_matching_active_session() {
-        let root = tempfile::tempdir().expect("session root");
-        let requested = super::super::session_broker::open_session(
-            "session-1".to_owned(),
-            "serving-peer".to_owned(),
-            "vm-1".to_owned(),
-            "seat:dell".to_owned(),
-            1,
-        );
-        let active =
-            super::super::session_broker::mark_active(&requested, 2).expect("active session");
-        MeshSessionStore::new(root.path().to_path_buf())
-            .publish(&active)
-            .expect("persist active session");
-        let worker = ClipboardSyncWorker::new(root.path().to_path_buf());
-        let clip = ClipEventBody::from_text(
-            "guest copy",
-            "vnc:serving-peer:session-1",
-            "2026-07-31T12:00:00Z",
-        );
-        assert_eq!(
-            worker.vnc_target_seat(&clip).expect("route lookup"),
-            Some(("session-1".to_owned(), "seat:dell".to_owned()))
-        );
-        let stale = ClipEventBody::from_text(
-            "guest copy",
-            "vnc:other-peer:session-1",
-            "2026-07-31T12:00:00Z",
-        );
-        assert_eq!(
-            worker.vnc_target_seat(&stale).expect("stale lookup"),
-            Some((String::new(), String::new()))
-        );
-    }
-
-    #[test]
     fn apply_pushes_new_clip_to_front_and_stamps_it() {
         let mut h = History::default();
         assert!(apply_clip(
@@ -4111,6 +3818,43 @@ mod tests {
         );
         assert_eq!(h.entries[0].source, "nodeA");
         assert_eq!(h.entries[0].time, "2026-07-26T10:02:00Z");
+    }
+
+    #[test]
+    fn vnc_clip_event_folds_canonical_history_without_secondary_action() {
+        let history_dir = tempfile::tempdir().unwrap();
+        let bus_dir = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).unwrap();
+        let clip = ClipEventBody::from_text(
+            "guest copy",
+            "vnc:serving-peer:session-1",
+            "2026-08-09T12:00:00Z",
+        );
+        persist
+            .write(
+                CLIP_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&clip).unwrap()),
+            )
+            .unwrap();
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf());
+        let mut cursor = None;
+        assert_eq!(worker.drain_clip_events(&mut persist, &mut cursor, None), 1);
+        let history = read_history(&history_path(history_dir.path()));
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].text, "guest copy");
+        assert_eq!(history.entries[0].source, "vnc:serving-peer:session-1");
+
+        let retired_topic = ["action", "vdi", "clipboard"].join("/");
+        assert!(
+            persist
+                .list_since(&retired_topic, None)
+                .expect("read retired action lane")
+                .is_empty(),
+            "canonical VNC history must not create a second action authority"
+        );
     }
 
     #[test]

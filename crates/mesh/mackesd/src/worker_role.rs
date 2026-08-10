@@ -1239,13 +1239,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         RestartPolicy::OnFailure,
         WorkerGroup::Data,
     ),
-    // VDI — per-session clipboard relay, node-local, runs everywhere.
-    WorkerSpec::tier(
-        "clipboard_bridge",
-        0,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Data,
-    ),
     // Onboarding action engines, leader/address-gated internally.
     WorkerSpec::tier(
         "service_onboard",
@@ -2998,7 +2991,7 @@ mod tests {
     fn canonical_registry_inventory_hash_covers_every_runtime_field() {
         let hash = registry_inventory_sha256(WORKER_REGISTRY);
         assert_eq!(
-            hash, "a1665a1cfd364133b5adcf9f0b4003913bd5972aa5bca9c827628a05d56dde79",
+            hash, "63950e85862aecdb4947c1d57e1a331d0a19b1a8bfb3a00c57f840100e50083a",
             "WL-ARCH-009: canonical registration inventory drifted"
         );
 
@@ -3134,7 +3127,7 @@ mod tests {
         // silent "unknown worker ⇒ rank 0" default (spawned + `runs(...)`-gated but
         // uncensused → hidden from `mackesd role-workers`, the BUG-STORAGE-1 class):
         // boot_readiness, kvm_health, scheduler, session_broker,
-        // session_roaming, clipboard_bridge,
+        // session_roaming,
         // service_onboard, spawn_lighthouse_onboard, onboard_apply, lighthouse_probe.
         // All rank 0 (behavior-preserving), so the split shifts 30/27 → 44/27,
         // len 57 → 71. The `worker_spawns_and_the_census_do_not_drift` test now keeps
@@ -3168,7 +3161,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 160);
+        assert_eq!(WORKER_REGISTRY.len(), 159);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3177,8 +3170,33 @@ mod tests {
                     SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor
                 ))
                 .count(),
-            82
+            81
         );
+    }
+
+    #[test]
+    fn retired_clipboard_authority_has_no_source_or_spawn_surface() {
+        let forbidden = [
+            ["clipboard", "_bridge"].concat(),
+            ["Clipboard", "BridgeWorker"].concat(),
+            ["OsClipboard", "Access"].concat(),
+            ["action", "/vdi/", "clipboard"].concat(),
+        ];
+        for path in rust_sources(&crate_src_dir()) {
+            let source = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!(
+                    "WL-ARCH-010 S6 guard: cannot read {}: {error}",
+                    path.display()
+                )
+            });
+            for retired in &forbidden {
+                assert!(
+                    !source.contains(retired),
+                    "WL-ARCH-010 S6: retired clipboard authority `{retired}` remains in {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
@@ -3211,7 +3229,7 @@ mod tests {
         };
         assert_eq!(
             count(0),
-            44,
+            43,
             "Lighthouse control plane plus universal storage/service/notification/control workers, with retired VM/container lifecycle and raw console relay absent"
         );
         assert_eq!(
@@ -3486,12 +3504,12 @@ mod tests {
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
         // gateway proxies brought the real pre-cutover count to 90. The current
-        // canonical roster contains 82 tiered/dynamic registrations, 70 direct
+        // canonical roster contains 81 tiered/dynamic registrations, 70 direct
         // supervisors/responders, and eight process-infrastructure rows. The
         // latter are universal census entries but still have one exact group
         // owner at runtime; all retired VM authorities are absent.
-        assert_eq!(lh.len(), 122);
-        assert_eq!(ws.len(), 160);
+        assert_eq!(lh.len(), 121);
+        assert_eq!(ws.len(), 159);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
