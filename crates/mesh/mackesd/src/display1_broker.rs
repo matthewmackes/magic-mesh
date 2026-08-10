@@ -12,9 +12,9 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{IoSlice, IoSliceMut, Read};
+use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, OwnedFd as StdOwnedFd};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use mackes_mesh_types::workloads::WorkloadAttachmentLease;
 use rustix::net::{
-    recvmsg, send, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
-    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+    accept_with, bind_unix, connect_unix, listen, recvmsg, send, sendmsg, socket_with,
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
 };
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::OwnedFd as ZvariantOwnedFd;
@@ -46,7 +47,61 @@ pub const DISPLAY1_SOCKET_ROOT: &str = "/run/mde/display1";
 /// Version for the bounded shell-to-daemon attachment handshake.
 pub const DISPLAY1_HANDSHAKE_SCHEMA_VERSION: u16 = 1;
 const MAX_DISPLAY1_HANDSHAKE_BYTES: usize = 4 * 1024;
+const MAX_DISPLAY1_ENVELOPE_BYTES: usize = 16 * 1024;
 const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
+// Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 preserves unknown receive
+// flags but does not expose a named constant for this result-only flag.
+const DISPLAY1_MSG_CTRUNC: u32 = 0x08;
+
+fn require_seqpacket(stream: &UnixStream) -> Result<(), Display1Error> {
+    let socket_type = rustix::net::sockopt::get_socket_type(stream)
+        .map_err(|error| Display1Error::Attachment(format!("SO_TYPE: {error}")))?;
+    if socket_type != SocketType::SEQPACKET {
+        return Err(Display1Error::Attachment(
+            "Display1 relay requires Unix SOCK_SEQPACKET".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn seqpacket_connect(path: &Path) -> Result<UnixStream, std::io::Error> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let address = SocketAddrUnix::new(path)?;
+    connect_unix(&socket, &address)?;
+    Ok(socket.into())
+}
+
+fn seqpacket_listener(path: &Path) -> Result<UnixStream, std::io::Error> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )?;
+    let address = SocketAddrUnix::new(path)?;
+    bind_unix(&socket, &address)?;
+    listen(&socket, 8)?;
+    Ok(socket.into())
+}
+
+fn reject_truncated_packet(flags: RecvFlags, context: &str) -> Result<(), Display1Error> {
+    if flags.contains(RecvFlags::TRUNC) {
+        return Err(Display1Error::Attachment(format!(
+            "truncated Display1 {context} packet"
+        )));
+    }
+    if flags.bits() & DISPLAY1_MSG_CTRUNC != 0 {
+        return Err(Display1Error::Attachment(format!(
+            "truncated Display1 {context} ancillary data"
+        )));
+    }
+    Ok(())
+}
 
 /// Derive the broker endpoint from a validated attachment lease id. The path
 /// never crosses mde-bus; only the opaque lease remains in the projection.
@@ -357,6 +412,7 @@ impl Display1ScmRightsRelay {
         if presented_nonce.is_empty() || presented_nonce != expected_nonce {
             return Err(Display1Error::Attachment("one-use nonce rejected".into()));
         }
+        require_seqpacket(&stream)?;
         lease
             .validate(now_ms)
             .map_err(|error| Display1Error::Attachment(error.to_string()))?;
@@ -412,6 +468,11 @@ impl Display1ScmRightsRelay {
             y0_top: frame.y0_top,
         })
         .map_err(|error| Display1Error::Attachment(error.to_string()))?;
+        if envelope.is_empty() || envelope.len() > MAX_DISPLAY1_ENVELOPE_BYTES {
+            return Err(Display1Error::Attachment(
+                "Display1 frame envelope exceeds the bounded packet size".into(),
+            ));
+        }
         let fd = frame.dmabuf.as_fd();
         let fds = [fd];
         let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
@@ -470,6 +531,11 @@ impl Display1ScmRightsRelay {
             damage,
         })
         .map_err(|error| Display1Error::Attachment(error.to_string()))?;
+        if envelope.is_empty() || envelope.len() > MAX_DISPLAY1_ENVELOPE_BYTES {
+            return Err(Display1Error::Attachment(
+                "Display1 damage envelope exceeds the bounded packet size".into(),
+            ));
+        }
         let sent = send(&self.stream, &envelope, SendFlags::DONTWAIT)
             .map_err(|error| Display1Error::Attachment(format!("damage send: {error}")))?;
         if sent != envelope.len() {
@@ -491,18 +557,28 @@ impl Display1ScmRightsRelay {
             return Err(Display1Error::Attachment("peer credential mismatch".into()));
         }
         let mut ack = [0_u8; 1];
-        let mut stream = &self.stream;
-        match stream.read(&mut ack) {
-            Ok(0) => Ok(false),
-            Ok(1) if ack[0] == DISPLAY1_PRESENT_ACK => Ok(true),
-            Ok(1) => Err(Display1Error::Attachment(
+        let mut iov = [IoSliceMut::new(&mut ack)];
+        let mut control = [];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+        let received = match recvmsg(&self.stream, &mut iov, &mut ancillary, RecvFlags::DONTWAIT) {
+            Ok(received) => received,
+            Err(rustix::io::Errno::AGAIN) => return Ok(false),
+            Err(error) => {
+                return Err(Display1Error::Attachment(format!(
+                    "read Display1 presentation acknowledgement: {error}"
+                )))
+            }
+        };
+        reject_truncated_packet(received.flags, "presentation acknowledgement")?;
+        if received.bytes == 0 {
+            return Ok(false);
+        }
+        if received.bytes == 1 && ack[0] == DISPLAY1_PRESENT_ACK {
+            Ok(true)
+        } else {
+            Err(Display1Error::Attachment(
                 "invalid Display1 presentation acknowledgement".into(),
-            )),
-            Ok(_) => unreachable!("one-byte acknowledgement buffer"),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-            Err(error) => Err(Display1Error::Attachment(format!(
-                "read Display1 presentation acknowledgement: {error}"
-            ))),
+            ))
         }
     }
 }
@@ -659,10 +735,10 @@ impl Display1AttachmentServer {
                 Display1Error::Attachment(format!("create broker root: {error}"))
             })?;
         }
-        let listener = match UnixListener::bind(&socket_path) {
+        let listener = match seqpacket_listener(&socket_path) {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                match UnixStream::connect(&socket_path) {
+                match seqpacket_connect(&socket_path) {
                     Ok(_) => {
                         return Err(Display1Error::Attachment(
                             "Display1 broker socket is already active".into(),
@@ -674,12 +750,12 @@ impl Display1AttachmentServer {
                                 "remove stale broker socket: {error}"
                             ))
                         })?;
-                        UnixListener::bind(&socket_path).map_err(|error| {
+                        seqpacket_listener(&socket_path).map_err(|error| {
                             Display1Error::Attachment(format!("bind broker socket: {error}"))
                         })?
                     }
                     Err(probe) if probe.kind() == std::io::ErrorKind::NotFound => {
-                        UnixListener::bind(&socket_path).map_err(|error| {
+                        seqpacket_listener(&socket_path).map_err(|error| {
                             Display1Error::Attachment(format!("bind broker socket: {error}"))
                         })?
                     }
@@ -696,9 +772,6 @@ impl Display1AttachmentServer {
                 )));
             }
         };
-        listener.set_nonblocking(true).map_err(|error| {
-            Display1Error::Attachment(format!("configure broker socket: {error}"))
-        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -770,7 +843,7 @@ impl Drop for Display1AttachmentServer {
 }
 
 fn serve_attachment_socket(
-    listener: UnixListener,
+    listener: UnixStream,
     lease: WorkloadAttachmentLease,
     sink: Arc<Display1AttachmentSink>,
     shutdown: Arc<AtomicBool>,
@@ -778,8 +851,10 @@ fn serve_attachment_socket(
 ) {
     let broker = Display1ScmRightsBroker::new();
     while !shutdown.load(Ordering::Acquire) && display1_now_ms() < lease.expires_at_ms {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
+        match accept_with(&listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+            Ok(stream) => {
+                let mut stream: UnixStream = stream.into();
+                let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let hello = match read_display1_hello(&mut stream, &lease) {
                     Ok(hello) => hello,
@@ -803,7 +878,7 @@ fn serve_attachment_socket(
                     Err(_) => continue,
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if error == rustix::io::Errno::AGAIN => {
                 thread::sleep(Duration::from_millis(20));
             }
             Err(_) => break,
@@ -820,21 +895,25 @@ fn read_display1_hello(
     stream: &mut UnixStream,
     lease: &WorkloadAttachmentLease,
 ) -> Result<Display1AttachHello, Display1Error> {
-    let mut length = [0_u8; 4];
-    stream.read_exact(&mut length).map_err(|error| {
-        Display1Error::Attachment(format!("Display1 handshake length: {error}"))
-    })?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > MAX_DISPLAY1_HANDSHAKE_BYTES {
+    require_seqpacket(stream)?;
+    let mut body = [0_u8; MAX_DISPLAY1_HANDSHAKE_BYTES];
+    let mut iov = [IoSliceMut::new(&mut body)];
+    let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+    let received = recvmsg(stream, &mut iov, &mut ancillary, RecvFlags::empty())
+        .map_err(|error| Display1Error::Attachment(format!("Display1 handshake: {error}")))?;
+    reject_truncated_packet(received.flags, "handshake")?;
+    if received.bytes == 0 {
         return Err(Display1Error::Attachment(
-            "Display1 handshake is outside the bounded size".into(),
+            "Display1 handshake is an empty packet".into(),
         ));
     }
-    let mut body = vec![0_u8; length];
-    stream
-        .read_exact(&mut body)
-        .map_err(|error| Display1Error::Attachment(format!("Display1 handshake body: {error}")))?;
-    let hello = serde_json::from_slice::<Display1AttachHello>(&body)
+    if ancillary.drain().next().is_some() {
+        return Err(Display1Error::Attachment(
+            "Display1 handshake must not carry ancillary data".into(),
+        ));
+    }
+    let hello = serde_json::from_slice::<Display1AttachHello>(&body[..received.bytes])
         .map_err(|error| Display1Error::Attachment(format!("Display1 handshake JSON: {error}")))?;
     hello.validate(lease)?;
     Ok(hello)
@@ -856,6 +935,7 @@ pub fn receive_display1_frame(
     lease: &WorkloadAttachmentLease,
     now_ms: u64,
 ) -> Result<Display1DmaBufFrame, Display1Error> {
+    require_seqpacket(stream)?;
     if peer_credentials(stream).map_err(|error| Display1Error::Attachment(error.to_string()))?
         != expected_peer
     {
@@ -864,12 +944,18 @@ pub fn receive_display1_frame(
     lease
         .validate(now_ms)
         .map_err(|error| Display1Error::Attachment(error.to_string()))?;
-    let mut bytes = [0_u8; 16 * 1024];
+    let mut bytes = [0_u8; MAX_DISPLAY1_ENVELOPE_BYTES];
     let mut iov = [IoSliceMut::new(&mut bytes)];
-    let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+    let mut control = [0_u8; rustix::cmsg_space!(ScmRights(2))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut control);
     let received = recvmsg(stream, &mut iov, &mut ancillary, RecvFlags::empty())
         .map_err(|error| Display1Error::Attachment(format!("SCM_RIGHTS receive: {error}")))?;
+    reject_truncated_packet(received.flags, "frame")?;
+    if received.bytes == 0 {
+        return Err(Display1Error::Attachment(
+            "empty Display1 frame packet".into(),
+        ));
+    }
     let envelope: Display1FrameEnvelope = serde_json::from_slice(&bytes[..received.bytes])
         .map_err(|error| Display1Error::Attachment(format!("frame envelope: {error}")))?;
     if envelope.kind != "frame"
@@ -891,8 +977,13 @@ pub fn receive_display1_frame(
     let mut descriptor = None;
     for message in ancillary.drain() {
         if let RecvAncillaryMessage::ScmRights(mut fds) = message {
-            descriptor = fds.next();
-            break;
+            let first = fds.next();
+            if descriptor.is_some() || fds.next().is_some() {
+                return Err(Display1Error::Attachment(
+                    "Display1 frame carried multiple descriptors".into(),
+                ));
+            }
+            descriptor = first;
         }
     }
     let dmabuf =
@@ -1088,11 +1179,33 @@ mod tests {
     use mackes_mesh_types::workloads::{
         WorkloadAttachmentProtocol, WorkloadId, WORKLOAD_CONTRACT_SCHEMA_VERSION,
     };
-    use std::io::Write;
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    fn seqpacket_pair() -> (UnixStream, UnixStream) {
+        let (left, right) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("seqpacket socketpair");
+        (left.into(), right.into())
+    }
+
+    fn receive_damage_packet(receiver: &UnixStream) -> Display1DamageEnvelope {
+        let mut bytes = [0_u8; 1024];
+        let mut iov = [IoSliceMut::new(&mut bytes)];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+        let packet = recvmsg(receiver, &mut iov, &mut ancillary, RecvFlags::empty())
+            .expect("receive damage");
+        reject_truncated_packet(packet.flags, "test damage").expect("complete packet");
+        assert!(ancillary.drain().next().is_none());
+        serde_json::from_slice(&bytes[..packet.bytes]).expect("damage envelope")
+    }
 
     #[derive(Default)]
     struct Sink {
@@ -1197,7 +1310,7 @@ mod tests {
 
     #[test]
     fn scm_rights_relay_binds_frame_to_one_use_lease_and_peer() {
-        let (sender, mut receiver) = UnixStream::pair().expect("socketpair");
+        let (sender, receiver) = seqpacket_pair();
         let sender_peer = peer_credentials(&sender).expect("sender peer");
         let receiver_peer = peer_credentials(&receiver).expect("receiver peer");
         let workload_id = WorkloadId::new("browser-seat15").expect("workload id");
@@ -1229,33 +1342,43 @@ mod tests {
             y0_top: true,
         };
         relay.send_frame(&frame, 1_001).expect("send frame");
-        let received =
-            receive_display1_frame(&receiver, receiver_peer, &lease, 1_002).expect("receive frame");
-        assert_eq!(received.width, 64);
-        assert_eq!(received.height, 32);
-        assert!(received.dmabuf.as_fd().as_raw_fd() >= 0);
-        let damage = Display1Damage {
+        let first_damage = Display1Damage {
             x: 4,
             y: 5,
             width: 16,
             height: 8,
         };
-        relay.send_damage(damage, 1_003).expect("send damage");
-        let mut damage_bytes = [0_u8; 1024];
-        let damage_len = receiver.read(&mut damage_bytes).expect("receive damage");
-        let envelope: Display1DamageEnvelope =
-            serde_json::from_slice(&damage_bytes[..damage_len]).expect("damage envelope");
-        assert_eq!(envelope.kind, "damage");
-        assert_eq!(envelope.lease_id, "lease-display1");
-        assert_eq!(envelope.generation, 7);
-        assert_eq!(envelope.damage, damage);
+        let second_damage = Display1Damage {
+            x: 20,
+            y: 10,
+            width: 12,
+            height: 6,
+        };
+        relay
+            .send_damage(first_damage, 1_002)
+            .expect("send first damage");
+        relay
+            .send_damage(second_damage, 1_003)
+            .expect("send second damage");
+        let received =
+            receive_display1_frame(&receiver, receiver_peer, &lease, 1_004).expect("receive frame");
+        assert_eq!(received.width, 64);
+        assert_eq!(received.height, 32);
+        assert!(received.dmabuf.as_fd().as_raw_fd() >= 0);
+        let first_envelope = receive_damage_packet(&receiver);
+        let second_envelope = receive_damage_packet(&receiver);
+        assert_eq!(first_envelope.kind, "damage");
+        assert_eq!(first_envelope.lease_id, "lease-display1");
+        assert_eq!(first_envelope.generation, 7);
+        assert_eq!(first_envelope.damage, first_damage);
+        assert_eq!(second_envelope.damage, second_damage);
         assert!(matches!(
-            relay.send_damage(damage, 2_001),
+            relay.send_damage(first_damage, 2_001),
             Err(Display1Error::Attachment(message)) if message.contains("lease")
         ));
         assert!(matches!(
             Display1ScmRightsRelay::attach(
-                UnixStream::pair().expect("second socketpair").0,
+                seqpacket_pair().0,
                 sender_peer,
                 lease,
                 "nonce-1",
@@ -1278,7 +1401,7 @@ mod tests {
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
             expires_at_ms: 2_000,
         };
-        let (first, _) = UnixStream::pair().expect("socketpair");
+        let (first, _) = seqpacket_pair();
         let expected_peer = peer_credentials(&first).expect("peer");
         let relay = broker
             .attach(
@@ -1291,7 +1414,7 @@ mod tests {
             )
             .expect("first attach");
         drop(relay);
-        let (second, _) = UnixStream::pair().expect("socketpair");
+        let (second, _) = seqpacket_pair();
         let error = broker
             .attach(
                 second,
@@ -1331,7 +1454,7 @@ mod tests {
             Display1Error::Attachment(message) if message.contains("already active")
         ));
         assert!(original.socket_path().exists());
-        UnixStream::connect(original.socket_path()).expect("original broker remains reachable");
+        seqpacket_connect(original.socket_path()).expect("original broker remains reachable");
     }
 
     #[test]
@@ -1349,12 +1472,12 @@ mod tests {
         let socket_path =
             display1_socket_path_at(temp.path(), &lease.lease_id).expect("bounded socket path");
         fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("broker root");
-        let stale = UnixListener::bind(&socket_path).expect("stale listener");
+        let stale = seqpacket_listener(&socket_path).expect("stale listener");
         drop(stale);
 
         let replacement = Display1AttachmentServer::start_at(temp.path(), lease)
             .expect("replace connection-refused stale socket");
-        UnixStream::connect(replacement.socket_path()).expect("replacement broker is reachable");
+        seqpacket_connect(replacement.socket_path()).expect("replacement broker is reachable");
     }
 
     #[test]
@@ -1371,13 +1494,12 @@ mod tests {
         };
         let server =
             Display1AttachmentServer::start_at(temp.path(), lease.clone()).expect("start broker");
-        let mut stream = UnixStream::connect(server.socket_path()).expect("connect broker");
+        let stream = seqpacket_connect(server.socket_path()).expect("connect broker");
         let hello = serde_json::to_vec(&Display1AttachHello::from_lease(&lease)).expect("hello");
-        let length = u32::try_from(hello.len()).expect("bounded hello");
-        stream
-            .write_all(&length.to_be_bytes())
-            .expect("hello length");
-        stream.write_all(&hello).expect("hello body");
+        assert_eq!(
+            send(&stream, &hello, SendFlags::empty()).expect("hello packet"),
+            hello.len()
+        );
 
         let sink = server.frame_sink();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1407,9 +1529,11 @@ mod tests {
             !server.first_frame_seen(),
             "socket delivery must not complete Workload readiness"
         );
-        stream
-            .write_all(&[DISPLAY1_PRESENT_ACK])
-            .expect("presentation acknowledgement");
+        assert_eq!(
+            send(&stream, &[DISPLAY1_PRESENT_ACK], SendFlags::empty())
+                .expect("presentation acknowledgement"),
+            1
+        );
         while !server.first_frame_seen() {
             if Instant::now() >= deadline {
                 panic!("broker did not observe the KMS presentation acknowledgement");
@@ -1433,13 +1557,12 @@ mod tests {
         let server =
             Display1AttachmentServer::start_at(temp.path(), lease.clone()).expect("start broker");
         let socket_path = server.socket_path().to_path_buf();
-        let mut stream = UnixStream::connect(&socket_path).expect("connect broker");
+        let stream = seqpacket_connect(&socket_path).expect("connect broker");
         let hello = serde_json::to_vec(&Display1AttachHello::from_lease(&lease)).expect("hello");
-        let length = u32::try_from(hello.len()).expect("bounded hello");
-        stream
-            .write_all(&length.to_be_bytes())
-            .expect("hello length");
-        stream.write_all(&hello).expect("hello body");
+        assert_eq!(
+            send(&stream, &hello, SendFlags::empty()).expect("hello packet"),
+            hello.len()
+        );
 
         let sink = server.frame_sink();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1463,9 +1586,11 @@ mod tests {
         }
         let peer = peer_credentials(&stream).expect("peer credentials");
         receive_display1_frame(&stream, peer, &lease, display1_now_ms()).expect("first frame");
-        stream
-            .write_all(&[DISPLAY1_PRESENT_ACK])
-            .expect("presentation acknowledgement");
+        assert_eq!(
+            send(&stream, &[DISPLAY1_PRESENT_ACK], SendFlags::empty())
+                .expect("presentation acknowledgement"),
+            1
+        );
         while !server.first_frame_seen() {
             if Instant::now() >= deadline {
                 panic!("broker did not observe readiness before expiry");

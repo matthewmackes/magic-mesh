@@ -5,7 +5,7 @@
 //! then hands the descriptor directly to mde-egui's PRIME/KMS importer. No
 //! frame bytes enter the Bus, JSON, or a CPU staging buffer.
 
-use std::io::{IoSliceMut, Write};
+use std::io::IoSliceMut;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -21,17 +21,63 @@ use mackes_mesh_types::workloads::{
 };
 use mde_bus::persist::Persist;
 use mde_egui::drm::{self, Display1FramePoll, Display1FrameSource, ExternalDmaBufFrame};
-use rustix::net::{recvmsg, send, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendFlags};
+use rustix::net::{
+    connect_unix, recv, recvmsg, send, socket_with, AddressFamily, RecvAncillaryBuffer,
+    RecvAncillaryMessage, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_ENVELOPE_BYTES: usize = 16 * 1024;
 const DISPLAY1_HANDSHAKE_SCHEMA_VERSION: u16 = 1;
 const MAX_HANDSHAKE_BYTES: usize = 4 * 1024;
 const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
+// Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 retains this result flag but
+// does not publish a named RecvFlags constant for it.
+const DISPLAY1_MSG_CTRUNC: u32 = 0x08;
 /// Must match mackesd's node-local per-lease broker root. The socket path is
 /// derived from the validated lease so a shell does not need an out-of-band
 /// environment variable for the endpoint.
 pub(crate) const DISPLAY1_SOCKET_ROOT: &str = "/run/mde/display1";
+
+fn require_seqpacket(stream: &UnixStream) -> Result<(), Display1ClientError> {
+    let socket_type = rustix::net::sockopt::get_socket_type(stream)
+        .map_err(|error| Display1ClientError::Peer(format!("SO_TYPE: {error}")))?;
+    if socket_type != SocketType::SEQPACKET {
+        return Err(Display1ClientError::Protocol(
+            "Display1 relay requires Unix SOCK_SEQPACKET".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn connect_seqpacket(path: &Path) -> Result<UnixStream, Display1ClientError> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|error| Display1ClientError::Peer(format!("create broker socket: {error}")))?;
+    let address = SocketAddrUnix::new(path)
+        .map_err(|error| Display1ClientError::Peer(format!("broker socket path: {error}")))?;
+    connect_unix(&socket, &address)
+        .map_err(|error| Display1ClientError::Peer(format!("connect broker: {error}")))?;
+    Ok(socket.into())
+}
+
+fn reject_truncated_packet(flags: RecvFlags, context: &str) -> Result<(), Display1ClientError> {
+    if flags.contains(RecvFlags::TRUNC) {
+        return Err(Display1ClientError::Protocol(format!(
+            "truncated Display1 {context} packet"
+        )));
+    }
+    if flags.bits() & DISPLAY1_MSG_CTRUNC != 0 {
+        return Err(Display1ClientError::Protocol(format!(
+            "truncated Display1 {context} ancillary data"
+        )));
+    }
+    Ok(())
+}
 
 /// Derive the broker endpoint for one validated attachment lease.
 #[must_use]
@@ -169,8 +215,7 @@ impl Display1Client {
         lease
             .validate(now_ms)
             .map_err(|error| Display1ClientError::Lease(error.to_string()))?;
-        let stream = UnixStream::connect(path)
-            .map_err(|error| Display1ClientError::Peer(format!("connect broker: {error}")))?;
+        let stream = connect_seqpacket(path)?;
         let peer = peer_credentials(&stream)?;
         if peer.uid != 0 || peer.gid != 0 {
             return Err(Display1ClientError::Peer(
@@ -188,6 +233,7 @@ impl Display1Client {
         lease: WorkloadAttachmentLease,
         now_ms: u64,
     ) -> Result<Self, Display1ClientError> {
+        require_seqpacket(&stream)?;
         lease
             .validate(now_ms)
             .map_err(|error| Display1ClientError::Lease(error.to_string()))?;
@@ -248,7 +294,7 @@ impl Display1Client {
             .map_err(|error| Display1ClientError::Lease(error.to_string()))?;
         let mut bytes = [0_u8; MAX_ENVELOPE_BYTES];
         let mut iov = [IoSliceMut::new(&mut bytes)];
-        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(2))];
         let mut ancillary = RecvAncillaryBuffer::new(&mut control);
         let received = match recvmsg(&self.stream, &mut iov, &mut ancillary, flags) {
             Ok(received) => received,
@@ -263,9 +309,7 @@ impl Display1Client {
                 )))
             }
         };
-        if received.bytes == 0 {
-            return Ok(ReceivedFrame::Disconnected);
-        }
+        reject_truncated_packet(received.flags, "relay")?;
         let mut descriptor = None;
         for message in ancillary.drain() {
             if let RecvAncillaryMessage::ScmRights(mut fds) = message {
@@ -277,6 +321,30 @@ impl Display1Client {
                 }
                 descriptor = first;
             }
+        }
+        if received.bytes == 0 {
+            if descriptor.is_some() {
+                return Err(Display1ClientError::Protocol(
+                    "empty Display1 packet carried a descriptor".into(),
+                ));
+            }
+            let mut next = [0_u8; 1];
+            return match recv(
+                &self.stream,
+                &mut next,
+                RecvFlags::PEEK | RecvFlags::DONTWAIT,
+            ) {
+                Err(rustix::io::Errno::AGAIN) => Err(Display1ClientError::Protocol(
+                    "empty Display1 relay packet".into(),
+                )),
+                Ok(0) => Ok(ReceivedFrame::Disconnected),
+                Ok(_) => Err(Display1ClientError::Protocol(
+                    "empty Display1 relay packet preceded another packet".into(),
+                )),
+                Err(error) => Err(Display1ClientError::Protocol(format!(
+                    "classify empty Display1 packet: {error}"
+                ))),
+            };
         }
         let envelope: RelayEnvelope = serde_json::from_slice(&bytes[..received.bytes])
             .map_err(|error| Display1ClientError::Protocol(format!("relay envelope: {error}")))?;
@@ -619,6 +687,7 @@ fn send_handshake(
     stream: &UnixStream,
     lease: &WorkloadAttachmentLease,
 ) -> Result<(), Display1ClientError> {
+    require_seqpacket(stream)?;
     let body = serde_json::to_vec(&Display1AttachHello {
         schema_version: DISPLAY1_HANDSHAKE_SCHEMA_VERSION,
         lease_id: lease.lease_id.as_str(),
@@ -634,13 +703,14 @@ fn send_handshake(
             "Display1 handshake exceeds the bounded size".into(),
         ));
     }
-    let length = u32::try_from(body.len())
-        .map_err(|_| Display1ClientError::Protocol("Display1 handshake is too large".into()))?;
-    let mut bytes = length.to_be_bytes().to_vec();
-    bytes.extend_from_slice(&body);
-    (&*stream)
-        .write_all(&bytes)
-        .map_err(|error| Display1ClientError::Peer(format!("Display1 handshake send: {error}")))
+    let sent = send(stream, &body, SendFlags::empty())
+        .map_err(|error| Display1ClientError::Peer(format!("Display1 handshake send: {error}")))?;
+    if sent != body.len() {
+        return Err(Display1ClientError::Protocol(
+            "short Display1 handshake packet".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Display1FrameSource for Display1Client {
@@ -671,6 +741,17 @@ mod tests {
     use std::io::{IoSlice, Read};
     use std::os::fd::AsFd;
 
+    fn seqpacket_pair() -> (UnixStream, UnixStream) {
+        let (left, right) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("seqpacket socketpair");
+        (left.into(), right.into())
+    }
+
     #[test]
     fn lease_id_derives_the_default_node_local_socket() {
         assert_eq!(
@@ -684,7 +765,7 @@ mod tests {
 
     #[test]
     fn lease_and_peer_are_required_before_frame_import() {
-        let (left, right) = UnixStream::pair().expect("socketpair");
+        let (left, right) = seqpacket_pair();
         let peer = peer_credentials(&left).expect("peer");
         let lease = WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -705,7 +786,7 @@ mod tests {
 
     #[test]
     fn nonblocking_poll_reports_idle_then_disconnects_without_waiting() {
-        let (left, right) = UnixStream::pair().expect("socketpair");
+        let (left, right) = seqpacket_pair();
         let peer = peer_credentials(&left).expect("peer");
         let lease = WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -729,8 +810,221 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_packet_is_rejected_while_orderly_disconnect_is_distinct() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-empty-packet".into(),
+            nonce: "nonce-empty-packet".into(),
+            workload_id: WorkloadId::new("browser-empty-packet").expect("workload id"),
+            generation: 1,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: 20_000,
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, 1_000).expect("attach");
+        assert_eq!(
+            send(&daemon, &[], SendFlags::empty()).expect("send empty packet"),
+            0
+        );
+        assert!(matches!(
+            client.try_receive(1_001),
+            Err(Display1ClientError::Protocol(message)) if message.contains("empty")
+        ));
+        drop(daemon);
+        assert!(matches!(
+            client.try_receive(1_002),
+            Ok(Display1FramePoll::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn rapid_frame_and_damage_packets_preserve_boundaries_and_descriptor_binding() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-packet-boundaries".into(),
+            nonce: "nonce-packet-boundaries".into(),
+            workload_id: WorkloadId::new("browser-packet-boundaries").expect("workload id"),
+            generation: 9,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: 20_000,
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, 1_000).expect("attach");
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "kind": "frame",
+            "lease_id": "lease-packet-boundaries",
+            "workload_id": "browser-packet-boundaries",
+            "generation": 9,
+            "width": 64,
+            "height": 32,
+            "stride": 256,
+            "fourcc": 0x3432_5258_u32,
+            "modifier": 0,
+            "y0_top": true
+        }))
+        .expect("frame envelope");
+        let dmabuf = std::fs::File::open("/dev/null").expect("DMA-BUF fixture");
+        let descriptors = [dmabuf.as_fd()];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut control);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+        assert_eq!(
+            sendmsg(
+                &daemon,
+                &[IoSlice::new(&frame)],
+                &mut ancillary,
+                SendFlags::empty(),
+            )
+            .expect("send frame packet"),
+            frame.len()
+        );
+        for (x, y) in [(1_u32, 2_u32), (3, 4)] {
+            let damage = serde_json::to_vec(&serde_json::json!({
+                "kind": "damage",
+                "lease_id": "lease-packet-boundaries",
+                "workload_id": "browser-packet-boundaries",
+                "generation": 9,
+                "damage": {"x": x, "y": y, "width": 8, "height": 6}
+            }))
+            .expect("damage envelope");
+            assert_eq!(
+                send(&daemon, &damage, SendFlags::empty()).expect("send damage packet"),
+                damage.len()
+            );
+        }
+
+        assert!(matches!(
+            client.try_receive(1_001),
+            Ok(Display1FramePoll::Frame { .. })
+        ));
+        assert!(matches!(
+            client.try_receive(1_002),
+            Ok(Display1FramePoll::Damage { x: 1, y: 2, .. })
+        ));
+        assert!(matches!(
+            client.try_receive(1_003),
+            Ok(Display1FramePoll::Damage { x: 3, y: 4, .. })
+        ));
+        assert!(matches!(
+            client.try_receive(1_004),
+            Ok(Display1FramePoll::Idle)
+        ));
+    }
+
+    #[test]
+    fn descriptor_cannot_cross_packet_boundaries_or_attach_to_damage() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-descriptor-boundary".into(),
+            nonce: "nonce-descriptor-boundary".into(),
+            workload_id: WorkloadId::new("browser-descriptor-boundary").expect("workload id"),
+            generation: 5,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: 20_000,
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, 1_000).expect("attach");
+        let frame_without_fd = serde_json::to_vec(&serde_json::json!({
+            "kind": "frame",
+            "lease_id": "lease-descriptor-boundary",
+            "workload_id": "browser-descriptor-boundary",
+            "generation": 5,
+            "width": 64,
+            "height": 32,
+            "stride": 256,
+            "fourcc": 0x3432_5258_u32,
+            "modifier": 0,
+            "y0_top": true
+        }))
+        .expect("frame envelope");
+        assert_eq!(
+            send(&daemon, &frame_without_fd, SendFlags::empty()).expect("send frame without fd"),
+            frame_without_fd.len()
+        );
+        let damage_with_fd = serde_json::to_vec(&serde_json::json!({
+            "kind": "damage",
+            "lease_id": "lease-descriptor-boundary",
+            "workload_id": "browser-descriptor-boundary",
+            "generation": 5,
+            "damage": {"x": 1, "y": 2, "width": 8, "height": 6}
+        }))
+        .expect("damage envelope");
+        let descriptor = std::fs::File::open("/dev/null").expect("descriptor fixture");
+        let descriptors = [descriptor.as_fd()];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut control);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+        assert_eq!(
+            sendmsg(
+                &daemon,
+                &[IoSlice::new(&damage_with_fd)],
+                &mut ancillary,
+                SendFlags::empty(),
+            )
+            .expect("send damage with fd"),
+            damage_with_fd.len()
+        );
+
+        assert!(matches!(
+            client.try_receive(1_001),
+            Err(Display1ClientError::Protocol(message)) if message.contains("missing DMA-BUF")
+        ));
+        assert!(matches!(
+            client.try_receive(1_002),
+            Err(Display1ClientError::Protocol(message)) if message.contains("must not carry")
+        ));
+
+        let descriptors = [descriptor.as_fd(); 16];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(16))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut control);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+        assert_eq!(
+            sendmsg(
+                &daemon,
+                &[IoSlice::new(&damage_with_fd)],
+                &mut ancillary,
+                SendFlags::empty(),
+            )
+            .expect("send ancillary-overflow packet"),
+            damage_with_fd.len()
+        );
+        assert!(matches!(
+            client.try_receive(1_003),
+            Err(Display1ClientError::Protocol(message)) if message.contains("ancillary")
+        ));
+    }
+
+    #[test]
+    fn oversized_packet_is_rejected_instead_of_partially_parsed() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-truncated-packet".into(),
+            nonce: "nonce-truncated-packet".into(),
+            workload_id: WorkloadId::new("browser-truncated-packet").expect("workload id"),
+            generation: 2,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: 20_000,
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, 1_000).expect("attach");
+        let oversized = vec![b'X'; MAX_ENVELOPE_BYTES + 1];
+        assert_eq!(
+            send(&daemon, &oversized, SendFlags::empty()).expect("send oversized packet"),
+            oversized.len()
+        );
+        assert!(matches!(
+            client.try_receive(1_001),
+            Err(Display1ClientError::Protocol(message)) if message.contains("truncated")
+        ));
+    }
+
+    #[test]
     fn presentation_acknowledgement_is_emitted_once_after_kms_success() {
-        let (mut daemon, shell) = UnixStream::pair().expect("socketpair");
+        let (mut daemon, shell) = seqpacket_pair();
         let peer = peer_credentials(&daemon).expect("peer");
         let lease = WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -794,7 +1088,10 @@ mod tests {
             "damage": {"x": 4, "y": 5, "width": 16, "height": 8}
         }))
         .expect("damage envelope");
-        daemon.write_all(&damage).expect("send damage");
+        assert_eq!(
+            send(&daemon, &damage, SendFlags::empty()).expect("send damage"),
+            damage.len()
+        );
         assert!(matches!(
             client.try_receive(1_002),
             Ok(Display1FramePoll::Damage {
@@ -812,9 +1109,10 @@ mod tests {
             "damage": {"x": 60, "y": 0, "width": 8, "height": 1}
         }))
         .expect("hostile damage envelope");
-        daemon
-            .write_all(&hostile_damage)
-            .expect("send hostile damage");
+        assert_eq!(
+            send(&daemon, &hostile_damage, SendFlags::empty()).expect("send hostile damage"),
+            hostile_damage.len()
+        );
         assert!(matches!(
             client.try_receive(1_003),
             Err(Display1ClientError::Protocol(message))
