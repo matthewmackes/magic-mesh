@@ -751,6 +751,8 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **Guest HTML safety checkpoint (2026-08-10):** active guest CF_HTML is refused before host publication; seat 90 passed the exact live-connect regression:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-guest-html-safety-r160.md`.
 - **RDP bitfield admission (2026-08-10):** malformed 40-byte `BI_BITFIELDS` headers are refused before image materialization; `.50` passed live-connect:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-bitfield-admission-r157.md`.
 - **Rich-session replay-capacity checkpoint (2026-08-10):** expired signed collaboration sessions release bounded ledger capacity before fresh intake while newer
@@ -844,7 +846,6 @@ behavioral evidence is not completion.
 - Origin or merged source IDs: 2026-07-26 operator platform cut; archived clipboard workstreams.
 
 ### WL-FUNC-017 - Complete Maps, navigation, and MG90 radio health
-
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
@@ -865,6 +866,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
+- **Offline timeline (r160):** impossible access order fails closed; BigBoy passed `docs/platform/evidence/WL-FUNC-017-2026-08-10-offline-timeline-r160.md`.
 - **Future cache timestamps (2026-08-10):** BigBoy passed removal of future cache entries: `docs/platform/evidence/WL-FUNC-017-2026-08-10-future-cache-timestamps-r157.md`.
 - **Offline basemap admission (2026-08-10):** ambiguous or unsafe region/MBTiles candidates fail closed; `.90` passed 6/6; renderer/routing/live proof remain:
   `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
@@ -2360,6 +2362,8 @@ behavioral evidence is not completion.
   oversized availability TTLs. Expected-state publishers, transition
   evaluation, history/detail, recovery/export, and three-seat proof remain.
 - Remaining work:
+- **Health expiry projection checkpoint (2026-08-10):** expired checkpoint state and stale invalid projections fail closed without touching symlinks; BigBoy passed:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-health-expiry-projection-r160.md`.
 - **Availability duplicate-precedence checkpoint (2026-08-10):** duplicate evidence is classified before at-capacity overflow in forward and reversed order, while a
   distinct extra node remains `CapacityExceeded`; machine 194 passed the exact regression: `docs/platform/evidence/WL-UX-013-2026-08-10-availability-duplicate-precedence-r13.md`.
 - **Expected-state boundary checkpoint (2026-08-06):** the health contract
