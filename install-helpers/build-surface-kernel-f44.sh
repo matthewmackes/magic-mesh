@@ -82,7 +82,41 @@ FAKE
     fi
     [[ "$output" == *"input bundle lock does not match"* && ! -e "$work/fake-command-invoked" ]] \
         || { echo "self-test did not reject inherited PATH: $output" >&2; exit 1; }
-    echo "Surface kernel builder self-test passed (8 hostile fixtures rejected)"
+    python3 - "$script" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+phase_one_marker = "# Phase 1:" + " networked dependency preparation with no source or credential mounts."
+phase_two_marker = "# Phase 2:" + " locked source build with credentials and the network disabled."
+end_marker = "mapfile -t " + "rpms < <(find"
+if any(source.count(marker) != 1 for marker in (phase_one_marker, phase_two_marker, end_marker)):
+    raise SystemExit("self-test could not locate the unique container phase boundaries")
+phase_one_start = source.index(phase_one_marker)
+phase_two_start = source.index(phase_two_marker, phase_one_start)
+phase_end = source.index(end_marker, phase_two_start)
+phase_one = source[phase_one_start:phase_two_start]
+phase_two = source[phase_two_start:phase_end]
+for forbidden in ("$PRIVATE_KEY", "$CERTIFICATE", "$scratch:/work", "/credentials/", "--volume"):
+    if forbidden in phase_one:
+        raise SystemExit(f"networked dependency phase exposes forbidden material: {forbidden}")
+if 'podman commit --pause=false "$deps_container" "$deps_image"' not in phase_one:
+    raise SystemExit("networked dependency phase does not commit its ephemeral image")
+header_end = phase_two.find('"$deps_image" bash -ceu')
+if header_end < 0:
+    raise SystemExit("offline build phase does not consume the ephemeral dependency image")
+header = phase_two[:header_end]
+required = (
+    "--network=none",
+    '"$scratch:/work"',
+    '"$PRIVATE_KEY:/credentials/MOK.key:ro"',
+    '"$CERTIFICATE:/credentials/MOK.crt:ro"',
+)
+if any(value not in header for value in required):
+    raise SystemExit("key-bearing build invocation is not offline with exact read-only mounts")
+print("Surface kernel container phase-boundary assertions passed")
+PY
+    echo "Surface kernel builder self-test passed (9 hostile/structural fixtures rejected)"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -260,8 +294,14 @@ fi
 
 scratch="$(mktemp -d /var/tmp/mcnf-surface-kernel.XXXXXX)"
 result_stage="$(mktemp -d "$output_parent/.surface-kernel-result.XXXXXX")"
+deps_container=""
+deps_image=""
+deps_container_owned=0
+deps_image_owned=0
 chmod 0700 "$scratch" "$result_stage"
 cleanup() {
+    if (( ${deps_container_owned:-0} )); then podman rm --force "$deps_container" >/dev/null 2>&1 || true; fi
+    if (( ${deps_image_owned:-0} )); then podman image rm --force "$deps_image" >/dev/null 2>&1 || true; fi
     if [[ -n "${scratch:-}" && -d "$scratch" ]]; then find "$scratch" -depth -delete; fi
     if [[ -n "${result_stage:-}" && -d "$result_stage" ]]; then find "$result_stage" -depth -delete; fi
 }
@@ -320,17 +360,42 @@ end = source.index(end_marker, start)
 path.write_text(source[:start] + new + "\n" + source[end:], encoding="utf-8")
 PY
 
+build_token="$(printf '%s-%s-%s' "$scratch" "$$" "$RANDOM" \
+    | sha256sum | awk '{print substr($1, 1, 24)}')"
+deps_container="mcnf-surface-deps-$build_token"
+deps_image="localhost/mcnf-surface-builddeps:$build_token"
+
+# Phase 1: networked dependency preparation with no source or credential mounts.
+podman container exists "$deps_container" \
+    && { echo "refusing colliding ephemeral dependency container name" >&2; exit 1; }
+podman image exists "$deps_image" \
+    && { echo "refusing colliding ephemeral dependency image name" >&2; exit 1; }
+podman create --name "$deps_container" --pull=never "$builder_image" bash -ceu '
+    dnf -y distro-sync
+    dnf -y install @rpm-development-tools git rpm-sign sbsigntools cpio
+    dnf -y builddep kernel
+' >/dev/null
+deps_container_owned=1
+podman start --attach "$deps_container"
+[[ "$(podman inspect --format '{{.State.ExitCode}}' "$deps_container")" == 0 ]] \
+    || { echo "Surface build-dependency preparation container failed" >&2; exit 1; }
+podman commit --pause=false "$deps_container" "$deps_image" >/dev/null
+deps_image_owned=1
+podman rm "$deps_container" >/dev/null
+deps_container=""
+deps_container_owned=0
+podman image exists "$deps_image" \
+    || { echo "ephemeral Surface build-dependency image was not committed" >&2; exit 1; }
+
+# Phase 2: locked source build with credentials and the network disabled.
 podman run --rm --pull=never \
+    --network=none \
     --security-opt label=disable \
     --env "LOCKED_ARK_COMMIT=$ark_commit" \
     --volume "$scratch:/work" \
     --volume "$PRIVATE_KEY:/credentials/MOK.key:ro" \
     --volume "$CERTIFICATE:/credentials/MOK.crt:ro" \
-    "$builder_image" bash -ceu '
-        dnf -y distro-sync
-        dnf -y install @rpm-development-tools git rpm-sign sbsigntools cpio
-        dnf -y builddep kernel
-
+    "$deps_image" bash -ceu '
         cd /work/kernel-ark
         git init --quiet
         git config user.name "MCNF Surface Builder"
@@ -433,6 +498,8 @@ manifest = {
         "dependency_resolution": "live Fedora 44 repositories at build time",
         "installed_rpm_inventory": "build-environment-rpm-nevra.txt",
         "source_fetch_policy": "locked archives only; audited upstream helper fetch disabled",
+        "dependency_phase_network": "enabled without source or credential mounts",
+        "key_bearing_build_phase_network": "disabled by podman --network=none",
     },
     "artifacts": artifacts,
 }
@@ -474,11 +541,14 @@ PY
     sha256sum "${files[@]}" >SHA256SUMS
 )
 chmod 0600 "$result_stage"/*
+podman image rm "$deps_image" >/dev/null
+deps_image=""
+deps_image_owned=0
+find "$scratch" -depth -delete
+scratch=""
 mv -T --no-clobber "$result_stage" "$OUTPUT"
 [[ ! -d "$result_stage" ]] \
     || { echo "refusing output created concurrently: $OUTPUT" >&2; exit 2; }
 result_stage=""
-find "$scratch" -depth -delete
-scratch=""
 trap - EXIT
 echo "Fedora 44 Surface kernel binary RPMs built; signing limits are explicit in $OUTPUT/signing-manifest.json"

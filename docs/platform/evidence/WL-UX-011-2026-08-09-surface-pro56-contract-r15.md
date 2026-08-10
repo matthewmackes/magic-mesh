@@ -386,13 +386,26 @@ farm slots:
   `172.20.0.50 / surface-integrate-shellcheck-r23`: Bash syntax, ShellCheck,
   JSON parsing, the ten-hostile-fixture source-lock self-test, and lock
   validation passed for the retained producer files.
+- `.90` kernel readiness validation: Bash syntax and all 9 hostile/structural
+  fixtures passed after splitting the producer into a networked dependency-only
+  phase with no mounts and a key-bearing `--network=none` phase. Local
+  ShellCheck, syntax, structural fixtures, and diff checks also passed.
+- `.90` MOK activation contract: the packaged fixed-path activator/drop-in
+  passed its hostile PATH/PYTHONPATH, encrypted-pair, packaging, and explicit
+  no-direct-reboot assertions; the focused daemon reboot-handoff refusal test
+  passed 1/1.
 
-A proposed secret-bearing kernel producer was rejected during integration and
-removed before commit. Independent review found that it mounted the Secure Boot
-private key into a networked container executing upstream build code and then
-embedded that key in a transient SRPM. It also did not verify the complete
-kernel/module signer set. This checkpoint therefore retains kernel production
-as missing rather than recording a misleading readiness pass.
+The first secret-bearing kernel producer was correctly rejected because it
+mounted the Secure Boot private key into a networked upstream build container.
+The retained redesign prepares dependencies in a credential-free container,
+commits a uniquely named ephemeral image, and runs all locked source/upstream
+code with the key read-only and `--network=none`. Collision-safe cleanup removes
+the container, image, scratch tree, and transient SRPM (which upstream declares
+with `MOK.key` as a source) before atomic output publication. Binary RPMs are
+scanned for private-key material. No kernel build or readiness green is claimed:
+the matching private key is absent, BigBoy has about 19.1 GiB scratch free
+versus the 45 GiB minimum, module-signer verification remains downstream, and
+final RPM release signing is still required.
 
 `git diff --check` passed after the exact formatter wave. These are checkpoint
 gates only: the missing governed Fedora 44 artifacts and live Surface
@@ -400,21 +413,23 @@ credential still prevent image/deployment acceptance.
 
 ## Remaining acceptance work
 
-- Package a privileged provisioner that atomically mints the action token,
-  seals its nonce-bound MOK permit, and injects both fixed systemd credentials
-  inside the 30-second window; add the typed host-state reboot handoff.
+- Add the local privileged minting front-end that creates the exact action token
+  and nonce-bound sealed permit. The packaged activator now validates and
+  installs the complete host-encrypted credential pair at one stop/start
+  boundary, but deliberately cannot mint authority. Reboot remains a separate
+  exact-body, single-use host-state `propose` then `confirm` pair.
 - Run privacy-armed camera frame and fingerprint functional hardware proof; the
   production inventory probes now verify libcamera/fprintd stack enumeration
   without capture, claim, enrollment, authentication, or enrolled-print reads.
   Exercise the new firmware and DRM mutation paths in a recovery-ready Surface
   hardware window; unit/farm gates deliberately performed no firmware or KMS
   mutation.
-- Build kernel-surface from the pinned inputs without exposing a signer to
-  networked or upstream build code; sign the kernel and every module in a
-  minimal network-disabled stage, rebuild `surface-secureboot` with the same
+- Supply the private key matching the locked Surface certificate and at least
+  45 GiB scratch capacity, then run the now network-isolated kernel producer,
+  verify the signer on every module, rebuild `surface-secureboot` with the same
   public certificate, sign the complete RPM set with the project release key,
-  then compose and deploy the current candidate to the `Surface` Pro 6 seat.
-  The existing unsigned userspace/data builds are producer proof only, and the
+  and compose/deploy the current candidate to the `Surface` Pro 6 seat. The
+  existing unsigned userspace/data builds are producer proof only, and the
   compose still fails closed without the complete governed artifact set.
 - Restore governed SSH/current-release access; the documented key is currently
   rejected on LAN and the overlay path is unavailable. On 2026-08-09 the Pro 6
