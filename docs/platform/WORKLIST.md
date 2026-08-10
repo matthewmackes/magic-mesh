@@ -1757,6 +1757,8 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- **Release-31 three-seat upgrade checkpoint (2026-08-10):** signed Fedora 44 bytes passed transaction, payload, grouped-runtime, and shell proof on Dell, seat 15,
+  and Surface while preserving Dell's Browser VM: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release31-three-seat-upgrade-r113.md`.
 - **Explicit release-gate matrix checkpoint (2026-08-09):** the historical r9
   matrix named 19 required GitHub, farm/package, five-seat, three-lighthouse,
   and seven failure/recovery gates; the verifier rejects incomplete, duplicate,
@@ -1846,6 +1848,8 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Release-31 three-seat return checkpoint (2026-08-10):** Dell, seat 15, and Surface returned from corrected-forward package replacement with exact payloads,
+  all six grouped services, Nebula, and zero-restart shells active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release31-three-seat-upgrade-r113.md`.
 - **Resource credential boot-retry checkpoint (2026-08-10):** transient SecretStore ordering failures retry every 30 seconds under a six-start/five-minute ceiling;
   terminal secret/configuration failures do not retry or mask failure: `docs/platform/evidence/WL-CRIT-007-WL-FUNC-019-2026-08-10-resource-credential-retry-r110.md`.
 - **Identity teardown checkpoint (2026-08-06):** `rejoin-v11-mesh.sh
