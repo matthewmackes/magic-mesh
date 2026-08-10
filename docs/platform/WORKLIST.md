@@ -105,12 +105,12 @@ behavioral evidence is not completion.
 - **Quadlet attachment cleanup:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
 - **Partition geometry refusal:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`.
 - **Mountpoint safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`.
+- **Storage name safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
-- **Recovered attachment identity:** exact lease/generation proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-exact-recovered-attachment-identity-r130.md`.
 - **Cleanup idempotence (2026-08-06):** sole libvirt actuator passed 23/23 on `.90`: `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
 - **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
   `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.

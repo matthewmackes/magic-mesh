@@ -1027,6 +1027,18 @@ pub enum OpInvalid {
         /// The rejected destination.
         mountpoint: String,
     },
+    /// A LUKS mapper name is empty, path-like, or otherwise unsafe for device-mapper.
+    #[error("unsafe mapper name {mapper_name}")]
+    UnsafeMapperName {
+        /// The rejected mapper name.
+        mapper_name: String,
+    },
+    /// A btrfs subvolume name is absolute, empty, or contains traversal components.
+    #[error("unsafe subvolume name {name}")]
+    UnsafeSubvolumeName {
+        /// The rejected subvolume name.
+        name: String,
+    },
     /// An op that needs a specific filesystem (a subvolume op needs btrfs) on a
     /// partition carrying a different one.
     #[error("partition {partition} is {found}, not {need} — op needs {need}")]
@@ -1108,19 +1120,46 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
         // unmounted.
         StorageOp::DeletePartition { partition }
         | StorageOp::Format { partition, .. }
-        | StorageOp::Move { partition, .. }
-        | StorageOp::LuksFormat { partition, .. } => {
+        | StorageOp::Move { partition, .. } => {
             let p = require_partition(topo, partition)?;
             require_unmounted(p)?;
             Ok(())
         }
         // Ops that only need the partition to exist (label/flags + LUKS open/close,
         // which address the container itself with no mount precondition).
-        StorageOp::SetLabel { partition, .. }
-        | StorageOp::SetFlags { partition, .. }
-        | StorageOp::LuksOpen { partition, .. }
-        | StorageOp::LuksClose { partition, .. } => {
+        StorageOp::SetLabel { partition, .. } | StorageOp::SetFlags { partition, .. } => {
             require_partition(topo, partition)?;
+            Ok(())
+        }
+        StorageOp::LuksOpen {
+            partition,
+            mapper_name,
+            ..
+        }
+        | StorageOp::LuksClose {
+            partition,
+            mapper_name,
+        } => {
+            require_partition(topo, partition)?;
+            if !safe_mapper_name(mapper_name) {
+                return Err(OpInvalid::UnsafeMapperName {
+                    mapper_name: mapper_name.clone(),
+                });
+            }
+            Ok(())
+        }
+        StorageOp::LuksFormat {
+            partition,
+            mapper_name,
+            ..
+        } => {
+            let p = require_partition(topo, partition)?;
+            require_unmounted(p)?;
+            if !safe_mapper_name(mapper_name) {
+                return Err(OpInvalid::UnsafeMapperName {
+                    mapper_name: mapper_name.clone(),
+                });
+            }
             Ok(())
         }
         StorageOp::Mount { partition, .. } => {
@@ -1159,9 +1198,21 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
             new_size_mib,
         } => validate_shrink(topo, partition, *new_size_mib),
         // Subvolume ops need a mounted btrfs (the tool operates on the mount point).
-        StorageOp::SubvolumeCreate { partition, .. }
-        | StorageOp::SubvolumeDelete { partition, .. }
-        | StorageOp::SubvolumeSnapshot { partition, .. } => validate_subvolume(topo, partition),
+        StorageOp::SubvolumeCreate { partition, name }
+        | StorageOp::SubvolumeDelete { partition, name } => {
+            validate_subvolume(topo, partition)?;
+            validate_subvolume_name(name)
+        }
+        StorageOp::SubvolumeSnapshot {
+            partition,
+            source,
+            dest,
+            ..
+        } => {
+            validate_subvolume(topo, partition)?;
+            validate_subvolume_name(source)?;
+            validate_subvolume_name(dest)
+        }
     }
 }
 
@@ -1178,6 +1229,35 @@ fn safe_mountpoint(mountpoint: &str) -> bool {
                 std::path::Component::RootDir | std::path::Component::Normal(_)
             )
         })
+}
+
+/// Accept only one normal device-mapper name component. The mapper is joined
+/// under `/dev/mapper` by the executor, so path separators must never cross that
+/// boundary.
+fn safe_mapper_name(mapper_name: &str) -> bool {
+    !mapper_name.is_empty()
+        && !mapper_name.contains('\0')
+        && Path::new(mapper_name).components().eq([
+            std::path::Component::Normal(std::ffi::OsStr::new(mapper_name)),
+        ])
+}
+
+/// Accept normal relative components for btrfs names, including nested names,
+/// but refuse absolute paths and lexical traversal before invoking btrfs.
+fn validate_subvolume_name(name: &str) -> Result<(), OpInvalid> {
+    let path = Path::new(name);
+    if !name.is_empty()
+        && !name.contains('\0')
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        Ok(())
+    } else {
+        Err(OpInvalid::UnsafeSubvolumeName {
+            name: name.to_string(),
+        })
+    }
 }
 
 /// Validate a `Grow`: the target must move up and fit the disk's free space.
@@ -4788,6 +4868,18 @@ mod tests {
             &btrfs
         )
         .is_ok());
+        for name in ["", "/absolute", "../escape", "nested/../escape"] {
+            assert!(matches!(
+                validate_op(
+                    &StorageOp::SubvolumeCreate {
+                        partition: "/dev/sdb1".into(),
+                        name: name.into(),
+                    },
+                    &btrfs
+                ),
+                Err(OpInvalid::UnsafeSubvolumeName { .. })
+            ));
+        }
     }
 
     #[test]
@@ -4813,6 +4905,19 @@ mod tests {
             mapper_name: "cryptdata".into(),
             keyfile: None,
         };
+        for mapper_name in ["", "../escape", "nested/name", "/absolute"] {
+            assert!(matches!(
+                validate_op(
+                    &StorageOp::LuksOpen {
+                        partition: "/dev/sdb1".into(),
+                        mapper_name: mapper_name.into(),
+                        keyfile: None,
+                    },
+                    &topo
+                ),
+                Err(OpInvalid::UnsafeMapperName { .. })
+            ));
+        }
         let json = serde_json::to_string(&op).unwrap();
         assert!(json.contains(r#""op":"luks_open""#));
         assert_eq!(serde_json::from_str::<StorageOp>(&json).unwrap(), op);
