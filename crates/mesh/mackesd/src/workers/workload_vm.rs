@@ -7,6 +7,11 @@
 /// Default libvirt network for managed Workload VMs.
 pub const DEFAULT_NETWORK: &str = "default";
 
+/// Bound virtio-net queue fan-out so a large admitted VM cannot turn one NIC
+/// into an unbounded host task/FD multiplier. Eight queues are enough to spread
+/// workstation traffic without exceeding the local I/O budget.
+const MAX_VIRTIO_NET_QUEUES: u32 = 8;
+
 /// The small, reconciler-owned subset of a VM definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmDomainSpec {
@@ -82,6 +87,14 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
     } else {
         String::new()
     };
+    // A queue per admitted guest vCPU avoids serializing desktop traffic on one
+    // virtqueue. Keep the single-queue fallback whenever the host cannot retain
+    // its required VM-free Dom0 thread, and cap queue-created host work.
+    let network_queues = if spec.host_threads > spec.vcpus && spec.vcpus > 0 {
+        spec.vcpus.min(MAX_VIRTIO_NET_QUEUES)
+    } else {
+        1
+    };
     format!(
         "<domain type='kvm'>\n\
          \x20 <name>{name}</name>\n\
@@ -107,7 +120,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
          \x20     <source file='{disk}'/>\n\
          \x20     <target dev='vda' bus='virtio'/>\n\
          \x20   </disk>\n\
-         \x20   <interface type='network'><source network='{network}'/><model type='virtio'/></interface>\n\
+         \x20   <interface type='network'><source network='{network}'/><model type='virtio'/><driver queues='{network_queues}'/></interface>\n\
          \x20   <console type='pty'/>\n\
          \x20   <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>\n\
          \x20   <graphics type='dbus' p2p='yes'><listen type='none'/><gl enable='yes'/></graphics>\n\
@@ -126,6 +139,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
         cpu_tune = cpu_tune,
         disk = xml_escape(disk_path),
         network = xml_escape(spec.network_or_default()),
+        network_queues = network_queues,
     )
 }
 
@@ -163,6 +177,27 @@ mod tests {
         assert!(xml.contains("<vcpupin vcpu='1' cpuset='2'/>"));
         assert!(xml.contains("<emulatorpin cpuset='1,2'/>"));
         assert!(xml.contains("<iothreadpin iothread='1' cpuset='1,2'/>"));
+        assert!(xml.contains("<driver queues='2'/>"));
+    }
+
+    #[test]
+    fn network_queue_fanout_preserves_dom0_capacity_and_is_bounded() {
+        let domain = |vcpus, host_threads| {
+            build_domain_xml(
+                &VmDomainSpec {
+                    name: "queue-test".into(),
+                    vcpus,
+                    ram_mb: 1024,
+                    host_threads,
+                    network: None,
+                },
+                "/var/lib/mde-vms/queue-test.qcow2",
+            )
+        };
+
+        assert!(domain(3, 4).contains("<driver queues='3'/>"));
+        assert!(domain(4, 4).contains("<driver queues='1'/>"));
+        assert!(domain(64, 65).contains("<driver queues='8'/>"));
     }
 
     #[test]
