@@ -91,13 +91,14 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: VM, container, session, console, and shell paths still publish or interpret overlapping lifecycle state; local attachment and capacity admission are not fully
-  proven.
+- Problem: VM, container, session, console, and shell paths still publish or interpret overlapping lifecycle state; local attachment and capacity admission are not fully proven.
 - Required outcome: One persisted idempotent Workload API controls lifecycle; only the reconciler actuates through libvirt/virtqemud or Quadlet/systemd.
   The shell consumes bounded typed projections, with tested local Display1/KMS attachment and RDP/SPICE/VNC recovery.
 - Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, hostile farm tests, and idempotent stopped-domain cleanup exist.
   Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work:
+- **Bounded virtio-net checkpoint (2026-08-10):** VM XML requests capped multiqueue only when Dom0 retains a VM-free thread; `.90` passed 3/3:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtio-net-queue-bound-r144.md`.
 - **Terminal attachment revocation checkpoint (2026-08-10):** permanent restart-observation failure clears its Display1 lease before journaling failure; exact machine-9
   proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
@@ -121,8 +122,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`. Other evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
-- **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and
-  libvirt inventory shortcuts and Datacenter's retired Nova-name heuristic were
+- **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and libvirt inventory shortcuts and Datacenter's retired Nova-name heuristic were
   deleted. One typed Workloads link/projection remains; the strengthened
   authority guard and three focused BigBoy shell tests pass. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-shell-runtime-projection-hard-cut-r4.md`.
