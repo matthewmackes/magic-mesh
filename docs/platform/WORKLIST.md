@@ -1848,6 +1848,8 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Dell release-31 boot-status checkpoint (2026-08-10):** a warned reboot cut total boot from 90.390s to 56.811s, started the shell at 23.650s, and handed off its splash
+  at 45.338s with grouped services and Browser VM recovered: `docs/platform/evidence/WL-CRIT-007-2026-08-10-dell-release31-boot-status-r115.md`.
 - **Non-blocking grouped-upgrade checkpoint (2026-08-10):** after release 31 exposed a >60-second synchronous target restart, the next RPM now queues grouped daemon
   convergence without retaining the transaction lock; shell replacement remains synchronous: `docs/platform/evidence/WL-CRIT-007-2026-08-10-nonblocking-grouped-upgrade-r114.md`.
 - **Release-31 three-seat return checkpoint (2026-08-10):** Dell, seat 15, and Surface returned from corrected-forward package replacement with exact payloads,
