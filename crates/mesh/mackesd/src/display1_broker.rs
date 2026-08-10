@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use mackes_mesh_types::workloads::WorkloadAttachmentLease;
 use rustix::net::{
-    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
-    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
 };
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::OwnedFd as ZvariantOwnedFd;
@@ -46,6 +46,7 @@ pub const DISPLAY1_SOCKET_ROOT: &str = "/run/mde/display1";
 /// Version for the bounded shell-to-daemon attachment handshake.
 pub const DISPLAY1_HANDSHAKE_SCHEMA_VERSION: u16 = 1;
 const MAX_DISPLAY1_HANDSHAKE_BYTES: usize = 4 * 1024;
+const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
 
 /// Derive the broker endpoint from a validated attachment lease id. The path
 /// never crosses mde-bus; only the opaque lease remains in the projection.
@@ -377,7 +378,9 @@ impl Display1ScmRightsRelay {
         let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
         let mut ancillary = SendAncillaryBuffer::new(&mut control);
         if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
-            return Err(Display1Error::Attachment("SCM_RIGHTS buffer too small".into()));
+            return Err(Display1Error::Attachment(
+                "SCM_RIGHTS buffer too small".into(),
+            ));
         }
         let sent = sendmsg(
             &self.stream,
@@ -393,6 +396,32 @@ impl Display1ScmRightsRelay {
             return Err(Display1Error::Attachment("short SCM_RIGHTS frame".into()));
         }
         Ok(())
+    }
+
+    /// Poll the one-byte shell acknowledgement emitted only after a
+    /// successful KMS modeset/page-flip. An idle socket is not readiness, and
+    /// EOF is a disconnect rather than an acknowledgement.
+    fn presentation_acknowledged(&self) -> Result<bool, Display1Error> {
+        if peer_credentials(&self.stream)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?
+            != self.peer
+        {
+            return Err(Display1Error::Attachment("peer credential mismatch".into()));
+        }
+        let mut ack = [0_u8; 1];
+        let mut stream = &self.stream;
+        match stream.read(&mut ack) {
+            Ok(0) => Ok(false),
+            Ok(1) if ack[0] == DISPLAY1_PRESENT_ACK => Ok(true),
+            Ok(1) => Err(Display1Error::Attachment(
+                "invalid Display1 presentation acknowledgement".into(),
+            )),
+            Ok(_) => unreachable!("one-byte acknowledgement buffer"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(Display1Error::Attachment(format!(
+                "read Display1 presentation acknowledgement: {error}"
+            ))),
+        }
     }
 }
 
@@ -418,6 +447,7 @@ impl Display1FrameSink for Display1ScmRightsRelay {
 /// successfully delivered frame for the Workload reconciler.
 pub struct Display1AttachmentSink {
     relay: Mutex<Option<Display1ScmRightsRelay>>,
+    frame_delivered: AtomicBool,
     first_frame: AtomicBool,
 }
 
@@ -425,6 +455,7 @@ impl Display1AttachmentSink {
     fn new() -> Self {
         Self {
             relay: Mutex::new(None),
+            frame_delivered: AtomicBool::new(false),
             first_frame: AtomicBool::new(false),
         }
     }
@@ -435,15 +466,40 @@ impl Display1AttachmentSink {
             .lock()
             .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
         *current = Some(relay);
+        self.frame_delivered.store(false, Ordering::Release);
         self.first_frame.store(false, Ordering::Release);
         Ok(())
     }
 
-    /// Whether a validated QEMU frame was delivered to the authenticated
-    /// shell relay.
+    /// Whether the authenticated shell acknowledged that KMS successfully
+    /// presented a delivered QEMU frame.
+    ///
+    /// The shell sends one fixed byte after the successful modeset/page-flip.
+    /// EOF remains a disconnect and an idle socket remains not-ready, so a
+    /// shell crash after receive cannot be mistaken for presentation.
     #[must_use]
     pub fn first_frame_seen(&self) -> bool {
-        self.first_frame.load(Ordering::Acquire)
+        if self.first_frame.load(Ordering::Acquire) {
+            return true;
+        }
+        if !self.frame_delivered.load(Ordering::Acquire) {
+            return false;
+        }
+        let acknowledged = self
+            .relay
+            .lock()
+            .ok()
+            .and_then(|relay| {
+                relay
+                    .as_ref()
+                    .map(Display1ScmRightsRelay::presentation_acknowledged)
+            })
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        if acknowledged {
+            self.first_frame.store(true, Ordering::Release);
+        }
+        acknowledged
     }
 }
 
@@ -457,7 +513,7 @@ impl Display1FrameSink for Display1AttachmentSink {
             Display1Error::Attachment("no authenticated shell relay is attached".into())
         })?;
         relay.send_frame(&frame, display1_now_ms())?;
-        self.first_frame.store(true, Ordering::Release);
+        self.frame_delivered.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -467,6 +523,7 @@ impl Display1FrameSink for Display1AttachmentSink {
             .lock()
             .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
         *relay = None;
+        self.frame_delivered.store(false, Ordering::Release);
         self.first_frame.store(false, Ordering::Release);
         Ok(())
     }
@@ -485,18 +542,13 @@ pub struct Display1AttachmentServer {
 
 impl Display1AttachmentServer {
     /// Start a production broker below `/run/mde/display1`.
-    pub fn start(
-        lease: WorkloadAttachmentLease,
-    ) -> Result<Self, Display1Error> {
+    pub fn start(lease: WorkloadAttachmentLease) -> Result<Self, Display1Error> {
         Self::start_at(Path::new(DISPLAY1_SOCKET_ROOT), lease)
     }
 
     /// Start a broker below an injected root. This is also the seam used by
     /// farm tests; no test needs to mutate the production `/run` hierarchy.
-    pub fn start_at(
-        root: &Path,
-        lease: WorkloadAttachmentLease,
-    ) -> Result<Self, Display1Error> {
+    pub fn start_at(root: &Path, lease: WorkloadAttachmentLease) -> Result<Self, Display1Error> {
         lease
             .validate(display1_now_ms())
             .map_err(|error| Display1Error::Attachment(error.to_string()))?;
@@ -504,8 +556,9 @@ impl Display1AttachmentServer {
             Display1Error::Attachment("lease id cannot name a Display1 socket".into())
         })?;
         if let Some(parent) = socket_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| Display1Error::Attachment(format!("create broker root: {error}")))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                Display1Error::Attachment(format!("create broker root: {error}"))
+            })?;
         }
         let listener = match UnixListener::bind(&socket_path) {
             Ok(listener) => listener,
@@ -544,16 +597,13 @@ impl Display1AttachmentServer {
                 )));
             }
         };
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| Display1Error::Attachment(format!("configure broker socket: {error}")))?;
+        listener.set_nonblocking(true).map_err(|error| {
+            Display1Error::Attachment(format!("configure broker socket: {error}"))
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(
-                &socket_path,
-                fs::Permissions::from_mode(0o660),
-            );
+            let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660));
         }
         let sink = Arc::new(Display1AttachmentSink::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -572,7 +622,9 @@ impl Display1AttachmentServer {
                     thread_socket_path,
                 );
             })
-            .map_err(|error| Display1Error::Attachment(format!("spawn broker listener: {error}")))?;
+            .map_err(|error| {
+                Display1Error::Attachment(format!("spawn broker listener: {error}"))
+            })?;
         Ok(Self {
             lease,
             socket_path,
@@ -670,9 +722,9 @@ fn read_display1_hello(
     lease: &WorkloadAttachmentLease,
 ) -> Result<Display1AttachHello, Display1Error> {
     let mut length = [0_u8; 4];
-    stream
-        .read_exact(&mut length)
-        .map_err(|error| Display1Error::Attachment(format!("Display1 handshake length: {error}")))?;
+    stream.read_exact(&mut length).map_err(|error| {
+        Display1Error::Attachment(format!("Display1 handshake length: {error}"))
+    })?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > MAX_DISPLAY1_HANDSHAKE_BYTES {
         return Err(Display1Error::Attachment(
@@ -705,8 +757,7 @@ pub fn receive_display1_frame(
     lease: &WorkloadAttachmentLease,
     now_ms: u64,
 ) -> Result<Display1DmaBufFrame, Display1Error> {
-    if peer_credentials(stream)
-        .map_err(|error| Display1Error::Attachment(error.to_string()))?
+    if peer_credentials(stream).map_err(|error| Display1Error::Attachment(error.to_string()))?
         != expected_peer
     {
         return Err(Display1Error::Attachment("peer credential mismatch".into()));
@@ -744,7 +795,8 @@ pub fn receive_display1_frame(
             break;
         }
     }
-    let dmabuf = descriptor.ok_or_else(|| Display1Error::Attachment("missing DMA-BUF FD".into()))?;
+    let dmabuf =
+        descriptor.ok_or_else(|| Display1Error::Attachment("missing DMA-BUF FD".into()))?;
     Ok(Display1DmaBufFrame {
         dmabuf,
         width: envelope.width,
@@ -998,9 +1050,7 @@ mod tests {
         )
         .expect("attach");
         let frame = Display1DmaBufFrame {
-            dmabuf: std::fs::File::open("/dev/null")
-                .expect("dev null")
-                .into(),
+            dmabuf: std::fs::File::open("/dev/null").expect("dev null").into(),
             width: 64,
             height: 32,
             stride: 256,
@@ -1009,8 +1059,8 @@ mod tests {
             y0_top: true,
         };
         relay.send_frame(&frame, 1_001).expect("send frame");
-        let received = receive_display1_frame(&receiver, receiver_peer, &lease, 1_002)
-            .expect("receive frame");
+        let received =
+            receive_display1_frame(&receiver, receiver_peer, &lease, 1_002).expect("receive frame");
         assert_eq!(received.width, 64);
         assert_eq!(received.height, 32);
         assert!(received.dmabuf.as_fd().as_raw_fd() >= 0);
@@ -1063,7 +1113,9 @@ mod tests {
                 1_000,
             )
             .expect_err("nonce replay must fail");
-        assert!(matches!(error, Display1Error::Attachment(message) if message.contains("replayed")));
+        assert!(
+            matches!(error, Display1Error::Attachment(message) if message.contains("replayed"))
+        );
     }
 
     #[test]
@@ -1128,8 +1180,8 @@ mod tests {
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
             expires_at_ms: display1_now_ms().saturating_add(5_000),
         };
-        let server = Display1AttachmentServer::start_at(temp.path(), lease.clone())
-            .expect("start broker");
+        let server =
+            Display1AttachmentServer::start_at(temp.path(), lease.clone()).expect("start broker");
         let mut stream = UnixStream::connect(server.socket_path()).expect("connect broker");
         let hello = serde_json::to_vec(&Display1AttachHello::from_lease(&lease)).expect("hello");
         let length = u32::try_from(hello.len()).expect("bounded hello");
@@ -1140,11 +1192,9 @@ mod tests {
 
         let sink = server.frame_sink();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !server.first_frame_seen() {
+        loop {
             let frame = Display1DmaBufFrame {
-                dmabuf: std::fs::File::open("/dev/null")
-                    .expect("dev null")
-                    .into(),
+                dmabuf: std::fs::File::open("/dev/null").expect("dev null").into(),
                 width: 64,
                 height: 32,
                 stride: 256,
@@ -1152,17 +1202,31 @@ mod tests {
                 modifier: 0,
                 y0_top: true,
             };
-            let _ = sink.accept(frame);
+            if sink.accept(frame).is_ok() {
+                break;
+            }
             if Instant::now() >= deadline {
                 panic!("broker did not accept the authenticated shell handshake");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         let peer = peer_credentials(&stream).expect("peer credentials");
-        let received = receive_display1_frame(&stream, peer, &lease, display1_now_ms())
-            .expect("first frame");
+        let received =
+            receive_display1_frame(&stream, peer, &lease, display1_now_ms()).expect("first frame");
         assert_eq!(received.width, 64);
-        assert!(server.first_frame_seen());
+        assert!(
+            !server.first_frame_seen(),
+            "socket delivery must not complete Workload readiness"
+        );
+        stream
+            .write_all(&[DISPLAY1_PRESENT_ACK])
+            .expect("presentation acknowledgement");
+        while !server.first_frame_seen() {
+            if Instant::now() >= deadline {
+                panic!("broker did not observe the KMS presentation acknowledgement");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -1175,10 +1239,10 @@ mod tests {
             workload_id: WorkloadId::new("browser-seat15").expect("workload id"),
             generation: 4,
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
-            expires_at_ms: display1_now_ms().saturating_add(250),
+            expires_at_ms: display1_now_ms().saturating_add(500),
         };
-        let server = Display1AttachmentServer::start_at(temp.path(), lease.clone())
-            .expect("start broker");
+        let server =
+            Display1AttachmentServer::start_at(temp.path(), lease.clone()).expect("start broker");
         let socket_path = server.socket_path().to_path_buf();
         let mut stream = UnixStream::connect(&socket_path).expect("connect broker");
         let hello = serde_json::to_vec(&Display1AttachHello::from_lease(&lease)).expect("hello");
@@ -1190,11 +1254,9 @@ mod tests {
 
         let sink = server.frame_sink();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !server.first_frame_seen() {
+        loop {
             let frame = Display1DmaBufFrame {
-                dmabuf: std::fs::File::open("/dev/null")
-                    .expect("dev null")
-                    .into(),
+                dmabuf: std::fs::File::open("/dev/null").expect("dev null").into(),
                 width: 64,
                 height: 32,
                 stride: 256,
@@ -1202,9 +1264,22 @@ mod tests {
                 modifier: 0,
                 y0_top: true,
             };
-            let _ = sink.accept(frame);
+            if sink.accept(frame).is_ok() {
+                break;
+            }
             if Instant::now() >= deadline {
                 panic!("broker did not install the authenticated relay");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let peer = peer_credentials(&stream).expect("peer credentials");
+        receive_display1_frame(&stream, peer, &lease, display1_now_ms()).expect("first frame");
+        stream
+            .write_all(&[DISPLAY1_PRESENT_ACK])
+            .expect("presentation acknowledgement");
+        while !server.first_frame_seen() {
+            if Instant::now() >= deadline {
+                panic!("broker did not observe readiness before expiry");
             }
             std::thread::sleep(Duration::from_millis(10));
         }

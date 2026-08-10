@@ -91,8 +91,7 @@ behavioral evidence is not completion.
 - **Admission/live proof checkpoints (2026-08-06/09):** the strict helper validates typed placement, resources, retry, and lease safety. Dell was unreachable; seat 15 lacked
   a revision receipt, typed projection, operation, and attachment generation, so acceptance refused:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
-- **Native attachment route checkpoint (2026-08-09):** invalid container/protocol attachment fails before effects and live headless Service VMs emit no attachment;
-  BigBoy passed 38/38 plus the reachable shell regression: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
+- **Native attachment route (2026-08-09):** invalid routes fail before effects; farm proof: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
 - **Console authority removal checkpoint (2026-08-08):** the raw console relay, cloud console dispatch,
   shell endpoint reader, obsolete Browser attach envelope, and matching live verifier were deleted.
   Typed Workload Open plus authenticated Display1 leases remain; focused BigBoy/`.90` gates pass.
@@ -140,8 +139,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON rejects duplicate keys; `.50` passed 9/9. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
-- **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness, relay state, and stale sockets; BigBoy passed 7/7. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
+- **Display1 readiness/expiry checkpoints (2026-08-06/09):** socket delivery no longer claims readiness; one lease-bound shell acknowledgement follows a received frame's
+  successful KMS presentation. Pre-frame, idle, EOF, invalid-byte, send-failure, and expiry paths fail closed; isolated BigBoy/`.50`/`.90` gates passed 9/9, 5/5, and 22/22:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-present-ack-r19.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
 - **Storage path-boundary checkpoint (2026-08-06):** virtual-storage validation rejects symlinks/outside-root images; `.90` passed:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
 - **Storage Bus transaction checkpoint (2026-08-09):** stable reads precede effects; late/replaced storage and failed publication correct forward without repeated operations.

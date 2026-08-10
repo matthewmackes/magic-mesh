@@ -115,6 +115,13 @@ pub trait Display1FrameSource {
     /// Poll one frame at `now`, returning a typed recovery transition on
     /// disconnect and a typed DRM error for a protocol/transport failure.
     fn poll(&mut self, now: Instant) -> Result<Display1FramePoll, DrmError>;
+
+    /// Acknowledge that the most recently returned frame completed its KMS
+    /// modeset/page-flip. Implementations may use this to make producer-side
+    /// readiness depend on presentation rather than socket delivery.
+    fn frame_presented(&mut self) -> Result<(), DrmError> {
+        Ok(())
+    }
 }
 
 /// Poll the native source while preserving the KMS ownership boundary on a
@@ -138,6 +145,19 @@ fn poll_display1_or_cleanup(
             ))),
         },
     }
+}
+
+/// Complete the consumer half of the Display1 readiness handshake. This is
+/// called only after the imported framebuffer has completed its KMS
+/// modeset/page-flip; a missing source or a failed acknowledgement is fatal to
+/// the attachment rather than silently fabricating readiness.
+fn acknowledge_display1_present(
+    source: &mut Option<&mut dyn Display1FrameSource>,
+) -> Result<(), DrmError> {
+    source
+        .as_mut()
+        .ok_or_else(|| DrmError::Present("Display1 source vanished before acknowledgement".into()))?
+        .frame_presented()
 }
 
 impl std::fmt::Display for DrmError {
@@ -2418,6 +2438,10 @@ pub fn run_drm_with_clipboard_and_display1(
                     let _ = clear_external_scanout(&gbm, &mut external_scanout);
                     return Err(error);
                 }
+                if let Err(error) = acknowledge_display1_present(&mut display1) {
+                    let _ = clear_external_scanout(&gbm, &mut external_scanout);
+                    return Err(error);
+                }
                 continue;
             }
             Some(Display1FramePoll::Idle) if external_scanout.is_some() => {
@@ -3092,11 +3116,12 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_drm_clipboard_owner, clear_rgba, drm_clipboard_output_text, drm_clipboard_poll_delay,
-        drm_modifiers, drm_screen_for_scale, explicit_modifier, open_primary_node,
-        poll_display1_or_cleanup, poll_pending_drm_clipboard_paste, probe_prime_import_liveness,
-        push_drm_clipboard_shortcut, refresh_drm_clipboard_offer, store_drm_clipboard_output,
-        Display1FramePoll, Display1FrameSource, DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
+        acknowledge_display1_present, apply_drm_clipboard_owner, clear_rgba,
+        drm_clipboard_output_text, drm_clipboard_poll_delay, drm_modifiers, drm_screen_for_scale,
+        explicit_modifier, open_primary_node, poll_display1_or_cleanup,
+        poll_pending_drm_clipboard_paste, probe_prime_import_liveness, push_drm_clipboard_shortcut,
+        refresh_drm_clipboard_offer, store_drm_clipboard_output, Display1FramePoll,
+        Display1FrameSource, DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
         DRM_CLIPBOARD_PASTE_TIMEOUT, DRM_CLIPBOARD_POLL_INTERVAL,
     };
     use crate::{LocalClipboardAuthority, MemoryRichClipboardClient, RichClipboardClient};
@@ -3111,6 +3136,49 @@ mod tests {
         fn poll(&mut self, _now: Instant) -> Result<Display1FramePoll, DrmError> {
             Err(DrmError::Present("native source transport lost".into()))
         }
+    }
+
+    struct PresentedDisplay1Source {
+        acknowledgements: usize,
+        fail: bool,
+    }
+
+    impl Display1FrameSource for PresentedDisplay1Source {
+        fn poll(&mut self, _now: Instant) -> Result<Display1FramePoll, DrmError> {
+            Ok(Display1FramePoll::Idle)
+        }
+
+        fn frame_presented(&mut self) -> Result<(), DrmError> {
+            self.acknowledgements += 1;
+            if self.fail {
+                Err(DrmError::Present(
+                    "presentation acknowledgement refused".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn display1_presentation_acknowledgement_is_exact_and_fail_closed() {
+        let mut source = PresentedDisplay1Source {
+            acknowledgements: 0,
+            fail: false,
+        };
+        let mut display1: Option<&mut dyn Display1FrameSource> = Some(&mut source);
+        acknowledge_display1_present(&mut display1).expect("acknowledge successful KMS present");
+        assert_eq!(source.acknowledgements, 1);
+
+        let mut failed = PresentedDisplay1Source {
+            acknowledgements: 0,
+            fail: true,
+        };
+        let mut display1: Option<&mut dyn Display1FrameSource> = Some(&mut failed);
+        let error = acknowledge_display1_present(&mut display1)
+            .expect_err("acknowledgement failure must fail the attachment");
+        assert!(error.to_string().contains("acknowledgement refused"));
+        assert_eq!(failed.acknowledgements, 1);
     }
 
     #[test]

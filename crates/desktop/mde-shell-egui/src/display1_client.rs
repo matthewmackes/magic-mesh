@@ -19,14 +19,15 @@ use mackes_mesh_types::workloads::{
     WorkloadAttachmentLease, WorkloadAttachmentProtocol, WorkloadOperationPhase,
     WorkloadStateSnapshot,
 };
-use mde_egui::drm::{self, Display1FramePoll, Display1FrameSource, ExternalDmaBufFrame};
 use mde_bus::persist::Persist;
-use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+use mde_egui::drm::{self, Display1FramePoll, Display1FrameSource, ExternalDmaBufFrame};
+use rustix::net::{recvmsg, send, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendFlags};
 use serde::{Deserialize, Serialize};
 
 const MAX_ENVELOPE_BYTES: usize = 16 * 1024;
 const DISPLAY1_HANDSHAKE_SCHEMA_VERSION: u16 = 1;
 const MAX_HANDSHAKE_BYTES: usize = 4 * 1024;
+const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
 /// Must match mackesd's node-local per-lease broker root. The socket path is
 /// derived from the validated lease so a shell does not need an out-of-band
 /// environment variable for the endpoint.
@@ -122,6 +123,8 @@ pub(crate) struct Display1Client {
     stream: UnixStream,
     peer: Display1PeerCredentials,
     lease: WorkloadAttachmentLease,
+    frame_received: bool,
+    first_present_acknowledged: bool,
 }
 
 impl Display1Client {
@@ -169,11 +172,39 @@ impl Display1Client {
             stream,
             peer,
             lease,
+            frame_received: false,
+            first_present_acknowledged: false,
         })
     }
 
+    /// Notify the broker exactly once that the first imported frame completed
+    /// its KMS modeset/page-flip. Socket delivery alone is not readiness.
+    fn acknowledge_first_present(&mut self) -> Result<(), Display1ClientError> {
+        if self.first_present_acknowledged {
+            return Ok(());
+        }
+        if !self.frame_received {
+            return Err(Display1ClientError::Protocol(
+                "cannot acknowledge presentation before receiving a Display1 frame".into(),
+            ));
+        }
+        let sent =
+            send(&self.stream, &[DISPLAY1_PRESENT_ACK], SendFlags::DONTWAIT).map_err(|error| {
+                Display1ClientError::Protocol(format!(
+                    "send Display1 presentation acknowledgement: {error}"
+                ))
+            })?;
+        if sent != 1 {
+            return Err(Display1ClientError::Protocol(
+                "short Display1 presentation acknowledgement".into(),
+            ));
+        }
+        self.first_present_acknowledged = true;
+        Ok(())
+    }
+
     fn receive_inner(
-        &self,
+        &mut self,
         now_ms: u64,
         flags: RecvFlags,
     ) -> Result<ReceivedFrame, Display1ClientError> {
@@ -237,6 +268,7 @@ impl Display1Client {
         }
         let descriptor =
             descriptor.ok_or_else(|| Display1ClientError::Protocol("missing DMA-BUF FD".into()))?;
+        self.frame_received = true;
         Ok(ReceivedFrame::Frame(descriptor, frame))
     }
 
@@ -244,7 +276,7 @@ impl Display1Client {
     /// helper is intentionally bounded to one frame; the live DRM loop uses
     /// [`Self::try_receive`] so it never blocks the render thread.
     pub(crate) fn receive(
-        &self,
+        &mut self,
         now_ms: u64,
     ) -> Result<(OwnedFd, ExternalDmaBufFrame), Display1ClientError> {
         match self.receive_inner(now_ms, RecvFlags::empty())? {
@@ -260,7 +292,7 @@ impl Display1Client {
 
     /// Poll one frame without blocking the direct-DRM render loop.
     pub(crate) fn try_receive(
-        &self,
+        &mut self,
         now_ms: u64,
     ) -> Result<Display1FramePoll, Display1ClientError> {
         Ok(match self.receive_inner(now_ms, RecvFlags::DONTWAIT)? {
@@ -281,7 +313,11 @@ pub(crate) enum Display1Source {
 }
 
 impl Display1Source {
-    pub(crate) fn dynamic(node: String, bus_root: Option<PathBuf>, workload_id: Option<String>) -> Self {
+    pub(crate) fn dynamic(
+        node: String,
+        bus_root: Option<PathBuf>,
+        workload_id: Option<String>,
+    ) -> Self {
         Self::Dynamic(DynamicDisplay1Client::spawn(node, bus_root, workload_id))
     }
 }
@@ -291,6 +327,13 @@ impl Display1FrameSource for Display1Source {
         match self {
             Self::Static(client) => client.poll(now),
             Self::Dynamic(client) => client.poll(now),
+        }
+    }
+
+    fn frame_presented(&mut self) -> Result<(), drm::DrmError> {
+        match self {
+            Self::Static(client) => client.frame_presented(),
+            Self::Dynamic(client) => client.frame_presented(),
         }
     }
 }
@@ -359,6 +402,17 @@ impl DynamicDisplay1Client {
             }
         }
     }
+
+    fn frame_presented(&mut self) -> Result<(), drm::DrmError> {
+        self.client
+            .as_mut()
+            .ok_or_else(|| {
+                drm::DrmError::Present(
+                    "Display1 client disconnected before presentation acknowledgement".into(),
+                )
+            })?
+            .frame_presented()
+    }
 }
 
 impl Drop for DynamicDisplay1Client {
@@ -385,12 +439,16 @@ fn discover_and_connect(
             offered_lease = None;
         }
         if pending.is_none() && offered_lease.is_none() {
-            if let Some(lease) = discover_display1_lease(bus_root.as_deref(), &node, workload_id.as_deref()) {
+            if let Some(lease) =
+                discover_display1_lease(bus_root.as_deref(), &node, workload_id.as_deref())
+            {
                 if let Some(socket) = socket_path_for_lease(&lease.lease_id) {
                     let now_ms = current_ms();
                     match Display1Client::connect_privileged(&socket, lease.clone(), now_ms) {
                         Ok(client) => pending = Some((lease.lease_id, client)),
-                        Err(error) => tracing::debug!(target: "shell::display1", %error, "Display1 lease discovered but broker is not ready"),
+                        Err(error) => {
+                            tracing::debug!(target: "shell::display1", %error, "Display1 lease discovered but broker is not ready")
+                        }
                     }
                 }
             }
@@ -417,11 +475,12 @@ fn discover_display1_lease(
     snapshot
         .workloads
         .into_iter()
+        .filter(|status| workload_id.is_none_or(|wanted| status.workload_id.as_str() == wanted))
         .filter(|status| {
-            workload_id.is_none_or(|wanted| status.workload_id.as_str() == wanted)
-        })
-        .filter(|status| {
-            !matches!(status.phase, WorkloadOperationPhase::Failed | WorkloadOperationPhase::Cancelled)
+            !matches!(
+                status.phase,
+                WorkloadOperationPhase::Failed | WorkloadOperationPhase::Cancelled
+            )
         })
         .filter_map(|status| status.attachment)
         .filter(|lease| lease.protocol == WorkloadAttachmentProtocol::QemuDisplay1Dmabuf)
@@ -436,7 +495,10 @@ fn current_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn send_handshake(stream: &UnixStream, lease: &WorkloadAttachmentLease) -> Result<(), Display1ClientError> {
+fn send_handshake(
+    stream: &UnixStream,
+    lease: &WorkloadAttachmentLease,
+) -> Result<(), Display1ClientError> {
     let body = serde_json::to_vec(&Display1AttachHello {
         schema_version: DISPLAY1_HANDSHAKE_SCHEMA_VERSION,
         lease_id: lease.lease_id.as_str(),
@@ -444,7 +506,9 @@ fn send_handshake(stream: &UnixStream, lease: &WorkloadAttachmentLease) -> Resul
         workload_id: lease.workload_id.as_str(),
         generation: lease.generation,
     })
-    .map_err(|error| Display1ClientError::Protocol(format!("Display1 handshake encode: {error}")))?;
+    .map_err(|error| {
+        Display1ClientError::Protocol(format!("Display1 handshake encode: {error}"))
+    })?;
     if body.is_empty() || body.len() > MAX_HANDSHAKE_BYTES {
         return Err(Display1ClientError::Protocol(
             "Display1 handshake exceeds the bounded size".into(),
@@ -470,6 +534,11 @@ impl Display1FrameSource for Display1Client {
         self.try_receive(now_ms)
             .map_err(|error| drm::DrmError::Present(error.to_string()))
     }
+
+    fn frame_presented(&mut self) -> Result<(), drm::DrmError> {
+        self.acknowledge_first_present()
+            .map_err(|error| drm::DrmError::Present(error.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +547,9 @@ mod tests {
     use mackes_mesh_types::workloads::{
         WorkloadAttachmentProtocol, WorkloadId, WORKLOAD_CONTRACT_SCHEMA_VERSION,
     };
+    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage};
+    use std::io::{IoSlice, Read};
+    use std::os::fd::AsFd;
 
     #[test]
     fn lease_id_derives_the_default_node_local_socket() {
@@ -503,7 +575,7 @@ mod tests {
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
             expires_at_ms: 2_000,
         };
-        let client = Display1Client::attach(right, peer, lease.clone(), 1_000).expect("attach");
+        let mut client = Display1Client::attach(right, peer, lease.clone(), 1_000).expect("attach");
         assert!(matches!(
             client.receive(2_001),
             Err(Display1ClientError::Lease(_))
@@ -524,7 +596,7 @@ mod tests {
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
             expires_at_ms: 20_000,
         };
-        let client = Display1Client::attach(right, peer, lease, 1_000).expect("attach");
+        let mut client = Display1Client::attach(right, peer, lease, 1_000).expect("attach");
         assert!(matches!(
             client.try_receive(1_001),
             Ok(Display1FramePoll::Idle)
@@ -533,6 +605,73 @@ mod tests {
         assert!(matches!(
             client.try_receive(1_002),
             Ok(Display1FramePoll::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn presentation_acknowledgement_is_emitted_once_after_kms_success() {
+        let (mut daemon, shell) = UnixStream::pair().expect("socketpair");
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-presented".into(),
+            nonce: "nonce-presented".into(),
+            workload_id: WorkloadId::new("browser-presented").expect("workload id"),
+            generation: 3,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: u64::MAX,
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, 1_000).expect("attach");
+
+        assert!(matches!(
+            client.frame_presented(),
+            Err(drm::DrmError::Present(message)) if message.contains("before receiving")
+        ));
+
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "lease_id": "lease-presented",
+            "workload_id": "browser-presented",
+            "generation": 3,
+            "width": 64,
+            "height": 32,
+            "stride": 256,
+            "fourcc": 0x3432_5258_u32,
+            "modifier": 0,
+            "y0_top": true
+        }))
+        .expect("frame envelope");
+        let dmabuf = std::fs::File::open("/dev/null").expect("DMA-BUF fixture");
+        let descriptors = [dmabuf.as_fd()];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut control);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+        assert_eq!(
+            sendmsg(
+                &daemon,
+                &[IoSlice::new(&envelope)],
+                &mut ancillary,
+                SendFlags::empty(),
+            )
+            .expect("send frame"),
+            envelope.len()
+        );
+        assert!(matches!(
+            client.try_receive(1_001),
+            Ok(Display1FramePoll::Frame { .. })
+        ));
+
+        client.frame_presented().expect("first KMS acknowledgement");
+        let mut ack = [0_u8; 1];
+        daemon.read_exact(&mut ack).expect("daemon receives ack");
+        assert_eq!(ack, [DISPLAY1_PRESENT_ACK]);
+
+        client
+            .frame_presented()
+            .expect("repeated frame is idempotent");
+        daemon.set_nonblocking(true).expect("nonblocking daemon");
+        assert!(matches!(
+            daemon.read(&mut ack),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
     }
 
