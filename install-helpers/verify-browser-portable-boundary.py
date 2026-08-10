@@ -232,6 +232,43 @@ def validate_partial_bundle_refusal(module: ModuleType, base: Path) -> None:
         raise BoundaryError("failed source entries must not leave a partial bundle")
 
 
+def validate_existing_bundle_integrity(module: ModuleType, base: Path) -> None:
+    roots = fixture_roots(base)
+    mutations = {
+        "deleted": lambda output: (output / "payload" / "downloads" / "manual.pdf").unlink(),
+        "tampered": lambda output: (output / "payload" / "downloads" / "manual.pdf").write_bytes(
+            b"tampered-download"
+        ),
+        "unexpected": lambda output: (output / "payload" / "unexpected-secret.txt").write_text(
+            "SECRET", encoding="utf-8"
+        ),
+    }
+    for name, mutate in mutations.items():
+        output = base / f"integrity-{name}"
+        module.migrate(roots, output)
+        mutate(output)
+        try:
+            module.migrate(roots, output)
+        except module.MigrationError as exc:
+            if "existing bundle" not in str(exc):
+                raise BoundaryError(f"{name} payload failed for the wrong reason: {exc}") from exc
+        else:
+            raise BoundaryError(f"an existing bundle with a {name} payload must be refused")
+
+    output = base / "integrity-symlink"
+    module.migrate(roots, output)
+    payload = output / "payload" / "downloads" / "manual.pdf"
+    payload.unlink()
+    payload.symlink_to(roots[1][0] / "manual.pdf")
+    try:
+        module.migrate(roots, output)
+    except module.MigrationError as exc:
+        if "existing bundle" not in str(exc):
+            raise BoundaryError(f"symlinked payload failed for the wrong reason: {exc}") from exc
+    else:
+        raise BoundaryError("an existing bundle with a symlinked payload must be refused")
+
+
 def validate_source(repo_root: Path) -> None:
     module = load_migration(repo_root)
     require_policy(module)
@@ -252,6 +289,8 @@ def validate_source(repo_root: Path) -> None:
         validate_live_source_race_refusal(module, Path(raw))
     with tempfile.TemporaryDirectory(prefix="browser-portable-partial-") as raw:
         validate_partial_bundle_refusal(module, Path(raw))
+    with tempfile.TemporaryDirectory(prefix="browser-portable-integrity-") as raw:
+        validate_existing_bundle_integrity(module, Path(raw))
 
 
 def self_test() -> None:

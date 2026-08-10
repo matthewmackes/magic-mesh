@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import shutil
 import stat
 import tempfile
@@ -216,6 +217,84 @@ def manifest_for(output: Path) -> dict:
     return data
 
 
+def bundle_payload_path(output: Path, relative: object) -> Path:
+    """Resolve one manifest output without permitting bundle-root escape."""
+
+    if not isinstance(relative, str) or not relative:
+        raise MigrationError("existing bundle has an invalid payload identity")
+    portable = PurePosixPath(relative)
+    if portable.is_absolute() or portable.parts[0] != "payload" or any(
+        part in ("", ".", "..") for part in portable.parts
+    ):
+        raise MigrationError("existing bundle has an unsafe payload identity")
+    destination = output.joinpath(*portable.parts)
+    cursor = output
+    for part in portable.parts[:-1]:
+        cursor /= part
+        try:
+            metadata = cursor.lstat()
+        except OSError as error:
+            raise MigrationError(
+                f"existing bundle payload directory is unreadable: {relative}"
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise MigrationError(f"existing bundle payload directory is unsafe: {relative}")
+    return destination
+
+
+def verify_existing_bundle(output: Path, manifest: dict) -> None:
+    """Require manifest bytes and the private payload tree to agree exactly."""
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise MigrationError("existing bundle manifest entries are invalid")
+    expected_files = {"manifest.json"}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise MigrationError("existing bundle manifest entry is invalid")
+        if entry.get("status") != "imported":
+            if "output" in entry:
+                raise MigrationError("existing bundle skipped entry names a payload")
+            continue
+        relative = entry.get("output")
+        destination = bundle_payload_path(output, relative)
+        expected_size = entry.get("bytes")
+        expected_sha256 = entry.get("sha256")
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 0
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise MigrationError("existing bundle manifest payload metadata is invalid")
+        try:
+            int(expected_sha256, 16)
+        except ValueError as error:
+            raise MigrationError("existing bundle manifest payload digest is invalid") from error
+        try:
+            actual_size, actual_sha256, _identity = source_snapshot(destination)
+        except (OSError, MigrationError) as error:
+            raise MigrationError(
+                f"existing bundle payload is unreadable: {relative}"
+            ) from error
+        if actual_size != expected_size or actual_sha256 != expected_sha256:
+            raise MigrationError(
+                f"existing bundle payload differs from its manifest: {relative}"
+            )
+        if relative in expected_files:
+            raise MigrationError("existing bundle contains duplicate payload identities")
+        expected_files.add(relative)
+
+    actual_files = set()
+    for path, relative in iter_files(output):
+        if path.is_symlink():
+            raise MigrationError(f"existing bundle contains a symlink: {relative}")
+        actual_files.add(relative)
+    if actual_files != expected_files:
+        raise MigrationError("existing bundle contains missing or unexpected files")
+
+
 def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) -> dict:
     validate_roots(roots, output)
     if output.exists() and output.is_symlink():
@@ -224,6 +303,7 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
         raise MigrationError("output is not a directory")
     if output.exists() and not replace:
         previous = manifest_for(output)
+        verify_existing_bundle(output, previous)
     else:
         previous = None
 
@@ -357,6 +437,7 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
             os.chmod(destination, stat.S_IRUSR | stat.S_IWUSR)
         (staging / "manifest.json").write_text(encoded, encoding="utf-8")
         os.chmod(staging / "manifest.json", stat.S_IRUSR | stat.S_IWUSR)
+        verify_existing_bundle(staging, manifest)
         if output.exists():
             if not replace:
                 raise MigrationError("output appeared during migration; refusing overwrite")
