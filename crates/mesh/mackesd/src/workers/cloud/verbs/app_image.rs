@@ -163,7 +163,10 @@ pub(super) fn check_runtime_evidence(
     // sessions. Search newest-first for this exact identity; an unrelated
     // session's fresh heartbeat must not block a valid resume here. Once a
     // record can be identified as belonging to this request, all freshness,
-    // validation, and terminal-state checks remain fail-closed.
+    // validation, and terminal-state checks remain fail-closed. Keep the
+    // newest generation as the authority while scanning: a delayed
+    // lower-generation row must not roll back to an older guest incarnation.
+    let mut newest_matching = None;
     for message in messages.iter().rev() {
         let Some(body) = message.body.as_deref() else {
             return AppVmRuntimeAdmission::Mismatched(
@@ -197,6 +200,15 @@ pub(super) fn check_runtime_evidence(
                 evidence.vm_id
             ));
         }
+        if let Some((_, newest_generation)) = newest_matching {
+            if evidence.generation > newest_generation {
+                return AppVmRuntimeAdmission::Stale(
+                    "guest runtime evidence regressed to an older generation".to_owned(),
+                );
+            }
+            continue;
+        }
+
         if message.ts_unix_ms > now_ms
             || now_ms.saturating_sub(message.ts_unix_ms) > APP_VM_RUNTIME_STALE_AFTER_MS
         {
@@ -212,16 +224,18 @@ pub(super) fn check_runtime_evidence(
                     .unwrap_or_else(|| "guest application reported failure".to_owned()),
             );
         }
-        return AppVmRuntimeAdmission::Observed {
-            state: evidence.state,
-            generation: evidence.generation,
-        };
+        newest_matching = Some((evidence.state, evidence.generation));
     }
 
-    AppVmRuntimeAdmission::Mismatched(format!(
-        "no guest observation matches session `{}` and app `{}`",
-        request.session_id, request.app_id
-    ))
+    newest_matching.map_or_else(
+        || {
+            AppVmRuntimeAdmission::Mismatched(format!(
+                "no guest observation matches session `{}` and app `{}`",
+                request.session_id, request.app_id
+            ))
+        },
+        |(state, generation)| AppVmRuntimeAdmission::Observed { state, generation },
+    )
 }
 
 /// Check the fixed App VM image selected by `AppVmProfile`.
@@ -705,6 +719,38 @@ mod tests {
                 generation: 4,
             }
         );
+    }
+
+    #[test]
+    fn runtime_evidence_rejects_a_late_lower_generation_row() {
+        let root = tempdir().unwrap();
+        let newer = publish_runtime(
+            root.path(),
+            "session-1",
+            "org.example.Writer",
+            9,
+            AppVmRuntimeState::Connected,
+            None,
+        );
+        publish_runtime(
+            root.path(),
+            "session-1",
+            "org.example.Writer",
+            8,
+            AppVmRuntimeState::Reconnecting,
+            None,
+        );
+
+        assert!(matches!(
+            check_runtime_evidence(
+                Some(root.path()),
+                &runtime_request("session-1", "org.example.Writer"),
+                "app-vm-1",
+                newer.ts_unix_ms,
+            ),
+            AppVmRuntimeAdmission::Stale(reason)
+                if reason.contains("regressed")
+        ));
     }
 
     #[test]
