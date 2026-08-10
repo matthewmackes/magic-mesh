@@ -987,6 +987,18 @@ pub enum OpInvalid {
         /// The free space available.
         free_mib: u64,
     },
+    /// A create-partition request has no usable size or overflows its end offset.
+    #[error(
+        "device {device}: invalid partition geometry start={start_mib} size={size_mib}"
+    )]
+    InvalidPartitionGeometry {
+        /// The disk.
+        device: String,
+        /// The requested start offset.
+        start_mib: u64,
+        /// The requested size.
+        size_mib: u64,
+    },
     /// A destructive/altering op on a mounted partition (unmount first).
     #[error("partition {partition} is mounted at {mountpoint} — unmount first")]
     PartitionMounted {
@@ -1059,6 +1071,13 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
             ..
         } => {
             let disk = require_device(topo, device)?;
+            if *size_mib == 0 || start_mib.checked_add(*size_mib).is_none() {
+                return Err(OpInvalid::InvalidPartitionGeometry {
+                    device: device.clone(),
+                    start_mib: *start_mib,
+                    size_mib: *size_mib,
+                });
+            }
             if disk.table.is_none() {
                 return Err(OpInvalid::NoPartitionTable {
                     device: device.clone(),
@@ -3916,6 +3935,24 @@ mod tests {
             validate_op(&too_big, &topo),
             Err(OpInvalid::NotEnoughSpace { .. })
         ));
+    }
+
+    #[test]
+    fn validate_create_partition_rejects_zero_size_and_geometry_overflow() {
+        let topo = sample_topo();
+        for (start_mib, size_mib) in [(1, 0), (u64::MAX - 1, 2)] {
+            let op = StorageOp::CreatePartition {
+                device: "/dev/sdb".into(),
+                start_mib,
+                size_mib,
+                filesystem: None,
+                label: None,
+            };
+            assert!(matches!(
+                validate_op(&op, &topo),
+                Err(OpInvalid::InvalidPartitionGeometry { .. })
+            ));
+        }
     }
 
     #[test]
