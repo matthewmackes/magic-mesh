@@ -3775,20 +3775,42 @@ impl WorkloadComputeWorker {
                 continue;
             }
             if let Some(lease) = outcome.attachment.as_ref() {
-                if lease.workload_id != status.workload_id
-                    || lease.generation != status.generation
-                    || lease.protocol != WorkloadAttachmentProtocol::QemuDisplay1Dmabuf
-                    || lease.validate(now_ms).is_err()
-                {
+                let Some(persisted_lease) = status.attachment.as_ref() else {
                     tracing::error!(
                         request_id = %request.request_id,
-                        "terminal attachment recovery returned mismatched lease identity"
+                        "terminal attachment recovery lost its journaled lease"
                     );
+                    let mut uncommitted = status.clone();
+                    uncommitted.attachment = Some(lease.clone());
+                    self.actuator.revoke_attachment(&uncommitted);
                     self.refuse_recovered_attachment(
                         ledger,
                         status,
-                        "recovered Display1 attachment returned mismatched identity and was refused"
-                            .to_owned(),
+                        "recovered Display1 attachment had no journaled lease authority and was refused",
+                        now_ms,
+                    );
+                    continue;
+                };
+                let substituted_lease = lease != persisted_lease;
+                if substituted_lease || lease.validate(now_ms).is_err() {
+                    tracing::error!(
+                        request_id = %request.request_id,
+                        "terminal attachment recovery returned an unauthorized or invalid lease"
+                    );
+                    // The adapter may already have materialized the returned
+                    // endpoint. Revoke that exact uncommitted capability as
+                    // well as the journaled lease; otherwise a hostile or
+                    // buggy recovery result can leave an untracked Display1
+                    // socket alive after the durable projection fails closed.
+                    if substituted_lease {
+                        let mut uncommitted = status.clone();
+                        uncommitted.attachment = Some(lease.clone());
+                        self.actuator.revoke_attachment(&uncommitted);
+                    }
+                    self.refuse_recovered_attachment(
+                        ledger,
+                        status,
+                        "recovered Display1 attachment did not reproduce the exact journaled lease and was refused",
                         now_ms,
                     );
                     continue;
@@ -5765,11 +5787,55 @@ mod tests {
         assert!(refused
             .reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("mismatched identity")));
+            .is_some_and(|reason| reason.contains("exact journaled lease")));
         assert!(refused
             .remediation
             .as_deref()
             .is_some_and(|remediation| remediation.contains("current generation")));
+    }
+
+    #[test]
+    fn recovered_attachment_cannot_substitute_a_new_lease_in_the_same_generation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let request = request();
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, now);
+        let mut substituted = lease.clone();
+        substituted.lease_id = format!("{}-substituted", substituted.lease_id);
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        seed_completed_attachment(&mut ledger, request.clone(), lease.clone(), now);
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            RecoveryActuator {
+                calls: Arc::new(Mutex::new(0)),
+                revoked: Arc::clone(&revoked),
+                outcome: WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::Ready,
+                    retryable: false,
+                    reason: None,
+                    remediation: None,
+                    attachment: Some(substituted.clone()),
+                },
+            },
+        ));
+
+        worker.reconcile_recovered_attachments(&mut ledger, now);
+
+        assert_eq!(
+            revoked.lock().expect("revoked attachments").as_slice(),
+            &[
+                (substituted.lease_id, substituted.generation),
+                (lease.lease_id, lease.generation),
+            ]
+        );
+        let refused = ledger.status(&request.request_id).expect("refused status");
+        assert!(refused.attachment.is_none());
+        assert_eq!(refused.readiness, WorkloadReadiness::Unavailable);
+        assert!(refused.reason.as_deref().is_some_and(|reason| {
+            reason.contains("did not reproduce the exact journaled lease")
+        }));
     }
 
     #[test]

@@ -93,8 +93,8 @@ behavioral evidence is not completion.
   proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
-- **Recovered attachment lease checkpoint (2026-08-10):** restart recovery refuses false Ready without its Display1 lease; exact machine-193 proof:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-attachment-lease-r110.md`.
+- **Recovered attachment lease checkpoints (2026-08-10):** restart recovery refuses false Ready without its Display1 lease, requires its full journaled identity, and revokes
+  substitutions; focused `.90`/BigBoy proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-exact-recovered-attachment-identity-r130.md`.
 - **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator accepts absent/stopped-domain cleanup while rejecting unrelated failures; 23/23 passed on `.90`:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
 - **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
