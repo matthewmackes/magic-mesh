@@ -1468,7 +1468,16 @@ fn cap_front_door_query(query: &mut String) {
 fn run_command_query(query: &str) -> Option<&str> {
     let query = query.trim_start();
     let command = query.strip_prefix('>')?.trim();
-    (!command.is_empty()).then_some(command)
+    // The command lane is an explicit operator affordance, but its value is
+    // eventually handed to the terminal route.  Refuse pasted control
+    // characters (especially CR/LF) here so one input event cannot smuggle a
+    // second command or alter terminal framing.  Keep the same bounded input
+    // contract as the omnibox even when this helper is called directly by a
+    // route/test seam rather than through the egui text editor.
+    (!command.is_empty()
+        && command.chars().count() <= MAX_QUERY_CHARS
+        && !command.chars().any(char::is_control))
+        .then_some(command)
 }
 
 fn run_command_mode(query: &str) -> bool {
@@ -5638,6 +5647,24 @@ mod tests {
             action,
             Some(FrontDoorTarget::RunCommand("journalctl -xe".to_owned())),
             "Enter in > mode should return a distinct run-command target, not a ranked search hit"
+        );
+    }
+
+    #[test]
+    fn front_door_run_command_rejects_control_separators_and_oversize_input() {
+        for query in ["> echo first\nsecond", "> echo first\rsecond", "> echo\tfirst"] {
+            assert_eq!(
+                run_command_query(query),
+                None,
+                "control-separated command input must not reach the terminal route: {query:?}"
+            );
+        }
+
+        let oversized = format!("> {}", "x".repeat(MAX_QUERY_CHARS + 1));
+        assert_eq!(
+            run_command_query(&oversized),
+            None,
+            "command mode must enforce the bounded omnibox input contract"
         );
     }
 
