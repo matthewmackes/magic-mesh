@@ -630,6 +630,8 @@ behavioral evidence is not completion.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
   Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
 - Remaining work:
+- **Conflicting duplicate checkpoint (2026-08-10):** signed event-ID conflicts fail closed in log and batch; exact duplicates remain idempotent. `.90` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-10-conflicting-event-duplicates-r157.md`.
 - **Files name-operation checkpoint (2026-08-10):** New Folder and Rename are reachable through the existing `FileOps` authority, with bounded validation and atomic
   no-replace rename; machines 193/9 passed seven focused tests: `docs/platform/evidence/WL-FUNC-011-2026-08-10-files-name-operations-r23.md`.
 - **Alert delivery restart checkpoint (2026-08-09):** successful Bus/fallback
@@ -751,6 +753,8 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **RDP bitfield admission (2026-08-10):** malformed 40-byte `BI_BITFIELDS` headers are refused before image materialization; `.50` passed live-connect:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-bitfield-admission-r157.md`.
 - **Rich-session replay-capacity checkpoint (2026-08-10):** expired signed collaboration sessions release bounded ledger capacity before fresh intake while newer
   replay expiry remains monotonic; machine 9 passed the exact regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-rich-session-replay-capacity-r121.md`.
 - **RDP CF_HTML checkpoint (2026-08-10):** the production CLIPRDR adapter now
@@ -863,6 +867,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
+- **Future cache timestamps (2026-08-10):** BigBoy passed removal of future cache entries: `docs/platform/evidence/WL-FUNC-017-2026-08-10-future-cache-timestamps-r157.md`.
 - **Offline basemap admission (2026-08-10):** ambiguous or unsafe region/MBTiles candidates fail closed; `.90` passed 6/6; renderer/routing/live proof remain:
   `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
 - **Offline index corruption recovery (2026-08-09):** malformed metadata is replaced atomically; future schemas and non-regular paths fail closed. Machine 193 passed:
@@ -1515,8 +1520,9 @@ behavioral evidence is not completion.
   CPU mitigations are farm-verified; gateway phases pass focused tests; Dell/seat-15 release CPU proof passes.
   Evidence: `evidence/WL-FUNC-021-2026-08-07-runtime-status-phase-coalescing-r1.md`, `evidence/WL-FUNC-021-2026-08-07-mesh-status-dedupe-r1.md`.
   Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; three-seat CPU/NWS recovery remains open.
-- **Seat-15 CPU (2026-08-10):** live sample found Syncthing convergence plus a shell diagnostic child; no pressure/deadlock.
-  Coalescing and steady-state retest remain: `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`.
+- **Seat-15 CPU (2026-08-10):** two bounded samples found Syncthing convergence plus shell diagnostics; load stayed below capacity and no daemon was pegged.
+  Steady-state retest remains: `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`,
+  `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-retest-r157.md`.
 - **Idle-state coalescing (2026-08-10):** BigBoy passed transition/heartbeat-preserving idle suppression:
   `docs/platform/evidence/WL-FUNC-021-2026-08-10-idle-state-coalescing-r155.md`.
 - **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427` completed through `mde-musicd` while a bounded PipeWire default-sink monitor
