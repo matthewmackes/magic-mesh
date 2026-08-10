@@ -87,8 +87,12 @@ Named farm gates completed with no failed Surface test:
 The collector, physical recorder, and promotion-verifier hostile self-tests
 also pass. The collector includes 14 redaction strings, bounded fwupd fixtures,
 and nine hostile camera-result fixtures. Exact-file formatting and diff checks
-passed for the owned paths. No live hardware success was inferred from farm or
-parser tests.
+passed for the owned paths. The final current-tree card Cargo run completed
+19/19 on `.50`; its synced wrapper snapshot then exited 2 on a post-test shell
+syntax error while another session was changing the farm helper. The current
+tracked helper separately passes `bash -n`, so the Cargo result is retained and
+no wrapper-success claim is made. No live hardware success was inferred from
+farm or parser tests.
 
 ## Remaining hard gates
 
