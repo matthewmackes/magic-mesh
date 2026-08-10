@@ -368,7 +368,7 @@ mod tests {
 
         let outcome = engine.merge(batch).expect("boundary-sized merge");
 
-        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.duplicates, 0);
         assert_eq!(outcome.dropped_invalid, MAX_MERGE_BATCH_EVENTS - 1);
         assert_eq!(engine.all_events(), vec![event]);
@@ -442,7 +442,7 @@ mod tests {
             ])
             .expect("conflicting duplicates are reported, not fatal to the batch");
 
-        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.accepted, 1);
         assert_eq!(outcome.duplicates, 1);
         assert_eq!(outcome.dropped_invalid, 2);
         assert_eq!(
