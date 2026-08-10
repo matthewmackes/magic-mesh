@@ -23,6 +23,8 @@ ROLE_FILE="${MCNF_ROLE_FILE:-/var/lib/mde/role.toml}"
 HEALTH_RUN_DIR="${MCNF_HEALTH_RUN_DIR:-/run/mesh-health}"
 NEBULA_UNREACHABLE_RESTART_STAMP="${MCNF_NEBULA_UNREACHABLE_RESTART_STAMP:-$HEALTH_RUN_DIR/nebula-unreachable.restarted}"
 NEBULA_UNREACHABLE_RESTART_COOLDOWN_S="${MCNF_NEBULA_UNREACHABLE_RESTART_COOLDOWN_S:-600}"
+PEER_PUBLICATION_RESTART_STAMP="${MCNF_PEER_PUBLICATION_RESTART_STAMP:-$HEALTH_RUN_DIR/peer-publication-stale.restarted}"
+PEER_PUBLICATION_RESTART_COOLDOWN_S="${MCNF_PEER_PUBLICATION_RESTART_COOLDOWN_S:-600}"
 log() { echo "mesh-health: $*"; }       # journal via the unit's StandardOutput
 
 case "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" in
@@ -30,6 +32,12 @@ case "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" in
 esac
 if [ "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" -lt 60 ]; then
     NEBULA_UNREACHABLE_RESTART_COOLDOWN_S=600
+fi
+case "$PEER_PUBLICATION_RESTART_COOLDOWN_S" in
+    ''|*[!0-9]*) PEER_PUBLICATION_RESTART_COOLDOWN_S=600 ;;
+esac
+if [ "$PEER_PUBLICATION_RESTART_COOLDOWN_S" -lt 60 ]; then
+    PEER_PUBLICATION_RESTART_COOLDOWN_S=600
 fi
 
 # Only manage a node that has actually been enrolled.
@@ -114,6 +122,19 @@ record_nebula_unreachable_restart() {
     : > "$NEBULA_UNREACHABLE_RESTART_STAMP"
 }
 
+peer_publication_restart_due() {
+    local now stamp_mtime
+    now="$(date +%s 2>/dev/null || true)"
+    stamp_mtime="$(stat -c %Y "$PEER_PUBLICATION_RESTART_STAMP" 2>/dev/null || true)"
+    [ -z "$now" ] || [ -z "$stamp_mtime" ] \
+        || [ "$((now - stamp_mtime))" -ge "$PEER_PUBLICATION_RESTART_COOLDOWN_S" ]
+}
+
+record_peer_publication_restart() {
+    mkdir -p "$HEALTH_RUN_DIR" 2>/dev/null || true
+    : > "$PEER_PUBLICATION_RESTART_STAMP"
+}
+
 # 0. Shared-state plane health. SUBSTRATE-V2: the plane is etcd (coordination)
 #    + Syncthing (files). When this node is on the etcd coordination plane
 #    (setup-etcd wrote the endpoints file), assert etcd quorum health + the
@@ -146,14 +167,17 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
             fi
         done
         if [ "$healthy_endpoint" -eq 0 ]; then
-            coordination_failed=1
             if [ -s "$ETCD_MEMBER_FILE" ]; then
+                coordination_failed=1
                 restart etcd.service "etcd unreachable (coordination plane down)"
             else
                 # Workstations are coordination clients, not local members.
                 # Restarting their condition-skipped etcd.service cannot heal a
                 # remote quorum and creates false recovery churn every minute.
-                log "DEGRADED: coordination endpoints unreachable; client-only node has no local etcd member to restart"
+                # The lease-backed publication stamp below is the authoritative
+                # client health result: a fresh stamp proves a commit even when
+                # this extra proposal probe exceeds its short timeout.
+                log "WARN: coordination endpoint probe timed out; client-only node has no local etcd member to restart"
                 alert etcd-client "coordination endpoints unreachable; no local member to restart"
             fi
         fi
@@ -252,8 +276,17 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ] && {
         || [ "$((publication_now - publication_mtime))" -gt "$PEER_PUBLICATION_MAX_AGE_S" ];
 }; then
     publication_failed=1
-    restart mackesd-observation.service \
-        "own peer publication missing or stale (lease-backed directory transaction not committing)"
+    if peer_publication_restart_due; then
+        record_peer_publication_restart
+        restart mackesd-observation.service \
+            "own peer publication missing or stale (lease-backed directory transaction not committing)"
+    else
+        log "DEGRADED: stale peer publication; observation restart suppressed by ${PEER_PUBLICATION_RESTART_COOLDOWN_S}s cooldown"
+        alert mackesd-observation.service \
+            "own peer publication stale; repeated restart suppressed"
+    fi
+else
+    rm -f -- "$PEER_PUBLICATION_RESTART_STAMP"
 fi
 
 # 2. nebula must be active AND own the overlay interface.

@@ -67,17 +67,21 @@ the prior file is recoverable at
   such restart for 600 seconds; and
 - clears the cooldown only after a lighthouse answers, while retaining a
   degraded health result during the outage; and
-- reports unreachable remote coordination as degraded on a client-only
-  workstation without futilely restarting its condition-skipped local
-  `etcd.service`.
+- warns on a timed-out extra coordination probe on a client-only workstation
+  without futilely restarting its condition-skipped local `etcd.service`, while
+  the lease-backed publication stamp remains the authoritative client result;
+  and
+- bounds stale-publication recovery to one observation restart per 600 seconds
+  instead of restarting that group on every timer tick.
 
 The hostile regression
 `install-helpers/test-mesh-health-nebula-recovery.sh` simulates a Nebula restart
 that tears down every grouped child. It proves all six are restored, the next
 timer pass cannot restart Nebula again, an expired cooldown permits one bounded
 retry, and successful lighthouse reachability clears the guard.
-The same fixture also proves that total client-only etcd loss causes zero local
-etcd restart attempts.
+The same fixture also proves that a client-only probe timeout with a fresh
+publication causes zero local etcd restart attempts, and that persistent stale
+publication triggers one observation restart followed by cooldown suppression.
 
 Farm lane `.50`, isolated slot `crit007-t480-r1`, passed exact shell syntax and
 the complete hostile regression:
@@ -117,5 +121,6 @@ is a separate fleet task. The bundle
 format still carries `epoch: 0` and permits divergent same-path content without
 a generation/integrity winner; this slice repairs T480 and contains the restart
 blast radius but does not redesign that Rust-owned bundle authority. The new
-watchdog bytes also require the next signed package rollout before they protect
-the installed seat from a future stale-roster recurrence.
+watchdog was installed as an exact farm-verified live hotfix with a rollback
+copy, but the next signed package rollout is still required to return T480 to
+unmodified RPM payload integrity.

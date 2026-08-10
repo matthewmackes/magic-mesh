@@ -74,8 +74,7 @@ EOF
 
 cat > "$BIN/etcdctl" <<'EOF'
 #!/usr/bin/env bash
-# The hostile client-only coordination fixture has no reachable remote member.
-exit 1
+test ! -e "${MCNF_TEST_STATE:?}/etcd-unreachable"
 EOF
 
 chmod +x "$BIN"/*
@@ -90,6 +89,7 @@ run_health() {
     MCNF_ETCD_ENDPOINTS_FILE="$ROOT/etcd-endpoints" \
     MCNF_ETCD_MEMBER_FILE="$ROOT/no-etcd-member" \
     MCNF_NEBULA_UNREACHABLE_RESTART_COOLDOWN_S=60 \
+    MCNF_PEER_PUBLICATION_RESTART_COOLDOWN_S=60 \
     MESH_ALERT_BIN=/bin/false \
     "$1"
 }
@@ -134,15 +134,32 @@ grep -Fq 'mesh-health: ok' "$ROOT/healthy.log"
 printf '%s\n' 'http://10.42.0.1:2379' > "$ROOT/etcd-endpoints"
 : > "$HEALTH_RUN/peer-publication.ok"
 : > "$STATE/systemctl.log"
-if run_health "$HEALTH" > "$ROOT/client-only-etcd.log" 2>&1; then
-    echo "expected unreachable client-only coordination to report degraded" >&2
-    exit 1
-fi
+: > "$STATE/etcd-unreachable"
+run_health "$HEALTH" > "$ROOT/client-only-etcd.log" 2>&1
 grep -Fq 'client-only node has no local etcd member to restart' \
     "$ROOT/client-only-etcd.log"
+grep -Fq 'mesh-health: ok' "$ROOT/client-only-etcd.log"
 if grep -Fq 'restart etcd.service' "$STATE/systemctl.log"; then
     echo "client-only coordination loss attempted a futile local etcd restart" >&2
     exit 1
 fi
+
+# A persistent publication failure may restart observation once, but not on
+# every minute timer tick while the remote quorum remains unable to commit.
+rm -f "$STATE/etcd-unreachable"
+touch -d '3 minutes ago' "$HEALTH_RUN/peer-publication.ok"
+: > "$STATE/systemctl.log"
+if run_health "$HEALTH" > "$ROOT/publication-first.log" 2>&1; then
+    echo "expected stale publication to report degraded" >&2
+    exit 1
+fi
+test "$(grep -Fc 'restart mackesd-observation.service' "$STATE/systemctl.log")" = 1
+if run_health "$HEALTH" > "$ROOT/publication-second.log" 2>&1; then
+    echo "expected cooldown-suppressed stale publication to remain degraded" >&2
+    exit 1
+fi
+test "$(grep -Fc 'restart mackesd-observation.service' "$STATE/systemctl.log")" = 1
+grep -Fq 'observation restart suppressed by 60s cooldown' \
+    "$ROOT/publication-second.log"
 
 echo "mesh-health nebula recovery hostile regression: passed"
