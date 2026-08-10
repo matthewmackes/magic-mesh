@@ -5618,10 +5618,15 @@ fn advance_queue_cursor(engine: Option<&Engine>, queue_path: &Path) {
 /// latter matters after provider loss: the engine can finish its bounded
 /// fallback/reconnect path between sweeps and must not leave a silent peer
 /// claiming playback until the stale-state timeout.
-fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
+fn write_periodic_state(
+    engine: Option<&Engine>,
+    queue_path: &Path,
+    last_idle_state: &mut Option<MusicState>,
+) {
     let Some(engine) = engine else { return };
     let queue = queue::read_from(queue_path);
     if engine.is_playing() {
+        *last_idle_state = None;
         write_playback_state(true, queue.current().unwrap_or(""), engine.position_ms());
     } else if !engine.is_active() {
         let idle = MusicState {
@@ -5631,8 +5636,25 @@ fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
             position_ms: engine.position_ms(),
             updated_ms: state::now_ms(),
         };
-        let _ = state::write_peer_state(&state::coordination_dir(), &idle);
+        if idle_state_changed(last_idle_state.as_ref(), &idle) {
+            let _ = state::write_peer_state(&state::coordination_dir(), &idle);
+            *last_idle_state = Some(idle);
+        }
     }
+}
+
+/// Idle state is not a heartbeat: once playback ownership is cleared, writing
+/// the same non-playing snapshot every cadence only churns the coordination
+/// file and wakes readers. Keep the transition write, then suppress identical
+/// idle content until a song/position/peer change occurs.
+#[must_use]
+fn idle_state_changed(previous: Option<&MusicState>, next: &MusicState) -> bool {
+    previous.is_none_or(|previous| {
+        previous.peer != next.peer
+            || previous.playing != next.playing
+            || previous.song_id != next.song_id
+            || previous.position_ms != next.position_ms
+    })
 }
 
 /// Continue finite media after the daemon has acquired a replacement physical
@@ -5876,6 +5898,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     let phase = initial_poll_phase(&host);
     let state_write_phase = initial_state_write_phase(&host);
     let mut last_state_write = Instant::now() - STATE_WRITE_INTERVAL - state_write_phase;
+    let mut last_idle_state = None;
     let phase_deadline = Instant::now() + phase;
     while !should_stop() {
         let remaining = phase_deadline.saturating_duration_since(Instant::now());
@@ -6047,7 +6070,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             browse_poll_due = false;
         }
         if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
-            write_periodic_state(engine.as_ref(), queue_path);
+            write_periodic_state(engine.as_ref(), queue_path, &mut last_idle_state);
             if let Some(current_revision) = workspace_revision {
                 if let Some(next_revision) = current_revision.checked_add(1) {
                     let snapshot = workspace_snapshot_from_dirs(
@@ -7081,6 +7104,38 @@ mod tests {
     fn idle_non_transport_cadences_are_slower_than_control_polling() {
         assert!(POLL_INTERVAL < BROWSE_POLL_INTERVAL);
         assert!(POLL_INTERVAL < CREDS_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn unchanged_idle_state_is_coalesced_after_transition_write() {
+        let first = MusicState {
+            peer: "seat-15".to_string(),
+            playing: false,
+            song_id: "song-1".to_string(),
+            position_ms: 4_000,
+            updated_ms: 100,
+        };
+        let later = MusicState {
+            updated_ms: 5_100,
+            ..first.clone()
+        };
+
+        assert!(idle_state_changed(None, &first));
+        assert!(!idle_state_changed(Some(&first), &later));
+        assert!(idle_state_changed(
+            Some(&first),
+            &MusicState {
+                position_ms: 4_001,
+                ..later.clone()
+            }
+        ));
+        assert!(idle_state_changed(
+            Some(&first),
+            &MusicState {
+                song_id: "song-2".to_string(),
+                ..later
+            }
+        ));
     }
 
     #[test]
