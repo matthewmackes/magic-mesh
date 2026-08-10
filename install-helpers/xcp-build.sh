@@ -138,7 +138,7 @@ do_sync_revision() {
 # Run a command in the remote repo with the cargo env + the workspace config
 # (mold linker, CMAKE policy) already present via the synced .cargo/config.toml.
 remote() {
-  local remote_env="" name quoted
+  local remote_env="" name quoted remote_script
   # Live VDI proof runners set one of these target variables in their local
   # environment. Forward only the bounded endpoint inputs approved by the
   # ignored live tests; arbitrary local environment must not cross the farm
@@ -150,7 +150,14 @@ remote() {
       remote_env+=" $name=$quoted"
     fi
   done
-  "${SSH[@]}" "$DEST" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && env$remote_env $*"
+  # Keep the complete recipe inside one remote Bash program. In particular,
+  # the RPM path begins with the shell builtin `export`; executing `$*`
+  # directly after `env` made `env` look for an external program named
+  # `export`, then the following semicolon allowed an unprovenanced build to
+  # continue. `%q` preserves the recipe as one `bash -lc` argument while the
+  # existing `quote_args` layer keeps individual Cargo arguments as data.
+  printf -v remote_script '%q' "$*"
+  "${SSH[@]}" "$DEST" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && env$remote_env bash -lc $remote_script"
 }
 
 # RPM ELF dependencies are build-host facts, not adjustable header metadata.
@@ -449,6 +456,19 @@ route_self_test() {
   check "cargo argv quotes command separators" \
     "$(quote_args test -p mackesd 'camera; H')" \
     " test -p mackesd camera\\;\\ H"
+  # A promotable RPM recipe starts with `export`. It must remain a shell
+  # builtin inside the remote Bash program, never become `env export ...`.
+  local quoted_recipe
+  printf -v quoted_recipe '%q' \
+    'export MCNF_BUILD_SOURCE_REVISION=abc MCNF_BUILD_PROMOTABLE=1; cargo build'
+  check "remote recipe quotes export as one Bash program" \
+    "$quoted_recipe" \
+    "export\\ MCNF_BUILD_SOURCE_REVISION=abc\\ MCNF_BUILD_PROMOTABLE=1\\;\\ cargo\\ build"
+  printf -v quoted_recipe '%q' \
+    'export MCNF_BUILD_SOURCE_REVISION=abc MCNF_BUILD_PROMOTABLE=1; printf "%s:%s" "$MCNF_BUILD_SOURCE_REVISION" "$MCNF_BUILD_PROMOTABLE"'
+  check "remote recipe executes export inside nested Bash" \
+    "$(bash -c "env bash -lc $quoted_recipe")" \
+    "abc:1"
   check "MCNF_BUILD_SHAPE=big"    "$(MCNF_BUILD_SHAPE=big infer_shape build -p mackesd)" big
   check "MCNF_BUILD_SHAPE=small"  "$(MCNF_BUILD_SHAPE=small infer_shape build --workspace)" small
 

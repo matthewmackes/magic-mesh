@@ -1743,6 +1743,11 @@ behavioral evidence is not completion.
   reordered, optional, or revision-mismatched plans. Machine 196 passed one
   positive and 12 hostile fixtures:
   `docs/platform/evidence/WL-CRIT-006-2026-08-09-release-gate-matrix-r9.md`.
+- **Remote provenance execution checkpoint (2026-08-10):** the first F44
+  release-30 cut exposed and rejected an `env export` wrapper defect before
+  packaging; recipes now execute as one quoted remote Bash program, and `.170`
+  passed the focused nested-export regression gate:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-10-remote-provenance-execution-r11.md`.
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
      - Inputs: governance, current CI, all active P0/P1 epics.
