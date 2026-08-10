@@ -458,7 +458,9 @@ payload_compress = "xz"
 # -31 (2026-08-10): make lighthouse retirement depend on directly reachable
 # authoritative voters, isolate mirror-sync publication to its Data owner, and
 # correct taskbar/health presentation truth.
-release = "31"
+# -32 (2026-08-10): admit RDP-only Windows discovery, enforce one kernel-leased
+# owner per grouped worker process, and revoke stale terminal Display1 leases.
+release = "32"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
