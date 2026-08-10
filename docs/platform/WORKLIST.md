@@ -1499,10 +1499,7 @@ behavioral evidence is not completion.
 - **Renderer recovery checkpoint (2026-08-08):** renderer failure revokes playback/MPRIS authority; reacquisition resumes the exact finite track at its audible
   position unless a control cancels it. Two hostile `.50` regressions passed; physical PipeWire/audible and two-seat proof remain. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-renderer-recovery-r1.md`.
-- **Real-mpv Media UI checkpoint (2026-08-07):** mde-media-egui 110/110; mde-media-core mpv 257 unit,
-  1 real-mpv fixture, and 1 doctest passed. Loading clears stale video frames.
-  Physical renderer, provider-loss, handoff, and second-seat proof remain open.
-  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-media-render-clear-r1.md`.
+- **Real-mpv UI (2026-08-07):** frames clear; 110/110 UI and 257 tests passed; physical proof remains: `docs/platform/evidence/WL-FUNC-021-2026-08-07-media-render-clear-r1.md`.
 - **Continuation (2026-08-07):** mde-musicd 182/182, roaming root-loss 18/18,
   reconnect 8/8, mesh-router 26/26, and Dell CPU proof max 385‰/mean 283‰
   passed. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-root-loss-r1.md`,
@@ -1518,6 +1515,8 @@ behavioral evidence is not completion.
   Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; three-seat CPU/NWS recovery remains open.
 - **Seat-15 CPU (2026-08-10):** live sample found Syncthing convergence plus a shell diagnostic child; no pressure/deadlock.
   Coalescing and steady-state retest remain: `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`.
+- **Idle-state coalescing (2026-08-10):** BigBoy passed transition/heartbeat-preserving idle suppression:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-10-idle-state-coalescing-r155.md`.
 - **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427` completed through `mde-musicd` while a bounded PipeWire default-sink monitor
   captured 26.8 MiB of 48 kHz stereo s32le; 6,287,357/6,717,440 samples were
   nonzero and playback returned 0. Temporary capture files were removed.
@@ -1831,6 +1830,10 @@ behavioral evidence is not completion.
   packaging; recipes now execute as one quoted remote Bash program, and `.170`
   passed the focused nested-export regression gate:
   `docs/platform/evidence/WL-CRIT-006-2026-08-10-remote-provenance-execution-r11.md`.
+- **Unique evidence claims (2026-08-10):** release verification rejects one
+  artifact reused across independent gates; canonical matrix validation passed
+  17 required gates and 15 hostile fixtures:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-10-unique-evidence-claims-r155.md`.
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
      - Inputs: governance, current CI, all active P0/P1 epics.
@@ -2375,6 +2378,9 @@ behavioral evidence is not completion.
   resolved conditions are excluded, and fresh informational expected absence
   remains non-outage. Machine 193 passed the exact focused test:
   `docs/platform/evidence/WL-UX-013-2026-08-10-stale-status-cell-r12.md`.
+- **Future-heartbeat checkpoint (2026-08-10):** future-dated heartbeats resolve
+  to `Unreachable` instead of fresh health; `.90` passed:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-future-heartbeat-r155.md`.
 - **Recovery target checkpoint (2026-08-09):** a condition cannot authorize remediation on another node; machine 194 passed 13/13:
   `docs/platform/evidence/WL-UX-013-2026-08-09-recovery-target-binding-r3.md`.
 - **Grade E authority checkpoint (2026-08-09):** two distinct active required warnings produce E without duplicate-delivery inflation; machines 9 and 194 passed the

@@ -1232,6 +1232,11 @@ fn compute_health_for_peer(
         Ok(h) => h,
         Err(_) => return HealthState::Unreachable,
     };
+    // A future-dated heartbeat is not fresh evidence: accepting it as age zero
+    // would let clock-skewed or forged input keep a peer green indefinitely.
+    if hb.at_ms > now_ms {
+        return HealthState::Unreachable;
+    }
     let age_ms = (now_ms - hb.at_ms).max(0);
     health_state_from_age(age_ms as u64)
 }
@@ -2208,6 +2213,26 @@ mod tests {
         assert_eq!(health_from_etcd("node-c", &live), HealthState::Degraded);
         // Absent ⇒ the keepalive lease expired ⇒ Unreachable.
         assert_eq!(health_from_etcd("ghost", &live), HealthState::Unreachable);
+    }
+
+    #[test]
+    fn future_heartbeat_is_not_admitted_as_fresh_health_evidence() {
+        let root = tempfile::tempdir().expect("temporary health root");
+        let now = 1_700_000_000_000i64;
+        let heartbeat = Heartbeat {
+            node_id: "peer:remote".into(),
+            at_ms: now + 1,
+            agent_version: "test".into(),
+            applied_revision: None,
+            health: HealthState::Healthy,
+        };
+        write_heartbeat(root.path(), &heartbeat).expect("write future heartbeat");
+
+        assert_eq!(
+            compute_health_for_peer(root.path(), "peer:remote", now),
+            HealthState::Unreachable,
+            "future-dated evidence must fail closed instead of becoming healthy"
+        );
     }
 
     #[test]
