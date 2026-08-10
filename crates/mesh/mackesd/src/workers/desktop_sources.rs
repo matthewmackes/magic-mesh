@@ -2768,8 +2768,16 @@ fn read_peer_records_bounded(dir: &Path) -> Result<Vec<PeerRecord>, String> {
                 path.display()
             ));
         }
-        let file = std::fs::File::open(&path)
-            .map_err(|error| format!("open peer record {}: {error}", path.display()))?;
+        let file: std::fs::File = rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| format!("open peer record {}: {error}", path.display()))?
+        .into();
         let opened = file
             .metadata()
             .map_err(|error| format!("inspect open peer record {}: {error}", path.display()))?;
@@ -4513,6 +4521,17 @@ mod tests {
                 "final symlinks must not be followed"
             );
         }
+    }
+
+    #[test]
+    fn peer_record_open_refuses_final_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, "{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dir.path().join("peer.json")).unwrap();
+        #[cfg(unix)]
+        assert!(read_peer_records_bounded(dir.path()).is_err());
     }
 
     // ── the merge fold ──

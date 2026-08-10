@@ -755,6 +755,8 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **VDI replay expiry:** `.90` passed bounded expired-session cleanup before fresh clipboard admission:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-expiry-r182.md`.
 - **Guest HTML safety checkpoint (2026-08-10):** active guest CF_HTML is refused before host publication; seat 90 passed the exact live-connect regression:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-guest-html-safety-r160.md`.
 - **RDP bitfield admission (2026-08-10):** malformed 40-byte `BI_BITFIELDS` headers are refused before image materialization; `.50` passed live-connect:
@@ -1179,6 +1181,8 @@ behavioral evidence is not completion.
   whose latest endpoint test failed remains unavailable and cannot expose a typed
   `launch` action; seat 90 passed the focused regression:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-failed-service-probe-launch-r164.md`.
+- **Peer-record nofollow:** `.90` passed final-symlink refusal at the record-open boundary:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-peer-record-nofollow-r180.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
 - **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card
@@ -2385,6 +2389,8 @@ behavioral evidence is not completion.
   oversized availability TTLs. Expected-state publishers, transition
   evaluation, history/detail, recovery/export, and three-seat proof remain.
 - Remaining work:
+- **Future health freshness:** `.50` passed refusal of zero/future-dated snapshots:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-future-health-freshness-r181.md`.
 - **Health expiry projection checkpoint (2026-08-10):** expired checkpoint state and stale invalid projections fail closed without touching symlinks; BigBoy passed:
   `docs/platform/evidence/WL-UX-013-2026-08-10-health-expiry-projection-r160.md`.
 - **Availability duplicate-precedence checkpoint (2026-08-10):** duplicate evidence is classified before at-capacity overflow in forward and reversed order, while a
