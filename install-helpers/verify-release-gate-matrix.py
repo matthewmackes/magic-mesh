@@ -127,6 +127,7 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
         fail("gates must be an array")
     ids: list[str] = []
     scope_claims: set[tuple[str, str]] = set()
+    evidence_claims: set[str] = set()
     scenario_claims: set[str] = set()
     for index, raw_gate in enumerate(gates):
         label = f"gates[{index}]"
@@ -194,6 +195,9 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
         evidence = gate["evidence_filename"]
         if not EVIDENCE_RE.fullmatch(evidence) or f"/{revision}/" not in evidence:
             fail(f"{label}.evidence_filename must be a revision-bound canonical JSON filename")
+        if evidence in evidence_claims:
+            fail(f"{label}.evidence_filename is reused by independent gate claims")
+        evidence_claims.add(evidence)
         if gate["revision_ref"] != "source_revision":
             fail(f"{label}.revision_ref must bind the sole canonical source_revision")
         if gate["required"] is not True:
@@ -268,6 +272,12 @@ def self_test() -> None:
     case("missing owner", lambda value: value["gates"][0].__setitem__("owner", ""))
     case("missing command", lambda value: value["gates"][0].__setitem__("command", ""))
     case("missing evidence", lambda value: value["gates"][0].__setitem__("evidence_filename", ""))
+    case(
+        "reused evidence claim",
+        lambda value: value["gates"][1].__setitem__(
+            "evidence_filename", value["gates"][0]["evidence_filename"]
+        ),
+    )
     case(
         "duplicate node claim",
         lambda value: value["gates"][next(
