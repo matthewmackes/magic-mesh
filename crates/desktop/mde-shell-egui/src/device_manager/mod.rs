@@ -139,6 +139,8 @@
               main.rs consumes them"
 )]
 
+mod surface_fleet;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -172,6 +174,7 @@ use serde::Deserialize;
 use crate::about;
 use crate::explorer::local_hostname;
 use crate::toast_bridge::TOAST_TOPIC;
+use surface_fleet::SurfaceFleetReadModel;
 
 /// Re-read THIS node's published inventory this often (design #8 — the ~30 s
 /// auto-refresh; the producer republishes on its own cadence). A Scan forces an
@@ -1483,6 +1486,10 @@ pub(crate) struct DeviceManagerState {
     /// ([`build_node_tree`]) flattens. Refreshed on every read; the By-type /
     /// By-connection views read only [`Self::inventory`] and ignore it.
     all_inventories: Vec<DeviceInventory>,
+    /// Compact read-only fold of every `state/hardware/surface/<node>` summary.
+    /// It is deliberately separate from the selected-host inventory and owns no
+    /// action seam: remote Surface nodes can never open local controls.
+    surface_fleet: SurfaceFleetReadModel,
     /// The DEVMGR-11 non-PC hosts (#6) — Nova instances, paired phones, LAN
     /// hosts, routers, vehicle gateways — each with its synthesized
     /// honest-partial tree (#22), gathered from their real sources on every
@@ -1534,6 +1541,7 @@ impl Default for DeviceManagerState {
             hosts: Vec::new(),
             inventory: None,
             all_inventories: Vec::new(),
+            surface_fleet: SurfaceFleetReadModel::default(),
             non_pc: Vec::new(),
             bus_root: mde_bus::client_data_dir(),
             seen: false,
@@ -1589,6 +1597,7 @@ impl DeviceManagerState {
         // and the router-registry mirrors.
         let non_pc = read_non_pc(&self.workgroup_root, self.bus_root.as_deref());
         self.hosts = merge_rail(build_rail(&all, &self.local_host), &non_pc);
+        self.surface_fleet = surface_fleet::read_surface_fleet(self.bus_root.as_deref(), now_ms());
         self.inventory = all
             .iter()
             .find(|inv| inv.host == self.selected_host)
@@ -1614,6 +1623,12 @@ impl DeviceManagerState {
             .iter()
             .find(|h| h.host == self.selected_host)
             .map_or(HostKind::Node, |h| h.kind)
+    }
+
+    /// Mutation stays on This Node. Remote mesh-node inventories and Surface
+    /// summaries are inspection-only even though those peers run a worker.
+    fn selected_controllable(&self) -> bool {
+        self.selected_kind().controllable() && self.selected_host == self.local_host
     }
 
     /// The selected non-PC host's explicit-unknowns source note (DEVMGR-11, §7),
@@ -1899,11 +1914,11 @@ impl DeviceManagerState {
     /// Stage the typed-arming confirm for a privileged device op on the selected
     /// device (MENU-5 → DEVMGR-8, #14) — the Device-menu twin of the row
     /// context-menu's Control verb, routing through the very same [`DeviceArming`]
-    /// stage + [`Self::dispatch_control`]. Guarded on a mesh-node host + a live
-    /// selection (§7 — a non-PC host / no selection never arms), so nothing reaches
-    /// a node until the operator echoes the device name.
+    /// stage + [`Self::dispatch_control`]. Guarded on This Node + a live selection,
+    /// so a remote or non-PC host never arms and nothing reaches the local worker
+    /// until the operator echoes the device name.
     fn arm_control(&mut self, op: DeviceControlOp) {
-        if !self.selected_kind().controllable() {
+        if !self.selected_controllable() {
             return;
         }
         // Resolve the target from the immutable read, then release that borrow before
@@ -2129,13 +2144,12 @@ impl DeviceManagerState {
     /// details** (any host kind), then — on a **mesh node**, the only kind that runs
     /// the `device_control` worker (§7) — the armed **Enable / Disable / Reload
     /// driver module / Rescan bus** verbs, each opening the typed-arming confirm
-    /// (#14) and context-gated on a live selection. A non-PC host honestly OMITS the
-    /// privileged verbs (the exact disclosure the row context-menu shows), never a
-    /// greyed placebo. No device selected reads a leading caption so the disabled
-    /// items have context.
+    /// (#14) and context-gated on a live selection under This Node. Remote nodes
+    /// and non-PC hosts honestly omit privileged verbs, never a greyed placebo.
+    /// No device selected reads a leading caption so disabled items have context.
     fn device_menu(&self) -> Menu<MenuAction> {
         let has_device = self.selected_device().is_some();
-        let controllable = self.selected_kind().controllable();
+        let controllable = self.selected_controllable();
         let mut entries = Vec::new();
         if !has_device {
             entries.push(Entry::Caption(
@@ -2157,13 +2171,13 @@ impl DeviceManagerState {
                 ));
             }
             entries.push(Entry::Caption(
-                "Enable/Disable, reload + rescan run on the node \u{2014} armed, audited."
+                "Enable/Disable, reload + rescan run on This Node \u{2014} armed, audited."
                     .to_string(),
             ));
         } else {
             entries.push(Entry::Caption(
-                "Enable/Disable + driver ops apply to mesh nodes only \u{2014} this host \
-                 runs no mesh device-control worker."
+                "Remote inventory is read-only \u{2014} device controls are available only on \
+                 This Node."
                     .to_string(),
             ));
         }
@@ -2229,9 +2243,9 @@ impl DeviceManagerState {
         let mut clicked: Option<DeviceSelection> = None;
         let mut action: Option<RowActionRequest> = None;
         let selected = self.selected.clone();
-        // DEVMGR-11 — privileged DEVMGR-8 verbs only reach a mesh node's mackesd;
-        // a non-PC host's rows honestly omit them (§7).
-        let allow_control = self.selected_kind().controllable();
+        // Privileged DEVMGR-8 verbs stay on This Node. Remote and non-PC rows
+        // honestly omit them.
+        let allow_control = self.selected_controllable();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2308,8 +2322,11 @@ impl DeviceManagerState {
             }
             // DEVMGR-8 — a privileged verb never fires from the menu: it stages the
             // typed-arming confirm (#14). The echoed confirm (render_arming) then
-            // dispatches it to the selected host's mackesd.
+            // dispatches it to This Node's mackesd.
             RowActionRequest::Control { op, target } => {
+                if !self.selected_controllable() {
+                    return;
+                }
                 self.arming = Some(DeviceArming {
                     op,
                     target: *target,
@@ -2423,17 +2440,14 @@ impl DeviceManagerState {
             target_host,
             typed: _,
         } = arming;
-        // DEVMGR-11 kind gate (§7): only a mesh node runs the device_control
-        // worker that drains these requests — a non-PC target (instance / phone /
-        // LAN host / router) is refused honestly, never a request that would sit
-        // in a dir nothing reads. (The context menu already omits the verbs for
-        // these hosts; this is the seam-level backstop.)
-        if !self.selected_kind().controllable() {
+        // This Node authority gate: remote inventory is read-only even when the
+        // peer runs a device-control worker. Non-PC targets are also refused.
+        if !self.selected_controllable() || target_host != self.local_host {
             raise_toast(
                 "warning",
                 &format!(
-                    "{target_host} is not a mesh node \u{2014} device ops need the node-side \
-                     mesh worker, so {} was not dispatched",
+                    "{target_host} is read-only from this seat \u{2014} device ops stay on This \
+                     Node, so {} was not dispatched",
                     op.as_str()
                 ),
             );
@@ -2996,7 +3010,7 @@ impl DeviceManagerState {
         // borrow ends before the mutate-after-frame toggle/selection below.
         let tree = self.inventory.as_ref().map(build_connection_tree);
         // DEVMGR-11 — same mesh-node-only gate as the by-type tree.
-        let allow_control = self.selected_kind().controllable();
+        let allow_control = self.selected_controllable();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -3081,6 +3095,8 @@ impl DeviceManagerState {
         // Build an owned tree (clones the records) so the immutable fleet borrow
         // ends before the mutate-after-frame toggle/selection below.
         let tree = build_node_tree(&self.all_inventories, &self.local_host);
+        surface_fleet::render(ui, &self.surface_fleet);
+        ui.add_space(Style::SP_S);
         fleet_header(ui, &tree);
         ui.add_space(Style::SP_S);
         egui::ScrollArea::vertical()
@@ -3093,8 +3109,15 @@ impl DeviceManagerState {
                 for host in &tree.hosts {
                     let open = self.expanded.contains(node_key(&host.host).as_str());
                     let is_selected_host = host.host == selected_host;
-                    let out =
-                        node_host_header(ui, host, open, selected.as_ref(), is_selected_host, now);
+                    let out = node_host_header(
+                        ui,
+                        host,
+                        open,
+                        selected.as_ref(),
+                        is_selected_host,
+                        host.host == self.local_host,
+                        now,
+                    );
                     if out.header_clicked {
                         toggled = Some(node_key(&host.host));
                     }
@@ -3950,6 +3973,7 @@ fn node_host_header(
     open: bool,
     selected: Option<&DeviceSelection>,
     is_selected_host: bool,
+    allow_control: bool,
     now_ms: u64,
 ) -> CategoryOutcome {
     // An absent host is a leaf — nothing published, nothing to expand (§7).
@@ -3996,9 +4020,9 @@ fn node_host_header(
                     // the same key on a different host must not read as selected).
                     let is_sel =
                         is_selected_host && selected.is_some_and(|s| s.matches(&cat.key, dev));
-                    // By-node flattens published MESH-NODE inventories only
-                    // (DEVMGR-10), so the DEVMGR-8 verbs are always live here.
-                    let out = device_row(ui, dev, &cat.key, is_sel, true);
+                    // Fleet rows are readable for every peer, but mutation is
+                    // offered only for This Node.
+                    let out = device_row(ui, dev, &cat.key, is_sel, allow_control);
                     if out.clicked {
                         clicked = Some(DeviceSelection::of(&cat.key, dev));
                     }

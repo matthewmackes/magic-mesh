@@ -5,9 +5,10 @@ use super::{
     humanize_ago, humanize_uptime, now_ms, read_phones, read_routers, render_device_details,
     render_json, render_report, sanitize, scanned_label, write_export, DeviceAction, DeviceArming,
     DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness, MenuAction,
-    RouterEditDraft, RowActionRequest, ViewMode, MAX_REPLICATED_DEVICE_MIRROR_BYTES, STALE_AFTER,
+    RouterEditDraft, RowActionRequest, SurfaceFleetReadModel, ViewMode,
+    MAX_REPLICATED_DEVICE_MIRROR_BYTES, STALE_AFTER,
 };
-use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
+use mackes_mesh_types::device_control::{self, DeviceControlOp, DeviceTarget};
 use mackes_mesh_types::device_inventory::{
     self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
@@ -71,6 +72,7 @@ fn state_with(inv: Option<DeviceInventory>, seen: bool) -> DeviceManagerState {
         // Seed the fleet set with the given inventory so a By-node render off a
         // bare state (no refresh) is coherent; a `refresh` repopulates it.
         all_inventories: inv.iter().cloned().collect(),
+        surface_fleet: SurfaceFleetReadModel::default(),
         inventory: inv,
         non_pc: Vec::new(),
         bus_root: None,
@@ -2616,6 +2618,63 @@ fn arm_control_stages_the_typed_arming_confirm_and_a_non_node_never_arms() {
     assert!(
         phone.arming.is_none(),
         "a non-node host never arms from the bar"
+    );
+}
+
+#[test]
+fn remote_mesh_node_inventory_is_read_only_at_every_device_control_seam() {
+    let scratch = ScratchRoot::new("remote-read-only");
+    let remote = host_inventory("remote-surface");
+    let mut state = state_with(Some(remote.clone()), true);
+    state.workgroup_root = scratch.path().to_path_buf();
+    state.hosts = build_rail(&[host_inventory("laptop-mm"), remote], "laptop-mm");
+    state.selected_host = "remote-surface".to_string();
+    state.selected = Some(DeviceSelection::of(category::PCI_DEVICES, &orphan()));
+
+    assert!(!state.selected_controllable());
+    let device_menu = &state.build_menus()[3];
+    assert!(
+        device_menu
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry, Entry::Item(item) if matches!(item.id, MenuAction::ArmControl(_)))),
+        "remote mesh-node inventory must not expose an armed device verb"
+    );
+
+    state.arm_control(DeviceControlOp::Disable);
+    assert!(state.arming.is_none(), "remote menu seam never arms");
+    state.apply_row_action(
+        RowActionRequest::Control {
+            op: DeviceControlOp::Disable,
+            target: Box::new(DeviceTarget::new("Remote device", category::PCI_DEVICES)),
+        },
+        &egui::Context::default(),
+    );
+    assert!(state.arming.is_none(), "remote row seam never arms");
+
+    state.dispatch_control(DeviceArming {
+        op: DeviceControlOp::Disable,
+        target: DeviceTarget::new("Remote device", category::PCI_DEVICES),
+        target_host: "remote-surface".to_string(),
+        typed: "Remote device".to_string(),
+    });
+    assert!(
+        device_control::take_requests(scratch.path(), "remote-surface").is_empty(),
+        "remote backstop must never persist a device-control request"
+    );
+
+    // A stale or forged arming cannot acquire local authority merely because
+    // the operator changes the visible selection back to This Node.
+    state.selected_host = "laptop-mm".to_string();
+    state.dispatch_control(DeviceArming {
+        op: DeviceControlOp::Disable,
+        target: DeviceTarget::new("Remote device", category::PCI_DEVICES),
+        target_host: "remote-surface".to_string(),
+        typed: "Remote device".to_string(),
+    });
+    assert!(
+        device_control::take_requests(scratch.path(), "remote-surface").is_empty(),
+        "target identity must remain bound to This Node at dispatch"
     );
 }
 
