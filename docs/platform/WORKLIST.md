@@ -326,6 +326,9 @@ behavioral evidence is not completion.
 - **Dell Display1/RDP (2026-08-09):** guest RDP boot proof: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
 - **Host-browser profile (2026-08-10):** manifest self-test passed: `docs/platform/evidence/WL-ARCH-008-2026-08-10-host-browser-profile-refusal-r156.md`.
 - Remaining work:
+- **Portable bundle integrity (2026-08-10):** payload size/hash, symlink,
+  duplicate, and unexpected-file checks passed `.90`:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-10-portable-bundle-integrity-r176.md`.
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
      - Inputs: current repo commit, Browser inventory, licenses.
@@ -1832,6 +1835,9 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- **Evidence identity binding (2026-08-10):** the release verifier rejects
+  cross-wired seat evidence filenames; `.90` passed 1 valid and 16 hostile
+  fixtures: `docs/platform/evidence/WL-CRIT-006-2026-08-10-evidence-identity-r177.md`.
 - **Release-32 native-F44 three-seat checkpoint (2026-08-10):** an F42 candidate was rejected before install; the corrected signed F44 artifact then passed integrity,
   transaction, package, grouped-runtime, and Dell Browser-VM preservation on exactly Dell, seat 15, and Surface:
   `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
