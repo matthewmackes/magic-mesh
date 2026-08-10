@@ -234,6 +234,11 @@ impl OfflineTileCache {
                 }
             };
         }
+        if self.entries[position].verified_at_ms > now_ms
+            || self.entries[position].last_access_ms > now_ms
+        {
+            return self.remove_bad(position, UnavailableReason::CorruptRemoved, None);
+        }
         if now_ms.saturating_sub(self.entries[position].verified_at_ms) > self.policy.max_age_ms {
             return match self.remove_position(position) {
                 Ok(()) => OfflineTile::Unavailable(UnavailableReason::Expired),
@@ -701,6 +706,35 @@ mod tests {
         assert!(matches!(
             cache.lookup(&catalog(), &id, 111),
             OfflineTile::Unavailable(UnavailableReason::Expired)
+        ));
+    }
+
+    #[test]
+    fn future_cache_timestamps_are_rejected_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CachePolicy::bounded(1024, 10_000).unwrap();
+        let id = tile(0);
+        let digest = sha256_hex(b"future");
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        cache
+            .store_verified(&catalog(), id.clone(), b"future", &digest, 10)
+            .unwrap();
+
+        let index_path = dir.path().join(INDEX_FILE);
+        let mut index: CacheIndex = serde_json::from_slice(&std::fs::read(&index_path).unwrap())
+            .unwrap();
+        index.entries[0].verified_at_ms = 20;
+        index.entries[0].last_access_ms = 20;
+        std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+        let mut restarted = OfflineTileCache::open(dir.path(), policy).unwrap();
+        assert!(matches!(
+            restarted.lookup(&catalog(), &id, 19),
+            OfflineTile::Unavailable(UnavailableReason::CorruptRemoved)
+        ));
+        assert!(matches!(
+            restarted.lookup(&catalog(), &id, 19),
+            OfflineTile::Unavailable(UnavailableReason::NotIndexed)
         ));
     }
 
