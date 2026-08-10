@@ -2157,6 +2157,16 @@ fn desktop_client_capability(
             ));
         }
     };
+    // Every shipped native desktop adapter carries its bounded text clipboard
+    // channel (RDP CLIPRDR, VNC ClientCutText/ServerCutText, or SPICE agent).
+    // Advertising only display/input made Remote Sessions hide a live feature
+    // that the selected adapter actually exposes after authorization.
+    let features = vec![
+        ClientFeature::Display,
+        ClientFeature::KeyboardInput,
+        ClientFeature::PointerInput,
+        ClientFeature::ClipboardText,
+    ];
     ClientCapability::new(
         adapter_id,
         "1",
@@ -2164,11 +2174,7 @@ fn desktop_client_capability(
         "1",
         ClientBoundary::ShellNative,
         vec![AuthMethod::MeshIdentity, AuthMethod::LocalApproval],
-        vec![
-            ClientFeature::Display,
-            ClientFeature::KeyboardInput,
-            ClientFeature::PointerInput,
-        ],
+        features,
         ClientCapabilityLimits {
             max_width: Some(3_840),
             max_height: Some(2_160),
@@ -4704,6 +4710,34 @@ mod tests {
                 .find(|action| action.verb == ResourceActionVerb::Connect)
                 .expect("typed transport has a connect action");
             assert_eq!(connect.availability.status, connect_status);
+        }
+    }
+
+    #[test]
+    fn desktop_resource_capabilities_include_the_live_text_clipboard_channel() {
+        for source in [
+            source_from_mdns(&ep("OfficePC", "192.168.1.60", 3389, DesktopProtocol::Rdp)),
+            source_from_manual(&ManualSource {
+                name: Some("vnc-fixture".into()),
+                host: "192.168.1.61".into(),
+                port: 5900,
+                protocol: DesktopProtocol::Vnc,
+            }),
+            source_from_vm(
+                "elm",
+                &Instance {
+                    id: "clipboard-vm".into(),
+                    name: "spice-fixture".into(),
+                    state: "running".into(),
+                },
+            ),
+        ] {
+            let card = resource_card_from_desktop_source(&source, RESOURCE_NOW)
+                .expect("desktop resource card");
+            assert_eq!(card.client_capabilities.len(), 1);
+            assert!(card.client_capabilities[0]
+                .features
+                .contains(&ClientFeature::ClipboardText));
         }
     }
 
