@@ -34,6 +34,35 @@ const SUPPORT_BUNDLE_MAX_RESOLVED: usize = 32;
 const SUPPORT_BUNDLE_MAX_FACTS: usize = 8;
 const SUPPORT_BUNDLE_MAX_TEXT_BYTES: usize = 192;
 const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
+const HISTORY_FILTER_STATE_ID: &str = "health-history-severity-filter";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum HistorySeverityFilter {
+    #[default]
+    All,
+    Warning,
+    Critical,
+}
+
+impl HistorySeverityFilter {
+    const ALL: [Self; 3] = [Self::All, Self::Warning, Self::Critical];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All severities",
+            Self::Warning => "Warning",
+            Self::Critical => "Critical",
+        }
+    }
+
+    const fn admits(self, severity: HealthSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Warning => matches!(severity, HealthSeverity::Warning),
+            Self::Critical => matches!(severity, HealthSeverity::Critical),
+        }
+    }
+}
 
 pub(crate) fn mount(
     ctx: &egui::Context,
@@ -480,14 +509,32 @@ fn detail(
     }
 
     if let Some(snapshot) = snapshot {
-        let resolved = recurrence_history(
+        let all_resolved = recurrence_history(
             &snapshot.resolved_conditions,
             &node,
             snapshot.generated_at_ms,
         );
-        if !resolved.is_empty() {
+        if !all_resolved.is_empty() {
             ui.separator();
             ui.strong("Recent History");
+            let mut filter = history_filter(ui.ctx());
+            egui::ComboBox::from_id_salt("health-history-severity-filter-combo")
+                .selected_text(filter.label())
+                .show_ui(ui, |ui| {
+                    for choice in HistorySeverityFilter::ALL {
+                        ui.selectable_value(&mut filter, choice, choice.label());
+                    }
+                });
+            set_history_filter(ui.ctx(), filter);
+            let resolved = filtered_recurrence_history(
+                &snapshot.resolved_conditions,
+                &node,
+                snapshot.generated_at_ms,
+                filter,
+            );
+            if resolved.is_empty() {
+                ui.colored_label(Style::TEXT_DIM, "No history matches this filter.");
+            }
             for recurrence in resolved {
                 let condition = recurrence.condition;
                 let recurrence_copy = if recurrence.occurrences == 1 {
@@ -1334,6 +1381,17 @@ fn resolution_duration_ms(condition: &HealthCondition) -> Option<u64> {
         .map(|resolved| resolved.saturating_sub(condition.active_since_ms))
 }
 
+fn history_filter(ctx: &egui::Context) -> HistorySeverityFilter {
+    ctx.data(|data| {
+        data.get_temp::<HistorySeverityFilter>(egui::Id::new(HISTORY_FILTER_STATE_ID))
+            .unwrap_or_default()
+    })
+}
+
+fn set_history_filter(ctx: &egui::Context, filter: HistorySeverityFilter) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_FILTER_STATE_ID), filter));
+}
+
 struct HistoryRecurrence<'a> {
     condition: &'a HealthCondition,
     occurrences: usize,
@@ -1350,9 +1408,19 @@ fn recurrence_history<'a>(
     node: &str,
     as_of_ms: u64,
 ) -> Vec<HistoryRecurrence<'a>> {
+    filtered_recurrence_history(conditions, node, as_of_ms, HistorySeverityFilter::All)
+}
+
+fn filtered_recurrence_history<'a>(
+    conditions: &'a [HealthCondition],
+    node: &str,
+    as_of_ms: u64,
+    filter: HistorySeverityFilter,
+) -> Vec<HistoryRecurrence<'a>> {
     let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
     let applies_to_page = |condition: &HealthCondition| {
         matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
+            && filter.admits(condition.severity)
             && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
                 (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
             })
@@ -2024,6 +2092,53 @@ mod tests {
         assert!(page.iter().all(|recurrence| {
             matches!(&recurrence.condition.scope, HealthScope::Node { node } if node == "node")
         }));
+    }
+
+    #[test]
+    fn history_severity_filters_apply_before_the_bounded_recurrence_page() {
+        let mut conditions = Vec::new();
+        for index in 0..32 {
+            let severity = if index % 2 == 0 {
+                HealthSeverity::Warning
+            } else {
+                HealthSeverity::Critical
+            };
+            let mut resolved = condition(
+                &format!("node:resolved-{index:02}"),
+                "node",
+                severity,
+                HealthComponent::System,
+            );
+            resolved.resolved_at_ms = Some(2_000 + index);
+            conditions.push(resolved);
+        }
+
+        for (filter, expected) in [
+            (HistorySeverityFilter::Warning, HealthSeverity::Warning),
+            (HistorySeverityFilter::Critical, HealthSeverity::Critical),
+        ] {
+            let page = filtered_recurrence_history(&conditions, "node", 100_000, filter);
+            assert_eq!(
+                page.len(),
+                HISTORY_PAGE_SIZE,
+                "each filter fills one bounded page from matching records"
+            );
+            assert!(page
+                .iter()
+                .all(|recurrence| recurrence.condition.severity == expected));
+        }
+
+        assert_eq!(
+            filtered_recurrence_history(
+                &conditions,
+                "missing-node",
+                100_000,
+                HistorySeverityFilter::Critical,
+            )
+            .len(),
+            0,
+            "a filter never widens node scope"
+        );
     }
 
     #[test]

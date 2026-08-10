@@ -2365,6 +2365,11 @@ behavioral evidence is not completion.
   24-hour window; future, unresolved, and older high-severity rows cannot
   displace valid history. BigBoy passed the exact hostile filter test:
   `docs/platform/evidence/WL-UX-013-2026-08-09-history-window-filter-r8.md`.
+- **History severity-filter checkpoint (2026-08-10):** the Health detail view
+  now applies All/Warning/Critical selection before recurrence aggregation and
+  the eight-row cap, while preserving node and 24-hour bounds. BigBoy passed
+  the exact regression plus the four-test related history suite:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-history-severity-filter-r140.md`.
 - **Health-action publication checkpoint (2026-08-09):** missing, unreadable,
   or unwritable local Bus state now produces a visible bounded modal error;
   confirmed recovery intent remains pending until its generation- and
