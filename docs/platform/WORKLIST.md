@@ -581,7 +581,7 @@ behavioral evidence is not completion.
   7. S7 Prove fleet isolation and convergence.
      - Objective: run crashes, provider loss, saturation, stale snapshots, staged change, forced partial failure, and corrected-forward recovery.
      - Inputs: S4-S6 and CRIT-006/007.
-     - Deliverable: five-workstation/three-lighthouse evidence bundle.
+     - Deliverable: at-most-three-workstation/three-lighthouse evidence bundle.
      - Depends on: S6.
      - Acceptance: bounded redacted snapshots converge without secrets or legacy fallback.
      - Validation: farm chaos/package gates and live captures.
