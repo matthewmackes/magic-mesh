@@ -40,9 +40,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::surface_hardware::{
-    SurfaceAvailability, SurfaceFleetSummary, SurfaceModelIdentity, SurfaceObservationSource,
-    SurfaceProGeneration, SurfaceProbeState, SurfaceProbeVerdict, SurfacePublication,
-    SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_HARDWARE_SCHEMA_VERSION,
+    SurfaceAvailability, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
+    SurfaceCameraProofUnavailable, SurfaceFleetSummary, SurfaceModelIdentity,
+    SurfaceObservationSource, SurfaceProGeneration, SurfaceProbeState, SurfaceProbeVerdict,
+    SurfacePublication, SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -440,6 +441,78 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>
     let overflow = output.len() > limit;
     output.truncate(limit);
     Ok((output, overflow))
+}
+
+/// Typed provider seam for the separately armed camera functional proof.
+pub trait CameraFunctionalProofProvider: Send + Sync {
+    /// Exercise exactly one camera frame without retaining its bytes.
+    fn prove_one_frame(&self) -> SurfaceCameraProofOutcome;
+}
+
+/// Production libcamera provider. Unlike the enumeration probe, this opens a
+/// stream and therefore may only be reached after action authorization and the
+/// explicit operator phrase have both passed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LiveCameraFunctionalProofProvider;
+
+impl LiveCameraFunctionalProofProvider {
+    const PROGRAM: &'static str = "/usr/bin/cam";
+    // Fedora 44 libcamera-tools 0.7.1 implements a positive numeric camera
+    // selector as one-based (`cameras[index - 1]`). Selecting `1` therefore
+    // means the first available camera, not an assumed second camera and not
+    // a parsed/retained device id. Its capture count is an exact frame limit;
+    // a filename without `#` remains unchanged, so the sole sink is /dev/null.
+    const ARGS: [&'static str; 3] = ["--camera=1", "--capture=1", "--file=/dev/null"];
+    const TIMEOUT: Duration = Duration::from_secs(8);
+}
+
+impl CameraFunctionalProofProvider for LiveCameraFunctionalProofProvider {
+    fn prove_one_frame(&self) -> SurfaceCameraProofOutcome {
+        let mut child = match Command::new(Self::PROGRAM)
+            .args(Self::ARGS)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SurfaceCameraProofOutcome::Unavailable(
+                    SurfaceCameraProofUnavailable::ProviderMissing,
+                );
+            }
+            Err(_) => {
+                return SurfaceCameraProofOutcome::Failed(SurfaceCameraProofFailure::CaptureFailed);
+            }
+        };
+
+        let deadline = Instant::now() + Self::TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    return SurfaceCameraProofOutcome::Passed;
+                }
+                Ok(Some(_)) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return SurfaceCameraProofOutcome::Failed(
+                        SurfaceCameraProofFailure::CaptureFailed,
+                    );
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return SurfaceCameraProofOutcome::Failed(SurfaceCameraProofFailure::TimedOut);
+                }
+            }
+        }
+    }
 }
 
 /// Parse `cam --list` conservatively. A successful command with the expected
@@ -1164,7 +1237,10 @@ pub(crate) fn shared_summary(board: &SurfaceVerifyBoard) -> SurfaceFleetSummary 
 // ─────────────────────────── the Bus worker (per-node) ──────────────────────
 
 #[cfg(feature = "async-services")]
-pub use worker::{board_topic, summary_topic, SurfaceVerifyWorker};
+pub use worker::{
+    board_topic, camera_proof_action_topic, camera_proof_result_topic, summary_topic,
+    SurfaceVerifyWorker,
+};
 
 #[cfg(feature = "async-services")]
 mod worker {
@@ -1177,18 +1253,40 @@ mod worker {
     //! #7). On a non-Surface node it idles (never touches the Bus).
 
     use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use mackes_mesh_types::surface_hardware::{
+        SurfaceActionHeader, SurfaceCameraProofOutcome, SurfaceCameraProofRefusal,
+        SurfaceCameraProofRequest, SurfaceCameraProofResult, SurfaceCameraProofUnavailable,
+        SurfaceModelIdentity, SurfaceProGeneration, SURFACE_CAMERA_PROOF_ARM_TOKEN,
+        SURFACE_HARDWARE_SCHEMA_VERSION,
+    };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
-    use super::{run_verify, shared_board, shared_summary, LiveSurfaceProbes};
-    use crate::surface::{detect, SurfaceDetection};
+    use super::{
+        run_verify, shared_board, shared_summary, CameraFunctionalProofProvider,
+        LiveCameraFunctionalProofProvider, LiveSurfaceProbes,
+    };
+    use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+    use crate::surface::{detect, SurfaceDetection, SurfaceModel};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Re-verify cadence — the board is fleet-visibility, not hot-path, so a
     /// modest tick keeps the rollup fresh without churn.
     pub const POLL: Duration = Duration::from_secs(30);
+
+    /// Camera actions poll with deterministic headroom inside the shared 30s
+    /// action lifetime; verification-board enumeration stays on [`POLL`].
+    pub const CAMERA_ACTION_POLL: Duration = Duration::from_secs(1);
+
+    /// Closed capability verb for one non-retaining camera functional proof.
+    pub const CAMERA_PROOF_ACTION_AUTH_VERB: &str = "surface-camera-functional-proof";
+
+    /// Stable capability target. The exact body additionally binds generation,
+    /// request identity, timestamps, and both arming fields.
+    pub const CAMERA_PROOF_ACTION_AUTH_TARGET: &str = "one-frame-discard";
 
     /// The per-node lane the full tri-state board lands on (Test tab).
     #[must_use]
@@ -1202,12 +1300,27 @@ mod worker {
         format!("state/hardware/surface/{node}")
     }
 
+    /// Per-node request lane for the separately armed camera proof.
+    #[must_use]
+    pub fn camera_proof_action_topic(node: &str) -> String {
+        format!("action/hardware/surface/{node}/camera-proof")
+    }
+
+    /// Per-node privacy-safe result lane for camera proof outcomes.
+    #[must_use]
+    pub fn camera_proof_result_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/camera-proof")
+    }
+
     /// The per-node `surface_verify` worker.
     pub struct SurfaceVerifyWorker {
         node_id: String,
         detection: SurfaceDetection,
         bus_root: Option<PathBuf>,
         poll: Duration,
+        camera_action_cursor: Option<String>,
+        authorizer: Arc<ActionAuthorizer>,
+        camera_provider: Arc<dyn CameraFunctionalProofProvider>,
     }
 
     impl SurfaceVerifyWorker {
@@ -1220,13 +1333,16 @@ mod worker {
                 detection: detect(),
                 bus_root: default_bus_root(),
                 poll: POLL,
+                camera_action_cursor: None,
+                authorizer: Arc::new(ActionAuthorizer::production()),
+                camera_provider: Arc::new(LiveCameraFunctionalProofProvider),
             }
         }
 
         /// Test constructor: an explicit detection + bus root, no real /sys.
         #[cfg(test)]
         #[must_use]
-        pub(crate) const fn with_parts(
+        pub(crate) fn with_parts(
             node_id: String,
             detection: SurfaceDetection,
             bus_root: PathBuf,
@@ -1236,6 +1352,31 @@ mod worker {
                 detection,
                 bus_root: Some(bus_root),
                 poll: POLL,
+                camera_action_cursor: None,
+                authorizer: Arc::new(ActionAuthorizer::production()),
+                camera_provider: Arc::new(LiveCameraFunctionalProofProvider),
+            }
+        }
+
+        /// Focused action test constructor with injected authorization and
+        /// provider seams. Production always installs the root verifier and
+        /// fixed libcamera provider.
+        #[cfg(test)]
+        pub(crate) fn with_camera_parts(
+            node_id: String,
+            detection: SurfaceDetection,
+            bus_root: PathBuf,
+            authorizer: Arc<ActionAuthorizer>,
+            camera_provider: Arc<dyn CameraFunctionalProofProvider>,
+        ) -> Self {
+            Self {
+                node_id,
+                detection,
+                bus_root: Some(bus_root),
+                poll: POLL,
+                camera_action_cursor: None,
+                authorizer,
+                camera_provider,
             }
         }
 
@@ -1261,6 +1402,125 @@ mod worker {
             debug_assert!(summary.validate().is_ok());
             publish(persist, &summary_topic(&self.node_id), &summary);
         }
+
+        fn admitted_camera_model(&self) -> Option<SurfaceModelIdentity> {
+            let SurfaceModel::Known(device) = &self.detection.model else {
+                return None;
+            };
+            match (&*device.product, device.contract_generation) {
+                ("Surface Pro 5", SurfaceProGeneration::Pro5)
+                | ("Surface Pro 6", SurfaceProGeneration::Pro6) => Some(SurfaceModelIdentity {
+                    product: device.product.clone(),
+                    generation: device.contract_generation,
+                }),
+                _ => None,
+            }
+        }
+
+        fn camera_result(
+            &self,
+            request_id: &str,
+            model: Option<SurfaceModelIdentity>,
+            outcome: SurfaceCameraProofOutcome,
+        ) -> SurfaceCameraProofResult {
+            SurfaceCameraProofResult {
+                schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                request_id: if request_id.is_empty() {
+                    "unadmitted".to_string()
+                } else {
+                    request_id.to_string()
+                },
+                model,
+                completed_at_ms: wall_now_ms(),
+                outcome,
+            }
+        }
+
+        fn camera_request(&self, body: Option<&str>) -> SurfaceCameraProofResult {
+            let Some(model) = self.admitted_camera_model() else {
+                return self.camera_result(
+                    "unadmitted",
+                    None,
+                    SurfaceCameraProofOutcome::Unavailable(
+                        SurfaceCameraProofUnavailable::UnsupportedModel,
+                    ),
+                );
+            };
+            let Some(body) = body else {
+                return self.camera_result(
+                    "unadmitted",
+                    Some(model),
+                    SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Contract),
+                );
+            };
+            let request = match SurfaceCameraProofRequest::from_json_at(
+                body.as_bytes(),
+                &self.node_id,
+                wall_now_ms(),
+            ) {
+                Ok(request) => request,
+                Err(_) => {
+                    return self.camera_result(
+                        "unadmitted",
+                        Some(model),
+                        SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Contract),
+                    );
+                }
+            };
+            if request.generation != model.generation {
+                return self.camera_result(
+                    &request.header.request_id,
+                    Some(model),
+                    SurfaceCameraProofOutcome::Refused(
+                        SurfaceCameraProofRefusal::GenerationMismatch,
+                    ),
+                );
+            }
+            let context = MutationContext {
+                verb: CAMERA_PROOF_ACTION_AUTH_VERB,
+                node: &self.node_id,
+                target: CAMERA_PROOF_ACTION_AUTH_TARGET,
+            };
+            if self.authorizer.authorize(body, context).is_err() {
+                tracing::warn!(
+                    target: "mackesd::surface_verify",
+                    node = %self.node_id,
+                    "refused unauthorized camera functional proof"
+                );
+                return self.camera_result(
+                    &request.header.request_id,
+                    Some(model),
+                    SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Authorization),
+                );
+            }
+            if request.arm_token.as_deref() != Some(SURFACE_CAMERA_PROOF_ARM_TOKEN) {
+                return self.camera_result(
+                    &request.header.request_id,
+                    Some(model),
+                    SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::OperatorArm),
+                );
+            }
+            self.camera_result(
+                &request.header.request_id,
+                Some(model),
+                self.camera_provider.prove_one_frame(),
+            )
+        }
+
+        fn poll_camera_actions(&mut self, persist: &Persist) {
+            let topic = camera_proof_action_topic(&self.node_id);
+            let Ok(messages) = persist.list_since(&topic, self.camera_action_cursor.as_deref())
+            else {
+                return;
+            };
+            for message in messages {
+                self.camera_action_cursor = Some(message.ulid.clone());
+                let result = self.camera_request(message.body.as_deref());
+                debug_assert!(result.validate().is_ok());
+                publish(persist, &camera_proof_result_topic(&self.node_id), &result);
+            }
+        }
     }
 
     /// Publish a serializable payload to `topic` (best-effort; a failed write
@@ -1282,6 +1542,14 @@ mod worker {
     /// The default Bus root (same shape the other bus workers use).
     fn default_bus_root() -> Option<PathBuf> {
         mde_bus::default_data_dir()
+    }
+
+    fn wall_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .unwrap_or(1)
     }
 
     #[async_trait::async_trait]
@@ -1306,17 +1574,31 @@ mod worker {
                 shutdown.wait().await;
                 return Ok(());
             };
+            let mut next_probe = Instant::now();
             loop {
                 match Persist::open(root.clone()) {
-                    Ok(persist) => self.probe_once(&persist),
+                    Ok(persist) => {
+                        let now = Instant::now();
+                        if now >= next_probe {
+                            self.probe_once(&persist);
+                            next_probe = now + self.poll;
+                        }
+                        self.poll_camera_actions(&persist);
+                    }
                     Err(e) => tracing::debug!(
                         target: "mackesd::surface_verify",
                         error = %e,
                         "bus open failed"
                     ),
                 }
+                let until_probe = next_probe.saturating_duration_since(Instant::now());
+                let delay = if until_probe.is_zero() {
+                    CAMERA_ACTION_POLL
+                } else {
+                    CAMERA_ACTION_POLL.min(until_probe)
+                };
                 tokio::select! {
-                    () = tokio::time::sleep(self.poll) => {}
+                    () = tokio::time::sleep(delay) => {}
                     () = shutdown.wait() => return Ok(()),
                 }
             }
@@ -1325,23 +1607,99 @@ mod worker {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
         use super::*;
+        use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
         use mackes_mesh_types::surface_hardware::{
-            SurfaceFleetSummary, SurfaceProGeneration, SurfaceVerifyBoard,
+            SurfaceCameraProofFailure, SurfaceCameraProofOutcome, SurfaceCameraProofRequest,
+            SurfaceCameraProofResult, SurfaceCameraProofUnavailable, SurfaceFleetSummary,
+            SurfaceProGeneration, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
         };
 
+        const AUTH_KEY: &[u8] = b"surface-camera-functional-proof-test-key";
+        const AUTH_NOW: i64 = 1_800_000_000_000;
+
         fn detection(product: &str) -> SurfaceDetection {
-            let dmi = DmiInfo {
+            let mut dmi = DmiInfo {
                 sys_vendor: MS_VENDOR.to_string(),
                 product_name: product.to_string(),
                 product_sku: String::new(),
                 ..Default::default()
             };
+            if product == "Surface Pro 5" {
+                dmi.product_name = "Surface Pro".to_string();
+                dmi.product_sku = "Surface_Pro_1796".to_string();
+            }
             SurfaceDetection {
                 model: identify(&dmi),
                 dmi,
             }
+        }
+
+        struct FakeCameraProvider {
+            calls: Arc<AtomicUsize>,
+            outcome: SurfaceCameraProofOutcome,
+        }
+
+        impl CameraFunctionalProofProvider for FakeCameraProvider {
+            fn prove_one_frame(&self) -> SurfaceCameraProofOutcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.outcome
+            }
+        }
+
+        fn camera_worker(
+            node: &str,
+            detection: SurfaceDetection,
+            root: &std::path::Path,
+            calls: Arc<AtomicUsize>,
+            outcome: SurfaceCameraProofOutcome,
+        ) -> SurfaceVerifyWorker {
+            SurfaceVerifyWorker::with_camera_parts(
+                node.to_string(),
+                detection,
+                root.to_path_buf(),
+                Arc::new(ActionAuthorizer::for_test(
+                    AUTH_KEY,
+                    root.join("auth"),
+                    AUTH_NOW,
+                )),
+                Arc::new(FakeCameraProvider { calls, outcome }),
+            )
+        }
+
+        fn signed_camera_request(
+            node: &str,
+            generation: SurfaceProGeneration,
+            arm: Option<&str>,
+            nonce: &str,
+        ) -> String {
+            let unsigned = serde_json::to_string(&SurfaceCameraProofRequest {
+                header: SurfaceActionHeader {
+                    schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: node.to_string(),
+                    request_id: nonce.to_string(),
+                    issued_at_ms: wall_now_ms(),
+                    armed_token: None,
+                },
+                generation,
+                arm_token: arm.map(str::to_string),
+            })
+            .unwrap();
+            authorize_test_body(
+                AUTH_KEY,
+                &unsigned,
+                MutationContext {
+                    verb: CAMERA_PROOF_ACTION_AUTH_VERB,
+                    node,
+                    target: CAMERA_PROOF_ACTION_AUTH_TARGET,
+                },
+                nonce,
+                AUTH_NOW + 30_000,
+            )
         }
 
         #[test]
@@ -1360,6 +1718,17 @@ mod worker {
             };
 
             assert_eq!(got, Some(expected));
+        }
+
+        #[test]
+        fn camera_action_poll_has_deterministic_freshness_headroom() {
+            assert!(
+                CAMERA_ACTION_POLL.as_millis()
+                    < u128::from(
+                        mackes_mesh_types::surface_hardware::MAX_SURFACE_ACTION_AGE_MS / 3
+                    )
+            );
+            assert_eq!(POLL, Duration::from_secs(30));
         }
 
         #[test]
@@ -1400,6 +1769,140 @@ mod worker {
             // This non-Surface farm host exposes none of the Pro hardware,
             // so enablement is honestly 0% (never a faked green).
             assert_eq!(summary.enablement_pct, 0);
+        }
+
+        #[test]
+        fn authorized_armed_pro5_and_pro6_reach_provider_once_and_publish_closed_result() {
+            for (product, generation) in [
+                ("Surface Pro 5", SurfaceProGeneration::Pro5),
+                ("Surface Pro 6", SurfaceProGeneration::Pro6),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut worker = camera_worker(
+                    "surface",
+                    detection(product),
+                    dir.path(),
+                    Arc::clone(&calls),
+                    SurfaceCameraProofOutcome::Passed,
+                );
+                let body = signed_camera_request(
+                    "surface",
+                    generation,
+                    Some(SURFACE_CAMERA_PROOF_ARM_TOKEN),
+                    match generation {
+                        SurfaceProGeneration::Pro5 => "camera-proof-pro5",
+                        SurfaceProGeneration::Pro6 => "camera-proof-pro6",
+                        SurfaceProGeneration::Unsupported => unreachable!(),
+                    },
+                );
+                persist
+                    .write(
+                        &camera_proof_action_topic("surface"),
+                        Priority::Default,
+                        None,
+                        Some(&body),
+                    )
+                    .unwrap();
+                worker.poll_camera_actions(&persist);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let results = persist
+                    .list_since(&camera_proof_result_topic("surface"), None)
+                    .unwrap();
+                assert_eq!(results.len(), 1);
+                let raw = results[0].body.as_deref().unwrap();
+                assert!(!raw.contains("/dev/video"));
+                assert!(!raw.contains("camera0"));
+                assert!(!raw.contains("frame"));
+                let result = SurfaceCameraProofResult::from_json(raw.as_bytes()).unwrap();
+                assert_eq!(result.outcome, SurfaceCameraProofOutcome::Passed);
+                assert_eq!(result.model.unwrap().generation, generation);
+            }
+        }
+
+        #[test]
+        fn missing_auth_wrong_arm_generation_replay_and_unsupported_never_reach_provider() {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let worker = camera_worker(
+                "surface",
+                detection("Surface Pro 6"),
+                dir.path(),
+                Arc::clone(&calls),
+                SurfaceCameraProofOutcome::Failed(SurfaceCameraProofFailure::CaptureFailed),
+            );
+
+            let unsigned = serde_json::to_string(&SurfaceCameraProofRequest {
+                header: SurfaceActionHeader {
+                    schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: "surface".into(),
+                    request_id: "unsigned-camera-proof".into(),
+                    issued_at_ms: wall_now_ms(),
+                    armed_token: None,
+                },
+                generation: SurfaceProGeneration::Pro6,
+                arm_token: Some(SURFACE_CAMERA_PROOF_ARM_TOKEN.into()),
+            })
+            .unwrap();
+            assert!(matches!(
+                worker.camera_request(Some(&unsigned)).outcome,
+                SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Authorization)
+            ));
+
+            let wrong_generation = signed_camera_request(
+                "surface",
+                SurfaceProGeneration::Pro5,
+                Some(SURFACE_CAMERA_PROOF_ARM_TOKEN),
+                "wrong-camera-generation",
+            );
+            assert!(matches!(
+                worker.camera_request(Some(&wrong_generation)).outcome,
+                SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::GenerationMismatch)
+            ));
+
+            let wrong_arm = signed_camera_request(
+                "surface",
+                SurfaceProGeneration::Pro6,
+                Some("CAPTURE CAMERA"),
+                "wrong-camera-arm",
+            );
+            assert!(matches!(
+                worker.camera_request(Some(&wrong_arm)).outcome,
+                SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::OperatorArm)
+            ));
+
+            let once = signed_camera_request(
+                "surface",
+                SurfaceProGeneration::Pro6,
+                Some(SURFACE_CAMERA_PROOF_ARM_TOKEN),
+                "camera-replay-once",
+            );
+            assert!(matches!(
+                worker.camera_request(Some(&once)).outcome,
+                SurfaceCameraProofOutcome::Failed(SurfaceCameraProofFailure::CaptureFailed)
+            ));
+            assert!(matches!(
+                worker.camera_request(Some(&once)).outcome,
+                SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Authorization)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let unsupported_calls = Arc::new(AtomicUsize::new(0));
+            let unsupported = camera_worker(
+                "surface",
+                detection("Surface Pro 8"),
+                dir.path(),
+                Arc::clone(&unsupported_calls),
+                SurfaceCameraProofOutcome::Passed,
+            );
+            assert_eq!(
+                unsupported.camera_request(Some(&once)).outcome,
+                SurfaceCameraProofOutcome::Unavailable(
+                    SurfaceCameraProofUnavailable::UnsupportedModel
+                )
+            );
+            assert_eq!(unsupported_calls.load(Ordering::SeqCst), 0);
         }
     }
 }
@@ -1752,6 +2255,22 @@ mod tests {
         }));
         assert_eq!(verdict.state, ProbeState::Ok);
         assert!(verdict.reason.contains("no frame captured"));
+    }
+
+    #[test]
+    fn functional_camera_provider_is_one_frame_fixed_discarding_and_bounded() {
+        assert_eq!(LiveCameraFunctionalProofProvider::PROGRAM, "/usr/bin/cam");
+        assert_eq!(
+            LiveCameraFunctionalProofProvider::ARGS,
+            ["--camera=1", "--capture=1", "--file=/dev/null"]
+        );
+        assert_eq!(
+            LiveCameraFunctionalProofProvider::TIMEOUT,
+            Duration::from_secs(8)
+        );
+        assert!(LiveCameraFunctionalProofProvider::ARGS
+            .iter()
+            .all(|argument| !argument.contains("shell")));
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub const MAX_SURFACE_STATE_AGE_MS: u64 = 90_000;
 pub const MAX_SURFACE_ACTION_AGE_MS: u64 = 30_000;
 /// Small tolerated wall-clock skew for action publishers.
 pub const MAX_SURFACE_ACTION_FUTURE_SKEW_MS: u64 = 5_000;
+/// Exact local phrase an operator must type before one camera functional proof.
+pub const SURFACE_CAMERA_PROOF_ARM_TOKEN: &str = "PROVE CAMERA";
 
 /// Contract admission failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +449,126 @@ pub struct SurfaceFirmwareApplyRequest {
     pub arm_token: Option<String>,
 }
 
+/// Explicitly armed request for one privacy-safe camera functional proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceCameraProofRequest {
+    /// Shared action identity and freshness metadata.
+    #[serde(flatten)]
+    pub header: SurfaceActionHeader,
+    /// Exact Pro generation the operator inspected and armed.
+    pub generation: SurfaceProGeneration,
+    /// Human-entered confirmation phrase. This is distinct from the root-minted
+    /// exact-body capability in `header.armed_token`.
+    #[serde(default)]
+    pub arm_token: Option<String>,
+}
+
+/// Closed, privacy-safe reason a camera functional proof was unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceCameraProofUnavailable {
+    /// The exact local DMI identity is not an admitted Surface Pro 5 or Pro 6.
+    UnsupportedModel,
+    /// The fixed libcamera proof provider is not installed.
+    ProviderMissing,
+}
+
+/// Closed failure class from the bounded functional provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceCameraProofFailure {
+    /// The provider exceeded its fixed wall-clock deadline and was killed.
+    TimedOut,
+    /// The provider ran but did not complete one frame successfully.
+    CaptureFailed,
+}
+
+/// Closed refusal class. No request body, token, camera path, or provider
+/// output is copied into the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceCameraProofRefusal {
+    /// The typed request failed shared contract admission.
+    Contract,
+    /// The exact-body privileged capability was absent or invalid.
+    Authorization,
+    /// The operator confirmation phrase was absent or incorrect.
+    OperatorArm,
+    /// The requested Pro generation did not equal the exact local DMI result.
+    GenerationMismatch,
+}
+
+/// Privacy-safe outcome of one camera functional proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+pub enum SurfaceCameraProofOutcome {
+    /// One frame traversed the libcamera pipeline and was discarded.
+    Passed,
+    /// The action could not run because its provider/model was unavailable.
+    Unavailable(SurfaceCameraProofUnavailable),
+    /// The admitted provider ran but failed or timed out.
+    Failed(SurfaceCameraProofFailure),
+    /// Admission, authorization, or explicit arming refused the action.
+    Refused(SurfaceCameraProofRefusal),
+}
+
+/// Bounded result publication for one camera functional-proof request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceCameraProofResult {
+    /// Current Surface contract schema.
+    pub schema_version: u64,
+    /// Exact node that consumed the action.
+    pub node: String,
+    /// Stable request identity, or `unadmitted` when decoding failed.
+    pub request_id: String,
+    /// Exact admitted local DMI identity. Absent only when the local model is
+    /// outside the Pro 5/6 functional-proof allowlist.
+    #[serde(default)]
+    pub model: Option<SurfaceModelIdentity>,
+    /// Completion time; never a claim about frame contents.
+    pub completed_at_ms: u64,
+    /// Closed result with no camera/device identifier or arbitrary text.
+    pub outcome: SurfaceCameraProofOutcome,
+}
+
+impl SurfaceCameraProofResult {
+    /// Decode untrusted JSON with duplicate-key, size, and semantic admission.
+    pub fn from_json(body: &[u8]) -> Result<Self, SurfaceContractError> {
+        decode(body, |value: &Self| value.validate())
+    }
+
+    /// Validate the exact supported model/generation pair and bounded header.
+    pub fn validate(&self) -> Result<(), SurfaceContractError> {
+        if self.schema_version != SURFACE_HARDWARE_SCHEMA_VERSION {
+            return Err(SurfaceContractError::Invalid("schema_version"));
+        }
+        validate_id(&self.node, "node")?;
+        validate_id(&self.request_id, "request_id")?;
+        if self.completed_at_ms == 0 {
+            return Err(SurfaceContractError::Invalid("completed_at_ms"));
+        }
+        match (&self.model, self.outcome) {
+            (
+                None,
+                SurfaceCameraProofOutcome::Unavailable(
+                    SurfaceCameraProofUnavailable::UnsupportedModel,
+                ),
+            ) => Ok(()),
+            (Some(model), _) => {
+                model.validate()?;
+                match (&*model.product, model.generation) {
+                    ("Surface Pro 5", SurfaceProGeneration::Pro5)
+                    | ("Surface Pro 6", SurfaceProGeneration::Pro6) => Ok(()),
+                    _ => Err(SurfaceContractError::Invalid("camera proof model")),
+                }
+            }
+            (None, _) => Err(SurfaceContractError::Invalid("camera proof model")),
+        }
+    }
+}
+
 /// Shared privileged-action identity and freshness header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,6 +634,18 @@ macro_rules! impl_action_decode {
 impl_action_decode!(SurfaceEnableRequest, |value: &SurfaceEnableRequest| {
     validate_optional_reason(&value.arm_token, "arm_token")
 });
+impl_action_decode!(
+    SurfaceCameraProofRequest,
+    |value: &SurfaceCameraProofRequest| {
+        if !matches!(
+            value.generation,
+            SurfaceProGeneration::Pro5 | SurfaceProGeneration::Pro6
+        ) {
+            return Err(SurfaceContractError::Invalid("generation"));
+        }
+        validate_optional_reason(&value.arm_token, "arm_token")
+    }
+);
 impl_action_decode!(
     SurfaceFirmwareApplyRequest,
     |value: &SurfaceFirmwareApplyRequest| {
@@ -912,15 +1046,13 @@ mod tests {
         current.available_version = None;
         current.available_checksum = None;
         current.update_available = false;
-        assert!(
-            SurfaceFirmwareInventory {
-                publication: publication(),
-                skipped: None,
-                devices: vec![current],
-            }
-            .validate()
-            .is_ok()
-        );
+        assert!(SurfaceFirmwareInventory {
+            publication: publication(),
+            skipped: None,
+            devices: vec![current],
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -946,5 +1078,68 @@ mod tests {
             ),
             Err(SurfaceContractError::Invalid("release_checksum"))
         );
+    }
+
+    #[test]
+    fn camera_proof_request_is_fresh_node_bound_and_pro56_only() {
+        let request = SurfaceCameraProofRequest {
+            header: action_header(),
+            generation: SurfaceProGeneration::Pro6,
+            arm_token: Some(SURFACE_CAMERA_PROOF_ARM_TOKEN.into()),
+        };
+        let body = serde_json::to_vec(&request).unwrap();
+        assert!(SurfaceCameraProofRequest::from_json_at(&body, "surface", NOW).is_ok());
+        assert_eq!(
+            SurfaceCameraProofRequest::from_json_at(&body, "other", NOW),
+            Err(SurfaceContractError::ForeignNode)
+        );
+
+        let unsupported = SurfaceCameraProofRequest {
+            generation: SurfaceProGeneration::Unsupported,
+            ..request
+        };
+        assert_eq!(
+            SurfaceCameraProofRequest::from_json_at(
+                &serde_json::to_vec(&unsupported).unwrap(),
+                "surface",
+                NOW,
+            ),
+            Err(SurfaceContractError::Invalid("generation"))
+        );
+    }
+
+    #[test]
+    fn camera_proof_result_admits_only_exact_pro56_or_unsupported_unavailable() {
+        let passed = SurfaceCameraProofResult {
+            schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+            node: "surface".into(),
+            request_id: "camera-proof-1".into(),
+            model: Some(publication().model),
+            completed_at_ms: NOW,
+            outcome: SurfaceCameraProofOutcome::Passed,
+        };
+        assert!(passed.validate().is_ok());
+
+        let mut substituted = passed.clone();
+        substituted.model = Some(SurfaceModelIdentity {
+            product: "Surface Pro 8".into(),
+            generation: SurfaceProGeneration::Unsupported,
+        });
+        assert_eq!(
+            substituted.validate(),
+            Err(SurfaceContractError::Invalid("camera proof model"))
+        );
+
+        let unavailable = SurfaceCameraProofResult {
+            model: None,
+            outcome: SurfaceCameraProofOutcome::Unavailable(
+                SurfaceCameraProofUnavailable::UnsupportedModel,
+            ),
+            ..passed
+        };
+        assert!(unavailable.validate().is_ok());
+        let mut missing_model_success = unavailable;
+        missing_model_success.outcome = SurfaceCameraProofOutcome::Passed;
+        assert!(missing_model_success.validate().is_err());
     }
 }
