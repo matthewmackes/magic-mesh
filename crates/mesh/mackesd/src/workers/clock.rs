@@ -803,8 +803,22 @@ impl ClockWorker {
                 }
             }
             ClockCommandKindV1::UpsertStopwatch { stopwatch } => {
+                anyhow::ensure!(
+                    stopwatch.origin_node_id == command_origin,
+                    "Clock stopwatch origin mismatch"
+                );
                 if peer_origin {
                     anyhow::bail!("peer Clock stopwatch mutation is not authoritative");
+                }
+                if let Some(existing) = snapshot
+                    .stopwatches
+                    .iter()
+                    .find(|value| value.stopwatch_id == stopwatch.stopwatch_id)
+                {
+                    anyhow::ensure!(
+                        existing.origin_node_id == stopwatch.origin_node_id,
+                        "Clock stopwatch identity conflict"
+                    );
                 }
                 let changed = snapshot
                     .stopwatches
@@ -4290,6 +4304,126 @@ mod tests {
         assert!(!changed);
         let durable = fixture.worker.store.load("seat-1").unwrap().unwrap();
         assert_eq!(durable.revision, 2);
+    }
+
+    #[test]
+    fn stopwatch_commands_cannot_claim_a_foreign_origin() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+
+        let command = |request_id: &str, origin_node_id: &str| {
+            ClockCommandV1 {
+                schema_version: CLOCK_SCHEMA_VERSION,
+                request_id: request_id.into(),
+                origin_node_id: "seat-1".into(),
+                expected_revision: 1,
+                issued_at_utc_ms: NOW,
+                expires_at_utc_ms: NOW + MAX_CLOCK_COMMAND_TTL_MS,
+                body: ClockCommandKindV1::UpsertStopwatch {
+                    stopwatch: ClockStopwatchV1 {
+                        stopwatch_id: "stopwatch-1".into(),
+                        origin_node_id: origin_node_id.into(),
+                        mirror_target_ids: vec!["seat-1".into()],
+                        revision: 1,
+                        phase: mackes_mesh_types::clock::ClockStopwatchPhase::Running,
+                        started_wall_utc_ms: Some(NOW),
+                        started_monotonic_ms: Some(1),
+                        accumulated_elapsed_ms: 0,
+                        laps: Vec::new(),
+                    },
+                },
+                signer_id: String::new(),
+                signature: String::new(),
+            }
+            .sign(
+                "seat-1-key",
+                &fixture.signing_key,
+                &ClockValidationContext {
+                    wall_utc_ms: NOW,
+                    monotonic_ms: 1,
+                    zone_exists: &zone_exists,
+                },
+            )
+            .unwrap()
+        };
+
+        let forged = command("stopwatch-forged-origin", "seat-2");
+        let owned = command("stopwatch-owned-origin", "seat-1");
+
+        fixture.publish(&forged);
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 1);
+        assert!(fixture
+            .worker
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .stopwatches
+            .is_empty());
+
+        fixture.publish(&owned);
+        fixture.worker.tick_once().unwrap();
+        let snapshot = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.stopwatches.len(), 1);
+        assert_eq!(snapshot.stopwatches[0].origin_node_id, "seat-1");
+
+        let durable = fixture.worker.store.load("seat-1").unwrap().unwrap();
+        assert_eq!(durable.revision, 2);
+        assert_eq!(
+            serde_json::from_str::<ClockSnapshotV1>(&durable.snapshot_json)
+                .unwrap()
+                .stopwatches[0]
+                .origin_node_id,
+            "seat-1"
+        );
+    }
+
+    #[test]
+    fn stopwatch_identity_conflict_cannot_transfer_an_existing_origin() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let foreign = ClockStopwatchV1 {
+            stopwatch_id: "stopwatch-conflict".into(),
+            origin_node_id: "seat-2".into(),
+            mirror_target_ids: vec!["seat-1".into()],
+            revision: 1,
+            phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
+            started_wall_utc_ms: None,
+            started_monotonic_ms: None,
+            accumulated_elapsed_ms: 5_000,
+            laps: Vec::new(),
+        };
+        fixture
+            .worker
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .stopwatches
+            .push(foreign.clone());
+        let mut takeover = foreign.clone();
+        takeover.origin_node_id = "seat-1".into();
+
+        let error = fixture
+            .worker
+            .apply_command(
+                ClockCommandKindV1::UpsertStopwatch {
+                    stopwatch: takeover,
+                },
+                "seat-1",
+                false,
+                "stopwatch-takeover",
+                1,
+                NOW,
+                NOW,
+            )
+            .expect_err("an existing stopwatch identity cannot change origin");
+
+        assert_eq!(error.to_string(), "Clock stopwatch identity conflict");
+        assert_eq!(
+            fixture.worker.snapshot.as_ref().unwrap().stopwatches,
+            vec![foreign]
+        );
     }
 
     #[test]

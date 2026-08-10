@@ -920,6 +920,9 @@ fn command_body(
                 },
                 None => return Err("start the stopwatch before using that action".to_owned()),
             };
+            if stopwatch.origin_node_id != snapshot.node_id {
+                return Err("a mirrored stopwatch is read-only on this node".to_owned());
+            }
             match action {
                 StopwatchAction::Start if stopwatch.phase != ClockStopwatchPhase::Running => {
                     stopwatch.phase = ClockStopwatchPhase::Running;
@@ -1594,6 +1597,37 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn mirrored_stopwatch_refuses_local_control_commands() {
+        let mut snapshot = snapshot();
+        snapshot.stopwatches.push(ClockStopwatchV1 {
+            stopwatch_id: "peer-stopwatch".into(),
+            origin_node_id: "node-b".into(),
+            mirror_target_ids: vec!["node-a".into()],
+            revision: 6,
+            phase: ClockStopwatchPhase::Running,
+            started_wall_utc_ms: Some(snapshot.produced_at_utc_ms - 5_000),
+            started_monotonic_ms: Some(1),
+            accumulated_elapsed_ms: 0,
+            laps: Vec::new(),
+        });
+
+        let result = command_body(
+            ClockUiAction::ControlStopwatch {
+                stopwatch_id: Some("peer-stopwatch".into()),
+                action: StopwatchAction::Pause,
+            },
+            &snapshot,
+            snapshot.produced_at_utc_ms,
+            6_000,
+        );
+
+        assert_eq!(
+            result,
+            Err("a mirrored stopwatch is read-only on this node".to_owned())
+        );
     }
 
     #[test]
