@@ -166,6 +166,8 @@ def virtual_size(path: Path, image_format: str) -> int | None:
 
 
 def profile_record(profile: Path, values: dict[str, str], metadata: os.stat_result) -> dict[str, object]:
+    if values["BROWSER_VM_HOST_BROWSER"] != "false":
+        fail("artifact profile enables host Browser ownership")
     try:
         transports = values["BROWSER_VM_TRANSPORTS"].split(",")
         vcpu = int(values["BROWSER_VM_VCPU"])
@@ -330,6 +332,20 @@ def self_test(repo_root: Path, profile: Path) -> None:
         expect_reject(
             lambda: verify_manifest(repo_root, profile, image, manifest),
             "a symlinked manifest",
+        )
+
+        host_browser_profile = root / "host-browser.env"
+        host_browser_profile.write_text(
+            profile.read_text(encoding="utf-8").replace(
+                "BROWSER_VM_HOST_BROWSER=false",
+                "BROWSER_VM_HOST_BROWSER=true",
+            ),
+            encoding="utf-8",
+        )
+        host_browser_profile.chmod(0o644)
+        expect_reject(
+            lambda: build_manifest(repo_root, host_browser_profile, image, "anaconda-iso"),
+            "a profile that enables host Browser ownership",
         )
 
 
