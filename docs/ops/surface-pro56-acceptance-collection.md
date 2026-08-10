@@ -10,6 +10,14 @@ reboot, play or record audio, or open a camera stream. Camera evidence is limite
 to libcamera enumeration. Network connection names, addresses, MAC addresses,
 and common secret forms are excluded or redacted.
 
+The interactive Surface card has a separate functional camera proof; it is not
+part of this read-only collector. That action requires an exact-body capability,
+the fixed operator phrase, and exact Pro 5/6 generation, asks the fixed provider
+for one frame, records only a closed outcome, and immediately discards the frame.
+It accepts no output path or device selector and never publishes image bytes.
+Fingerprint collection remains read-only, non-claiming fprintd device enumeration;
+neither path proves biometric enrollment or authentication.
+
 Run it locally on the named seat. Use an output path on a root-only local
 filesystem; the tool refuses to overwrite a path and writes files mode `0600`.
 

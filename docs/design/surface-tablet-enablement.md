@@ -9,15 +9,19 @@
 > plus the display (native LCD / HD) + touch-in-shell work the DRM-native egui shell needs
 > to be a real tablet.
 
-> **Implementation reconciliation (2026-08-09):** the locks below preserve the
+> **Implementation reconciliation (2026-08-10):** the locks below preserve the
 > product intent, while the shipped authority boundaries are narrower and safer.
 > Pro 6 is the canonical `Surface` seat; Pro 5 is admitted only for Microsoft DMI
 > SKUs `Surface_Pro_1796` and `Surface_Pro_1807`. Activation, MOK import, exact
 > device-scoped firmware staging, and sole-runner DRM modesetting now have live
 > bounded implementations. Reboot remains a separate host-state propose/confirm
-> operation. Camera and fingerprint daemon probes are privacy-preserving,
-> read-only capability discovery; functional and human-observed behavior belongs
-> to the governed physical-acceptance record and is never inferred from discovery.
+> operation. Enable results now use a dedicated bounded/versioned shared contract
+> tied to the exact local node, request, producer, completion freshness, and Pro 5/6
+> identity; the shell no longer keeps a private result mirror. Camera and fingerprint
+> inventory probes are privacy-preserving and read-only. A separately authorized,
+> operator-armed camera action proves exactly one frame and immediately discards it;
+> fingerprint function and other human-observed behavior still require governed
+> physical acceptance and are never inferred from discovery.
 
 ## The locks
 
@@ -29,9 +33,9 @@
 | 2 | Scope | **The full linux-surface matrix** — touchscreen + pen/stylus (iptsd), Type Cover kbd/trackpad, Surface Aggregator Module (SAM: battery/thermal/perf), auto-rotation + accelerometer, cameras, WiFi/BT quirks, S0ix suspend, fingerprint/Hello where supported. Each a probed line item. |
 | 3 | Detection | **DMI auto-detect → per-model profile.** A mackesd probe reads `/sys/class/dmi/id` (vendor 'Microsoft Corporation' + product) and matches a built-in model table (Pro/Book/Laptop/Go + generation); the card auto-appears with that model's exact subsystem checklist. Non-Surface nodes never see it. |
 | 4 | Install action | **A `surface_enable` mackesd worker** (typed verbs, no raw shell): activate iptsd through its packaged udev admission, apply the supported SAM profile, and drive Secure-Boot MOK enrollment. Live effects use fixed bounded commands behind injectable seams and fail closed when their packages or authority are unavailable. |
-| 5 | Verify | **Per-subsystem live probes → green/red/degraded board** (OW-10 self-test idiom): touch, pen, Type Cover, SAM, accelerometer, camera, WiFi/BT, S0ix, and fingerprint capabilities are reported without invented success. Privacy-sensitive or disruptive functional checks require explicit operator-armed physical acceptance; discovery alone never proves a captured camera frame, enrollment, suspend residency, or human-visible behavior. |
+| 5 | Verify | **Per-subsystem live probes → green/red/degraded board** (OW-10 self-test idiom): touch, pen, Type Cover, SAM, accelerometer, camera, WiFi/BT, S0ix, and fingerprint capabilities are reported without invented success. Discovery alone never proves function. The camera has one narrow exception: an exact-body-authorized, explicitly armed, one-frame proof that retains no pixels. Fingerprint remains non-claiming fprintd device enumeration; enrollment, suspend residency, biometric function, and other human-visible behavior require governed physical acceptance. |
 | 6 | Secure Boot | **Guided MOK enrollment.** Detect Secure-Boot state; if modules are blocked, stage the exact certificate using short-lived sealed credentials, then hand reboot off to the independent host-state propose/confirm authority and show exactly what the blue MOK-Manager firmware screen will ask. Post-reboot verify the key enrolled + modules load. Honest about the manual firmware step no software can automate. |
-| 7 | Fleet view | **Local-first + a compact mesh summary.** The full install/verify/config area lives under This Node; each Surface node also publishes `state/hardware/surface/<node>` (model, enablement %, any red subsystem) so the Controller/fleet rollup shows which Surfaces are healthy. Visibility only — no remote control (that would need OW-15). |
+| 7 | Fleet view | **Local-first + a compact mesh summary.** The full install/verify/config area lives under This Node; each Surface node also publishes `state/hardware/surface/<node>` (model, enablement %, any red subsystem) so Device Manager's bounded Surface fleet rollup shows which Surfaces are healthy. Visibility only — the rollup owns no action topic or remote-control callback. |
 | 8 | Updates | **fwupd/LVFS firmware panel + enablement rides the image.** A bootc update carries enablement forward (no reapply); separately the area surfaces device firmware via fwupd/LVFS (UEFI, touch controller, SAM — current/available versions, typed-armed `fwupdmgr` apply). Verify re-runs after a firmware/image change. |
 | 9 | 2-in-1 | **Detect + drive the shell reaction here.** Watch SW_TABLET_MODE + Type Cover attach/detach → publish `event/hardware/formfactor` (Tablet/Laptop); AND implement the shell's tablet-mode UX (auto-rotate, OSK, touch layout) in this epic (operator scoped it in). |
 | 10 | Placement | **A model-gated "Surface / Hardware Enablement" card in the This Node plane** with three tabs — **Install** (observed activation/MOK/firmware state and governed actions), **Test** (the probe board), **Config** (observed SAM/form-factor/display state plus the governed DRM mode picker). Unsupported iptsd tuning and rotation-write controls are not exposed. One Workstation bootc image; a `surface-tools` group + linux-surface layer conditionally present, inert on non-Surface hardware. |
@@ -51,15 +55,17 @@
 
 ```
 This Node plane (mde-shell-egui) ─ "Surface / Hardware Enablement" card (model-gated)
-  ├ Install tab   → action/hardware/surface/* (activate · MOK-enroll · fwupd apply)
+  ├ Install tab   → observes strict enable/MOK state · publishes governed fwupd apply
+  │                  staged MOK → navigation-only handoff to System / Power & Battery
   ├ Test tab      → state/hardware/surface/<node>/probes (the tri-state board)
   └ Config tab    → observed SAM/form-factor/display state + governed DRM mode picker
 
 mackesd  ── surface_detect (DMI→model profile)         ── typed verbs, no raw shell
-         ── surface_enable worker (iptsd activate, per-model config, MOK flow)
+         ── surface_enable worker (root-minter request; iptsd/SAM + MOK import only)
          ── surface_verify (per-subsystem live probes, tri-state)
          ── surface_firmware (fwupd/LVFS list + apply)
          └ publishes state/hardware/surface/<node> (compact fleet summary)
+                      state/hardware/surface/<node>/enable (strict shared result)
                          event/hardware/formfactor (Tablet|Laptop)
 
 DRM shell seat (mde-egui drm.rs + mde-shell-egui) ── consumes the above:
@@ -77,8 +83,10 @@ bootc Workstation image ── conditional linux-surface layer + surface-tools g
   layer, inert on non-Surface hardware. No separate variant/role.
 - **mackesd owns the hardware truth** (locks 3–8): detect → enable → verify → firmware,
   each a typed verb behind an injectable seam; supported live actions use bounded fixed
-  providers and unsupported or unavailable actions fail closed; publishes the compact
-  fleet summary + the formfactor signal.
+  providers and unsupported or unavailable actions fail closed. Enable publication is a
+  strict shared result with no reboot token/state; malformed, stale, foreign-node, foreign-
+  request, wrong-source, oversized, duplicate-key, and non-Pro-5/6 records are refused.
+  It also publishes the compact fleet summary + the formfactor signal.
 - **The DRM shell consumes** (locks 11–16): the seat gains native-mode/scale + a KMS mode
   picker + multitouch + rotation + OSK + gestures. §6-clean: the shell reacts to mackesd's
   hardware signals; mackesd never reaches into the shell.
@@ -94,7 +102,9 @@ bootc Workstation image ── conditional linux-surface layer + surface-tools g
   subsystem checklist; gates the card's visibility + the verify expectations.
 - **SURFACE-3 — the `surface_enable` worker + guided MOK.** Activate iptsd and set the
   supported SAM profile via fixed typed providers; the guided MOK flow binds a short-lived
-  sealed import credential to the exact request and hands reboot to the separate host-state
+  sealed import credential to the exact root-minter request. Its bounded shared result can
+  say the proven import is awaiting a governed host reboot, but carries no reboot token or
+  execution state. The shell makes a navigation-only handoff to the separate host-state
   propose/confirm authority before post-reboot key+module verification.
 - **SURFACE-4 — per-subsystem verify probes + fleet publish.** The tri-state
   (green/red/degraded) probe board across the full matrix; interactive probes prompt
@@ -130,14 +140,16 @@ signal drives 10/11's auto-engage. SURFACE-5 parallelizes with 6 once 2/3 land.
 
 1. Booting a Surface Pro shows the model-gated card in This Node with its exact subsystem
    checklist; a non-Surface node never shows it.
-2. The Install tab activates iptsd + walks MOK enrollment (sealed import followed by an
-   independent host-state propose/confirm reboot and honest firmware-prompt copy);
+2. The root-only minter authorizes iptsd/SAM activation + MOK import; the Install tab
+   consumes the fresh exact-local shared result and walks MOK enrollment (sealed import
+   followed by a navigation-only handoff to an independent host-state propose/confirm
+   reboot and honest firmware-prompt copy);
    post-reboot the modules load and the card reflects it.
 3. The Test tab's probe board shows each subsystem green/red/degraded with the real reason;
    touch/pen actually produce input events, SAM battery/thermal read live, the accelerometer
    yields orientation.
-4. The fleet rollup shows each Surface node's compact enablement summary; a red subsystem is
-   visible without visiting the node.
+4. Device Manager's read-only fleet rollup admits each Surface node's bounded, fresh compact
+   enablement summary; a red subsystem is visible without visiting or controlling the node.
 5. The panel runs at native resolution with crisp fractional-scaled UI; switching to HD does
    a real modeset (fewer pixels) and back.
 6. Touch works in the shell: tap/scroll/pinch/long-press/edge-swipe; detaching the Type Cover
@@ -148,10 +160,15 @@ signal drives 10/11's auto-engage. SURFACE-5 parallelizes with 6 once 2/3 land.
 ## Risks / out of scope
 
 - **Risks**: MOK enrollment's manual firmware step (mitigate: honest guided copy + post-reboot
-  verify); fingerprint/Hello + cameras are the flakiest Linux subsystems (verify reports
-  degraded honestly rather than faking); DRM modeset/rotation correctness with the touch
+  verify); fingerprint/Hello remains inventory-only and camera one-frame proof still depends
+  on the installed provider and physical hardware (unavailable/failed is reported honestly);
+  DRM modeset/rotation correctness with the touch
   matrix (the touch-transform test is the guard); linux-surface kernel tracking across bootc
   base bumps (the image layer pins it).
+- **External acceptance blockers**: software gates cannot substitute for the release-signed
+  Surface artifact publication, approved SSH recovery key/fingerprint, governed access to the
+  canonical Pro 6 seat, or direct Pro 6 then Pro 5 operator proof. Until those external inputs
+  exist, deployment/promotion remains blocked and no physical acceptance is claimed.
 - **Out of scope**: remote-driving another node's Surface enablement (visibility only, lock 7 —
   would need OW-15); non-Surface convertibles (Surface-specific model table for v1); a separate
   Surface image/role (one image + conditional layer, lock 10); pen palm-rejection tuning UI

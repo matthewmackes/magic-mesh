@@ -35,6 +35,15 @@ unknown IDs: `touch`, `pen`, `type-cover`, `buttons`, `microsd`, `rotation`,
 }
 ```
 
+For `camera-privacy`, use the Surface card's separately authorized and armed
+one-frame proof when the fixed libcamera provider is available, and record its
+closed outcome plus the operator's physical privacy-indicator observation. The
+proof retains no frame and is not a preview. For `fingerprint`, record only a
+hands-on operator result or an explicit `blocked`/`unsupported` limitation;
+read-only fprintd enumeration is capability evidence, not biometric function.
+Missing hardware, provider support, seat access, or an operator is an external
+blocker and must remain `blocked`/`unsupported`, never an inferred pass.
+
 Allowed outcomes are `pass`, `fail`, `blocked`, and `unsupported`. `pass` and
 `fail` require `performed: true`; `blocked` and `unsupported` require
 `performed: false`. A pass cannot declare a limitation. Every non-pass must
