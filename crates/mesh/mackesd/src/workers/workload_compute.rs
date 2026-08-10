@@ -12,6 +12,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
@@ -62,6 +63,9 @@ pub const MAX_AUTH_TTL_MS: i64 = 30_000;
 /// hard upper bound, so a stuck backend cannot create a restart storm.
 const MAX_ADAPTER_ATTEMPTS: u16 = 8;
 const MAX_RETRY_BACKOFF_MS: u64 = 30_000;
+/// The hardened seat-user PipeWire-Pulse bridge consumed by system QEMU.
+const WORKLOAD_AUDIO_PORT: u16 = 4713;
+const WORKLOAD_AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Rootful Quadlet's transient, node-local source directory. Workload
 /// operations are executed by the system daemon, so user-scoped Quadlets
 /// would be invisible to the sole systemd authority.
@@ -1789,6 +1793,9 @@ impl SystemWorkloadActuator {
     fn run_power_command(request: &WorkloadOperationRequest, verb: &str) -> Result<(), String> {
         let status = match request.backend {
             WorkloadBackend::LibvirtVirtqemud => {
+                if verb == "start" {
+                    require_workload_audio_endpoint()?;
+                }
                 let mut command = Command::new("virsh");
                 command.args([
                     "--connect",
@@ -1957,6 +1964,7 @@ impl SystemWorkloadActuator {
         });
         let _ = fs::remove_file(&xml_path);
         Self::require_success(define_result?, "define")?;
+        require_workload_audio_endpoint().map_err(WorkloadActuatorError::Retryable)?;
         let start = Self::virsh_output(&domain, "start")?;
         if start.status.success()
             || libvirt_domain_already_running(&String::from_utf8_lossy(&start.stderr))
@@ -1980,6 +1988,26 @@ impl SystemWorkloadActuator {
             Self::require_success(output, "undefine").map(|_| ())
         }
     }
+}
+
+fn require_workload_audio_endpoint() -> Result<(), String> {
+    require_workload_audio_endpoint_at(
+        SocketAddr::from(([127, 0, 0, 1], WORKLOAD_AUDIO_PORT)),
+        WORKLOAD_AUDIO_CONNECT_TIMEOUT,
+    )
+}
+
+fn require_workload_audio_endpoint_at(
+    endpoint: SocketAddr,
+    timeout: Duration,
+) -> Result<(), String> {
+    TcpStream::connect_timeout(&endpoint, timeout)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Workload VM audio endpoint {endpoint} is unavailable: {error}; restore mcnf-qemu-pulse-endpoint.service before starting the VM"
+            )
+        })
 }
 
 fn libvirt_domain_absent_or_stopped(detail: &str) -> bool {
@@ -5424,6 +5452,26 @@ mod tests {
         assert!(!libvirt_domain_already_running(
             "permission denied while contacting virtqemud"
         ));
+    }
+
+    #[test]
+    fn vm_start_requires_a_reachable_local_audio_endpoint() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("audio fixture listener");
+        let live = listener.local_addr().expect("fixture address");
+        require_workload_audio_endpoint_at(live, Duration::from_millis(100))
+            .expect("reachable endpoint");
+
+        let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("closed fixture listener");
+        let closed_address = closed.local_addr().expect("closed fixture address");
+        drop(closed);
+        let error = require_workload_audio_endpoint_at(
+            closed_address,
+            Duration::from_millis(100),
+        )
+        .expect_err("closed endpoint must prevent a silent VM start");
+        assert!(error.contains("restore mcnf-qemu-pulse-endpoint.service"));
     }
 
     #[test]

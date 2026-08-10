@@ -57,6 +57,9 @@ fn xml_escape(value: &str) -> String {
 /// The QEMU graphics FD remains local: the reconciler's authenticated Display1
 /// broker receives it over the peer-to-peer libvirt D-Bus connection. Guest RDP
 /// is the independent recovery path; QEMU rejects a SPICE head beside D-Bus GL.
+/// Audio is local-only too: QEMU connects to the seat user's hardened
+/// PipeWire-Pulse loopback endpoint instead of guessing at a system QEMU
+/// user's nonexistent PipeWire runtime directory.
 #[must_use]
 pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
     format!(
@@ -89,7 +92,10 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
          \x20   <video><model type='virtio'><acceleration accel3d='yes'/></model></video>\n\
          \x20   <memballoon model='virtio'/>\n\
          \x20   <sound model='virtio'/>\n\
-         \x20   <audio id='1' type='pipewire'><output name='mde-vms' streamName='vm-{name}' latency='40'/></audio>\n\
+         \x20   <audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'>\n\
+         \x20     <input streamName='vm-{name}-capture'/>\n\
+         \x20     <output streamName='vm-{name}-playback'/>\n\
+         \x20   </audio>\n\
          \x20 </devices>\n\
          </domain>\n",
         name = xml_escape(&spec.name),
@@ -121,6 +127,12 @@ mod tests {
         assert!(!xml.contains("type='spice'"));
         assert!(xml.contains("guest&lt;&amp;"));
         assert!(xml.contains("a&apos;&amp;.qcow2"));
+        assert!(xml.contains(
+            "<audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'>"
+        ));
+        assert!(xml.contains("<input streamName='vm-guest&lt;&amp;-capture'/>"));
+        assert!(xml.contains("<output streamName='vm-guest&lt;&amp;-playback'/>"));
+        assert!(!xml.contains("type='pipewire'"));
     }
 
     #[test]

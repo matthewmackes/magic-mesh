@@ -139,9 +139,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON rejects duplicate keys; `.50` passed 9/9. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
-- **Display1/clipboard authority checkpoints (2026-08-06/09):** readiness, damage, packet-safe frame/FD delivery, and removal of the obsolete clipboard relay are proven.
-  Lease-bound input, audio, and live proof remain. Display1 evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-seqpacket-r21.md`.
-  Clipboard evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-clipboard-authority-hard-cut-s6.md`.
+- **Display1/clipboard/audio authority checkpoints (2026-08-06/10):** readiness, damage, packet-safe frame/FD delivery, lease-bound focused QEMU input, local VM
+  audio admission and obsolete clipboard removal are proven; live hardware proof remains. Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-seqpacket-r21.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-input-audio-r23.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-clipboard-authority-hard-cut-s6.md`.
 - **Storage path-boundary checkpoint (2026-08-06):** virtual-storage validation rejects symlinks/outside-root images; `.90` passed:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
 - **Storage Bus transaction checkpoint (2026-08-09):** stable reads precede effects; late/replaced storage and failed publication correct forward without repeated operations.
@@ -1885,6 +1885,9 @@ behavioral evidence is not completion.
 - **Eagle additive recovery checkpoint (2026-08-09):** release 29 exposed a repeated asynchronous target-restart loop. Recovery now starts the target and only missing
   groups without stopping healthy processes; `.50` passed the full fixture. Privileged Eagle deployment remains:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-eagle-additive-group-recovery-r8.md`.
+- **T480 lighthouse/restart checkpoint (2026-08-10):** a stale epoch-0 bundle repeatedly regenerated retired lighthouse endpoints; corrected-forward roster repair
+  restored all three overlays. The watchdog now restores only missing groups and limits unreachable-overlay Nebula restarts to one per 600 seconds; `.50` passed the
+  hostile fixture and T480 held healthy across the timer: `docs/platform/evidence/WL-CRIT-007-2026-08-10-t480-lighthouse-recovery-r106.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
