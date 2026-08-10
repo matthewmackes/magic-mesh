@@ -210,6 +210,15 @@ main() {
         return 0
     fi
 
+    # The first network check admits the event, but the link can disappear
+    # while another recovery still holds the lock. Re-attest after acquiring
+    # the single-flight lease so a stale positive event cannot trigger a
+    # Nebula restart or downstream service mutation.
+    if ! physical_network_online; then
+        publish "offline-during-recovery"
+        return 0
+    fi
+
     # NetworkManager may emit several positive return events for one physical
     # recovery (link, DHCP, connectivity, reapply). Never restart an already
     # healthy overlay for each event: doing so can exhaust nebula.service's

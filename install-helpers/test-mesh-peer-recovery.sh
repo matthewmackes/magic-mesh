@@ -135,7 +135,16 @@ test -f "${MCNF_TEST_STATE:?}/active-nebula.service" \
 SH
 cat >"$BIN/nm-online" <<'SH'
 #!/bin/sh
-test -f "${MCNF_TEST_STATE:?}/online"
+state=${MCNF_TEST_STATE:?}
+if [ -f "$state/drop-after-first-online-check" ]; then
+    count=$(cat "$state/online-checks" 2>/dev/null || printf 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$state/online-checks"
+    if [ "$count" -ge 2 ]; then
+        rm -f "$state/online"
+    fi
+fi
+test -f "$state/online"
 SH
 cat >"$BIN/notify" <<'SH'
 #!/bin/sh
@@ -161,6 +170,23 @@ run_helper
 [ ! -s "$STATE/mutations" ]
 grep -Fq 'offline-no-mutation' "$STATE/notifies"
 echo 'PASS offline fixture: no service mutation'
+
+# The event can be admitted while online and lose its link before the
+# single-flight lease is acquired. The post-lock attestation must fail closed
+# before even restarting Nebula or touching a configured substrate service.
+: >"$STATE/online"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+: >"$STATE/online-checks"
+: >"$STATE/drop-after-first-online-check"
+run_helper
+if [ -s "$STATE/mutations" ]; then
+    echo 'mid-recovery network loss caused a service mutation' >&2
+    exit 1
+fi
+grep -Fq 'status=offline-during-recovery' "$STATE/notifies"
+rm -f "$STATE/drop-after-first-online-check"
+echo 'PASS stale-network fixture: post-lock attestation fails closed'
 
 : >"$STATE/online"
 : >"$STATE/notifies"
