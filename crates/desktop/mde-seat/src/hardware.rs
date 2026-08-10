@@ -138,7 +138,9 @@ impl HardwareClient for SysfsHardware {
 
         let mut zones = Vec::new();
         if let Some(entries) = thermal {
-            for entry in entries.flatten() {
+            let mut entries = entries.flatten().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+            for entry in entries {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if !name.starts_with("thermal_zone") || zones.len() >= MAX_ZONES {

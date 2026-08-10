@@ -129,6 +129,9 @@ pub(super) fn preflight(
             .payload
             .validate()
             .map_err(|_| AndroidProviderRefusal::CatalogUnavailable)?;
+        if input.now_unix_ms < catalog.payload.issued_at_unix_ms {
+            return Err(AndroidProviderRefusal::CatalogUnavailable);
+        }
         if input.now_unix_ms > catalog.payload.expires_at_unix_ms {
             return Err(AndroidProviderRefusal::CatalogExpired);
         }
@@ -489,6 +492,21 @@ mod tests {
             assert_eq!(admission.refusal, Some(reason));
             assert_eq!(admission.readiness, AndroidProviderReadiness::Unavailable);
         }
+    }
+
+    #[test]
+    fn future_issued_catalog_is_not_admitted_before_validity_window() {
+        let mut future = catalog();
+        future.payload.issued_at_unix_ms = NOW + 1;
+
+        let admission = run(&future, &healthy_probe(), NOW, true);
+
+        assert!(!admission.is_ready());
+        assert_eq!(
+            admission.refusal,
+            Some(AndroidProviderRefusal::CatalogUnavailable)
+        );
+        assert_eq!(admission.readiness, AndroidProviderReadiness::Unavailable);
     }
 
     #[test]

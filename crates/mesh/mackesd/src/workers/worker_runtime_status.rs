@@ -267,6 +267,9 @@ impl WorkerRuntimeNodeStatus {
         if self.observed_at_ms == 0 || now_ms < self.observed_at_ms {
             return Err(WorkerRuntimeStatusError::NodeSnapshot("observed_at_ms"));
         }
+        if now_ms.saturating_sub(self.observed_at_ms) > RUNTIME_FRESHNESS_MS {
+            return Err(WorkerRuntimeStatusError::NodeSnapshot("observed_at_ms"));
+        }
         if self.workers.len() > MAX_NODE_STATUS_WORKERS {
             return Err(WorkerRuntimeStatusError::NodeSnapshot("workers.capacity"));
         }
@@ -1864,6 +1867,22 @@ mod tests {
         assert_eq!(
             fold_group_statuses("node-a", 3_000, &foreign),
             Err(WorkerRuntimeStatusError::NodeSnapshot("groups.owner"))
+        );
+    }
+
+    #[test]
+    fn stale_empty_aggregate_is_rejected_at_decode() {
+        let stale = WorkerRuntimeNodeStatus {
+            schema_version: runtime::WORKER_RUNTIME_SCHEMA_VERSION,
+            node_id: "node-a".to_owned(),
+            observed_at_ms: 1_000,
+            workers: Vec::new(),
+        };
+        let body = stale.to_json().expect("encode stale aggregate");
+
+        assert_eq!(
+            WorkerRuntimeNodeStatus::from_json(&body, 1_000 + RUNTIME_FRESHNESS_MS + 1),
+            Err(WorkerRuntimeStatusError::NodeSnapshot("observed_at_ms"))
         );
     }
 

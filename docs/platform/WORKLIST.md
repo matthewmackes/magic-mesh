@@ -400,10 +400,10 @@ behavioral evidence is not completion.
   Operations, and staged Action Console; old surfaces and health duplication are removed.
 - Current state: all 152 registered starts have bounded runtime contracts; six grouped services ship, but complete ownership, UI cutover, and fleet proof remain.
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
-- **Action Console checkpoints (2026-08-08/09):** generation-bound actions and digest recomputation fail closed:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
+- **Action Console evidence (2026-08-08/09):** generation/digest gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
+- **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
 - Remaining work:
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
@@ -1340,15 +1340,15 @@ behavioral evidence is not completion.
   typed start/stop/readiness, VDI presentation, and bounded host isolation.
 - Current state: signed catalog/import, provider preflight, crash-safe lifecycle, bounded guest relay, typed VDI source, and governed Workloads cards/actions exist;
   release artifacts, remote-session attachment, guest packaging, nested-KVM run, and live proof remain.
-- **Catalog/provider checkpoints (2026-08-08):** signed image/package/policy import and image/KVM/capacity/libvirt preflight passed farm gates:
+- **Catalog/provider (2026-08-08):** signed import and image/KVM/capacity/libvirt preflight passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
-- **S3 lifecycle/readiness (2026-08-09):** exact-generation recovery and bounded guest relay passed BigBoy; outer-VM loss now revokes retained VDI sources, with `.90` at 6/6:
+- **S3 lifecycle/readiness (2026-08-09):** recovery, guest relay, and VDI revocation passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-lifecycle-s3-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-09-vdi-readiness-revocation-r4.md`.
-- **S4 governed Workloads UX (2026-08-08):** daemon-cache-bound signed cards, typed lifecycle, responsive rendering, and WebRTC handoff passed 6/6 on `.170`;
-  authorized Remote Sessions consumption and fail-closed no-dial refusal passed 2/2; live decoder/captures remain. Evidence:
+- **S4 governed UX (2026-08-08):** signed cards, lifecycle, rendering, handoff, and no-dial refusal passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-governed-android-ux-s4-r1.md`.
-- **Release-artifact admission (2026-08-09):** schema-v2 readiness binds release, package, architecture, compatibility, and tool digest; machine 193 gates passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-09-release-artifact-admission-s2-s5-r5.md`.
+- **Release admission (2026-08-09):** schema-v2 readiness binding passed: `docs/platform/evidence/WL-FUNC-020-2026-08-09-release-artifact-admission-s2-s5-r5.md`.
+- **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
 - Remaining work:
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
     libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
@@ -2211,6 +2211,10 @@ behavioral evidence is not completion.
   interfaces with exact control-compatible sysfs identity and truthful link
   state; `.90` passed the exact regression:
   `docs/platform/evidence/WL-UX-011-2026-08-10-network-interface-provider-r19.md`.
+- **Deterministic thermal source checkpoint (2026-08-10):** sysfs thermal zones
+  are sorted before the bounded provider limit, preventing directory-order
+  churn in hardware summaries; `.50` passed the focused hostile-sensor gate:
+  `docs/platform/evidence/WL-UX-011-2026-08-10-thermal-zone-order-r153.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.
