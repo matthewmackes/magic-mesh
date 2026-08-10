@@ -1793,9 +1793,7 @@ SERVER: MCNF/1.0\r\n\r\n";
     #[test]
     fn failed_latest_test_revokes_launch_admission_even_when_enabled() {
         let root = tempfile::tempdir().unwrap();
-        persist_configuration(
-            root.path(),
-            &StoredServiceConfiguration {
+        let config = StoredServiceConfiguration {
                 schema_version: SERVICE_CONFIG_VERSION,
                 service_kind: "jellyfin".into(),
                 non_secret_values: BTreeMap::from([(
@@ -1807,24 +1805,12 @@ SERVER: MCNF/1.0\r\n\r\n";
                 enabled: true,
                 last_test_ok: Some(false),
                 updated_at_ms: 1_700_000_000_000,
-            },
-        )
-        .expect("persist service state");
-
-        let catalog = catalog_from_services_with_root(
-            &ServicesState {
-                host: "seat-15".into(),
-                records: vec![],
-                published_at_ms: 1_700_000_000_000,
-            },
-            root.path(),
-        )
-        .expect("valid catalog");
-        let card = catalog
-            .cards
-            .iter()
-            .find(|card| card.identity.canonical_key == "provider/jellyfin/jellyfin")
-            .expect("Jellyfin service card");
+            };
+        persist_configuration(root.path(), &config).expect("persist service state");
+        let spec = registered_service("jellyfin").expect("registered Jellyfin adapter");
+        let card = registered_card(spec, "seat-15", 1_700_000_000_000, Some(&config))
+            .expect("valid service card");
+        card.validate().expect("failed probe remains a valid card");
         let launch = card
             .actions
             .iter()
