@@ -1508,6 +1508,7 @@ impl SystemWorkloadActuator {
         }
         let domain = Self::libvirt_domain(request);
         let disk = pool.join(format!("{domain}.qcow2"));
+        ensure_new_overlay_path(&disk)?;
         let disk_string = disk.to_string_lossy().into_owned();
         let image_args = crate::workers::workload_vm::build_qemu_img_argv(
             Some(&base.to_string_lossy()),
@@ -1518,11 +1519,13 @@ impl SystemWorkloadActuator {
         image_command.args(&image_args);
         let image_status =
             status_with_timeout(image_command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                let _ = fs::remove_file(&disk);
                 WorkloadActuatorError::Retryable(format!(
                     "VM overlay creation failed to start: {error}"
                 ))
             })?;
         if !image_status.success() {
+            let _ = fs::remove_file(&disk);
             return Err(WorkloadActuatorError::Retryable(format!(
                 "VM overlay creation exited with {image_status}"
             )));
@@ -1539,10 +1542,12 @@ impl SystemWorkloadActuator {
         };
         let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string)
             .map_err(|error| {
+                let _ = fs::remove_file(&disk);
                 WorkloadActuatorError::Permanent(format!("invalid VM resources: {error}"))
             })?;
         let xml_path = std::env::temp_dir().join(format!("mde-workload-{domain}.xml"));
         fs::write(&xml_path, xml.as_bytes()).map_err(|error| {
+            let _ = fs::remove_file(&disk);
             WorkloadActuatorError::Retryable(format!("write VM definition: {error}"))
         })?;
         let mut define_command = Command::new("virsh");
@@ -1848,6 +1853,18 @@ impl SystemWorkloadActuator {
         Ok(output.status.success()
             && (state.trim().eq_ignore_ascii_case("running")
                 || state.trim().eq_ignore_ascii_case("active")))
+    }
+}
+
+fn ensure_new_overlay_path(path: &Path) -> Result<(), WorkloadActuatorError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(WorkloadActuatorError::Permanent(
+            "managed VM overlay already exists without an admitted domain".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(WorkloadActuatorError::Retryable(format!(
+            "inspect managed VM overlay path: {error}"
+        ))),
     }
 }
 
@@ -5705,6 +5722,18 @@ mod tests {
         let error = validate_recovered_attachment_lease(&request, &status, &lease, now)
             .expect_err("recovery must reject a lease beyond the request authority window");
         assert!(error.contains("outlives"));
+    }
+
+    #[test]
+    fn existing_vm_overlay_is_not_overwritten_or_deleted() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("existing.qcow2");
+        fs::write(&path, b"retained overlay").expect("seed overlay");
+
+        let error = ensure_new_overlay_path(&path)
+            .expect_err("an orphan overlay must require explicit recovery");
+        assert!(matches!(error, WorkloadActuatorError::Permanent(_)));
+        assert_eq!(fs::read(&path).expect("retained overlay"), b"retained overlay");
     }
 
     #[test]
