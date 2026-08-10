@@ -6,9 +6,9 @@
 //! per-model [`SurfaceProfile`]; this unit turns that profile into the
 //! observed enablement posture the bootc image *can't* fully prove ahead of time:
 //!
-//! * **Activate + configure** — preserve the typed desired plan, but fail the
-//!   live mutation closed until it is connected to the shared
-//!   Preview/Commit/Cancel/Audit authority with a fresh provider generation.
+//! * **Activate + configure** — after the worker consumes the shared exact-body,
+//!   single-use action capability, retrigger the package-owned iptsd udev rule
+//!   and apply the fixed Surface platform profile through `surface-control`.
 //! * **Guided MOK enrollment** (lock #6) — on a Secure-Boot host whose
 //!   linux-surface modules are blocked, stage the machine-owner key
 //!   (`mokutil --import`), hand back the **exact blue MOK-Manager firmware
@@ -19,9 +19,9 @@
 //!
 //! **Everything that touches the machine sits behind the injectable
 //! [`SurfaceActions`] seam.** The production seam ([`LiveSurfaceActions`])
-//! uses fixed binaries, fixed paths, and bounded subprocesses for read-only
-//! classification. Profile activation/config writes remain integration-gated;
-//! MOK import uses a request-bound sealed systemd credential and proves the
+//! uses fixed binaries, fixed paths, allowlisted arguments, and bounded
+//! subprocesses for activation and classification. MOK import uses a
+//! request-bound sealed systemd credential and proves the
 //! fixed certificate is pending afterward.
 //! Pending enrollment is proven in-process by
 //! matching the fixed package certificate's complete SHA-1 fingerprint against
@@ -62,6 +62,11 @@ mod mok_credential;
 /// The packaged per-device iptsd systemd template. A udev rule owns instance
 /// selection; callers can never provide a unit or hidraw path.
 pub const IPTSD_UNIT: &str = "iptsd@.service";
+
+#[cfg(feature = "async-services")]
+const IPTSD_ACTIVE_PATTERN: &str = "iptsd@*.service";
+#[cfg(feature = "async-services")]
+const SAM_BALANCED_PROFILE: &str = "balanced";
 
 /// The linux-surface kernel modules the verify step confirms load once the
 /// MOK key is enrolled. A representative core set (touch/pen digitizer + the
@@ -234,6 +239,28 @@ impl LiveSurfaceActions {
     }
 }
 
+fn validate_unit_target(unit: &str) -> Result<(), EnableError> {
+    if unit == IPTSD_UNIT {
+        Ok(())
+    } else {
+        LiveSurfaceActions::failed("activate iptsd", "unit is not the fixed iptsd template")
+    }
+}
+
+fn validate_config_target(key: ConfigKey, value: &str) -> Result<(), EnableError> {
+    match (key, value) {
+        (ConfigKey::SamPerfProfile, "balanced") => Ok(()),
+        (ConfigKey::SamPerfProfile, _) => LiveSurfaceActions::failed(
+            "apply sam_perf_profile",
+            "profile is not the fixed balanced Surface profile",
+        ),
+        _ => LiveSurfaceActions::failed(
+            format!("apply {}", key.id()),
+            "configuration is package- or DRM-runner-owned",
+        ),
+    }
+}
+
 #[cfg(feature = "async-services")]
 fn run_fixed(
     action: &str,
@@ -241,13 +268,45 @@ fn run_fixed(
     args: &[&str],
 ) -> Result<std::process::Output, EnableError> {
     let mut command = Command::new(program);
-    command.args(args).env("LC_ALL", "C");
+    command
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("SYSTEMD_COLORS", "0");
     crate::workers::proc::output_with_timeout(command, SURFACE_COMMAND_TIMEOUT).map_err(|error| {
         EnableError::Failed {
             action: action.to_string(),
             detail: error.to_string(),
         }
     })
+}
+
+#[cfg(feature = "async-services")]
+fn command_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        format!("command exited with {}", output.status)
+    } else {
+        detail.to_string()
+    }
+}
+
+#[cfg(feature = "async-services")]
+fn iptsd_is_active() -> Result<bool, EnableError> {
+    let output = run_fixed(
+        "query iptsd activation",
+        "/usr/bin/systemctl",
+        &["is-active", IPTSD_ACTIVE_PATTERN],
+    )?;
+    Ok(output.status.success())
 }
 
 fn parse_secure_boot_state(text: &str) -> Option<SecureBootState> {
@@ -333,24 +392,86 @@ fn pending_list_contains_sha1(
 
 impl SurfaceActions for LiveSurfaceActions {
     fn enable_unit(&self, unit: &str) -> Result<bool, EnableError> {
-        if unit != IPTSD_UNIT {
-            return Self::failed("activate iptsd", "unit is not the fixed iptsd template");
+        validate_unit_target(unit)?;
+        #[cfg(feature = "async-services")]
+        {
+            if iptsd_is_active()? {
+                return Ok(true);
+            }
+
+            // iptsd 3.1.0's packaged rule matches hidraw/add, then admits only
+            // devices accepted by its fixed `iptsd-check-device --quiet
+            // $DEVNAME` helper. No narrower stable property is part of that
+            // package contract, so replay the rule's exact subsystem/action
+            // scope and let the packaged helper select the device. This worker
+            // never accepts a unit instance or /dev path from the request.
+            let trigger = run_fixed(
+                "activate iptsd",
+                "/usr/bin/udevadm",
+                &["trigger", "--action=add", "--subsystem-match=hidraw"],
+            )?;
+            if !trigger.status.success() {
+                return Self::failed("activate iptsd", command_detail(&trigger));
+            }
+            let settle = run_fixed(
+                "wait for iptsd activation",
+                "/usr/bin/udevadm",
+                &["settle", "--timeout=8"],
+            )?;
+            if !settle.status.success() {
+                return Self::failed("wait for iptsd activation", command_detail(&settle));
+            }
+            if !iptsd_is_active()? {
+                return Self::failed(
+                    "activate iptsd",
+                    "the package udev rule did not start an iptsd device instance",
+                );
+            }
+            return Ok(false);
         }
-        Self::gated(
-            "activate iptsd (Surface Preview / Commit / Cancel / Audit authority unavailable)",
-        )
+        #[cfg(not(feature = "async-services"))]
+        Self::gated("activate iptsd (async-services disabled)")
     }
 
-    fn apply_config(&self, key: ConfigKey, _value: &str) -> Result<(), EnableError> {
-        if key != ConfigKey::SamPerfProfile {
-            return Self::failed(
-                format!("apply {}", key.id()),
-                "configuration is package- or DRM-runner-owned",
-            );
+    fn apply_config(&self, key: ConfigKey, value: &str) -> Result<(), EnableError> {
+        validate_config_target(key, value)?;
+        #[cfg(feature = "async-services")]
+        {
+            // surface-control validates the requested profile against the
+            // kernel-advertised choices and skips the write when it is already
+            // current. Both the executable and every argument are fixed here.
+            let apply = run_fixed(
+                "apply sam_perf_profile",
+                "/usr/bin/surface",
+                &["--quiet", "profile", "set", SAM_BALANCED_PROFILE],
+            )?;
+            if !apply.status.success() {
+                return Self::failed("apply sam_perf_profile", command_detail(&apply));
+            }
+            let verify = run_fixed(
+                "verify sam_perf_profile",
+                "/usr/bin/surface",
+                &["--quiet", "profile", "get"],
+            )?;
+            if !verify.status.success() {
+                return Self::failed("verify sam_perf_profile", command_detail(&verify));
+            }
+            let current = std::str::from_utf8(&verify.stdout)
+                .map_err(|_| EnableError::Failed {
+                    action: "verify sam_perf_profile".to_string(),
+                    detail: "surface-control returned a non-UTF-8 profile".to_string(),
+                })?
+                .trim();
+            if current != SAM_BALANCED_PROFILE || !verify.stderr.is_empty() {
+                return Self::failed(
+                    "verify sam_perf_profile",
+                    "surface-control did not confirm the fixed balanced profile",
+                );
+            }
+            return Ok(());
         }
-        Self::gated(
-            "apply sam_perf_profile (Surface Preview / Commit / Cancel / Audit authority unavailable)",
-        )
+        #[cfg(not(feature = "async-services"))]
+        Self::gated("apply sam_perf_profile (async-services disabled)")
     }
 
     fn secure_boot_state(&self) -> Result<SecureBootState, EnableError> {
@@ -1944,13 +2065,15 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
         let config = actions.apply_config(ConfigKey::RotationHint, "auto");
         assert!(matches!(config, Err(EnableError::Failed { .. })));
         assert!(matches!(
-            actions.enable_unit(IPTSD_UNIT),
-            Err(EnableError::IntegrationGated { action }) if action.contains("Preview / Commit / Cancel / Audit")
+            validate_config_target(ConfigKey::SamPerfProfile, "performance"),
+            Err(EnableError::Failed { action, detail })
+                if action == "apply sam_perf_profile" && detail.contains("fixed balanced")
         ));
-        assert!(matches!(
-            actions.apply_config(ConfigKey::SamPerfProfile, "balanced"),
-            Err(EnableError::IntegrationGated { action }) if action.contains("Preview / Commit / Cancel / Audit")
-        ));
+        assert_eq!(validate_unit_target(IPTSD_UNIT), Ok(()));
+        assert_eq!(
+            validate_config_target(ConfigKey::SamPerfProfile, "balanced"),
+            Ok(())
+        );
         let pending = actions.mok_pending(Path::new("/tmp/caller.cer"));
         assert!(matches!(pending, Err(EnableError::Failed { .. })));
         let hostile_pending = actions.mok_pending(Path::new("/tmp/cert.cer\n--root-pw"));
