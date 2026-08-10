@@ -33,6 +33,10 @@ const CARD_MS: u64 = 120_000;
 // scan can take longer than CARD_MS, and dropping the typed card earlier makes
 // it disappear between otherwise healthy inventory publications.
 const PROBED_RDP_MAX_AGE_MS: u64 = 300_000;
+// Retained desktop-source cards use the same five-minute freshness lease as
+// the desktop-source adapter. Do not let a delayed or replayed roster revive
+// an RDP endpoint after that lease has elapsed.
+const DESKTOP_ROSTER_MAX_AGE_MS: u64 = 300_000;
 const SERVICE_CONFIG_VERSION: u16 = 1;
 const MAX_CONFIGURATION_BYTES: u64 = 64 * 1024;
 
@@ -265,7 +269,7 @@ fn catalog_from_services_and_root(
         cards.push(observed_card(record, &state.host, now)?);
     }
     if let Some(desktop_state) = desktop_state {
-        append_desktop_cards(&mut cards, desktop_state)?;
+        append_desktop_cards(&mut cards, desktop_state, now)?;
     }
     if let Some(ssh_x11_state) = ssh_x11_state {
         append_ssh_x11_cards(&mut cards, ssh_x11_state)?;
@@ -291,7 +295,17 @@ fn catalog_from_services_and_root(
 fn append_desktop_cards(
     cards: &mut Vec<ResourceCard>,
     desktop_state: &DesktopSourcesState,
+    now: u64,
 ) -> Result<(), ResourceValidationError> {
+    // The roster is retained across discovery cycles, so its publication
+    // timestamp is the authority for whether its source rows may still be
+    // projected. A future timestamp is also withheld: accepting it would let
+    // clock-skewed or replayed state obtain a fresh five-minute card lease.
+    if desktop_state.published_at_ms > now
+        || now.saturating_sub(desktop_state.published_at_ms) > DESKTOP_ROSTER_MAX_AGE_MS
+    {
+        return Ok(());
+    }
     let mut desktop_cards = BTreeMap::<String, ResourceCard>::new();
     for source in &desktop_state.sources {
         let card = resource_card_from_desktop_source(source, desktop_state.published_at_ms)?;
@@ -1593,6 +1607,52 @@ mod tests {
         );
         catalog.validate().expect("validated catalog");
         assert!(catalog.content_digest.is_some());
+    }
+
+    #[test]
+    fn stale_or_future_desktop_roster_cannot_revive_rdp_cards() {
+        const NOW: i64 = 1_700_000_000_000;
+        let root = tempfile::tempdir().unwrap();
+        let services = ServicesState {
+            host: "seat-15".into(),
+            records: vec![],
+            published_at_ms: NOW,
+        };
+        let source = DesktopSource {
+            id: "peer:stale-windows".into(),
+            name: "Stale Windows".into(),
+            node: "windows".into(),
+            host: "172.20.146.54".into(),
+            protocols: vec![ProtocolOffer::new(DesktopProtocol::Rdp, Some(3389))],
+            origin: SourceOrigin::MeshPeer,
+            reachability: Reachability::Reachable,
+            reason: None,
+            os_hint: None,
+            power_state: None,
+            thumbnail_ref: None,
+        };
+
+        for published_at_ms in [
+            (NOW - i64::try_from(DESKTOP_ROSTER_MAX_AGE_MS).unwrap() - 1) as u64,
+            (NOW + 1) as u64,
+        ] {
+            let catalog = catalog_from_services_with_root_and_desktops(
+                &services,
+                root.path(),
+                Some(&DesktopSourcesState {
+                    node: "desktop-discovery".into(),
+                    sources: vec![source.clone()],
+                    lanes: vec![],
+                    published_at_ms,
+                }),
+            )
+            .expect("stale roster is withheld without invalidating the catalog");
+            assert!(!catalog
+                .cards
+                .iter()
+                .any(|card| card.identity.canonical_key == "peer:stale-windows"));
+            catalog.validate().expect("catalog remains valid");
+        }
     }
 
     #[test]

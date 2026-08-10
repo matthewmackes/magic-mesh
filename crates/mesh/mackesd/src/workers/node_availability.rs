@@ -14,11 +14,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use mackes_mesh_types::health::{
-    node_health_topic, ExpectedReturn, NodeAvailabilityAssessment, NodeAvailabilityIntent,
-    NodeAvailabilityPolicy, NodeAvailabilityState, NodeAvailabilityValidationError,
-    NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass, MAX_NODE_AVAILABILITY_ID_BYTES,
-    MAX_NODE_AVAILABILITY_INTENT_TTL_MS, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
-    NODE_HEALTH_TOPIC_PREFIX,
+    ExpectedReturn, MAX_NODE_AVAILABILITY_ID_BYTES, MAX_NODE_AVAILABILITY_INTENT_TTL_MS,
+    NODE_AVAILABILITY_INTENT_SCHEMA_VERSION, NODE_HEALTH_TOPIC_PREFIX, NodeAvailabilityAssessment,
+    NodeAvailabilityIntent, NodeAvailabilityPolicy, NodeAvailabilityState,
+    NodeAvailabilityValidationError, NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass,
+    node_health_topic,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, PersistError};
@@ -741,6 +741,14 @@ impl RuntimeAvailabilityPublisher {
     pub fn correct_forward(
         &self,
     ) -> Result<Option<NodeAvailabilityIntent>, RuntimeAvailabilityError> {
+        self.correct_forward_at(availability_now_ms())
+    }
+
+    /// Correct a durable-only event at an injected clock.
+    pub fn correct_forward_at(
+        &self,
+        now_ms: u64,
+    ) -> Result<Option<NodeAvailabilityIntent>, RuntimeAvailabilityError> {
         let publication_lock = RUNTIME_PUBLICATION_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = publication_lock
             .lock()
@@ -750,7 +758,7 @@ impl RuntimeAvailabilityPublisher {
         verify_availability_bus_identity(&persist, &self.bus_root, bus_identity)
             .map_err(RuntimeAvailabilityError::BusIdentity)?;
         if let Some(intent) = &current {
-            retry_durable_publication(&mut persist, &self.bus_root, bus_identity, intent)?;
+            retry_durable_publication(&mut persist, &self.bus_root, bus_identity, intent, now_ms)?;
         }
         Ok(current)
     }
@@ -771,7 +779,13 @@ impl RuntimeAvailabilityPublisher {
             .map_err(RuntimeAvailabilityError::BusIdentity)?;
 
         if let Some(previous) = &previous {
-            retry_durable_publication(&mut persist, &self.bus_root, bus_identity, previous)?;
+            retry_durable_publication(
+                &mut persist,
+                &self.bus_root,
+                bus_identity,
+                previous,
+                now_ms,
+            )?;
             if runtime_request_matches(previous, &request)? && now_ms <= previous.expires_at_ms {
                 return Ok(previous.clone());
             }
@@ -943,7 +957,13 @@ fn retry_durable_publication(
     bus_root: &Path,
     bus_identity: AvailabilityBusIdentity,
     intent: &NodeAvailabilityIntent,
+    now_ms: u64,
 ) -> Result<(), RuntimeAvailabilityError> {
+    match intent.validate_at(now_ms) {
+        Ok(()) => {}
+        Err(NodeAvailabilityValidationError::Stale) => return Ok(()),
+        Err(error) => return Err(RuntimeAvailabilityError::Contract(error)),
+    }
     let body = serde_json::to_string(intent)
         .map_err(|error| RuntimeAvailabilityError::DurableRecord(error.to_string()))?;
     if body.len() > MAX_LIFECYCLE_INTENT_RECORD_BYTES {
@@ -1686,8 +1706,8 @@ impl From<AvailabilityAdmissionError> for AvailabilityFoldError {
 mod tests {
     use super::*;
     use mackes_mesh_types::health::{
-        ExpectedReturn, NodeAddressFamily, NodeConnectionType, NodeConnectivitySummary,
-        NodeDeviceClass, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+        ExpectedReturn, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION, NodeAddressFamily,
+        NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass,
     };
 
     const NOW_MS: u64 = 10_000;
@@ -1881,16 +1901,18 @@ mod tests {
             rows[1].body.as_deref(),
             std::str::from_utf8(&returned_body).ok()
         );
-        assert!(durable_path
-            .parent()
-            .expect("durable parent")
-            .read_dir()
-            .expect("read durable parent")
-            .all(|entry| entry
-                .expect("directory entry")
-                .file_name()
-                .to_string_lossy()
-                == "node-a-intent.json"));
+        assert!(
+            durable_path
+                .parent()
+                .expect("durable parent")
+                .read_dir()
+                .expect("read durable parent")
+                .all(|entry| entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    == "node-a-intent.json")
+        );
     }
 
     #[test]
@@ -1924,10 +1946,12 @@ mod tests {
             ))
         ));
         assert_eq!(ledger.current("node-a"), Some(&awake));
-        assert!(persist
-            .read_latest(&node_health_topic("node-a"))
-            .expect("read Bus")
-            .is_none());
+        assert!(
+            persist
+                .read_latest(&node_health_topic("node-a"))
+                .expect("read Bus")
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -1989,15 +2013,19 @@ mod tests {
             ))
         ));
         assert_eq!(ledger.current("node-a"), Some(&awake));
-        assert!(persist
-            .read_latest(&node_health_topic("node-a"))
-            .expect("read Bus")
-            .is_none());
-        assert!(real_parent
-            .read_dir()
-            .expect("read real parent")
-            .next()
-            .is_none());
+        assert!(
+            persist
+                .read_latest(&node_health_topic("node-a"))
+                .expect("read Bus")
+                .is_none()
+        );
+        assert!(
+            real_parent
+                .read_dir()
+                .expect("read real parent")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2231,6 +2259,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_publisher_does_not_republish_expired_durable_expected_absence() {
+        let bus = tempfile::tempdir().expect("bus");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(bus.path(), &durable);
+        let sleeping = build_runtime_intent(
+            "node-a",
+            "node-a-device",
+            NodeDeviceClass::Laptop,
+            None,
+            runtime_sleep_request(),
+            10_000,
+        )
+        .expect("build expected absence");
+        write_lifecycle_intent_record(
+            &durable,
+            serde_json::to_string(&sleeping)
+                .expect("encode expected absence")
+                .as_bytes(),
+        )
+        .expect("stage durable expected absence");
+
+        assert_eq!(
+            publisher
+                .correct_forward_at(sleeping.expires_at_ms + 1)
+                .expect("stale correction must remain readable"),
+            Some(sleeping.clone())
+        );
+        let returned = publisher
+            .publish_at(runtime_returned_request(), sleeping.expires_at_ms + 2)
+            .expect("publish fresh returned transition");
+        assert_eq!(returned.generation, sleeping.generation + 1);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        let rows = persist
+            .list_since(&node_health_topic("node-a"), None)
+            .expect("read fresh projection");
+        assert_eq!(rows.len(), 1, "expired durable truth must not be projected");
+        let projected: NodeAvailabilityIntent =
+            serde_json::from_str(rows[0].body.as_deref().expect("projection body"))
+                .expect("typed returned projection");
+        assert_eq!(projected, returned);
+    }
+
+    #[test]
     fn bus_transaction_recovers_late_storage_with_same_long_running_owner() {
         let holder = tempfile::tempdir().expect("holder");
         let blocked_parent = holder.path().join("blocked-parent");
@@ -2240,9 +2313,11 @@ mod tests {
         let durable = state.path().join("availability/current.json");
         let publisher = runtime_publisher(&bus, &durable);
 
-        assert!(publisher
-            .publish_at(runtime_sleep_request(), 40_000)
-            .is_err());
+        assert!(
+            publisher
+                .publish_at(runtime_sleep_request(), 40_000)
+                .is_err()
+        );
         assert!(!durable.exists(), "failed input staging cannot mint truth");
 
         std::fs::remove_file(&blocked_parent).expect("remove blocker");
@@ -2412,14 +2487,18 @@ mod tests {
             serde_json::to_vec(&sleeping).expect("sleep bytes")
         );
         let current = Persist::open(bus.clone()).expect("current Bus");
-        assert!(current
-            .read_latest(&node_health_topic("node-a"))
-            .expect("current projection")
-            .is_none());
+        assert!(
+            current
+                .read_latest(&node_health_topic("node-a"))
+                .expect("current projection")
+                .is_none()
+        );
 
         let publisher = runtime_publisher(&bus, &durable);
         assert_eq!(
-            publisher.correct_forward().expect("recover outbox"),
+            publisher
+                .correct_forward_at(21_000)
+                .expect("recover outbox"),
             Some(sleeping.clone())
         );
         let recovered: NodeAvailabilityIntent = serde_json::from_str(

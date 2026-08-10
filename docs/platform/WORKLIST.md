@@ -1211,6 +1211,10 @@ behavioral evidence is not completion.
   passed 3/3. Live Windows address
   discovery and installed connection proof remain. Evidence:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-probed-rdp-resource-card-s2-r3.md`.
+- **Stale desktop-roster checkpoint (2026-08-10):** future-dated and older-than-five-minute
+  desktop source rosters are withheld before they can revive an approval-gated RDP card;
+  `.90` passed the exact regression. Authenticated login/render proof remains:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-stale-desktop-roster-r151.md`.
 - **Live Windows discovery checkpoint (2026-08-09):** Basement seat 15 now
   explicitly targets the quiet Windows endpoint at `172.20.146.54`; its fresh
   shared probe inventory contains `ms-wbt-server` on TCP 3389. Authenticated
@@ -2389,6 +2393,10 @@ behavioral evidence is not completion.
   five focused machine-194 gates: `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`.
 - **Node-availability recovery (2026-08-09):** durable truth corrects forward across late/replaced Bus storage without committing partial ledger state. Machine 193 passed 4/4:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-availability-bus-transaction-recovery-r88.md`.
+- **Expired expected-absence checkpoint (2026-08-10):** an expired durable expected-state
+  intent remains readable for audit but is not republished onto the health Bus; the next
+  live transition wins without stale projection. BigBoy passed the exact regression:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-expired-expected-absence-r151.md`.
 - **Quiet-Windows discovery checkpoint (2026-08-09):** ping-silent local hosts reach bounded TCP 3389 fingerprinting without widening the `/24`; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
 - **Seat 15 RDP catalog-TTL closure (2026-08-09):** release 27 kept the card available beyond the old two-minute cutoff and renewed it across two scans:
