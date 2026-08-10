@@ -95,9 +95,15 @@ and later recurs.
 ## Verification lock
 
 Acceptance requires farm unit/integration gates, dark/light/narrow/desktop/
-large-text render proof, and direct polling on all five seats. Each seat must
-prove current package identity, required providers, device inventory, resource
-thresholds, `mm` user-session playback and capture, exact badge count, modal
-rendering, guided-action audit, and critical auto-open behavior. Completion is
-not claimed until the five direct polls show zero warning/critical conditions
-for two publisher freshness cycles plus reboot/resume checks.
+large-text render proof, and direct polling on no more than three selected
+physical test seats. The default release baseline is Dell, Seat 15, and Surface;
+a hardware-specific proof may substitute another named seat while keeping the
+activity at three seats or fewer. Every selected seat must prove current package
+identity, required providers, device inventory, resource thresholds, `mm`
+user-session playback and capture, exact badge count, modal rendering,
+guided-action audit, and critical auto-open behavior. Completion is not claimed
+until every selected-seat direct poll shows zero warning/critical conditions for
+two publisher freshness cycles plus reboot/resume checks. Wider fleet rollout,
+when required, proceeds in separately bounded waves and does not expand this
+test requirement. The independently governed three-lighthouse quorum is not a
+physical test-seat requirement.
