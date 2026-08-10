@@ -461,6 +461,16 @@ pub(crate) enum Action {
     ToggleQuickLook,
     /// FILEMGR-10 — Escape / backdrop click: close the quick-look overlay.
     CloseQuickLook,
+    /// WL-FUNC-011 — open New Folder in the active pane's current directory.
+    OpenNewFolder(usize),
+    /// WL-FUNC-011 — open Rename for exactly one focused local entry.
+    OpenRename(usize),
+    /// WL-FUNC-011 — edit the shared New Folder / Rename name field.
+    SetNameDialogInput(String),
+    /// WL-FUNC-011 — submit the open name operation through FileOps.
+    SubmitNameDialog(usize),
+    /// WL-FUNC-011 — close the name dialog without mutation.
+    CancelNameDialog,
     /// FILEMGR-11 — open the permanent-delete confirm for the pane's selection.
     RequestDelete(usize),
     /// FILEMGR-11 — a keystroke in the delete confirm's typed-arming echo.
@@ -697,6 +707,8 @@ fn clipboard_keys(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
 fn operation_dialogs(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     if b.pending_conflict().is_some() {
         conflict_dialog(ui, b, actions);
+    } else if b.name_dialog().is_some() {
+        name_dialog(ui, b, actions);
     } else if b.pending_delete().is_some() {
         delete_dialog(ui, b, actions);
     } else if b.properties().is_some() {
@@ -770,6 +782,11 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         Action::ToggleListThumbs => browser.toggle_list_thumbs(),
         Action::ToggleQuickLook => browser.toggle_quick_look(),
         Action::CloseQuickLook => browser.close_quick_look(),
+        Action::OpenNewFolder(p) => browser.open_new_folder(p),
+        Action::OpenRename(p) => browser.open_rename(p),
+        Action::SetNameDialogInput(name) => browser.set_name_dialog_input(name),
+        Action::SubmitNameDialog(p) => browser.submit_name_dialog(p),
+        Action::CancelNameDialog => browser.cancel_name_dialog(),
         Action::RequestDelete(p) => browser.request_delete(p),
         Action::DeleteEcho(text) => browser.set_delete_echo(text),
         Action::ConfirmDelete => browser.confirm_delete(),
@@ -3157,6 +3174,54 @@ fn push_resolution(
     });
 }
 
+/// New Folder / Rename share one bounded single-component form. The model owns
+/// validation and executes through its existing FileOps authority; the view only
+/// mirrors state and keeps every failure visible until corrected or cancelled.
+fn name_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let Some(dialog) = b.name_dialog() else {
+        return;
+    };
+    let (title, button_label) = dialog.labels();
+    let pane = b.active_pane_index();
+    if modal_backdrop(ui.ctx(), "files-name-dialog-dim") {
+        actions.push(Action::CancelNameDialog);
+    }
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            let mut name = dialog.name.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut name)
+                    .hint_text("Name")
+                    .desired_width(Style::SP_XL * 8.0),
+            );
+            if response.changed() {
+                actions.push(Action::SetNameDialogInput(name));
+            }
+            let validation = dialog.validation_error();
+            if let Some(error) = validation.as_deref() {
+                ui.colored_label(Style::WARN, error);
+            } else if let Some(error) = dialog.error.as_deref() {
+                ui.colored_label(Style::DANGER, error);
+            }
+            ui.add_space(Style::SP_S);
+            ui.horizontal(|ui| {
+                let submit =
+                    egui::Button::new(RichText::new(button_label).color(Style::BG).strong())
+                        .fill(Style::ACCENT);
+                if ui.add_enabled(validation.is_none(), submit).clicked() {
+                    actions.push(Action::SubmitNameDialog(pane));
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CancelNameDialog);
+                }
+            });
+        });
+}
+
 /// The permanent-delete confirm (FILEMGR-11 / lock 3/6): names the items, spells
 /// out that the delete is final (no trash, no undo), and — when the target is on a
 /// remote / escalated mesh mount — layers typed-arming on top (lock 19): the
@@ -4786,6 +4851,26 @@ mod tests {
         b.click(0, 0);
         b.open_properties(0);
         assert!(b.properties().is_some(), "the dialog opened");
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_new_folder_and_rename_dialogs() {
+        let fixture = RenderFixture {
+            peers: Vec::new(),
+            rows: vec![
+                FileRow::local("report.txt", Mime::Doc, "5 B", "now").with_path("/d/report.txt")
+            ],
+        };
+        let mut b = FileBrowser::with_file_ops(Box::new(fixture), FakeFileOps::new());
+        b.open_new_folder(0);
+        assert!(b.name_dialog().is_some(), "New Folder opened");
+        mount(&mut b);
+        b.cancel_name_dialog();
+
+        b.click(0, 0);
+        b.open_rename(0);
+        assert!(b.name_dialog().is_some(), "Rename opened");
         mount(&mut b);
     }
 }

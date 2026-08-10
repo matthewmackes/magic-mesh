@@ -1336,6 +1336,93 @@ fn open_properties_on_a_pathless_peer_row_is_an_honest_note() {
     );
 }
 
+#[test]
+fn new_folder_and_rename_execute_through_the_existing_fileops_authority() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("report.txt");
+    std::fs::write(&source, b"report").expect("seed source");
+    let rows =
+        vec![FileRow::local("report.txt", Mime::Doc, "6 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = FileBrowser::with_file_ops(
+        Box::new(FixtureBackend::new(Vec::new(), rows)),
+        FakeFileOps::new(),
+    )
+    .with_meta_ops(mde_files::fileops::LiveFileOps::new(), false);
+
+    b.open_new_folder(0);
+    b.set_name_dialog_input("Projects".to_string());
+    b.submit_name_dialog(0);
+    assert!(
+        b.name_dialog().is_none(),
+        "successful create closes the dialog"
+    );
+    assert!(
+        temp.path().join("Projects").is_dir(),
+        "FileOps created the folder"
+    );
+
+    b.click(0, 0);
+    b.open_rename(0);
+    b.set_name_dialog_input("report-final.txt".to_string());
+    b.submit_name_dialog(0);
+    assert!(
+        b.name_dialog().is_none(),
+        "successful rename closes the dialog"
+    );
+    assert!(!source.exists(), "the old name is gone");
+    assert_eq!(
+        std::fs::read(temp.path().join("report-final.txt")).expect("renamed file"),
+        b"report",
+        "FileOps preserved the renamed payload"
+    );
+}
+
+#[test]
+fn name_operations_refuse_invalid_or_existing_targets_without_mutation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let occupied = temp.path().join("occupied.txt");
+    std::fs::write(&source, b"source").expect("seed source");
+    std::fs::write(&occupied, b"occupied").expect("seed destination");
+    let rows =
+        vec![FileRow::local("source.txt", Mime::Doc, "6 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = FileBrowser::with_file_ops(
+        Box::new(FixtureBackend::new(Vec::new(), rows)),
+        FakeFileOps::new(),
+    )
+    .with_meta_ops(mde_files::fileops::LiveFileOps::new(), false);
+
+    b.open_new_folder(0);
+    b.set_name_dialog_input("nested/path".to_string());
+    b.submit_name_dialog(0);
+    assert!(b.name_dialog().is_some(), "invalid input stays open");
+    assert!(
+        !temp.path().join("nested").exists(),
+        "no partial path was created"
+    );
+    b.cancel_name_dialog();
+
+    b.click(0, 0);
+    b.open_rename(0);
+    b.set_name_dialog_input("occupied.txt".to_string());
+    b.submit_name_dialog(0);
+    let error = b
+        .name_dialog()
+        .and_then(|d| d.error.as_deref())
+        .expect("collision is visible");
+    assert!(
+        error.contains("already exists"),
+        "honest collision: {error}"
+    );
+    assert_eq!(std::fs::read(&source).expect("source intact"), b"source");
+    assert_eq!(
+        std::fs::read(&occupied).expect("target intact"),
+        b"occupied"
+    );
+}
+
 // ── TRANSFERS-8: the tab + the three Submit entry points (Q13) ────────────
 
 use crate::transfers::test_support::FakeTransfers;

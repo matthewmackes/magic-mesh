@@ -3746,6 +3746,26 @@ impl WorkloadComputeWorker {
                 );
                 continue;
             }
+            // A restart cannot turn the adapter's missing attachment into a
+            // successful StartAndAttach projection.  Recovery is the only
+            // authority allowed to recreate the exact lease, so Ready without
+            // that confirmation must revoke the stale descriptor and fail
+            // closed instead of advertising a usable session.
+            if outcome.readiness == WorkloadReadiness::Ready
+                && outcome.attachment.is_none()
+            {
+                tracing::error!(
+                    request_id = %request.request_id,
+                    "terminal attachment recovery reported Ready without a lease"
+                );
+                self.refuse_recovered_attachment(
+                    ledger,
+                    status,
+                    "recovered Display1 attachment reported Ready without an authoritative lease and was revoked",
+                    now_ms,
+                );
+                continue;
+            }
             if let Some(lease) = outcome.attachment.as_ref() {
                 if lease.workload_id != status.workload_id
                     || lease.generation != status.generation
@@ -5644,6 +5664,46 @@ mod tests {
             .remediation
             .as_deref()
             .is_some_and(|remediation| remediation.contains("current generation")));
+    }
+
+    #[test]
+    fn recovered_ready_without_authoritative_lease_is_refused_and_unpublished() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let request = request();
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, now);
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        seed_completed_attachment(&mut ledger, request.clone(), lease.clone(), now);
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            RecoveryActuator {
+                calls: Arc::new(Mutex::new(0)),
+                revoked: Arc::clone(&revoked),
+                outcome: WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::Ready,
+                    retryable: false,
+                    reason: None,
+                    remediation: None,
+                    attachment: None,
+                },
+            },
+        ));
+
+        worker.reconcile_recovered_attachments(&mut ledger, now);
+
+        assert_eq!(
+            *revoked.lock().expect("revoked attachments"),
+            vec![(lease.lease_id, lease.generation)]
+        );
+        let refused = ledger.status(&request.request_id).expect("refused status");
+        assert!(refused.attachment.is_none());
+        assert_eq!(refused.readiness, WorkloadReadiness::Unavailable);
+        assert!(refused
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("without an authoritative lease")));
     }
 
     #[test]

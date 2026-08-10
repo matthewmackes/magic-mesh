@@ -16,6 +16,10 @@ readonly DROPIN_SOURCE="/usr/libexec/mackesd/resource-publisher-hmac.conf"
 readonly DROPIN_PATH="/etc/systemd/system/mde-shell-egui.service.d/60-resource-publisher-hmac.conf"
 readonly SECRET_BIN="/usr/bin/mackesd"
 readonly UNIT_SOURCE="/usr/lib/systemd/system/mcnf-resource-publisher-credential.service"
+readonly EX_DATAERR=65
+readonly EX_NOINPUT=66
+readonly EX_TEMPFAIL=75
+readonly EX_CONFIG=78
 
 validate_key() {
   local value bytes
@@ -27,8 +31,37 @@ validate_key() {
   [ -n "$value" ] && [ "$bytes" -gt 0 ] && [ "$bytes" -le 4096 ]
 }
 
+unit_has_one_line() {
+  [ "$(grep -Fxc -- "$2" "$1")" -eq 1 ]
+}
+
+validate_retry_unit() {
+  local unit="$1"
+  unit_has_one_line "$unit" \
+    'ExecStart=/usr/bin/timeout --signal=TERM --kill-after=5s 30s /usr/libexec/mackesd/provision-resource-publisher-credential' \
+    && unit_has_one_line "$unit" 'StartLimitIntervalSec=5min' \
+    && unit_has_one_line "$unit" 'StartLimitBurst=6' \
+    && unit_has_one_line "$unit" 'Restart=on-failure' \
+    && unit_has_one_line "$unit" 'RestartSec=30s' \
+    && unit_has_one_line "$unit" 'RestartPreventExitStatus=65 66 78' \
+    && [ "$(grep -Ec '^StartLimitIntervalSec=' "$unit")" -eq 1 ] \
+    && [ "$(grep -Ec '^StartLimitBurst=' "$unit")" -eq 1 ] \
+    && [ "$(grep -Ec '^Restart=' "$unit")" -eq 1 ] \
+    && [ "$(grep -Ec '^RestartSec=' "$unit")" -eq 1 ] \
+    && [ "$(grep -Ec '^RestartPreventExitStatus=' "$unit")" -eq 1 ] \
+    && ! grep -Eq '^(ExecStart=-|SuccessExitStatus=|RestartForceExitStatus=)' "$unit"
+}
+
+assert_hostile_unit_rejected() {
+  local unit="$1" mutation="$2"
+  if validate_retry_unit "$unit"; then
+    echo "provision-resource-publisher-credential: unsafe unit mutation accepted: $mutation" >&2
+    return 1
+  fi
+}
+
 self_test() {
-  local test_dir good bad template unit
+  local test_dir good bad template unit hostile
   test_dir="$(mktemp -d)"
   good="$test_dir/good"
   bad="$test_dir/bad"
@@ -47,10 +80,29 @@ self_test() {
   if [ ! -r "$unit" ]; then
     unit="$(cd "$(dirname "$0")/.." && pwd)/packaging/systemd/mcnf-resource-publisher-credential.service"
   fi
-  grep -Fxq \
-    'ExecStart=/usr/bin/timeout --signal=TERM --kill-after=5s 30s /usr/libexec/mackesd/provision-resource-publisher-credential' \
-    "$unit"
-  ! grep -Eq '^ExecStart=-' "$unit"
+  validate_retry_unit "$unit"
+
+  # Hostile structural mutations prove the verifier rejects restart storms,
+  # failure masking, unbounded retries, and loss of terminal credential states.
+  hostile="$test_dir/hostile.service"
+  cp -- "$unit" "$hostile"
+  sed -i 's/^RestartSec=30s$/RestartSec=1ms/' "$hostile"
+  assert_hostile_unit_rejected "$hostile" 'restart storm pacing'
+  cp -- "$unit" "$hostile"
+  printf '\nRestart=always\n' >>"$hostile"
+  assert_hostile_unit_rejected "$hostile" 'overriding restart policy'
+  cp -- "$unit" "$hostile"
+  sed -i 's/^StartLimitBurst=6$/StartLimitBurst=60/' "$hostile"
+  assert_hostile_unit_rejected "$hostile" 'unbounded retry burst'
+  cp -- "$unit" "$hostile"
+  sed -i '/^RestartPreventExitStatus=/d' "$hostile"
+  assert_hostile_unit_rejected "$hostile" 'retrying permanent credential failures'
+  cp -- "$unit" "$hostile"
+  printf '\nSuccessExitStatus=75\n' >>"$hostile"
+  assert_hostile_unit_rejected "$hostile" 'masking transient failure as success'
+  cp -- "$unit" "$hostile"
+  sed -i 's|^ExecStart=|ExecStart=-|' "$hostile"
+  assert_hostile_unit_rejected "$hostile" 'masking ExecStart failure'
   rm -rf -- "$test_dir"
   echo "provision-resource-publisher-credential: self-test passed"
 }
@@ -75,16 +127,16 @@ fi
 for command_name in systemd-creds install grep wc cmp chmod chown; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "provision-resource-publisher-credential: required command unavailable: $command_name" >&2
-    exit 1
+    exit "$EX_CONFIG"
   }
 done
 [ -x "$SECRET_BIN" ] || {
   echo "provision-resource-publisher-credential: approved secret-store API unavailable: $SECRET_BIN" >&2
-  exit 1
+  exit "$EX_CONFIG"
 }
 [ -r "$DROPIN_SOURCE" ] || {
   echo "provision-resource-publisher-credential: credential drop-in template unavailable" >&2
-  exit 1
+  exit "$EX_CONFIG"
 }
 
 tmp_dir="$(mktemp -d /run/mcnf-resource-publisher.XXXXXX)"
@@ -93,23 +145,28 @@ plain="$tmp_dir/plain"
 encrypted="$tmp_dir/encrypted"
 decrypted="$tmp_dir/decrypted"
 
-if ! "$SECRET_BIN" secret get "$SECRET_NAME" >"$plain" 2>/dev/null; then
-  echo "provision-resource-publisher-credential: approved secret '$SECRET_NAME' is unavailable" >&2
-  exit 1
+secret_status=0
+"$SECRET_BIN" secret get "$SECRET_NAME" >"$plain" 2>/dev/null || secret_status=$?
+if [ "$secret_status" -eq 3 ]; then
+  echo "provision-resource-publisher-credential: approved secret '$SECRET_NAME' is not in the store" >&2
+  exit "$EX_NOINPUT"
+elif [ "$secret_status" -ne 0 ]; then
+  echo "provision-resource-publisher-credential: approved secret store is temporarily unavailable (status $secret_status)" >&2
+  exit "$EX_TEMPFAIL"
 fi
 validate_key "$plain" || {
   echo "provision-resource-publisher-credential: approved publisher key is empty, multiline, or oversized" >&2
-  exit 1
+  exit "$EX_DATAERR"
 }
 
 for path in "$CREDENTIAL_PATH" "$DROPIN_PATH"; do
   [ ! -L "$path" ] || {
     echo "provision-resource-publisher-credential: refusing symlinked output: $path" >&2
-    exit 1
+    exit "$EX_CONFIG"
   }
   [ ! -e "$path" ] || [ -f "$path" ] || {
     echo "provision-resource-publisher-credential: refusing non-regular output: $path" >&2
-    exit 1
+    exit "$EX_CONFIG"
   }
 done
 

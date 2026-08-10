@@ -1,8 +1,8 @@
 //! FILEMGR-11 — the render-agnostic state of the operation dialogs.
 //!
-//! Three of the four FILEMGR-11 dialogs keep their decision state here, with no
-//! egui in it (the fourth — the interactive conflict dialog — folds its state in
-//! [`crate::ops`], where the FILEMGR-2 channel resolver lives). Everything
+//! The FILEMGR-11 dialogs keep their decision state here, with no
+//! egui in it (the interactive conflict dialog folds its state in [`crate::ops`],
+//! where the FILEMGR-2 channel resolver lives). Everything
 //! decision-shaped is a plain data fold so it can be unit-tested without a GPU:
 //!
 //! * [`Perms`] — the permission bits behind the Properties dialog's rwx grid,
@@ -12,6 +12,10 @@
 //!   real `chmod`/`chown` back through the same seam. The chown control is
 //!   offered **only when permitted** (`chown_permitted`), honestly disabled
 //!   otherwise (§7 — never a faked success).
+//! * [`NameDialog`] — the bounded single-component name entry shared by New
+//!   Folder and Rename. The model executes the accepted path through the same
+//!   injected [`FileOps`] authority as Properties; syscall failures remain
+//!   visible in the open dialog.
 //! * [`ConfirmDelete`] + [`Arming`] — the permanent-delete confirm (lock 3/6 —
 //!   no trash, no undo), with **typed-arming** (lock 19) layered on when the
 //!   deletion targets a remote / escalated mesh mount: the user must type the
@@ -24,9 +28,127 @@
 //! I/O and a deterministic privilege model.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use mde_files::fileops::FileOps;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// New Folder / Rename name entry.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Portable Linux limit for one path component, measured in encoded bytes.
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// The operation an open [`NameDialog`] will perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameOperation {
+    /// Create one child directory under `parent`.
+    NewFolder {
+        /// Directory that receives the new child.
+        parent: PathBuf,
+    },
+    /// Rename `source` to a sibling under `parent`.
+    Rename {
+        /// Existing path captured when the dialog opened.
+        source: PathBuf,
+        /// Existing path's parent; Rename cannot move across directories.
+        parent: PathBuf,
+        /// Existing basename, used to reject an unchanged submission.
+        original: String,
+    },
+}
+
+/// Render-agnostic input and error state for New Folder / Rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameDialog {
+    /// The filesystem operation and its authoritative paths.
+    pub operation: NameOperation,
+    /// UTF-8 name buffer edited by egui.
+    pub name: String,
+    /// The most recent FileOps/preflight failure. Validation errors are derived
+    /// live by [`validation_error`](Self::validation_error).
+    pub error: Option<String>,
+}
+
+impl NameDialog {
+    /// Open a blank New Folder dialog for an already-resolved directory.
+    #[must_use]
+    pub fn new_folder(parent: PathBuf) -> Self {
+        Self {
+            operation: NameOperation::NewFolder { parent },
+            name: String::new(),
+            error: None,
+        }
+    }
+
+    /// Open Rename prefilled with the entry's current name.
+    #[must_use]
+    pub fn rename(source: PathBuf, parent: PathBuf, original: String) -> Self {
+        Self {
+            operation: NameOperation::Rename {
+                source,
+                parent,
+                original: original.clone(),
+            },
+            name: original,
+            error: None,
+        }
+    }
+
+    /// Dialog title and affirmative button label.
+    #[must_use]
+    pub const fn labels(&self) -> (&'static str, &'static str) {
+        match &self.operation {
+            NameOperation::NewFolder { .. } => ("New Folder", "Create"),
+            NameOperation::Rename { .. } => ("Rename", "Rename"),
+        }
+    }
+
+    /// Validate one literal child-name component. Leading/trailing spaces are
+    /// preserved because they are legal names; whitespace-only input is refused
+    /// as an easy-to-miss entry. Paths, dot aliases, NUL, and overlong names
+    /// never reach FileOps.
+    #[must_use]
+    pub fn validation_error(&self) -> Option<String> {
+        if self.name.is_empty() || self.name.chars().all(char::is_whitespace) {
+            return Some("Enter a name.".to_string());
+        }
+        if self.name == "." || self.name == ".." {
+            return Some("Use a name other than . or ...".to_string());
+        }
+        if self.name.as_bytes().contains(&0) {
+            return Some("A name can't contain a NUL character.".to_string());
+        }
+        if self.name.contains('/') {
+            return Some("Enter one name, without a path or slash.".to_string());
+        }
+        if self.name.len() > MAX_NAME_BYTES {
+            return Some(format!("Name is longer than {MAX_NAME_BYTES} bytes."));
+        }
+        let mut components = Path::new(&self.name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Some("Enter one name, without a path or slash.".to_string());
+        }
+        if let NameOperation::Rename { original, .. } = &self.operation {
+            if &self.name == original {
+                return Some("Enter a different name.".to_string());
+            }
+        }
+        None
+    }
+
+    /// The target path after successful validation.
+    #[must_use]
+    pub fn target(&self) -> Option<PathBuf> {
+        if self.validation_error().is_some() {
+            return None;
+        }
+        let parent = match &self.operation {
+            NameOperation::NewFolder { parent } | NameOperation::Rename { parent, .. } => parent,
+        };
+        Some(parent.join(&self.name))
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Permission bits ↔ the rwx grid ↔ the octal value.
@@ -618,6 +740,48 @@ mod tests {
         assert_eq!(
             fs.metadata(Path::new("/d/report.txt")).expect("stat").mode,
             0o644
+        );
+    }
+
+    // ── New Folder / Rename name validation ────────────────────────────────
+
+    #[test]
+    fn name_dialog_accepts_only_one_bounded_literal_component() {
+        let mut dialog = NameDialog::new_folder(PathBuf::from("/work"));
+        for invalid in ["", "   ", ".", "..", "nested/path", "/absolute"] {
+            dialog.name = invalid.to_string();
+            assert!(
+                dialog.validation_error().is_some(),
+                "{invalid:?} must not become a filesystem target"
+            );
+            assert!(dialog.target().is_none());
+        }
+        dialog.name = "a".repeat(MAX_NAME_BYTES + 1);
+        assert!(dialog.validation_error().is_some(), "overlong name refused");
+
+        dialog.name = "Quarterly Reports".to_string();
+        assert_eq!(dialog.validation_error(), None);
+        assert_eq!(
+            dialog.target(),
+            Some(PathBuf::from("/work/Quarterly Reports"))
+        );
+    }
+
+    #[test]
+    fn rename_requires_a_real_change() {
+        let mut dialog = NameDialog::rename(
+            PathBuf::from("/work/report.txt"),
+            PathBuf::from("/work"),
+            "report.txt".to_string(),
+        );
+        assert_eq!(
+            dialog.validation_error().as_deref(),
+            Some("Enter a different name.")
+        );
+        dialog.name = "report-final.txt".to_string();
+        assert_eq!(
+            dialog.target(),
+            Some(PathBuf::from("/work/report-final.txt"))
         );
     }
 

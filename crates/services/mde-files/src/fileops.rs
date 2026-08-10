@@ -85,6 +85,8 @@ pub trait FileOps {
     fn copy_file(&self, src: &Path, dst: &Path) -> io::Result<u64>;
     /// Rename / move (a single `rename(2)`; same-filesystem move is atomic).
     fn rename(&self, src: &Path, dst: &Path) -> io::Result<()>;
+    /// Atomically rename without replacing an existing destination.
+    fn rename_noreplace(&self, src: &Path, dst: &Path) -> io::Result<()>;
     /// Unlink a single file or symlink (never a directory).
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Remove a directory and everything under it.
@@ -246,6 +248,17 @@ impl FileOps for LiveFileOps {
 
     fn rename(&self, src: &Path, dst: &Path) -> io::Result<()> {
         std::fs::rename(src, dst)
+    }
+
+    fn rename_noreplace(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            src,
+            rustix::fs::CWD,
+            dst,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -675,6 +688,35 @@ impl FileOps for FakeFileOps {
         Ok(())
     }
 
+    fn rename_noreplace(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let mut st = self.state.borrow_mut();
+        st.lookup(src)?;
+        st.require_parent_dir(dst)?;
+        if st.paths.contains_key(dst) {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        let moves: Vec<(PathBuf, PathBuf)> = st
+            .paths
+            .keys()
+            .filter_map(|p| {
+                if p == src {
+                    Some((p.clone(), dst.to_path_buf()))
+                } else if p.starts_with(src) {
+                    let rel = p.strip_prefix(src).ok()?;
+                    Some((p.clone(), dst.join(rel)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (from, to) in moves {
+            if let Some(ino) = st.paths.remove(&from) {
+                st.paths.insert(to, ino);
+            }
+        }
+        Ok(())
+    }
+
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let mut st = self.state.borrow_mut();
         let ino = st.lookup(path)?;
@@ -1077,6 +1119,26 @@ mod tests {
         assert!(!dst.exists() && moved.exists());
         ops.remove(&moved).expect("remove");
         assert!(!moved.exists());
+    }
+
+    #[test]
+    fn live_rename_noreplace_preserves_an_existing_destination() {
+        let ops = LiveFileOps::new();
+        let d = TempDir::new("rename-noreplace");
+        let src = d.path("source.txt");
+        let dst = d.path("destination.txt");
+        std::fs::write(&src, b"source").expect("write source");
+        std::fs::write(&dst, b"destination").expect("write destination");
+
+        let error = ops
+            .rename_noreplace(&src, &dst)
+            .expect_err("existing destination must be refused atomically");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).expect("source intact"), b"source");
+        assert_eq!(
+            std::fs::read(&dst).expect("destination intact"),
+            b"destination"
+        );
     }
 
     #[test]

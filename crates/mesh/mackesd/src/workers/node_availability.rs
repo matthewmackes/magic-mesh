@@ -170,15 +170,16 @@ impl<const MAX_NODES: usize> AvailabilityLedger<MAX_NODES> {
     ) -> Result<AvailabilityEvaluationSnapshot, AvailabilityEvaluationError> {
         let mut evidence_by_node = BTreeMap::new();
         for item in evidence {
-            if evidence_by_node.len() == MAX_NODES {
+            let node_id = item.node_id.clone();
+            if evidence_by_node.contains_key(&node_id) {
+                return Err(AvailabilityEvaluationError::DuplicateEvidence { node_id });
+            }
+            if evidence_by_node.len() >= MAX_NODES {
                 return Err(AvailabilityEvaluationError::CapacityExceeded {
                     capacity: MAX_NODES,
                 });
             }
-            let node_id = item.node_id.clone();
-            if evidence_by_node.insert(node_id.clone(), item).is_some() {
-                return Err(AvailabilityEvaluationError::DuplicateEvidence { node_id });
-            }
+            evidence_by_node.insert(node_id, item);
         }
 
         let mut assessments = BTreeMap::new();
@@ -2949,6 +2950,37 @@ mod tests {
             duplicate,
             Err(AvailabilityEvaluationError::DuplicateEvidence { node_id })
                 if node_id == "node-z"
+        ));
+    }
+
+    #[test]
+    fn evaluation_rejects_duplicate_at_capacity_before_distinct_overflow() {
+        let ledger = AvailabilityLedger::<2>::new();
+        let node_a = evidence("node-a", NodeDeviceClass::Desktop, Some(1_000));
+        let node_b = evidence("node-b", NodeDeviceClass::Desktop, Some(1_000));
+
+        for duplicate_order in [
+            vec![node_a.clone(), node_a.clone(), node_b.clone()],
+            vec![node_b.clone(), node_a.clone(), node_a.clone()],
+        ] {
+            assert!(matches!(
+                ledger.evaluate(duplicate_order, NOW_MS),
+                Err(AvailabilityEvaluationError::DuplicateEvidence { node_id })
+                    if node_id == "node-a"
+            ));
+        }
+
+        let distinct_overflow = ledger.evaluate(
+            vec![
+                node_a,
+                node_b,
+                evidence("node-c", NodeDeviceClass::Desktop, Some(1_000)),
+            ],
+            NOW_MS,
+        );
+        assert!(matches!(
+            distinct_overflow,
+            Err(AvailabilityEvaluationError::CapacityExceeded { capacity: 2 })
         ));
     }
 

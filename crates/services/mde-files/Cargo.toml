@@ -40,6 +40,10 @@ md5        = "0.7"
 # so it stays testable against `FakeFileOps`.
 globset    = "0.4"
 regex      = "1"
+# Atomic no-replace rename for the Files surface. This is the same safe rustix
+# wrapper already locked by the workspace; the `fs` feature exposes
+# `renameat2(RENAME_NOREPLACE)` without introducing unsafe code here.
+rustix     = { version = "1", features = ["fs"] }
 # mackesd-IPC opt-in deps. Behind the `dbus` feature so the headless
 # crate (DemoBackend only) keeps a minimal dep graph. zbus was dropped
 # at E0.3.2 when the last D-Bus client (Fleet.Files) moved to the Bus.

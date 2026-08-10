@@ -4570,6 +4570,7 @@ dependencies = [
  "mde-bus",
  "png 0.18.1",
  "regex",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tar",

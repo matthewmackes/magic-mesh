@@ -15,12 +15,14 @@
 //!
 //! The menus and the seam each drives:
 //!
-//! * **File** — New Tab / Close Tab ([`FileBrowser::new_tab`]/[`close_tab`]),
-//!   Refresh ([`FileBrowser::reload_all`] + roster).
+//! * **File** — New Folder ([`FileBrowser::open_new_folder`]), New Tab / Close
+//!   Tab ([`FileBrowser::new_tab`]/[`close_tab`]), Refresh
+//!   ([`FileBrowser::reload_all`] + roster).
 //! * **Edit** — Copy / Cut / Paste (the FILEMGR-12 shell clipboard,
 //!   [`clip_copy`]/[`clip_cut`]/[`clip_paste`]), Select All / Clear Selection,
-//!   Delete ([`request_delete`], the FILEMGR-11 typed-arming confirm), Properties
-//!   ([`open_properties`], the rwx/octal/owner dialog).
+//!   Rename ([`FileBrowser::open_rename`]), Delete ([`request_delete`], the
+//!   FILEMGR-11 typed-arming confirm), Properties ([`open_properties`], the
+//!   rwx/octal/owner dialog).
 //! * **View** — Layout (List/Grid/Details, [`set_view`]), Sort By (the four
 //!   [`SortKey`]s + Directories-First, [`sort_by`]/[`toggle_dirs_first`]), Show
 //!   Hidden, Dual Pane, Preview Pane, List Thumbnails, Quick Look, Search — the
@@ -40,9 +42,8 @@
 //! status cluster carries the surface's real live indicators — the current path,
 //! the item + selection counts, a live transfer count, and the mesh presence.
 //!
-//! **Honestly omitted** (no landed seam → no dead entry): **New Folder** and
-//! **Rename** (the model has no mkdir/rename op — only copy/move/delete), a
-//! **Quit** (Files is an embedded dock surface with no independent window to
+//! **Honestly omitted** (no landed seam → no dead entry): **Quit** (Files is an
+//! embedded dock surface with no independent window to
 //! close — the dock owns its lifecycle, lock 10), and a **free-space** status
 //! chip (the workspace bans `statvfs`, and a `df` probe is a blocking subprocess
 //! that has no place on the paint path — so the value has no honest non-blocking
@@ -88,6 +89,8 @@ const DESTINATIONS_OPEN: &str = "files-menubar-destinations-open";
 /// built from a borrow-free snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Picked {
+    /// Open the New Folder dialog in the active directory.
+    NewFolder,
     /// Open a fresh tab in the active pane ([`FileBrowser::new_tab`]).
     NewTab,
     /// Close the active pane's active tab ([`FileBrowser::close_tab`]).
@@ -104,6 +107,8 @@ pub(crate) enum Picked {
     SelectAll,
     /// Drop the selection ([`clear_selection`]).
     ClearSelection,
+    /// Open Rename for the one focused local entry.
+    Rename,
     /// Open the permanent-delete confirm ([`request_delete`]).
     Delete,
     /// Open the Properties dialog ([`open_properties`]).
@@ -177,6 +182,7 @@ pub(crate) enum Picked {
 pub(crate) fn to_action(picked: Picked, cx: &FilesCtx) -> Option<Action> {
     let p = cx.active;
     Some(match picked {
+        Picked::NewFolder => Action::OpenNewFolder(p),
         Picked::NewTab => Action::NewTab(p),
         Picked::CloseTab => Action::CloseTab(p, cx.tab_ix),
         Picked::Refresh => Action::Refresh,
@@ -185,6 +191,7 @@ pub(crate) fn to_action(picked: Picked, cx: &FilesCtx) -> Option<Action> {
         Picked::Paste => Action::ClipPaste(p),
         Picked::SelectAll => Action::SelectAll(p),
         Picked::ClearSelection => Action::ClearSelection(p),
+        Picked::Rename => Action::OpenRename(p),
         Picked::Delete => Action::RequestDelete(p),
         Picked::Properties => Action::OpenProperties(p),
         Picked::SetView(m) => Action::SetView(p, m),
@@ -265,6 +272,10 @@ pub(crate) struct FilesCtx {
     pub has_local_selection: bool,
     /// The focused row is a local file (Properties / Open-in-Editor's gate).
     pub has_focused_local: bool,
+    /// The listing resolves to a concrete directory (New Folder's gate).
+    pub has_directory: bool,
+    /// Exactly one local row is focused (Rename's gate).
+    pub can_rename: bool,
     /// History back is available.
     pub can_back: bool,
     /// History forward is available.
@@ -339,6 +350,9 @@ pub(crate) fn snapshot(b: &FileBrowser) -> FilesCtx {
         has_selection: !tab.selection().is_empty(),
         has_local_selection: !tab.selected_paths().is_empty(),
         has_focused_local: tab.focused_row().and_then(|r| r.path.as_ref()).is_some(),
+        has_directory: tab.current_dir().is_some(),
+        can_rename: tab.selection().len() == 1
+            && tab.focused_row().and_then(|r| r.path.as_ref()).is_some(),
         can_back: tab.can_back(),
         can_forward: tab.can_forward(),
         can_paste: b.can_paste(),
@@ -375,6 +389,10 @@ fn file_menu(cx: &FilesCtx) -> Menu<Picked> {
     Menu::new(
         "File",
         vec![
+            Entry::Item(
+                BarItem::new(Picked::NewFolder, "New Folder\u{2026}").enabled(cx.has_directory),
+            ),
+            Entry::Separator,
             item(Picked::NewTab, "New Tab"),
             Entry::Item(BarItem::new(Picked::CloseTab, "Close Tab").enabled(cx.tab_count > 1)),
             Entry::Separator,
@@ -416,6 +434,7 @@ fn edit_menu(cx: &FilesCtx) -> Menu<Picked> {
                     .enabled(cx.has_selection),
             ),
             Entry::Separator,
+            Entry::Item(BarItem::new(Picked::Rename, "Rename\u{2026}").enabled(cx.can_rename)),
             Entry::Item(
                 BarItem::new(Picked::Delete, "Delete\u{2026}")
                     .shortcut("Del")
@@ -837,6 +856,8 @@ mod tests {
             has_selection: true,
             has_local_selection: true,
             has_focused_local: true,
+            has_directory: true,
+            can_rename: true,
             can_back: true,
             can_forward: false,
             can_paste: true,
@@ -918,19 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn omitted_features_have_no_dead_entry() {
-        // No mkdir/rename seam, no window to quit, no honest free-space probe —
-        // so New Folder / Rename / Quit never ship as a greyed teaser (§7).
-        let labels: Vec<String> = all_items(&build_menus(&fixture()))
-            .into_iter()
-            .map(|(label, _, _)| label)
-            .collect();
-        for banned in ["New Folder", "Rename", "Quit"] {
-            assert!(
-                !labels.iter().any(|l| l == banned),
-                "{banned} shipped without a landed seam"
-            );
-        }
+    fn new_folder_and_rename_ship_while_quit_remains_honestly_omitted() {
+        let items = all_items(&build_menus(&fixture()));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::NewFolder));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::Rename));
+        assert!(!items.iter().any(|(label, _, _)| label == "Quit"));
     }
 
     // ── item → action (the §6 glue) ──────────────────────────────────────────
@@ -943,6 +956,14 @@ mod tests {
         assert!(matches!(
             to_action(Picked::NewTab, &cx),
             Some(Action::NewTab(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::NewFolder, &cx),
+            Some(Action::OpenNewFolder(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::Rename, &cx),
+            Some(Action::OpenRename(0))
         ));
         assert!(matches!(
             to_action(Picked::CloseTab, &cx),
@@ -999,6 +1020,8 @@ mod tests {
             has_selection: false,
             has_local_selection: false,
             has_focused_local: false,
+            has_directory: false,
+            can_rename: false,
             can_back: false,
             can_forward: false,
             can_paste: false,
@@ -1039,6 +1062,16 @@ mod tests {
             enabled(&menus, &Picked::Properties),
             Some(false),
             "Properties needs a local row"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::NewFolder),
+            Some(false),
+            "New Folder needs a resolved directory"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::Rename),
+            Some(false),
+            "Rename needs exactly one local row"
         );
         assert_eq!(
             enabled(&menus, &Picked::CloseTab),

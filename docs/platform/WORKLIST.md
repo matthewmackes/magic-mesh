@@ -90,6 +90,8 @@ behavioral evidence is not completion.
   an already-stopped libvirt domain as an idempotent destroy/undefine boundary, and an independent live-proof helper validates the typed projection and refuses
   missing runtime evidence. Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work:
+- **Recovered attachment lease checkpoint (2026-08-10):** restart recovery refuses a false Ready result without its authoritative Display1 lease; machine 193 passed
+  the exact hostile regression: `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-attachment-lease-r110.md`.
 - **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator
   accepts absent/stopped-domain diagnostics during ordered cleanup while still
   refusing unrelated virtqemud failures. Workload `workload_compute` passed
@@ -118,8 +120,7 @@ behavioral evidence is not completion.
 - **Heartbeat runtime-projection hard cut (2026-08-08):** peer heartbeats no
   longer probe or replicate raw Podman/libvirt inventories. Remote VM desktop
   cards consume the serving node's validated typed Workload snapshot; rolling
-  readers discard retired fields, and focused farm/authority gates pass.
-  Evidence:
+  readers discard retired fields, and focused farm/authority gates pass. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-heartbeat-runtime-projection-hard-cut-r5.md`.
 - **Retired compute-inventory hard cut (2026-08-09):** network probing no longer reads the retired VM roster; typed Workloads owns runtime identity. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-compute-inventory-hard-cut-r6.md`.
@@ -199,8 +200,7 @@ behavioral evidence is not completion.
   Workload caller and activation/package contracts passed their typed-action
   checks. BigBoy passed the focused reconciler admission test 1/1 and `.90`
   passed the hostile storage-link test 1/1; the focused backend contract gate
-  passed 12/12 on `.50`; live Dell/seat-15, native KMS/EGL, packaging-install,
-  and restart proof remain. Evidence:
+  passed 12/12 on `.50`; live Dell/seat-15, native KMS/EGL, packaging-install, and restart proof remain. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-wiring-r1.md`.
 - **Dell typed capacity-refusal checkpoint (2026-08-08):** Release 21 published one capability-bound Browser Standard `StartAndAttach`; live four-thread admission
   refused before effects, retained the VM shut off, and produced typed failure. OpenTofu, Ansible, libvirt, KVM, Podman, storage, shell, and all six workers passed.
@@ -621,6 +621,8 @@ behavioral evidence is not completion.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
   Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
 - Remaining work:
+- **Files name-operation checkpoint (2026-08-10):** New Folder and Rename are reachable through the existing `FileOps` authority, with bounded validation and atomic
+  no-replace rename; machines 193/9 passed seven focused tests: `docs/platform/evidence/WL-FUNC-011-2026-08-10-files-name-operations-r23.md`.
 - **Alert delivery restart checkpoint (2026-08-09):** successful Bus/fallback
   delivery now persists bounded no-follow receipts across daemon restart;
   failed delivery retries, and traversal/forged-symlink IDs fail safely.
@@ -740,6 +742,8 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **Expired consent capacity checkpoint (2026-08-10):** every clipboard consent sweep removes expired authority before admission, including an empty sweep; machine 193
+  passed the exact denial regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-consent-capacity-cleanup-r22.md`.
 - **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks
   now expire at their admitting envelope/lease boundary; newer terminal
   sequences extend both high-water and retention monotonically, while renewed
@@ -1131,6 +1135,10 @@ behavioral evidence is not completion.
 - Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
   fixtures, responsive captures, and live recovery proof remain.
 - Remaining work:
+- **Peer-App target-binding checkpoint (2026-08-10):** legacy rows with an explicit cross-peer node are discarded before becoming resource/action targets; machine 193
+  passed the exact regression: `docs/platform/evidence/WL-FUNC-019-2026-08-10-peer-app-target-binding-r22.md`.
+- **Resource credential retry checkpoint (2026-08-10):** transient SecretStore startup failures retry with a bounded systemd rate while absent/invalid credentials stay
+  terminal; machine 193 passed focused hostile cases: `docs/platform/evidence/WL-CRIT-007-WL-FUNC-019-2026-08-10-resource-credential-retry-r110.md`.
 - **Resource catalog hostile-boundary checkpoint (2026-08-06):** resource
   contract tests cover multi-source cards, duplicate identities, malformed
   provenance, and unknown kinds; the focused farm lane passed 1/1 on `.90`.
@@ -1838,6 +1846,8 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Resource credential boot-retry checkpoint (2026-08-10):** transient SecretStore ordering failures retry every 30 seconds under a six-start/five-minute ceiling;
+  terminal secret/configuration failures do not retry or mask failure: `docs/platform/evidence/WL-CRIT-007-WL-FUNC-019-2026-08-10-resource-credential-retry-r110.md`.
 - **Identity teardown checkpoint (2026-08-06):** `rejoin-v11-mesh.sh
   --self-test` and the farm `.50` lane
   `crit007-rejoin-selftest-20260806-r1` passed; failed leave or residual
@@ -2249,6 +2259,8 @@ behavioral evidence is not completion.
   oversized availability TTLs. Expected-state publishers, transition
   evaluation, history/detail, recovery/export, and three-seat proof remain.
 - Remaining work:
+- **Availability duplicate-precedence checkpoint (2026-08-10):** duplicate evidence is classified before at-capacity overflow in forward and reversed order, while a
+  distinct extra node remains `CapacityExceeded`; machine 194 passed the exact regression: `docs/platform/evidence/WL-UX-013-2026-08-10-availability-duplicate-precedence-r13.md`.
 - **Expected-state boundary checkpoint (2026-08-06):** the health contract
   suite covers `Sleeping → Returned` at the `u64::MAX` boundary and refuses an
   overlong TTL; `.50` passed 1/1. Evidence:

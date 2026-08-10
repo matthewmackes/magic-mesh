@@ -33,7 +33,9 @@ use mde_files::search::{
 use mde_files::send_to::{SendToEntry, SendToRequest};
 
 use crate::chat_bridge::{BusChatBridge, ChatBridge};
-use crate::dialogs::{Arming, ConfirmDelete, Perm, PermClass, PropertiesDialog};
+use crate::dialogs::{
+    Arming, ConfirmDelete, NameDialog, NameOperation, Perm, PermClass, PropertiesDialog,
+};
 use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
 use crate::preview::{PreviewState, Previews, ThumbState};
@@ -1018,6 +1020,9 @@ pub struct FileBrowser {
     chown_permitted: bool,
     /// FILEMGR-11 — the open Properties dialog, if any.
     properties: Option<PropertiesDialog>,
+    /// WL-FUNC-011 — the open New Folder / Rename dialog, if any. Both execute
+    /// through `meta_ops`, the existing immediate FileOps authority.
+    name_dialog: Option<NameDialog>,
     /// FILEMGR-11 — the pending permanent-delete confirm, if any.
     confirm_delete: Option<ConfirmDelete>,
     /// FILEMGR-9 — the mesh-mount client (reads `state/mesh-mount/*`, writes
@@ -1116,6 +1121,7 @@ impl FileBrowser {
             meta_ops: Box::new(LiveFileOps::new()),
             chown_permitted: false,
             properties: None,
+            name_dialog: None,
             confirm_delete: None,
             chat: Box::new(BusChatBridge::from_env()),
             clipboard: None,
@@ -2474,6 +2480,103 @@ impl FileBrowser {
     }
 
     // ── the operation dialogs (FILEMGR-11) ───────────────────────────────────
+
+    /// Open New Folder against `pane`'s resolved current directory. Virtual or
+    /// unresolved locations fail honestly instead of opening a dead dialog.
+    pub fn open_new_folder(&mut self, pane: usize) {
+        let Some(parent) = self.pane(pane).active_tab().current_dir() else {
+            self.last_note = Some("This location has no writable filesystem path.".to_string());
+            return;
+        };
+        self.name_dialog = Some(NameDialog::new_folder(parent));
+        self.last_note = None;
+    }
+
+    /// Open Rename for exactly one focused local row. The source and parent are
+    /// captured now, so later selection changes cannot redirect the operation.
+    pub fn open_rename(&mut self, pane: usize) {
+        let tab = self.pane(pane).active_tab();
+        if tab.selection().len() != 1 {
+            self.last_note = Some("Select exactly one item to rename.".to_string());
+            return;
+        }
+        let Some(row) = tab.focused_row() else {
+            self.last_note = Some("Select exactly one item to rename.".to_string());
+            return;
+        };
+        let Some(source) = row.path.as_ref().map(PathBuf::from) else {
+            self.last_note = Some("This entry has no writable filesystem path.".to_string());
+            return;
+        };
+        let Some(parent) = source.parent().map(Path::to_path_buf) else {
+            self.last_note = Some("This entry has no parent directory.".to_string());
+            return;
+        };
+        self.name_dialog = Some(NameDialog::rename(source, parent, row.name.clone()));
+        self.last_note = None;
+    }
+
+    /// The open New Folder / Rename dialog, if any.
+    #[must_use]
+    pub fn name_dialog(&self) -> Option<&NameDialog> {
+        self.name_dialog.as_ref()
+    }
+
+    /// Replace the dialog's name buffer and clear a stale syscall error. Live
+    /// validation is derived from the new value by the dialog.
+    pub fn set_name_dialog_input(&mut self, name: String) {
+        if let Some(dialog) = self.name_dialog.as_mut() {
+            dialog.name = name;
+            dialog.error = None;
+        }
+    }
+
+    /// Execute New Folder / Rename through the existing immediate [`FileOps`]
+    /// authority. A destination preflight prevents ordinary replacement; any
+    /// validation, preflight, or syscall failure remains visible in the dialog.
+    pub fn submit_name_dialog(&mut self, pane: usize) {
+        let Some(dialog) = self.name_dialog.as_ref() else {
+            return;
+        };
+        let Some(target) = dialog.target() else {
+            return;
+        };
+        let operation = dialog.operation.clone();
+        let result = match self.meta_ops.symlink_metadata(&target) {
+            Ok(_) => Err(format!(
+                "An item named \u{201c}{}\u{201d} already exists.",
+                dialog.name
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match operation {
+                NameOperation::NewFolder { .. } => self
+                    .meta_ops
+                    .create_dir(&target)
+                    .map_err(|e| format!("Couldn't create folder: {e}")),
+                NameOperation::Rename { source, .. } => self
+                    .meta_ops
+                    .rename_noreplace(&source, &target)
+                    .map_err(|e| format!("Couldn't rename item: {e}")),
+            },
+            Err(e) => Err(format!("Couldn't check the destination: {e}")),
+        };
+        match result {
+            Ok(()) => {
+                self.name_dialog = None;
+                self.last_note = None;
+                self.reload(pane);
+            }
+            Err(error) => {
+                if let Some(dialog) = self.name_dialog.as_mut() {
+                    dialog.error = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Dismiss New Folder / Rename without touching the filesystem.
+    pub fn cancel_name_dialog(&mut self) {
+        self.name_dialog = None;
+    }
 
     /// The collision an in-flight op is blocked on, if the user hasn't answered
     /// it — the op id + the [`Conflict`](mde_files::opqueue::Conflict) the conflict

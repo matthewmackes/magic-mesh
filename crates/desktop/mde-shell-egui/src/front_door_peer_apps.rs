@@ -396,7 +396,11 @@ fn fold_peer_apps_reply(
         .entries
         .into_iter()
         .filter_map(|entry| {
-            let node = clean_node(&entry.node).unwrap_or(reply_node.as_str());
+            let node = match clean_node(&entry.node) {
+                Some(node) if node == reply_node => node,
+                Some(_) => return None,
+                None => reply_node.as_str(),
+            };
             let id = entry.id.trim();
             let name = entry.name.trim();
             if node.is_empty() || id.is_empty() || name.is_empty() {
@@ -531,6 +535,45 @@ mod tests {
             note.as_deref(),
             Some("app discovery reply was for pine, not oak")
         );
+    }
+
+    #[test]
+    fn legacy_cross_peer_row_is_rejected_instead_of_becoming_a_launch_target() {
+        let (apps, note) = fold_peer_apps_reply(
+            "oak",
+            PeerAppsReply {
+                ok: true,
+                node: "oak".into(),
+                entries: vec![
+                    PeerAppEntry {
+                        id: "org.example.Safe".into(),
+                        name: "Safe".into(),
+                        source: "flatpak".into(),
+                        node: String::new(),
+                        icon: String::new(),
+                        health: "ready".into(),
+                        state: "installed".into(),
+                    },
+                    PeerAppEntry {
+                        id: "org.example.Substituted".into(),
+                        name: "Substituted".into(),
+                        source: "flatpak".into(),
+                        node: "pine".into(),
+                        icon: String::new(),
+                        health: "ready".into(),
+                        state: "installed".into(),
+                    },
+                ],
+                catalog: None,
+                error: None,
+            },
+        );
+
+        assert!(note.is_none());
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].id, "org.example.Safe");
+        assert_eq!(apps[0].node, "oak");
+        assert!(apps[0].flatpak_id().is_ok_and(|id| id.is_some()));
     }
 
     #[test]

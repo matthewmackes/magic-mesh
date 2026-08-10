@@ -1217,6 +1217,16 @@ pub struct ClipboardSessionConsentLedger {
 }
 
 impl ClipboardSessionConsentLedger {
+    /// Release permissions that can no longer authorize a clipboard effect.
+    ///
+    /// This runs on every consent-lane sweep, including an empty one, so dead
+    /// sessions cannot permanently consume the bounded permission table and
+    /// deny a fresh authenticated session admission.
+    fn cleanup_expired(&mut self, now_ms: u64) {
+        self.latest_by_identity
+            .retain(|_, consent| consent.expires_at_ms > now_ms);
+    }
+
     /// Admit one consent update after validating its identity, freshness,
     /// explicit state, and strict monotonic update ordering.
     pub fn admit(
@@ -1911,6 +1921,7 @@ impl ClipboardSyncWorker {
         ledger: &mut ClipboardSessionConsentLedger,
         now_ms: u64,
     ) -> usize {
+        ledger.cleanup_expired(now_ms);
         let mut admitted = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -2972,6 +2983,63 @@ mod tests {
                 ClipboardSessionConsentValidationError::Expired { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn consent_sweep_releases_expired_capacity_before_fresh_admission() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf());
+        let mut ledger = ClipboardSessionConsentLedger::default();
+        let issued_at_ms = 1_700_000_000_000;
+        let expires_at_ms = issued_at_ms + 10;
+
+        for lane in 0..MAX_V2_CONSENT_SESSIONS {
+            ledger
+                .admit(
+                    v2_consent(
+                        "node-a",
+                        "seat-a",
+                        &format!("expired-session-{lane}"),
+                        true,
+                        issued_at_ms,
+                        expires_at_ms,
+                    ),
+                    issued_at_ms + 1,
+                )
+                .expect("fill consent ledger with short-lived permissions");
+        }
+        assert_eq!(ledger.latest_by_identity.len(), MAX_V2_CONSENT_SESSIONS);
+
+        let mut cursor = None;
+        assert_eq!(
+            worker.process_clipboard_consents(
+                Vec::new(),
+                &mut cursor,
+                None,
+                &mut ledger,
+                expires_at_ms,
+            ),
+            0
+        );
+        assert!(
+            ledger.latest_by_identity.is_empty(),
+            "an empty live sweep must release every expired permission"
+        );
+
+        ledger
+            .admit(
+                v2_consent(
+                    "node-new",
+                    "seat-new",
+                    "fresh-session",
+                    true,
+                    expires_at_ms + 1,
+                    expires_at_ms + 60_001,
+                ),
+                expires_at_ms + 2,
+            )
+            .expect("expired permissions must not deny fresh capacity");
+        assert_eq!(ledger.latest_by_identity.len(), 1);
     }
 
     #[test]
