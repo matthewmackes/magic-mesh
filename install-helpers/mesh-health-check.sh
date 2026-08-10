@@ -25,6 +25,11 @@ NEBULA_UNREACHABLE_RESTART_STAMP="${MCNF_NEBULA_UNREACHABLE_RESTART_STAMP:-$HEAL
 NEBULA_UNREACHABLE_RESTART_COOLDOWN_S="${MCNF_NEBULA_UNREACHABLE_RESTART_COOLDOWN_S:-600}"
 PEER_PUBLICATION_RESTART_STAMP="${MCNF_PEER_PUBLICATION_RESTART_STAMP:-$HEALTH_RUN_DIR/peer-publication-stale.restarted}"
 PEER_PUBLICATION_RESTART_COOLDOWN_S="${MCNF_PEER_PUBLICATION_RESTART_COOLDOWN_S:-600}"
+ETCD_RESTART_STAMP="${MCNF_ETCD_RESTART_STAMP:-$HEALTH_RUN_DIR/etcd-unreachable.restarted}"
+ETCD_RESTART_COOLDOWN_S="${MCNF_ETCD_RESTART_COOLDOWN_S:-1800}"
+ETCD_PRESSURE_THRESHOLD="${MCNF_ETCD_PRESSURE_THRESHOLD:-80}"
+CPU_PRESSURE_FILE="${MCNF_CPU_PRESSURE_FILE:-/proc/pressure/cpu}"
+MEMORY_PRESSURE_FILE="${MCNF_MEMORY_PRESSURE_FILE:-/proc/pressure/memory}"
 log() { echo "mesh-health: $*"; }       # journal via the unit's StandardOutput
 
 case "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" in
@@ -38,6 +43,18 @@ case "$PEER_PUBLICATION_RESTART_COOLDOWN_S" in
 esac
 if [ "$PEER_PUBLICATION_RESTART_COOLDOWN_S" -lt 60 ]; then
     PEER_PUBLICATION_RESTART_COOLDOWN_S=600
+fi
+case "$ETCD_RESTART_COOLDOWN_S" in
+    ''|*[!0-9]*) ETCD_RESTART_COOLDOWN_S=1800 ;;
+esac
+if [ "$ETCD_RESTART_COOLDOWN_S" -lt 300 ]; then
+    ETCD_RESTART_COOLDOWN_S=1800
+fi
+case "$ETCD_PRESSURE_THRESHOLD" in
+    ''|*[!0-9]*) ETCD_PRESSURE_THRESHOLD=80 ;;
+esac
+if [ "$ETCD_PRESSURE_THRESHOLD" -lt 1 ] || [ "$ETCD_PRESSURE_THRESHOLD" -gt 100 ]; then
+    ETCD_PRESSURE_THRESHOLD=80
 fi
 
 # Only manage a node that has actually been enrolled.
@@ -135,6 +152,148 @@ record_peer_publication_restart() {
     : > "$PEER_PUBLICATION_RESTART_STAMP"
 }
 
+etcd_restart_due() {
+    local now stamp_mtime
+    now="$(date +%s 2>/dev/null || true)"
+    stamp_mtime="$(stat -c %Y "$ETCD_RESTART_STAMP" 2>/dev/null || true)"
+    [ -z "$now" ] || [ -z "$stamp_mtime" ] \
+        || [ "$((now - stamp_mtime))" -ge "$ETCD_RESTART_COOLDOWN_S" ]
+}
+
+record_etcd_restart() {
+    mkdir -p "$HEALTH_RUN_DIR" 2>/dev/null \
+        && : > "$ETCD_RESTART_STAMP"
+}
+
+psi_some_avg10() {
+    local file="$1"
+    awk '$1 == "some" {
+        for (i = 2; i <= NF; i++) {
+            if ($i ~ /^avg10=/) {
+                sub(/^avg10=/, "", $i)
+                print $i
+                exit
+            }
+        }
+    }' "$file" 2>/dev/null || true
+}
+
+psi_is_severe() {
+    local value="$1"
+    [ -n "$value" ] && awk -v value="$value" -v threshold="$ETCD_PRESSURE_THRESHOLD" \
+        'BEGIN { exit !(value >= threshold) }'
+}
+
+psi_value_is_valid() {
+    local value="$1"
+    [ -n "$value" ] && awk -v value="$value" \
+        'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 0 && value <= 100) }'
+}
+
+# A failed proposal is not permission to restart an etcd voter. A slow member
+# can still be replaying its WAL or shutting down, and killing it again extends
+# the outage. Recovery is admitted only when the unit is in a stable state, a
+# strict majority answers the read-only status verb, host pressure is bounded,
+# and the previous watchdog restart is outside its cooldown.
+recover_etcd_if_safe() {
+    local active_state sub_state endpoint status_json fingerprint
+    local cluster_id member_id leader_id raft_term
+    local expected_cluster="" expected_leader="" expected_term=""
+    local configured=0 responders=0 required
+    local cpu_pressure memory_pressure
+    local -a endpoints=("$@")
+    local -A seen_endpoints=() seen_members=()
+
+    active_state="$(systemctl show etcd.service -p ActiveState --value 2>/dev/null || true)"
+    sub_state="$(systemctl show etcd.service -p SubState --value 2>/dev/null || true)"
+    case "$active_state" in
+        activating|deactivating|reloading|refreshing)
+            log "DEGRADED: etcd recovery suppressed: unit is ${active_state}/${sub_state:-unknown}; allow the current transition to finish, then inspect journalctl -u etcd.service"
+            return 1
+            ;;
+        active|inactive|failed)
+            ;;
+        *)
+            log "DEGRADED: etcd recovery suppressed: unit state is ${active_state:-unknown}/${sub_state:-unknown}; inspect systemctl status etcd.service"
+            return 1
+            ;;
+    esac
+
+    cpu_pressure="$(psi_some_avg10 "$CPU_PRESSURE_FILE")"
+    memory_pressure="$(psi_some_avg10 "$MEMORY_PRESSURE_FILE")"
+    if ! psi_value_is_valid "$cpu_pressure" || ! psi_value_is_valid "$memory_pressure"; then
+        log "DEGRADED: etcd recovery suppressed: PSI pressure telemetry unavailable or invalid (cpu=${cpu_pressure:-unavailable}, memory=${memory_pressure:-unavailable}); inspect /proc/pressure before recovery"
+        return 1
+    fi
+    if psi_is_severe "$cpu_pressure" || psi_is_severe "$memory_pressure"; then
+        log "DEGRADED: etcd recovery suppressed: severe host pressure cpu.some.avg10=${cpu_pressure:-unknown}% memory.some.avg10=${memory_pressure:-unknown}% (limit ${ETCD_PRESSURE_THRESHOLD}%); relieve load/memory pressure before recovery"
+        return 1
+    fi
+
+    for endpoint in "${endpoints[@]}"; do
+        endpoint="$(printf '%s' "$endpoint" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "$endpoint" ] || continue
+        [ -z "${seen_endpoints[$endpoint]+x}" ] || continue
+        seen_endpoints["$endpoint"]=1
+        configured=$((configured + 1))
+        status_json="$(ETCDCTL_API=3 etcdctl --command-timeout=3s \
+            --endpoints="$endpoint" --write-out=json endpoint status 2>/dev/null)" \
+            || continue
+        fingerprint="$(printf '%s' "$status_json" | python3 -c '
+import json
+import sys
+
+try:
+    document = json.load(sys.stdin)
+    status = document[0]["Status"]
+    header = status["header"]
+    values = (
+        header["cluster_id"],
+        header["member_id"],
+        status["leader"],
+        status["raftTerm"],
+    )
+    if len(document) != 1 or any(type(value) is not int or value <= 0 for value in values):
+        raise ValueError("invalid status identity")
+except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(":".join(str(value) for value in values))
+' 2>/dev/null)" || continue
+        IFS=: read -r cluster_id member_id leader_id raft_term <<<"$fingerprint"
+        if [ -z "$expected_cluster" ]; then
+            expected_cluster="$cluster_id"
+            expected_leader="$leader_id"
+            expected_term="$raft_term"
+        fi
+        [ "$cluster_id" = "$expected_cluster" ] \
+            && [ "$leader_id" = "$expected_leader" ] \
+            && [ "$raft_term" = "$expected_term" ] \
+            && [ -z "${seen_members[$member_id]+x}" ] || continue
+        seen_members["$member_id"]=1
+        responders=$((responders + 1))
+    done
+    required=$((configured / 2 + 1))
+    if [ "$configured" -eq 0 ] || [ "$responders" -lt "$required" ]; then
+        log "DEGRADED: etcd recovery suppressed: read-only quorum visibility ${responders}/${configured}, require ${required} distinct members agreeing on cluster/leader/term; restore overlay/quorum or inspect member status before restarting"
+        return 1
+    fi
+
+    if ! etcd_restart_due; then
+        log "DEGRADED: etcd recovery suppressed by ${ETCD_RESTART_COOLDOWN_S}s cooldown; inspect journalctl -u etcd.service and endpoint status before retry"
+        return 1
+    fi
+
+    # Record first: a failed or timed-out systemctl call must not make the
+    # minute timer amplify the same failure indefinitely.
+    if ! record_etcd_restart; then
+        log "DEGRADED: etcd recovery suppressed: unable to persist restart cooldown at $ETCD_RESTART_STAMP; restore /run capacity and permissions before recovery"
+        return 1
+    fi
+    restart etcd.service \
+        "proposal probes failed, but read-only quorum is visible (${responders}/${configured}) and host pressure is bounded"
+    return 0
+}
+
 # 0. Shared-state plane health. SUBSTRATE-V2: the plane is etcd (coordination)
 #    + Syncthing (files). When this node is on the etcd coordination plane
 #    (setup-etcd wrote the endpoints file), assert etcd quorum health + the
@@ -169,7 +328,7 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
         if [ "$healthy_endpoint" -eq 0 ]; then
             if [ -s "$ETCD_MEMBER_FILE" ]; then
                 coordination_failed=1
-                restart etcd.service "etcd unreachable (coordination plane down)"
+                recover_etcd_if_safe "${etcd_endpoints[@]}" || true
             else
                 # Workstations are coordination clients, not local members.
                 # Restarting their condition-skipped etcd.service cannot heal a
@@ -180,6 +339,8 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
                 log "WARN: coordination endpoint probe timed out; client-only node has no local etcd member to restart"
                 alert etcd-client "coordination endpoints unreachable; no local member to restart"
             fi
+        else
+            rm -f -- "$ETCD_RESTART_STAMP"
         fi
     fi
     # Syncthing file plane (non-critical to liveness, but recover + note it).
