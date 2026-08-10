@@ -884,7 +884,13 @@ fn projection_from(
             .payload
             .entries
             .iter()
-            .filter(|entry| entry.state == FlatpakInstallState::Installed)
+            .filter(|entry| {
+                entry.state == FlatpakInstallState::Installed
+                    && entry
+                        .supported_actions
+                        .iter()
+                        .any(|action| action == "launch")
+            })
             .map(project_entry)
             .collect()
     } else {
@@ -1254,6 +1260,22 @@ mod tests {
             latest_status(&persist).reason,
             AppCatalogStatusReason::RetainedCatalogExpired
         );
+    }
+
+    #[test]
+    fn installed_row_without_launch_action_is_not_projected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut catalog = signed_catalog(&key, "flatpak-production", 7);
+        catalog.payload.entries[1].supported_actions = vec!["resume".into()];
+        let catalog = SignedFlatpakAppCatalog::sign(
+            "flatpak-release-v1",
+            catalog.payload,
+            &key,
+        )
+        .unwrap();
+
+        let projection = projection_from("node-01", &catalog, true).unwrap();
+        assert!(projection.entries.is_empty());
     }
 
     #[test]
