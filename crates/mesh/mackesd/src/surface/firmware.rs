@@ -958,8 +958,9 @@ fn shared_inventory(
     Ok(value)
 }
 
-/// An empty fwupd device envelope — the honest fallback when the updates read
-/// is unavailable (so the inventory still lists devices as up-to-date).
+/// Empty fwupd envelope used by parser/provider test fixtures. Production
+/// treats an unavailable updates read as unavailable inventory; it never uses
+/// this value to infer that devices are up to date.
 const EMPTY_DEVICE_LIST: &str = r#"{"Devices":[]}"#;
 
 // ─────────────────────────── the apply verb (typed-armed) ───────────────────
