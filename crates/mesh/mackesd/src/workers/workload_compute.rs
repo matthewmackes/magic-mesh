@@ -3423,6 +3423,14 @@ impl WorkloadComputeWorker {
         retryable: bool,
         now_ms: u64,
     ) {
+        // A terminal failure cannot retain an attachment capability. This is
+        // especially important during restart recovery: a persisted in-flight
+        // StartAndAttach may already carry a Display1 lease when observation
+        // fails permanently. Revoke that exact identity before journaling the
+        // failure so neither the durable record nor its projection can expose
+        // a stale session endpoint.
+        self.actuator.revoke_attachment(&status);
+        status.attachment = None;
         status.phase = WorkloadOperationPhase::Failed;
         status.power = WorkloadPowerState::Failed;
         status.readiness = WorkloadReadiness::Failed;
@@ -5161,6 +5169,46 @@ mod tests {
         }
     }
 
+    struct PermanentObserveAttachmentActuator {
+        revoked: Arc<Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl WorkloadActuator for PermanentObserveAttachmentActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("recovered in-flight operation must be observed, not applied")
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("unexpired recovered operation must not enter cleanup")
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            Err(WorkloadActuatorError::Permanent(
+                "recovered Display1 endpoint has hostile peer credentials".into(),
+            ))
+        }
+
+        fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+            if let Some(lease) = status.attachment.as_ref() {
+                self.revoked
+                    .lock()
+                    .expect("revoked attachments")
+                    .push((lease.lease_id.clone(), lease.generation));
+            }
+        }
+    }
+
     struct PermanentActuator;
     impl WorkloadActuator for PermanentActuator {
         fn apply(
@@ -6775,6 +6823,67 @@ mod tests {
 
         worker.reconcile_inflight(&mut ledger, retry_at);
         assert_eq!(*observe_calls.lock().expect("observe calls"), 2);
+    }
+
+    #[test]
+    fn permanent_observation_failure_after_restart_revokes_persisted_attachment() {
+        let temp = tempfile::tempdir().expect("temp");
+        let started_at = now_ms();
+        let mut request = request();
+        request.deadline_at_ms = started_at + 20_000;
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, started_at);
+        {
+            let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+            let mut status = ledger
+                .accept(request.clone(), started_at)
+                .expect("queue request");
+            for phase in [
+                WorkloadOperationPhase::Validating,
+                WorkloadOperationPhase::Admitting,
+                WorkloadOperationPhase::Defining,
+                WorkloadOperationPhase::Starting,
+                WorkloadOperationPhase::WaitingForGuest,
+                WorkloadOperationPhase::WaitingForService,
+                WorkloadOperationPhase::PreparingDisplay,
+                WorkloadOperationPhase::WaitingForFirstFrame,
+            ] {
+                status.phase = phase;
+                if phase == WorkloadOperationPhase::WaitingForFirstFrame {
+                    status.power = WorkloadPowerState::Running;
+                    status.readiness = WorkloadReadiness::PreparingDisplay;
+                    status.attachment = Some(lease.clone());
+                    status.signals =
+                        WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
+                }
+                status = ledger
+                    .advance(&request.request_id, status, started_at)
+                    .expect("persist hostile restart boundary");
+            }
+        }
+
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("reopened ledger");
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            PermanentObserveAttachmentActuator {
+                revoked: Arc::clone(&revoked),
+            },
+        ));
+
+        worker.reconcile_inflight(&mut ledger, started_at);
+
+        assert_eq!(
+            revoked.lock().expect("revoked attachments").as_slice(),
+            &[(lease.lease_id, lease.generation)]
+        );
+        let failed = ledger.status(&request.request_id).expect("failed status");
+        assert_eq!(failed.phase, WorkloadOperationPhase::Failed);
+        assert_eq!(failed.readiness, WorkloadReadiness::Failed);
+        assert!(failed.attachment.is_none());
+        assert!(!failed.retryable);
+        assert!(failed
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("hostile peer credentials")));
     }
 
     #[test]

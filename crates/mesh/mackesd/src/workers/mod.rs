@@ -1123,6 +1123,78 @@ pub struct Supervisor {
     /// transitional all-groups supervisor; `Some` admits only workers whose
     /// canonical registry entry belongs to the selected process.
     worker_group: Option<crate::worker_role::WorkerGroup>,
+    /// Canonical registry identities currently owned by this supervisor.
+    /// Diagnostic kebab/snake aliases must not create a second live owner.
+    worker_owners: Arc<std::sync::Mutex<std::collections::HashSet<&'static str>>>,
+    /// Shared Bus-root lease directory used by the six installed process
+    /// groups. `None` is retained only for embedded/dev supervisors that do
+    /// not have the installed services' explicit `MDE_BUS_ROOT`.
+    worker_owner_root: Option<std::path::PathBuf>,
+    /// Open exclusive group lease. Keeping the descriptor alive makes the
+    /// kernel, rather than process-local memory, enforce single ownership.
+    group_owner_lease: Option<std::fs::File>,
+}
+
+struct WorkerOwnerLease {
+    worker_id: &'static str,
+    owners: Arc<std::sync::Mutex<std::collections::HashSet<&'static str>>>,
+}
+
+impl Drop for WorkerOwnerLease {
+    fn drop(&mut self) {
+        self.owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(self.worker_id);
+    }
+}
+
+fn canonical_worker_identity(name: &'static str) -> &'static str {
+    crate::worker_role::spec(name)
+        .or_else(|| {
+            name.contains('-')
+                .then(|| name.replace('-', "_"))
+                .and_then(|alias| crate::worker_role::spec(&alias))
+        })
+        .map_or(name, |spec| spec.name)
+}
+
+fn acquire_group_owner_lease(
+    root: &std::path::Path,
+    group: crate::worker_role::WorkerGroup,
+) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("creating worker owner root {}", root.display()))?;
+    let metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("inspecting worker owner root {}", root.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "worker owner root is not a real directory: {}",
+        root.display()
+    );
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("securing worker owner root {}", root.display()))?;
+
+    let path = root.join(format!("{}.lock", group.as_str()));
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "worker group lease is not a regular file: {}",
+            path.display()
+        );
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("opening worker group lease {}", path.display()))?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .with_context(|| format!("worker group {:?} already has a live owner", group))?;
+    Ok(file)
 }
 
 impl Default for Supervisor {
@@ -1145,6 +1217,11 @@ impl Supervisor {
             status: None,
             alert_sink: default_breaker_alert_sink(),
             worker_group: None,
+            worker_owners: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            worker_owner_root: std::env::var_os("MDE_BUS_ROOT")
+                .map(std::path::PathBuf::from)
+                .map(|root| root.join(".mackesd-worker-owners")),
+            group_owner_lease: None,
         }
     }
 
@@ -1166,7 +1243,28 @@ impl Supervisor {
     /// admitted; unknown names fail closed rather than becoming an accidental
     /// seventh process surface.
     pub fn set_worker_group(&mut self, group: crate::worker_role::WorkerGroup) {
+        self.try_set_worker_group(group)
+            .unwrap_or_else(|error| panic!("WL-ARCH-009: {error:#}"));
+    }
+
+    fn try_set_worker_group(
+        &mut self,
+        group: crate::worker_role::WorkerGroup,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.worker_group.is_none(),
+            "worker process group is already selected"
+        );
+        if let Some(root) = self.worker_owner_root.as_deref() {
+            self.group_owner_lease = Some(acquire_group_owner_lease(root, group)?);
+        }
         self.worker_group = Some(group);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_worker_owner_root(&mut self, root: std::path::PathBuf) {
+        self.worker_owner_root = Some(root);
     }
 
     /// Whether a registered worker belongs to this supervisor's group. This is
@@ -1235,13 +1333,35 @@ impl Supervisor {
         if !self.accepts_worker(name) {
             return;
         }
+        let worker_id = canonical_worker_identity(name);
+        {
+            let mut owners = self
+                .worker_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !owners.insert(worker_id) {
+                error!(
+                    worker = %name,
+                    worker_id = %worker_id,
+                    "WL-ARCH-009: refusing duplicate live worker owner"
+                );
+                return;
+            }
+        }
+        let owner_lease = WorkerOwnerLease {
+            worker_id,
+            owners: Arc::clone(&self.worker_owners),
+        };
         let shutdown = token;
         // EFF-24 — register + maintain the live status row.
         let status = self.status.clone();
         // test-obs-10 — the breaker-trip alert sink, moved into the task.
         let alert_sink = self.alert_sink.clone();
-        update_status(&status, name, |w| w.alive = true);
+        update_status(&status, worker_id, |w| w.alive = true);
         self.join.spawn(async move {
+            // The lease releases the canonical identity on every exit path,
+            // including panic/abort, so a completed owner can be replaced.
+            let _owner_lease = owner_lease;
             // ENT-6 — closed-state restart-policy state for this worker.
             let mut delay = INITIAL_BACKOFF;
             let mut rapid_failures: u32 = 0;
@@ -1260,7 +1380,7 @@ impl Supervisor {
             let last_result: anyhow::Result<()> = loop {
                 info!(worker = %name, "starting worker");
                 if !first_run {
-                    update_status(&status, name, |w| {
+                    update_status(&status, worker_id, |w| {
                         w.restarts += 1;
                         w.alive = true;
                     });
@@ -1297,7 +1417,7 @@ impl Supervisor {
                             res = run_fut.as_mut() => break res,
                             () = stability.as_mut(), if !cleared => {
                                 cleared = true;
-                                update_status(&status, name, |w| w.breaker_tripped = false);
+                                update_status(&status, worker_id, |w| w.breaker_tripped = false);
                                 info!(
                                     worker = %name,
                                     "mackesd-05: half-open trial stable — clearing breaker",
@@ -1332,7 +1452,7 @@ impl Supervisor {
                 // EFF-24 — record the exit; `alive` flips back on if a
                 // restart follows.
                 let exit_ok = outcome.is_ok();
-                update_status(&status, name, |w| {
+                update_status(&status, worker_id, |w| {
                     w.alive = false;
                     w.last_exit_ok = Some(exit_ok);
                 });
@@ -1360,7 +1480,7 @@ impl Supervisor {
                             rapid_failures = 0;
                             delay = INITIAL_BACKOFF;
                             window_start = std::time::Instant::now();
-                            update_status(&status, name, |w| w.breaker_tripped = false);
+                            update_status(&status, worker_id, |w| w.breaker_tripped = false);
                             info!(
                                 worker = %name,
                                 "mackesd-05: half-open trial recovered — breaker closed",
@@ -1372,7 +1492,7 @@ impl Supervisor {
                             // more. `apply_trial_outcome` only ever yields
                             // `Closed`/`Open`; the `HalfOpen` arm is folded
                             // in so the match stays exhaustive.
-                            update_status(&status, name, |w| w.breaker_tripped = true);
+                            update_status(&status, worker_id, |w| w.breaker_tripped = true);
                             warn!(
                                 worker = %name,
                                 cooldown_s = cooldown.as_secs(),
@@ -1425,7 +1545,7 @@ impl Supervisor {
                         // genuine closed→open trip bumps the cumulative
                         // per-worker counter the metrics exporter surfaces as
                         // `mackesd_breaker_trips_total{worker=…}`.
-                        update_status(&status, name, |w| {
+                        update_status(&status, worker_id, |w| {
                             w.breaker_tripped = true;
                             w.breaker_trips += 1;
                         });
@@ -1447,7 +1567,7 @@ impl Supervisor {
                                     BREAKER_WINDOW.as_secs()
                                 ),
                             };
-                            sink.publish(&notify::breaker_trip_alert(name, &reason));
+                            sink.publish(&notify::breaker_trip_alert(worker_id, &reason));
                         }
                         cooldown = COOLDOWN_INITIAL;
                         let mut cool_tok = shutdown.clone();
@@ -1794,6 +1914,126 @@ mod tests {
         let mut observation = Supervisor::new();
         observation.set_worker_group(crate::worker_role::WorkerGroup::Observation);
         assert!(observation.accepts_worker("link-traffic"));
+    }
+
+    struct NamedRegistryWorker {
+        name: &'static str,
+        starts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for NamedRegistryWorker {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn run(&mut self, _shutdown: ShutdownToken) -> anyhow::Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn group_lease_child_probe() {
+        let Some(root) = std::env::var_os("MACKESD_TEST_WORKER_OWNER_ROOT") else {
+            return;
+        };
+        let expect_blocked = std::env::var_os("MACKESD_TEST_EXPECT_OWNER_BLOCKED").is_some();
+        let mut supervisor = Supervisor::new();
+        supervisor.set_worker_owner_root(std::path::PathBuf::from(root));
+        let result = supervisor.try_set_worker_group(crate::worker_role::WorkerGroup::Control);
+        assert_eq!(
+            result.is_err(),
+            expect_blocked,
+            "child process group-lease verdict did not match the live owner"
+        );
+    }
+
+    fn run_group_lease_child(root: &std::path::Path, expect_blocked: bool) {
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("current lib-test executable"),
+        );
+        command
+            .args([
+                "--exact",
+                "workers::tests::group_lease_child_probe",
+                "--nocapture",
+            ])
+            .env("MACKESD_TEST_WORKER_OWNER_ROOT", root);
+        if expect_blocked {
+            command.env("MACKESD_TEST_EXPECT_OWNER_BLOCKED", "1");
+        } else {
+            command.env_remove("MACKESD_TEST_EXPECT_OWNER_BLOCKED");
+        }
+        assert!(
+            command.status().expect("run group-lease child").success(),
+            "child process did not observe the expected group lease verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_lease_refuses_second_process_and_canonicalizes_replacement() {
+        let owner_root = tempfile::tempdir().expect("owner root");
+        let mut supervisor = Supervisor::new();
+        supervisor.set_worker_owner_root(owner_root.path().to_path_buf());
+        supervisor
+            .try_set_worker_group(crate::worker_role::WorkerGroup::Control)
+            .expect("first process owns control group");
+        run_group_lease_child(owner_root.path(), true);
+        let status = new_status_map();
+        supervisor.set_status_map(Arc::clone(&status));
+        let starts = Arc::new(AtomicUsize::new(0));
+
+        supervisor.spawn(Spawn::new(
+            NamedRegistryWorker {
+                name: "mesh_router",
+                starts: Arc::clone(&starts),
+            },
+            RestartPolicy::Never,
+        ));
+        supervisor.spawn(Spawn::new(
+            NamedRegistryWorker {
+                name: "mesh-router",
+                starts: Arc::clone(&starts),
+            },
+            RestartPolicy::Never,
+        ));
+
+        let first = supervisor.join_all().await;
+        assert_eq!(first.len(), 1, "an alias must not start a second owner");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["mesh_router"],
+            "status publication must retain the canonical registry identity"
+        );
+
+        supervisor.spawn(Spawn::new(
+            NamedRegistryWorker {
+                name: "mesh-router",
+                starts: Arc::clone(&starts),
+            },
+            RestartPolicy::Never,
+        ));
+        let replacement = supervisor.join_all().await;
+        assert_eq!(replacement.len(), 1, "a completed owner is replaceable");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "replacement must update, not duplicate, the publication row"
+        );
+
+        drop(supervisor);
+        run_group_lease_child(owner_root.path(), false);
     }
 
     // ── mackesd-05: half-open recovery — behavioral (paused-time) ───

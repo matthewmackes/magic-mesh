@@ -44,6 +44,16 @@ pub const CURATED_PORTS: &[u16] = &[
 /// §7 risk note mandates "not `-T5`".
 const TIMING: &str = "-T3";
 
+/// Nmap replaces its default host-discovery set as soon as any `-P*` argument
+/// is explicit.  Spell out the privileged-worker defaults and add only TCP
+/// 3389 to the SYN ports: an RDP-only Windows host can answer discovery while
+/// ICMP/HTTP-visible peers keep their existing admission paths.  This is
+/// deliberately not `-Pn`; neither targets nor scanned ports expand.
+const HOST_DISCOVERY_ECHO: &str = "-PE";
+const HOST_DISCOVERY_SYN: &str = "-PS443,3389";
+const HOST_DISCOVERY_ACK: &str = "-PA80";
+const HOST_DISCOVERY_TIMESTAMP: &str = "-PP";
+
 /// nmap binary name (overridable in `scan` for tests).
 pub const DEFAULT_NMAP_BINARY: &str = "nmap";
 
@@ -75,6 +85,10 @@ pub fn fast_argv(targets: &[String]) -> Vec<String> {
     // leaving the panel at "0 hosts" on a healthy mesh.
     let mut argv = vec![
         TIMING.to_owned(),
+        HOST_DISCOVERY_ECHO.to_owned(),
+        HOST_DISCOVERY_SYN.to_owned(),
+        HOST_DISCOVERY_ACK.to_owned(),
+        HOST_DISCOVERY_TIMESTAMP.to_owned(),
         // SUBAUDIT-C2 — bound per-host time so a slow/LAN target can't
         // stall the inventory write (the fast cycle must stay fast).
         "--host-timeout".to_owned(),
@@ -96,6 +110,10 @@ pub fn fast_argv(targets: &[String]) -> Vec<String> {
 pub fn deep_argv(targets: &[String], nse_dir: &str) -> Vec<String> {
     let mut argv = vec![
         TIMING.to_owned(),
+        HOST_DISCOVERY_ECHO.to_owned(),
+        HOST_DISCOVERY_SYN.to_owned(),
+        HOST_DISCOVERY_ACK.to_owned(),
+        HOST_DISCOVERY_TIMESTAMP.to_owned(),
         "--host-timeout".to_owned(),
         "60s".to_owned(),
         "-sV".to_owned(),
@@ -1205,6 +1223,11 @@ mod tests {
     fn fast_argv_is_rate_limited_and_xml_stdout() {
         let argv = fast_argv(&["10.42.0.5".to_owned()]);
         assert!(argv.contains(&"-T3".to_owned()), "polite timing present");
+        assert!(
+            argv.contains(&HOST_DISCOVERY_SYN.to_owned()),
+            "reachable RDP endpoints participate in host discovery"
+        );
+        assert!(!argv.contains(&"-Pn".to_owned()), "silent hosts stay gated");
         assert!(!argv.contains(&"-T5".to_owned()), "never -T5");
         assert!(!argv.contains(&"-T4".to_owned()), "not aggressive -T4");
         // -oX - => XML to stdout.
@@ -1221,6 +1244,8 @@ mod tests {
         let argv = deep_argv(&["10.42.0.5".to_owned()], "/usr/share/mde/nmap");
         assert!(argv.contains(&"-sV".to_owned()));
         assert!(argv.contains(&"--version-all".to_owned()));
+        assert!(argv.contains(&HOST_DISCOVERY_SYN.to_owned()));
+        assert!(!argv.contains(&"-Pn".to_owned()), "silent hosts stay gated");
         assert!(argv.contains(&"-T3".to_owned()));
         assert!(!argv.contains(&"-T5".to_owned()));
         let s = argv.iter().position(|a| a == "--script").expect("--script");
@@ -1232,6 +1257,31 @@ mod tests {
         let argv = deep_argv(&["10.42.0.5".to_owned()], "");
         assert!(!argv.contains(&"--script".to_owned()));
         assert!(argv.contains(&"-sV".to_owned()));
+    }
+
+    #[test]
+    fn rdp_host_discovery_keeps_the_bounded_target_and_port_scope() {
+        let targets = ["172.20.146.54".to_owned(), "10.42.0.5".to_owned()];
+        for argv in [fast_argv(&targets), deep_argv(&targets, "")] {
+            for default_probe in [
+                HOST_DISCOVERY_ECHO,
+                HOST_DISCOVERY_ACK,
+                HOST_DISCOVERY_TIMESTAMP,
+            ] {
+                assert!(argv.iter().any(|argument| argument == default_probe));
+            }
+            assert_eq!(
+                argv.iter()
+                    .filter(|argument| argument.as_str() == HOST_DISCOVERY_SYN)
+                    .count(),
+                1
+            );
+            assert!(!argv.iter().any(|argument| argument == "-Pn"));
+            assert_eq!(&argv[argv.len() - targets.len()..], targets.as_slice());
+
+            let port_flag = argv.iter().position(|argument| argument == "-p").unwrap();
+            assert_eq!(argv[port_flag + 1], port_spec());
+        }
     }
 
     #[test]

@@ -90,12 +90,11 @@ behavioral evidence is not completion.
   an already-stopped libvirt domain as an idempotent destroy/undefine boundary, and an independent live-proof helper validates the typed projection and refuses
   missing runtime evidence. Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work:
-- **Recovered attachment lease checkpoint (2026-08-10):** restart recovery refuses a false Ready result without its authoritative Display1 lease; machine 193 passed
-  the exact hostile regression: `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-attachment-lease-r110.md`.
-- **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator
-  accepts absent/stopped-domain diagnostics during ordered cleanup while still
-  refusing unrelated virtqemud failures. Workload `workload_compute` passed
-  23/23 on `.90` in `workload-cleanup-idempotence-20260806-r1`.
+- **Terminal attachment revocation checkpoint (2026-08-10):** permanent restart-observation failure clears its Display1 lease before journaling failure; exact machine-9
+  proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
+- **Recovered attachment lease checkpoint (2026-08-10):** restart recovery refuses false Ready without its Display1 lease; exact machine-193 proof:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-attachment-lease-r110.md`.
+- **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator accepts absent/stopped-domain cleanup while rejecting unrelated failures; 23/23 passed on `.90`:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
 - **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
   `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
@@ -393,12 +392,11 @@ behavioral evidence is not completion.
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console checkpoints (2026-08-08/09):** generation-bound actions and digest recomputation fail closed:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
-- **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts have stable registry rows; uncensused starts fail closed. Six group maps feed one Observation-owned
-  aggregate; release 29 proved exact process owners and six fresh maps live on four seats after correcting legacy runtime-name alias admission. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-runtime-status-aggregate-ownership-r100.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-process-infrastructure-ownership-r103.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
+- **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - Remaining work:
+- **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
 - **Mirror owner (2026-08-10):** only Data publishes `mirror_syncd`; machine 193 passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-mirror-owner-gate-r109.md`.
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
@@ -1135,6 +1133,9 @@ behavioral evidence is not completion.
 - Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
   fixtures, responsive captures, and live recovery proof remain.
 - Remaining work:
+- **RDP host-discovery checkpoint (2026-08-10):** bounded fast and deep probes preserve the default privileged discovery set and add TCP/3389 without `-Pn` or
+  target/port expansion; machine 9 passed the exact regression. Seat-15 deployment and live authenticated-card proof remain:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-rdp-host-discovery-r117.md`.
 - **Peer-App target-binding checkpoint (2026-08-10):** legacy rows with an explicit cross-peer node are discarded before becoming resource/action targets; machine 193
   passed the exact regression: `docs/platform/evidence/WL-FUNC-019-2026-08-10-peer-app-target-binding-r22.md`.
 - **Resource credential retry checkpoint (2026-08-10):** transient SecretStore startup failures retry with a bounded systemd rate while absent/invalid credentials stay
