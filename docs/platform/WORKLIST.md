@@ -872,10 +872,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
-- **MG90 partial-manager expiry:** `.90` passed preservation of a healthy source publication when one approved manager expires:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-10-mg90-partial-manager-expiry-r183.md`.
+- **MG90 manager failover:** `.90` preserved healthy-source publication: `docs/platform/evidence/WL-FUNC-017-2026-08-10-mg90-partial-manager-expiry-r183.md`.
 - **Offline timeline (r160):** impossible access order fails closed; BigBoy passed `docs/platform/evidence/WL-FUNC-017-2026-08-10-offline-timeline-r160.md`.
-- **Future cache timestamps (2026-08-10):** BigBoy passed removal of future cache entries: `docs/platform/evidence/WL-FUNC-017-2026-08-10-future-cache-timestamps-r157.md`.
 - **Offline basemap admission (2026-08-10):** ambiguous or unsafe region/MBTiles candidates fail closed; `.90` passed 6/6; renderer/routing/live proof remain:
   `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
 - **Offline index corruption recovery (2026-08-09):** malformed metadata is replaced atomically; future schemas and non-regular paths fail closed. Machine 193 passed:
