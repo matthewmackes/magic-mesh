@@ -270,6 +270,11 @@ COPY packaging/systemd/mackesd-actions.service /usr/lib/systemd/system/mackesd-a
 COPY packaging/systemd/mackesd-data.service /usr/lib/systemd/system/mackesd-data.service
 COPY packaging/systemd/mackesd-compute.service /usr/lib/systemd/system/mackesd-compute.service
 COPY packaging/systemd/mackesd-integrations.service /usr/lib/systemd/system/mackesd-integrations.service
+# Request-bound Surface MOK credentials are never present in the image. Ship
+# only the explicit runtime activator and its fixed LoadCredentialEncrypted
+# contract; neither is installed into mackesd-actions.service by default.
+COPY install-helpers/provision-surface-mok-import-credentials.sh /usr/libexec/mackesd/provision-surface-mok-import-credentials
+COPY packaging/systemd/surface-mok-import-credential.conf /usr/libexec/mackesd/surface-mok-import-credential.conf
 COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
 COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-mesh.toml
 # Virtualization/VDI kernel args (IOMMU + VFIO passthrough + nested virt) baked

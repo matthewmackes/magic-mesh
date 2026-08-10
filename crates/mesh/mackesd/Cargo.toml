@@ -556,6 +556,11 @@ assets = [
     { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
+    # Surface MOK import uses a request-bound pair of already host-encrypted
+    # runtime credentials. This helper/drop-in is inert until explicitly
+    # activated on an admitted Surface Pro 5/6 node.
+    { source = "install-helpers/provision-surface-mok-import-credentials.sh", dest = "/usr/libexec/mackesd/provision-surface-mok-import-credentials", mode = "755" },
+    { source = "packaging/systemd/surface-mok-import-credential.conf", dest = "/usr/libexec/mackesd/surface-mok-import-credential.conf", mode = "644" },
     # WL-FUNC-021 — Music mutations use a dedicated asymmetric credential:
     # only the root DRM shell receives the encrypted seed; mde-musicd reads the
     # derived public key. Keep this helper/drop-in separate from cloud-arm.
