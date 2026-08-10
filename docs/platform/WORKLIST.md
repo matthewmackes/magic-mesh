@@ -760,6 +760,9 @@ behavioral evidence is not completion.
 - Remaining work:
 - **VDI replay expiry:** `.90` passed bounded expired-session cleanup before fresh clipboard admission:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-expiry-r182.md`.
+- **VDI replay retention:** `.90` passed refusal of an older replay after a newer
+  shorter-lived sequence; the lane retains the longest expiry observed:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-retention-r185.md`.
 - **Guest HTML safety checkpoint (2026-08-10):** active guest CF_HTML is refused before host publication; seat 90 passed the exact live-connect regression:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-guest-html-safety-r160.md`.
 - **RDP bitfield admission (2026-08-10):** malformed 40-byte `BI_BITFIELDS` headers are refused before image materialization; `.50` passed live-connect:
@@ -1186,6 +1189,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-failed-service-probe-launch-r164.md`.
 - **Peer-record nofollow:** `.90` passed final-symlink refusal at the record-open boundary:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-peer-record-nofollow-r180.md`.
+- **Manual-store root nofollow:** `.50` passed refusal of a symlinked manual-source store directory:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-manual-store-root-nofollow-r185.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
 - **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card

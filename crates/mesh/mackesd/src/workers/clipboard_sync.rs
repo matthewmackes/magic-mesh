@@ -1091,12 +1091,22 @@ impl ClipboardEnvelopeV2Ledger {
     }
 
     fn record(&mut self, envelope: &ClipboardEnvelopeV2) {
+        let expires_at_ms = self
+            .latest_by_session
+            .get(&envelope.source_session)
+            .map_or(envelope.expires_at_ms, |previous| {
+                previous.expires_at_ms.max(envelope.expires_at_ms)
+            });
         let marker = ClipboardEnvelopeV2ReplayMarker {
             source_node: envelope.source_node.clone(),
             source_seat: envelope.source_seat.clone(),
             source_session: envelope.source_session.clone(),
             sequence: envelope.sequence,
-            expires_at_ms: envelope.expires_at_ms,
+            // A newer sequence is not proof that an older retained envelope
+            // has disappeared. Keep the longest expiry observed for this
+            // source lane so cleanup cannot reopen replay admission while a
+            // still-materializable older payload remains retained.
+            expires_at_ms,
         };
         let replace = self
             .latest_by_session
@@ -3458,6 +3468,40 @@ mod tests {
                 1_700_000_000_001,
             )
             .expect("fresh source session must be admitted after expiry cleanup");
+    }
+
+    #[test]
+    fn v2_replay_lane_keeps_longest_expiry_across_newer_sequences() {
+        let now_ms = 1_700_000_000_000;
+        let mut older = v2_inline(1, &["text/plain"]);
+        older.expires_at_ms = now_ms + 100;
+        let mut newer = v2_inline(2, &["text/plain"]);
+        newer.expires_at_ms = now_ms + 10;
+
+        let mut ledger = ClipboardEnvelopeV2Ledger::default();
+        ledger.record(&older);
+        ledger.record(&newer);
+
+        ledger.cleanup_expired(now_ms + 11);
+        assert_eq!(
+            ledger
+                .latest_by_session
+                .get("session-a")
+                .map(|marker| marker.expires_at_ms),
+            Some(now_ms + 100),
+            "a newer short-lived sequence must not hide an older retained payload"
+        );
+
+        let replay = serde_json::to_vec(&older).expect("encode older replay");
+        assert!(matches!(
+            ledger.admit(&replay, now_ms + 11),
+            Err(ClipboardEnvelopeV2BoundaryError::Admission(
+                ClipboardEnvelopeV2ValidationError::Replay {
+                    previous: 2,
+                    received: 1,
+                }
+            ))
+        ));
     }
 
     #[test]
