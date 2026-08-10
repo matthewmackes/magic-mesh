@@ -26,13 +26,22 @@ tasks.
   tests, farm command and result, and required live/package evidence are recorded
   in docs/platform/evidence/. Missing hardware or provider access is a named
   blocker, not a passing substitute.
+- **Test-seat cap (operator lock 2026-08-10):** no validation, rollout proof,
+  capture, chaos, recovery, or acceptance activity may require or exercise more
+  than three physical test seats. The default release set is Dell, seat 15, and
+  Surface; an epic may substitute another named seat when its hardware is the
+  subject, but must remain at three or fewer. Historical five-seat evidence stays
+  factual but creates no forward five-seat requirement. Lighthouses are not test
+  seats and retain their independently governed three-node quorum proof.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
   never run filler tests.
-- **Rollout lock:** prove the release seat first, then Dell, Eagle, seat 15,
-  T480, Surface, and three lighthouses. Publish the red AI-GENERATED-ALERT and
-  wait five seconds before each seat mutation. Recover failures by re-enrollment
-  and corrected-forward deployment, never rollback.
+- **Rollout lock:** prove each release activity on no more than three selected
+  physical seats and the independently required lighthouses. Wider fleet
+  deployment, when needed, proceeds in separately bounded waves and does not
+  expand the test requirement. Publish the red AI-GENERATED-ALERT and wait five
+  seconds before each seat mutation. Recover failures by re-enrollment and
+  corrected-forward deployment, never rollback.
 - **Story format:** execute stories top-to-bottom. Do not start a story until
   every dependency is green. If a dependency or external resource is absent,
   set the epic to Blocked with the exact missing item; do not invent evidence.
@@ -267,9 +276,9 @@ behavioral evidence is not completion.
      - Objective: exercise cold/warm start, native frame/input/audio/clipboard, remote recovery, container health, stop/restart, suspend/rejoin, reboot, and
        corrected-forward upgrade.
      - Inputs: completed S1-S7 and release revision.
-     - Deliverable: five-seat and three-lighthouse evidence bundle.
+     - Deliverable: at-most-three-seat and three-lighthouse evidence bundle.
      - Depends on: S7, CRIT-006, CRIT-007.
-     - Acceptance: Dell and seat 15 pass first; every required seat and lighthouse rejects unsafe placement and recovers.
+     - Acceptance: Dell and seat 15 pass first; every selected test seat (maximum three) and lighthouse rejects unsafe placement and recovers.
      - Validation: farm release gates plus named live-seat commands.
      - Done when: all required artifacts and limitations are recorded; unresolved hardware keeps Status Remaining.
 - Scope: Owns Workload contracts, reconciler, adapters, readiness, admission, storage, attachment, presentation, provisioning UX, packaging, and integrated proof. Browser
@@ -296,7 +305,7 @@ behavioral evidence is not completion.
 - Problem: CEF/Servo host Browser code, frame copies, helpers, and package seams still compete with the DRM shell and violate the VM-only application boundary.
 - Required outcome: Preserve the old stack with history in matthewmackes/magic-mesh-browser-stack, remove it from magic-mesh, and make Surface::Browser start/resume a
   browser-vm that renders guest Chromium over VDI with focused input and guest-owned chrome.
-- Current state: Standalone CI and the typed Browser path pass; portable import, guest image/audio quality, and five-seat performance proof remain.
+- Current state: Standalone CI and the typed Browser path pass; portable import, guest image/audio quality, and three-seat performance proof remain.
 - **Portable migration checkpoints (2026-08-06):** deterministic allowlist, idempotency, symlink, and secret boundaries passed BigBoy and `.50`:
   `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`, `docs/platform/evidence/WL-ARCH-008-2026-08-09-portable-manifest-identity-r2.md`.
 - **Display1 rollback checkpoint (2026-08-09):** exact XML restoration passed `.90`: `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
@@ -353,7 +362,7 @@ behavioral evidence is not completion.
   6. S6 Prove quality and upgrade behavior.
      - Objective: verify five-tab cadence, damage uploads, navigation latency, guest audio, install/upgrade cleanup, and corrected-forward recovery.
      - Inputs: S1-S5 and release artifacts.
-     - Deliverable: timestamped 15-minute metrics, audio proof, RPM proof, and five-seat captures.
+     - Deliverable: timestamped 15-minute metrics, audio proof, RPM proof, and captures from no more than three selected seats.
      - Depends on: S5, CRIT-006, CRIT-007.
      - Acceptance: >=30 FPS visible target, no unexplained >500ms stall, navigation p95 <=100ms, and no secret/data loss.
      - Validation: farm standalone/magic-mesh gates and live seat commands.
@@ -366,7 +375,9 @@ behavioral evidence is not completion.
   1. Old Browser stack builds from its clean standalone clone and is absent from production magic-mesh.
   2. Browser opens the same guest session over RDP/Sunshine with focused input, audio, clipboard, reconnect, and no host engine.
   3. Five-tab performance, package cleanup, and data migration meet the stated thresholds.
-- Verification method: standalone and root cargo gates, architecture/secret/package gates, and live video/audio/latency captures on named seats; put the longest build on
+- Verification method: standalone and root cargo gates,
+  architecture/secret/package gates, and live video/audio/latency captures on
+  no more than three selected seats; put the longest build on
   BigBoy.
 - Origin or merged source IDs: 2026-07-28 Option 3; archived WL-PERF-003, FUNC-001..004, ARCH-005; browser-perf-native design.
 
@@ -585,7 +596,7 @@ behavioral evidence is not completion.
   1. Registry/spawn drift tests prove exactly one owner for every worker and capability.
   2. Six groups run under budgets with bounded credential-free snapshots and one SQLite writer.
   3. Workers and Action Console are the only node-management surfaces; Health remains a separate modal.
-  4. Fleet chaos and five-seat/three-lighthouse evidence passes.
+  4. Fleet chaos and at-most-three-seat/three-lighthouse evidence passes.
 - Verification method: registry, contract, process/chaos, action-auth, route/render, package, format, and live fleet cargo gates; longest job on BigBoy.
 - Origin or merged source IDs: 2026-08-01 process isolation evaluation; 2026-08-03 Workers merge survey; 2026-08-04 Network Operations directive.
 
@@ -689,7 +700,7 @@ behavioral evidence is not completion.
      - Validation: architecture, secret, supersession, package, and shell gates.
      - Done when: fresh checkout has no retired production route/worker/package.
   8. S8 Prove collaboration release.
-     - Objective: run offline/online, permission, media, transfer, editor, clipboard, migration, recovery, and five-seat live acceptance.
+     - Objective: run offline/online, permission, media, transfer, editor, clipboard, migration, recovery, and at-most-three-seat live acceptance.
      - Inputs: S1-S7, CRIT-006.
      - Deliverable: signed evidence bundle and visual captures.
      - Depends on: S7.
@@ -704,7 +715,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Exactly six primary sections exist and all retired collaboration surfaces are unreachable.
   2. Signed offline replay, real media, CAS transfer, native office, and rich clipboard pass focused hostile tests.
-  3. Five-seat release proof records real providers, partial failures, and corrected-forward recovery.
+  3. Three-seat-maximum release proof records real providers, partial failures, and corrected-forward recovery.
 - Verification method: collab/file/editor/media cargo suites, architecture/secret/package gates, visual captures, and live provider tests; route long jobs to BigBoy.
 - Origin or merged source IDs: NOTIFY-CHAT, EDITOR-*, FILEMGR-*, TEAMS-*, CLIPBOARD-*, VOICE-*; 2026-08-03 Mesh Collaboration survey.
 
@@ -788,7 +799,7 @@ behavioral evidence is not completion.
   5. S5 Integrate UI permissions and release proof.
      - Objective: expose user-visible source/target, approval, progress, and failure without a second clipboard store.
      - Inputs: FUNC-011 suite and UX-009.
-     - Deliverable: UI model, redacted audit rows, package policy, five-seat proof.
+     - Deliverable: UI model, redacted audit rows, package policy, and proof on no more than three seats.
      - Depends on: S2-S4.
      - Acceptance: only approved transfers occur and all limits remain enforced.
      - Validation: shell render, package, and live-seat gates.
@@ -800,7 +811,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Text, HTML, image, file, and typed metadata round-trip or fail with a typed reason.
   2. Secret, replay, flood, stale lease, and unauthorized-peer tests pass.
-  3. Five-seat local/mesh/VDI evidence shows bounded memory and cleanup.
+  3. At-most-three-seat local/mesh/VDI evidence shows bounded memory and cleanup.
 - Verification method: shared, bus, shell, VDI, package, and live cargo gates with explicit farm routing; record exact payload hashes.
 - Origin or merged source IDs: 2026-07-26 operator platform cut; archived clipboard workstreams.
 
@@ -844,8 +855,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
 - **Vehicle audit-truth checkpoint (2026-08-09):** an MG90 reboot reports
   `audited=true` only after its AdminAction row commits; audit failure preserves
-  the applied reboot while returning `audited=false` and a bounded error.
-  BigBoy passed both exact fixtures:
+  the applied reboot while returning `audited=false` and a bounded error. BigBoy passed both exact fixtures:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-vehicle-audit-truth-r8.md`.
 - **Vehicle crash/Bus transaction checkpoint (2026-08-09):** durable reboot
   claims/results prevent duplicate gateway and audit effects, while staged
@@ -991,7 +1001,7 @@ behavioral evidence is not completion.
   10. S10 Integrate Maps/Car, package, document, and prove release behavior.
       - Objective: close the complete Maps/weather/navigation/vehicle/radio slice with reproducible farm and live evidence.
       - Inputs: S1-S9, ARCH-009/010 authority, UX-009/012, CRIT-006/007, package policy, and required hardware/providers.
-      - Deliverable: production wiring and default-on Workstation weather worker; responsive Maps/Car captures; package/service policy; five-seat/MG90/weather evidence;
+      - Deliverable: production wiring and default-on Workstation weather worker; responsive Maps/Car captures; package/service policy; at-most-three-seat/MG90/weather evidence;
         updated `docs/design/platform-interfaces.md` and refreshed `docs/design/maps-live-overlays.md` that describes shipped rather than planned providers.
       - Farm routing: rerun `farm-topology.sh table`; use distinct free slots with mesh contracts on `.90`, focused async workers on `.50`, and the longest
         Maps/shell/full gate on BigBoy `.130`. Run worklist self-test before lint, then doc-supersession and style-leak gates.
@@ -1000,7 +1010,8 @@ behavioral evidence is not completion.
       - Depends on: S5-S9, ARCH-009, ARCH-010, UX-009, UX-012, CRIT-006, CRIT-007.
       - Acceptance: no GUI-owned provider, network I/O, duplicate destination, fabricated data, secret, unbounded cache, stale installed payload, or undocumented live gap;
         missing hardware/provider access is recorded honestly and cannot become a production pass by inference.
-      - Validation: focused cargo gates, full CI gate, package/RPM ownership checks, doc/worklist/style lints, direct-DRM captures, provider traces, and five-seat fleet proof.
+      - Validation: focused cargo gates, full CI gate, package/RPM ownership checks, doc/worklist/style lints, direct-DRM captures,
+        provider traces, and fleet proof on no more than three seats.
       - Done when: one evidence bundle records revision, exact commands/slots/results, source timestamps/attribution, captures, package identity, all live outcomes, and any
         explicit production blocker.
 - Scope: Owns maps, current/forecast weather, live weather layers, weather location preference, taskbar weather projection/deep link, navigation,
@@ -1018,7 +1029,7 @@ behavioral evidence is not completion.
   3. Current weather and 1D/3D/5D forecasts are location-correct, bounded, attributed, fresh-or-explicitly-stale, and honest under partial provider loss.
   4. Radar, alerts, temperature, wind, and cloud cover render from daemon-owned validated data with independent truthful layer state.
   5. The weather icon and temperature sit immediately left of the clock, deep-link to Maps weather mode, degrade responsively, and never alter clock/tray semantics.
-  6. Five-seat and MG90/weather-provider proof covers live/manual/offline/provider-loss/restart/sleep/rejoin and package upgrade.
+  6. At-most-three-seat and MG90/weather-provider proof covers live/manual/offline/provider-loss/restart/sleep/rejoin and package upgrade.
 - Verification method: contract/property, location/persistence, NWS/nowCOAST/IEM parser and worker, route/cache, provider/fault, Maps/shell model/render/navigation,
   accessibility, package, documentation, and live hardware/provider gates with explicit farm slots; BigBoy runs the longest Maps/shell and route suites.
 - Origin or merged source IDs: 2026-07-29 Maps/MG90 review and vehicle/navigation source workstreams; 2026-08-08 operator map-first weather, 1D/3D/5D,
@@ -1092,7 +1103,7 @@ behavioral evidence is not completion.
      - Validation: shell render/navigation tests.
      - Done when: Dark/Light/narrow/largest-text captures pass.
   5. S5 Prove security and release behavior.
-     - Objective: verify sandbox, resource limits, package upgrade, app data persistence, reconnect, and five-seat acceptance.
+     - Objective: verify sandbox, resource limits, package upgrade, app data persistence, reconnect, and acceptance on no more than three seats.
      - Inputs: S1-S4 and CRIT-006/007.
      - Deliverable: signed security/package/live evidence.
      - Depends on: S4.
@@ -1105,7 +1116,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Signed catalog search opens one isolated App VM through typed Workloads.
   2. Readiness, input, audio, persistence, stop, crash, reconnect, and cleanup are truthful.
-  3. Five-seat security and package proof passes without host app installation.
+  3. Three-seat-maximum security and package proof passes without host app installation.
 - Verification method: catalog, image, Workload, shell, package, SELinux, and live VDI cargo gates; BigBoy runs image/build jobs.
 - Origin or merged source IDs: 2026-07-31 Flatpak Front Door decision and archived app-launch workstreams.
 
@@ -1250,7 +1261,7 @@ behavioral evidence is not completion.
      - Validation: authority scan and Workload/action cargo tests on BigBoy.
      - Done when: every card action has a typed reply path.
   5. S5 Prove universal discovery and recovery.
-     - Objective: exercise peer loss/rejoin, stale catalogs, duplicate sources, action failure, reconnect, and five-seat acceptance.
+     - Objective: exercise peer loss/rejoin, stale catalogs, duplicate sources, action failure, reconnect, and acceptance on no more than three seats.
      - Inputs: S1-S4 and CRIT-006/007.
      - Deliverable: catalog/action/live evidence bundle.
      - Depends on: S4.
@@ -1264,7 +1275,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Every supported resource appears once with identity, provenance, freshness, and capabilities.
   2. Every action is typed, authorized, generation-bound, cancellable, and observable.
-  3. Five-seat/lighthouse loss, rejoin, and recovery produce no fabricated resource or side effect.
+  3. At-most-three-seat/lighthouse loss, rejoin, and recovery produce no fabricated resource or side effect.
 - Verification method: schema/adapter/catalog/action cargo suites, authority scans, shell captures, and live fleet proof; use BigBoy for the broad catalog gate.
 - Origin or merged source IDs: Remote Sessions surveys and archived resource/session discovery workstreams.
 
@@ -1330,7 +1341,7 @@ behavioral evidence is not completion.
      - Validation: shell render/authority tests.
      - Done when: responsive captures and refusal states pass.
   5. S5 Prove security, package, and live behavior.
-     - Objective: verify image provenance, SELinux/cgroup/device isolation, audio/input, reconnect, upgrade, and five-seat acceptance.
+     - Objective: verify image provenance, SELinux/cgroup/device isolation, audio/input, reconnect, upgrade, and acceptance on no more than three seats.
      - Inputs: S1-S4 and CRIT-006/007.
      - Deliverable: signed package/security/live evidence.
      - Depends on: S4.
@@ -1452,7 +1463,7 @@ behavioral evidence is not completion.
   New: `evidence/WL-FUNC-021-2026-08-07-peer-roster-canonical-r1.md`, `evidence/WL-FUNC-021-2026-08-07-cast-seek-rollback-r1.md`.
   CPU mitigations are farm-verified; gateway phases pass focused tests; Dell/seat-15 release CPU proof passes.
   `evidence/WL-FUNC-021-2026-08-07-runtime-status-phase-coalescing-r1.md`, `evidence/WL-FUNC-021-2026-08-07-mesh-status-dedupe-r1.md`.
-  Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; five-seat CPU/NWS recovery remains open.
+  Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; three-seat CPU/NWS recovery remains open.
 - **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427`
   completed through `mde-musicd` while a bounded PipeWire default-sink monitor
   captured 26.8 MiB of 48 kHz stereo s32le; 6,287,357/6,717,440 samples were
@@ -1476,7 +1487,7 @@ behavioral evidence is not completion.
 - **Artwork/pagination checkpoint (2026-08-07):** mde-musicd 199/199, mde-music-egui 64/64, shell route 1/1, UI format pass; release-6
   `magic-mesh-12.1.6-6.x86_64` is live on Dell and seat 15 (87,591,150 bytes; SHA-256 `eb9d6194b6a03a835a4b533f124260a39afbdb8297d81da410fdedf45f6d225e`).
   Both live gates pass with `NRestarts=0`; album offsets 0, 100, and 1600 return distinct rows, final 70/`has_more=false`; album/podcast art are local JPEGs.
-  C-SPAN lacks a token; open: renderer, provider-loss, cast, handoff, radio playback, five-seat CPU/NWS.
+  C-SPAN lacks a token; open: renderer, provider-loss, cast, handoff, radio playback, three-seat CPU/NWS.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-music-artwork-release6-r1.md`.
 - **Mutation authorization delivery audit (2026-08-06):** the audit confirms
   that the daemon's legacy HMAC verifier remains fail-closed, while the Music
@@ -1561,7 +1572,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Daemon authority and real mpv frame/audio playback pass hostile and fixture tests.
   2. Library/Jellyfin/cache/bookmark, discovery/cast, handoff, and network-loss flows are typed and bounded.
-  3. Five-seat visual/audio/package evidence proves the shipped release or names blockers.
+  3. At-most-three-seat visual/audio/package evidence proves the shipped release or names blockers.
 - Verification method: use @farm:{cargo test -p mde-musicd}
   @farm:{cargo test -p mde-media-core --features mpv}
   @farm:{cargo test -p mde-media-egui}
@@ -1719,9 +1730,11 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Static tests are strong but one signed release gate does not yet prove CI authority, farm topology, package integrity, five-seat behavior, lighthouses,
+- Problem: Static tests are strong but one signed release gate does not yet prove CI authority, farm topology, package integrity, three-seat behavior, lighthouses,
   recovery, and corrected-forward deployment together.
-- Required outcome: GitHub required checks and farm evidence bind one revision; signed schema-5 evidence proves six-node/five-seat acceptance, package/runtime integrity,
+- Required outcome: GitHub required checks and farm evidence bind one revision;
+  signed schema-5 evidence proves six-node acceptance using exactly three
+  physical test seats plus three lighthouses, package/runtime integrity,
   recovery, and corrected-forward promotion without rollback.
 - Current state: evidence schema/signing, topology, recovery, and live/VDI helpers exist; current release binding, seats, lighthouse convergence, and complete failure
   matrix remain.
@@ -1736,12 +1749,17 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
-- **Explicit release-gate matrix checkpoint (2026-08-09):** one pinned revision
-  now names all 19 required GitHub, farm/package, five-seat, three-lighthouse,
+- **Explicit release-gate matrix checkpoint (2026-08-09):** the historical r9
+  matrix named 19 required GitHub, farm/package, five-seat, three-lighthouse,
   and seven failure/recovery gates; the verifier rejects incomplete, duplicate,
   reordered, optional, or revision-mismatched plans. Machine 196 passed one
   positive and 12 hostile fixtures:
   `docs/platform/evidence/WL-CRIT-006-2026-08-09-release-gate-matrix-r9.md`.
+  The 2026-08-10 operator cap supersedes the five-seat portion: the current
+  matrix must require exactly Dell, seat 15, and Surface, never more than three
+  physical test seats in one activity. The machine-enforced matrix, hostile
+  checks, and collector proof are recorded in
+  `docs/platform/evidence/WL-CRIT-006-2026-08-10-three-seat-acceptance-cap-r12.md`.
 - **Remote provenance execution checkpoint (2026-08-10):** the first F44
   release-30 cut exposed and rejected an `env export` wrapper defect before
   packaging; recipes now execute as one quoted remote Bash program, and `.170`
@@ -1772,13 +1790,13 @@ behavioral evidence is not completion.
      - Validation: full farm cargo/package/secret/architecture gates.
      - Done when: all required checks are green or named blockers are carried.
   4. S4 Run fleet and live-seat acceptance.
-     - Objective: deploy the same revision to release seat, Dell, Eagle, seat 15, T480, Surface, and three lighthouses with alert protocol.
+     - Objective: deploy the same revision to Dell, seat 15, Surface, and three lighthouses with alert protocol; any substitute seat keeps the physical test set at three or fewer.
      - Inputs: S3, enrollment roster, rollout policy.
      - Deliverable: runtime, GUI, network, audio, VDI, and package captures.
      - Depends on: S3.
      - Acceptance: no stale installed payload or missing seat/lighthouse is treated as pass.
      - Validation: named live-seat and lighthouse scripts.
-     - Done when: every matrix row has direct evidence.
+     - Done when: every selected-seat and lighthouse matrix row has direct evidence without exceeding the three-seat cap.
   5. S5 Exercise failure and corrected-forward recovery.
      - Objective: inject process, network, sleep, reboot, provider, package, and peer failures and recover by re-enrollment/corrected forward.
      - Inputs: S4 and CRIT-007.
@@ -1797,7 +1815,7 @@ behavioral evidence is not completion.
      - Done when: decision is reproducible from the evidence bundle.
 - Scope: Owns release gate authority, schema/signing, farm/CI/package/live evidence, topology, rollout, failure injection, and promotion decision. Feature implementation
   remains in its owner epic.
-- Relevant files/components: AI_GOVERNANCE, CI workflow, install-helpers release/evidence/farm scripts, package manifests, docs/platform/evidence, five-seat and
+- Relevant files/components: AI_GOVERNANCE, CI workflow, install-helpers release/evidence/farm scripts, package manifests, docs/platform/evidence, three-seat and
   lighthouse tooling.
 - Dependencies: all P0/P1 feature epics, CRIT-007, and the active repository revision.
 - Acceptance criteria:
@@ -1958,7 +1976,7 @@ behavioral evidence is not completion.
      - Validation: Workload/VDI cargo tests and seat proof.
      - Done when: no duplicate VM/container/session exists.
   4. S4 Prove fleet rollout and corrected forward.
-     - Objective: execute boot/sleep/reboot/upgrade recovery on all seats and lighthouses.
+     - Objective: execute boot/sleep/reboot/upgrade recovery on no more than three selected physical seats per activity and on the required lighthouses.
      - Inputs: S1-S3, CRIT-006.
      - Deliverable: signed recovery matrix.
      - Depends on: S3.
@@ -1972,7 +1990,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Boot, sleep, network transition, reboot, and upgrade restore one authenticated peer/session.
   2. Stale identities, leases, rows, and processes are removed or surfaced as actionable failure.
-  3. All seats/lighthouses have direct recovery evidence.
+  3. Every selected test seat (maximum three) and required lighthouse has direct recovery evidence.
 - Verification method: systemd/shell/Workload cargo gates, farm package checks, fault injection, and live recovery scripts; BigBoy runs the broadest gate.
 - Origin or merged source IDs: operator boot/sleep peer-return bug and archived recovery incidents.
 
@@ -2136,7 +2154,7 @@ behavioral evidence is not completion.
   4. S4 Integrate Workers and fleet proof.
      - Objective: render device-by-type/topology/entity details, conflicts, history, scans, and redacted exports across the fleet.
      - Inputs: S1-S3 and UX-009.
-     - Deliverable: Workers device_inventory view and five-seat/three-lighthouse evidence.
+     - Deliverable: Workers device_inventory view and at-most-three-seat/three-lighthouse evidence.
      - Depends on: S3.
      - Acceptance: stale/failed providers remain visible and export contains no credentials.
      - Validation: shell render, package, and live provider gates.
@@ -2162,7 +2180,7 @@ behavioral evidence is not completion.
 - Problem: taskbar placement, Start/Search, Home, pins, clock/tray, and health entry still diverge from the operator-locked full-width Construct contract.
 - Required outcome: a 48px full-width taskbar supports Bottom/Left placement, icon-only Start/Search/Back/Home, user-managed centered pins, right-side placement control,
   clock/tray semantics, and Bing-wallpaper Home with no second launcher.
-- Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and five-seat proof remain.
+- Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and three-seat proof remain.
 - **Live battery (2026-08-08/09):** the primary UPower percentage/icon is immediately left of the clock in both placements; `.90` passed the two exact source/geometry tests:
   `docs/platform/evidence/WL-UX-012-2026-08-09-live-battery-r13.md`.
 - **Taskbar identity checkpoint (2026-08-09):** connected sessions and pinned desktops now have disjoint typed egui identities and hit regions; BigBoy passed 49/49:
@@ -2200,7 +2218,7 @@ behavioral evidence is not completion.
      - Validation: model/property/render cargo tests.
      - Done when: persistence and deep-link evidence exists.
   4. S4 Prove responsive and release behavior.
-     - Objective: verify Bottom/Left, Dark/Light, large text, lock, multi-display, session switching, package upgrade, and five-seat captures.
+     - Objective: verify Bottom/Left, Dark/Light, large text, lock, multi-display, session switching, package upgrade, and captures on no more than three seats.
      - Inputs: S1-S3, UX-009, CRIT-006/007.
      - Deliverable: deterministic captures and rollout evidence.
      - Depends on: S3.
@@ -2214,8 +2232,8 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Full-width 48px Bottom/Left taskbar and icon-only actions match the lock.
   2. Pins, placement, clock/tray, health deep link, and Home persist and remain bounded.
-  3. Five-seat responsive/package proof passes without a second launcher.
-- Verification method: shell model/render/navigation cargo gates, package checks, and direct-DRM/Sunshine captures on named seats.
+  3. At-most-three-seat responsive/package proof passes without a second launcher.
+- Verification method: shell model/render/navigation cargo gates, package checks, and direct-DRM/Sunshine captures on no more than three selected seats.
 - Origin or merged source IDs: 2026-07-29 taskbar/Home operator lock and archived dock workstreams.
 
 ### WL-UX-013 - System and Mesh Health history and expected-state intelligence
@@ -2229,7 +2247,7 @@ behavioral evidence is not completion.
 - Current state: health contracts, worker, Bus projection, and A-F policy exist;
   the expected-state boundary now covers max-timestamp return and rejects
   oversized availability TTLs. Expected-state publishers, transition
-  evaluation, history/detail, recovery/export, and five-seat proof remain.
+  evaluation, history/detail, recovery/export, and three-seat proof remain.
 - Remaining work:
 - **Expected-state boundary checkpoint (2026-08-06):** the health contract
   suite covers `Sleeping → Returned` at the `u64::MAX` boundary and refuses an
@@ -2330,7 +2348,9 @@ behavioral evidence is not completion.
      - Validation: action-auth/export cargo tests and secret scan.
      - Done when: successful and failed recovery traces exist.
   5. S5 Integrate modal and prove transitions.
-     - Objective: render wide/narrow/largest-text states and test boot/sleep/network/maintenance/outage/rejoin on all seats/lighthouses.
+     - Objective: render wide/narrow/largest-text states and test
+       boot/sleep/network/maintenance/outage/rejoin on no more than three
+       selected physical seats per activity and on the required lighthouses.
      - Inputs: S1-S4, UX-009/012, CRIT-006/007.
      - Deliverable: visual/live evidence bundle.
      - Depends on: S4.
@@ -2345,7 +2365,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Expected absence, outage, stale, rejoin, grade, duration, recurrence, and remediation are deterministic.
   2. Modal history/detail/filter/export and safe recovery are bounded and redacted.
-  3. Five-seat/lighthouse proof shows no false emergency or duplicate authority.
+  3. At-most-three-seat/lighthouse proof shows no false emergency or duplicate authority.
 - Verification method: health/property/fault/UI/package cargo gates, secret scans, and direct transition captures; longest health suite on BigBoy.
 - Origin or merged source IDs: 2026-08-04 System and Mesh Health survey and archived health authority work.
 
@@ -2399,7 +2419,9 @@ behavioral evidence is not completion.
      - Validation: shell render/action/accessibility cargo tests.
      - Done when: every policy state has a capture.
   5. S5 Prove live performance and release.
-     - Objective: exercise all grades, fallback, audio, GPU loss, suspend/resume, lock, immersive, reduced motion, multi-display, package upgrade, and five-seat runtime.
+     - Objective: exercise all grades, fallback, audio, GPU loss,
+       suspend/resume, lock, immersive, reduced motion, multi-display, package
+       upgrade, and runtime on no more than three seats.
      - Inputs: S1-S4 and CRIT-006/007.
      - Deliverable: frames, videos, waveforms, package manifest, and live evidence.
      - Depends on: S4.
@@ -2414,8 +2436,10 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. One ToastHost renders six distinct grades, correct dwell/audio/grouping/ack, and no duplicate authority.
   2. Live/pre-rendered/static tiers preserve semantics across device loss and all responsive/interruption states.
-  3. Asset provenance, package, farm, and five-seat evidence is reproducible.
-- Verification method: health/toast/asset/renderer/accessibility cargo gates, package/license checks, golden/video/waveform captures, and live five-seat proof; BigBoy
+  3. Asset provenance, package, farm, and at-most-three-seat evidence is reproducible.
+- Verification method: health/toast/asset/renderer/accessibility cargo gates,
+  package/license checks, golden/video/waveform captures, and live proof on no
+  more than three seats; BigBoy
   runs the longest renderer job.
 - Origin or merged source IDs: 2026-08-04 cinematic A-F Kiron survey and archived KIRON/toast workstreams.
 
