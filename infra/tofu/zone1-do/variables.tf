@@ -5,13 +5,13 @@ variable "region" {
 }
 
 variable "lighthouse_size" {
-  description = "The only supported thin lighthouse size (1 shared vCPU, 512 MiB RAM, 10 GiB SSD)."
+  description = "The only supported thin lighthouse size (1 shared vCPU, 1 GiB RAM; existing 10 GiB disks may be retained)."
   type        = string
-  default     = "s-1vcpu-512mb-10gb"
+  default     = "s-1vcpu-1gb"
 
   validation {
-    condition     = var.lighthouse_size == "s-1vcpu-512mb-10gb"
-    error_message = "Lighthouses must use the thin s-1vcpu-512mb-10gb profile; media/fileshare and larger variants are retired."
+    condition     = var.lighthouse_size == "s-1vcpu-1gb"
+    error_message = "Lighthouses must use the thin s-1vcpu-1gb profile; media/fileshare and larger variants are retired."
   }
 }
 

@@ -12,7 +12,7 @@ pub fn run(role: String, media: bool) -> anyhow::Result<()> {
         })?;
         // Thin-lighthouse policy: the historical Lighthouse_Media subclass is
         // retired. Reject the capability at the CLI boundary rather than
-        // allowing a day-2 promotion to turn a 512 MiB control-plane node into
+        // allowing a day-2 promotion to turn a 1 GiB control-plane node into
         // a media or file-sharing host.
         if media {
             anyhow::bail!(

@@ -28,7 +28,7 @@ for one mesh (that needs the out-of-scope multi-lighthouse roster work).
 ```sh
 doctl auth init                       # once
 ./install-helpers/do-lighthouse-up.sh acme-mesh \
-    --region nyc3 --size s-1vcpu-512mb-10gb --image fedora-43-x64
+    --region nyc3 --size s-1vcpu-1gb --image fedora-43-x64
 ```
 
 Output ends with a ready-to-paste line:

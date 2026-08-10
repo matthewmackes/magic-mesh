@@ -9,7 +9,7 @@ use crate::*;
 /// The only DigitalOcean lighthouse shape. Keep the CLI gate aligned with the
 /// join helper, Datacenter HCL writer, and Tofu variable validation so an
 /// invalid override cannot mint a bearer before the provisioner rejects it.
-const THIN_LIGHTHOUSE_SIZE: &str = "s-1vcpu-512mb-10gb";
+const THIN_LIGHTHOUSE_SIZE: &str = "s-1vcpu-1gb";
 
 /// SETUP-4/5 — mint a single-use v3 join token for a new peer/lighthouse on
 /// THIS lighthouse. Reads the mesh-id from the local founding bundle and the

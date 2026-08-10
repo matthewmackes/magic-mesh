@@ -1893,6 +1893,15 @@ behavioral evidence is not completion.
 - **T480 lighthouse/restart checkpoint (2026-08-10):** a stale epoch-0 bundle repeatedly regenerated retired lighthouse endpoints; corrected-forward roster repair
   restored all three overlays. The watchdog now restores only missing groups and limits unreachable-overlay Nebula restarts to one per 600 seconds; `.50` passed the
   hostile fixture and T480 held healthy across the timer: `docs/platform/evidence/WL-CRIT-007-2026-08-10-t480-lighthouse-recovery-r106.md`.
+- **Lighthouse quorum-capacity checkpoint (2026-08-10):** all three 512-MiB
+  voters were OOM/swap-starved and continuously lost raft leadership. A
+  one-at-a-time, CPU/RAM-only DigitalOcean resize put every voter at 1 GiB
+  without changing its 10-GB disk, etcd data, membership, or identity. Term
+  5534 then held with all three indexes converged; 25/25 seat overlay paths,
+  every grouped service, fresh publication, and Dell's unchanged Browser VM
+  passed a watchdog hold. Lighthouse `.1` also moved corrected-forward to the
+  signed grouped release 9; `.2`/`.3` package access remains explicit:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-lighthouse-quorum-capacity-r107.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without

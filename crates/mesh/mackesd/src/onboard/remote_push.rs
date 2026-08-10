@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn pin_role_refuses_the_retired_media_lighthouse_role() {
         // Thin-lighthouse policy: the historical OW-11 promotion path must not
-        // be able to turn a 512 MiB control-plane node into a media/fileshare
+        // be able to turn a 1 GiB control-plane node into a media/fileshare
         // host, even when it bypasses the CLI and reaches the local applier.
         let (tmp, applier) = local_applier();
         let err = applier

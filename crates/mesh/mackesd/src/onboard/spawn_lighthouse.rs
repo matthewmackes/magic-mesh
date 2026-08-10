@@ -55,11 +55,11 @@ pub const REPO_BASEURL: &str = "https://matthewmackes.github.io/magic-mesh";
 
 /// Default cloud region for a spawned lighthouse (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_REGION: &str = "nyc3";
-/// Default cloud droplet size (the smallest DO Basic Droplet: 1 shared vCPU,
-/// 512 MiB RAM and 10 GiB SSD). The cloud-init profile is the only supported
+/// Default cloud droplet size (the supported DigitalOcean control-plane floor:
+/// one shared vCPU and 1 GiB RAM). The cloud-init profile is the only supported
 /// lighthouse shape: a thin relay/control-plane node with no media or
 /// file-sharing subclass.
-pub const DEFAULT_CLOUD_SIZE: &str = "s-1vcpu-512mb-10gb";
+pub const DEFAULT_CLOUD_SIZE: &str = "s-1vcpu-1gb";
 /// Default cloud image (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_IMAGE: &str = "fedora-43-x64";
 /// The join-token placeholder the rendered provision spec carries.
@@ -76,7 +76,7 @@ pub enum SpawnTarget {
     Cloud {
         /// DO region slug (e.g. `nyc3`).
         region: String,
-        /// DO droplet size slug (e.g. `s-1vcpu-512mb-10gb`).
+        /// DO droplet size slug (the supported floor is `s-1vcpu-1gb`).
         size: String,
     },
 }
@@ -851,13 +851,15 @@ mod tests {
     }
 
     #[test]
-    fn render_spec_rejects_larger_wire_size_by_normalizing_to_thin_profile() {
-        let spec = render_spec(&SpawnTarget::Cloud {
-            region: "sfo3".to_string(),
-            size: "s-2vcpu-2gb".to_string(),
-        });
-        match spec {
-            ProvisionSpec::CloudInit { size, .. } => assert_eq!(size, DEFAULT_CLOUD_SIZE),
+    fn render_spec_normalizes_unsupported_wire_sizes_to_thin_profile() {
+        for unsupported in ["s-1vcpu-512mb-10gb", "s-2vcpu-2gb"] {
+            let spec = render_spec(&SpawnTarget::Cloud {
+                region: "sfo3".to_string(),
+                size: unsupported.to_string(),
+            });
+            match spec {
+                ProvisionSpec::CloudInit { size, .. } => assert_eq!(size, DEFAULT_CLOUD_SIZE),
+            }
         }
     }
 

@@ -1,14 +1,17 @@
 # DigitalOcean Small Lighthouse
 
-**Status:** design locked 2026-07-23. This is the only supported DigitalOcean
-lighthouse profile: a thin control-plane appliance. Media and file-sharing
-lighthouse classes are retired and must not be provisioned.
+**Status:** design locked 2026-07-23; capacity floor corrected 2026-08-10. This
+is the only supported DigitalOcean lighthouse profile: a thin control-plane
+appliance. Media and file-sharing lighthouse classes are retired and must not
+be provisioned.
 
 ## Decision
 
-Every DigitalOcean lighthouse uses the smallest Basic Droplet that DigitalOcean
-currently publishes: `s-1vcpu-512mb-10gb` (one shared vCPU, 512 MiB RAM and 10
-GiB SSD). The provisioning scripts and the `mackesd onboard spawn-lighthouse`
+Every DigitalOcean lighthouse uses `s-1vcpu-1gb` (one shared vCPU and 1 GiB
+RAM). Existing 10-GiB disks may be retained through a CPU/RAM-only resize. The
+former 512-MiB plan is unsupported: a live three-voter fleet exhausted RAM,
+thrashed swap, triggered OOM kills, and continuously lost raft leadership. The
+provisioning scripts and the `mackesd onboard spawn-lighthouse`
 planner use this slug and reject role promotion or sizing that would create a
 media, file-sharing, or general-purpose lighthouse.
 
@@ -20,7 +23,7 @@ Syncthing/file-sharing helpers and unit files, browser/desktop, virtualization,
 and birthright/optional first-boot payloads. The full `magic-mesh` and
 `magic-mesh-server` packages are not valid DO lighthouse inputs.
 
-The 512 MiB node is a relay/control-plane appliance. It runs Nebula, the local
+The 1 GiB node is a relay/control-plane appliance. It runs Nebula, the local
 etcd voter when it is a full lighthouse, `mackesd`, bounded Caddy ingress, and
 `mesh-health` recovery.
 It does not run a desktop, Navidrome, Netdata, the notification broker,
@@ -53,7 +56,7 @@ service surgery:
 2. serve enrollment on TCP 4243 and HTTPS fallback on TCP 443;
 3. participate as an etcd voter and survive a mackesd restart;
 4. maintain a two-lighthouse roster and reconnect after the peer is restarted;
-5. remain below the 512 MiB host ceiling during a 30-minute join/reconcile soak
+5. remain below the 1 GiB host ceiling during a 30-minute join/reconcile soak
    with no host OOM kill (service-level cgroup pressure is allowed); and
 6. retain at least 1 GiB free disk after bootstrap and bounded logs.
 
@@ -63,6 +66,6 @@ local packaging proof do not pretend to replace that live DigitalOcean gate.
 ## Explicit non-goals
 
 This profile does not promise media serving, file sharing, general-purpose
-workload execution, desktop rendering, or arbitrary peer counts on 512 MiB.
+workload execution, desktop rendering, or arbitrary peer counts on 1 GiB.
 Those duties belong on non-lighthouse nodes; no larger or media lighthouse
 variant is supported.

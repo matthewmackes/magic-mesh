@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # configure-small-lighthouse.sh — apply the supported low-memory lighthouse
-# profile to a DigitalOcean Basic 512 MiB droplet.
+# profile to a DigitalOcean Basic 1 GiB droplet.
 #
-# The smallest Basic Droplet is one shared vCPU, 512 MiB RAM and 10 GiB SSD
-# (currently s-1vcpu-512mb-10gb).  This profile deliberately keeps the node a
+# The supported floor is one shared vCPU, 1 GiB RAM and a 10 GiB preserved disk
+# (s-1vcpu-1gb with CPU/RAM-only sizing).  The former 512 MiB floor OOM/swap-
+# starved a live three-voter quorum.  This profile deliberately keeps the node a
 # relay/control-plane appliance: Nebula, etcd, mackesd and mesh-health remain;
 # GUI, media, Netdata, broker and shell bootstrap work are disabled.  The
 # limits are per-service so a burst cannot take down the whole droplet.
@@ -93,7 +94,7 @@ vm.swappiness=10
 vm.vfs_cache_pressure=50
 CONF
 
-# A 512 MiB droplet has no useful failure mode without emergency swap.  Keep
+# A 1 GiB droplet still needs an emergency package/bootstrap cushion. Keep
 # this idempotent and never replace an operator-provided swap device/file.
 if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q .; then
     if [ ! -e /swapfile ]; then
@@ -134,4 +135,4 @@ systemctl enable nebula.service mackesd.target mesh-health.timer >/dev/null 2>&1
 
 install -m 0644 /dev/null /etc/mackesd/lighthouse-profile
 printf '%s\n' 'small' >/etc/mackesd/lighthouse-profile
-echo "configure-small-lighthouse: profile=small applied (512 MiB / 1 vCPU baseline)"
+echo "configure-small-lighthouse: profile=small applied (1 GiB / 1 vCPU baseline)"

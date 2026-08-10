@@ -1426,7 +1426,7 @@ fi
 # The only package-level hard dependency for the thin appliance.  etcd and
 # Caddy are installed by their bounded, idempotent setup helpers after the
 # overlay has an address; making either a transaction dependency would make a
-# 512 MiB first boot less reliable and would pull optional stacks.
+# 1 GiB first boot less reliable and would pull optional stacks.
 nebula = "*"
 age = "*"
 

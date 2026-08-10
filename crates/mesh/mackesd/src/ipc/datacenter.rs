@@ -15,7 +15,7 @@ use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 /// The only supported DigitalOcean lighthouse shape. Lighthouses are thin
 /// relay/control-plane appliances; callers cannot opt them into a larger or
 /// media/fileshare-capable droplet.
-pub const THIN_LIGHTHOUSE_SIZE: &str = "s-1vcpu-512mb-10gb";
+pub const THIN_LIGHTHOUSE_SIZE: &str = "s-1vcpu-1gb";
 
 /// Authorization node scope for the Datacenter responder. Mutation
 /// targets are the existing resource lock keys, so a capability cannot be
@@ -1442,7 +1442,7 @@ mod tests {
         assert!(hcl.contains("resource \"digitalocean_droplet\" \"lighthouse_lighthouse_04\""));
         assert!(hcl.contains("name     = \"lighthouse-04\""));
         assert!(hcl.contains("region   = \"sfo3\""));
-        assert!(hcl.contains("size     = \"s-1vcpu-512mb-10gb\""));
+        assert!(hcl.contains("size     = \"s-1vcpu-1gb\""));
         assert!(hcl.contains("image    = \"fedora-43-x64\""));
         assert!(hcl.contains("tags     = [\"magic-lighthouse\"]"));
         assert!(hcl.contains("digitalocean_ssh_key.mackes_mesh_claude.id"));
@@ -1463,11 +1463,13 @@ mod tests {
     }
 
     #[test]
-    fn lighthouse_create_resource_rejects_a_larger_profile() {
-        let error =
-            lighthouse_create_resource("lighthouse-04", "sfo3", "s-2vcpu-2gb", "fedora-43-x64")
-                .unwrap_err();
-        assert!(error.contains(THIN_LIGHTHOUSE_SIZE), "{error}");
+    fn lighthouse_create_resource_rejects_noncanonical_profiles() {
+        for unsupported in ["s-1vcpu-512mb-10gb", "s-2vcpu-2gb"] {
+            let error =
+                lighthouse_create_resource("lighthouse-04", "sfo3", unsupported, "fedora-43-x64")
+                    .unwrap_err();
+            assert!(error.contains(THIN_LIGHTHOUSE_SIZE), "{error}");
+        }
     }
 
     #[test]
@@ -1490,7 +1492,7 @@ mod tests {
         assert!(tf.contains("DATACENTER-19"));
         assert!(tf.contains("resource \"digitalocean_droplet\" \"lighthouse_lighthouse_04\""));
         assert!(tf.contains("region   = \"sfo3\""));
-        assert!(tf.contains("size     = \"s-1vcpu-512mb-10gb\""));
+        assert!(tf.contains("size     = \"s-1vcpu-1gb\""));
         assert!(tf.contains("image    = \"fedora-43-x64\""));
 
         // A second create of the SAME name is rejected (no silent overwrite).

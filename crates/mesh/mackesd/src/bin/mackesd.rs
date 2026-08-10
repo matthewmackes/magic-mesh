@@ -1382,7 +1382,7 @@ enum LighthouseCmd {
         /// DigitalOcean region slug (e.g. `nyc3`, `sfo3`, `fra1`).
         #[arg(long)]
         region: String,
-        /// DO droplet size slug (default: the provisioner's `s-1vcpu-512mb-10gb`).
+        /// DO droplet size slug (default: the provisioner's `s-1vcpu-1gb`).
         #[arg(long)]
         size: Option<String>,
         /// DO image slug (default: the provisioner's `fedora-43-x64`).

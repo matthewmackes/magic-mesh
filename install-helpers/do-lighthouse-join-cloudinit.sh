@@ -68,7 +68,7 @@ JOIN_OUT="$(mackesd join "$JOIN_TOKEN" --role lighthouse 2>&1)" \
     || fail "mackesd join failed: $JOIN_OUT"
 echo "$JOIN_OUT"
 
-# Keep the join path on the same 512 MiB control-plane profile as the founding
+# Keep the join path on the same 1 GiB control-plane profile as the founding
 # path.  This runs after join because join pins the role and starts the units.
 "$PROFILE_HELPER" small \
     || fail "could not apply the small lighthouse resource profile"
