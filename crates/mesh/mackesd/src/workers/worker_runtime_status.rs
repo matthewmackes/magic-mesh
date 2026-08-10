@@ -531,9 +531,18 @@ impl WorkerRuntimeSampler {
             .collect::<Vec<_>>();
         let mut admitted_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            match crate::worker_role::worker_contract_for(row.name)
-                .map_err(WorkerRuntimeStatusError::Contract)?
-            {
+            // Match Supervisor::accepts_worker: a few long-lived Worker
+            // implementations expose a kebab-case diagnostic name while the
+            // canonical registry predates it with snake_case. Exact registry
+            // identities still win; only an absent exact row may use the
+            // underscore alias.
+            let mut contract = crate::worker_role::worker_contract_for(row.name)
+                .map_err(WorkerRuntimeStatusError::Contract)?;
+            if contract.is_none() && row.name.contains('-') {
+                contract = crate::worker_role::worker_contract_for(&row.name.replace('-', "_"))
+                    .map_err(WorkerRuntimeStatusError::Contract)?;
+            }
+            match contract {
                 Some(contract) => admitted_rows.push((row, contract)),
                 None => return Err(WorkerRuntimeStatusError::UnregisteredWorker),
             }
@@ -1944,5 +1953,28 @@ mod tests {
             duplicate_node.validate_at(2_500),
             Err(WorkerRuntimeStatusError::NodeSnapshot("workers.duplicate"))
         ));
+    }
+
+    #[test]
+    fn supervisor_sampler_uses_the_supervisors_canonical_kebab_alias() {
+        let statuses = crate::workers::new_status_map();
+        statuses.lock().expect("status map").insert(
+            "nebula-csr-watcher",
+            crate::workers::WorkerStatus {
+                name: "nebula-csr-watcher",
+                alive: true,
+                restarts: 0,
+                breaker_tripped: false,
+                breaker_trips: 0,
+                last_exit_ok: None,
+            },
+        );
+
+        let node = WorkerRuntimeSampler::default()
+            .sample(&statuses, "node-a", 10_000)
+            .expect("a Supervisor-admitted kebab alias must remain publishable");
+        assert_eq!(node.workers.len(), 1);
+        assert_eq!(node.workers[0].contract.worker_id, "nebula_csr_watcher");
+        assert_eq!(node.workers[0].snapshot.worker_id, "nebula_csr_watcher");
     }
 }
