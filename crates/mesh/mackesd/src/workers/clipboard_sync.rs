@@ -1138,9 +1138,16 @@ impl ClipboardSessionIdentityKey {
 /// Bounded, payload-free replay ledger for the collaboration envelope lane.
 /// The complete signed body remains in Bus retention owned by the producer;
 /// this worker keeps only full source identity and its sequence high-water.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollabClipboardEnvelopeV2ReplayMarker {
+    sequence: u64,
+    expires_unix_ms: u64,
+}
+
 #[derive(Debug, Default)]
 struct CollabClipboardEnvelopeV2Ledger {
-    latest_by_identity: BTreeMap<ClipboardSessionIdentityKey, u64>,
+    latest_by_identity:
+        BTreeMap<ClipboardSessionIdentityKey, CollabClipboardEnvelopeV2ReplayMarker>,
 }
 
 impl CollabClipboardEnvelopeV2Ledger {
@@ -1149,6 +1156,7 @@ impl CollabClipboardEnvelopeV2Ledger {
         &mut self,
         persist: &Persist,
         activation_tail: Option<&str>,
+        now_ms: u64,
     ) -> Result<(), String> {
         let messages = persist
             .read_tail(
@@ -1166,9 +1174,20 @@ impl CollabClipboardEnvelopeV2Ledger {
             let Ok(envelope) = CollabClipboardEnvelopeV2::from_json(body) else {
                 continue;
             };
+            if envelope.expires_unix_ms <= now_ms {
+                continue;
+            }
             self.record(&envelope);
         }
         Ok(())
+    }
+
+    /// Release source/session replay authority once no retained envelope for
+    /// that identity can still be materialized. This keeps ended sessions from
+    /// permanently consuming the bounded rich-clipboard intake table.
+    fn cleanup_expired(&mut self, now_ms: u64) {
+        self.latest_by_identity
+            .retain(|_, marker| marker.expires_unix_ms > now_ms);
     }
 
     fn admit(
@@ -1179,7 +1198,10 @@ impl CollabClipboardEnvelopeV2Ledger {
         let envelope = CollabClipboardEnvelopeV2::from_json_bytes(body)
             .map_err(|error| CollabClipboardEnvelopeV2BoundaryError::Decode(error.to_string()))?;
         let key = ClipboardSessionIdentityKey::from_collab_envelope(&envelope);
-        let previous = self.latest_by_identity.get(&key).copied();
+        let previous = self
+            .latest_by_identity
+            .get(&key)
+            .map(|marker| marker.sequence);
         if previous.is_none() && self.latest_by_identity.len() >= MAX_COLLAB_V2_SOURCE_LANES {
             return Err(
                 CollabClipboardEnvelopeV2BoundaryError::LedgerCapacityExceeded {
@@ -1195,13 +1217,19 @@ impl CollabClipboardEnvelopeV2Ledger {
 
     fn record(&mut self, envelope: &CollabClipboardEnvelopeV2) {
         let key = ClipboardSessionIdentityKey::from_collab_envelope(envelope);
-        let sequence = envelope.sequence;
-        if self
-            .latest_by_identity
-            .get(&key)
-            .is_none_or(|previous| sequence > *previous)
-        {
-            self.latest_by_identity.insert(key, sequence);
+        let marker = CollabClipboardEnvelopeV2ReplayMarker {
+            sequence: envelope.sequence,
+            expires_unix_ms: envelope.expires_unix_ms,
+        };
+        match self.latest_by_identity.get_mut(&key) {
+            Some(previous) if marker.sequence > previous.sequence => {
+                previous.sequence = marker.sequence;
+                previous.expires_unix_ms = previous.expires_unix_ms.max(marker.expires_unix_ms);
+            }
+            None => {
+                self.latest_by_identity.insert(key, marker);
+            }
+            Some(_) => {}
         }
     }
 }
@@ -1587,7 +1615,7 @@ impl ClipboardSyncWorker {
         let mut collab_v2_ledger = CollabClipboardEnvelopeV2Ledger::default();
         #[cfg(test)]
         gate(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, 6)?;
-        collab_v2_ledger.seed_from_retained(persist, collab_v2_cursor.as_deref())?;
+        collab_v2_ledger.seed_from_retained(persist, collab_v2_cursor.as_deref(), now_ms)?;
         let mut mesh_replay_ledger = mesh::ClipboardMeshReplayLedger::default();
         #[cfg(test)]
         gate(&mesh_receive_topic, 7)?;
@@ -2317,6 +2345,7 @@ impl ClipboardSyncWorker {
         consent_ledger: &ClipboardSessionConsentLedger,
         now_ms: u64,
     ) -> usize {
+        ledger.cleanup_expired(now_ms);
         let mut materialized = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -3609,9 +3638,114 @@ mod tests {
         assert_eq!(
             ledger
                 .latest_by_identity
-                .get(&ClipboardSessionIdentityKey::from_collab_envelope(&files)),
-            Some(&4),
+                .get(&ClipboardSessionIdentityKey::from_collab_envelope(&files))
+                .map(|marker| marker.sequence),
+            Some(4),
             "only valid admitted metadata advances replay state; echo is rejected intrinsically"
+        );
+    }
+
+    #[test]
+    fn expired_rich_sessions_release_replay_capacity_before_fresh_admission() {
+        let now_ms = CONSENT_AUTH_NOW as u64 + 1;
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let fresh = CollabClipboardEnvelopeV2::new(
+            CollabClipboardClipId::from_uuid(uuid::Uuid::from_u128(0x9_001)),
+            CollabClipboardSourceV2::new(
+                CollabClipboardNodeId::new("node-a").expect("source node"),
+                CollabClipboardSeatId::new("seat-a").expect("source seat"),
+            ),
+            CollabClipboardTargetV2::new(
+                CollabClipboardNodeId::new("eagle").expect("target node"),
+                CollabClipboardSeatId::new("eagle").expect("target seat"),
+            ),
+            CollabClipboardSessionId::from_uuid(uuid::Uuid::from_u128(0x9_002)),
+            1,
+            now_ms,
+            now_ms + 60_000,
+            vec![CollabClipboardMimeOfferV2::inline_text(
+                CollabClipboardMimeKind::TextHtml,
+                "<strong>fresh rich clipboard</strong>",
+            )
+            .expect("valid rich offer")],
+        )
+        .expect("valid fresh rich envelope")
+        .signed(&collab_v2_signing_key());
+        let body = serde_json::to_string(&fresh).expect("encode fresh rich envelope");
+        persist
+            .write(
+                COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish fresh rich envelope");
+        let messages = persist
+            .list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, None)
+            .expect("read fresh rich envelope");
+
+        let mut ledger = CollabClipboardEnvelopeV2Ledger::default();
+        for lane in 0..MAX_COLLAB_V2_SOURCE_LANES {
+            ledger.latest_by_identity.insert(
+                ClipboardSessionIdentityKey {
+                    source_node: format!("expired-node-{lane}"),
+                    source_seat: "seat-a".to_owned(),
+                    source_session: format!("expired-session-{lane}"),
+                },
+                CollabClipboardEnvelopeV2ReplayMarker {
+                    sequence: u64::MAX,
+                    expires_unix_ms: now_ms,
+                },
+            );
+        }
+        let mut consent_ledger = ClipboardSessionConsentLedger::default();
+        consent_ledger
+            .admit(
+                v2_consent(
+                    fresh.source.node.as_str(),
+                    fresh.source.seat.as_str(),
+                    &fresh.session.to_string(),
+                    true,
+                    now_ms,
+                    now_ms + 60_000,
+                ),
+                now_ms,
+            )
+            .expect("admit fresh rich session consent");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_target_node("eagle")
+            .with_target_seat("seat:eagle");
+        let mut cursor = None;
+
+        assert_eq!(
+            worker.process_collab_clipboard_envelopes(
+                &mut persist,
+                messages,
+                &mut cursor,
+                None,
+                &mut ledger,
+                &consent_ledger,
+                now_ms,
+            ),
+            0,
+            "the text-only seat handoff must still refuse an HTML downgrade"
+        );
+        assert!(
+            cursor.is_some(),
+            "the terminal rich refusal is acknowledged"
+        );
+        let fresh_marker = ledger
+            .latest_by_identity
+            .get(&ClipboardSessionIdentityKey::from_collab_envelope(&fresh))
+            .expect("fresh rich session admitted after expired cleanup");
+        assert_eq!(fresh_marker.sequence, 1);
+        assert_eq!(fresh_marker.expires_unix_ms, now_ms + 60_000);
+        assert_eq!(
+            ledger.latest_by_identity.len(),
+            1,
+            "expired session identities must not retain bounded runtime capacity"
         );
     }
 

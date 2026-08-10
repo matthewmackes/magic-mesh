@@ -740,6 +740,8 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **Rich-session replay-capacity checkpoint (2026-08-10):** expired signed collaboration sessions release bounded ledger capacity before fresh intake while newer
+  replay expiry remains monotonic; machine 9 passed the exact regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-rich-session-replay-capacity-r121.md`.
 - **Expired consent capacity checkpoint (2026-08-10):** every clipboard consent sweep removes expired authority before admission, including an empty sweep; machine 193
   passed the exact denial regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-consent-capacity-cleanup-r22.md`.
 - **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks
@@ -1717,7 +1719,7 @@ behavioral evidence is not completion.
      - Depends on: S1-S5, UX-012, FUNC-021, CRIT-006, and CRIT-007.
      - Acceptance: fresh install and upgrade both start deterministically; legacy files are untouched; installed services own the right payload; all live gaps are explicit.
      - Validation: worklist self-test/lint, doc-supersession/style/bus/layer gates, Clock/Music/shell package tests, RPM payload checks, and named live-seat/fleet commands.
-     - Done when: one evidence bundle binds revision, farm hosts/slots/results, direct-DRM captures, audio metrics, package identity, and six-node execution/recovery outcomes.
+     - Done when: one evidence bundle binds revision, farm hosts/slots/results, direct-DRM captures, audio metrics, package identity, and three-seat-plus-lighthouse recovery.
 - Scope: Owns Clock contracts, worker, persistence, World Clock/Alarm/Timer/Stopwatch UX, selected-peer execution, Clock audio seam, clock/bell routing, lock-clock content,
   migration, packaging, documentation, and proof. Music retains catalog/provider/credentials/general playback; Notification Center retains general history; UX-012 retains
   taskbar geometry; health and weather retain their existing authorities.
@@ -1729,9 +1731,9 @@ behavioral evidence is not completion.
   2. Alarms/timers survive restart/reboot/suspend, execute on all selected capable peers, converge global Snooze/Stop, honor local opt-out/blocking, and never ring late delivery.
   3. Bundled/local/Music/podcast/NPR/radio audio is catalog-owned, queue-isolated, bounded, audible, ducked/restored, and falls back within three seconds without raw URLs.
   4. Clock, bell, weather, battery, health, placement, Notification Center, banners, and lock curtain retain distinct truthful actions in Bottom and Left placements.
-  5. Fresh install, non-importing upgrade, package, direct-DRM/audio, and six-node failure/recovery evidence prove the shipped behavior or name an exact blocker.
+  5. Fresh install, non-importing upgrade, package, direct-DRM/audio, and three-seat-plus-lighthouse recovery evidence prove behavior or name an exact blocker.
 - Verification method: contracts on `.90`, worker/store and focused shell tests on `.50`, longest Music/shell/render/fault suites on BigBoy `.130`, then RPM and seat `.15`
-  direct-DRM/physical-audio proof followed by six-node target/rejoin/suspend/reboot/source-loss/acknowledgement acceptance. Use explicit farm host/slot variables.
+  direct-DRM/physical-audio proof followed by acceptance on at most three selected seats and the separately governed lighthouses. Use explicit farm host/slot variables.
 - Origin or merged source IDs: 2026-08-08 Clock Interface 50-question operator survey; AOSP DeskClock reference; existing shell Timers & Alarms implementation; UX-012
   clock/tray, FUNC-017 clock-weather, FUNC-021 Music/radio, Notification Center, and curtain workstreams.
 
