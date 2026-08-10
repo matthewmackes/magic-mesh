@@ -34,13 +34,15 @@ pub mod enable;
 /// tri-state board (Ok/Failed/Degraded + NeedsGesture) across this module's
 /// [`SurfaceProfile`] checklist, plus the compact `state/hardware/surface/<node>`
 /// fleet summary (lock #7). Injectable [`verify::SurfaceProbes`] seam; live
-/// reads integration-gated.
+/// reads use bounded hardware and fixed-argv observation paths, with gestures
+/// and unavailable stacks reported honestly.
 pub mod verify;
 
 /// SURFACE-5 — the fwupd/LVFS firmware panel: list this node's updatable
 /// firmware (current/available versions via `fwupdmgr get-devices`/`get-updates`),
 /// a typed-armed `fw-apply` verb, and a verify re-run after a successful apply
-/// (lock #8). Injectable [`firmware::Fwupd`] seam; live calls integration-gated.
+/// (lock #8). Injectable [`firmware::Fwupd`] seam; the live mutation revalidates
+/// and hashes one exact release before device-scoped local installation.
 pub mod firmware;
 
 /// The five DMI fields the Surface identity fold reads, already

@@ -17,16 +17,17 @@
 //!
 //! **Every reading comes through the injectable [`SurfaceProbes`] seam.**
 //! The production seam ([`LiveSurfaceProbes`]) reads `/sys` / evdev directly
-//! and uses one fixed-argv, bounded libcamera enumeration command (§9 — no
-//! `dmidecode` or shell). Confirmations a headless box genuinely can't make
-//! safely (a camera frame grab, a fingerprint enroll capability) remain
-//! unperformed or return an honest [`ProbeError::IntegrationGated`]
-//! rather than a faked success (§7 — the same discipline
+//! and uses fixed-argv, bounded, read-only libcamera and fprintd inventory
+//! commands (§9 — no `dmidecode` or shell). It never opens a camera capture
+//! stream, reads enrolled-print data, claims a fingerprint device, or starts
+//! enrollment/authentication. The probes verify that each userspace stack can
+//! enumerate a usable device without crossing those privacy boundaries (§7 —
+//! the same discipline
 //! [`super::enable::LiveSurfaceActions`] uses). Interactive-gesture probes
 //! (pen pressure/tilt, S0ix suspend residency) fold to
 //! [`ProbeState::NeedsGesture`] — an honest operator prompt, not a fault.
 //! The pure classification folds (reading → tri-state) are unit-tested with
-//! fixtures; the live reads are integration-gated.
+//! fixtures; the live reads remain environment-dependent integration probes.
 //!
 //! Alongside the full board this unit publishes the **compact
 //! `state/hardware/surface/<node>` summary** (model, enablement %, count of
@@ -39,9 +40,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::surface_hardware::{
-    SURFACE_HARDWARE_SCHEMA_VERSION, SurfaceAvailability, SurfaceFleetSummary,
-    SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration, SurfaceProbeState,
-    SurfaceProbeVerdict, SurfacePublication, SurfaceSubsystem, SurfaceVerifyBoard,
+    SurfaceAvailability, SurfaceFleetSummary, SurfaceModelIdentity, SurfaceObservationSource,
+    SurfaceProGeneration, SurfaceProbeState, SurfaceProbeVerdict, SurfacePublication,
+    SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +61,7 @@ pub enum ProbeState {
     Ok,
     /// Present but not fully healthy — one of several expected signals is
     /// missing (SAM battery readable but thermal not; pen pressure but no
-    /// tilt; a camera enumerated but no frame confirmed).
+    /// tilt; a camera device enumerated but its libcamera pipeline unavailable).
     Degraded,
     /// The subsystem the profile says the model *has* is absent or broken —
     /// honestly red, never a fake green.
@@ -142,13 +143,13 @@ pub struct AccelReading {
     pub vector: Option<[f64; 3]>,
 }
 
-/// The camera reading — device enumerated + whether a frame was captured.
+/// The camera reading — device enumerated + non-capturing pipeline readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CameraReading {
     /// A V4L2 capture device is enumerated.
     pub device_present: bool,
-    /// A frame was actually captured (the live confirmation).
-    pub frame_captured: bool,
+    /// libcamera exposed a capture pipeline. No frame was requested or read.
+    pub pipeline_ready: bool,
 }
 
 /// The Wi-Fi + Bluetooth reading — each radio's up/down state.
@@ -171,13 +172,13 @@ pub struct S0ixReading {
     pub advanced: Option<bool>,
 }
 
-/// The fingerprint reader reading — device present + enroll capability.
+/// The fingerprint reader reading — device present + read-only stack readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FingerprintReading {
     /// A fingerprint device is enumerated.
     pub device_present: bool,
-    /// The device reports it can enroll (driver + stack ready).
-    pub enroll_capable: bool,
+    /// fprintd's manager exposed the device without claiming it.
+    pub stack_ready: bool,
 }
 
 // ─────────────────────────────── the seam ───────────────────────────────────
@@ -223,8 +224,8 @@ impl std::error::Error for ProbeError {}
 ///
 /// # Errors
 ///
-/// Each probe returns [`ProbeError::IntegrationGated`] when the live read is
-/// integration-gated (headless / non-Surface) and [`ProbeError::Failed`] on a
+/// A probe may return [`ProbeError::IntegrationGated`] when its required live
+/// gesture or hardware boundary is unavailable and [`ProbeError::Failed`] on a
 /// concrete read failure; the classification folds turn either into an honest
 /// red cell.
 pub trait SurfaceProbes {
@@ -238,26 +239,23 @@ pub trait SurfaceProbes {
     fn probe_sam(&self) -> Result<SamReading, ProbeError>;
     /// Read the accelerometer's orientation vector.
     fn probe_accelerometer(&self) -> Result<AccelReading, ProbeError>;
-    /// Read the camera (enumeration + a frame capture).
+    /// Read the camera's non-capturing libcamera pipeline capability.
     fn probe_camera(&self) -> Result<CameraReading, ProbeError>;
     /// Read the Wi-Fi + Bluetooth radios' up/down state.
     fn probe_wifi_bt(&self) -> Result<WifiBtReading, ProbeError>;
     /// Read the S0ix residency counter (advancement needs a suspend gesture).
     fn probe_s0ix(&self) -> Result<S0ixReading, ProbeError>;
-    /// Read the fingerprint reader (presence + enroll capability).
+    /// Read the fingerprint reader's non-claiming fprintd capability.
     fn probe_fingerprint(&self) -> Result<FingerprintReading, ProbeError>;
 }
 
 // ─────────────────────────── the production seam ────────────────────────────
 
 /// The production seam. §9-clean: it reads `/sys` / evdev directly and runs
-/// only a fixed-argv, bounded libcamera enumeration (no `dmidecode`/shell).
-///
-/// The confirmations a headless box genuinely can't
-/// make safely — a camera **frame grab** and a fingerprint **enroll
-/// capability** query — return an honest [`ProbeError::IntegrationGated`]
-/// rather than a faked success (lock #5, §7). The presence-style reads are
-/// real; the interactive fields (pen pressure/tilt, S0ix advancement) come
+/// only fixed-argv, bounded, read-only libcamera/fprintd inventory commands
+/// (no `dmidecode`/shell). Camera frame capture and fingerprint claim,
+/// enrollment, verification, and enrolled-print listing are deliberately
+/// absent. The interactive fields (pen pressure/tilt, S0ix advancement) come
 /// back unset so the fold prompts the operator (a gesture), never green.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveSurfaceProbes;
@@ -273,14 +271,20 @@ impl LiveSurfaceProbes {
     const LIBCAMERA_ARGS: [&'static str; 1] = ["--list"];
     const LIBCAMERA_TIMEOUT: Duration = Duration::from_secs(5);
     const LIBCAMERA_OUTPUT_LIMIT: usize = 64 * 1024;
+    const BUSCTL: &'static str = "/usr/bin/busctl";
+    const FPRINT_MANAGER_ARGS: [&'static str; 7] = [
+        "--system",
+        "--timeout=5",
+        "call",
+        "net.reactivated.Fprint",
+        "/net/reactivated/Fprint/Manager",
+        "net.reactivated.Fprint.Manager",
+        "GetDevices",
+    ];
+    const FPRINT_TIMEOUT: Duration = Duration::from_secs(5);
+    const FPRINT_OUTPUT_LIMIT: usize = 16 * 1024;
     /// A representative Intel PMC S0ix residency counter (µs since boot).
     const S0IX_RESIDENCY: &'static str = "/sys/kernel/debug/pmc_core/slp_s0_residency_usec";
-
-    fn gated<T>(probe: impl Into<String>) -> Result<T, ProbeError> {
-        Err(ProbeError::IntegrationGated {
-            probe: probe.into(),
-        })
-    }
 
     /// Read a `/sys` scalar file, trimmed, if present.
     fn scalar(path: &Path) -> Option<String> {
@@ -333,6 +337,26 @@ impl LiveSurfaceProbes {
             detail,
         })
     }
+
+    /// Ask fprintd's read-only Manager.GetDevices method for attached readers.
+    /// This neither claims a reader nor requests enrolled-print information.
+    fn enumerate_fprintd() -> Result<Vec<String>, ProbeError> {
+        let output = run_bounded_command(
+            Self::BUSCTL,
+            &Self::FPRINT_MANAGER_ARGS,
+            Self::FPRINT_TIMEOUT,
+            Self::FPRINT_OUTPUT_LIMIT,
+        )
+        .map_err(|detail| ProbeError::Failed {
+            probe: "fprintd device inventory".to_string(),
+            detail,
+        })?;
+
+        parse_fprintd_devices(&output).map_err(|detail| ProbeError::Failed {
+            probe: "fprintd device inventory".to_string(),
+            detail,
+        })
+    }
 }
 
 /// Run one fixed-argv observation command with bounded wall time and output.
@@ -355,11 +379,11 @@ fn run_bounded_command(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "could not capture libcamera stdout".to_string())?;
+        .ok_or_else(|| format!("could not capture {program} stdout"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "could not capture libcamera stderr".to_string())?;
+        .ok_or_else(|| format!("could not capture {program} stderr"))?;
     let stdout_reader = std::thread::spawn(move || read_bounded(stdout, limit));
     let stderr_reader = std::thread::spawn(move || read_bounded(stderr, limit));
 
@@ -385,12 +409,12 @@ fn run_bounded_command(
 
     let (stdout, stdout_overflow) = stdout_reader
         .join()
-        .map_err(|_| "libcamera stdout reader failed".to_string())?
-        .map_err(|e| format!("could not read libcamera stdout: {e}"))?;
+        .map_err(|_| format!("{program} stdout reader failed"))?
+        .map_err(|e| format!("could not read {program} stdout: {e}"))?;
     let (stderr, stderr_overflow) = stderr_reader
         .join()
-        .map_err(|_| "libcamera stderr reader failed".to_string())?
-        .map_err(|e| format!("could not read libcamera stderr: {e}"))?;
+        .map_err(|_| format!("{program} stderr reader failed"))?
+        .map_err(|e| format!("could not read {program} stderr: {e}"))?;
 
     if stdout_overflow || stderr_overflow {
         return Err(format!("output exceeded {limit} bytes"));
@@ -422,27 +446,103 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>
 /// header and no numbered entries truthfully means no libcamera cameras. Any
 /// unfamiliar output is an error, not an inferred success.
 fn parse_libcamera_list(output: &str) -> Result<bool, String> {
+    if output
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b'\n' && byte != b'\t')
+    {
+        return Err("output contained control characters".to_string());
+    }
     let mut saw_header = false;
-    let mut camera_count = 0usize;
+    let mut camera_indexes = [false; 16];
     for line in output.lines() {
         let trimmed = line.trim();
         if trimmed == "Available cameras:" {
+            if saw_header {
+                return Err("unexpected output (duplicate camera header)".to_string());
+            }
             saw_header = true;
             continue;
         }
         if saw_header {
-            let Some((index, _description)) = trimmed.split_once(':') else {
+            if trimmed.is_empty() {
                 continue;
-            };
-            if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
-                camera_count = camera_count.saturating_add(1);
             }
+            let (index, description) = trimmed
+                .split_once(':')
+                .ok_or_else(|| "unexpected camera row".to_string())?;
+            let index = index
+                .parse::<usize>()
+                .map_err(|_| "invalid camera index".to_string())?;
+            if index >= camera_indexes.len() {
+                return Err("camera index exceeded 15".to_string());
+            }
+            if camera_indexes[index] {
+                return Err("duplicate camera index".to_string());
+            }
+            let description = description.trim();
+            if description.len() > 1024
+                || !description.contains(" (")
+                || !description.ends_with(')')
+            {
+                return Err("malformed camera description".to_string());
+            }
+            camera_indexes[index] = true;
         }
     }
     if !saw_header {
         return Err("unexpected output (missing `Available cameras:` header)".to_string());
     }
-    Ok(camera_count > 0)
+    Ok(camera_indexes.into_iter().any(|seen| seen))
+}
+
+/// Parse `busctl ... Manager.GetDevices` output exactly enough to reject
+/// malformed or injected object paths. The expected shape is `ao N "PATH"…`.
+/// fprintd device object paths contain no biometric or enrollment information.
+fn parse_fprintd_devices(output: &str) -> Result<Vec<String>, String> {
+    const PREFIX: &str = "/net/reactivated/Fprint/Device/";
+    const MAX_DEVICES: usize = 16;
+
+    let body = output.strip_suffix('\n').unwrap_or(output);
+    if body.chars().any(char::is_control) {
+        return Err("output contained control characters".to_string());
+    }
+    let tokens: Vec<_> = body.split_ascii_whitespace().collect();
+    if tokens.len() < 2 || tokens[0] != "ao" {
+        return Err("unexpected output (expected `ao` object-path array)".to_string());
+    }
+    let count = tokens[1]
+        .parse::<usize>()
+        .map_err(|_| "invalid device count".to_string())?;
+    if tokens[1] != count.to_string() {
+        return Err("device count was not canonical decimal".to_string());
+    }
+    if count > MAX_DEVICES {
+        return Err(format!("device count exceeded {MAX_DEVICES}"));
+    }
+    if tokens.len() != count.saturating_add(2) {
+        return Err("device count did not match object paths".to_string());
+    }
+
+    tokens[2..]
+        .iter()
+        .map(|token| {
+            let path = token
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .ok_or_else(|| "object path was not quoted".to_string())?;
+            let suffix = path
+                .strip_prefix(PREFIX)
+                .ok_or_else(|| "object path was outside fprintd device namespace".to_string())?;
+            if suffix.is_empty()
+                || !suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err("object path contained invalid device id".to_string());
+            }
+            Ok(path.to_string())
+        })
+        .collect()
 }
 
 impl SurfaceProbes for LiveSurfaceProbes {
@@ -518,9 +618,10 @@ impl SurfaceProbes for LiveSurfaceProbes {
         // libcamera is the authoritative enumeration path for the IPU3 camera
         // stack used by Surface Pro 5/6. Enumeration has no capture side
         // effect; frame capture remains privacy-gated and is never attempted.
+        let pipeline_ready = Self::enumerate_libcamera()?;
         Ok(CameraReading {
-            device_present: Self::enumerate_libcamera()?,
-            frame_captured: false,
+            device_present: pipeline_ready,
+            pipeline_ready,
         })
     }
 
@@ -554,9 +655,14 @@ impl SurfaceProbes for LiveSurfaceProbes {
     }
 
     fn probe_fingerprint(&self) -> Result<FingerprintReading, ProbeError> {
-        // Enroll capability lives behind the fprint/libfprint userspace stack,
-        // not a §9 sysfs scalar — gate it honestly rather than fake a green.
-        Self::gated("fingerprint enroll capability")
+        // Manager.GetDevices is the narrowest fprintd capability probe: it
+        // discovers libfprint-backed devices without Claim, enrolled-print
+        // listing, enrollment, authentication, or raw biometric data access.
+        let devices = Self::enumerate_fprintd()?;
+        Ok(FingerprintReading {
+            device_present: !devices.is_empty(),
+            stack_ready: !devices.is_empty(),
+        })
     }
 }
 
@@ -724,8 +830,8 @@ pub fn classify_accelerometer(reading: Result<AccelReading, ProbeError>) -> Subs
     SubsystemVerdict::new(Subsystem::RotationAccel, state, reason)
 }
 
-/// Classify the camera reading. A captured frame → green; enumerated but no
-/// frame → degraded; absent → red. (Live gates the frame grab honestly.)
+/// Classify the camera reading. A non-capturing libcamera pipeline → green;
+/// a device without a ready pipeline → degraded; absent → red.
 #[must_use]
 pub fn classify_camera(reading: Result<CameraReading, ProbeError>) -> SubsystemVerdict {
     let r = match reading {
@@ -734,12 +840,15 @@ pub fn classify_camera(reading: Result<CameraReading, ProbeError>) -> SubsystemV
     };
     let (state, reason) = if !r.device_present {
         (ProbeState::Failed, "no camera enumerated".to_string())
-    } else if r.frame_captured {
-        (ProbeState::Ok, "camera captured a frame".to_string())
+    } else if r.pipeline_ready {
+        (
+            ProbeState::Ok,
+            "libcamera pipeline ready (no frame captured)".to_string(),
+        )
     } else {
         (
             ProbeState::Degraded,
-            "camera enumerated but no frame captured".to_string(),
+            "camera enumerated but libcamera pipeline unavailable".to_string(),
         )
     };
     SubsystemVerdict::new(Subsystem::Cameras, state, reason)
@@ -797,9 +906,8 @@ pub fn classify_s0ix(reading: Result<S0ixReading, ProbeError>) -> SubsystemVerdi
     SubsystemVerdict::new(Subsystem::S0ix, state, reason)
 }
 
-/// Classify the fingerprint reading. Present + enroll-capable → green;
-/// present but not capable → degraded; absent → red. (Live gates the
-/// capability query honestly.)
+/// Classify the fingerprint reading. Present through the read-only fprintd
+/// inventory → green; present without a ready stack → degraded; absent → red.
 #[must_use]
 pub fn classify_fingerprint(reading: Result<FingerprintReading, ProbeError>) -> SubsystemVerdict {
     let r = match reading {
@@ -811,15 +919,15 @@ pub fn classify_fingerprint(reading: Result<FingerprintReading, ProbeError>) -> 
             ProbeState::Failed,
             "no fingerprint reader enumerated".to_string(),
         )
-    } else if r.enroll_capable {
+    } else if r.stack_ready {
         (
             ProbeState::Ok,
-            "fingerprint reader ready to enroll".to_string(),
+            "fingerprint reader enumerated through fprintd (not claimed)".to_string(),
         )
     } else {
         (
             ProbeState::Degraded,
-            "fingerprint reader present but not enroll-capable".to_string(),
+            "fingerprint reader present but fprintd stack unavailable".to_string(),
         )
     };
     SubsystemVerdict::new(Subsystem::Fingerprint, state, reason)
@@ -1056,13 +1164,13 @@ pub(crate) fn shared_summary(board: &SurfaceVerifyBoard) -> SurfaceFleetSummary 
 // ─────────────────────────── the Bus worker (per-node) ──────────────────────
 
 #[cfg(feature = "async-services")]
-pub use worker::{SurfaceVerifyWorker, board_topic, summary_topic};
+pub use worker::{board_topic, summary_topic, SurfaceVerifyWorker};
 
 #[cfg(feature = "async-services")]
 mod worker {
     //! The per-node `surface_verify` Bus worker (a *leader-of-self* worker:
     //! it probes only its own hardware, never a remote node). Each tick it
-    //! runs [`super::run_verify`] against the integration-gated
+    //! runs [`super::run_verify`] against the hardware-backed
     //! [`super::LiveSurfaceProbes`], publishes the full board to
     //! [`board_topic`] (SURFACE-6's Test tab), and the compact
     //! [`super::FleetSummary`] to [`summary_topic`] (the fleet rollup, lock
@@ -1074,8 +1182,8 @@ mod worker {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
-    use super::{LiveSurfaceProbes, run_verify, shared_board, shared_summary};
-    use crate::surface::{SurfaceDetection, detect};
+    use super::{run_verify, shared_board, shared_summary, LiveSurfaceProbes};
+    use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Re-verify cadence — the board is fleet-visibility, not hot-path, so a
@@ -1218,7 +1326,7 @@ mod worker {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::surface::{DmiInfo, MS_VENDOR, identify};
+        use crate::surface::{identify, DmiInfo, MS_VENDOR};
         use mackes_mesh_types::surface_hardware::{
             SurfaceFleetSummary, SurfaceProGeneration, SurfaceVerifyBoard,
         };
@@ -1289,7 +1397,7 @@ mod worker {
                     .unwrap();
             assert_eq!(summary.publication.node, "node-a");
             assert_eq!(summary.publication.model.product, "Surface Pro 6");
-            // Live seam is integration-gated headless → nothing fully green,
+            // This non-Surface farm host exposes none of the Pro hardware,
             // so enablement is honestly 0% (never a faked green).
             assert_eq!(summary.enablement_pct, 0);
         }
@@ -1301,7 +1409,7 @@ mod worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::{DmiInfo, MS_VENDOR, identify};
+    use crate::surface::{identify, DmiInfo, MS_VENDOR};
 
     /// A fully scripted fake seam so the folds + board run green without a
     /// machine. Each field drives the matching probe's reading.
@@ -1344,7 +1452,7 @@ mod tests {
                 }),
                 camera: Ok(CameraReading {
                     device_present: true,
-                    frame_captured: true,
+                    pipeline_ready: true,
                 }),
                 wifi_bt: Ok(WifiBtReading {
                     wifi_up: true,
@@ -1356,7 +1464,7 @@ mod tests {
                 }),
                 fingerprint: Ok(FingerprintReading {
                     device_present: true,
-                    enroll_capable: true,
+                    stack_ready: true,
                 }),
             }
         }
@@ -1593,11 +1701,11 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_present_but_incapable_is_degraded() {
+    fn fingerprint_present_but_stack_unavailable_is_degraded() {
         assert_eq!(
             classify_fingerprint(Ok(FingerprintReading {
                 device_present: true,
-                enroll_capable: true
+                stack_ready: true
             }))
             .state,
             ProbeState::Ok
@@ -1605,7 +1713,7 @@ mod tests {
         assert_eq!(
             classify_fingerprint(Ok(FingerprintReading {
                 device_present: true,
-                enroll_capable: false
+                stack_ready: false
             }))
             .state,
             ProbeState::Degraded
@@ -1613,7 +1721,7 @@ mod tests {
         assert_eq!(
             classify_fingerprint(Ok(FingerprintReading {
                 device_present: false,
-                enroll_capable: false
+                stack_ready: false
             }))
             .state,
             ProbeState::Failed
@@ -1632,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn libcamera_enumeration_is_fixed_bounded_and_never_captures() {
+    fn libcamera_capability_probe_is_fixed_bounded_and_never_captures() {
         assert_eq!(LiveSurfaceProbes::LIBCAMERA_CAM, "/usr/bin/cam");
         assert_eq!(LiveSurfaceProbes::LIBCAMERA_ARGS, ["--list"]);
         assert_eq!(LiveSurfaceProbes::LIBCAMERA_TIMEOUT, Duration::from_secs(5));
@@ -1640,10 +1748,75 @@ mod tests {
 
         let verdict = classify_camera(Ok(CameraReading {
             device_present: true,
-            frame_captured: false,
+            pipeline_ready: true,
         }));
-        assert_eq!(verdict.state, ProbeState::Degraded);
+        assert_eq!(verdict.state, ProbeState::Ok);
         assert!(verdict.reason.contains("no frame captured"));
+    }
+
+    #[test]
+    fn libcamera_parser_rejects_hostile_or_ambiguous_rows() {
+        for hostile in [
+            "Available cameras:\n0: no-device-path\n",
+            "Available cameras:\n0: Camera (/one)\n0: Camera (/two)\n",
+            "Available cameras:\n16: Camera (/path)\n",
+            "Available cameras:\ncamera-shaped noise\n",
+            "Available cameras:\nAvailable cameras:\n",
+            "Available cameras:\n0: Camera (/path)\0\n",
+        ] {
+            assert!(
+                parse_libcamera_list(hostile).is_err(),
+                "accepted {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fprintd_inventory_is_fixed_read_only_bounded_and_strictly_parsed() {
+        assert_eq!(LiveSurfaceProbes::BUSCTL, "/usr/bin/busctl");
+        assert_eq!(
+            LiveSurfaceProbes::FPRINT_MANAGER_ARGS,
+            [
+                "--system",
+                "--timeout=5",
+                "call",
+                "net.reactivated.Fprint",
+                "/net/reactivated/Fprint/Manager",
+                "net.reactivated.Fprint.Manager",
+                "GetDevices",
+            ]
+        );
+        assert_eq!(LiveSurfaceProbes::FPRINT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(LiveSurfaceProbes::FPRINT_OUTPUT_LIMIT, 16 * 1024);
+        assert_eq!(parse_fprintd_devices("ao 0\n"), Ok(Vec::new()));
+        assert_eq!(
+            parse_fprintd_devices(
+                "ao 2 \"/net/reactivated/Fprint/Device/0\" \"/net/reactivated/Fprint/Device/reader_1\"\n"
+            ),
+            Ok(vec![
+                "/net/reactivated/Fprint/Device/0".to_string(),
+                "/net/reactivated/Fprint/Device/reader_1".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn fprintd_parser_rejects_hostile_or_inconsistent_inventory() {
+        for hostile in [
+            "ao 1",
+            "ao 0 \"/net/reactivated/Fprint/Device/0\"",
+            "ao 1 \"/not-fprintd/Device/0\"",
+            "ao 1 \"/net/reactivated/Fprint/Device/../Manager\"",
+            "ao 1 \"/net/reactivated/Fprint/Device/0\" trailing",
+            "ao 17 \"/net/reactivated/Fprint/Device/0\"",
+            "ao 01 \"/net/reactivated/Fprint/Device/0\"",
+            "ao 1 \"/net/reactivated/Fprint/Device/0\"\nextra\n",
+        ] {
+            assert!(
+                parse_fprintd_devices(hostile).is_err(),
+                "accepted {hostile:?}"
+            );
+        }
     }
 
     #[test]
@@ -1669,18 +1842,14 @@ mod tests {
         // A clamshell Laptop has no detachable Type Cover → that row must not
         // appear (verify neither probes nor faults it).
         let board = run_verify(&FakeProbes::default(), &detect_of("Surface Laptop 3"));
-        assert!(
-            !board
-                .rows
-                .iter()
-                .any(|r| r.subsystem == Subsystem::TypeCover)
-        );
-        assert!(
-            !board
-                .rows
-                .iter()
-                .any(|r| r.subsystem == Subsystem::RotationAccel)
-        );
+        assert!(!board
+            .rows
+            .iter()
+            .any(|r| r.subsystem == Subsystem::TypeCover));
+        assert!(!board
+            .rows
+            .iter()
+            .any(|r| r.subsystem == Subsystem::RotationAccel));
         // But it DOES claim + probe the fingerprint reader.
         assert_eq!(state_of(&board, Subsystem::Fingerprint), ProbeState::Ok);
     }
@@ -1701,12 +1870,10 @@ mod tests {
             assert_eq!(state_of(&board, s), ProbeState::Ok, "{s:?} should be green");
         }
         // The Pro has IR-face, not a fingerprint reader — not claimed/probed.
-        assert!(
-            !board
-                .rows
-                .iter()
-                .any(|r| r.subsystem == Subsystem::Fingerprint)
-        );
+        assert!(!board
+            .rows
+            .iter()
+            .any(|r| r.subsystem == Subsystem::Fingerprint));
     }
 
     #[test]
@@ -1716,12 +1883,10 @@ mod tests {
             assert_eq!(board.model, product);
             assert!(board.skipped.is_none());
             assert_eq!(state_of(&board, Subsystem::Cameras), ProbeState::Ok);
-            assert!(
-                board
-                    .rows
-                    .iter()
-                    .any(|row| row.subsystem == Subsystem::TypeCover)
-            );
+            assert!(board
+                .rows
+                .iter()
+                .any(|row| row.subsystem == Subsystem::TypeCover));
         }
     }
 
@@ -1848,24 +2013,21 @@ mod tests {
     }
 
     #[test]
-    fn live_probes_are_integration_gated_never_faked_green() {
-        // The production seam must answer honestly headless — the gated
-        // camera + fingerprint fold to red, nothing is a green lie.
+    fn live_probes_are_environment_honest_and_never_request_private_data() {
+        // The production seam must answer honestly headless. Depending on the
+        // farm host, enumeration can be unavailable, empty, or successful.
         let board = run_verify(&LiveSurfaceProbes, &detect_of("Surface Laptop 3"));
         let camera = board
             .rows
             .iter()
             .find(|r| r.subsystem == Subsystem::Cameras)
             .expect("camera row");
-        // Enumeration may fail/return absent (red) or find a libcamera camera
-        // (degraded because capture stays privacy-gated), but never turns green.
-        assert_ne!(camera.state, ProbeState::Ok);
+        assert!(matches!(camera.state, ProbeState::Ok | ProbeState::Failed));
         let fp = board
             .rows
             .iter()
             .find(|r| r.subsystem == Subsystem::Fingerprint)
             .expect("fingerprint row");
-        assert_eq!(fp.state, ProbeState::Failed);
-        assert!(fp.reason.contains("integration-gated"));
+        assert!(matches!(fp.state, ProbeState::Ok | ProbeState::Failed));
     }
 }

@@ -17,16 +17,23 @@ Changed production paths:
 - `crates/mesh/mackes-mesh-types/src/lib.rs`
 - `crates/mesh/mackesd/src/surface/mod.rs`
 - `crates/mesh/mackesd/src/surface/enable.rs`
+- `crates/mesh/mackesd/src/surface/mok_credential.rs`
 - `crates/mesh/mackesd/src/surface/firmware.rs`
 - `crates/mesh/mackesd/src/surface/verify.rs`
 - `crates/desktop/mde-shell-egui/src/surface_card.rs`
+- `crates/shared/mde-egui/src/display.rs`
+- `crates/shared/mde-egui/src/drm.rs`
+- `crates/shared/mde-egui/src/lib.rs`
 - `packaging/bootc/Containerfile`
 - `packaging/bootc/README.md`
 - `packaging/bootc/verify-image.sh`
 - `packaging/surface/README.md`
+- `packaging/surface/surface-build-inputs.f44.json`
 - `packaging/surface/surface-stack.schema.json`
 - `packaging/surface/surface-stack.f44.json`
 - `install-helpers/collect-surface-acceptance.py`
+- `install-helpers/build-surface-userspace-f44.sh`
+- `install-helpers/fetch-surface-build-inputs.sh`
 - `install-helpers/verify-surface-stack.sh`
 - `docs/ops/surface-pro56-acceptance-collection.md`
 
@@ -59,9 +66,12 @@ bounded admission before HMAC validation. The shell publishes only the firmware
 request whose fresh inventory/release/checksum fields are present; Surface
 activation and MOK reboot controls are visibly disabled until the shared
 Preview/Commit/Cancel/Audit authority carries a fresh provider generation.
-Externally published enable requests reach an integration-gated seam and cannot
-retrigger udev or write the platform profile. iptsd presets remain package-owned
-and rotation remains DRM-runner-owned.
+Externally published enable requests still cannot retrigger udev or write the
+platform profile until those changes join the shared staged-control authority.
+iptsd presets remain package-owned and rotation remains DRM-runner-owned. The
+MOK sub-action is narrower: an already-authorized exact request may import only
+the fixed package certificate when matching sealed systemd credentials are
+present; the shell still emits no reboot intent.
 
 Secure Boot and enrolled-key posture use fixed, bounded `mokutil` reads; module
 checks are fixed sysfs reads. Pending MOK proof derives the complete SHA-1
@@ -69,8 +79,10 @@ fingerprint of the fixed DER package certificate in-process with the Rust
 `sha1` crate and compares it with complete bounded `mokutil --list-new`
 fingerprints; malformed, duplicate, truncated, or non-UTF-8 output fails closed.
 SHA-1 is used only as mokutil's certificate identifier, not as a trust primitive.
-MOK import and reboot remain explicitly unavailable until a sealed one-time
-credential broker and typed host-state handoff exist.
+MOK import consumes a sealed permit bound to the node, request id, action-auth
+nonce/expiry, and exact certificate fingerprint, then confirms that fingerprint
+through `mokutil --list-new`. Packaging the short-lived credential provisioner
+and the typed host-state reboot handoff remains open.
 
 The live firmware provider now performs fixed-argv, locale-stable, 20-second
 bounded `fwupdmgr get-devices` and `get-updates` JSON reads, with concurrent
@@ -80,14 +92,19 @@ inventory unavailable; it cannot fabricate an up-to-date result. Firmware apply
 now binds the selected device to a fresh inventory publication timestamp, exact
 release version, and exact lowercase SHA-256. The daemon immediately re-reads
 fwupd inventory and requires the same device/release/checksum tuple before the
-provider seam can run. The live exact-release install seam remains fail-closed
-and reports integration-gated until its mutation argv is implemented.
+provider seam can run. The live seam then binds the exact HTTPS location and
+declared size from the refreshed release, downloads into a private bounded
+stage, verifies the SHA-256 in-process, and invokes only device-scoped
+`fwupdmgr local-install`; broad update, activation, and reboot are never called.
 
-Camera presence now uses fixed `/usr/bin/cam --list` enumeration with a
+Camera capability now uses fixed `/usr/bin/cam --list` enumeration with a
 five-second timeout and 64-KiB caps on both pipes. It never opens a stream or
-captures pixels. Enumerated hardware is therefore degraded until a separate
-privacy-armed frame proof exists; missing, malformed, failed, or oversized
-enumeration is an honest failure.
+captures pixels. A strictly parsed enumerated pipeline is green for the
+non-capturing provider fact, while separate privacy-armed frame proof remains
+open. Fingerprint capability likewise uses only fixed read-only
+`fprintd` `Manager.GetDevices`; it never claims a reader or reads enrolled-print
+data. Missing, malformed, failed, ambiguous, or oversized output remains an
+honest failure.
 
 The verification worker now publishes the shared bounded verify-board and fleet
 summary types directly, and the shell consumes those same types instead of
@@ -127,6 +144,14 @@ an exact Fedora 44 bootc base digest, and required
 kernel/module signer plus certificate bindings. The committed manifest is
 honestly `blocked` with all unavailable immutable values null.
 
+The producer side now has a separate Fedora 44 build-input lock. It binds a
+digest-pinned Fedora 44 builder image and the complete official source set:
+linux-surface packaging, the exact Fedora kernel-ark tag, iptsd, the
+libwacom-surface patch set plus its upstream libwacom archive, surface-control,
+secureboot-mok, and the exact Surface certificate. Every input carries an
+immutable commit/ref, HTTPS URL, filename, SHA-256, and license; the five package
+rows map to their complete ordered input sets. This lock is not RPM readiness.
+
 The build driver now runs that strict verifier before RPM staging, registry
 access, or Podman. A valid blocked manifest exits through
 `GATED[WL-UX-011/surface-provenance]`; malformed provenance is a refusal. If the
@@ -135,6 +160,19 @@ Fedora 44 base digest and install only verified local RPM paths; they do not
 import a mutable network key or resolve unconstrained Surface package names.
 This records rather than silently
 settles the project-wide baseline decision.
+
+The live mutation seams are no longer blanket stubs. Firmware apply now
+re-reads updates, binds one exact device/version/SHA-256/HTTPS location/declared
+size, downloads into a private bounded stage, verifies the cabinet in-process,
+and invokes only device-scoped `fwupdmgr local-install`; it never invokes broad
+update, reboot, or activation. MOK import now consumes a short-lived mde-seal
+permit plus password from two fixed systemd credentials, binds them to the
+node, request, action-auth nonce/expiry, and exact certificate, keeps the secret
+off argv/environment/hashfiles, and proves the exact pending fingerprint after
+`mokutil` returns. The Surface display control now queues a typed request to the
+sole DRM runner, which tears down and rebuilds its existing GBM/EGL session at
+an advertised connector mode, acknowledges only after committed scanout, and
+rebuilds the prior mode on a pre-commit target failure.
 
 On 2026-08-09, a bounded direct request for
 `https://pkg.surfacelinux.com/fedora/f44/repodata/repomd.xml` returned HTTP 404.
@@ -301,6 +339,60 @@ farm slots:
   fixtures; and
 - `172.20.0.50 / surface-final-types-r19`: `bash -n`, `shellcheck`, and JSON
   parsing passed for the changed packaging/verifier inputs.
+- `172.20.0.130 / surface-source-lock-r1`: the new build-input validator
+  rejected 10 hostile fixtures, then fetched all eight locked upstream inputs
+  and revalidated the emitted ten-file bundle with `sha256sum -c`.
+- `172.20.0.130 / surface-userspace-producer-r3`: the governed producer
+  revalidated the exact eight-input bundle, built inside the digest-pinned
+  Fedora 44 image, and emitted hash-checked unsigned
+  `iptsd-3.1.0-1.fc44.x86_64.rpm` plus its source RPM and explicit unsigned
+  build manifest. Two earlier fail-closed iterations exposed and corrected the
+  archive-without-Git-metadata case and deterministic Git date portability.
+  Fedora build dependencies were resolved from the live F44 repositories, so
+  this is hash-bound producer proof, not a hermetic or bit-reproducible claim.
+- Follow-on isolated BigBoy producer runs emitted and hash-checked the exact
+  Fedora 44 unsigned artifact sets for `libwacom-surface` (main, data, devel,
+  utils, and source RPMs), `surface-control` (x86_64 and source RPMs), and
+  `surface-secureboot` (noarch and source RPMs). Each output includes its exact
+  source rows, digest-pinned builder, `signed:false`, installed build-environment
+  RPM inventory, and `SHA256SUMS`; hostile extra-directory and symlink bundle
+  fixtures were refused.
+- `172.20.0.130 / surface-fw-exact-test-r2`: all 36 exact firmware inventory,
+  admission, private-stage, bounded-download, hash/size, and device-scoped
+  local-install tests passed.
+- `172.20.0.90 / surface-mok-hardening-r1`: all 36 Surface enable/MOK tests
+  passed after the sealed credential and exact pending-certificate path landed.
+- `172.20.0.90 / surface-verify-contract-r2`: all 10 DRM display tests and all
+  8 DRM-enabled Surface-card tests passed for request/commit/rollback behavior.
+- `172.20.0.90 / surface-coherent-daemon-r20`: the final synchronized
+  current-tree daemon Surface suite passed all 117 tests, with 4,552 filtered
+  and no failures, including the privacy-preserving camera/fprintd probes.
+- `172.20.0.50 / surface-coherent-shell-r20`: the synchronized DRM-enabled
+  shell Surface-card suite passed all 8 tests, with 1,514 filtered and no
+  failures.
+- `172.20.0.170`: the privacy-preserving camera/fingerprint focused suite
+  passed all 26 verify tests, with 4,643 filtered and no failures; exact-file
+  `rustfmt --check` also passed.
+- `172.20.0.130 / surface-integrate-daemon-r22`: the final synchronized daemon
+  Surface suite passed all 117 tests, with 4,552 filtered and no failures.
+- `172.20.0.90 / surface-integrate-drm-r22`: the complete DRM-enabled shared
+  `mde-egui` library passed all 329 tests.
+- `172.20.0.50 / surface-integrate-shell-r22`: the final synchronized
+  DRM-enabled shell Surface-card suite passed all 8 tests, with 1,514 filtered
+  and no failures.
+- `172.20.0.196 / surface-integrate-fmt-r23`: exact-file `rustfmt --check`
+  passed for all nine changed Rust implementation modules.
+- `172.20.0.170 / surface-integrate-packaging-r23` and
+  `172.20.0.50 / surface-integrate-shellcheck-r23`: Bash syntax, ShellCheck,
+  JSON parsing, the ten-hostile-fixture source-lock self-test, and lock
+  validation passed for the retained producer files.
+
+A proposed secret-bearing kernel producer was rejected during integration and
+removed before commit. Independent review found that it mounted the Secure Boot
+private key into a networked container executing upstream build code and then
+embedded that key in a transient SRPM. It also did not verify the complete
+kernel/module signer set. This checkpoint therefore retains kernel production
+as missing rather than recording a misleading readiness pass.
 
 `git diff --check` passed after the exact formatter wave. These are checkpoint
 gates only: the missing governed Fedora 44 artifacts and live Surface
@@ -308,18 +400,27 @@ credential still prevent image/deployment acceptance.
 
 ## Remaining acceptance work
 
-- Add a narrow credential provider for MOK import, exact pending-certificate
-  staging, and the typed host-state reboot handoff. Implement the live
-  exact-release fwupdmgr mutation behind the now-bound and revalidated request.
-- Add privacy-armed camera frame and fingerprint capability providers, and
-  replace the shell card's headless display controller with real KMS modesets.
-- Build or source the five pinned, signed Fedora 44 linux-surface RPMs and their
-  exact local signing key (the compose now fails closed without them), then
-  compose and deploy the current candidate to the `Surface` Pro 6 seat.
+- Package a privileged provisioner that atomically mints the action token,
+  seals its nonce-bound MOK permit, and injects both fixed systemd credentials
+  inside the 30-second window; add the typed host-state reboot handoff.
+- Run privacy-armed camera frame and fingerprint functional hardware proof; the
+  production inventory probes now verify libcamera/fprintd stack enumeration
+  without capture, claim, enrollment, authentication, or enrolled-print reads.
+  Exercise the new firmware and DRM mutation paths in a recovery-ready Surface
+  hardware window; unit/farm gates deliberately performed no firmware or KMS
+  mutation.
+- Build kernel-surface from the pinned inputs without exposing a signer to
+  networked or upstream build code; sign the kernel and every module in a
+  minimal network-disabled stage, rebuild `surface-secureboot` with the same
+  public certificate, sign the complete RPM set with the project release key,
+  then compose and deploy the current candidate to the `Surface` Pro 6 seat.
+  The existing unsigned userspace/data builds are producer proof only, and the
+  compose still fails closed without the complete governed artifact set.
 - Restore governed SSH/current-release access; the documented key is currently
   rejected on LAN and the overlay path is unavailable. On 2026-08-09 the Pro 6
-  answered LAN ICMP at `172.20.146.79` in 0.346 ms, but rejected both locally
-  configured public-key identities for `root`; `10.42.0.7` did not answer ICMP.
+  repeatedly answered LAN ICMP at `172.20.146.79` (latest 0.443 ms), but
+  rejected the governed key for both `root` and `mm`; `10.42.0.7` did not answer
+  ICMP.
 - Run direct touch, pen, Type Cover, SAM, accelerometer/rotation, camera,
   Wi-Fi/Bluetooth, S0ix, fingerprint, DRM mode, audio, suspend, reboot, and
   upgrade-return proof on Surface Pro 6.

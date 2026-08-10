@@ -17,6 +17,8 @@
 //! dependency and compiles + tests on the headless farm. The Config tab that drives
 //! it (SURFACE-6) reads the queryable [`DisplayController`] state.
 
+use std::sync::{Mutex, OnceLock};
+
 /// A single scanout mode a connector can drive: a resolution + refresh, and whether
 /// it is the connector's **preferred** (native panel) mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +371,14 @@ pub enum ModesetError {
     },
     /// The live KMS `set_crtc`/atomic commit failed on a real seat.
     Kms(String),
+    /// The single DRM owner accepted the request and will acknowledge it after
+    /// rebuilding GBM/EGL and completing the first KMS commit.
+    Pending {
+        /// Process-local request generation.
+        request_id: u64,
+    },
+    /// Another display rebuild or unconsumed acknowledgement is in flight.
+    Busy,
 }
 
 impl std::fmt::Display for ModesetError {
@@ -382,6 +392,10 @@ impl std::fmt::Display for ModesetError {
                 )
             }
             Self::Kms(why) => write!(f, "KMS modeset failed: {why}"),
+            Self::Pending { request_id } => {
+                write!(f, "DRM mode rebuild queued (request {request_id})")
+            }
+            Self::Busy => f.write_str("another DRM mode rebuild is still in flight"),
         }
     }
 }
@@ -397,7 +411,35 @@ pub trait ModesetSeam {
     ///
     /// # Errors
     /// [`ModesetError`] — `NoDrmMaster` headless, `Kms` on a live failure.
-    fn apply(&self, mode: &PanelMode) -> Result<(), ModesetError>;
+    fn apply(&self, mode: &PanelMode) -> Result<ModesetDispatch, ModesetError>;
+
+    /// Poll the acknowledgement for a previously queued request.
+    fn poll(&self, _request_id: u64) -> Option<ModesetAck> {
+        None
+    }
+}
+
+/// Immediate or runner-coordinated modeset admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModesetDispatch {
+    /// A synchronous test/hardware seam completed the change.
+    Applied,
+    /// The single DRM runner accepted the request and must rebuild its render target.
+    Queued {
+        /// Process-local request generation.
+        request_id: u64,
+    },
+}
+
+/// Runner acknowledgement consumed by the requesting controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModesetAck {
+    /// Matching request generation.
+    pub request_id: u64,
+    /// Requested advertised panel mode.
+    pub mode: PanelMode,
+    /// Committed result.
+    pub result: Result<(), String>,
 }
 
 /// The headless seam: every modeset is an honest [`ModesetError::NoDrmMaster`]. This
@@ -407,10 +449,92 @@ pub trait ModesetSeam {
 pub struct HeadlessModeset;
 
 impl ModesetSeam for HeadlessModeset {
-    fn apply(&self, _mode: &PanelMode) -> Result<(), ModesetError> {
+    fn apply(&self, _mode: &PanelMode) -> Result<ModesetDispatch, ModesetError> {
         Err(ModesetError::NoDrmMaster(
             "headless seam — no DRM device present".into(),
         ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunnerModesetRequest {
+    pub request_id: u64,
+    pub mode: PanelMode,
+}
+
+#[derive(Default)]
+struct RunnerModesetState {
+    next_request_id: u64,
+    request: Option<RunnerModesetRequest>,
+    ack: Option<ModesetAck>,
+}
+
+fn runner_modeset_state() -> &'static Mutex<RunnerModesetState> {
+    static STATE: OnceLock<Mutex<RunnerModesetState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(RunnerModesetState::default()))
+}
+
+fn runner_panel_state() -> &'static Mutex<Option<PanelInfo>> {
+    static PANEL: OnceLock<Mutex<Option<PanelInfo>>> = OnceLock::new();
+    PANEL.get_or_init(|| Mutex::new(None))
+}
+
+/// Latest connector-derived inventory from the sole DRM runner.
+#[must_use]
+pub fn runner_panel_info() -> Option<PanelInfo> {
+    runner_panel_state().lock().ok()?.clone()
+}
+
+pub(crate) fn publish_runner_panel(panel: PanelInfo) {
+    if let Ok(mut current) = runner_panel_state().lock() {
+        *current = Some(panel);
+    }
+}
+
+/// Process-local seam into the already-running DRM owner. It never opens a DRM
+/// node; the runner drains the single bounded request after a completed frame.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunnerModeset;
+
+impl ModesetSeam for RunnerModeset {
+    fn apply(&self, mode: &PanelMode) -> Result<ModesetDispatch, ModesetError> {
+        let mut state = runner_modeset_state()
+            .lock()
+            .map_err(|_| ModesetError::Busy)?;
+        if state.request.is_some() || state.ack.is_some() {
+            return Err(ModesetError::Busy);
+        }
+        state.next_request_id = state.next_request_id.saturating_add(1).max(1);
+        let request_id = state.next_request_id;
+        state.request = Some(RunnerModesetRequest {
+            request_id,
+            mode: *mode,
+        });
+        Ok(ModesetDispatch::Queued { request_id })
+    }
+
+    fn poll(&self, request_id: u64) -> Option<ModesetAck> {
+        let mut state = runner_modeset_state().lock().ok()?;
+        (state.ack.as_ref()?.request_id == request_id)
+            .then(|| state.ack.take())
+            .flatten()
+    }
+}
+
+pub(crate) fn take_runner_modeset_request() -> Option<RunnerModesetRequest> {
+    runner_modeset_state().lock().ok()?.request.take()
+}
+
+pub(crate) fn acknowledge_runner_modeset(
+    request: RunnerModesetRequest,
+    result: Result<(), String>,
+) {
+    if let Ok(mut state) = runner_modeset_state().lock() {
+        state.ack = Some(ModesetAck {
+            request_id: request.request_id,
+            mode: request.mode,
+            result,
+        });
     }
 }
 
@@ -424,6 +548,7 @@ pub struct DisplayController {
     active: PanelMode,
     scale_override: Option<f32>,
     seam: Box<dyn ModesetSeam + Send + Sync>,
+    pending: Option<(u64, PanelMode)>,
 }
 
 impl DisplayController {
@@ -437,6 +562,7 @@ impl DisplayController {
             active,
             scale_override: None,
             seam,
+            pending: None,
         }
     }
 
@@ -445,6 +571,34 @@ impl DisplayController {
     #[must_use]
     pub fn headless(panel: PanelInfo) -> Self {
         Self::new(panel, Box::new(HeadlessModeset))
+    }
+
+    /// A controller coordinated with the process's already-running DRM owner.
+    #[must_use]
+    pub fn runner(panel: PanelInfo) -> Self {
+        Self::new(panel, Box::new(RunnerModeset))
+    }
+
+    /// Refresh connector inventory obtained by the DRM owner without replacing
+    /// the modeset seam or an in-flight request.
+    pub fn update_panel(&mut self, panel: PanelInfo) {
+        if self.panel == panel {
+            return;
+        }
+        let active = panel
+            .modes
+            .iter()
+            .find(|mode| {
+                mode.width == self.active.width
+                    && mode.height == self.active.height
+                    && mode.refresh_mhz == self.active.refresh_mhz
+            })
+            .copied()
+            .unwrap_or(panel.native);
+        self.panel = panel;
+        if self.pending.is_none() {
+            self.active = active;
+        }
     }
 
     /// The detected panel (physical size, native mode, full mode list).
@@ -504,7 +658,7 @@ impl DisplayController {
     /// # Errors
     /// [`ModesetError::UnknownMode`] if `target` isn't advertised; whatever the seam
     /// returns otherwise (`NoDrmMaster` headless, `Kms` on a live failure).
-    pub fn set_mode(&mut self, target: &PanelMode) -> Result<(), ModesetError> {
+    pub fn request_mode(&mut self, target: &PanelMode) -> Result<ModesetDispatch, ModesetError> {
         let matched = self.panel.modes.iter().find(|m| {
             m.width == target.width
                 && m.height == target.height
@@ -516,9 +670,36 @@ impl DisplayController {
                 height: target.height,
             });
         };
-        self.seam.apply(&mode)?;
-        self.active = mode;
-        Ok(())
+        let dispatch = self.seam.apply(&mode)?;
+        match dispatch {
+            ModesetDispatch::Applied => self.active = mode,
+            ModesetDispatch::Queued { request_id } => self.pending = Some((request_id, mode)),
+        }
+        Ok(dispatch)
+    }
+
+    /// Compatibility wrapper for synchronous callers. A runner-coordinated
+    /// rebuild returns `Pending` and updates active state only after its ack.
+    pub fn set_mode(&mut self, target: &PanelMode) -> Result<(), ModesetError> {
+        match self.request_mode(target)? {
+            ModesetDispatch::Applied => Ok(()),
+            ModesetDispatch::Queued { request_id } => Err(ModesetError::Pending { request_id }),
+        }
+    }
+
+    /// Drain a runner acknowledgement, committing active state only after KMS
+    /// confirmed the rebuilt target (or retaining the previous mode on rollback).
+    pub fn poll_pending_mode(&mut self) -> Option<Result<PanelMode, ModesetError>> {
+        let (request_id, mode) = self.pending?;
+        let ack = self.seam.poll(request_id)?;
+        self.pending = None;
+        Some(match ack.result {
+            Ok(()) => {
+                self.active = mode;
+                Ok(mode)
+            }
+            Err(reason) => Err(ModesetError::Kms(reason)),
+        })
     }
 
     /// Switch to the best mode of a role (native / HD / other) via the seam — the
@@ -696,9 +877,9 @@ mod tests {
     // Implemented on the Arc so the test can keep a handle to inspect the record
     // after handing a boxed clone to the controller (coherence: the trait is local).
     impl ModesetSeam for std::sync::Arc<RecordingSeam> {
-        fn apply(&self, mode: &PanelMode) -> Result<(), ModesetError> {
+        fn apply(&self, mode: &PanelMode) -> Result<ModesetDispatch, ModesetError> {
             self.applied.lock().expect("lock").push(*mode);
-            Ok(())
+            Ok(ModesetDispatch::Applied)
         }
     }
 
@@ -721,6 +902,46 @@ mod tests {
         assert_eq!(applied.len(), 2, "HD then native = 2 modesets");
         assert_eq!((applied[0].width, applied[0].height), (1920, 1080));
         assert!(applied[1].preferred);
+    }
+
+    #[test]
+    fn runner_modeset_commits_only_after_ack_and_retains_mode_on_failure() {
+        *runner_modeset_state().lock().expect("coordinator lock") = RunnerModesetState::default();
+        let native = PanelMode::new(3000, 2000, 60, true);
+        let hd = PanelMode::new(1920, 1080, 60, false);
+        let panel = PanelInfo::new(native, (260, 173), &[hd]);
+        let mut ctrl = DisplayController::runner(panel);
+
+        let ModesetDispatch::Queued { request_id } =
+            ctrl.request_mode(&hd).expect("runner accepts one request")
+        else {
+            panic!("runner seam must queue, not fake a synchronous commit");
+        };
+        assert_eq!(*ctrl.active_mode(), native);
+        let request = take_runner_modeset_request().expect("runner drains request");
+        assert_eq!(request.request_id, request_id);
+        acknowledge_runner_modeset(request, Ok(()));
+        assert_eq!(ctrl.poll_pending_mode(), Some(Ok(hd)));
+        assert_eq!(*ctrl.active_mode(), hd);
+
+        let ModesetDispatch::Queued { .. } = ctrl
+            .request_mode(&native)
+            .expect("second request accepted after ack consumption")
+        else {
+            panic!("runner seam must queue");
+        };
+        let request = take_runner_modeset_request().expect("runner drains second request");
+        acknowledge_runner_modeset(request, Err("rollback restored HD".into()));
+        assert!(matches!(
+            ctrl.poll_pending_mode(),
+            Some(Err(ModesetError::Kms(_)))
+        ));
+        assert_eq!(
+            *ctrl.active_mode(),
+            hd,
+            "failed request retains last acked mode"
+        );
+        *runner_modeset_state().lock().expect("coordinator lock") = RunnerModesetState::default();
     }
 
     #[test]

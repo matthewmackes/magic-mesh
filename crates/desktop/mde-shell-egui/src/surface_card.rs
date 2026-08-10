@@ -29,8 +29,8 @@
 //!
 //! Every field is the worker's real typed state, rendered as-is: an
 //! integration-gated enable step shows as gated, a `NeedsGesture` probe prompts
-//! the operator, a headless DRM modeset is refused with the honest
-//! [`mde_egui::ModesetError::NoDrmMaster`] — never a faked success. With no Bus
+//! the operator, and a shipped DRM modeset is acknowledged only after the sole
+//! seat runner rebuilt GBM/EGL and committed KMS — never a faked success. With no Bus
 //! (or no Surface) on the box the card simply isn't drawn.
 
 use std::path::{Path, PathBuf};
@@ -38,12 +38,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::surface_hardware::{
-    SURFACE_HARDWARE_SCHEMA_VERSION, SurfaceActionHeader, SurfaceAvailability,
-    SurfaceFirmwareApplyRequest, SurfaceFirmwareInventory, SurfaceFleetSummary, SurfaceProbeState,
-    SurfaceSubsystem, SurfaceVerifyBoard,
+    SurfaceActionHeader, SurfaceAvailability, SurfaceFirmwareApplyRequest,
+    SurfaceFirmwareInventory, SurfaceFleetSummary, SurfaceProbeState, SurfaceSubsystem,
+    SurfaceVerifyBoard, SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 use mde_egui::egui::{self, RichText};
-use mde_egui::{DisplayController, ModeClass, PanelInfo, Style};
+use mde_egui::{DisplayController, ModeClass, ModesetDispatch, PanelInfo, Style};
 use serde::Deserialize;
 
 use mde_bus::hooks::config::Priority;
@@ -391,7 +391,7 @@ impl Default for SurfaceCardState {
             selected_fw: None,
             action_note: None,
             last_error: None,
-            display: probe_panel().map(DisplayController::headless),
+            display: probe_panel().map(production_display_controller),
             modeset_note: None,
             cur_summary: None,
             cur_board: None,
@@ -422,6 +422,17 @@ fn probe_panel() -> Option<PanelInfo> {
         }
     }
     None
+}
+
+fn production_display_controller(panel: PanelInfo) -> DisplayController {
+    #[cfg(feature = "drm")]
+    {
+        DisplayController::runner(panel)
+    }
+    #[cfg(not(feature = "drm"))]
+    {
+        DisplayController::headless(panel)
+    }
 }
 
 impl SurfaceCardState {
@@ -1122,6 +1133,10 @@ impl SurfaceCardState {
     }
 
     fn show_display(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "drm")]
+        if self.display.is_none() {
+            self.display = mde_egui::runner_panel_info().map(DisplayController::runner);
+        }
         let Some(ctrl) = self.display.as_mut() else {
             // No panel EDID readable (headless / farm / windowed): show the live
             // egui scale honestly rather than a fabricated picker.
@@ -1138,6 +1153,21 @@ impl SurfaceCardState {
             );
             return;
         };
+
+        #[cfg(feature = "drm")]
+        if let Some(panel) = mde_egui::runner_panel_info() {
+            ctrl.update_panel(panel);
+        }
+
+        if let Some(ack) = ctrl.poll_pending_mode() {
+            self.modeset_note = Some(match ack {
+                Ok(mode) => format!(
+                    "switched to {}×{} after DRM/GBM/EGL rebuild",
+                    mode.width, mode.height
+                ),
+                Err(error) => error.to_string(),
+            });
+        }
 
         let native = *ctrl.native_mode();
         let active = *ctrl.active_mode();
@@ -1184,10 +1214,16 @@ impl SurfaceCardState {
                     .selectable_label(selected, RichText::new(label).size(Style::SMALL))
                     .clicked()
                 {
-                    match ctrl.set_mode(&mode) {
-                        Ok(()) => {
+                    match ctrl.request_mode(&mode) {
+                        Ok(ModesetDispatch::Applied) => {
                             self.modeset_note =
                                 Some(format!("switched to {}\u{00D7}{}", mode.width, mode.height));
+                        }
+                        Ok(ModesetDispatch::Queued { request_id }) => {
+                            self.modeset_note = Some(format!(
+                                "rebuilding DRM scanout for {}×{} (request {request_id})…",
+                                mode.width, mode.height
+                            ));
                         }
                         // Honest gated state — the headless seam refuses; a real
                         // KMS seat applies (§7 — never faked).
@@ -1405,12 +1441,12 @@ fn read_latest_with<T>(
 mod tests {
     use super::*;
     use mackes_mesh_types::surface_hardware::{
-        MAX_SURFACE_WIRE_BYTES, SurfaceModelIdentity, SurfaceObservationSource,
-        SurfaceProGeneration, SurfaceProbeVerdict, SurfacePublication,
+        SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration, SurfaceProbeVerdict,
+        SurfacePublication, MAX_SURFACE_WIRE_BYTES,
     };
     use mde_bus::persist::Persist;
+    use mde_egui::egui::{pos2, vec2, Rect};
     use mde_egui::PanelMode;
-    use mde_egui::egui::{Rect, pos2, vec2};
 
     const ACTION_NOW_MS: u64 = 1_800_000_000_000;
 
@@ -1677,10 +1713,12 @@ mod tests {
             "\"enablement_pct\":75,\"enablement_pct\":75",
             1,
         );
-        assert!(
-            decode_surface_summary_at(duplicate_summary.as_bytes(), "this-node", ACTION_NOW_MS)
-                .is_none()
-        );
+        assert!(decode_surface_summary_at(
+            duplicate_summary.as_bytes(),
+            "this-node",
+            ACTION_NOW_MS
+        )
+        .is_none());
 
         let oversized = vec![b' '; MAX_SURFACE_WIRE_BYTES + 1];
         assert!(decode_surface_board_at(&oversized, "this-node", ACTION_NOW_MS).is_none());

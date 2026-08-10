@@ -629,6 +629,37 @@ fn panel_from_connector(conn: &connector::Info) -> Option<PanelInfo> {
     Some(PanelInfo::new(native, phys_mm, &raw))
 }
 
+fn select_requested_primary_mode(
+    card: &Card,
+    outputs: &mut [Output],
+    requested: Option<PanelMode>,
+) -> Result<(), DrmError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let primary = outputs
+        .first_mut()
+        .ok_or_else(|| DrmError::NoOutput("no primary output for requested mode".into()))?;
+    let connector = card
+        .get_connector(primary.connector, false)
+        .map_err(|error| DrmError::NoOutput(format!("read primary connector modes: {error}")))?;
+    let Some(mode) = connector.modes().iter().find(|mode| {
+        let candidate = from_drm_mode(mode);
+        candidate.width == requested.width
+            && candidate.height == requested.height
+            && candidate.refresh_mhz == requested.refresh_mhz
+    }) else {
+        return Err(DrmError::NoOutput(format!(
+            "requested mode {}x{} @ {:.3} Hz is no longer advertised",
+            requested.width,
+            requested.height,
+            requested.refresh_hz()
+        )));
+    };
+    primary.mode = *mode;
+    Ok(())
+}
+
 /// libinput device opener for a bare seat (root on a VT). The present loop pumps
 /// egui input from here; on a host with logind a seat manager would mediate fd
 /// access — that path is a follow-up.
@@ -1532,6 +1563,102 @@ pub fn run_drm_with_clipboard_and_display1(
     mut display1: Option<&mut dyn Display1FrameSource>,
     mut ui: impl FnMut(&egui::Context),
 ) -> Result<(), DrmError> {
+    let mut requested_mode = None;
+    let mut applying: Option<(crate::display::RunnerModesetRequest, PanelMode)> = None;
+    let mut rollback: Option<(crate::display::RunnerModesetRequest, String)> = None;
+
+    loop {
+        let startup_ack = applying
+            .map(|(request, _)| SessionStartupAck::Applied(request))
+            .or_else(|| {
+                rollback.as_ref().map(|(request, reason)| {
+                    SessionStartupAck::RolledBack(*request, reason.clone())
+                })
+            });
+        let mut startup_committed = false;
+        let result = run_drm_session(
+            app_id,
+            clipboard,
+            &mut display1,
+            &mut ui,
+            requested_mode,
+            startup_ack,
+            &mut startup_committed,
+        );
+        match result {
+            Ok(DrmSessionExit::Quit) => return Ok(()),
+            Ok(DrmSessionExit::Reconfigure { request, previous }) => {
+                requested_mode = Some(request.mode);
+                applying = Some((request, previous));
+                rollback = None;
+            }
+            Err(error) if applying.is_some() && !startup_committed => {
+                let (request, previous) = applying.take().expect("guarded above");
+                requested_mode = Some(previous);
+                rollback = Some((request, error.to_string()));
+            }
+            Err(error) if rollback.is_some() && !startup_committed => {
+                let (request, apply_error) = rollback.take().expect("guarded above");
+                crate::display::acknowledge_runner_modeset(
+                    request,
+                    Err(format!(
+                        "mode rebuild failed ({apply_error}); rollback also failed ({error})"
+                    )),
+                );
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DrmSessionExit {
+    Quit,
+    Reconfigure {
+        request: crate::display::RunnerModesetRequest,
+        previous: PanelMode,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum SessionStartupAck {
+    Applied(crate::display::RunnerModesetRequest),
+    RolledBack(crate::display::RunnerModesetRequest, String),
+}
+
+fn complete_session_startup_ack(
+    startup_ack: &mut Option<SessionStartupAck>,
+    startup_committed: &mut bool,
+) {
+    let Some(ack) = startup_ack.take() else {
+        return;
+    };
+    match ack {
+        SessionStartupAck::Applied(request) => {
+            crate::display::acknowledge_runner_modeset(request, Ok(()));
+        }
+        SessionStartupAck::RolledBack(request, reason) => {
+            crate::display::acknowledge_runner_modeset(
+                request,
+                Err(format!(
+                    "mode rebuild failed ({reason}); previous mode restored"
+                )),
+            );
+        }
+    }
+    *startup_committed = true;
+}
+
+fn run_drm_session(
+    app_id: &str,
+    clipboard: &mut dyn crate::RichClipboardClient,
+    display1: &mut Option<&mut dyn Display1FrameSource>,
+    ui: &mut impl FnMut(&egui::Context),
+    requested_mode: Option<PanelMode>,
+    mut startup_ack: Option<SessionStartupAck>,
+    startup_committed: &mut bool,
+) -> Result<DrmSessionExit, DrmError> {
     let (_node, file) = open_primary_node()?;
     let card = Card(file);
     // Enumerate every connected head (E12-18 multi-CRTC). The primary drives the
@@ -1540,7 +1667,8 @@ pub fn run_drm_with_clipboard_and_display1(
     // Heterogeneous heads (different modes / a distinct VM texture per head — the
     // two-monitors-two-VMs demo) are the hardware-gated drive E12-19 does with the
     // same [`set_layout`] primitive over per-head framebuffers + atomic commits.
-    let resolved = resolve_outputs(&card)?;
+    let mut resolved = resolve_outputs(&card)?;
+    select_requested_primary_mode(&card, &mut resolved, requested_mode)?;
     let primary_size = resolved[0].mode.size();
     let heads: Vec<Output> = {
         let mut it = resolved.into_iter();
@@ -1739,11 +1867,14 @@ pub fn run_drm_with_clipboard_and_display1(
     // — its headless arm returns an honest gated error and the running loop's live
     // surface-rebuild switch is the hardware-gated follow-up, so the seat starts at
     // native (no faked hot-switch). `gbm` also speaks KMS, so it reads the connector.
-    let native_ppp = gbm
+    let runner_panel = gbm
         .get_connector(heads[0].connector, false)
         .ok()
-        .and_then(|conn| panel_from_connector(&conn))
-        .map_or(1.0, |panel| panel.scale());
+        .and_then(|conn| panel_from_connector(&conn));
+    if let Some(panel) = runner_panel.clone() {
+        crate::display::publish_runner_panel(panel);
+    }
+    let native_ppp = runner_panel.map_or(1.0, |panel| panel.scale());
     if (native_ppp - 1.0).abs() > f32::EPSILON {
         egui_ctx.set_pixels_per_point(native_ppp);
     }
@@ -1798,6 +1929,7 @@ pub fn run_drm_with_clipboard_and_display1(
     // held-still finger's long-press still fires (`gestures.tick`) with no new events.
     let mut touch_active: u32 = 0;
     let mut quit = false;
+    let mut session_exit = DrmSessionExit::Quit;
     // Esc is a normal key on a shipped desktop — it must NEVER tear the seat down
     // (any dialog/field owns it). Quitting the DRM session on Esc is a dev-only
     // escape hatch, opt-in via `MDE_DRM_ESC_QUIT`; production leaves it unset so the
@@ -2415,7 +2547,7 @@ pub fn run_drm_with_clipboard_and_display1(
         // polled only after rendering so the UI loop never performs blocking
         // backend work, and every imported FD is retained through the KMS
         // completion boundary.
-        let display1_state = poll_display1_or_cleanup(&mut display1, Instant::now(), || {
+        let display1_state = poll_display1_or_cleanup(display1, Instant::now(), || {
             clear_external_scanout(&gbm, &mut external_scanout)
         })?;
         match display1_state {
@@ -2438,15 +2570,26 @@ pub fn run_drm_with_clipboard_and_display1(
                     let _ = clear_external_scanout(&gbm, &mut external_scanout);
                     return Err(error);
                 }
-                if let Err(error) = acknowledge_display1_present(&mut display1) {
+                if let Err(error) = acknowledge_display1_present(display1) {
                     let _ = clear_external_scanout(&gbm, &mut external_scanout);
                     return Err(error);
+                }
+                complete_session_startup_ack(&mut startup_ack, startup_committed);
+                if let Some(request) = crate::display::take_runner_modeset_request() {
+                    let previous = from_drm_mode(&heads[0].mode);
+                    session_exit = DrmSessionExit::Reconfigure { request, previous };
+                    break;
                 }
                 continue;
             }
             Some(Display1FramePoll::Idle) if external_scanout.is_some() => {
                 // The last native frame is still valid. Do not lock a GBM BO
                 // or replace it merely because egui repainted internally.
+                if let Some(request) = crate::display::take_runner_modeset_request() {
+                    let previous = from_drm_mode(&heads[0].mode);
+                    session_exit = DrmSessionExit::Reconfigure { request, previous };
+                    break;
+                }
                 continue;
             }
             Some(Display1FramePoll::Disconnected) => {
@@ -2498,6 +2641,7 @@ pub fn run_drm_with_clipboard_and_display1(
             // Single-head → one set_crtc at the origin, identical to before.
             let fbs = vec![fb; heads.len()];
             set_layout(&gbm, &heads, &fbs)?;
+            complete_session_startup_ack(&mut startup_ack, startup_committed);
         } else {
             // Flip every head to the new front buffer, then drain one PageFlip
             // completion per head before recycling buffers (vblank sync).
@@ -2524,19 +2668,44 @@ pub fn run_drm_with_clipboard_and_display1(
             drop(prev_bo);
         }
         prev = Some(bo);
+
+        if let Some(request) = crate::display::take_runner_modeset_request() {
+            let previous = from_drm_mode(&heads[0].mode);
+            // Returning drops the current EGL window surface, GBM scanout
+            // surface, framebuffer cache, and DRM master in dependency order.
+            // The outer coordinator then reconstructs all of them for the new
+            // mode; it never opens a competing master.
+            session_exit = DrmSessionExit::Reconfigure { request, previous };
+            break;
+        }
     }
 
     // teardown (best-effort; the OS reclaims the rest on exit)
     if let Some(bo) = prev.take() {
         drop(bo);
     }
-    clear_external_scanout(&gbm, &mut external_scanout)?;
+    if let Err(error) = clear_external_scanout(&gbm, &mut external_scanout) {
+        if let DrmSessionExit::Reconfigure { request, .. } = &session_exit {
+            crate::display::acknowledge_runner_modeset(
+                *request,
+                Err(format!("mode rebuild teardown failed ({error})")),
+            );
+        }
+        return Err(error);
+    }
     // Destroy the framebuffers cached across the surface's buffer-object ring (perf-1).
     for (_, fb) in fb_cache {
         let _ = gbm.destroy_framebuffer(fb);
     }
     painter.destroy();
-    Ok(())
+    // A mode change restarts this session in-process. Release EGL in strict
+    // child-to-parent order before the GBM surface/device and DRM fd drop, so
+    // the next session cannot inherit a window surface tied to the old mode.
+    let _ = egl.make_current(display, None, None, None);
+    let _ = egl.destroy_surface(display, surface);
+    let _ = egl.destroy_context(display, context);
+    let _ = egl.terminate(display);
+    Ok(session_exit)
 }
 
 // ── MEDIA-2: the live overlay video-plane wiring (hardware-gated) ─────────────

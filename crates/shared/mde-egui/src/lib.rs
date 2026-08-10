@@ -67,9 +67,9 @@ pub use clipboard::{
 };
 pub use code::CodeToken;
 pub use display::{
-    build_mode_list, fractional_scale, panel_dpi, parse_edid, scale_for_panel, select_mode,
-    DisplayController, EdidError, EdidPanel, HeadlessModeset, ModeClass, ModesetError, ModesetSeam,
-    PanelInfo, PanelMode,
+    build_mode_list, fractional_scale, panel_dpi, parse_edid, runner_panel_info, scale_for_panel,
+    select_mode, DisplayController, EdidError, EdidPanel, HeadlessModeset, ModeClass, ModesetAck,
+    ModesetDispatch, ModesetError, ModesetSeam, PanelInfo, PanelMode, RunnerModeset,
 };
 pub use formfactor::{
     apply_rotation, drain_formfactor, orientation_from_accel, push_formfactor, request_rotation,

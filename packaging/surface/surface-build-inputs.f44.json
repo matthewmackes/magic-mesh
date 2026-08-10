@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "kind": "mcnf-surface-build-inputs",
+  "target": { "os": "fedora", "release": 44, "arch": "x86_64" },
+  "builder_image": "registry.fedoraproject.org/fedora@sha256:7fe670b1256501fbcbcccdef586bbcb9cb93d5737a341aa562c070853e08be52",
+  "inputs": [
+    {
+      "id": "linux-surface",
+      "filename": "linux-surface-4cbbe2ed574d7ec3384c611fba32fad3bf7b6ee8.tar.gz",
+      "url": "https://github.com/linux-surface/linux-surface/archive/4cbbe2ed574d7ec3384c611fba32fad3bf7b6ee8.tar.gz",
+      "ref": "refs/tags/fedora-43-6.19.8-3",
+      "commit": "4cbbe2ed574d7ec3384c611fba32fad3bf7b6ee8",
+      "sha256": "55541a9f9853aa1faf0cf3d20a460349fc60904287a56d8d18fd52e89bc87a87",
+      "license": "GPL-2.0-only"
+    },
+    {
+      "id": "kernel-ark",
+      "filename": "kernel-ark-5667f6c208ffa2e194324516a44ebc149b20041e.tar.gz",
+      "url": "https://gitlab.com/cki-project/kernel-ark/-/archive/5667f6c208ffa2e194324516a44ebc149b20041e/kernel-ark-5667f6c208ffa2e194324516a44ebc149b20041e.tar.gz",
+      "ref": "refs/tags/kernel-6.19.8-0",
+      "commit": "5667f6c208ffa2e194324516a44ebc149b20041e",
+      "sha256": "6ed6f3775ec173ba97f726c7b6899ad7da22d2c1bf3e840cae14689887482c46",
+      "license": "GPL-2.0-only"
+    },
+    {
+      "id": "iptsd",
+      "filename": "iptsd-a83bc1232f7096f8b33b50fdbda249cd640de670.tar.gz",
+      "url": "https://github.com/linux-surface/iptsd/archive/a83bc1232f7096f8b33b50fdbda249cd640de670.tar.gz",
+      "ref": "refs/tags/v3.1.0",
+      "commit": "a83bc1232f7096f8b33b50fdbda249cd640de670",
+      "sha256": "af64f692c01be4d0c64b8c2f13e4409146184b01668bfc4d76ceb77ab63fb3a8",
+      "license": "GPL-2.0-or-later"
+    },
+    {
+      "id": "libwacom-surface",
+      "filename": "libwacom-surface-3ba6d71825ba64b03a8b6ddbffbdfa06bb573b97.tar.gz",
+      "url": "https://github.com/linux-surface/libwacom-surface/archive/3ba6d71825ba64b03a8b6ddbffbdfa06bb573b97.tar.gz",
+      "ref": "refs/tags/v2.17.0-1",
+      "commit": "3ba6d71825ba64b03a8b6ddbffbdfa06bb573b97",
+      "sha256": "e3d5993ef79a67b444c82bfdb21aaed673a5c90ae1a596873e4c2250e845d560",
+      "license": "MIT"
+    },
+    {
+      "id": "libwacom-upstream",
+      "filename": "libwacom-2.17.0.tar.xz",
+      "url": "https://github.com/linuxwacom/libwacom/releases/download/libwacom-2.17.0/libwacom-2.17.0.tar.xz",
+      "ref": "refs/tags/libwacom-2.17.0",
+      "commit": "17d546f0cdbb4216d7c86697f498de4ca396e501",
+      "sha256": "41a0f239841567b101904df8ced81e1e0115334ccfd82a024412aa0903dae5a7",
+      "license": "MIT"
+    },
+    {
+      "id": "surface-control",
+      "filename": "surface-control-33d5bee2dd00e7bb57bacee983ce4dd4bf608657.tar.gz",
+      "url": "https://github.com/linux-surface/surface-control/archive/33d5bee2dd00e7bb57bacee983ce4dd4bf608657.tar.gz",
+      "ref": "refs/tags/v0.5.0-1",
+      "commit": "33d5bee2dd00e7bb57bacee983ce4dd4bf608657",
+      "sha256": "b968839ccc31c8e8f065d02b06ecb929f912072d98195c41e0036d03875bdd30",
+      "license": "MIT"
+    },
+    {
+      "id": "secureboot-mok",
+      "filename": "secureboot-mok-824c91a894eb4abc26d79303ad7080c1daae1600.tar.gz",
+      "url": "https://github.com/linux-surface/secureboot-mok/archive/824c91a894eb4abc26d79303ad7080c1daae1600.tar.gz",
+      "ref": "refs/tags/20251230-1",
+      "commit": "824c91a894eb4abc26d79303ad7080c1daae1600",
+      "sha256": "7706a0537e5354f3b994de705fc3f5b69ca31ffe12317f65811e9c753efd429b",
+      "license": "GPL-2.0-or-later"
+    },
+    {
+      "id": "surface-certificate",
+      "filename": "surface.cer",
+      "url": "https://raw.githubusercontent.com/linux-surface/linux-surface/d8887bc8ce14a47d5b9d45f6697f05d53e43fe9a/pkg/keys/surface.crt",
+      "ref": "d8887bc8ce14a47d5b9d45f6697f05d53e43fe9a:pkg/keys/surface.crt",
+      "commit": "d8887bc8ce14a47d5b9d45f6697f05d53e43fe9a",
+      "sha256": "362f021b5f8da1a0a6c377d16b005d34701d1879de67b4293d8cbd4859f16b5b",
+      "license": "LicenseRef-linux-surface-certificate"
+    }
+  ],
+  "packages": [
+    { "name": "kernel-surface", "input_ids": ["linux-surface", "kernel-ark", "surface-certificate"] },
+    { "name": "iptsd", "input_ids": ["iptsd"] },
+    { "name": "libwacom-surface", "input_ids": ["libwacom-surface", "libwacom-upstream"] },
+    { "name": "surface-control", "input_ids": ["surface-control"] },
+    { "name": "surface-secureboot", "input_ids": ["secureboot-mok", "surface-certificate"] }
+  ]
+}

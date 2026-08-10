@@ -20,13 +20,17 @@
 //! **Everything that touches the machine sits behind the injectable
 //! [`SurfaceActions`] seam.** The production seam ([`LiveSurfaceActions`])
 //! uses fixed binaries, fixed paths, and bounded subprocesses for read-only
-//! classification while every activation write remains integration-gated.
+//! classification. Profile activation/config writes remain integration-gated;
+//! MOK import uses a request-bound sealed systemd credential and proves the
+//! fixed certificate is pending afterward.
 //! Pending enrollment is proven in-process by
 //! matching the fixed package certificate's complete SHA-1 fingerprint against
 //! `mokutil --list-new`; SHA-1 is used only because that is the exact identifier
-//! mokutil exposes for this read, not as a trust primitive. MOK import and reboot
-//! remain explicitly gated until the narrow credential helper and host-state
-//! handoff exist. The pure core — the per-model [`plan_enable`], the
+//! mokutil exposes for this read, not as a trust primitive. Reboot stays behind
+//! the host-state worker's exact-body, single-use `propose` then `confirm`
+//! authority; the Surface worker cannot safely mint or retain either reboot
+//! capability. The pure core —
+//! the per-model [`plan_enable`], the
 //! [`MokState`] machine, the [`run_enable`] fold — is unit-tested end-to-end
 //! against a fake seam.
 //!
@@ -48,6 +52,10 @@ use sha1::{Digest as _, Sha1};
 use mackes_mesh_types::surface_hardware::SurfaceProGeneration;
 
 use super::{Subsystem, SurfaceDetection, SurfaceDevice, SurfaceModel, SurfaceProfile};
+
+#[cfg(feature = "async-services")]
+#[path = "mok_credential.rs"]
+mod mok_credential;
 
 // ─────────────────────────────── constants ──────────────────────────────────
 
@@ -185,12 +193,33 @@ impl std::fmt::Display for EnableError {
 impl std::error::Error for EnableError {}
 
 /// The production Surface seam. Activation and read-only posture checks use
-/// fixed, bounded host operations. MOK staging and reboot stay gated until
-/// their dedicated credential, privilege, and host-state lanes land.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LiveSurfaceActions;
+/// fixed, bounded host operations. MOK staging additionally requires a sealed
+/// one-use permit bound to the already-authorized request. Reboot stays gated
+/// until the typed host-state lane lands.
+#[derive(Debug, Clone, Default)]
+pub struct LiveSurfaceActions {
+    #[cfg(feature = "async-services")]
+    mok_binding: Option<mok_credential::MokImportBinding>,
+}
 
 impl LiveSurfaceActions {
+    #[cfg(feature = "async-services")]
+    fn for_request(
+        node: &str,
+        request_id: &str,
+        authorization_nonce: &str,
+        authorization_expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            mok_binding: Some(mok_credential::MokImportBinding {
+                node: node.to_string(),
+                request_id: request_id.to_string(),
+                authorization_nonce: authorization_nonce.to_string(),
+                authorization_expires_at_ms,
+            }),
+        }
+    }
+
     fn gated<T>(action: impl Into<String>) -> Result<T, EnableError> {
         Err(EnableError::IntegrationGated {
             action: action.into(),
@@ -256,6 +285,24 @@ fn certificate_sha1(der: &[u8]) -> Result<[u8; SHA1_FINGERPRINT_BYTES], &'static
     let mut fingerprint = [0_u8; SHA1_FINGERPRINT_BYTES];
     fingerprint.copy_from_slice(&digest);
     Ok(fingerprint)
+}
+
+fn format_sha1_fingerprint(fingerprint: &[u8; SHA1_FINGERPRINT_BYTES]) -> String {
+    fingerprint
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+#[cfg(feature = "async-services")]
+fn wall_now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn pending_list_contains_sha1(
@@ -411,18 +458,62 @@ impl SurfaceActions for LiveSurfaceActions {
         if key_path != Path::new(MOK_KEY_PATH) {
             return Self::failed("stage MOK key", "certificate path is not allowlisted");
         }
-        // mokutil's only non-interactive import modes consume either a caller-
-        // supplied password-hash file (`--hash-file`) or the host root password
-        // hash (`--root-pw`). This action contract carries neither a sealed,
-        // one-time credential nor an allowlisted helper capable of supplying
-        // one. Using `/etc/shadow`, inventing a static password, accepting a
-        // caller path, or putting a secret in argv/environment would violate
-        // the credential boundary. Refuse before executing mokutil or mutating
-        // EFI variables until a dedicated credential broker is part of the
-        // typed request.
-        Self::gated(
-            "stage MOK key (sealed one-time credential broker is not implemented; no EFI mutation)",
-        )
+        #[cfg(feature = "async-services")]
+        {
+            let Some(binding) = self.mok_binding.as_ref() else {
+                return Self::gated(
+                    "stage MOK key (authorized Surface request binding is unavailable)",
+                );
+            };
+            let metadata =
+                std::fs::symlink_metadata(MOK_KEY_PATH).map_err(|error| EnableError::Failed {
+                    action: "stage MOK key".to_string(),
+                    detail: format!("Surface certificate is unavailable: {error}"),
+                })?;
+            if !metadata.file_type().is_file()
+                || metadata.len() == 0
+                || metadata.len() > MOK_OUTPUT_LIMIT_BYTES as u64
+            {
+                return Self::failed(
+                    "stage MOK key",
+                    "Surface certificate is not a bounded regular file",
+                );
+            }
+            let certificate = mok_credential::read_bounded_regular(
+                Path::new(MOK_KEY_PATH),
+                MOK_OUTPUT_LIMIT_BYTES - 1,
+            )
+            .map_err(|error| EnableError::Failed {
+                action: "stage MOK key".to_string(),
+                detail: format!("read fixed Surface certificate: {error}"),
+            })?;
+            let fingerprint =
+                certificate_sha1(&certificate).map_err(|detail| EnableError::Failed {
+                    action: "stage MOK key".to_string(),
+                    detail: detail.to_string(),
+                })?;
+            let permit =
+                mok_credential::load_systemd_permit(binding, &fingerprint, wall_now_ms_u64())
+                    .map_err(|detail| EnableError::Failed {
+                        action: "stage MOK key".to_string(),
+                        detail,
+                    })?;
+            mok_credential::import_fixed_certificate(permit.password()).map_err(|detail| {
+                EnableError::Failed {
+                    action: "stage MOK key".to_string(),
+                    detail,
+                }
+            })?;
+            if !self.mok_pending(key_path)? {
+                return Self::failed(
+                    "stage MOK key",
+                    "mokutil returned success but the fixed certificate is not pending",
+                );
+            }
+            return Ok(format_sha1_fingerprint(&fingerprint));
+        }
+        #[cfg(not(feature = "async-services"))]
+        Self::gated("stage MOK key (async-services disabled)")
     }
 
     fn modules_loaded(&self, modules: &[&str]) -> Result<bool, EnableError> {
@@ -442,7 +533,10 @@ impl SurfaceActions for LiveSurfaceActions {
     }
 
     fn reboot(&self) -> Result<(), EnableError> {
-        Self::gated("reboot delegated to the typed host-state workflow")
+        Self::gated(
+            "reboot requires a separately authorized host-state propose/confirm pair; \
+             surface_enable never mints or retains either exact-body capability",
+        )
     }
 }
 
@@ -723,7 +817,8 @@ impl EnableResult {
 /// The `surface_enable` verb: activate + configure this node per its detected
 /// model, then walk the guided MOK state machine. Pure control flow over the
 /// injectable [`SurfaceActions`] seam — the whole thing is unit-tested with a
-/// fake; production hands [`LiveSurfaceActions`] (integration-gated).
+/// fake; production hands [`LiveSurfaceActions`] (fixed/bounded reads,
+/// request-bound MOK import, and fail-closed staged actions).
 ///
 /// `arm` is the operator-typed arming token from the enable request; it only
 /// matters in the [`MokState::KeyMissing`] branch, where a matching token
@@ -878,7 +973,7 @@ fn run_mok(actions: &impl SurfaceActions, arm: Option<&str>) -> MokEnrollment {
 
 #[cfg(feature = "async-services")]
 pub use worker::{
-    ENABLE_ACTION_AUTH_VERB, EnableRequest, SurfaceEnableWorker, enable_topic, result_topic,
+    enable_topic, result_topic, EnableRequest, SurfaceEnableWorker, ENABLE_ACTION_AUTH_VERB,
 };
 
 #[cfg(feature = "async-services")]
@@ -886,7 +981,7 @@ mod worker {
     //! The per-node `surface_enable` Bus worker (a *leader-of-self* worker:
     //! it acts only on its own hardware, never a remote node). It drains
     //! [`enable_topic`] for this node, runs [`super::run_enable`] against the
-    //! integration-gated [`super::LiveSurfaceActions`], and publishes the
+    //! fail-closed [`super::LiveSurfaceActions`], and publishes the
     //! typed [`super::EnableResult`] to [`result_topic`]. SURFACE-4 folds
     //! that into the fleet enablement summary.
 
@@ -898,9 +993,9 @@ mod worker {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
-    use super::{EnableResult, LiveSurfaceActions, SurfaceModel, run_enable};
+    use super::{run_enable, EnableResult, LiveSurfaceActions, SurfaceModel};
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
-    use crate::surface::{SurfaceDetection, detect};
+    use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Poll cadence — enable is operator-driven, so a modest tick is plenty.
@@ -1031,11 +1126,23 @@ mod worker {
                 return self
                     .refused_result(&format!("surface enable authorization refused: {error}"));
             }
-            run_enable(
-                &LiveSurfaceActions,
-                &self.detection,
-                req.arm_token.as_deref(),
-            )
+            let Some(authorization) = req
+                .header
+                .armed_token
+                .as_deref()
+                .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
+            else {
+                return self.refused_result(
+                    "surface enable authorization refused: verified capability is unavailable",
+                );
+            };
+            let actions = LiveSurfaceActions::for_request(
+                &self.node_id,
+                &req.header.request_id,
+                &authorization.nonce,
+                u64::try_from(authorization.expires_at_ms).unwrap_or(0),
+            );
+            run_enable(&actions, &self.detection, req.arm_token.as_deref())
         }
 
         fn refused_result(&self, reason: &str) -> EnableResult {
@@ -1121,8 +1228,8 @@ mod worker {
         use std::sync::Arc;
 
         use super::*;
-        use crate::ipc::action_auth::{ActionAuthorizer, MutationContext, authorize_test_body};
-        use crate::surface::{DmiInfo, MS_VENDOR, identify};
+        use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
+        use crate::surface::{identify, DmiInfo, MS_VENDOR};
 
         const AUTH_KEY: &[u8] = b"surface-enable-action-auth-test-key";
         const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -1276,12 +1383,10 @@ mod worker {
                 .expect("list results");
             let result: EnableResult =
                 serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            assert!(
-                result
-                    .skipped
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("shared contract admission"))
-            );
+            assert!(result
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("shared contract admission")));
             assert!(result.activation.units.is_empty());
         }
 
@@ -1303,12 +1408,10 @@ mod worker {
             let result = worker.apply_request(Some(
                 &serde_json::to_string(&request).expect("serialize hostile request"),
             ));
-            assert!(
-                result
-                    .skipped
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("targets a different node"))
-            );
+            assert!(result
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("targets a different node")));
             assert!(result.activation.units.is_empty());
 
             let stale = EnableRequest {
@@ -1325,12 +1428,10 @@ mod worker {
             let result = worker.apply_request(Some(
                 &serde_json::to_string(&stale).expect("serialize stale request"),
             ));
-            assert!(
-                result
-                    .skipped
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("stale or future-dated"))
-            );
+            assert!(result
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("stale or future-dated")));
             assert!(result.activation.units.is_empty());
         }
 
@@ -1365,19 +1466,15 @@ mod worker {
                 .iter()
                 .map(|item| serde_json::from_str(item.body.as_deref().unwrap()).unwrap())
                 .collect();
-            assert!(
-                results[0]
-                    .skipped
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("authorization refused"))
-            );
+            assert!(results[0]
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("authorization refused")));
             assert!(results[1].skipped.is_none());
-            assert!(
-                results[2]
-                    .skipped
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("already used"))
-            );
+            assert!(results[2]
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("already used")));
         }
     }
 }
@@ -1387,7 +1484,7 @@ mod worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::{DmiInfo, MS_VENDOR, SurfaceFamily, identify};
+    use crate::surface::{identify, DmiInfo, SurfaceFamily, MS_VENDOR};
 
     /// A fake seam whose every action is scripted, so the fold + state
     /// machine run green without touching a machine.
@@ -1596,12 +1693,11 @@ mod tests {
             dmi,
         };
         let r = run_enable(&FakeActions::default(), &det, None);
-        assert!(
-            r.skipped
-                .as_deref()
-                .unwrap()
-                .contains("unrecognised Surface")
-        );
+        assert!(r
+            .skipped
+            .as_deref()
+            .unwrap()
+            .contains("unrecognised Surface"));
     }
 
     #[test]
@@ -1615,12 +1711,10 @@ mod tests {
             &detect_of("Surface Pro 7"),
             Some(MOK_ARM_TOKEN),
         );
-        assert!(
-            result
-                .skipped
-                .as_deref()
-                .is_some_and(|reason| reason.contains("Pro 5/6 action contract"))
-        );
+        assert!(result
+            .skipped
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Pro 5/6 action contract")));
         assert!(result.activation.units.is_empty());
         assert!(result.activation.configs.is_empty());
         assert_eq!(result.mok, MokEnrollment::NotRequired);
@@ -1635,12 +1729,11 @@ mod tests {
         let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
         assert_eq!(r.model, "Surface Pro 6");
         assert_eq!(r.activation.units[0].outcome, StepOutcome::Applied);
-        assert!(
-            r.activation
-                .configs
-                .iter()
-                .all(|c| c.outcome == StepOutcome::Applied)
-        );
+        assert!(r
+            .activation
+            .configs
+            .iter()
+            .all(|c| c.outcome == StepOutcome::Applied));
         assert_eq!(r.mok, MokEnrollment::NotRequired);
     }
 
@@ -1842,38 +1935,45 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
 
     #[test]
     fn live_seam_rejects_non_allowlisted_targets_before_effects() {
-        let unit = LiveSurfaceActions.enable_unit("caller-controlled.service");
+        let actions = LiveSurfaceActions::default();
+        let unit = actions.enable_unit("caller-controlled.service");
         assert!(matches!(
             unit,
             Err(EnableError::Failed { action, .. }) if action == "activate iptsd"
         ));
-        let config = LiveSurfaceActions.apply_config(ConfigKey::RotationHint, "auto");
+        let config = actions.apply_config(ConfigKey::RotationHint, "auto");
         assert!(matches!(config, Err(EnableError::Failed { .. })));
         assert!(matches!(
-            LiveSurfaceActions.enable_unit(IPTSD_UNIT),
+            actions.enable_unit(IPTSD_UNIT),
             Err(EnableError::IntegrationGated { action }) if action.contains("Preview / Commit / Cancel / Audit")
         ));
         assert!(matches!(
-            LiveSurfaceActions.apply_config(ConfigKey::SamPerfProfile, "balanced"),
+            actions.apply_config(ConfigKey::SamPerfProfile, "balanced"),
             Err(EnableError::IntegrationGated { action }) if action.contains("Preview / Commit / Cancel / Audit")
         ));
-        let pending = LiveSurfaceActions.mok_pending(Path::new("/tmp/caller.cer"));
+        let pending = actions.mok_pending(Path::new("/tmp/caller.cer"));
         assert!(matches!(pending, Err(EnableError::Failed { .. })));
-        let hostile_pending = LiveSurfaceActions.mok_pending(Path::new("/tmp/cert.cer\n--root-pw"));
+        let hostile_pending = actions.mok_pending(Path::new("/tmp/cert.cer\n--root-pw"));
         assert!(matches!(hostile_pending, Err(EnableError::Failed { .. })));
 
-        let hostile_import = LiveSurfaceActions.mok_import(Path::new("--root-pw"));
+        let hostile_import = actions.mok_import(Path::new("--root-pw"));
         assert!(matches!(
             hostile_import,
             Err(EnableError::Failed { action, detail })
                 if action == "stage MOK key" && detail.contains("not allowlisted")
         ));
-        let fixed_import = LiveSurfaceActions.mok_import(Path::new(MOK_KEY_PATH));
+        let fixed_import = actions.mok_import(Path::new(MOK_KEY_PATH));
         assert!(matches!(
             fixed_import,
             Err(EnableError::IntegrationGated { action })
-                if action.contains("sealed one-time credential broker")
-                    && action.contains("no EFI mutation")
+                if action.contains("authorized Surface request binding")
+        ));
+        let reboot = actions.reboot();
+        assert!(matches!(
+            reboot,
+            Err(EnableError::IntegrationGated { action })
+                if action.contains("host-state propose/confirm")
+                    && action.contains("never mints or retains")
         ));
     }
 }

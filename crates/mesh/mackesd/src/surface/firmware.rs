@@ -25,22 +25,28 @@
 //! **Every fwupd call sits behind the injectable [`Fwupd`] seam.** The JSON
 //! parse is a pure fold ([`inventory_from_json`]) unit-tested with fixtures;
 //! the production seam ([`LiveFwupd`]) invokes only fixed `/usr/bin/fwupdmgr`
-//! read argv with a locale, time, and output bound. Apply remains fail-closed
-//! after binding a fresh inventory publication, exact release, and SHA-256:
-//! the production exact-release install seam is not implemented yet.
+//! read argv with a locale, time, and output bound. Apply revalidates the exact
+//! device/release/SHA-256 against a second fwupd read, downloads only that
+//! release's HTTPS cabinet into a private bounded staging directory, hashes it
+//! in-process, and invokes device-scoped `local-install`. It never invokes the
+//! broad `update` command.
 //! §6-clean: it stays wholly in mackesd.
 
+use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use mackes_mesh_types::surface_hardware::{
-    SURFACE_HARDWARE_SCHEMA_VERSION, SurfaceAvailability, SurfaceFirmwareDevice,
-    SurfaceFirmwareInventory, SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration,
-    SurfacePublication,
+    SurfaceAvailability, SurfaceFirmwareDevice, SurfaceFirmwareInventory, SurfaceModelIdentity,
+    SurfaceObservationSource, SurfaceProGeneration, SurfacePublication,
+    SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 
 use super::{SurfaceDetection, SurfaceModel};
@@ -57,10 +63,15 @@ const FWUPDMGR: &str = "/usr/bin/fwupdmgr";
 const GET_DEVICES_ARGS: [&str; 3] = ["get-devices", "--json", "--no-unreported-check"];
 const GET_UPDATES_ARGS: [&str; 3] = ["get-updates", "--json", "--no-unreported-check"];
 const FWUPD_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const FWUPD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const FWUPD_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const FWUPD_POLL: Duration = Duration::from_millis(25);
 const MAX_FWUPD_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_FWUPD_DEVICES: usize = 64;
 const MAX_FWUPD_FIELD_BYTES: usize = 512;
+const MAX_FWUPD_LOCATION_BYTES: usize = 2 * 1024;
+const MAX_FWUPD_CAB_BYTES: u64 = 512 * 1024 * 1024;
+const FWUPD_STAGE_ROOT: &str = "/var/tmp";
 
 // ─────────────────────────────── the seam ───────────────────────────────────
 
@@ -68,8 +79,7 @@ const MAX_FWUPD_FIELD_BYTES: usize = 512;
 /// [`super::enable::EnableError`]'s honest split.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FwError {
-    /// A mutating fwupd action is deliberately unavailable because its shared
-    /// authority contract is not strong enough yet.
+    /// A provider seam deliberately reports an unavailable fwupd action.
     IntegrationGated {
         /// The fwupd action that is integration-gated.
         action: String,
@@ -107,7 +117,8 @@ impl std::error::Error for FwError {}
 /// # Errors
 ///
 /// Reads return [`FwError::Failed`] for missing binaries, timeouts, bad status,
-/// oversized output, or malformed JSON. Mutation remains integration-gated.
+/// oversized output, malformed JSON, an unbound cabinet, or an exact install
+/// failure.
 pub trait Fwupd {
     /// Raw `fwupdmgr get-devices --json` output (the full inventory).
     ///
@@ -120,8 +131,8 @@ pub trait Fwupd {
     /// # Errors
     /// The seam's typed [`FwError`] (gated / failed) — see the trait docs.
     fn get_updates_json(&self) -> Result<String, FwError>;
-    /// Future exact-bound apply seam. Production refuses this until the shared
-    /// request includes inventory generation, release, and checksum bindings.
+    /// Exact-bound apply seam. Production revalidates and hashes the selected
+    /// release cabinet before a device-scoped install.
     ///
     /// # Errors
     /// The seam's typed [`FwError`] (gated / failed) — see the trait docs.
@@ -177,14 +188,222 @@ impl Fwupd for LiveFwupd {
     }
     fn apply_update(
         &self,
-        _device_id: &str,
-        _release_version: &str,
-        _release_checksum: &str,
+        device_id: &str,
+        release_version: &str,
+        release_checksum: &str,
     ) -> Result<(), FwError> {
-        Err(FwError::IntegrationGated {
-            action: "fwupdmgr exact-release install is not implemented".into(),
+        validate_live_binding(device_id, release_version, release_checksum)?;
+
+        // Re-read immediately inside the live mutation seam. This is a second
+        // check after run_apply's fresh inventory admission and closes the gap
+        // between the provider-neutral contract and cabinet acquisition.
+        let updates_json =
+            Self::read_json("fwupdmgr get-updates before install", &GET_UPDATES_ARGS)?;
+        let exact_release =
+            exact_release_location(&updates_json, device_id, release_version, release_checksum)?;
+        let stage = FirmwareStage::create().map_err(|error| FwError::Failed {
+            action: "prepare private firmware staging directory".into(),
+            detail: error.to_string(),
+        })?;
+
+        let download_args = [
+            "download",
+            exact_release.location.as_str(),
+            "--no-unreported-check",
+        ];
+        run_checked_fwupdmgr(
+            "fwupdmgr download exact firmware cabinet",
+            &download_args,
+            FWUPD_DOWNLOAD_TIMEOUT,
+            Some(stage.path()),
+        )?;
+        let cabinet = stage.single_cabinet(exact_release.size)?;
+        let actual_checksum = sha256_bounded_file(&cabinet)?;
+        if actual_checksum != release_checksum {
+            return Err(FwError::Failed {
+                action: "verify downloaded firmware cabinet".into(),
+                detail: format!(
+                    "SHA-256 mismatch: selected {release_checksum}, downloaded {actual_checksum}"
+                ),
+            });
+        }
+
+        let cabinet_path = cabinet.to_str().ok_or_else(|| FwError::Failed {
+            action: "admit downloaded firmware cabinet".into(),
+            detail: "staging path is not UTF-8".into(),
+        })?;
+        let install_args = exact_local_install_args(cabinet_path, device_id);
+        run_checked_fwupdmgr(
+            "fwupdmgr local-install exact firmware cabinet",
+            &install_args,
+            FWUPD_INSTALL_TIMEOUT,
+            None,
+        )
+    }
+}
+
+fn validate_live_binding(
+    device_id: &str,
+    release_version: &str,
+    release_checksum: &str,
+) -> Result<(), FwError> {
+    let device_valid = device_id.len() == 40
+        && device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let version_valid = !release_version.is_empty()
+        && release_version.len() <= MAX_FWUPD_FIELD_BYTES
+        && !release_version.starts_with('-')
+        && release_version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte));
+    let checksum_valid = release_checksum.len() == 64
+        && release_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if device_valid && version_valid && checksum_valid {
+        Ok(())
+    } else {
+        Err(FwError::Failed {
+            action: "admit exact firmware install binding".into(),
+            detail: "device ID, release version, or SHA-256 is not canonical".into(),
         })
     }
+}
+
+fn exact_local_install_args<'a>(cabinet: &'a str, device_id: &'a str) -> [&'a str; 6] {
+    [
+        "local-install",
+        cabinet,
+        device_id,
+        "--assume-yes",
+        "--no-reboot-check",
+        "--no-unreported-check",
+    ]
+}
+
+fn run_checked_fwupdmgr(
+    action: &str,
+    args: &[&str],
+    timeout: Duration,
+    current_dir: Option<&Path>,
+) -> Result<(), FwError> {
+    let output = run_fwupdmgr_at(args, timeout, current_dir).map_err(|error| FwError::Failed {
+        action: action.to_string(),
+        detail: error.to_string(),
+    })?;
+    if !output.status.success() {
+        return Err(FwError::Failed {
+            action: action.to_string(),
+            detail: bounded_text(&output.stderr),
+        });
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(FwError::Failed {
+            action: action.to_string(),
+            detail: format!("output exceeded {MAX_FWUPD_OUTPUT_BYTES} bytes"),
+        });
+    }
+    Ok(())
+}
+
+struct FirmwareStage {
+    path: PathBuf,
+}
+
+impl FirmwareStage {
+    fn create() -> io::Result<Self> {
+        for _ in 0..16 {
+            let path = Path::new(FWUPD_STAGE_ROOT)
+                .join(format!("mackesd-fwupd-{:032x}", rand::random::<u128>()));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique firmware staging directory",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn single_cabinet(&self, expected_size: u64) -> Result<PathBuf, FwError> {
+        let mut entries = fs::read_dir(&self.path)
+            .map_err(|error| FwError::Failed {
+                action: "inspect downloaded firmware cabinet".into(),
+                detail: error.to_string(),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| FwError::Failed {
+                action: "inspect downloaded firmware cabinet".into(),
+                detail: error.to_string(),
+            })?;
+        if entries.len() != 1 {
+            return Err(FwError::Failed {
+                action: "inspect downloaded firmware cabinet".into(),
+                detail: format!("expected exactly one file, found {}", entries.len()),
+            });
+        }
+        let entry = entries.pop().expect("one entry checked");
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| FwError::Failed {
+            action: "inspect downloaded firmware cabinet".into(),
+            detail: error.to_string(),
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_FWUPD_CAB_BYTES
+            || metadata.len() != expected_size
+        {
+            return Err(FwError::Failed {
+                action: "inspect downloaded firmware cabinet".into(),
+                detail: format!(
+                    "download is not a regular file with the bound {expected_size}-byte size (maximum {MAX_FWUPD_CAB_BYTES})"
+                ),
+            });
+        }
+        Ok(entry.path())
+    }
+}
+
+impl Drop for FirmwareStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn sha256_bounded_file(path: &Path) -> Result<String, FwError> {
+    let mut file = File::open(path).map_err(|error| FwError::Failed {
+        action: "hash downloaded firmware cabinet".into(),
+        detail: error.to_string(),
+    })?;
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| FwError::Failed {
+            action: "hash downloaded firmware cabinet".into(),
+            detail: error.to_string(),
+        })?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count as u64);
+        if total > MAX_FWUPD_CAB_BYTES {
+            return Err(FwError::Failed {
+                action: "hash downloaded firmware cabinet".into(),
+                detail: format!("cabinet exceeds {MAX_FWUPD_CAB_BYTES} bytes"),
+            });
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 struct FwupdOutput {
@@ -221,14 +440,30 @@ fn reap(child: &mut Child) {
 }
 
 fn run_fwupdmgr(args: &[&str]) -> io::Result<FwupdOutput> {
-    let mut child = Command::new(FWUPDMGR)
+    run_fwupdmgr_at(args, FWUPD_READ_TIMEOUT, None)
+}
+
+fn run_fwupdmgr_at(
+    args: &[&str],
+    timeout: Duration,
+    current_dir: Option<&Path>,
+) -> io::Result<FwupdOutput> {
+    let mut command = Command::new(FWUPDMGR);
+    command
         .args(args)
+        // Do not allow inherited proxy, loader, or FWUPD_* variables to alter
+        // this privileged fixed-argv boundary.
+        .env_clear()
         .env("LC_ALL", "C")
         .env("LANG", "C")
+        .env("PATH", "/usr/sbin:/usr/bin")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let mut child = command.spawn()?;
     let stdout = child.stdout.take().ok_or_else(|| {
         reap(&mut child);
         io::Error::other("fwupdmgr stdout pipe unavailable")
@@ -239,7 +474,7 @@ fn run_fwupdmgr(args: &[&str]) -> io::Result<FwupdOutput> {
     })?;
     let stdout_reader = thread::spawn(move || read_bounded(stdout));
     let stderr_reader = thread::spawn(move || read_bounded(stderr));
-    let deadline = Instant::now() + FWUPD_READ_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -257,7 +492,7 @@ fn run_fwupdmgr(args: &[&str]) -> io::Result<FwupdOutput> {
             let _ = stderr_reader.join();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "fwupdmgr exceeded 20 second timeout",
+                format!("fwupdmgr exceeded {} second timeout", timeout.as_secs()),
             ));
         }
         thread::sleep(FWUPD_POLL);
@@ -319,6 +554,110 @@ struct RawRelease {
     version: String,
     #[serde(default, rename = "Checksum")]
     checksums: Vec<String>,
+    #[serde(default, rename = "Locations")]
+    locations: Vec<String>,
+    #[serde(default, rename = "Size")]
+    size: Option<u64>,
+}
+
+struct ExactReleaseDownload {
+    location: String,
+    size: u64,
+}
+
+fn exact_release_location(
+    updates_json: &str,
+    device_id: &str,
+    release_version: &str,
+    release_checksum: &str,
+) -> Result<ExactReleaseDownload, FwError> {
+    mackes_mesh_types::workloads::reject_duplicate_json_keys(updates_json).map_err(|error| {
+        FwError::Failed {
+            action: "revalidate exact firmware release".into(),
+            detail: error.to_string(),
+        }
+    })?;
+    let updates: RawDeviceList =
+        serde_json::from_str(updates_json).map_err(|error| FwError::Failed {
+            action: "revalidate exact firmware release".into(),
+            detail: error.to_string(),
+        })?;
+    validate_raw_inventory(&updates.devices, "get-updates before install")?;
+    let matching_devices: Vec<_> = updates
+        .devices
+        .iter()
+        .filter(|device| device.device_id == device_id)
+        .collect();
+    if matching_devices.len() != 1 {
+        return Err(FwError::Failed {
+            action: "revalidate exact firmware release".into(),
+            detail: "selected device is absent or ambiguous in refreshed updates".into(),
+        });
+    }
+    let matching_releases: Vec<_> = matching_devices[0]
+        .releases
+        .iter()
+        .filter(|release| {
+            release.version == release_version
+                && release
+                    .checksums
+                    .iter()
+                    .any(|checksum| checksum.eq_ignore_ascii_case(release_checksum))
+        })
+        .collect();
+    if matching_releases.len() != 1 {
+        return Err(FwError::Failed {
+            action: "revalidate exact firmware release".into(),
+            detail: "selected release version and SHA-256 are absent or ambiguous".into(),
+        });
+    }
+    let locations: Vec<_> = matching_releases[0]
+        .locations
+        .iter()
+        .filter(|location| safe_https_location(location))
+        .collect();
+    let Some(location) = locations.first() else {
+        return Err(FwError::Failed {
+            action: "revalidate exact firmware release".into(),
+            detail: "selected release has no admitted HTTPS cabinet location".into(),
+        });
+    };
+    let Some(size @ 1..=MAX_FWUPD_CAB_BYTES) = matching_releases[0].size else {
+        return Err(FwError::Failed {
+            action: "revalidate exact firmware release".into(),
+            detail: format!(
+                "selected release has no non-zero cabinet size at or below {MAX_FWUPD_CAB_BYTES} bytes"
+            ),
+        });
+    };
+    Ok(ExactReleaseDownload {
+        location: (*location).clone(),
+        size,
+    })
+}
+
+fn safe_https_location(location: &str) -> bool {
+    if location.len() > MAX_FWUPD_LOCATION_BYTES
+        || !location.starts_with("https://")
+        || !location.is_ascii()
+        || location
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || location.contains('@')
+        || location.contains('#')
+        || location.contains('?')
+    {
+        return false;
+    }
+    let authority = location
+        .trim_start_matches("https://")
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    !authority.is_empty()
+        && authority
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-:[]".contains(&byte))
 }
 
 /// One updatable firmware component on the node — the Install tab's row.
@@ -438,6 +777,12 @@ fn validate_raw_inventory(devices: &[RawDevice], source: &str) -> Result<(), FwE
                     && release.checksums.iter().all(|checksum| {
                         matches!(checksum.len(), 40 | 64)
                             && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    && release.locations.len() <= 8
+                    && release.locations.iter().all(|location| {
+                        !location.is_empty()
+                            && location.len() <= MAX_FWUPD_LOCATION_BYTES
+                            && !location.chars().any(char::is_control)
                     })
             });
         if !valid || !ids.insert(device.device_id.as_str()) {
@@ -627,7 +972,9 @@ pub enum ApplyOutcome {
         /// Why it was refused (arm token missing/wrong).
         reason: String,
     },
-    /// The update was applied this call.
+    /// fwupd accepted the exact cabinet for this device. Offline firmware may
+    /// be staged and still require an operator-controlled reboot to take
+    /// effect; this outcome never claims the device version already changed.
     Applied,
     /// The live apply is integration-gated (honest, §7).
     Gated {
@@ -642,9 +989,9 @@ pub enum ApplyOutcome {
 }
 
 impl ApplyOutcome {
-    /// Does this outcome trigger a verify re-run? Only a genuinely
-    /// [`Self::Applied`] update changes the firmware, so only it re-runs
-    /// SURFACE-4's verify (a refused/gated/failed apply changed nothing). Pure.
+    /// Does this outcome trigger a verify re-run? A successful fwupd
+    /// install/stage can change pending state, so it re-runs SURFACE-4's
+    /// verify; a refused/gated/failed apply changed nothing. Pure.
     #[must_use]
     pub const fn triggers_reverify(&self) -> bool {
         matches!(self, Self::Applied)
@@ -806,8 +1153,8 @@ pub fn run_apply(
 
 #[cfg(feature = "async-services")]
 pub use worker::{
-    FW_ACTION_AUTH_VERB, FwApplyRequest, SurfaceFirmwareWorker, fw_apply_topic, fw_result_topic,
-    inventory_topic,
+    fw_apply_topic, fw_result_topic, inventory_topic, FwApplyRequest, SurfaceFirmwareWorker,
+    FW_ACTION_AUTH_VERB,
 };
 
 #[cfg(feature = "async-services")]
@@ -830,12 +1177,12 @@ mod worker {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
-    use super::{ApplyResult, LiveFwupd, SurfaceModel, run_apply, run_inventory, shared_inventory};
+    use super::{run_apply, run_inventory, shared_inventory, ApplyResult, LiveFwupd, SurfaceModel};
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::verify::{
-        LiveSurfaceProbes, board_topic, run_verify, shared_board, shared_summary, summary_topic,
+        board_topic, run_verify, shared_board, shared_summary, summary_topic, LiveSurfaceProbes,
     };
-    use crate::surface::{SurfaceDetection, detect};
+    use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Poll cadence — firmware is operator-driven + slow-moving, so a modest
@@ -1138,9 +1485,9 @@ mod worker {
         use std::sync::Arc;
 
         use super::*;
-        use crate::ipc::action_auth::{ActionAuthorizer, MutationContext, authorize_test_body};
+        use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
         use crate::surface::firmware::ApplyOutcome;
-        use crate::surface::{DmiInfo, MS_VENDOR, identify};
+        use crate::surface::{identify, DmiInfo, MS_VENDOR};
 
         const AUTH_KEY: &[u8] = b"surface-firmware-action-auth-test-key";
         const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -1554,7 +1901,7 @@ mod worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::{DmiInfo, MS_VENDOR, identify};
+    use crate::surface::{identify, DmiInfo, MS_VENDOR};
 
     const APPLY_NOW_MS: u64 = 1_800_000_000_000;
     const RELEASE_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1699,13 +2046,11 @@ mod tests {
                 })
             })
             .collect();
-        assert!(
-            inventory_from_json(
-                &serde_json::json!({"Devices": rows}).to_string(),
-                EMPTY_DEVICE_LIST
-            )
-            .is_err()
-        );
+        assert!(inventory_from_json(
+            &serde_json::json!({"Devices": rows}).to_string(),
+            EMPTY_DEVICE_LIST
+        )
+        .is_err());
     }
 
     #[test]
@@ -1729,6 +2074,94 @@ mod tests {
         );
         assert!(!GET_DEVICES_ARGS.iter().any(|arg| arg.contains("update")));
         assert!(!GET_UPDATES_ARGS.iter().any(|arg| *arg == "update"));
+    }
+
+    #[test]
+    fn exact_release_admission_binds_device_version_checksum_and_https_location() {
+        let device = "0123456789abcdef0123456789abcdef01234567";
+        let json = format!(
+            r#"{{"Devices":[{{"DeviceId":"{device}","Name":"System Firmware","Version":"1.0","Releases":[{{"Version":"1.2.4","Checksum":["{RELEASE_SHA256}"],"Locations":["https://fwupd.org/downloads/surface.cab"],"Size":12345}}]}}]}}"#
+        );
+        let exact = exact_release_location(&json, device, "1.2.4", RELEASE_SHA256).unwrap();
+        assert_eq!(exact.location, "https://fwupd.org/downloads/surface.cab");
+        assert_eq!(exact.size, 12345);
+        assert!(exact_release_location(&json, device, "1.2.5", RELEASE_SHA256).is_err());
+        assert!(exact_release_location(&json, device, "1.2.4", &"b".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn exact_release_admission_rejects_unsafe_or_ambiguous_locations() {
+        let device = "0123456789abcdef0123456789abcdef01234567";
+        for location in [
+            "http://fwupd.org/surface.cab",
+            "https://user:secret@fwupd.org/surface.cab",
+            "https://fwupd.org/surface.cab#fragment",
+            "https://fwupd.org/surface.cab?credential=secret",
+            "file:///tmp/surface.cab",
+        ] {
+            let json = format!(
+                r#"{{"Devices":[{{"DeviceId":"{device}","Name":"System Firmware","Version":"1.0","Releases":[{{"Version":"1.2.4","Checksum":["{RELEASE_SHA256}"],"Locations":["{location}"],"Size":12345}}]}}]}}"#
+            );
+            assert!(
+                exact_release_location(&json, device, "1.2.4", RELEASE_SHA256).is_err(),
+                "unsafe location admitted: {location}"
+            );
+        }
+
+        let duplicate = format!(
+            r#"{{"Devices":[{{"DeviceId":"{device}","Name":"System Firmware","Version":"1.0","Releases":[{{"Version":"1.2.4","Checksum":["{RELEASE_SHA256}"],"Locations":["https://fwupd.org/a.cab"],"Size":12345}},{{"Version":"1.2.4","Checksum":["{RELEASE_SHA256}"],"Locations":["https://fwupd.org/b.cab"],"Size":12345}}]}}]}}"#
+        );
+        assert!(exact_release_location(&duplicate, device, "1.2.4", RELEASE_SHA256).is_err());
+
+        for size in [0, MAX_FWUPD_CAB_BYTES + 1] {
+            let json = format!(
+                r#"{{"Devices":[{{"DeviceId":"{device}","Name":"System Firmware","Version":"1.0","Releases":[{{"Version":"1.2.4","Checksum":["{RELEASE_SHA256}"],"Locations":["https://fwupd.org/a.cab"],"Size":{size}}}]}}]}}"#
+            );
+            assert!(exact_release_location(&json, device, "1.2.4", RELEASE_SHA256).is_err());
+        }
+    }
+
+    #[test]
+    fn live_install_argv_is_exact_device_scoped_and_never_broad_update() {
+        let device = "0123456789abcdef0123456789abcdef01234567";
+        let args = exact_local_install_args("/var/tmp/private/exact.cab", device);
+        assert_eq!(
+            args,
+            [
+                "local-install",
+                "/var/tmp/private/exact.cab",
+                device,
+                "--assume-yes",
+                "--no-reboot-check",
+                "--no-unreported-check",
+            ]
+        );
+        assert!(!args.iter().any(|arg| *arg == "update"));
+        assert!(validate_live_binding(device, "1.2.4", RELEASE_SHA256).is_ok());
+        assert!(validate_live_binding("--update", "1.2.4", RELEASE_SHA256).is_err());
+        assert!(validate_live_binding(device, "--force", RELEASE_SHA256).is_err());
+        assert!(validate_live_binding(device, "1.2.4", &"A".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn private_stage_binds_one_regular_file_size_and_sha256() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let stage = FirmwareStage::create().expect("private stage");
+        assert_eq!(
+            fs::metadata(stage.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let cabinet = stage.path().join("surface.cab");
+        fs::write(&cabinet, b"abc").expect("write fixture cabinet");
+        assert_eq!(stage.single_cabinet(3).unwrap(), cabinet);
+        assert_eq!(
+            sha256_bounded_file(&cabinet).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(stage.single_cabinet(4).is_err(), "size mismatch admitted");
+        fs::write(stage.path().join("unexpected"), b"x").expect("second file");
+        assert!(stage.single_cabinet(3).is_err(), "multiple files admitted");
     }
 
     #[test]
@@ -1781,12 +2214,11 @@ mod tests {
             ..Default::default()
         };
         let inv = run_inventory(&fake, &detect_of("Surface Pro 8"));
-        assert!(
-            inv.skipped
-                .as_deref()
-                .unwrap()
-                .contains("integration-gated")
-        );
+        assert!(inv
+            .skipped
+            .as_deref()
+            .unwrap()
+            .contains("integration-gated"));
         assert!(inv.devices.is_empty(), "never a fabricated device list");
     }
 
@@ -1801,12 +2233,10 @@ mod tests {
             apply: Ok(()),
         };
         let inventory = run_inventory(&fake, &detect_of("Surface Pro 6"));
-        assert!(
-            inventory
-                .skipped
-                .as_deref()
-                .is_some_and(|reason| reason.contains("daemon unavailable"))
-        );
+        assert!(inventory
+            .skipped
+            .as_deref()
+            .is_some_and(|reason| reason.contains("daemon unavailable")));
         assert!(inventory.devices.is_empty());
     }
 
@@ -1914,7 +2344,7 @@ mod tests {
             devices_json: Ok(DEVICES_JSON.to_string()),
             updates_json: Ok(UPDATES_JSON.to_string()),
             apply: Err(FwError::Failed {
-                action: "fwupdmgr update sysfw-1".into(),
+                action: "fwupdmgr local-install sysfw-1".into(),
                 detail: "device rejected the update".into(),
             }),
         };
@@ -1996,24 +2426,18 @@ mod tests {
     #[test]
     fn triggers_reverify_only_on_applied() {
         assert!(ApplyOutcome::Applied.triggers_reverify());
-        assert!(
-            !ApplyOutcome::Refused {
-                reason: String::new()
-            }
-            .triggers_reverify()
-        );
-        assert!(
-            !ApplyOutcome::Gated {
-                reason: String::new()
-            }
-            .triggers_reverify()
-        );
-        assert!(
-            !ApplyOutcome::Failed {
-                reason: String::new()
-            }
-            .triggers_reverify()
-        );
+        assert!(!ApplyOutcome::Refused {
+            reason: String::new()
+        }
+        .triggers_reverify());
+        assert!(!ApplyOutcome::Gated {
+            reason: String::new()
+        }
+        .triggers_reverify());
+        assert!(!ApplyOutcome::Failed {
+            reason: String::new()
+        }
+        .triggers_reverify());
     }
 
     #[test]
