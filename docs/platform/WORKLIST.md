@@ -1848,6 +1848,10 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Lighthouse release-11 payload checkpoint (2026-08-10):** release 10 omitted the secret helper and a group-writable cloud machine ID blocked authenticated peer
+  publication. Release 11 now ships the helper exactly once and converges the identity to mode `0444`; BigBoy passed the focused package contract, and live `.1`
+  resumed publication plus healthy watchdog status after the same correction. Release-11 build/sign/deploy and recipient-service convergence remain:
+  `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-lighthouse-release11-payload-r116.md`.
 - **Dell release-31 boot-status checkpoint (2026-08-10):** a warned reboot cut total boot from 90.390s to 56.811s, started the shell at 23.650s, and handed off its splash
   at 45.338s with grouped services and Browser VM recovered: `docs/platform/evidence/WL-CRIT-007-2026-08-10-dell-release31-boot-status-r115.md`.
 - **Non-blocking grouped-upgrade checkpoint (2026-08-10):** after release 31 exposed a >60-second synchronous target restart, the next RPM now queues grouped daemon

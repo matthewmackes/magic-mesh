@@ -878,15 +878,18 @@ mod tests {
                 .expect("server assets array"),
         ] {
             for destination in [
+                "/opt/mcnf/automation/secrets/mcnf-secret.sh",
                 "/usr/libexec/mackesd/mesh-secret-recipient-reconcile",
                 "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service",
                 "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer",
             ] {
-                assert!(
+                assert_eq!(
                     assets
                         .iter()
-                        .any(|asset| asset["dest"].as_str() == Some(destination)),
-                    "each RPM shape must ship {destination}"
+                        .filter(|asset| asset["dest"].as_str() == Some(destination))
+                        .count(),
+                    1,
+                    "each RPM shape must ship {destination} exactly once"
                 );
             }
         }
@@ -895,6 +898,13 @@ mod tests {
                 .as_str()
                 .is_some_and(|script| script.contains("mcnf-mesh-secret-recipient.timer")),
             "the base RPM must enable ongoing recipient reconciliation"
+        );
+        let tmpfiles = include_str!("../../../../../packaging/tmpfiles/magic-mesh.conf");
+        assert!(
+            tmpfiles
+                .lines()
+                .any(|line| line == "z /etc/machine-id 0444 root root -"),
+            "package convergence must repair a group-writable machine identity before overlay publication"
         );
     }
 

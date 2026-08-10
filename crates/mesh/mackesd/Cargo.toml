@@ -1322,9 +1322,9 @@ summary = "MCNF thin DigitalOcean lighthouse — Nebula relay, etcd quorum, and 
 payload_compress = "xz"
 # Keep the role variants monotonic with the base package for corrected-forward
 # fleet deployment.
-# -10 carries the 1-GiB capacity floor, authoritative live-voter retirement
-# preflight, and Data-only mirror-sync publication.
-release = "10"
+# -11 adds the package-owned recipient helper and repairs group-writable cloud
+# machine identities so authenticated peer publication can resume.
+release = "11"
 license = "GPL-3.0-or-later AND MPL-2.0"
 # The thin variant must replace (not co-install with) any role package that
 # owns the same daemon/unit paths.  An operator can use `dnf swap` for an
@@ -1354,6 +1354,9 @@ assets = [
     { source = "packaging/systemd/mcnf-peer-recovery-sleep", dest = "/usr/lib/systemd/system-sleep/mcnf-peer-recovery", mode = "755" },
     { source = "packaging/systemd/90-mcnf-peer-recovery", dest = "/etc/NetworkManager/dispatcher.d/90-mcnf-peer-recovery", mode = "755" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
+    # Recipient reconciliation invokes this package-owned helper through its
+    # /opt/mcnf default. Keep it in the thin payload as well as base/server.
+    { source = "automation/secrets/mcnf-secret.sh", dest = "/opt/mcnf/automation/secrets/mcnf-secret.sh", mode = "755" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.timer", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer", mode = "644" },
