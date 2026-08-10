@@ -864,8 +864,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
-- **Offline basemap admission (2026-08-10):** hostile MBTiles metadata and tile coords fail closed; machine 193 passed 12/12; production data/renderer/routing/live proof remain:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-metadata-admission-r141.md`.
+- **Offline basemap admission (2026-08-10):** ambiguous or unsafe region/MBTiles candidates fail closed; `.90` passed 6/6; renderer/routing/live proof remain:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
 - **Offline index corruption recovery (2026-08-09):** malformed metadata is replaced atomically; future schemas and non-regular paths fail closed. Machine 193 passed:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
 - **Weather cache identity checkpoint (2026-08-09):** restart recovery now
