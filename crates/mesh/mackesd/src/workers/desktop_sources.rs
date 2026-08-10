@@ -1908,6 +1908,7 @@ pub fn load_manual_sources(store_root: &Path) -> Vec<ManualSource> {
 }
 
 fn load_manual_sources_strict(store_root: &Path) -> std::io::Result<Vec<ManualSource>> {
+    let _store_dir = open_manual_store_root(store_root)?;
     let data = read_bounded_manual_store(&manual_store_path(store_root))?;
     serde_json::from_str(&data)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
@@ -4556,10 +4557,15 @@ mod tests {
         let target = dir.path().join("target");
         let root = dir.path().join("desktops");
         std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join(MANUAL_STORE_FILE), "[]").unwrap();
         std::os::unix::fs::symlink(&target, &root).unwrap();
 
         assert!(save_manual_sources(&root, &[]).is_err());
-        assert!(!target.join(MANUAL_STORE_FILE).exists());
+        assert!(load_manual_sources(&root).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(target.join(MANUAL_STORE_FILE)).unwrap(),
+            "[]"
+        );
     }
 
     #[test]
