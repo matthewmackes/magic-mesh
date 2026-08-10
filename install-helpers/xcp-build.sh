@@ -162,13 +162,15 @@ remote() {
 
 # RPM ELF dependencies are build-host facts, not adjustable header metadata.
 # A media-enabled shell cut on Fedora 42, for example, needs FFmpeg-7 sonames
-# and cannot safely be deployed to a Fedora 44 Workstation with FFmpeg-8.  A
-# caller that knows its target release therefore opts into this hard check:
+# and cannot safely be deployed to a Fedora 44 Workstation with FFmpeg-8.
+# Every native cut must name its target release so this hard check cannot be
+# silently bypassed:
 #
 #   MCNF_RPM_TARGET_FEDORA=44 MCNF_BUILD_HOST=172.20.0.131 xcp-build.sh rpm
 #
-# Keeping it explicit preserves the F42 bootc/local-artifact lane while making
-# a physical-seat F44 release fail before a long, unusable native farm cut.
+# An intentional F42 cut remains available by explicitly naming Fedora 42.
+# Container cuts select their Fedora image separately and do not use this
+# native-builder guard.
 valid_rpm_target_fedora() {
   case "${1:-}" in
     ''|*[!0-9]*) return 1 ;;
@@ -176,20 +178,81 @@ valid_rpm_target_fedora() {
   esac
 }
 
+builder_fedora_release() {
+  "${SSH[@]}" "$DEST" 'rpm -E %fedora'
+}
+
 assert_rpm_target_fedora() {
   local wanted="${MCNF_RPM_TARGET_FEDORA:-}" actual
-  [ -z "$wanted" ] && return 0
+  if [ -z "$wanted" ]; then
+    warn "refusing native RPM cut: MCNF_RPM_TARGET_FEDORA is required"
+    warn "name the builder's Fedora release explicitly (for example MCNF_RPM_TARGET_FEDORA=42)"
+    return 2
+  fi
   valid_rpm_target_fedora "$wanted" || {
     warn "MCNF_RPM_TARGET_FEDORA must be a Fedora numeric release (got '$wanted')"
     return 2
   }
-  actual="$(remote 'rpm -E %fedora' | tr -d '[:space:]')"
+  actual="$(builder_fedora_release | tr -d '[:space:]')"
   if [ "$actual" != "$wanted" ]; then
     warn "refusing RPM cut: requested Fedora $wanted target but $BUILD_HOST is Fedora ${actual:-unknown}"
     warn "ELF sonames must be built for the target release; select a matching builder (F44 Workstations: 172.20.0.131)."
     return 2
   fi
   log "RPM target-Fedora guard: builder Fedora $actual matches requested target Fedora $wanted"
+}
+
+rpm_target_self_test() {
+  local fails=0 marker mock_builder_fedora status
+  marker="$(mktemp)"
+  trap 'rm -f -- "$marker"' EXIT
+
+  # Replace farm contact with a deterministic builder-release probe. The marker
+  # proves a missing target is rejected before even inspecting the builder.
+  builder_fedora_release() {
+    printf x >>"$marker"
+    printf '%s\n' "$mock_builder_fedora"
+  }
+  BUILD_HOST="self-test-builder"
+
+  expect_preflight() { # description target|UNSET builder expected-status expected-probes
+    local description="$1" target="$2" expected_status="$4" expected_probes="$5" probes
+    mock_builder_fedora="$3"
+    : >"$marker"
+    if [ "$target" = UNSET ]; then
+      (unset MCNF_RPM_TARGET_FEDORA; assert_rpm_target_fedora >/dev/null 2>&1) && status=0 || status=$?
+    else
+      MCNF_RPM_TARGET_FEDORA="$target" assert_rpm_target_fedora >/dev/null 2>&1 && status=0 || status=$?
+    fi
+    probes="$(wc -c <"$marker")"
+    if [ "$status" -eq "$expected_status" ] && [ "$probes" -eq "$expected_probes" ]; then
+      printf '  ok   %s\n' "$description"
+    else
+      printf '  FAIL %s: exit/probes [%s/%s] want [%s/%s]\n' \
+        "$description" "$status" "$probes" "$expected_status" "$expected_probes"
+      fails=$((fails + 1))
+    fi
+  }
+
+  expect_preflight "omitted target is rejected before builder probe" UNSET 42 2 0
+  expect_preflight "mismatched target is rejected during preflight" 44 42 2 1
+  expect_preflight "matching target passes preflight" 44 44 0 1
+  [ "$(unset MCNF_BUILD_SHAPE; infer_shape rpm)" = big ] \
+    || { echo "  FAIL native RPM no longer routes as a big job"; fails=$((fails + 1)); }
+
+  valid_rpm_target_fedora 44 || fails=$((fails + 1))
+  ! valid_rpm_target_fedora f44 || fails=$((fails + 1))
+  ! valid_rpm_target_fedora 44.0 || fails=$((fails + 1))
+  ! valid_rpm_target_fedora '' || fails=$((fails + 1))
+
+  rm -f -- "$marker"
+  trap - EXIT
+  if [ "$fails" -eq 0 ]; then
+    echo "RPM target-Fedora guard self-test: ALL PASS"
+    return 0
+  fi
+  echo "RPM target-Fedora guard self-test: $fails FAILED" >&2
+  return 1
 }
 
 quote_args() {
@@ -535,14 +598,7 @@ route_self_test() {
 # --- offline subcommands (no host resolution / farm contact) -------------------
 case "${1:-}" in
   --route-test | route-test) route_self_test; exit $? ;;
-  --rpm-target-test)
-    valid_rpm_target_fedora 44 && ! valid_rpm_target_fedora f44 \
-      && ! valid_rpm_target_fedora 44.0 \
-      && ! valid_rpm_target_fedora '' \
-      && { echo "RPM target-Fedora guard self-test: PASS"; exit 0; }
-    echo "RPM target-Fedora guard self-test: FAIL" >&2
-    exit 1
-    ;;
+  --rpm-target-test) rpm_target_self_test; exit $? ;;
   route) shift; resolve_host "$@"; exit 0 ;; # resolve_host already logged host+reason
   # build-deploy-3 self-check: print the canonical RPM cut knobs THIS path uses.
   # Both cut paths source install-helpers/rpm-features.sh, so this doubles as the
@@ -611,12 +667,16 @@ case "${1:-}" in
     ;;
 
   rpm)
+    # This is deliberately the first native-cut action after host routing: an
+    # omitted or mismatched target must fail before source sync, dependency
+    # installation, vendoring, or compilation can create a promotable-looking
+    # artifact. `container-rpm` selects its Fedora image in its own helper.
+    assert_rpm_target_fedora
     IFS=$'\t' read -r MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH \
       < <("$SOURCE_RECEIPT_HELPER" --repo "$REPO")
     export MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH
     log "promotable source receipt: $MCNF_BUILD_SOURCE_REVISION (epoch $SOURCE_DATE_EPOCH)"
     do_sync_revision "$MCNF_BUILD_SOURCE_REVISION"
-    assert_rpm_target_fedora
     # build-deploy-7 — cargo-generate-rpm is NOT installed per-cut on this path;
     # it is pinned at VM-PROVISIONING time to CGR_VERSION by
     # setup-build-vm-toolchain.sh + infra/ansible build-vm-toolchain.yml (pinned by

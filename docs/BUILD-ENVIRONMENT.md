@@ -51,14 +51,17 @@ assume `/opt/mde/cef` exists on generic farm VMs unless a packaging/install step
 has staged it.
 
 **RPM target-Fedora note (learned 2026-07-15):** all five farm build VMs
-currently report **Fedora 42**. Therefore `xcp-build.sh rpm` produces a native
-F42-linked RPM, even when the target workstation is Fedora 44. Do not install a
-native farm RPM on an F44 Workstation seat unless `rpm -Uvh --test` passes; media
-and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). The physical
-Workstation fleet is Fedora 44: its standard release path is the dedicated
-native F44 BigBoy builder documented in `docs/F44-BUILDER-AND-SEAT-DEPLOY.md`,
-with `MCNF_RPM_TARGET_FEDORA=44` set so `xcp-build.sh` rejects a mismatched
-builder before compiling. The Fedora 44 container lane is compatibility proof,
+currently report **Fedora 42**. A native cut explicitly targeted at Fedora 42
+therefore produces an F42-linked RPM; those builders cannot cut a native F44
+artifact. Do not install a native farm RPM on an F44 Workstation seat unless
+`rpm -Uvh --test` passes; media and ICU sonames can differ (`mpv-libs`, FFmpeg,
+ICU, Python). The native
+`xcp-build.sh rpm` path requires `MCNF_RPM_TARGET_FEDORA` and rejects an omitted
+or mismatched release before source sync or compilation. Intentional F42 native
+builds remain valid with `MCNF_RPM_TARGET_FEDORA=42`. The physical Workstation
+fleet is Fedora 44: its standard release path is the dedicated native F44 BigBoy
+builder documented in `docs/F44-BUILDER-AND-SEAT-DEPLOY.md`, with
+`MCNF_RPM_TARGET_FEDORA=44`. The Fedora 44 container lane is compatibility proof,
 not the current physical-seat release cut. A F42 RPM's FFmpeg requirements must
 never be filtered or overridden: they are produced from the shell binary's ELF
 dependencies and would fail at runtime even if a transaction were forced.
@@ -484,7 +487,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 | CEF live probe says `/opt/mde/cef` is missing on a farm VM | farm build VMs do not all have the packaged runtime staged under `/opt`; `.50` currently has the warm live bundle in `$HOME/mde-cef-active` | set `MDE_CEF_ROOT=$HOME/mde-cef-active` for `.50` probes, or run the packaging installer before using `/opt/mde/cef` |
 | `cargo test -p mde-web-cef` says the package does not match any packages | `mde-web-cef` is a nested standalone workspace outside the repo-root workspace package set | run through the farm with `cargo test --manifest-path crates/desktop/mde-web-cef/Cargo.toml ...` |
 | rsync code 23 while renaming a transient provider file in a farm slot | two `xcp-build.sh` jobs reused the same `MCNF_BUILD_SLOT` concurrently | use distinct slots for parallel jobs, or serialize the `xcp-build.sh` sync/build and direct-SSH into the warmed slot afterward |
-| native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
+| native farm RPM cut refuses an omitted or mismatched Fedora target | native RPM dependencies inherit the builder's Fedora sonames, so an implicit or cross-release cut is not promotable | set `MCNF_RPM_TARGET_FEDORA` to the builder's numeric release and select a matching builder; use `container-rpm 44` only when the versioned container lane is intended, then prove the result with `rpm -Uvh --test` before install |
 | Browser verifier still shows the old failure after an RPM install | an interactive dry-run/install paste may have let `rpm -Uvh --test` consume the queued real install, or only part of the split payload was replaced | run dry-run and install as separate commands; verify helper hashes with `sha256sum` plus `rpm -q --dump magic-mesh-browser`, then run `rpm -V magic-mesh-browser` before debugging runtime behavior |
 | Browser verifier passes but leaves new `/tmp/.mde-web-*-root-<pid>-<run>` directories after ordinary exit | the child cleaned its private `/oldroot` mount but not the host-visible old-root mountpoint before detaching it | normal exits should remove the old-root mountpoint before `umount2(\"/oldroot\", MNT_DETACH)`; compare `find /tmp -name '.mde-web-*-root-[0-9]*-[0-9]*'` before/after a verifier run and expect no new entries |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
@@ -545,7 +548,7 @@ against the distro before relying on it.
 |---|---|---|---|---|
 | **bootc immutable image base** | **42** | `packaging/bootc/Containerfile:53` (`ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42`) | "matches the fleet's RPM channel … mesh-service container is FROM fedora:42 too" (`Containerfile:50-52`); `--build-arg BOOTC_BASE=…` for an F43+ rebase (`:52`) | The **oldest** live target → the effective glibc **floor**. Anything installed *into* this image (RPM + layered dnf pkgs) must not require a glibc newer than F42's. |
 | **Canonical container RPM cut** | **43** (default) | `install-helpers/build-rpm-fedora43.sh:43` (`FEDORA="${1:-43}"`) | Builds the RPM inside a `fedora:43` container so its glibc `Requires` match F43 and it installs on F43 lighthouses / older cloud images (`:4-9`) | Produces an RPM installable on **F43 and newer** (forward-compat). Positional arg overrides the version. |
-| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**42** current) | `docs/BUILD-ENVIRONMENT.md:34` ("five Fedora 42 VMs"); verify live with `install-helpers/farm.sh status` + `/etc/fedora-release` before relying on it | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc and native library sonames**. Today this is an F42 artifact; it is not a safe F44 Workstation artifact when FFmpeg/ICU/Python sonames differ. For F44 seats, use `install-helpers/build-rpm-fedora43.sh 44` and `rpm -Uvh --test`. |
+| **Farm native RPM cut** (`xcp-build.sh rpm`) | explicitly named builder Fedora (`MCNF_RPM_TARGET_FEDORA`; farm VMs are **42** current) | `xcp-build.sh` probes `rpm -E %fedora` before source sync; verify live inventory with `install-helpers/farm.sh status` | Native release build/gates run on the farm VMs (§4) | Omitted and cross-release targets fail before compilation. An intentional F42 cut sets `MCNF_RPM_TARGET_FEDORA=42`; an F44 Workstation cut selects an F44 builder and sets `MCNF_RPM_TARGET_FEDORA=44`. |
 | **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
 | **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
 | **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/platform/WORKLIST.md:1132`). |
