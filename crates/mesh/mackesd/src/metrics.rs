@@ -58,13 +58,23 @@ pub struct Histogram {
 
 impl Histogram {
     /// Construct an empty histogram with the given buckets.
-    /// Buckets must be in ascending `le` order — callers that
-    /// pass unsorted buckets get incorrect percentile estimates.
+    ///
+    /// Prometheus requires finite, ascending bucket bounds.  Normalize
+    /// provider-supplied schedules at the ownership boundary so a malformed
+    /// optional metrics provider cannot publish NaN/Inf bounds or silently
+    /// corrupt percentile estimates by supplying an unsorted schedule.
     #[must_use]
     pub fn new(name: &'static str, help: &'static str, bucket_les: &[f64]) -> Self {
-        let buckets = bucket_les
+        let mut normalized: Vec<f64> = bucket_les
             .iter()
-            .map(|le| Bucket { le: *le, count: 0 })
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        normalized.sort_by(f64::total_cmp);
+        normalized.dedup_by(|left, right| left.total_cmp(right).is_eq());
+        let buckets = normalized
+            .into_iter()
+            .map(|le| Bucket { le, count: 0 })
             .collect();
         Self {
             name,
@@ -459,6 +469,22 @@ mod tests {
         for b in &h.buckets {
             assert_eq!(b.count, 0);
         }
+    }
+
+    #[test]
+    fn histogram_normalizes_hostile_provider_bucket_schedule() {
+        // An optional provider must not be able to make the shared exporter
+        // emit invalid Prometheus bounds or produce an incorrect percentile
+        // by handing the runtime an unsorted/duplicated schedule.
+        let mut h = Histogram::new("x", "x", &[5.0, f64::NAN, 1.0, 5.0, f64::INFINITY]);
+        assert_eq!(
+            h.buckets.iter().map(|bucket| bucket.le).collect::<Vec<_>>(),
+            vec![1.0, 5.0],
+        );
+        h.observe(2.0);
+        assert_eq!(h.buckets[0].count, 0);
+        assert_eq!(h.buckets[1].count, 1);
+        assert_eq!(h.percentile_estimate(0.5), Some(3.0));
     }
 
     #[test]

@@ -441,11 +441,11 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-responder-group-isolation-r5.md`.
 - **Nebula dispatcher ownership checkpoint (2026-08-09):** Control and Observation own distinct registered adapters; the other groups fail closed. Machine 196 passed 4/4
   admission guards; complete worker-role rerun remains: `docs/platform/evidence/WL-ARCH-009-2026-08-09-nebula-dispatcher-ownership-r95.md`.
-- **Metrics collector recovery checkpoint (2026-08-09):** a missing
-  node-exporter textfile directory is recreated, while symlink substitution
-  fails closed and atomic temporary files are cleaned on failure. Machine 194
-  passed 3/3 focused tests; Dell deployment proof remains:
+- **Metrics collector recovery checkpoint (2026-08-09):** missing textfile directory is recreated; symlink substitution fails closed; temporary files are cleaned on failure.
+  Machine 194 passed 3/3; Dell deployment proof remains:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
+- **Metrics bucket ownership checkpoint (2026-08-10):** provider schedules discard non-finite bounds, sort, and deduplicate before publication; `.90` passed the hostile regression:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-10-metrics-bucket-normalization-r184.md`.
 - **Compute Bus recovery (2026-08-09):** complete reads and durable pending output preserve Cloud/storage/workload/migration/scheduler truth across late/replaced Bus:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`,
