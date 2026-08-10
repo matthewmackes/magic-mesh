@@ -2152,6 +2152,11 @@ behavioral evidence is not completion.
   Final farm gates passed 10 journal, 17 shared, 2 daemon recovery, 6 CLI, and
   1 shell test, plus wrapper and collector/recorder/promotion hostile suites:
   `docs/platform/evidence/WL-UX-011-2026-08-10-surface-cancellation-journal-acceptance-seal-r18.md`.
+- **Physical network-interface provider checkpoint (2026-08-10):** Device
+  Inventory now publishes bounded, credential-free physical wired/Wi-Fi
+  interfaces with exact control-compatible sysfs identity and truthful link
+  state; `.90` passed the exact regression:
+  `docs/platform/evidence/WL-UX-011-2026-08-10-network-interface-provider-r19.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.
@@ -2337,6 +2342,16 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
 - **Seat 15 RDP catalog-TTL closure (2026-08-09):** release 27 kept the card available beyond the old two-minute cutoff and renewed it across two scans:
   `docs/platform/evidence/WL-FUNC-019-WL-UX-013-WL-ARCH-009-2026-08-09-release27-rdp-continuity-r100.md`.
+- **Canonical health Bus-twin checkpoint (2026-08-10):** an exact signed Bus
+  twin of already-staged canonical health now advances its cursor without a
+  false replay rejection; non-identical equal/older generations still fail
+  closed. `.90` passed the exact regression:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-health-bus-twin-r122.md`.
+- **Expected-return revision checkpoint (2026-08-10):** sleep/maintenance
+  idempotency now binds the requested return duration, so a revised deadline
+  publishes a new generation while exact and saturating retries remain stable;
+  `.90` passed the exact regression:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-expected-return-revision-r123.md`.
 - **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
   bounded/redacted support bundle through a private no-follow path and a synced
   atomic transaction, with honest failures and bounded top-N materialization.

@@ -744,6 +744,105 @@ pub fn input_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
         .collect()
 }
 
+/// Maximum physical network interfaces published by one inventory generation.
+/// Linux interface names are kernel-bounded; this additional entity cap keeps a
+/// hostile fixture or malformed sysfs mount from expanding the mesh artifact.
+const MAX_NETWORK_INTERFACES: usize = 256;
+
+/// Read at most `limit` children and sort that bounded sample for stable output.
+fn sorted_children_bounded(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd.take(limit).flatten().map(|entry| entry.path()).collect();
+    out.sort();
+    out
+}
+
+/// Physical network interfaces (`/sys/class/net/*`).
+///
+/// This is intentionally credential-free: it never reads addresses, SSIDs,
+/// connection profiles, or NetworkManager state. The class path is the exact
+/// generation identity consumed by the safe device-control executor. A
+/// `device` link distinguishes hardware-backed interfaces from loopback and
+/// transient virtual links; link state is observational and never interpreted
+/// as an administrative disable action.
+#[must_use]
+pub fn network_interfaces(roots: &SysfsRoots) -> Vec<DeviceRecord> {
+    sorted_children_bounded(&roots.sys.join("class").join("net"), MAX_NETWORK_INTERFACES)
+        .into_iter()
+        .filter_map(|dir| {
+            let node = dir.file_name()?.to_str()?;
+            if node == "lo" || std::fs::symlink_metadata(dir.join("device")).is_err() {
+                return None;
+            }
+
+            let wireless = dir.join("wireless").is_dir();
+            let operstate = read_trim(&dir.join("operstate"));
+            let carrier = read_trim(&dir.join("carrier")).and_then(|value| match value.as_str() {
+                "0" => Some("absent"),
+                "1" => Some("present"),
+                _ => None,
+            });
+            let (status, problem) = match (operstate.as_deref(), carrier) {
+                (Some("up"), Some("absent")) => (
+                    DeviceStatus::Unknown,
+                    Some("carrier absent while link reports up".to_string()),
+                ),
+                (Some("up"), _) => (DeviceStatus::Ok, None),
+                (
+                    Some(
+                        state @ ("down" | "dormant" | "lowerlayerdown" | "notpresent" | "testing"
+                        | "unknown"),
+                    ),
+                    _,
+                ) => (DeviceStatus::Unknown, Some(format!("link state: {state}"))),
+                _ => (
+                    DeviceStatus::Unknown,
+                    Some("link state unavailable".to_string()),
+                ),
+            };
+            let mut events = Vec::with_capacity(3);
+            events.push(if wireless {
+                "kind: wireless".to_string()
+            } else {
+                "kind: wired".to_string()
+            });
+            if let Some(state) = operstate.filter(|state| {
+                matches!(
+                    state.as_str(),
+                    "up" | "down"
+                        | "dormant"
+                        | "lowerlayerdown"
+                        | "notpresent"
+                        | "testing"
+                        | "unknown"
+                )
+            }) {
+                events.push(format!("link state: {state}"));
+            }
+            if let Some(carrier) = carrier {
+                events.push(format!("carrier: {carrier}"));
+            }
+
+            Some(DeviceRecord {
+                name: if wireless {
+                    format!("Wi-Fi interface {node}")
+                } else {
+                    format!("Network interface {node}")
+                },
+                sysfs_path: Some(dir.to_string_lossy().into_owned()),
+                driver: bound_driver(&dir.join("device")),
+                driver_version: driver_version(&dir.join("device")),
+                status,
+                problem,
+                events,
+                ..DeviceRecord::new(node, status)
+            })
+        })
+        .collect()
+}
+
 /// Sensors + thermal zones (`/sys/class/thermal/*` types + `/sys/class/hwmon/*`
 /// names). A thermal zone carries its current temperature as an event line.
 #[must_use]
@@ -930,6 +1029,11 @@ pub fn enumerate(
     add(&mut buckets, category::PROCESSORS, processors(roots));
     add(&mut buckets, category::MEMORY, memory(roots));
     add(&mut buckets, category::DISK_DRIVES, block_devices(roots));
+    add(
+        &mut buckets,
+        category::NETWORK_ADAPTERS,
+        network_interfaces(roots),
+    );
     add(&mut buckets, category::INPUT, input_devices(roots));
     add(&mut buckets, category::SENSORS, sensors(roots));
     add(&mut buckets, category::BLUETOOTH, bluetooth(roots));
@@ -1331,6 +1435,56 @@ mod tests {
         assert!(power_supplies(&roots)
             .iter()
             .any(|r| r.name.contains("Battery")));
+    }
+
+    #[test]
+    fn physical_network_interfaces_are_bounded_sourced_and_credential_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let net = roots.sys.join("class/net");
+        let wired = net.join("eno1");
+        put(&wired.join("operstate"), "down\n");
+        put(&wired.join("carrier"), "0\n");
+        put(
+            &wired.join("address"),
+            "credential-like-address-must-not-publish\n",
+        );
+        fs::create_dir_all(wired.join("device")).unwrap();
+        let wifi = net.join("wlan0");
+        put(&wifi.join("operstate"), "up\n");
+        put(&wifi.join("carrier"), "1\n");
+        put(
+            &wifi.join("ssid"),
+            "credential-like-ssid-must-not-publish\n",
+        );
+        fs::create_dir_all(wifi.join("device")).unwrap();
+        fs::create_dir_all(wifi.join("wireless")).unwrap();
+        put(&net.join("lo/operstate"), "unknown\n");
+        put(&net.join("veth0/operstate"), "up\n");
+
+        let records = network_interfaces(&roots);
+        assert_eq!(records.len(), 2);
+        let eno1 = records
+            .iter()
+            .find(|record| record.name.contains("eno1"))
+            .unwrap();
+        assert_eq!(eno1.status, DeviceStatus::Unknown);
+        assert_eq!(eno1.problem.as_deref(), Some("link state: down"));
+        assert_eq!(
+            Path::new(eno1.sysfs_path.as_deref().unwrap()),
+            wired.as_path()
+        );
+        let wlan0 = records
+            .iter()
+            .find(|record| record.name.contains("wlan0"))
+            .unwrap();
+        assert_eq!(wlan0.status, DeviceStatus::Ok);
+        assert!(wlan0.events.iter().any(|event| event == "kind: wireless"));
+
+        let published = serde_json::to_string(&records).unwrap();
+        assert!(!published.contains("credential-like"));
+        assert!(!published.contains("veth0"));
+        assert!(!published.contains("\"lo\""));
     }
 
     #[test]

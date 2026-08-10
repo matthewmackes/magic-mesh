@@ -972,6 +972,13 @@ fn ingest_health_bus_message(
         report.rejected += 1;
         return true;
     }
+    // The canonical file and durable Bus lane carry the same signed state in
+    // normal operation. Files are staged first, so consuming that exact Bus
+    // twin must advance the cursor without misclassifying it as a replay.
+    // Non-identical equal/older generations still fail closed below.
+    if ledger.retained(publisher) == Some(&candidate) {
+        return true;
+    }
     if let Err(error) = ledger.validate_candidate(&candidate, now_ms) {
         report.rejected += 1;
         tracing::warn!(
@@ -1457,6 +1464,44 @@ mod tests {
             )
             .expect("decode restored projection"),
             first
+        );
+    }
+
+    #[test]
+    fn health_ingress_advances_exact_bus_twin_of_canonical_state() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
+        let conn = fresh_store();
+        seed_node(&conn, "node-a");
+        let state = health_publication("node-a", 1, 100);
+        project_health_state(workgroup.path(), &state).expect("seed canonical state");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let message = persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&state).expect("encode state")),
+            )
+            .expect("publish matching Bus state");
+        let mut ingress = HealthIngressState::default();
+
+        let report = ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut ingress,
+            500,
+        )
+        .expect("ingress");
+
+        assert_eq!(report.accepted, 1, "canonical state is admitted once");
+        assert_eq!(report.rejected, 0, "its exact Bus twin is not a replay");
+        assert_eq!(ingress.ledger.retained("node-a"), Some(&state));
+        assert_eq!(
+            ingress.bus_cursors.get("node-a").map(String::as_str),
+            Some(message.ulid.as_str())
         );
     }
 

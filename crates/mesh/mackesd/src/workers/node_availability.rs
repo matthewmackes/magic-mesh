@@ -772,7 +772,7 @@ impl RuntimeAvailabilityPublisher {
 
         if let Some(previous) = &previous {
             retry_durable_publication(&mut persist, &self.bus_root, bus_identity, previous)?;
-            if runtime_request_matches(previous, &request) && now_ms <= previous.expires_at_ms {
+            if runtime_request_matches(previous, &request)? && now_ms <= previous.expires_at_ms {
                 return Ok(previous.clone());
             }
         }
@@ -824,12 +824,21 @@ pub fn runtime_availability_path(workgroup_root: &Path, node_id: &str) -> PathBu
 fn runtime_request_matches(
     current: &NodeAvailabilityIntent,
     request: &RuntimeAvailabilityRequest,
-) -> bool {
-    current.state == request.state
+) -> Result<bool, RuntimeAvailabilityError> {
+    let requested_return_delay = request.expected_return_after.map(duration_ms).transpose()?;
+    let expected_return_matches = match (&current.expected_return, requested_return_delay) {
+        (Some(expected), Some(delay)) => {
+            expected.expected_at_ms == current.observed_at_ms.saturating_add(delay)
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    Ok(current.state == request.state
         && current.source == request.source
         && current.reason == request.reason
+        && expected_return_matches
         && current.old_connectivity == request.old_connectivity
-        && current.new_connectivity == request.new_connectivity
+        && current.new_connectivity == request.new_connectivity)
 }
 
 fn build_runtime_intent(
@@ -2115,6 +2124,75 @@ mod tests {
             .list_since(&node_health_topic("node-a"), None)
             .expect("read events");
         assert_eq!(rows.len(), 2, "the idempotent retry must not mint an event");
+    }
+
+    #[test]
+    fn runtime_publisher_publishes_revised_expected_return_deadline() {
+        let bus = tempfile::tempdir().expect("bus");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(bus.path(), &durable);
+
+        let original = publisher
+            .publish_at(runtime_sleep_request(), 10_000)
+            .expect("publish original expected return");
+        let revised = publisher
+            .publish_at(
+                RuntimeAvailabilityRequest::lifecycle(
+                    NodeAvailabilityState::Sleeping,
+                    "host-state-power",
+                    "managed suspend",
+                    Some(Duration::from_secs(120)),
+                ),
+                11_000,
+            )
+            .expect("publish revised expected return");
+
+        assert_eq!(revised.generation, original.generation + 1);
+        assert_ne!(revised.event_id, original.event_id);
+        assert_eq!(
+            revised
+                .expected_return
+                .as_ref()
+                .map(|expected| expected.expected_at_ms),
+            Some(131_000)
+        );
+        assert_eq!(
+            publisher.current_intent().expect("read revised truth"),
+            Some(revised.clone())
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        assert_eq!(
+            persist
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("read expected-state transitions")
+                .len(),
+            2
+        );
+
+        let saturated_bus = tempfile::tempdir().expect("saturated bus");
+        let saturated_state = tempfile::tempdir().expect("saturated state");
+        let saturated_durable = saturated_state.path().join("availability/current.json");
+        let saturated_publisher = runtime_publisher(saturated_bus.path(), &saturated_durable);
+        let saturated = saturated_publisher
+            .publish_at(runtime_sleep_request(), u64::MAX - 30_000)
+            .expect("publish saturated expected return");
+        let saturated_retry = saturated_publisher
+            .publish_at(runtime_sleep_request(), u64::MAX - 20_000)
+            .expect("retry saturated expected return");
+        assert_eq!(
+            saturated_retry, saturated,
+            "saturation must not turn an exact retry into a revision"
+        );
+        let saturated_persist =
+            Persist::open(saturated_bus.path().to_path_buf()).expect("open saturated Bus");
+        assert_eq!(
+            saturated_persist
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("read saturated expected-state transition")
+                .len(),
+            1
+        );
     }
 
     #[test]
