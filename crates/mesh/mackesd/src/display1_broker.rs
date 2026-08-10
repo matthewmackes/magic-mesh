@@ -1271,6 +1271,17 @@ macro_rules! qemu_input_call {
 }
 
 impl Display1InputState {
+    /// Forget every edge and sequence tied to a relay that is no longer the
+    /// active QEMU endpoint. Release attempts are best effort because the old
+    /// endpoint may already have vanished; retaining failed edges would make
+    /// them stale state for the next relay and can reject legitimate input.
+    fn reset_after_relay_loss(&mut self) {
+        self.focused = false;
+        self.last_sequence = 0;
+        self.held_keys.clear();
+        self.held_buttons.clear();
+    }
+
     fn admit_sequence(&mut self, sequence: u64) -> Result<(), Display1Error> {
         if sequence == 0 || sequence <= self.last_sequence {
             return Err(Display1Error::Attachment(
@@ -1285,8 +1296,9 @@ impl Display1InputState {
     pub async fn replace_relay(&mut self, peer: &Display1Peer) -> Result<(), Display1Error> {
         let result = self.release_all(peer).await;
         // A vanished old QEMU endpoint must not retain stale sequence/focus or
-        // prevent a subsequently registered relay from starting cleanly.
-        self.last_sequence = 0;
+        // prevent a subsequently registered relay from starting cleanly. This
+        // also clears edges whose best-effort release failed above.
+        self.reset_after_relay_loss();
         result
     }
 
@@ -2010,6 +2022,24 @@ mod tests {
             Err(Display1Error::Attachment(message))
                 if message.contains("replayed or non-monotonic")
         ));
+    }
+
+    #[test]
+    fn relay_loss_reset_clears_stale_focus_edges_and_sequence() {
+        let mut state = Display1InputState {
+            focused: true,
+            last_sequence: u64::MAX,
+            held_keys: BTreeSet::from([30, 31]),
+            held_buttons: BTreeSet::from([0, 2]),
+        };
+
+        state.reset_after_relay_loss();
+
+        assert!(!state.focused);
+        assert_eq!(state.last_sequence, 0);
+        assert!(state.held_keys.is_empty());
+        assert!(state.held_buttons.is_empty());
+        assert!(state.admit_sequence(1).is_ok());
     }
 
     #[test]
