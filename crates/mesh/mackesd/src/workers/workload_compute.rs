@@ -1356,6 +1356,7 @@ impl SystemWorkloadActuator {
     fn qemu_display1_address(
         request: &WorkloadOperationRequest,
     ) -> Result<String, WorkloadActuatorError> {
+        let domain = Self::libvirt_domain(request);
         let mut command = Command::new("virsh");
         command.args([
             "--connect",
@@ -1363,7 +1364,7 @@ impl SystemWorkloadActuator {
             "domdisplay",
             "--type",
             "dbus",
-            Self::libvirt_domain(request),
+            &domain,
         ]);
         let output = output_with_timeout(command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
             WorkloadActuatorError::Retryable(format!("Display1 address probe failed: {error}"))
@@ -1377,12 +1378,13 @@ impl SystemWorkloadActuator {
     }
 
     fn domain_defined(request: &WorkloadOperationRequest) -> Result<bool, String> {
+        let domain = Self::libvirt_domain(request);
         let mut command = Command::new("virsh");
         command.args([
             "--connect",
             "qemu:///system",
             "dominfo",
-            Self::libvirt_domain(request),
+            &domain,
         ]);
         let output = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             .map_err(|error| format!("domain existence probe failed: {error}"))?;
@@ -1622,16 +1624,30 @@ impl SystemWorkloadActuator {
         Ok(())
     }
 
-    /// Source identities are globally stable (`vm:<node>:<domain>`), while
-    /// libvirt receives only the domain component. Keep that translation in the
-    /// sole actuator so every caller can use one collision-resistant identity.
-    fn libvirt_domain(request: &WorkloadOperationRequest) -> &str {
-        request
-            .workload_id
-            .as_str()
+    /// Source identities are globally stable, but the final component alone
+    /// is not unique: two app VMs can share an app name or catalog revision.
+    /// Keep the full identity in a bounded deterministic domain name, with a
+    /// digest suffix preventing truncation collisions.
+    fn libvirt_domain(request: &WorkloadOperationRequest) -> String {
+        let identity = request.workload_id.as_str();
+        let readable = identity
             .rsplit(':')
             .next()
-            .unwrap_or(request.workload_id.as_str())
+            .unwrap_or(identity)
+            .chars()
+            .filter(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+            .take(40)
+            .collect::<String>();
+        let digest = Sha256::digest(identity.as_bytes());
+        let digest = digest[..8]
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        if readable.is_empty() {
+            format!("mde-vm-{digest}")
+        } else {
+            format!("mde-vm-{readable}-{digest}")
+        }
     }
 
     fn runtime_name(request: &WorkloadOperationRequest) -> String {
@@ -1798,7 +1814,7 @@ impl SystemWorkloadActuator {
     fn destroy_vm(request: &WorkloadOperationRequest) -> Result<(), String> {
         let domain = Self::libvirt_domain(request);
         let mut destroy = Command::new("virsh");
-        destroy.args(["--connect", "qemu:///system", "destroy", domain]);
+        destroy.args(["--connect", "qemu:///system", "destroy", &domain]);
         let destroy_output = output_with_timeout(destroy, DEFAULT_CMD_TIMEOUT)
             .map_err(|error| format!("destroy actuator failed to start: {error}"))?;
         if !destroy_output.status.success() {
@@ -1817,7 +1833,7 @@ impl SystemWorkloadActuator {
             "--connect",
             "qemu:///system",
             "undefine",
-            domain,
+            &domain,
             "--managed-save",
             "--nvram",
         ]);
@@ -1851,12 +1867,13 @@ impl SystemWorkloadActuator {
                 if verb == "start" {
                     require_workload_audio_endpoint()?;
                 }
+                let domain = Self::libvirt_domain(request);
                 let mut command = Command::new("virsh");
                 command.args([
                     "--connect",
                     "qemu:///system",
                     verb,
-                    Self::libvirt_domain(request),
+                    &domain,
                 ]);
                 status_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             }
@@ -1877,12 +1894,13 @@ impl SystemWorkloadActuator {
     fn running(request: &WorkloadOperationRequest) -> Result<bool, String> {
         let output = match request.backend {
             WorkloadBackend::LibvirtVirtqemud => {
+                let domain = Self::libvirt_domain(request);
                 let mut command = Command::new("virsh");
                 command.args([
                     "--connect",
                     "qemu:///system",
                     "domstate",
-                    Self::libvirt_domain(request),
+                    &domain,
                 ]);
                 output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             }
@@ -5681,11 +5699,37 @@ mod tests {
     fn stable_source_identity_maps_to_the_libvirt_domain_name() {
         let mut request = request();
         request.workload_id = WorkloadId::new("vm:seat15:browser").expect("id");
-        assert_eq!(SystemWorkloadActuator::libvirt_domain(&request), "browser");
+        let domain = SystemWorkloadActuator::libvirt_domain(&request);
+        assert!(domain.starts_with("mde-vm-browser-"));
+        assert_eq!(domain.len(), "mde-vm-browser-".len() + 16);
         assert_eq!(
             SystemWorkloadActuator::vm_overlay_path(&request),
-            Path::new("/var/lib/mde-vms/browser.qcow2")
+            Path::new("/var/lib/mde-vms").join(format!("{domain}.qcow2"))
         );
+    }
+
+    #[test]
+    fn hostile_workload_id_suffixes_cannot_alias_a_vm_domain_or_overlay() {
+        let mut first = request();
+        first.workload_id = WorkloadId::new("app-vm:seat15:writer:org.example.Writer:catalog-7")
+            .expect("first id");
+        let mut second = first.clone();
+        second.workload_id = WorkloadId::new("app-vm:seat15:reader:org.example.Reader:catalog-7")
+            .expect("second id");
+
+        let first_domain = SystemWorkloadActuator::libvirt_domain(&first);
+        let second_domain = SystemWorkloadActuator::libvirt_domain(&second);
+        assert_ne!(
+            first_domain, second_domain,
+            "full Workload identity must survive the libvirt naming boundary"
+        );
+        assert_ne!(
+            SystemWorkloadActuator::vm_overlay_path(&first),
+            SystemWorkloadActuator::vm_overlay_path(&second),
+            "colliding final components must not share a managed overlay"
+        );
+        assert!(first_domain.len() <= 63);
+        assert!(second_domain.len() <= 63);
     }
 
     #[test]
