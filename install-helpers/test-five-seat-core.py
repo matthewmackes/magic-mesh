@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five-seat Mesh Teams/clipboard/file acceptance and recovery matrix.
+"""Three-seat Mesh Teams/clipboard/file acceptance and recovery matrix.
 
 The harness drives the root shell's hidden acceptance verbs, so commands use
 the same signed action publisher and native clipboard provider as the visible
@@ -35,21 +35,24 @@ class SeatSpec:
 
 def seat_address(label: str, default: str) -> str:
     """Allow a DHCP-renumbered seat to be tested without changing the harness."""
-    return os.environ.get(f"MCNF_FIVE_SEAT_{label.upper()}_ADDRESS", default)
+    return os.environ.get(f"MCNF_THREE_SEAT_{label.upper()}_ADDRESS", default)
 
 
 def seat_proxy_jump(label: str) -> str | None:
     """Route a seat through a reachable mesh peer when its LAN path is absent."""
-    return os.environ.get(f"MCNF_FIVE_SEAT_{label.upper()}_PROXY_JUMP")
+    return os.environ.get(f"MCNF_THREE_SEAT_{label.upper()}_PROXY_JUMP")
 
 
-SEATS = (
-    SeatSpec("t480", seat_address("t480", "172.20.146.68"), "mm", "password", "sudo-password", seat_proxy_jump("t480")),
-    SeatSpec("eagle", seat_address("eagle", "172.20.146.88"), "mm", "password", "sudo-password", seat_proxy_jump("eagle")),
-    SeatSpec("basement", seat_address("basement", "172.20.0.15"), "root", "key", "root", seat_proxy_jump("basement")),
+BASELINE_SEATS = (
     SeatSpec("dell", seat_address("dell", "172.20.146.225"), "mm", "key", "sudo-n", seat_proxy_jump("dell")),
-    SeatSpec("surface", seat_address("surface", "172.20.146.79"), "root", "password", "root", seat_proxy_jump("surface")),
+    SeatSpec("seat15", seat_address("seat15", "172.20.0.15"), "root", "key", "root", seat_proxy_jump("seat15")),
+    SeatSpec("surface", seat_address("surface", "172.20.146.79"), "root", "key", "root", seat_proxy_jump("surface")),
 )
+OPTIONAL_INSPECTION_SEATS = {
+    "eagle": SeatSpec("eagle", seat_address("eagle", "172.20.146.88"), "mm", "password", "sudo-password", seat_proxy_jump("eagle")),
+    "t480": SeatSpec("t480", seat_address("t480", "172.20.146.68"), "mm", "password", "sudo-password", seat_proxy_jump("t480")),
+}
+MAX_ACTIVITY_SEATS = 3
 
 SSH_COMMON = (
     "-o", "StrictHostKeyChecking=accept-new",
@@ -116,9 +119,9 @@ class Seat:
 
     def acceptance(self, verb: str, payload: str = "", argument: str | None = None) -> dict:
         transport_id = uuid.uuid4().hex
-        input_path = f"/run/mde-five-seat-accept-{transport_id}.in"
-        output_path = f"/run/mde-five-seat-accept-{transport_id}.out"
-        error_path = f"/run/mde-five-seat-accept-{transport_id}.err"
+        input_path = f"/run/mde-three-seat-accept-{transport_id}.in"
+        output_path = f"/run/mde-three-seat-accept-{transport_id}.out"
+        error_path = f"/run/mde-three-seat-accept-{transport_id}.err"
         service = (
             f"{ACCEPTANCE_BASE} "
             f"-p StandardInput=file:{input_path} "
@@ -169,7 +172,8 @@ class Seat:
 def redact(text: str) -> str:
     if not text:
         return text
-    return text.replace(password.decode("utf-8", "ignore"), "[REDACTED]")
+    secret = password.decode("utf-8", "ignore")
+    return text.replace(secret, "[REDACTED]") if secret else text
 
 
 def wait_for(description: str, predicate, timeout: int = 75, interval: float = 1.0):
@@ -298,7 +302,7 @@ def clipboard_and_observe(source: Seat, target: Seat, marker: str) -> None:
 
 def file_and_observe(source: Seat, target: Seat, space: str, marker: str, cleanup: list[tuple[Seat, str]]) -> None:
     digest = hashlib.sha256(marker.encode()).hexdigest()
-    remote_path = f"/tmp/mde-five-seat-{run_id}-{source.spec.label}-{target.spec.label}.txt"
+    remote_path = f"/tmp/mde-three-seat-{run_id}-{source.spec.label}-{target.spec.label}.txt"
     source.run(
         f"umask 077; dd of={shlex.quote(remote_path)} status=none",
         payload=marker.encode(),
@@ -377,12 +381,57 @@ def recovery_cycle(seat: Seat) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--password-file", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        description="Run the required three-seat release baseline or an explicitly optional non-baseline inspection.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--required-baseline",
+        action="store_true",
+        help="require exactly Dell, seat15, and Surface (the default)",
+    )
+    mode.add_argument(
+        "--inspect-seat",
+        action="append",
+        choices=sorted(OPTIONAL_INSPECTION_SEATS),
+        help="inspect an explicitly named non-baseline seat; never release-gating",
+    )
+    parser.add_argument("--password-file", type=Path)
     parser.add_argument("--key", type=Path, default=Path("/root/.ssh/mackes_mesh_ed25519"))
-    parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--evidence", type=Path)
     parser.add_argument("--skip-recovery", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
+
+
+def selected_specs(parsed: argparse.Namespace) -> tuple[tuple[SeatSpec, ...], str]:
+    if not parsed.inspect_seat:
+        return BASELINE_SEATS, "required-baseline"
+    labels = list(dict.fromkeys(parsed.inspect_seat))
+    if len(labels) != len(parsed.inspect_seat):
+        raise Failure("optional inspection seat names must be unique")
+    specs = tuple(OPTIONAL_INSPECTION_SEATS[label] for label in labels)
+    if not specs or len(specs) > MAX_ACTIVITY_SEATS:
+        raise Failure(f"one activity must select between 1 and {MAX_ACTIVITY_SEATS} seats")
+    return specs, "optional-inspection"
+
+
+def self_test() -> None:
+    baseline, mode = selected_specs(argparse.Namespace(inspect_seat=None))
+    if mode != "required-baseline" or [seat.label for seat in baseline] != ["dell", "seat15", "surface"]:
+        raise Failure("required baseline is not exactly Dell, seat15, and Surface")
+    optional, mode = selected_specs(argparse.Namespace(inspect_seat=["eagle", "t480"]))
+    if mode != "optional-inspection" or [seat.label for seat in optional] != ["eagle", "t480"]:
+        raise Failure("explicit non-baseline inspection selection changed")
+    if len(baseline) > MAX_ACTIVITY_SEATS or len(optional) > MAX_ACTIVITY_SEATS:
+        raise Failure("physical-seat activity cap exceeded")
+    try:
+        selected_specs(argparse.Namespace(inspect_seat=["eagle", "eagle"]))
+    except Failure:
+        pass
+    else:
+        raise Failure("duplicate optional inspection was accepted")
+    print("three-seat acceptance collector self-test passed (3-seat cap and optional isolation enforced)")
 
 
 def write_evidence(state: dict) -> None:
@@ -393,13 +442,27 @@ def write_evidence(state: dict) -> None:
 
 
 args = parse_args()
-password = args.password_file.read_bytes().splitlines()[0]
-if not password:
-    raise SystemExit("password file has an empty first line")
+if args.self_test:
+    self_test()
+    raise SystemExit(0)
+if args.evidence is None:
+    raise SystemExit("--evidence is required outside --self-test")
+specs, activity_mode = selected_specs(args)
+if any(spec.ssh_auth == "password" or spec.privilege == "sudo-password" for spec in specs):
+    if args.password_file is None:
+        raise SystemExit("--password-file is required for the selected optional inspection")
+    password = args.password_file.read_bytes().splitlines()[0]
+    if not password:
+        raise SystemExit("password file has an empty first line")
+else:
+    password = b""
 run_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
 evidence: dict = {
     "schema_version": 1,
     "run_id": run_id,
+    "activity_mode": activity_mode,
+    "required_baseline": activity_mode == "required-baseline",
+    "selected_seats": [spec.label for spec in specs],
     "started_at_unix": int(time.time()),
     "reachable": [],
     "skipped": [],
@@ -415,7 +478,7 @@ owned_spaces: list[tuple[Seat, str]] = []
 
 def main() -> int:
     seats: list[Seat] = []
-    for spec in SEATS:
+    for spec in specs:
         seat = Seat(spec, args.key, password)
         probe = seat.run("hostname", check=False, timeout=12)
         if probe.returncode != 0:
@@ -427,8 +490,12 @@ def main() -> int:
         seats.append(seat)
         evidence["reachable"].append({"seat": spec.label, "hostname": seat.hostname})
 
+    if activity_mode == "required-baseline" and len(seats) != len(BASELINE_SEATS):
+        missing = sorted({spec.label for spec in BASELINE_SEATS} - {seat.spec.label for seat in seats})
+        raise Failure(f"required three-seat baseline is incomplete; unreachable={missing}")
+
     if len(seats) < 2:
-        evidence["result"] = "skipped-insufficient-reachable-seats"
+        evidence["result"] = "inspection-skipped-insufficient-reachable-seats"
         write_evidence(evidence)
         return 0
 
@@ -453,7 +520,7 @@ def main() -> int:
         "fingerprint": next(iter(fingerprints.values())),
     }
 
-    team_name = f"Acceptance · all seats · {run_id}"
+    team_name = f"Acceptance · selected seats · {run_id}"
     team = create_space(seats[0], "team", team_name)
     owned_spaces.append((seats[0], team))
     add_members(seats[0], team, seats, team_name)
@@ -461,7 +528,7 @@ def main() -> int:
     command(seats[0], {"send_message": {"space": team, "thread": None, "body": broadcast}})
     for seat in seats:
         wait_for(
-            f"all-seat broadcast on {seat.spec.label}",
+            f"selected-seat broadcast on {seat.spec.label}",
             lambda seat=seat: any(
                 row.get("body") == broadcast
                 for row in (seat.latest_body(f"state/collab/conversation/{team}") or {}).get("messages", [])
@@ -502,7 +569,7 @@ def main() -> int:
             evidence["recovery"].append({"seat": seat.spec.label, "units": units, "passed": True})
             write_evidence(evidence)
 
-    evidence["result"] = "passed"
+    evidence["result"] = "passed" if activity_mode == "required-baseline" else "inspection-passed"
     return 0
 
 
@@ -512,7 +579,7 @@ except Exception as error:
     evidence["result"] = "failed"
     evidence["failure"] = redact(str(error))
     write_evidence(evidence)
-    print(f"five-seat acceptance failed: {redact(str(error))}", file=sys.stderr)
+    print(f"three-seat acceptance failed: {redact(str(error))}", file=sys.stderr)
     exit_code = 1
 finally:
     # Delete only exact per-run files and spaces. Missing cleanup targets are

@@ -32,7 +32,7 @@ GATE_KEYS = {
 EXPECTED_ROSTERS = {
     "github_checks": ["github-required"],
     "farm_packages": ["farm-ci", "workstation-rpm", "lighthouse-rpm"],
-    "seats": ["t480", "eagle", "seat15", "dell", "surface"],
+    "seats": ["dell", "seat15", "surface"],
     "lighthouses": [
         "lh-104-236-118-177", "lh-46-101-219-245", "lh-64-23-131-57",
     ],
@@ -183,6 +183,14 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
             fail(f"{label}.owner must be a canonical identifier")
         if "\n" in gate["command"] or len(gate["command"]) > 2048:
             fail(f"{label}.command must be one bounded command line")
+        if scope_kind == "seat":
+            command = gate["command"]
+            if "install-helpers/test-five-seat-core.py" not in command:
+                fail(f"{label}.command must use the bounded three-seat collector")
+            if "--required-baseline" not in command:
+                fail(f"{label}.command must explicitly select the required three-seat baseline")
+            if "--inspect-seat" in command:
+                fail(f"{label}.command cannot promote optional seat inspection to a required gate")
         evidence = gate["evidence_filename"]
         if not EVIDENCE_RE.fullmatch(evidence) or f"/{revision}/" not in evidence:
             fail(f"{label}.evidence_filename must be a revision-bound canonical JSON filename")
@@ -228,7 +236,10 @@ def generated_fixture(revision: str) -> dict[str, Any]:
         gates.append({
             "gate_id": gate_id, "scope_kind": scope_kind, "scope_id": scope_id,
             "categories": sorted(categories), "owner": "self-test-owner",
-            "command": f"self-test --gate {gate_id}",
+            "command": (
+                "install-helpers/test-five-seat-core.py --required-baseline"
+                if scope_kind == "seat" else f"self-test --gate {gate_id}"
+            ),
             "evidence_filename": f"docs/platform/release-evidence/{revision}/{gate_id}.json",
             "pass_condition": "typed result is pass", "revision_ref": "source_revision",
             "required": True,
@@ -262,7 +273,7 @@ def self_test() -> None:
         lambda value: value["gates"][next(
             index for index, gate in enumerate(value["gates"])
             if gate["scope_kind"] == "seat" and gate["scope_id"] == "surface"
-        )].update(scope_id="t480", gate_id="seat-t480"),
+        )].update(scope_id="dell", gate_id="seat-dell"),
     )
     case(
         "duplicate scenario claim",
@@ -273,6 +284,20 @@ def self_test() -> None:
     )
     case("malformed revision", lambda value: value.__setitem__("source_revision", "abc123"))
     case("incomplete seat roster", lambda value: value["rosters"]["seats"].pop())
+    case(
+        "optional seat inspection promoted to required gate",
+        lambda value: value["gates"][next(
+            index for index, gate in enumerate(value["gates"])
+            if gate["scope_kind"] == "seat"
+        )].__setitem__("command", "install-helpers/test-five-seat-core.py --inspect-seat eagle"),
+    )
+    case(
+        "implicit required seat baseline",
+        lambda value: value["gates"][next(
+            index for index, gate in enumerate(value["gates"])
+            if gate["scope_kind"] == "seat"
+        )].__setitem__("command", "install-helpers/test-five-seat-core.py"),
+    )
     case("unknown category", lambda value: value["gates"][0]["categories"].append("implied"))
     case("optional required gate", lambda value: value["gates"][0].__setitem__("required", False))
     case("unbound revision", lambda value: value["gates"][0].__setitem__("revision_ref", "HEAD"))

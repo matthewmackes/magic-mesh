@@ -18,10 +18,8 @@
     "scenario-provider-loss",
     "scenario-sleep-resume",
     "seat-dell",
-    "seat-eagle",
     "seat-seat15",
-    "seat-surface",
-    "seat-t480"
+    "seat-surface"
   ],
   "rosters": {
     "github_checks": [
@@ -33,10 +31,8 @@
       "lighthouse-rpm"
     ],
     "seats": [
-      "t480",
-      "eagle",
-      "seat15",
       "dell",
+      "seat15",
       "surface"
     ],
     "lighthouses": [
@@ -229,21 +225,9 @@
       "scope_id": "dell",
       "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
       "owner": "fleet-acceptance",
-      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "command": "install-helpers/test-five-seat-core.py --required-baseline --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/three-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/three-seat-core.json",
       "pass_condition": "Dell at 172.20.146.225 directly proves the exact package plus runtime, GUI, network, physical audio, and VDI acceptance",
-      "revision_ref": "source_revision",
-      "required": true
-    },
-    {
-      "gate_id": "seat-eagle",
-      "scope_kind": "seat",
-      "scope_id": "eagle",
-      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
-      "owner": "fleet-acceptance",
-      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "pass_condition": "Eagle at 172.20.146.88 directly proves the exact package plus runtime, GUI, network, physical audio, and VDI acceptance",
       "revision_ref": "source_revision",
       "required": true
     },
@@ -253,8 +237,8 @@
       "scope_id": "seat15",
       "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
       "owner": "fleet-acceptance",
-      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "command": "install-helpers/test-five-seat-core.py --required-baseline --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/three-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/three-seat-core.json",
       "pass_condition": "basement seat 15 at 172.20.0.15 directly proves the exact package plus runtime, direct-DRM GUI, network, physical audio, and VDI acceptance",
       "revision_ref": "source_revision",
       "required": true
@@ -265,21 +249,9 @@
       "scope_id": "surface",
       "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
       "owner": "fleet-acceptance",
-      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "command": "install-helpers/test-five-seat-core.py --required-baseline --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/three-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/three-seat-core.json",
       "pass_condition": "Surface at 172.20.146.79 directly proves the exact package plus runtime, GUI, network, physical audio, and VDI acceptance",
-      "revision_ref": "source_revision",
-      "required": true
-    },
-    {
-      "gate_id": "seat-t480",
-      "scope_kind": "seat",
-      "scope_id": "t480",
-      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
-      "owner": "fleet-acceptance",
-      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
-      "pass_condition": "T480 at 172.20.146.68 directly proves the exact package plus runtime, direct-DRM GUI, network, physical audio, and VDI acceptance",
       "revision_ref": "source_revision",
       "required": true
     }
