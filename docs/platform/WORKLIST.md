@@ -1171,6 +1171,10 @@ behavioral evidence is not completion.
   issuance, expiry, or ambiguity checks do not hold;
   seat 50 passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-action-admission-r159.md`.
+- **Failed-probe launch admission checkpoint (2026-08-10):** an enabled service
+  whose latest endpoint test failed remains unavailable and cannot expose a typed
+  `launch` action; seat 90 passed the focused regression:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-failed-service-probe-launch-r164.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
 - **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card
@@ -1962,6 +1966,10 @@ behavioral evidence is not completion.
   remains. Evidence:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`,
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-recovery-readiness-order-r149.md`.
+- **Post-lock network attestation checkpoint (2026-08-10):** recovery rechecks
+  network readiness after acquiring its single-flight lock and refuses all
+  mutation if the link disappeared; seat 90 passed the stale-network fixture:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-post-lock-network-attestation-r163.md`.
 - **Syncthing reconcile bound (2026-08-10):** timer/manual runs now serialize
   and bound CLI/registry calls, preventing stalled overlap from amplifying CPU;
   `.50` passed the device-scope self-test:
