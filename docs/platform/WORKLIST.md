@@ -2083,6 +2083,14 @@ behavioral evidence is not completion.
   the kernel signing key/capacity, release-signed artifact set, approved SSH key
   artifact, governed canonical-seat access, and direct Pro 6 then Pro 5 proof:
   `docs/platform/evidence/WL-UX-011-2026-08-10-surface-pro56-first-class-runtime-r16.md`.
+- **Surface pending-action cancellation checkpoint (2026-08-10):** Surface
+  enable/MOK and exact-device firmware apply now accept a separately signed,
+  exact-target cancellation only before the local worker claims effects.
+  Durable cancellation claims recover after a daemon crash without reviving
+  expired authority; late/refused cancellation never interrupts effects or
+  replaces the original result. Focused farm gates passed 11 daemon, 3 shared
+  contract, 1 shell, and 1 root-CLI test:
+  `docs/platform/evidence/WL-UX-011-2026-08-10-surface-pending-cancellation-r17.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.
