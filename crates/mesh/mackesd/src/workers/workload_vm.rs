@@ -116,7 +116,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
          \x20 <resource><partition>/machine.slice</partition></resource>\n\
          \x20 <devices>\n\
          \x20   <disk type='file' device='disk'>\n\
-         \x20     <driver name='qemu' type='qcow2' cache='none' io='native' iothread='1'/>\n\
+         \x20     <driver name='qemu' type='qcow2' cache='none' io='native' iothread='1' discard='unmap'/>\n\
          \x20     <source file='{disk}'/>\n\
          \x20     <target dev='vda' bus='virtio'/>\n\
          \x20   </disk>\n\
@@ -172,7 +172,7 @@ mod tests {
         assert!(xml.contains("<iothreads>1</iothreads>"));
         assert!(xml.contains("<topology sockets='1' dies='1' cores='2' threads='1'/>"));
         assert!(xml
-            .contains("<driver name='qemu' type='qcow2' cache='none' io='native' iothread='1'/>"));
+            .contains("<driver name='qemu' type='qcow2' cache='none' io='native' iothread='1' discard='unmap'/>"));
         assert!(xml.contains("<vcpupin vcpu='0' cpuset='1'/>"));
         assert!(xml.contains("<vcpupin vcpu='1' cpuset='2'/>"));
         assert!(xml.contains("<emulatorpin cpuset='1,2'/>"));
