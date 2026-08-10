@@ -1810,6 +1810,31 @@ fn manual_store_path(store_root: &Path) -> PathBuf {
     store_root.join(MANUAL_STORE_FILE)
 }
 
+fn open_manual_store_root(store_root: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+
+        return Ok(rustix::fs::open(
+            store_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into());
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(store_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manual source store root is not a real directory",
+            ));
+        }
+        std::fs::File::open(store_root)
+    }
+}
+
 /// Read the node-local manual-source store through the descriptor that will be
 /// parsed. Refuse final symlinks, blocking special files, oversized input,
 /// invalid UTF-8, and files that change while being materialized.
@@ -1903,6 +1928,7 @@ fn save_manual_sources_with_rename(
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(store_root)?;
+    let store_dir = open_manual_store_root(store_root)?;
     let json = serde_json::to_string_pretty(sources)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if json.len() > MAX_MANUAL_STORE_BYTES {
@@ -1926,7 +1952,7 @@ fn save_manual_sources_with_rename(
         file.sync_all()?;
         drop(file);
         rename(&tmp, &manual_store_path(store_root))?;
-        std::fs::File::open(store_root)?.sync_all()
+        store_dir.sync_all()
     })();
     if result.is_err() {
         // One known temp path, one bounded cleanup attempt. Never recurse into
@@ -4521,6 +4547,19 @@ mod tests {
                 "final symlinks must not be followed"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_store_rejects_a_symlinked_store_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let root = dir.path().join("desktops");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+
+        assert!(save_manual_sources(&root, &[]).is_err());
+        assert!(!target.join(MANUAL_STORE_FILE).exists());
     }
 
     #[test]
