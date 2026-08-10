@@ -49,6 +49,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 
+#[cfg(feature = "async-services")]
+use mackes_mesh_types::surface_enable::{
+    SurfaceEnableActivation as SharedActivation, SurfaceEnableConfig as SharedConfig,
+    SurfaceEnableConfigResult as SharedConfigResult, SurfaceEnableMokState as SharedMokState,
+    SurfaceEnableOutcome as SharedOutcome, SurfaceEnableRefusal as SharedRefusal,
+    SurfaceEnableResult as SharedEnableResult, SurfaceEnableSource as SharedSource,
+    SurfaceEnableStepOutcome as SharedStepOutcome, SurfaceEnableUnit as SharedUnit,
+    SurfaceEnableUnitResult as SharedUnitResult, SURFACE_ENABLE_RESULT_SCHEMA_VERSION,
+};
 use mackes_mesh_types::surface_hardware::SurfaceProGeneration;
 
 use super::{Subsystem, SurfaceDetection, SurfaceDevice, SurfaceModel, SurfaceProfile};
@@ -905,6 +914,18 @@ pub struct EnableResult {
     pub activation: ActivationResult,
     /// The MOK-enrollment verdict.
     pub mok: MokEnrollment,
+    /// Private typed refusal provenance used only at the shared publication
+    /// boundary. It is never serialized as part of this legacy diagnostic.
+    #[serde(skip)]
+    refusal: Option<EnableRefusal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnableRefusal {
+    Contract,
+    Authorization,
+    ObsoleteRebootArm,
+    Policy,
 }
 
 impl EnableResult {
@@ -915,7 +936,127 @@ impl EnableResult {
             skipped: Some(reason.into()),
             activation: ActivationResult::default(),
             mok: MokEnrollment::NotRequired,
+            refusal: Some(EnableRefusal::Policy),
         }
+    }
+
+    fn refused(
+        model: impl Into<String>,
+        refusal: EnableRefusal,
+        reason: impl Into<String>,
+    ) -> Self {
+        let mut result = Self::skipped(model, reason);
+        result.refusal = Some(refusal);
+        result
+    }
+}
+
+#[cfg(feature = "async-services")]
+fn shared_result(
+    node: &str,
+    request_id: &str,
+    published_at_ms: u64,
+    device: &SurfaceDevice,
+    result: &EnableResult,
+) -> Result<SharedEnableResult, &'static str> {
+    if !matches!(
+        device.contract_generation,
+        SurfaceProGeneration::Pro5 | SurfaceProGeneration::Pro6
+    ) {
+        return Err("result model is outside the exact Surface Pro 5/6 contract");
+    }
+    let outcome = if let Some(reason) = result.skipped.as_ref() {
+        let code = match result.refusal.unwrap_or(EnableRefusal::Policy) {
+            EnableRefusal::Contract => SharedRefusal::Contract,
+            EnableRefusal::Authorization => SharedRefusal::Authorization,
+            EnableRefusal::ObsoleteRebootArm => SharedRefusal::ObsoleteRebootArm,
+            EnableRefusal::Policy => SharedRefusal::Policy,
+        };
+        SharedOutcome::Refused {
+            code,
+            reason: reason.clone(),
+        }
+    } else {
+        let units = result
+            .activation
+            .units
+            .iter()
+            .map(|row| {
+                if row.unit != IPTSD_UNIT {
+                    return Err("unrecognized enable unit");
+                }
+                Ok(SharedUnitResult {
+                    unit: SharedUnit::Iptsd,
+                    outcome: shared_step_outcome(&row.outcome),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let configs = result
+            .activation
+            .configs
+            .iter()
+            .map(|row| {
+                if row.key != ConfigKey::SamPerfProfile {
+                    return Err("unrecognized enable config");
+                }
+                Ok(SharedConfigResult {
+                    config: SharedConfig::SamBalancedProfile,
+                    outcome: shared_step_outcome(&row.outcome),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mok = match &result.mok {
+            MokEnrollment::NotRequired => SharedMokState::NotRequired,
+            MokEnrollment::Enrolled { modules_loaded } => SharedMokState::Enrolled {
+                modules_loaded: *modules_loaded,
+            },
+            MokEnrollment::ImportedAwaitingArm {
+                firmware_prompt,
+                key_fingerprint,
+                ..
+            } => SharedMokState::AwaitingGovernedHostReboot {
+                firmware_prompt: firmware_prompt.clone(),
+                key_fingerprint: key_fingerprint.clone(),
+            },
+            MokEnrollment::Undetermined { reason } => SharedMokState::Undetermined {
+                reason: reason.clone(),
+            },
+            MokEnrollment::RebootArmed { .. } => {
+                return Err("legacy reboot state cannot enter the shared contract");
+            }
+        };
+        SharedOutcome::Completed {
+            activation: SharedActivation { units, configs },
+            mok,
+        }
+    };
+    let shared = SharedEnableResult {
+        schema_version: SURFACE_ENABLE_RESULT_SCHEMA_VERSION,
+        node: node.to_string(),
+        request_id: request_id.to_string(),
+        model: device.product.clone(),
+        generation: device.contract_generation,
+        source: SharedSource::LocalSurfaceEnableWorker,
+        published_at_ms,
+        outcome,
+    };
+    shared
+        .validate()
+        .map_err(|_| "shared result validation failed")?;
+    Ok(shared)
+}
+
+#[cfg(feature = "async-services")]
+fn shared_step_outcome(outcome: &StepOutcome) -> SharedStepOutcome {
+    match outcome {
+        StepOutcome::Applied => SharedStepOutcome::Applied,
+        StepOutcome::AlreadyActive => SharedStepOutcome::AlreadyActive,
+        StepOutcome::Gated { reason } => SharedStepOutcome::Gated {
+            reason: reason.clone(),
+        },
+        StepOutcome::Failed { reason } => SharedStepOutcome::Failed {
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -964,8 +1105,9 @@ pub fn run_enable(
     }
 
     if arm.is_some() {
-        return EnableResult::skipped(
+        return EnableResult::refused(
             device.product.clone(),
+            EnableRefusal::ObsoleteRebootArm,
             "obsolete Surface reboot-arm input refused; use the governed System Power & Battery workflow",
         );
     }
@@ -978,6 +1120,7 @@ pub fn run_enable(
         skipped: None,
         activation,
         mok,
+        refusal: None,
     }
 }
 
@@ -1081,7 +1224,9 @@ mod worker {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
-    use super::{run_enable, EnableResult, LiveSurfaceActions, SurfaceModel};
+    use super::{
+        run_enable, shared_result, EnableRefusal, EnableResult, LiveSurfaceActions, SurfaceModel,
+    };
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
@@ -1178,8 +1323,22 @@ mod worker {
             };
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
+                let received_at_ms = wall_now_ms();
+                let admitted_request_id = msg.body.as_deref().and_then(|body| {
+                    EnableRequest::from_json_at(body.as_bytes(), &self.node_id, received_at_ms)
+                        .ok()
+                        .map(|request| request.header.request_id)
+                });
                 let result = self.apply_request(msg.body.as_deref());
-                self.publish(persist, &result);
+                // Publication freshness starts after every activation/MOK
+                // effect completes, never when the request was received.
+                let published_at_ms = wall_now_ms();
+                self.publish(
+                    persist,
+                    admitted_request_id.as_deref(),
+                    published_at_ms,
+                    &result,
+                );
             }
         }
 
@@ -1188,15 +1347,17 @@ mod worker {
         /// gate runs before [`run_enable`] or any privileged seam call.
         fn apply_request(&self, body: Option<&str>) -> EnableResult {
             let Some(body) = body else {
-                return self.refused_result("enable request body is missing");
+                return self
+                    .refused_result(EnableRefusal::Contract, "enable request body is missing");
             };
             let req =
                 match EnableRequest::from_json_at(body.as_bytes(), &self.node_id, wall_now_ms()) {
                     Ok(req) => req,
                     Err(error) => {
-                        return self.refused_result(&format!(
-                            "enable request failed shared contract admission: {error}"
-                        ));
+                        return self.refused_result(
+                            EnableRefusal::Contract,
+                            &format!("enable request failed shared contract admission: {error}"),
+                        );
                     }
                 };
             let context = MutationContext {
@@ -1211,11 +1372,14 @@ mod worker {
                     %error,
                     "refused unauthorized surface enable"
                 );
-                return self
-                    .refused_result(&format!("surface enable authorization refused: {error}"));
+                return self.refused_result(
+                    EnableRefusal::Authorization,
+                    &format!("surface enable authorization refused: {error}"),
+                );
             }
             if req.arm_token.is_some() {
                 return self.refused_result(
+                    EnableRefusal::ObsoleteRebootArm,
                     "obsolete Surface reboot-arm input refused; use the governed System Power & Battery workflow",
                 );
             }
@@ -1226,6 +1390,7 @@ mod worker {
                 .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
             else {
                 return self.refused_result(
+                    EnableRefusal::Authorization,
                     "surface enable authorization refused: verified capability is unavailable",
                 );
             };
@@ -1238,18 +1403,45 @@ mod worker {
             run_enable(&actions, &self.detection, req.arm_token.as_deref())
         }
 
-        fn refused_result(&self, reason: &str) -> EnableResult {
+        fn refused_result(&self, refusal: EnableRefusal, reason: &str) -> EnableResult {
             let model = match &self.detection.model {
                 SurfaceModel::Known(device) => device.product.clone(),
                 SurfaceModel::UnknownSurface { product } => product.clone(),
                 SurfaceModel::NotASurface => String::new(),
             };
-            EnableResult::skipped(model, reason)
+            EnableResult::refused(model, refusal, reason)
         }
 
         /// Publish the typed result to the per-node result lane.
-        fn publish(&self, persist: &Persist, result: &EnableResult) {
-            let Ok(body) = serde_json::to_string(result) else {
+        fn publish(
+            &self,
+            persist: &Persist,
+            request_id: Option<&str>,
+            published_at_ms: u64,
+            result: &EnableResult,
+        ) {
+            let Some(request_id) = request_id else {
+                tracing::warn!(
+                    target: "mackesd::surface_enable",
+                    node = %self.node_id,
+                    "not publishing an enable diagnostic without an admitted request identity"
+                );
+                return;
+            };
+            let SurfaceModel::Known(device) = &self.detection.model else {
+                return;
+            };
+            let Ok(shared) =
+                shared_result(&self.node_id, request_id, published_at_ms, device, result)
+            else {
+                tracing::warn!(
+                    target: "mackesd::surface_enable",
+                    node = %self.node_id,
+                    "not publishing an enable diagnostic outside the strict shared contract"
+                );
+                return;
+            };
+            let Ok(body) = shared.to_json() else {
                 return;
             };
             let topic = result_topic(&self.node_id);
@@ -1323,6 +1515,10 @@ mod worker {
         use super::*;
         use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
+        use mackes_mesh_types::surface_enable::{
+            SurfaceEnableOutcome as SharedOutcome, SurfaceEnableRefusal as SharedRefusal,
+            SurfaceEnableResult as SharedEnableResult,
+        };
 
         const AUTH_KEY: &[u8] = b"surface-enable-action-auth-test-key";
         const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -1403,7 +1599,7 @@ mod worker {
         }
 
         #[test]
-        fn drains_a_request_and_publishes_a_result() {
+        fn unsupported_surface_result_is_not_published_into_pro5_6_contract() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             // Use a detected-but-unsupported model so this worker plumbing
@@ -1422,35 +1618,51 @@ mod worker {
             let out = persist
                 .list_since(&result_topic("node-a"), None)
                 .expect("list results");
-            assert_eq!(out.len(), 1, "one result published");
-            let result: EnableResult =
-                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            assert_eq!(result.model, "Surface Pro 8");
-            assert!(result.skipped.as_deref().is_some_and(|reason| {
-                reason.contains("not admitted by the Surface Pro 5/6 action contract")
-            }));
+            assert!(out.is_empty());
         }
 
         #[test]
         fn authorized_obsolete_reboot_arm_is_refused_before_live_actions() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
             let request = signed_request(
                 "node-a",
                 Some("REBOOT-TO-ENROLL-MOK"),
                 "surface-enable-obsolete-reboot",
             );
-
-            let result = worker.apply_request(Some(&request));
-
-            assert!(result.activation.units.is_empty());
-            assert!(result.activation.configs.is_empty());
-            assert_eq!(result.mok, super::super::MokEnrollment::NotRequired);
-            assert!(
-                result.skipped.as_deref().is_some_and(
-                    |reason| reason.contains("obsolete Surface reboot-arm input refused")
+            persist
+                .write(
+                    &enable_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&request),
                 )
-            );
+                .expect("write request");
+            let before = wall_now_ms();
+
+            worker.poll_once(&persist);
+
+            let after = wall_now_ms();
+            let output = persist
+                .list_since(&result_topic("node-a"), None)
+                .expect("list result");
+            assert_eq!(output.len(), 1);
+            let shared = SharedEnableResult::from_json_at(
+                output[0].body.as_deref().unwrap().as_bytes(),
+                "node-a",
+                "surface-enable-obsolete-reboot",
+                after,
+            )
+            .expect("admit shared result");
+            assert!((before..=after).contains(&shared.published_at_ms));
+            assert!(matches!(
+                shared.outcome,
+                SharedOutcome::Refused {
+                    code: SharedRefusal::ObsoleteRebootArm,
+                    ..
+                }
+            ));
         }
 
         #[test]
@@ -1496,13 +1708,7 @@ mod worker {
             let out = persist
                 .list_since(&result_topic("node-a"), None)
                 .expect("list results");
-            let result: EnableResult =
-                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            assert!(result
-                .skipped
-                .as_deref()
-                .is_some_and(|reason| reason.contains("shared contract admission")));
-            assert!(result.activation.units.is_empty());
+            assert!(out.is_empty());
         }
 
         #[test]
@@ -1577,19 +1783,36 @@ mod worker {
                 .list_since(&result_topic("node-replay"), None)
                 .expect("list results");
             assert_eq!(out.len(), 3);
-            let results: Vec<EnableResult> = out
+            let results: Vec<SharedEnableResult> = out
                 .iter()
-                .map(|item| serde_json::from_str(item.body.as_deref().unwrap()).unwrap())
+                .map(|item| {
+                    SharedEnableResult::from_json_at(
+                        item.body.as_deref().unwrap().as_bytes(),
+                        "node-replay",
+                        "surface-enable-replay",
+                        wall_now_ms(),
+                    )
+                    .unwrap()
+                })
                 .collect();
-            assert!(results[0]
-                .skipped
-                .as_deref()
-                .is_some_and(|reason| reason.contains("authorization refused")));
-            assert!(results[1].skipped.is_none());
-            assert!(results[2]
-                .skipped
-                .as_deref()
-                .is_some_and(|reason| reason.contains("already used")));
+            assert!(matches!(
+                results[0].outcome,
+                SharedOutcome::Refused {
+                    code: SharedRefusal::Authorization,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                results[1].outcome,
+                SharedOutcome::Completed { .. }
+            ));
+            assert!(matches!(
+                results[2].outcome,
+                SharedOutcome::Refused {
+                    code: SharedRefusal::Authorization,
+                    ..
+                }
+            ));
         }
     }
 }
@@ -1984,6 +2207,84 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
         let r = run_enable(&fake, &detect_of("Surface Pro 6"), Some("nope"));
         assert_eq!(fake.effects.get(), 0);
         assert!(r.skipped.is_some());
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn shared_projection_removes_legacy_reboot_state_and_binds_request() {
+        let internal = EnableResult {
+            model: "Surface Pro 6".into(),
+            skipped: None,
+            activation: ActivationResult {
+                units: vec![UnitResult {
+                    unit: IPTSD_UNIT.into(),
+                    outcome: StepOutcome::Applied,
+                }],
+                configs: vec![ConfigResult {
+                    key: ConfigKey::SamPerfProfile,
+                    subsystem: Subsystem::Sam,
+                    outcome: StepOutcome::AlreadyActive,
+                }],
+            },
+            mok: MokEnrollment::ImportedAwaitingArm {
+                firmware_prompt: mok_firmware_prompt(),
+                arm_token: String::new(),
+                key_fingerprint: "01:23:45:67:89:AB:CD:EF:10:32:54:76:98:BA:DC:FE:11:22:33:44"
+                    .into(),
+            },
+            refusal: None,
+        };
+        let shared = shared_result(
+            "surface-6",
+            "surface-enable-request",
+            1_800_000_000_000,
+            &device_of("Surface Pro 6"),
+            &internal,
+        )
+        .expect("project strict shared result");
+        let body = shared.to_json().expect("encode strict shared result");
+
+        assert!(!body.contains("arm_token"));
+        assert!(!body.contains("RebootArmed"));
+        assert!(matches!(
+            shared.outcome,
+            SharedOutcome::Completed {
+                mok: SharedMokState::AwaitingGovernedHostReboot { .. },
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn shared_refusal_codes_are_typed_not_inferred_from_prose() {
+        for (internal, expected) in [
+            (EnableRefusal::Contract, SharedRefusal::Contract),
+            (EnableRefusal::Authorization, SharedRefusal::Authorization),
+            (
+                EnableRefusal::ObsoleteRebootArm,
+                SharedRefusal::ObsoleteRebootArm,
+            ),
+            (EnableRefusal::Policy, SharedRefusal::Policy),
+        ] {
+            let diagnostic = EnableResult::refused(
+                "Surface Pro 6",
+                internal,
+                "identical wording for every typed refusal",
+            );
+            let shared = shared_result(
+                "surface-6",
+                "surface-enable-refusal",
+                1_800_000_000_000,
+                &device_of("Surface Pro 6"),
+                &diagnostic,
+            )
+            .expect("project typed refusal");
+            assert!(matches!(
+                shared.outcome,
+                SharedOutcome::Refused { code, .. } if code == expected
+            ));
+        }
     }
 
     #[test]

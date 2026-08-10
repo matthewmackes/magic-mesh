@@ -5,8 +5,8 @@
 //! workers publish, and drives their typed verbs. Three tabs (design lock #10):
 //!
 //! * **Install** — activate/enable (the `surface_enable` verb), the guided MOK
-//!   enrollment flow (the [`MokEnrollment`] state + the typed-armed reboot
-//!   control + the firmware-prompt copy), and the SURFACE-5 fwupd firmware list
+//!   enrollment flow (the shared [`SurfaceEnableMokState`] observation plus
+//!   firmware-prompt copy), and the SURFACE-5 fwupd firmware list
 //!   with a typed-armed `fw-apply` control.
 //! * **Test** — the SURFACE-4 tri-state probe board (each subsystem
 //!   Ok/Failed/Degraded/NeedsGesture with its reason) + a re-read control.
@@ -37,6 +37,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::surface_enable::{
+    SurfaceEnableActivation, SurfaceEnableConfig, SurfaceEnableConfigResult, SurfaceEnableMokState,
+    SurfaceEnableOutcome, SurfaceEnableRefusal, SurfaceEnableResult, SurfaceEnableSource,
+    SurfaceEnableStepOutcome, SurfaceEnableUnit, SurfaceEnableUnitResult,
+    MAX_SURFACE_ENABLE_RESULT_AGE_MS, MAX_SURFACE_ENABLE_RESULT_FUTURE_SKEW_MS,
+};
 use mackes_mesh_types::surface_hardware::{
     SurfaceActionHeader, SurfaceAvailability, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
     SurfaceCameraProofRefusal, SurfaceCameraProofRequest, SurfaceCameraProofResult,
@@ -49,7 +55,6 @@ use mackes_mesh_types::surface_hardware::{
 };
 use mde_egui::egui::{self, RichText};
 use mde_egui::{DisplayController, ModeClass, ModesetDispatch, PanelInfo, Style};
-use serde::Deserialize;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -64,10 +69,6 @@ const REFRESH: Duration = Duration::from_secs(5);
 const MAX_SURFACE_STATE_AGE_MS: u64 = 90_000;
 /// Tolerated publisher/seat wall-clock skew before a future state is refused.
 const MAX_SURFACE_STATE_FUTURE_SKEW_MS: u64 = 5_000;
-/// A pending-MOK handoff is destructive-adjacent: it may only route while the
-/// local enable result that proved the staged key is as fresh as the hardware
-/// publication itself. It carries no reboot token or execution authority.
-const MAX_MOK_HANDOFF_AGE_MS: u64 = 90_000;
 /// A camera request cannot hold the single local in-flight slot indefinitely.
 const MAX_CAMERA_PROOF_IN_FLIGHT_MS: u64 = 90_000;
 /// Firmware apply can legitimately spend 10 minutes downloading plus 30
@@ -118,23 +119,6 @@ fn camera_proof_result_topic(node: &str) -> String {
     format!("state/hardware/surface/{node}/camera-proof")
 }
 
-// ───────────────────────── the wire mirrors — state (§6) ────────────────────
-
-/// Mirror of the daemon's `Subsystem` (default enum repr — the variant name on
-/// the wire). Carries the human label the board renders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-enum Subsystem {
-    Touch,
-    Pen,
-    TypeCover,
-    Sam,
-    RotationAccel,
-    Cameras,
-    WifiBt,
-    S0ix,
-    Fingerprint,
-}
-
 fn probe_tone(state: SurfaceProbeState) -> egui::Color32 {
     match state {
         SurfaceProbeState::Ok => Style::OK,
@@ -179,107 +163,6 @@ fn shared_subsystem_id(subsystem: SurfaceSubsystem) -> &'static str {
         SurfaceSubsystem::S0ix => "s0ix",
         SurfaceSubsystem::Fingerprint => "fingerprint",
     }
-}
-
-/// Mirror of the daemon's `ConfigKey`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-enum ConfigKey {
-    SamPerfProfile,
-    IptsdCalibration,
-    RotationHint,
-}
-
-impl ConfigKey {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::SamPerfProfile => "SAM perf profile",
-            Self::IptsdCalibration => "iptsd calibration / sensitivity",
-            Self::RotationHint => "Rotation hint",
-        }
-    }
-}
-
-/// Mirror of the daemon's `StepOutcome` (externally-tagged).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-enum StepOutcome {
-    Applied,
-    AlreadyActive,
-    Gated { reason: String },
-    Failed { reason: String },
-}
-
-impl StepOutcome {
-    const fn tone(&self) -> egui::Color32 {
-        match self {
-            Self::Applied | Self::AlreadyActive => Style::OK,
-            Self::Gated { .. } => Style::WARN,
-            Self::Failed { .. } => Style::DANGER,
-        }
-    }
-    fn summary(&self) -> String {
-        match self {
-            Self::Applied => "applied".to_string(),
-            Self::AlreadyActive => "already active".to_string(),
-            Self::Gated { reason } => format!("integration-gated \u{2014} {reason}"),
-            Self::Failed { reason } => format!("failed \u{2014} {reason}"),
-        }
-    }
-}
-
-/// Mirror of the daemon's `UnitResult`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct UnitResult {
-    unit: String,
-    outcome: StepOutcome,
-}
-
-/// Mirror of the daemon's `ConfigResult`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct ConfigResult {
-    key: ConfigKey,
-    #[allow(dead_code)]
-    subsystem: Subsystem,
-    outcome: StepOutcome,
-}
-
-/// Mirror of the daemon's `ActivationResult`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-struct ActivationResult {
-    #[serde(default)]
-    units: Vec<UnitResult>,
-    #[serde(default)]
-    configs: Vec<ConfigResult>,
-}
-
-/// Mirror of the daemon's `MokEnrollment` state machine (SURFACE-3, lock #6).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-enum MokEnrollment {
-    NotRequired,
-    Enrolled {
-        modules_loaded: bool,
-    },
-    ImportedAwaitingArm {
-        firmware_prompt: String,
-        arm_token: String,
-        key_fingerprint: String,
-    },
-    RebootArmed {
-        outcome: StepOutcome,
-    },
-    Undetermined {
-        reason: String,
-    },
-}
-
-/// Mirror of the daemon's `EnableResult` (SURFACE-3, Install tab).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct EnableResult {
-    model: String,
-    #[serde(default)]
-    skipped: Option<String>,
-    #[serde(default)]
-    activation: ActivationResult,
-    mok: MokEnrollment,
 }
 
 // ───────────────────────── shared action contract (§6) ─────────────────────
@@ -365,13 +248,7 @@ pub(crate) struct SurfaceCardState {
     /// The full tri-state probe board (Test tab).
     board: Option<SurfaceVerifyBoard>,
     /// The typed enable result (Install tab).
-    enable: Option<EnableResult>,
-    /// Bus write timestamp for the admitted enable result. This is the proof
-    /// that an `ImportedAwaitingArm` result is current rather than retained
-    /// indefinitely from an earlier boot/session.
-    enable_published_at_ms: Option<u64>,
-    /// Exact local node whose per-node result topic supplied `enable`.
-    enable_node: Option<String>,
+    enable: Option<SurfaceEnableResult>,
     /// The fwupd inventory (Install tab).
     firmware: Option<SurfaceFirmwareInventory>,
     /// The last exactly correlated shared v2 fw-apply result (Install tab).
@@ -419,8 +296,6 @@ impl Default for SurfaceCardState {
             summary: None,
             board: None,
             enable: None,
-            enable_published_at_ms: None,
-            enable_node: None,
             firmware: None,
             apply: None,
             firmware_in_flight: None,
@@ -547,11 +422,14 @@ impl SurfaceCardState {
             &persist,
             &enable_result_topic(&node),
             &node,
+            self.summary
+                .as_ref()
+                .map(|summary| &summary.publication.model),
             &mut self.cur_enable,
             &mut self.enable,
-            &mut self.enable_published_at_ms,
-            &mut self.enable_node,
+            now_ms,
         );
+        self.age_enable_at(&node, now_ms);
         read_latest_surface_firmware(
             &persist,
             &firmware_topic(&node),
@@ -604,8 +482,6 @@ impl SurfaceCardState {
         self.summary = None;
         self.board = None;
         self.enable = None;
-        self.enable_published_at_ms = None;
-        self.enable_node = None;
         self.firmware = None;
         self.apply = None;
         self.firmware_in_flight = None;
@@ -625,6 +501,24 @@ impl SurfaceCardState {
     /// re-reads the Bus — the node re-verifies on its own 30 s tick.
     const fn force_refresh(&mut self) {
         self.last_poll = None;
+    }
+
+    /// Remove retained enable state once it no longer satisfies the shared
+    /// freshness and exact local model contract. The Install tab must never
+    /// leave a previously green activation cosmetically current forever.
+    fn age_enable_at(&mut self, expected_node: &str, now_ms: u64) {
+        if self.enable.as_ref().is_some_and(|result| {
+            !enable_result_matches_local_at(
+                result,
+                expected_node,
+                self.summary
+                    .as_ref()
+                    .map(|summary| &summary.publication.model),
+                now_ms,
+            )
+        }) {
+            self.enable = None;
+        }
     }
 
     /// Publish a typed action body to `topic`, recording an honest note / error.
@@ -777,18 +671,7 @@ impl SurfaceCardState {
 
         // The typed enable result + the guided MOK flow.
         match self.enable.clone() {
-            Some(res) if res.skipped.is_none() => {
-                handoff = self.show_enable_result(ui, &res);
-            }
-            Some(res) => {
-                mde_egui::muted_note(
-                    ui,
-                    format!(
-                        "Enable skipped: {}",
-                        res.skipped.unwrap_or_else(|| "unknown".to_string())
-                    ),
-                );
-            }
+            Some(res) => handoff = self.show_enable_result(ui, &res),
             None => {
                 mde_egui::muted_note(
                     ui,
@@ -814,21 +697,37 @@ impl SurfaceCardState {
     fn show_enable_result(
         &mut self,
         ui: &mut egui::Ui,
-        res: &EnableResult,
+        res: &SurfaceEnableResult,
     ) -> Option<SurfaceCardHandoff> {
         let mut handoff = None;
+        let SurfaceEnableOutcome::Completed { activation, mok } = &res.outcome else {
+            if let SurfaceEnableOutcome::Refused { code, reason } = &res.outcome {
+                ui.horizontal_wrapped(|ui| {
+                    mde_egui::status_dot(ui, Style::WARN);
+                    ui.add_space(Style::SP_XS);
+                    mde_egui::muted_note(
+                        ui,
+                        format!(
+                            "Activation refused ({}) — {reason}",
+                            enable_refusal_label(*code)
+                        ),
+                    );
+                });
+            }
+            return None;
+        };
         // Activation units.
-        for unit in &res.activation.units {
+        for unit in &activation.units {
             ui.horizontal_wrapped(|ui| {
-                mde_egui::status_dot(ui, unit.outcome.tone());
+                mde_egui::status_dot(ui, enable_step_tone(&unit.outcome));
                 ui.add_space(Style::SP_XS);
                 ui.label(
-                    RichText::new(&unit.unit)
+                    RichText::new(enable_unit_label(unit.unit))
                         .color(Style::TEXT)
                         .size(Style::SMALL),
                 );
                 ui.add_space(Style::SP_S);
-                mde_egui::muted_note(ui, unit.outcome.summary());
+                mde_egui::muted_note(ui, enable_step_summary(&unit.outcome));
             });
         }
         ui.add_space(Style::SP_S);
@@ -841,15 +740,15 @@ impl SurfaceCardState {
                 .strong(),
         );
         ui.add_space(Style::SP_XS);
-        match &res.mok {
-            MokEnrollment::NotRequired => {
+        match mok {
+            SurfaceEnableMokState::NotRequired => {
                 ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, Style::OK);
                     ui.add_space(Style::SP_XS);
                     mde_egui::muted_note(ui, "Secure Boot off \u{2014} no key to enroll.");
                 });
             }
-            MokEnrollment::Enrolled { modules_loaded } => {
+            SurfaceEnableMokState::Enrolled { modules_loaded } => {
                 let tone = if *modules_loaded {
                     Style::OK
                 } else {
@@ -868,26 +767,15 @@ impl SurfaceCardState {
                     );
                 });
             }
-            MokEnrollment::RebootArmed { outcome } => {
-                ui.horizontal_wrapped(|ui| {
-                    mde_egui::status_dot(ui, outcome.tone());
-                    ui.add_space(Style::SP_XS);
-                    mde_egui::muted_note(
-                        ui,
-                        format!("Reboot armed \u{2014} {}", outcome.summary()),
-                    );
-                });
-            }
-            MokEnrollment::Undetermined { reason } => {
+            SurfaceEnableMokState::Undetermined { reason } => {
                 ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, Style::WARN);
                     ui.add_space(Style::SP_XS);
                     mde_egui::muted_note(ui, format!("MOK posture undetermined \u{2014} {reason}"));
                 });
             }
-            MokEnrollment::ImportedAwaitingArm {
+            SurfaceEnableMokState::AwaitingGovernedHostReboot {
                 firmware_prompt,
-                arm_token: _,
                 key_fingerprint,
             } => {
                 handoff = self.show_mok_arm(ui, firmware_prompt, key_fingerprint);
@@ -902,7 +790,20 @@ impl SurfaceCardState {
         firmware_prompt: &str,
         key_fingerprint: &str,
     ) -> Option<SurfaceCardHandoff> {
-        mde_egui::field(ui, "Key fingerprint", key_fingerprint, Style::TEXT);
+        ui.label(
+            RichText::new("Key fingerprint")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::Label::new(
+                RichText::new(key_fingerprint)
+                    .color(Style::TEXT)
+                    .size(Style::SMALL)
+                    .monospace(),
+            )
+            .wrap(),
+        );
         ui.add_space(Style::SP_XS);
         // The exact blue-screen firmware copy, verbatim (lock #6 — honest about
         // the manual firmware step no software can automate).
@@ -956,14 +857,21 @@ impl SurfaceCardState {
         let node = self.node.as_deref()?;
         let summary = self.summary.as_ref()?;
         let enable = self.enable.as_ref()?;
-        let published_at_ms = self.enable_published_at_ms?;
-        if self.enable_node.as_deref() != Some(node)
-            || summary.publication.node != node
+        if summary.publication.node != node
             || !matches!(summary.publication.availability, SurfaceAvailability::Fresh)
-            || summary.publication.model.product != enable.model
-            || published_at_ms > now_ms.saturating_add(MAX_SURFACE_STATE_FUTURE_SKEW_MS)
-            || now_ms.saturating_sub(published_at_ms) > MAX_MOK_HANDOFF_AGE_MS
-            || !matches!(enable.mok, MokEnrollment::ImportedAwaitingArm { .. })
+            || !enable_result_matches_local_at(
+                enable,
+                node,
+                Some(&summary.publication.model),
+                now_ms,
+            )
+            || !matches!(
+                enable.outcome,
+                SurfaceEnableOutcome::Completed {
+                    mok: SurfaceEnableMokState::AwaitingGovernedHostReboot { .. },
+                    ..
+                }
+            )
         {
             return None;
         }
@@ -1378,22 +1286,27 @@ impl SurfaceCardState {
         let configs = self
             .enable
             .as_ref()
-            .map(|e| e.activation.configs.clone())
+            .and_then(|result| match &result.outcome {
+                SurfaceEnableOutcome::Completed { activation, .. } => {
+                    Some(activation.configs.clone())
+                }
+                SurfaceEnableOutcome::Refused { .. } => None,
+            })
             .unwrap_or_default();
         if configs.is_empty() {
             mde_egui::muted_note(ui, "No governed SAM profile result has been published yet.");
         } else {
             for cfg in &configs {
                 ui.horizontal_wrapped(|ui| {
-                    mde_egui::status_dot(ui, cfg.outcome.tone());
+                    mde_egui::status_dot(ui, enable_step_tone(&cfg.outcome));
                     ui.add_space(Style::SP_XS);
                     ui.label(
-                        RichText::new(cfg.key.label())
+                        RichText::new(enable_config_label(cfg.config))
                             .color(Style::TEXT)
                             .size(Style::SMALL),
                     );
                     ui.add_space(Style::SP_S);
-                    mde_egui::muted_note(ui, cfg.outcome.summary());
+                    mde_egui::muted_note(ui, enable_step_summary(&cfg.outcome));
                 });
             }
         }
@@ -1589,16 +1502,17 @@ fn discover_node(persist: &Persist, expected_node: &str) -> Option<String> {
         .then(|| expected_node.to_string())
 }
 
-/// Read the local enable-result lane while retaining the Bus write timestamp
-/// and exact topic node needed to admit a short-lived post-MOK handoff.
+/// Read only a fresh, bounded shared enable observation from the exact local
+/// lane and exact currently admitted Surface model. Rejected messages advance
+/// the cursor but cannot replace the last admitted state.
 fn read_latest_enable(
     persist: &Persist,
     topic: &str,
     expected_node: &str,
+    expected_model: Option<&SurfaceModelIdentity>,
     cursor: &mut Option<String>,
-    slot: &mut Option<EnableResult>,
-    published_at_ms: &mut Option<u64>,
-    source_node: &mut Option<String>,
+    slot: &mut Option<SurfaceEnableResult>,
+    now_ms: u64,
 ) {
     let Ok(messages) = persist.list_since(topic, cursor.as_deref()) else {
         return;
@@ -1608,16 +1522,34 @@ fn read_latest_enable(
         let Some(body) = message.body.as_deref() else {
             continue;
         };
-        let Ok(decoded) = serde_json::from_str::<EnableResult>(body) else {
+        let Ok(decoded) =
+            SurfaceEnableResult::from_json_for_node_at(body.as_bytes(), expected_node, now_ms)
+        else {
             continue;
         };
-        let Ok(timestamp) = u64::try_from(message.ts_unix_ms) else {
+        if !enable_result_matches_local_at(&decoded, expected_node, expected_model, now_ms) {
             continue;
-        };
+        }
         *slot = Some(decoded);
-        *published_at_ms = Some(timestamp);
-        *source_node = Some(expected_node.to_string());
     }
+}
+
+fn enable_result_matches_local_at(
+    result: &SurfaceEnableResult,
+    expected_node: &str,
+    expected_model: Option<&SurfaceModelIdentity>,
+    now_ms: u64,
+) -> bool {
+    let Some(model) = expected_model else {
+        return false;
+    };
+    result.validate().is_ok()
+        && result.node == expected_node
+        && result.model == model.product
+        && result.generation == model.generation
+        && result.source == SurfaceEnableSource::LocalSurfaceEnableWorker
+        && result.published_at_ms <= now_ms.saturating_add(MAX_SURFACE_ENABLE_RESULT_FUTURE_SKEW_MS)
+        && now_ms.saturating_sub(result.published_at_ms) <= MAX_SURFACE_ENABLE_RESULT_AGE_MS
 }
 
 fn read_latest_surface_summary(
@@ -1747,6 +1679,44 @@ fn camera_outcome_label(outcome: SurfaceCameraProofOutcome) -> (egui::Color32, &
             Style::WARN,
             "Refused — the requested generation did not match local hardware.",
         ),
+    }
+}
+
+fn enable_unit_label(unit: SurfaceEnableUnit) -> &'static str {
+    match unit {
+        SurfaceEnableUnit::Iptsd => "IPTS touch service",
+    }
+}
+
+fn enable_config_label(config: SurfaceEnableConfig) -> &'static str {
+    match config {
+        SurfaceEnableConfig::SamBalancedProfile => "SAM balanced profile",
+    }
+}
+
+fn enable_step_tone(outcome: &SurfaceEnableStepOutcome) -> egui::Color32 {
+    match outcome {
+        SurfaceEnableStepOutcome::Applied | SurfaceEnableStepOutcome::AlreadyActive => Style::OK,
+        SurfaceEnableStepOutcome::Gated { .. } => Style::WARN,
+        SurfaceEnableStepOutcome::Failed { .. } => Style::DANGER,
+    }
+}
+
+fn enable_step_summary(outcome: &SurfaceEnableStepOutcome) -> String {
+    match outcome {
+        SurfaceEnableStepOutcome::Applied => "applied".to_string(),
+        SurfaceEnableStepOutcome::AlreadyActive => "already active".to_string(),
+        SurfaceEnableStepOutcome::Gated { reason } => format!("integration-gated — {reason}"),
+        SurfaceEnableStepOutcome::Failed { reason } => format!("failed — {reason}"),
+    }
+}
+
+fn enable_refusal_label(refusal: SurfaceEnableRefusal) -> &'static str {
+    match refusal {
+        SurfaceEnableRefusal::Contract => "request contract",
+        SurfaceEnableRefusal::Authorization => "local authorization",
+        SurfaceEnableRefusal::ObsoleteRebootArm => "obsolete reboot authority",
+        SurfaceEnableRefusal::Policy => "local policy",
     }
 }
 
@@ -1982,29 +1952,36 @@ mod tests {
                     },
                 ],
             }),
-            enable: Some(EnableResult {
+            enable: Some(SurfaceEnableResult {
+                schema_version:
+                    mackes_mesh_types::surface_enable::SURFACE_ENABLE_RESULT_SCHEMA_VERSION,
+                node: "this-node".to_string(),
+                request_id: "enable-external-minter".to_string(),
                 model: "Surface Pro 6".to_string(),
-                skipped: None,
-                activation: ActivationResult {
-                    units: vec![UnitResult {
-                        unit: "iptsd@.service".to_string(),
-                        outcome: StepOutcome::AlreadyActive,
-                    }],
-                    configs: vec![ConfigResult {
-                        key: ConfigKey::SamPerfProfile,
-                        subsystem: Subsystem::Sam,
-                        outcome: StepOutcome::Applied,
-                    }],
-                },
-                mok: MokEnrollment::ImportedAwaitingArm {
-                    firmware_prompt: "After the reboot the firmware shows a blue screen..."
-                        .to_string(),
-                    arm_token: "REBOOT-TO-ENROLL-MOK".to_string(),
-                    key_fingerprint: "SHA1:ab:cd:ef".to_string(),
+                generation: SurfaceProGeneration::Pro6,
+                source: SurfaceEnableSource::LocalSurfaceEnableWorker,
+                published_at_ms: ACTION_NOW_MS,
+                outcome: SurfaceEnableOutcome::Completed {
+                    activation: SurfaceEnableActivation {
+                        units: vec![SurfaceEnableUnitResult {
+                            unit: SurfaceEnableUnit::Iptsd,
+                            outcome: SurfaceEnableStepOutcome::AlreadyActive,
+                        }],
+                        configs: vec![SurfaceEnableConfigResult {
+                            config: SurfaceEnableConfig::SamBalancedProfile,
+                            outcome: SurfaceEnableStepOutcome::Applied,
+                        }],
+                    },
+                    mok: SurfaceEnableMokState::AwaitingGovernedHostReboot {
+                        firmware_prompt:
+                            "After reboot, use MOK Manager to enroll the staged Surface key."
+                                .to_string(),
+                        key_fingerprint:
+                            "01:23:45:67:89:AB:CD:EF:10:32:54:76:98:BA:DC:FE:11:22:33:44"
+                                .to_string(),
+                    },
                 },
             }),
-            enable_published_at_ms: Some(ACTION_NOW_MS),
-            enable_node: Some("this-node".to_string()),
             firmware: Some(SurfaceFirmwareInventory {
                 publication: SurfacePublication {
                     source: SurfaceObservationSource::Fwupd,
@@ -2042,8 +2019,6 @@ mod tests {
                 summary: None,
                 board: None,
                 enable: None,
-                enable_published_at_ms: None,
-                enable_node: None,
                 firmware: None,
                 apply: None,
                 firmware_in_flight: None,
@@ -2568,22 +2543,19 @@ mod tests {
         assert_eq!(board.rows[0].subsystem, SurfaceSubsystem::Touch);
         assert_eq!(board.rows[1].state, SurfaceProbeState::NeedsGesture);
 
-        let mok: EnableResult = serde_json::from_str(
-            r#"{"model":"Surface Pro 6","skipped":null,
-                "activation":{"units":[{"unit":"iptsd@.service","outcome":"AlreadyActive"}],
-                  "configs":[{"key":"SamPerfProfile","subsystem":"Sam","outcome":"Applied"}]},
-                "mok":{"Enrolled":{"modules_loaded":true}}}"#,
+        let expected_enable = fixture.enable.as_ref().unwrap();
+        let mok = SurfaceEnableResult::from_json_for_node_at(
+            expected_enable.to_json().unwrap().as_bytes(),
+            "this-node",
+            ACTION_NOW_MS,
         )
-        .expect("enable decodes");
+        .expect("shared enable decodes");
         assert!(matches!(
-            mok.mok,
-            MokEnrollment::Enrolled {
-                modules_loaded: true
+            mok.outcome,
+            SurfaceEnableOutcome::Completed {
+                mok: SurfaceEnableMokState::AwaitingGovernedHostReboot { .. },
+                ..
             }
-        ));
-        assert!(matches!(
-            mok.activation.configs[0].outcome,
-            StepOutcome::Applied
         ));
 
         let summary_body = serde_json::to_vec(fixture.summary.as_ref().unwrap()).unwrap();
@@ -2606,7 +2578,7 @@ mod tests {
         );
 
         let mut remote = fixture();
-        remote.enable_node = Some("another-node".into());
+        remote.enable.as_mut().unwrap().node = "another-node".into();
         assert_eq!(remote.pending_mok_handoff_at(ACTION_NOW_MS), None);
 
         let mut model_mismatch = fixture();
@@ -2625,17 +2597,23 @@ mod tests {
         assert_eq!(stale_summary.pending_mok_handoff_at(ACTION_NOW_MS), None);
 
         let mut expired = fixture();
-        expired.enable_published_at_ms = Some(ACTION_NOW_MS - MAX_MOK_HANDOFF_AGE_MS - 1);
+        expired.enable.as_mut().unwrap().published_at_ms =
+            ACTION_NOW_MS - MAX_SURFACE_ENABLE_RESULT_AGE_MS - 1;
         assert_eq!(expired.pending_mok_handoff_at(ACTION_NOW_MS), None);
 
         let mut future = fixture();
-        future.enable_published_at_ms = Some(ACTION_NOW_MS + MAX_SURFACE_STATE_FUTURE_SKEW_MS + 1);
+        future.enable.as_mut().unwrap().published_at_ms =
+            ACTION_NOW_MS + MAX_SURFACE_ENABLE_RESULT_FUTURE_SKEW_MS + 1;
         assert_eq!(future.pending_mok_handoff_at(ACTION_NOW_MS), None);
 
         let mut no_longer_pending = fixture();
-        no_longer_pending.enable.as_mut().unwrap().mok = MokEnrollment::Enrolled {
-            modules_loaded: true,
-        };
+        if let SurfaceEnableOutcome::Completed { mok, .. } =
+            &mut no_longer_pending.enable.as_mut().unwrap().outcome
+        {
+            *mok = SurfaceEnableMokState::Enrolled {
+                modules_loaded: true,
+            };
+        }
         assert_eq!(
             no_longer_pending.pending_mok_handoff_at(ACTION_NOW_MS),
             None
@@ -2643,57 +2621,107 @@ mod tests {
     }
 
     #[test]
-    fn enable_result_reader_binds_bus_timestamp_and_exact_topic_node() {
+    fn enable_result_reader_admits_only_fresh_exact_local_shared_observations() {
         let dir = tempfile::tempdir().expect("surface enable result bus");
         let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
         let result = fixture().enable.expect("fixture enable result");
-        let body = serde_json::json!({
-            "model": "Surface Pro 6",
-            "activation": {
-                "units": [{"unit": "iptsd@.service", "outcome": "AlreadyActive"}],
-                "configs": [{
-                    "key": "SamPerfProfile",
-                    "subsystem": "Sam",
-                    "outcome": "Applied"
-                }]
-            },
-            "mok": {
-                "ImportedAwaitingArm": {
-                    "firmware_prompt": "After the reboot the firmware shows a blue screen...",
-                    "arm_token": "REBOOT-TO-ENROLL-MOK",
-                    "key_fingerprint": "SHA1:ab:cd:ef"
-                }
-            }
-        })
-        .to_string();
+        let valid = result.to_json().unwrap();
+        let mut hostile = Vec::new();
+        let mut foreign = result.clone();
+        foreign.node = "foreign-node".into();
+        hostile.push(foreign.to_json().unwrap());
+        let mut other_model = result.clone();
+        other_model.model = "Surface Pro 5".into();
+        other_model.generation = SurfaceProGeneration::Pro5;
+        hostile.push(other_model.to_json().unwrap());
+        let mut stale = result.clone();
+        stale.published_at_ms = ACTION_NOW_MS - MAX_SURFACE_ENABLE_RESULT_AGE_MS - 1;
+        hostile.push(stale.to_json().unwrap());
+        let mut future = result.clone();
+        future.published_at_ms = ACTION_NOW_MS + MAX_SURFACE_ENABLE_RESULT_FUTURE_SKEW_MS + 1;
+        hostile.push(future.to_json().unwrap());
+        hostile.push(valid.replacen("{", r#"{"unknown":true,"#, 1));
+        hostile.push(valid.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        ));
+        hostile.push(
+            " ".repeat(mackes_mesh_types::surface_enable::MAX_SURFACE_ENABLE_RESULT_WIRE_BYTES + 1),
+        );
+        hostile.push(
+            r#"{"model":"Surface Pro 6","mok":{"RebootArmed":{"arm_token":"secret"}}}"#.into(),
+        );
+        for body in hostile {
+            persist
+                .write(
+                    &enable_result_topic("this-node"),
+                    Priority::Default,
+                    None,
+                    Some(&body),
+                )
+                .expect("write hostile enable result");
+        }
+        let mut cursor = None;
+        let mut decoded = None;
+        read_latest_enable(
+            &persist,
+            &enable_result_topic("this-node"),
+            "this-node",
+            Some(&test_publication().model),
+            &mut cursor,
+            &mut decoded,
+            ACTION_NOW_MS,
+        );
+        assert!(decoded.is_none());
+
         let stored = persist
             .write(
                 &enable_result_topic("this-node"),
                 Priority::Default,
                 None,
-                Some(&body),
+                Some(&valid),
             )
-            .expect("write local result");
-        let mut cursor = None;
-        let mut decoded = None;
-        let mut published_at_ms = None;
-        let mut source_node = None;
+            .expect("write local shared result");
         read_latest_enable(
             &persist,
             &enable_result_topic("this-node"),
             "this-node",
+            Some(&test_publication().model),
             &mut cursor,
             &mut decoded,
-            &mut published_at_ms,
-            &mut source_node,
+            ACTION_NOW_MS,
         );
         assert_eq!(decoded, Some(result));
-        assert_eq!(
-            published_at_ms,
-            Some(u64::try_from(stored.ts_unix_ms).expect("non-negative Bus time"))
-        );
-        assert_eq!(source_node.as_deref(), Some("this-node"));
         assert_eq!(cursor.as_deref(), Some(stored.ulid.as_str()));
+    }
+
+    #[test]
+    fn retained_enable_result_is_removed_after_shared_freshness_window() {
+        let mut state = fixture();
+        state.age_enable_at(
+            "this-node",
+            ACTION_NOW_MS + MAX_SURFACE_ENABLE_RESULT_AGE_MS,
+        );
+        assert!(
+            state.enable.is_some(),
+            "the exact freshness boundary remains admitted"
+        );
+
+        state.age_enable_at(
+            "this-node",
+            ACTION_NOW_MS + MAX_SURFACE_ENABLE_RESULT_AGE_MS + 1,
+        );
+        assert!(
+            state.enable.is_none(),
+            "an expired green activation must disappear from the Install tab"
+        );
+
+        let mut future = fixture();
+        future.enable.as_mut().unwrap().published_at_ms =
+            ACTION_NOW_MS + MAX_SURFACE_ENABLE_RESULT_FUTURE_SKEW_MS + 1;
+        future.age_enable_at("this-node", ACTION_NOW_MS);
+        assert!(future.enable.is_none());
     }
 
     #[test]

@@ -34,8 +34,8 @@ pub mod cap_tags;
 // The SOLE definition site for the mesh cloud's catalog/resource/health/stack
 // shapes + the `action/cloud/*` lifecycle command contract; all consumers bind
 // to `cloud::*`.
-pub mod cloud;
 pub mod clock;
+pub mod cloud;
 pub mod connect;
 // CONNECT-1 (2026-06-19) — unified connectivity / exposure policy model + state.
 pub mod ddns;
@@ -81,24 +81,24 @@ pub mod location;
 pub mod media_sources;
 /// WL-FUNC-021 — public-verifier contract for Music workspace mutations.
 pub mod music_auth;
-/// WL-FUNC-011 / WL-FUNC-019 — bounded OpenSubsonic-compatible media admission.
-pub mod subsonic;
 /// Typed, credential-free NetworkManager/ModemManager link observations for
 /// the additive `network.interfaces[]` mesh-status field.
 pub mod network_status;
+/// WL-FUNC-011 / WL-FUNC-019 — bounded OpenSubsonic-compatible media admission.
+pub mod subsonic;
 // arch-7 (2026-07-11) — the canonical shared-storage mount constant +
 // the AUDIT-MESH-15 write-safety guard, relocated out of the `mackesd` bin
 // crate so worker crates factored out of the daemon
 // reuse the one audited guard. `mackesd` re-exports at its crate root.
 pub mod mesh_storage;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
+/// WL-FUNC-017 S6 — bounded daemon-owned route/navigation contracts.
+pub mod navigation;
 pub mod nebula;
 /// WL-FUNC-012 / OVERLAY-1 — keyless NWS active-alert snapshot shared by the
 /// workstation adapter and Maps & Location.
 pub mod nws_alert;
 pub mod nws_forecast;
-/// WL-FUNC-017 S6 — bounded daemon-owned route/navigation contracts.
-pub mod navigation;
 pub mod peer_probe;
 // PEERVER-1 (v2.7, 2026-05-29) — peer-data convergence records.
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
@@ -107,14 +107,16 @@ pub mod peers;
 /// WL-FUNC-019 — versioned universal resource identity, capability, transport,
 /// provenance, auth/health, catalog, and bounded-action contracts.
 pub mod resources;
-/// WL-ARCH-009 — neutral, strict-versioned worker runtime and change-set contracts.
-pub mod worker_runtime;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
 /// WL-FUNC-019 — bounded SSH/SFTP browsing and X11 resource admission.
 pub mod ssh_x11;
+/// Strict versioned Surface Pro 5/6 enable-result publication contract.
+pub mod surface_enable;
 /// WL-UX-011 — bounded Microsoft Surface Pro 5/6 observation and action contracts.
 pub mod surface_hardware;
+/// WL-ARCH-009 — neutral, strict-versioned worker runtime and change-set contracts.
+pub mod worker_runtime;
 // WL-RUN-006 (2026-07-19) — the router firewall-edit verb (`action/router/*`
 // `RouterActionRequest`) + its tamper-evident audit schema. The "mutations
 // fast-follow" of the router-control read slice: the shell's Device-Manager
@@ -189,6 +191,7 @@ pub use resources::{
     ServiceLifecycleStatus, ServiceStackPlane, ServiceStackTier, SourceProvenance,
     TransportCandidate, RESOURCE_CATALOG_TOPIC,
 };
+pub use tags::{Tag, TagFlavor, TagMember, TagStore, TagStoreError};
 pub use worker_runtime::{
     WorkerAction, WorkerChangeSetItem, WorkerChangeSetItemOutcome, WorkerChangeSetOperation,
     WorkerChangeSetOutcome, WorkerChangeSetRequest, WorkerChangeSetResult, WorkerChangeSetTarget,
@@ -199,17 +202,15 @@ pub use worker_runtime::{
 pub use workloads::{
     admit_workload, host_reserve, valid_phase_transition, workload_state_topic, AdmissionDenial,
     HostCapacity, WorkloadAdmission, WorkloadAttachmentLease, WorkloadAttachmentProtocol,
-    WorkloadBackend,
-    WorkloadContractError, WorkloadDesiredState, WorkloadId, WorkloadKind, WorkloadOperationAction,
-    WorkloadHealth, WorkloadOperationPhase, WorkloadOperationRequest, WorkloadOperationStatus,
-    WorkloadPowerState, WorkloadPressure, WorkloadProfile, WorkloadReadiness,
-    WorkloadResources, WorkloadRuntimeSignals, WorkloadStateSnapshot,
-    MAX_WORKLOAD_ATTACHMENTS, MAX_WORKLOAD_DEADLINE_MS, MAX_WORKLOAD_IDENTIFIER_BYTES,
-    MAX_WORKLOAD_TEXT_BYTES, MAX_WORKLOAD_WIRE_BYTES, MAX_WORKLOADS_PER_NODE,
+    WorkloadBackend, WorkloadContractError, WorkloadDesiredState, WorkloadHealth, WorkloadId,
+    WorkloadKind, WorkloadOperationAction, WorkloadOperationPhase, WorkloadOperationRequest,
+    WorkloadOperationStatus, WorkloadPowerState, WorkloadPressure, WorkloadProfile,
+    WorkloadReadiness, WorkloadResources, WorkloadRuntimeSignals, WorkloadStateSnapshot,
+    MAX_WORKLOADS_PER_NODE, MAX_WORKLOAD_ATTACHMENTS, MAX_WORKLOAD_DEADLINE_MS,
+    MAX_WORKLOAD_IDENTIFIER_BYTES, MAX_WORKLOAD_TEXT_BYTES, MAX_WORKLOAD_WIRE_BYTES,
     MIN_HOST_CPU_RESERVE, MIN_HOST_MEMORY_RESERVE_MB, WORKLOAD_CONTRACT_SCHEMA_VERSION,
     WORKLOAD_OPERATION_TOPIC, WORKLOAD_STATE_TOPIC_PREFIX,
 };
-pub use tags::{Tag, TagFlavor, TagMember, TagStore, TagStoreError};
 
 use serde::{Deserialize, Serialize};
 
