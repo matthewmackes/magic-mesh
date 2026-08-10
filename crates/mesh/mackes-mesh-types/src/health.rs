@@ -1500,7 +1500,13 @@ impl SystemMeshHealthSnapshot {
 
     #[must_use]
     pub fn is_fresh(&self, now_ms: u64) -> bool {
-        now_ms <= self.fresh_until_ms
+        // A projection cannot be current before it was generated.  The
+        // nonzero check also keeps the wire-level zero timestamp sentinel
+        // from becoming fresh when a test or hostile caller supplies
+        // `now_ms == 0`.
+        self.generated_at_ms != 0
+            && self.generated_at_ms <= now_ms
+            && now_ms <= self.fresh_until_ms
     }
 }
 
@@ -2198,6 +2204,28 @@ mod tests {
             100 + MAX_NODE_HEALTH_PUBLICATION_TTL_MS,
             "a caller cannot fabricate an unbounded fresh projection"
         );
+    }
+
+    #[test]
+    fn snapshot_freshness_rejects_future_and_zero_timestamp_projections() {
+        let mut future = fold_snapshot(
+            "node",
+            "r1",
+            &BTreeSet::from(["node".to_string()]),
+            vec![state("node", 1, 100)],
+            2,
+            100,
+            100,
+            0,
+        );
+        future.generated_at_ms = 101;
+        future.fresh_until_ms = 200;
+        assert!(!future.is_fresh(100), "future evidence must not appear current");
+
+        let mut zero = future;
+        zero.generated_at_ms = 0;
+        zero.fresh_until_ms = 0;
+        assert!(!zero.is_fresh(0), "zero timestamp is an invalid freshness sentinel");
     }
 
     #[test]
