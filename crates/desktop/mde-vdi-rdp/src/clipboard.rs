@@ -349,7 +349,10 @@ impl CliprdrBackend for TextCliprdrBackend {
                 RemoteFormat::UnicodeText => {
                     state.remote_text = decode_unicode_text(response.data())
                 }
-                RemoteFormat::Html(_) => state.remote_html = decode_cf_html(response.data()),
+                RemoteFormat::Html(_) => {
+                    state.remote_html = decode_cf_html(response.data())
+                        .filter(|html| guest_html_fragment_is_safe(html));
+                }
             }
         });
     }
@@ -541,11 +544,63 @@ fn decode_cf_html(data: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Refuse active guest HTML before it enters the host/mesh clipboard lane.
+///
+/// CF_HTML's offsets and byte cap protect the transport, but they do not make
+/// the fragment inert. Keep ordinary rich formatting while refusing elements,
+/// event-handler attributes, and URL schemes that can execute or navigate when
+/// a downstream host clipboard consumer renders the guest-originated value.
+fn guest_html_fragment_is_safe(fragment: &str) -> bool {
+    let fragment = fragment.to_ascii_lowercase();
+    let mut remainder = fragment.as_str();
+    while let Some((_, after_open)) = remainder.split_once('<') {
+        let Some((tag, after_tag)) = after_open.split_once('>') else {
+            return false;
+        };
+        let tag = tag.trim_start().trim_start_matches('/').trim_start();
+        let name_end = tag
+            .find(|character: char| character.is_ascii_whitespace() || character == '/')
+            .unwrap_or(tag.len());
+        let name = &tag[..name_end];
+        if matches!(
+            name,
+            "base" | "embed" | "form" | "iframe" | "link" | "meta" | "object" | "script"
+                | "style" | "svg"
+        ) {
+            return false;
+        }
+
+        let attributes = &tag[name_end..];
+        if attributes.contains("javascript:") || attributes.contains("vbscript:") {
+            return false;
+        }
+        let mut attribute = attributes;
+        while let Some(start) = attribute.find(|character: char| character.is_ascii_alphabetic()) {
+            attribute = &attribute[start..];
+            let end = attribute
+                .find(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+                .unwrap_or(attribute.len());
+            let name = &attribute[..end];
+            let after_name = &attribute[end..];
+            if name.starts_with("on")
+                && name.len() > 2
+                && after_name.trim_start().starts_with('=')
+            {
+                return false;
+            }
+            attribute = after_name;
+        }
+        remainder = after_tag;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_cf_html, decode_unicode_text, encode_cf_html, html_format, ClipboardBridge,
-        ClipboardBridgeError, DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
+        decode_cf_html, decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe,
+        html_format, ClipboardBridge, ClipboardBridgeError, DIBV5_FORMAT, DIB_FORMAT,
+        HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
     };
     use ironrdp_cliprdr::pdu::{
         ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FormatDataRequest,
@@ -651,6 +706,22 @@ mod tests {
                 + 1
         ]));
         assert_eq!(bridge.take_remote_html(), None);
+    }
+
+    #[test]
+    fn guest_html_active_content_is_refused_before_host_publication() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        backend.on_remote_copy(&[html_format()]);
+        assert_eq!(bridge.take_remote_format_request(), Some(HTML_FORMAT_ID));
+
+        let hostile = encode_cf_html(r#"<div onclick="javascript:alert(1)"><script>alert(1)</script></div>"#);
+        backend.on_format_data_response(FormatDataResponse::new_data(hostile));
+
+        assert_eq!(bridge.take_remote_html(), None);
+        assert!(!guest_html_fragment_is_safe(
+            r#"<div onclick="javascript:alert(1)"><script>alert(1)</script></div>"#
+        ));
+        assert!(guest_html_fragment_is_safe("<p><strong>safe</strong> guest</p>"));
     }
 
     #[test]
