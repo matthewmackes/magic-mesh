@@ -1067,6 +1067,8 @@ behavioral evidence is not completion.
 - **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
   machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
+- **Blocked App-VM authorization checkpoint (2026-08-10):** stale, unavailable, or malformed blocked Flatpak rows now fail before root authorization or Bus payload;
+  `.90` passed the focused regression: `docs/platform/evidence/WL-FUNC-018-2026-08-10-blocked-appvm-authorization-r127.md`.
 - **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
   only after governed projection/status effects succeed, and expiry retains
   authority until its retraction publishes. Machine 194 passed the exact
@@ -1620,6 +1622,8 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Ringing schedule-removal checkpoint (2026-08-10):** removal now persists a terminal acknowledgement, queues Music Stop, and cancels pending snooze children before
+  deleting the schedule; `.90` passed: `docs/platform/evidence/WL-FUNC-022-2026-08-10-ringing-schedule-removal-r128.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Clock documentation/package hard-cut checkpoint (2026-08-09):** the visible

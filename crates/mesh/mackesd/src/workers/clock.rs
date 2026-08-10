@@ -695,11 +695,54 @@ impl ClockWorker {
                 if peer_origin {
                     anyhow::bail!("peer Clock schedule removal is not authoritative");
                 }
-                let before = snapshot.schedules.len();
+                if !snapshot
+                    .schedules
+                    .iter()
+                    .any(|value| value.schedule_id == schedule_id)
+                {
+                    return Ok(false);
+                }
+                let ringing_occurrence_ids = snapshot
+                    .occurrences
+                    .iter()
+                    .filter(|occurrence| {
+                        occurrence.schedule_id == schedule_id
+                            && occurrence.phase == ClockOccurrencePhase::Ringing
+                    })
+                    .map(|occurrence| {
+                        (
+                            occurrence.occurrence_id.clone(),
+                            occurrence.global_event_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for (occurrence_id, global_event_id) in ringing_occurrence_ids {
+                    let acknowledgement = ClockAcknowledgementV1 {
+                        acknowledgement_id: schedule_removal_acknowledgement_id(
+                            &occurrence_id,
+                            request_id,
+                        ),
+                        global_event_id,
+                        actor_node_id: command_origin.to_owned(),
+                        actor_clock: expected_snapshot_revision.checked_add(1).ok_or_else(
+                            || anyhow::anyhow!("Clock schedule removal generation exhausted"),
+                        )?,
+                        acknowledged_at_utc_ms: issued_at_ms,
+                        stop: true,
+                    };
+                    anyhow::ensure!(
+                        acknowledge(snapshot, &occurrence_id, acknowledgement)?,
+                        "Clock schedule removal could not stop its ringing occurrence"
+                    );
+                }
+                snapshot.occurrences.retain(|occurrence| {
+                    occurrence.schedule_id != schedule_id
+                        || occurrence.phase != ClockOccurrencePhase::Scheduled
+                });
                 snapshot
                     .schedules
                     .retain(|value| value.schedule_id != schedule_id);
-                snapshot.schedules.len() != before
+                true
             }
             ClockCommandKindV1::SetScheduleEnabled {
                 schedule_id,
@@ -2091,6 +2134,18 @@ fn auto_silence_acknowledgement_id(occurrence: &ClockOccurrenceV1) -> String {
     )
 }
 
+fn schedule_removal_acknowledgement_id(occurrence_id: &str, request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"magic-mesh:clock-schedule-removal:v1\0");
+    digest.update(occurrence_id.as_bytes());
+    digest.update([0]);
+    digest.update(request_id.as_bytes());
+    format!(
+        "clock-schedule-removal-{}",
+        &hex_bytes(&digest.finalize())[..32]
+    )
+}
+
 fn local_time_zone() -> String {
     std::env::var("TZ")
         .ok()
@@ -2448,6 +2503,38 @@ mod tests {
                 &self.signing_key,
                 &ClockValidationContext {
                     wall_utc_ms: NOW,
+                    monotonic_ms: 1,
+                    zone_exists: &zone_exists,
+                },
+            )
+            .unwrap()
+        }
+
+        fn remove_schedule_command(
+            &self,
+            request_id: &str,
+            expected_revision: u64,
+            schedule_id: &str,
+            now_ms: i64,
+        ) -> ClockCommandV1 {
+            ClockCommandV1 {
+                schema_version: CLOCK_SCHEMA_VERSION,
+                request_id: request_id.into(),
+                origin_node_id: "seat-1".into(),
+                expected_revision,
+                issued_at_utc_ms: now_ms,
+                expires_at_utc_ms: now_ms + MAX_CLOCK_COMMAND_TTL_MS,
+                body: ClockCommandKindV1::RemoveSchedule {
+                    schedule_id: schedule_id.into(),
+                },
+                signer_id: String::new(),
+                signature: String::new(),
+            }
+            .sign(
+                "seat-1-key",
+                &self.signing_key,
+                &ClockValidationContext {
+                    wall_utc_ms: now_ms,
                     monotonic_ms: 1,
                     zone_exists: &zone_exists,
                 },
@@ -3327,6 +3414,81 @@ mod tests {
                 ringing.occurrence_id.clone(),
                 ringing.revision,
                 auto_silence_acknowledgement_id(&ringing),
+            )]
+        );
+    }
+
+    #[test]
+    fn removing_a_ringing_schedule_atomically_stops_audio_and_persists_the_terminal_occurrence() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let due_at = NOW + 5_000;
+        fixture.publish(&fixture.alarm_command("remove-ringing", 1, due_at));
+        fixture.worker.tick_once().unwrap();
+
+        fixture.clock.0.store(due_at, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let ringing = fixture.worker.snapshot.as_ref().unwrap().occurrences[0].clone();
+        assert_eq!(ringing.phase, ClockOccurrencePhase::Ringing);
+
+        let remove_request_id = "remove-ringing-schedule";
+        fixture.publish(&fixture.remove_schedule_command(
+            remove_request_id,
+            fixture.worker.snapshot.as_ref().unwrap().revision,
+            &ringing.schedule_id,
+            due_at,
+        ));
+        fixture.worker.tick_once().unwrap();
+
+        let snapshot = fixture.worker.snapshot.as_ref().unwrap();
+        assert!(snapshot.schedules.is_empty());
+        let stopped = snapshot
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.occurrence_id == ringing.occurrence_id)
+            .unwrap();
+        assert_eq!(stopped.phase, ClockOccurrencePhase::Stopped);
+        assert!(stopped
+            .targets
+            .iter()
+            .all(|target| target.disposition == ClockTargetDisposition::Stopped));
+        let acknowledgement = stopped.acknowledgement.as_ref().unwrap();
+        assert!(acknowledgement.stop);
+        assert_eq!(acknowledgement.actor_node_id, "seat-1");
+        assert_eq!(acknowledgement.actor_clock, snapshot.revision);
+        assert_eq!(acknowledgement.acknowledged_at_utc_ms, due_at);
+        assert_eq!(
+            acknowledgement.acknowledgement_id,
+            schedule_removal_acknowledgement_id(&ringing.occurrence_id, remove_request_id)
+        );
+
+        let durable = fixture.worker.store.load("seat-1").unwrap().unwrap();
+        assert_eq!(durable.revision, snapshot.revision);
+        assert_eq!(
+            ClockSnapshotV1::from_persisted_json_at(
+                durable.snapshot_json.as_bytes(),
+                &fixture.worker.context(due_at),
+            )
+            .unwrap(),
+            *snapshot
+        );
+
+        let stops = fixture
+            .audio_messages()
+            .into_iter()
+            .map(|body| serde_json::from_str::<ClockAudioRequestV1>(&body).unwrap())
+            .filter_map(|request| match request.body {
+                ClockAudioActionV1::Stop { acknowledgement_id } => {
+                    Some((request.occurrence_id, acknowledgement_id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stops,
+            vec![(
+                ringing.occurrence_id.clone(),
+                schedule_removal_acknowledgement_id(&ringing.occurrence_id, remove_request_id),
             )]
         );
     }

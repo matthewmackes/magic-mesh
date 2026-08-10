@@ -2819,6 +2819,17 @@ fn peer_app_provision_wire_with(
     target: &FrontDoorPeerAppTarget,
     authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
 ) -> Result<(String, String), String> {
+    if let Some(reason) = target.launch_blocked_reason.as_deref() {
+        let reason = reason.trim();
+        let reason = if reason.is_empty() {
+            "unspecified admission refusal"
+        } else {
+            reason
+        };
+        return Err(format!(
+            "Flatpak App VM launch is blocked by current admission state: {reason}"
+        ));
+    }
     let node = target.node.trim();
     if node.is_empty()
         || node.len() > 255
@@ -6962,6 +6973,39 @@ mod tests {
             launch_blocked_reason: None,
         };
         assert!(peer_app_launch_wire(&target).is_none());
+    }
+
+    #[test]
+    fn blocked_flatpak_state_cannot_reach_app_vm_authorization() {
+        let mut target = FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.example.Editor".to_owned(),
+            name: "Editor".to_owned(),
+            source: "flatpak".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: vec!["audio".to_owned()],
+            launch_blocked_reason: Some("not launchable: stale catalog".to_owned()),
+        };
+        let authorization_called = std::cell::Cell::new(false);
+
+        let error = peer_app_provision_wire_with(&target, |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("stale catalog state must fail closed before authorization");
+
+        assert!(error.contains("stale catalog"), "{error}");
+        assert!(!authorization_called.get());
+
+        target.launch_blocked_reason = Some("  ".to_owned());
+        let error = peer_app_provision_wire_with(&target, |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("an empty blocked marker must remain fail closed");
+        assert!(error.contains("unspecified admission refusal"), "{error}");
+        assert!(!authorization_called.get());
     }
 
     #[test]
