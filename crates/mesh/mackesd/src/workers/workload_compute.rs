@@ -2082,11 +2082,7 @@ impl WorkloadActuator for SystemWorkloadActuator {
         let Some(lease) = status.attachment.as_ref() else {
             return Ok(None);
         };
-        if lease.workload_id != status.workload_id
-            || lease.generation != status.generation
-            || lease.protocol != WorkloadAttachmentProtocol::QemuDisplay1Dmabuf
-            || lease.validate(now_ms).is_err()
-        {
+        if validate_recovered_attachment_lease(request, status, lease, now_ms).is_err() {
             self.revoke_persisted_attachment(status);
             return Ok(Some(Self::recovered_attachment_unavailable(
                 "the recovered Display1 lease was expired or did not match the exact workload generation and was revoked",
@@ -3798,7 +3794,10 @@ impl WorkloadComputeWorker {
                     continue;
                 };
                 let substituted_lease = lease != persisted_lease;
-                if substituted_lease || lease.validate(now_ms).is_err() {
+                if substituted_lease
+                    || validate_recovered_attachment_lease(&request, &status, lease, now_ms)
+                        .is_err()
+                {
                     tracing::error!(
                         request_id = %request.request_id,
                         "terminal attachment recovery returned an unauthorized or invalid lease"
@@ -4483,6 +4482,29 @@ fn phase_steps(
 
 fn bounded_reason(reason: &str) -> String {
     reason.chars().take(512).collect()
+}
+
+fn validate_recovered_attachment_lease(
+    request: &WorkloadOperationRequest,
+    status: &WorkloadOperationStatus,
+    lease: &WorkloadAttachmentLease,
+    now_ms: u64,
+) -> Result<(), &'static str> {
+    if lease.workload_id != request.workload_id || lease.workload_id != status.workload_id {
+        return Err("lease workload identity does not match the recovered Workload");
+    }
+    if lease.generation != status.generation {
+        return Err("lease generation does not match the recovered Workload generation");
+    }
+    if lease.protocol != WorkloadAttachmentProtocol::QemuDisplay1Dmabuf {
+        return Err("lease protocol is not the authenticated Display1 protocol");
+    }
+    if lease.expires_at_ms > request.deadline_at_ms {
+        return Err("lease outlives the originating Workload operation deadline");
+    }
+    lease
+        .validate(now_ms)
+        .map_err(|_| "recovered Workload lease is expired or malformed")
 }
 
 fn safe_request_id(body: &str) -> String {
@@ -5644,6 +5666,20 @@ mod tests {
         let next = SystemWorkloadActuator::attachment_lease(&next_request, 2, now);
         assert_ne!(first.lease_id, next.lease_id);
         assert_eq!(next.generation, 2);
+    }
+
+    #[test]
+    fn recovered_attachment_lease_cannot_outlive_its_operation_deadline() {
+        let now = now_ms();
+        let mut request = request();
+        request.deadline_at_ms = now.saturating_add(10_000);
+        let status = queued_status(&request);
+        let mut lease = SystemWorkloadActuator::attachment_lease(&request, 1, now);
+        lease.expires_at_ms = request.deadline_at_ms.saturating_add(1);
+
+        let error = validate_recovered_attachment_lease(&request, &status, &lease, now)
+            .expect_err("recovery must reject a lease beyond the request authority window");
+        assert!(error.contains("outlives"));
     }
 
     #[test]
