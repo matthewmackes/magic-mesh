@@ -28,6 +28,7 @@ use mde_egui::Style;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::model::MapViewState;
+use crate::offline_catalog::RegionId;
 
 // The map canvas is intentionally dark in both shell color schemes. Keep the
 // honest no-data copy on the map-content palette so Light-mode token remapping
@@ -117,6 +118,21 @@ pub struct BasemapMeta {
     pub raw: RawMeta,
 }
 
+/// A filesystem region admitted as one unambiguous, catalog-compatible bundle.
+#[derive(Debug, Clone)]
+struct InstalledRegion {
+    id: RegionId,
+    dir: PathBuf,
+    mbtiles: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum RootAdmission {
+    NoData,
+    One(InstalledRegion),
+    Rejected,
+}
+
 /// Candidate map-data roots in lookup order.
 ///
 /// `MDE_MAPS_DIR` is authoritative when set. Otherwise, production reads the
@@ -145,50 +161,113 @@ fn maps_roots() -> Vec<PathBuf> {
     )
 }
 
-/// The first `*.mbtiles` file directly inside `dir`, if any.
-fn mbtiles_in(dir: &Path) -> Option<PathBuf> {
-    let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("mbtiles"))
-        })
-        .collect();
-    hits.sort();
-    hits.into_iter().next()
+fn admit_region_dir(dir: PathBuf) -> Result<Option<InstalledRegion>, ()> {
+    let entries = std::fs::read_dir(&dir).map_err(|_| ())?;
+    let mut mbtiles = None;
+    let mut has_region_data = false;
+
+    for entry in entries {
+        let entry = entry.map_err(|_| ())?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let is_mbtiles = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mbtiles"));
+        let is_gazetteer = file_name == "gazetteer.sqlite";
+        if !is_mbtiles && !is_gazetteer {
+            continue;
+        }
+        has_region_data = true;
+
+        // Do not follow links or admit directories/devices/FIFOs as databases.
+        if !entry.file_type().map_err(|_| ())?.is_file() {
+            return Err(());
+        }
+        if is_mbtiles {
+            let stem = path.file_stem().and_then(|stem| stem.to_str()).ok_or(())?;
+            RegionId::parse(stem).map_err(|_| ())?;
+            if mbtiles.replace(path).is_some() {
+                return Err(());
+            }
+        }
+    }
+
+    if !has_region_data {
+        return Ok(None);
+    }
+    let name = dir.file_name().and_then(|name| name.to_str()).ok_or(())?;
+    let id = RegionId::parse(name).map_err(|_| ())?;
+    Ok(Some(InstalledRegion { id, dir, mbtiles }))
 }
 
-/// Resolve the installed region directory.
-///
-/// The first sub-directory of the maps root that carries a `.mbtiles` or a
-/// `gazetteer.sqlite`. Returns `None` when no data is installed (the honest
-/// offline fallback).
-#[must_use]
-pub fn region_dir() -> Option<PathBuf> {
-    for root in maps_roots() {
-        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        dirs.sort();
-        if let Some(dir) = dirs
-            .into_iter()
-            .find(|d| mbtiles_in(d).is_some() || d.join("gazetteer.sqlite").exists())
-        {
-            return Some(dir);
+fn admit_root(root: &Path) -> RootAdmission {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RootAdmission::NoData;
+        }
+        Err(_) => return RootAdmission::Rejected,
+    };
+    let mut admitted = None;
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return RootAdmission::Rejected;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return RootAdmission::Rejected;
+        };
+        let path = entry.path();
+
+        // A link to a directory is indistinguishable from a region candidate
+        // through the old `Path::is_dir` check. Reject it without traversing it.
+        if file_type.is_symlink() && path.is_dir() {
+            return RootAdmission::Rejected;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        match admit_region_dir(path) {
+            Ok(None) => {}
+            Ok(Some(region)) if admitted.is_none() => admitted = Some(region),
+            Ok(Some(_)) | Err(()) => return RootAdmission::Rejected,
+        }
+    }
+
+    admitted.map_or(RootAdmission::NoData, RootAdmission::One)
+}
+
+fn installed_region_in(roots: &[PathBuf]) -> Option<InstalledRegion> {
+    for root in roots {
+        match admit_root(root) {
+            RootAdmission::NoData => {}
+            RootAdmission::One(region) => return Some(region),
+            RootAdmission::Rejected => return None,
         }
     }
     None
 }
 
+fn installed_region() -> Option<InstalledRegion> {
+    installed_region_in(&maps_roots())
+}
+
+/// Resolve the one unambiguous, catalog-compatible installed region directory.
+///
+/// Returns `None` when no data is installed or candidate admission fails, which
+/// preserves the honest offline fallback rather than guessing at filesystem
+/// discovery order.
+#[must_use]
+pub fn region_dir() -> Option<PathBuf> {
+    installed_region().map(|region| region.dir)
+}
+
 /// Open an `MBTiles`/`SQLite` file read-only. Fail-soft: `None` when it cannot open.
 fn open_ro(path: &Path) -> Option<Connection> {
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
 }
 
@@ -350,15 +429,11 @@ pub fn cached_meta(ctx: &Context) -> Option<BasemapMeta> {
     if let Some(meta) = ctx.data_mut(|d| d.get_temp::<BasemapMeta>(key)) {
         return Some(meta);
     }
-    let dir = region_dir()?;
-    let mbtiles = mbtiles_in(&dir)?;
+    let installed = installed_region()?;
+    let mbtiles = installed.mbtiles?;
     let raw = read_meta(&mbtiles)?;
-    let region = dir.file_name().map_or_else(
-        || "region".to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
     let meta = BasemapMeta {
-        region,
+        region: installed.id.as_str().to_owned(),
         mbtiles,
         raw,
     };
@@ -754,6 +829,132 @@ mod tests {
         )
         .unwrap();
         png
+    }
+
+    fn synth_region(root: &Path, name: &str, mbtiles_name: &str) -> PathBuf {
+        let region = root.join(name);
+        std::fs::create_dir(&region).unwrap();
+        synth_mbtiles(&region.join(mbtiles_name));
+        region
+    }
+
+    #[test]
+    fn region_admission_preserves_one_valid_bundle_and_honest_no_data() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(installed_region_in(&[empty.path().to_path_buf()]).is_none());
+
+        let installed = tempfile::tempdir().unwrap();
+        let region = synth_region(installed.path(), "east-texas", "east-texas.mbtiles");
+        std::fs::write(region.join("gazetteer.sqlite"), b"catalog").unwrap();
+        let admitted = installed_region_in(&[empty.path().to_path_buf(), installed.path().into()])
+            .expect("one regular installed region must be admitted");
+        assert_eq!(admitted.id.as_str(), "east-texas");
+        assert_eq!(admitted.dir, region);
+        assert_eq!(
+            admitted.mbtiles.as_deref(),
+            Some(region.join("east-texas.mbtiles").as_path())
+        );
+    }
+
+    #[test]
+    fn region_admission_rejects_multiple_regions_in_both_creation_orders() {
+        for names in [["alpha", "zulu"], ["zulu", "alpha"]] {
+            let root = tempfile::tempdir().unwrap();
+            for name in names {
+                synth_region(root.path(), name, &format!("{name}.mbtiles"));
+            }
+            assert!(
+                installed_region_in(&[root.path().into()]).is_none(),
+                "region ambiguity must not depend on creation/discovery order: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_admission_rejects_multiple_mbtiles_in_both_creation_orders() {
+        for names in [
+            ["alpha.mbtiles", "zulu.mbtiles"],
+            ["zulu.mbtiles", "alpha.mbtiles"],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let region = root.path().join("east-texas");
+            std::fs::create_dir(&region).unwrap();
+            for name in names {
+                synth_mbtiles(&region.join(name));
+            }
+            assert!(
+                installed_region_in(&[root.path().into()]).is_none(),
+                "MBTiles ambiguity must not depend on creation/discovery order: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_admission_rejects_unsafe_region_and_mbtiles_slugs() {
+        for reverse in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let candidates = if reverse {
+                [
+                    ("east-texas", "east-texas.mbtiles"),
+                    ("Unsafe Region", "safe.mbtiles"),
+                ]
+            } else {
+                [
+                    ("Unsafe Region", "safe.mbtiles"),
+                    ("east-texas", "east-texas.mbtiles"),
+                ]
+            };
+            for (region, mbtiles) in candidates {
+                synth_region(root.path(), region, mbtiles);
+            }
+            assert!(
+                installed_region_in(&[root.path().into()]).is_none(),
+                "an unsafe region candidate must poison admission regardless of ordering"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        synth_region(root.path(), "east-texas", "Unsafe Name.mbtiles");
+        assert!(installed_region_in(&[root.path().into()]).is_none());
+    }
+
+    #[test]
+    fn region_admission_rejects_non_regular_mbtiles_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let region = synth_region(root.path(), "east-texas", "east-texas.mbtiles");
+        std::fs::create_dir(region.join("other.mbtiles")).unwrap();
+        assert!(
+            installed_region_in(&[root.path().into()]).is_none(),
+            "a directory masquerading as MBTiles must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn region_admission_rejects_symlinked_region_and_mbtiles_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        synth_region(root.path(), "east-texas", "east-texas.mbtiles");
+        let external = tempfile::tempdir().unwrap();
+        let external_region = synth_region(external.path(), "linked", "linked.mbtiles");
+        symlink(&external_region, root.path().join("linked-region")).unwrap();
+        assert!(
+            installed_region_in(&[root.path().into()]).is_none(),
+            "a symlinked region beside a valid region must not be silently skipped"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let region = synth_region(root.path(), "east-texas", "east-texas.mbtiles");
+        symlink(
+            external_region.join("linked.mbtiles"),
+            region.join("linked.mbtiles"),
+        )
+        .unwrap();
+        assert!(
+            installed_region_in(&[root.path().into()]).is_none(),
+            "a symlinked MBTiles candidate must fail closed"
+        );
     }
 
     #[test]
