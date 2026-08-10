@@ -39,7 +39,9 @@ tasks.
   audit class is exempt. Configuration, identities, credentials, current
   materialized state, user media, queued payloads, and VM disks are not history
   and must survive each epoch. Offline replicas must not be able to restore an
-  expired record after they rejoin.
+  expired record after they rejoin. The release-33 Dell churn, compact-Bus,
+  synchronized privacy epoch, VM CPU/I/O profile, and exact cold-boot proof is
+  recorded in `docs/platform/evidence/WL-ARCH-008-WL-ARCH-009-WL-ARCH-010-WL-CRIT-007-2026-08-10-dell-churn-release33-r134.md`.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
   never run filler tests.
