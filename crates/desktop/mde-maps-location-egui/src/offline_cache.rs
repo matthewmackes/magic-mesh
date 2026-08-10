@@ -439,6 +439,7 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
             || !is_sha256_hex(&entry.sha256)
             || entry.byte_len == 0
             || entry.byte_len > MAX_TILE_BYTES as u64
+            || entry.last_access_ms < entry.verified_at_ms
             || !identities.insert(entry.tile.clone())
         {
             return Err(CacheError::CorruptIndex(
@@ -921,5 +922,40 @@ mod tests {
             future,
             "a future-generation index must not be destroyed by an older reader"
         );
+    }
+
+    #[test]
+    fn impossible_access_timeline_recovers_empty_before_renderer_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CachePolicy::bounded(1024, 10_000).unwrap();
+        let id = tile(0);
+        let digest = sha256_hex(b"verified");
+        let index = CacheIndex {
+            schema: INDEX_SCHEMA,
+            entries: vec![CacheEntry {
+                tile: id.clone(),
+                catalog_sha256: catalog().digest().to_string(),
+                sha256: digest,
+                byte_len: b"verified".len() as u64,
+                verified_at_ms: 20,
+                last_access_ms: 19,
+            }],
+        };
+        std::fs::write(
+            dir.path().join(INDEX_FILE),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        assert!(cache.is_empty());
+        assert!(matches!(
+            cache.lookup(&catalog(), &id, 20),
+            OfflineTile::Unavailable(UnavailableReason::NotIndexed)
+        ));
+        let recovered: CacheIndex =
+            serde_json::from_slice(&std::fs::read(dir.path().join(INDEX_FILE)).unwrap()).unwrap();
+        assert_eq!(recovered.schema, INDEX_SCHEMA);
+        assert!(recovered.entries.is_empty());
     }
 }
