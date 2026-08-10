@@ -39,15 +39,13 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use super::{Subsystem, SurfaceDetection, SurfaceDevice, SurfaceModel, SurfaceProfile};
 use mackes_mesh_types::surface_hardware::{
     SurfaceAvailability, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
     SurfaceCameraProofUnavailable, SurfaceFleetSummary, SurfaceModelIdentity,
     SurfaceObservationSource, SurfaceProGeneration, SurfaceProbeState, SurfaceProbeVerdict,
     SurfacePublication, SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_HARDWARE_SCHEMA_VERSION,
 };
-use serde::{Deserialize, Serialize};
-
-use super::{Subsystem, SurfaceDetection, SurfaceDevice, SurfaceModel, SurfaceProfile};
 
 // ─────────────────────────────── the tri-state ──────────────────────────────
 
@@ -56,7 +54,7 @@ use super::{Subsystem, SurfaceDetection, SurfaceDevice, SurfaceModel, SurfacePro
 /// The tri-state is `Ok`/`Degraded`/`Failed`; the interactive-gesture probes
 /// (pen, suspend) add [`Self::NeedsGesture`], which prompts the operator
 /// honestly rather than faulting a subsystem we simply haven't exercised yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeState {
     /// Verified working — the reading confirms the subsystem is live.
     Ok,
@@ -186,7 +184,7 @@ pub struct FingerprintReading {
 
 /// A typed failure from the [`SurfaceProbes`] seam — mirrors
 /// [`super::enable::EnableError`]'s honest split.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeError {
     /// The live probe isn't wired to real hardware yet — the honest answer
     /// on any non-Surface dev box / headless CI (§7: never a faked green).
@@ -743,7 +741,7 @@ impl SurfaceProbes for LiveSurfaceProbes {
 
 /// One subsystem's row on the verify board — the subsystem, its tri-state,
 /// and the real reason string (lock #5: every cell carries a reason).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubsystemVerdict {
     /// The subsystem this row verifies.
     pub subsystem: Subsystem,
@@ -1011,7 +1009,7 @@ pub fn classify_fingerprint(reading: Result<FingerprintReading, ProbeError>) -> 
 /// The full per-node verify board — the model string + one row per subsystem
 /// the model's profile claims. SURFACE-6's Test tab renders it; [`summarize`]
 /// folds it to the compact fleet summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyBoard {
     /// The recognised model's product string (empty when the node isn't a
     /// recognised Surface — then `rows` is empty and nothing is probed).
@@ -1087,7 +1085,7 @@ pub fn run_verify(probes: &impl SurfaceProbes, detection: &SurfaceDetection) -> 
 /// The compact `state/hardware/surface/<node>` summary the fleet rollup reads
 /// (lock #7): model, enablement %, and the red subsystems. Visibility only —
 /// no remote control.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetSummary {
     /// The publishing node's id.
     pub node: String,

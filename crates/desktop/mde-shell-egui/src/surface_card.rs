@@ -49,8 +49,8 @@ use mackes_mesh_types::surface_hardware::{
     SurfaceCameraProofUnavailable, SurfaceFirmwareApplyFailure, SurfaceFirmwareApplyOutcome,
     SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyRequest, SurfaceFirmwareApplyResult,
     SurfaceFirmwareApplyTarget, SurfaceFirmwareApplyUnavailable, SurfaceFirmwareInventory,
-    SurfaceFleetSummary, SurfaceModelIdentity, SurfaceProGeneration, SurfaceProbeState,
-    SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
+    SurfaceFleetSummary, SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration,
+    SurfaceProbeState, SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
     SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 use mde_egui::egui::{self, RichText};
@@ -457,13 +457,28 @@ impl SurfaceCardState {
         // a last-good `Fresh` value would stay cosmetically fresh forever when
         // the producer stops publishing and the cursor sees no new messages.
         if let Some(summary) = self.summary.as_mut() {
-            let _ = admit_publication_freshness(&mut summary.publication, &node, now_ms);
+            let _ = admit_publication_freshness(
+                &mut summary.publication,
+                &node,
+                SurfaceObservationSource::Kernel,
+                now_ms,
+            );
         }
         if let Some(board) = self.board.as_mut() {
-            let _ = admit_publication_freshness(&mut board.publication, &node, now_ms);
+            let _ = admit_publication_freshness(
+                &mut board.publication,
+                &node,
+                SurfaceObservationSource::Kernel,
+                now_ms,
+            );
         }
         if let Some(firmware) = self.firmware.as_mut() {
-            let _ = admit_publication_freshness(&mut firmware.publication, &node, now_ms);
+            let _ = admit_publication_freshness(
+                &mut firmware.publication,
+                &node,
+                SurfaceObservationSource::Fwupd,
+                now_ms,
+            );
         }
         if self.camera_in_flight.as_ref().is_some_and(|pending| {
             pending.node != node
@@ -1588,7 +1603,12 @@ fn read_latest_surface_firmware(
     let now_ms = wall_clock_ms();
     read_latest_with(persist, topic, cursor, slot, |body| {
         let mut value = SurfaceFirmwareInventory::from_json(body).ok()?;
-        admit_publication_freshness(&mut value.publication, expected_node, now_ms)?;
+        admit_publication_freshness(
+            &mut value.publication,
+            expected_node,
+            SurfaceObservationSource::Fwupd,
+            now_ms,
+        )?;
         Some(value)
     });
 }
@@ -1604,9 +1624,17 @@ fn wall_clock_ms() -> u64 {
 fn admit_publication_freshness(
     publication: &mut mackes_mesh_types::surface_hardware::SurfacePublication,
     expected_node: &str,
+    expected_source: SurfaceObservationSource,
     now_ms: u64,
 ) -> Option<()> {
-    if publication.node != expected_node {
+    if publication.node != expected_node
+        || publication.source != expected_source
+        || !matches!(
+            (&*publication.model.product, publication.model.generation),
+            ("Surface Pro 5", SurfaceProGeneration::Pro5)
+                | ("Surface Pro 6", SurfaceProGeneration::Pro6)
+        )
+    {
         return None;
     }
     if matches!(publication.availability, SurfaceAvailability::Fresh) {
@@ -1628,7 +1656,12 @@ fn decode_surface_summary_at(
     now_ms: u64,
 ) -> Option<SurfaceFleetSummary> {
     let mut value = SurfaceFleetSummary::from_json(body).ok()?;
-    admit_publication_freshness(&mut value.publication, expected_node, now_ms)?;
+    admit_publication_freshness(
+        &mut value.publication,
+        expected_node,
+        SurfaceObservationSource::Kernel,
+        now_ms,
+    )?;
     Some(value)
 }
 
@@ -1638,7 +1671,12 @@ fn decode_surface_board_at(
     now_ms: u64,
 ) -> Option<SurfaceVerifyBoard> {
     let mut value = SurfaceVerifyBoard::from_json(body).ok()?;
-    admit_publication_freshness(&mut value.publication, expected_node, now_ms)?;
+    admit_publication_freshness(
+        &mut value.publication,
+        expected_node,
+        SurfaceObservationSource::Kernel,
+        now_ms,
+    )?;
     Some(value)
 }
 
@@ -1715,7 +1753,6 @@ fn enable_refusal_label(refusal: SurfaceEnableRefusal) -> &'static str {
     match refusal {
         SurfaceEnableRefusal::Contract => "request contract",
         SurfaceEnableRefusal::Authorization => "local authorization",
-        SurfaceEnableRefusal::ObsoleteRebootArm => "obsolete reboot authority",
         SurfaceEnableRefusal::Policy => "local policy",
     }
 }
@@ -2758,6 +2795,27 @@ mod tests {
 
         assert!(decode_surface_board_at(&valid_board, "foreign-node", ACTION_NOW_MS).is_none());
         assert!(decode_surface_summary_at(&valid_summary, "foreign-node", ACTION_NOW_MS).is_none());
+
+        let mut wrong_source = fixture().summary.unwrap();
+        wrong_source.publication.source = SurfaceObservationSource::Fwupd;
+        assert!(decode_surface_summary_at(
+            &serde_json::to_vec(&wrong_source).unwrap(),
+            "this-node",
+            ACTION_NOW_MS,
+        )
+        .is_none());
+
+        let mut unsupported = fixture().board.unwrap();
+        unsupported.publication.model = SurfaceModelIdentity {
+            product: "Surface Pro 8".into(),
+            generation: SurfaceProGeneration::Unsupported,
+        };
+        assert!(decode_surface_board_at(
+            &serde_json::to_vec(&unsupported).unwrap(),
+            "this-node",
+            ACTION_NOW_MS,
+        )
+        .is_none());
     }
 
     #[test]

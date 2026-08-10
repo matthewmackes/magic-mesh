@@ -88,7 +88,24 @@ pub struct SurfaceModelIdentity {
 impl SurfaceModelIdentity {
     /// Validate model identity bounds.
     pub fn validate(&self) -> Result<(), SurfaceContractError> {
-        validate_text(&self.product, MAX_SURFACE_MODEL_BYTES, "model.product")
+        validate_text(&self.product, MAX_SURFACE_MODEL_BYTES, "model.product")?;
+        match (&*self.product, self.generation) {
+            ("Surface Pro 5", SurfaceProGeneration::Pro5)
+            | ("Surface Pro 6", SurfaceProGeneration::Pro6) => Ok(()),
+            ("Surface Pro 5" | "Surface Pro 6", SurfaceProGeneration::Unsupported)
+            | (_, SurfaceProGeneration::Pro5 | SurfaceProGeneration::Pro6) => {
+                Err(SurfaceContractError::Invalid("model generation"))
+            }
+            (_, SurfaceProGeneration::Unsupported) => Ok(()),
+        }
+    }
+}
+
+fn validate_exact_pro56_model(model: &SurfaceModelIdentity) -> Result<(), SurfaceContractError> {
+    match (&*model.product, model.generation) {
+        ("Surface Pro 5", SurfaceProGeneration::Pro5)
+        | ("Surface Pro 6", SurfaceProGeneration::Pro6) => Ok(()),
+        _ => Err(SurfaceContractError::Invalid("Surface Pro 5/6 model")),
     }
 }
 
@@ -243,6 +260,10 @@ impl SurfaceVerifyBoard {
     /// Validate board bounds and unique subsystem rows.
     pub fn validate(&self) -> Result<(), SurfaceContractError> {
         self.publication.validate()?;
+        validate_exact_pro56_model(&self.publication.model)?;
+        if self.publication.source != SurfaceObservationSource::Kernel {
+            return Err(SurfaceContractError::Invalid("board source"));
+        }
         validate_optional_reason(&self.skipped, "skipped")?;
         if self.skipped.is_some()
             && matches!(self.publication.availability, SurfaceAvailability::Fresh)
@@ -295,6 +316,10 @@ impl SurfaceFleetSummary {
     /// Validate counts, percentage, and duplicate-free red rows.
     pub fn validate(&self) -> Result<(), SurfaceContractError> {
         self.publication.validate()?;
+        validate_exact_pro56_model(&self.publication.model)?;
+        if self.publication.source != SurfaceObservationSource::Kernel {
+            return Err(SurfaceContractError::Invalid("fleet summary source"));
+        }
         if !matches!(self.publication.availability, SurfaceAvailability::Fresh)
             && (self.enablement_pct != 0 || self.red_count != 0 || !self.red_subsystems.is_empty())
         {
@@ -360,6 +385,10 @@ impl SurfaceFirmwareInventory {
     /// Validate inventory bounds and stable unique device identities.
     pub fn validate(&self) -> Result<(), SurfaceContractError> {
         self.publication.validate()?;
+        validate_exact_pro56_model(&self.publication.model)?;
+        if self.publication.source != SurfaceObservationSource::Fwupd {
+            return Err(SurfaceContractError::Invalid("firmware source"));
+        }
         validate_optional_reason(&self.skipped, "skipped")?;
         if self.skipped.is_some()
             && matches!(self.publication.availability, SurfaceAvailability::Fresh)
@@ -426,9 +455,6 @@ pub struct SurfaceEnableRequest {
     /// Shared action identity and freshness metadata.
     #[serde(flatten)]
     pub header: SurfaceActionHeader,
-    /// Human-entered MOK reboot token, when arming that step.
-    #[serde(default)]
-    pub arm_token: Option<String>,
 }
 
 /// Firmware apply action request.
@@ -795,9 +821,7 @@ macro_rules! impl_action_decode {
     };
 }
 
-impl_action_decode!(SurfaceEnableRequest, |value: &SurfaceEnableRequest| {
-    validate_optional_reason(&value.arm_token, "arm_token")
-});
+impl_action_decode!(SurfaceEnableRequest, |_value: &SurfaceEnableRequest| Ok(()));
 impl_action_decode!(
     SurfaceCameraProofRequest,
     |value: &SurfaceCameraProofRequest| {
@@ -926,10 +950,17 @@ mod tests {
         }
     }
 
+    fn firmware_publication() -> SurfacePublication {
+        SurfacePublication {
+            source: SurfaceObservationSource::Fwupd,
+            ..publication()
+        }
+    }
+
     #[test]
     fn pro5_and_pro6_are_explicit_while_other_generations_are_not_claimed() {
         let pro5 = SurfaceModelIdentity {
-            product: "Surface Pro".into(),
+            product: "Surface Pro 5".into(),
             generation: SurfaceProGeneration::Pro5,
         };
         let pro6 = publication().model;
@@ -942,6 +973,54 @@ mod tests {
         assert_ne!(
             SurfaceProGeneration::Pro6,
             SurfaceProGeneration::Unsupported
+        );
+    }
+
+    #[test]
+    fn observations_bind_exact_pro56_identity_and_provider_source() {
+        let mut board = SurfaceVerifyBoard {
+            publication: publication(),
+            skipped: None,
+            rows: vec![probe_row()],
+        };
+        board.publication.source = SurfaceObservationSource::Fwupd;
+        assert_eq!(
+            board.validate(),
+            Err(SurfaceContractError::Invalid("board source"))
+        );
+
+        let mut summary = SurfaceFleetSummary {
+            publication: publication(),
+            enablement_pct: 100,
+            red_count: 0,
+            red_subsystems: vec![],
+        };
+        summary.publication.model.generation = SurfaceProGeneration::Pro5;
+        assert_eq!(
+            summary.validate(),
+            Err(SurfaceContractError::Invalid("model generation"))
+        );
+        summary.publication.model = SurfaceModelIdentity {
+            product: "Surface Pro 8".into(),
+            generation: SurfaceProGeneration::Unsupported,
+        };
+        assert_eq!(
+            summary.validate(),
+            Err(SurfaceContractError::Invalid("Surface Pro 5/6 model"))
+        );
+
+        let mut inventory = SurfaceFirmwareInventory {
+            publication: SurfacePublication {
+                source: SurfaceObservationSource::Fwupd,
+                ..publication()
+            },
+            skipped: None,
+            devices: vec![firmware_device()],
+        };
+        inventory.publication.source = SurfaceObservationSource::Kernel;
+        assert_eq!(
+            inventory.validate(),
+            Err(SurfaceContractError::Invalid("firmware source"))
         );
     }
 
@@ -1069,7 +1148,6 @@ mod tests {
     fn actions_reject_foreign_stale_future_and_oversized_input_before_effects() {
         let request = SurfaceEnableRequest {
             header: action_header(),
-            arm_token: None,
         };
         let body = serde_json::to_vec(&request).unwrap();
         assert!(SurfaceEnableRequest::from_json_at(&body, "surface", NOW).is_ok());
@@ -1115,7 +1193,7 @@ mod tests {
     fn firmware_inventory_rejects_duplicate_devices() {
         let device = firmware_device();
         let inventory = SurfaceFirmwareInventory {
-            publication: publication(),
+            publication: firmware_publication(),
             skipped: None,
             devices: vec![device.clone(), device],
         };
@@ -1128,7 +1206,7 @@ mod tests {
     #[test]
     fn firmware_inventory_rejects_devices_when_skipped_unavailable_or_stale() {
         let fresh_skipped = SurfaceFirmwareInventory {
-            publication: publication(),
+            publication: firmware_publication(),
             skipped: Some("fwupd unavailable".into()),
             devices: vec![],
         };
@@ -1137,7 +1215,7 @@ mod tests {
             Err(SurfaceContractError::Invalid("fresh skipped firmware"))
         );
 
-        let mut skipped_publication = publication();
+        let mut skipped_publication = firmware_publication();
         skipped_publication.availability = SurfaceAvailability::Unavailable {
             reason: "provider absent".into(),
         };
@@ -1159,7 +1237,7 @@ mod tests {
                 reason: "provider timed out".into(),
             },
         ] {
-            let mut publication = publication();
+            let mut publication = firmware_publication();
             publication.availability = availability;
             let inventory = SurfaceFirmwareInventory {
                 publication,
@@ -1182,7 +1260,7 @@ mod tests {
         missing_version.available_checksum = None;
         assert_eq!(
             SurfaceFirmwareInventory {
-                publication: publication(),
+                publication: firmware_publication(),
                 skipped: None,
                 devices: vec![missing_version],
             }
@@ -1196,7 +1274,7 @@ mod tests {
         false_update.update_available = false;
         assert_eq!(
             SurfaceFirmwareInventory {
-                publication: publication(),
+                publication: firmware_publication(),
                 skipped: None,
                 devices: vec![false_update],
             }
@@ -1211,7 +1289,7 @@ mod tests {
         current.available_checksum = None;
         current.update_available = false;
         assert!(SurfaceFirmwareInventory {
-            publication: publication(),
+            publication: firmware_publication(),
             skipped: None,
             devices: vec![current],
         }
