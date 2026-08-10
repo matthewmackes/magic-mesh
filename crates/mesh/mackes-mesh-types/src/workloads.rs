@@ -855,7 +855,10 @@ impl WorkloadAttachmentLease {
         check_schema(self.schema_version)?;
         check_identifier(&self.lease_id, "lease_id")?;
         check_identifier(&self.nonce, "nonce")?;
-        if self.generation == 0 || self.expires_at_ms <= now_ms {
+        if self.generation == 0
+            || self.expires_at_ms <= now_ms
+            || self.expires_at_ms.saturating_sub(now_ms) > MAX_WORKLOAD_DEADLINE_MS
+        {
             return Err(WorkloadContractError::InvalidNumber("lease"));
         }
         Ok(())
@@ -1358,6 +1361,23 @@ mod tests {
             Err(WorkloadContractError::InvalidNumber(
                 "attachment_generation"
             ))
+        );
+    }
+
+    #[test]
+    fn attachment_lease_rejects_an_unbounded_expiry_window() {
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-bounded".into(),
+            nonce: "nonce-bounded".into(),
+            workload_id: WorkloadId::new("browser-seat15").expect("valid workload id"),
+            generation: 1,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: MAX_WORKLOAD_DEADLINE_MS + 2_000,
+        };
+        assert_eq!(
+            lease.validate(1_000),
+            Err(WorkloadContractError::InvalidNumber("lease"))
         );
     }
 
