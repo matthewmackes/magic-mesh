@@ -1545,11 +1545,30 @@ impl SystemWorkloadActuator {
                 let _ = fs::remove_file(&disk);
                 WorkloadActuatorError::Permanent(format!("invalid VM resources: {error}"))
             })?;
-        let xml_path = std::env::temp_dir().join(format!("mde-workload-{domain}.xml"));
-        fs::write(&xml_path, xml.as_bytes()).map_err(|error| {
+        let xml_path = std::env::temp_dir().join(format!(
+            "mde-workload-{domain}-{}-{}.xml",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut xml_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&xml_path)
+            .map_err(|error| {
+                let _ = fs::remove_file(&disk);
+                WorkloadActuatorError::Retryable(format!("create VM definition: {error}"))
+            })?;
+        if let Err(error) = xml_file
+            .write_all(xml.as_bytes())
+            .and_then(|()| xml_file.sync_all())
+        {
+            let _ = fs::remove_file(&xml_path);
             let _ = fs::remove_file(&disk);
-            WorkloadActuatorError::Retryable(format!("write VM definition: {error}"))
-        })?;
+            return Err(WorkloadActuatorError::Retryable(format!(
+                "write VM definition: {error}"
+            )));
+        }
         let mut define_command = Command::new("virsh");
         define_command.args([
             "--connect",
