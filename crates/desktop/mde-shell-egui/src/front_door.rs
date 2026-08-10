@@ -899,13 +899,16 @@ impl FrontDoorState {
     /// the copy in the ephemeral Front Door state avoids a second persistence
     /// model while allowing a selected catalog app to expose a real pin toggle.
     pub(crate) fn set_taskbar_pins(&mut self, pins: &[Surface]) {
-        self.taskbar_pins = Some(
-            pins.iter()
-                .copied()
-                .filter(|surface| Surface::ALL.contains(surface))
-                .take(Surface::ALL.len())
-                .collect(),
-        );
+        let mut bounded = Vec::with_capacity(Surface::ALL.len());
+        for surface in pins.iter().copied() {
+            if Surface::ALL.contains(&surface)
+                && !bounded.contains(&surface)
+                && bounded.len() < Surface::ALL.len()
+            {
+                bounded.push(surface);
+            }
+        }
+        self.taskbar_pins = Some(bounded);
     }
 
     pub(crate) fn set_peer_app_favorites(&mut self, favorites: &FrontDoorPeerAppFavorites) {
@@ -4146,6 +4149,25 @@ mod tests {
                 FrontDoorTarget::Browser("browser".to_owned()),
             ),
         ]
+    }
+
+    #[test]
+    fn taskbar_pin_projection_preserves_order_without_duplicate_center_slots() {
+        let mut state = FrontDoorState::default();
+
+        state.set_taskbar_pins(&[
+            Surface::Browser,
+            Surface::Browser,
+            Surface::Files,
+            Surface::Browser,
+            Surface::Music,
+        ]);
+
+        assert_eq!(
+            state.taskbar_pins.as_deref(),
+            Some(&[Surface::Browser, Surface::Files, Surface::Music][..]),
+            "user-managed pins must occupy one stable centered slot per surface"
+        );
     }
 
     fn fixture_console_search_hit() -> ConsoleSearchHit {

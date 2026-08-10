@@ -323,9 +323,8 @@ behavioral evidence is not completion.
 - **Browser VM artifact-identity checkpoint (2026-08-09):** exact 4/8192/64 profile and bounded qcow2/raw manifests reject stale, hostile, or unsupported artifacts;
   machine 194 passed the focused contract gates: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-image-contract-r72.md`.
   A real admitted 64-GiB qcow2 then passed `qemu-img` integrity: `docs/platform/evidence/WL-ARCH-008-2026-08-09-browser-vm-real-image-r77.md`.
-- **Dell Display1/RDP checkpoint (2026-08-09):** the disk-preserving one-head GL migration boots the retained VM and reaches guest RDP:
-  `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
-  Catalog/boot boundary: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-catalog-boot-r80.md`.
+- **Dell Display1/RDP (2026-08-09):** guest RDP boot proof: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
+- **Host-browser profile (2026-08-10):** manifest self-test passed: `docs/platform/evidence/WL-ARCH-008-2026-08-10-host-browser-profile-refusal-r156.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
@@ -1083,6 +1082,9 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Blocked App-VM authorization checkpoint (2026-08-10):** stale, unavailable, or malformed blocked Flatpak rows now fail before root authorization or Bus payload;
   `.90` passed the focused regression: `docs/platform/evidence/WL-FUNC-018-2026-08-10-blocked-appvm-authorization-r127.md`.
+- **App VM generation rollback (2026-08-10):** later lower-generation runtime
+  rows are refused; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-generation-rollback-r156.md`.
 - **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
   only after governed projection/status effects succeed, and expiry retains
   authority until its retraction publishes. Machine 194 passed the exact
@@ -2288,11 +2290,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-012-2026-08-09-taskbar-control-identity-r2.md`.
 - **Narrow geometry checkpoint (2026-08-09):** center controls are admitted only when a physical 40px slot exists, preserving More at 480px and preventing Home overlap at
   320px; `.50` passed 50/50: `docs/platform/evidence/WL-UX-012-2026-08-09-narrow-center-geometry-r3.md`.
-- **Taskbar action-map checkpoint (2026-08-10):** Start and Search are distinct
-  typed controls over the one Front Door, Back retains typed history, and Home
-  idempotently opens the Bing-wallpaper base. The conflicting Home/Sessions
-  cycle was deleted; focused BigBoy action, pointer, and narrow-geometry gates
-  pass: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-action-map-r4.md`.
+- **Taskbar action map (2026-08-10):** typed Start/Search/Back/Home map passed; conflicting cycle deleted: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-action-map-r4.md`.
+- **Taskbar pin identity (2026-08-10):** BigBoy passed stable deduplication: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-pin-dedupe-r156.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.

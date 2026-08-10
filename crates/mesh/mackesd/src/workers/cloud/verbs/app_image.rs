@@ -167,7 +167,7 @@ pub(super) fn check_runtime_evidence(
     // newest generation as the authority while scanning: a delayed
     // lower-generation row must not roll back to an older guest incarnation.
     let mut newest_matching = None;
-    for message in messages.iter().rev() {
+    for message in &messages {
         let Some(body) = message.body.as_deref() else {
             return AppVmRuntimeAdmission::Mismatched(
                 "guest runtime record has no typed body".to_owned(),
@@ -201,7 +201,7 @@ pub(super) fn check_runtime_evidence(
             ));
         }
         if let Some((_, newest_generation)) = newest_matching {
-            if evidence.generation > newest_generation {
+            if evidence.generation < newest_generation {
                 return AppVmRuntimeAdmission::Stale(
                     "guest runtime evidence regressed to an older generation".to_owned(),
                 );
