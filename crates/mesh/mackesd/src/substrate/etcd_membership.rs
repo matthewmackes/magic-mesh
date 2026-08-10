@@ -18,9 +18,20 @@
 //! the unit); this module owns the cluster-side mutation and hands the script the
 //! `ETCD_INITIAL_CLUSTER` to start the local member with `state=existing`.
 
-use std::path::Path;
-
 use crate::substrate::etcd::connect;
+
+/// One authoritative etcd member plus the result of a direct, bounded client
+/// probe to that member. Retirement policy consumes this instead of replicated
+/// peer-directory rows, which can outlive an unreachable voter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberSnapshot {
+    /// etcd member name; empty until a newly added member starts.
+    pub name: String,
+    /// Whether etcd still classifies this member as a learner.
+    pub learner: bool,
+    /// Whether a linearizable read succeeded through this exact member.
+    pub reachable: bool,
+}
 
 /// A member's Raft **peer** URL (the `:2380` advertise-peer address).
 #[must_use]
@@ -83,6 +94,42 @@ fn member_pairs(members: &[etcd_client::Member]) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+fn client_endpoint_from_peer(peer: &str) -> Option<String> {
+    peer.strip_suffix(":2380")
+        .map(|prefix| format!("{prefix}:2379"))
+}
+
+/// Read the authoritative member set and directly probe every member's client
+/// endpoint. A successful probe is a bounded linearizable read through that
+/// exact endpoint, so a stale directory row or merely configured URL cannot be
+/// counted as a live HA survivor.
+pub async fn member_snapshots(endpoints: &[String]) -> Result<Vec<MemberSnapshot>, String> {
+    let mut client = connect(endpoints)
+        .await
+        .map_err(|error| format!("etcd connect: {error}"))?;
+    let response = client
+        .member_list()
+        .await
+        .map_err(|error| format!("member_list: {error}"))?;
+    let mut snapshots = Vec::with_capacity(response.members().len());
+    for member in response.members() {
+        let endpoint = member
+            .peer_urls()
+            .first()
+            .and_then(|peer| client_endpoint_from_peer(peer));
+        let reachable = match endpoint {
+            Some(endpoint) => connect(&[endpoint]).await.is_ok(),
+            None => false,
+        };
+        snapshots.push(MemberSnapshot {
+            name: member.name().to_string(),
+            learner: member.is_learner(),
+            reachable,
+        });
+    }
+    Ok(snapshots)
 }
 
 /// Idempotently add THIS node (a lighthouse) to the etcd cluster as a **voter** and
@@ -185,19 +232,6 @@ pub async fn remove_member(endpoints: &[String], sel: &MemberSel) -> Result<bool
     Ok(true)
 }
 
-/// The overlay IPs that SHOULD be etcd voters per the canonical directory: every
-/// `role==lighthouse` record carrying an overlay IP. Detection helper for an
-/// operator/diagnostic readout of who is (or isn't yet) in the quorum.
-#[must_use]
-pub fn voter_overlays_from_directory(workgroup_root: &Path) -> Vec<String> {
-    crate::substrate::peers::read_directory(workgroup_root)
-        .into_iter()
-        .filter(mackes_mesh_types::lighthouse::is_lighthouse)
-        .filter_map(|p| p.overlay_ip)
-        .filter(|ip| !ip.is_empty())
-        .collect()
-}
-
 /// Blocking [`add_self_as_voter`] for the sync join path. Reuses the shared,
 /// runtime-aware [`crate::substrate::peers::block_on`] bridge (safe from both a
 /// plain std::thread and an async worker). `None` if a private runtime couldn't be
@@ -220,6 +254,14 @@ pub fn remove_member_blocking(
     crate::substrate::peers::block_on(remove_member(endpoints, sel))
 }
 
+/// Blocking bridge for the destructive lighthouse-retirement preflight.
+#[must_use]
+pub fn member_snapshots_blocking(
+    endpoints: &[String],
+) -> Option<Result<Vec<MemberSnapshot>, String>> {
+    crate::substrate::peers::block_on(member_snapshots(endpoints))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +270,16 @@ mod tests {
     fn urls_are_overlay_bound() {
         assert_eq!(peer_url("10.42.0.4"), "http://10.42.0.4:2380");
         assert_eq!(client_url("10.42.0.4"), "http://10.42.0.4:2379");
+    }
+
+    #[test]
+    fn peer_urls_map_only_the_etcd_raft_port_to_the_client_port() {
+        assert_eq!(
+            client_endpoint_from_peer("http://10.42.0.2:2380"),
+            Some("http://10.42.0.2:2379".to_string())
+        );
+        assert_eq!(client_endpoint_from_peer("http://10.42.0.2:1234"), None);
+        assert_eq!(client_endpoint_from_peer(""), None);
     }
 
     #[test]

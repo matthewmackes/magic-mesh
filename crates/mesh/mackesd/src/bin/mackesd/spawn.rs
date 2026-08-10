@@ -3167,14 +3167,10 @@ pub(crate) fn spawn_probe_observability_workers(
     // its dnf .repo to self-serve from the local file:// mount (W62); the
     // leader additionally pulls upstream + indexes, Syncthing replicating
     // the result. No DB handle needed — it works off the replicated root.
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::mirror_syncd::MirrorSyncd::new(workgroup_root.clone()),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("mirror_syncd".into());
+    // ARCH-009: gate before construction and roster publication. `Supervisor`
+    // rejects a wrong-group task, but an unconditional push after that refusal
+    // used to make every grouped process claim Data-owned `mirror_syncd`.
+    spawn_mirror_syncd_if_owned(sup, worker_names, workgroup_root);
 
     // NF-1.5 (v2.5) — TCP/443 covert listener. Binds the
     // TLS 1.3 listener on :443 (default; env-overrideable),
@@ -3427,6 +3423,26 @@ pub(crate) fn spawn_probe_observability_workers(
             .expect("worker_names mutex")
             .push(name.into());
     }
+}
+
+fn spawn_mirror_syncd_if_owned(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    workgroup_root: &std::path::Path,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+
+    if !sup.accepts_worker("mirror_syncd") {
+        return;
+    }
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::mirror_syncd::MirrorSyncd::new(workgroup_root.to_path_buf()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("mirror_syncd".into());
 }
 
 // run_serve extract: kdc/messaging/fleet-sync tail workers (kdc_host .. music_autoconfig).
@@ -3786,6 +3802,50 @@ mod process_group_thread_admission_tests {
                     mackesd_core::worker_role::belongs_to_group(publisher, group),
                     group == owner,
                     "{publisher} escaped from {owner} into {group}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_syncd_is_published_only_by_its_data_group_owner() {
+        use mackesd_core::worker_role::WorkerGroup;
+        use mackesd_core::workers::{new_status_map, worker_runtime_status::WorkerRuntimeSampler};
+        use std::sync::{Arc, Mutex};
+
+        for group in WorkerGroup::ALL {
+            let status = new_status_map();
+            let names = Arc::new(Mutex::new(Vec::new()));
+            let mut supervisor = mackesd_core::workers::Supervisor::new();
+            supervisor.set_status_map(Arc::clone(&status));
+            supervisor.set_worker_group(group);
+
+            spawn_mirror_syncd_if_owned(
+                &mut supervisor,
+                &names,
+                std::path::Path::new("/nonexistent/arch009-mirror-owner"),
+            );
+
+            let expected = group == WorkerGroup::Data;
+            let published_names = names.lock().expect("worker names").clone();
+            assert_eq!(
+                published_names,
+                if expected {
+                    vec!["mirror_syncd".to_string()]
+                } else {
+                    Vec::new()
+                },
+                "{group} published a worker roster it does not own"
+            );
+            let snapshot = WorkerRuntimeSampler::default()
+                .sample(&status, "node-arch009", 1)
+                .expect("owned supervisor rows must remain publishable");
+            assert_eq!(snapshot.workers.len(), usize::from(expected));
+            if let Some(worker) = snapshot.workers.first() {
+                assert_eq!(worker.contract.worker_id, "mirror_syncd");
+                assert_eq!(
+                    worker.contract.group,
+                    mackes_mesh_types::worker_runtime::WorkerGroup::Data
                 );
             }
         }

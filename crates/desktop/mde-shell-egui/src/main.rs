@@ -170,27 +170,6 @@ struct Nav {
     plane: Plane,
 }
 
-/// The merged Home/Sessions control walks one stable cycle: clean desktop,
-/// restore the last session/workspace, then open the Remote Sessions chooser.
-/// The stage lives in the shell so bottom, docked, narrow, and large-text
-/// layouts all share the same interaction contract.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum HomeCycleStage {
-    #[default]
-    Active,
-    CleanDesktop,
-    Restored,
-    Sessions,
-}
-
-const fn home_cycle_stage_after_click(stage: HomeCycleStage) -> HomeCycleStage {
-    match stage {
-        HomeCycleStage::Active | HomeCycleStage::Sessions => HomeCycleStage::CleanDesktop,
-        HomeCycleStage::CleanDesktop => HomeCycleStage::Restored,
-        HomeCycleStage::Restored => HomeCycleStage::Sessions,
-    }
-}
-
 /// The three mesh-control views retained as child tabs inside Workers. Their
 /// old Surface variants are migration aliases only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1314,9 +1293,6 @@ struct Shell {
     /// minimize control animates the active workspace toward that button, then routes
     /// to [`Surface::Desktop`] ("Remote Sessions").
     menu_bar_minimize: Option<MenuBarMinimizeEffect>,
-    /// State and saved location for the merged Home/Sessions toolbar control.
-    home_cycle_stage: HomeCycleStage,
-    home_cycle_restore: Option<(NavLocation, bool)>,
     /// Last central workspace rect, captured from the active [`CentralPanel`] so the
     /// minimize cue starts from the actual workspace area.
     last_workspace_rect: Option<egui::Rect>,
@@ -1488,8 +1464,6 @@ impl Shell {
             lock_signal: lock_signal::LogindLockSource::new(ctx),
             workbench_poll_epoch: None,
             menu_bar_minimize: None,
-            home_cycle_stage: HomeCycleStage::Active,
-            home_cycle_restore: None,
             last_workspace_rect: None,
             layout_mode: LayoutModeControl::default(),
         };
@@ -1698,59 +1672,16 @@ impl Shell {
         self.last_nav_location = Some(location);
     }
 
-    fn current_nav_location(&self) -> NavLocation {
-        NavLocation {
-            expanded: self.nav.expanded,
-            surface: self.nav.surface,
-            plane: self.nav.plane,
-            fleet_mesh_tab: self.fleet_mesh_tab,
-            this_node_tab: self.this_node_tab,
-            workers_tab: self.workers_tab,
-            this_node_section: self.this_node_section,
-            this_node_page: self.this_node_page,
-        }
-    }
-
-    fn reset_home_cycle(&mut self) {
-        self.home_cycle_stage = HomeCycleStage::Active;
-        self.home_cycle_restore = None;
-    }
-
-    /// Drive the merged Home/Sessions toolbar control. A clean desktop only
-    /// collapses Construct chrome; it never closes a VDI session. The third
-    /// step exposes the chooser while preserving that session for restoration.
-    fn cycle_home_sessions(&mut self) {
-        match self.home_cycle_stage {
-            HomeCycleStage::Active | HomeCycleStage::Sessions => {
-                self.home_cycle_restore =
-                    Some((self.current_nav_location(), self.sessions_picker_open));
-                self.sessions_picker_open = false;
-                self.front_door.close();
-                self.construct.switcher_open = false;
-                self.construct.notification_center_open = false;
-                self.construct.control_center_open = false;
-                self.nav.expanded = false;
-                self.nav.surface = Surface::Desktop;
-                self.home_cycle_stage = home_cycle_stage_after_click(self.home_cycle_stage);
-            }
-            HomeCycleStage::CleanDesktop => {
-                if let Some((location, picker_open)) = self.home_cycle_restore {
-                    self.apply_nav_location(location);
-                    self.sessions_picker_open = picker_open;
-                } else {
-                    self.nav.expanded = true;
-                    self.nav.surface = Surface::Desktop;
-                    self.sessions_picker_open = true;
-                }
-                self.home_cycle_stage = home_cycle_stage_after_click(self.home_cycle_stage);
-            }
-            HomeCycleStage::Restored => {
-                self.nav.expanded = true;
-                self.nav.surface = Surface::Desktop;
-                self.sessions_picker_open = true;
-                self.home_cycle_stage = home_cycle_stage_after_click(self.home_cycle_stage);
-            }
-        }
+    /// Open the one Bing-wallpaper Home route. Home is idempotent: repeated
+    /// clicks stay Home and never expose a second launcher or session cycle.
+    fn open_bing_wallpaper_home(&mut self) {
+        self.sessions_picker_open = false;
+        self.front_door.close();
+        self.construct.switcher_open = false;
+        self.construct.notification_center_open = false;
+        self.construct.control_center_open = false;
+        self.nav.expanded = false;
+        self.nav.surface = Surface::Desktop;
     }
 
     /// Collapse every historical node-management route into Workers while
@@ -1816,7 +1747,6 @@ impl Shell {
     }
 
     fn open_maps_weather(&mut self) {
-        self.reset_home_cycle();
         self.nav.expanded = true;
         self.nav.surface = Surface::MapsLocation;
         self.sessions_picker_open = false;
@@ -1871,12 +1801,10 @@ impl Shell {
     fn apply_nav_bar_action(&mut self, action: nav_bar::Action, ctx: &egui::Context) {
         let action_label = nav_bar_action_label(&action);
         match action {
-            nav_bar::Action::OpenSearch => {
-                self.reset_home_cycle();
+            nav_bar::Action::OpenFrontDoor | nav_bar::Action::FocusSearch => {
                 self.open_front_door_panel();
             }
             nav_bar::Action::Back => {
-                self.reset_home_cycle();
                 if let Some(previous) = self.nav_history.pop() {
                     self.apply_nav_location(previous);
                 } else {
@@ -1885,10 +1813,9 @@ impl Shell {
                 }
             }
             nav_bar::Action::Home => {
-                self.cycle_home_sessions();
+                self.open_bing_wallpaper_home();
             }
             nav_bar::Action::OpenEditor => {
-                self.reset_home_cycle();
                 self.nav.expanded = true;
                 self.nav.surface = Surface::Communications;
                 self.communications.open_editor();
@@ -1897,7 +1824,6 @@ impl Shell {
                 self.nav_bar.toggle(Instant::now(), Motion::mode());
             }
             nav_bar::Action::OpenSurface(surface) => {
-                self.reset_home_cycle();
                 self.nav.expanded = true;
                 self.nav.surface = surface;
                 self.sessions_picker_open = surface == Surface::Desktop;
@@ -1905,19 +1831,15 @@ impl Shell {
             }
             nav_bar::Action::OpenWeather => self.open_maps_weather(),
             nav_bar::Action::PinSurface(surface) => {
-                self.reset_home_cycle();
                 self.nav_bar.pin_surface(surface);
             }
             nav_bar::Action::UnpinSurface(surface) => {
-                self.reset_home_cycle();
                 self.nav_bar.unpin_surface(surface);
             }
             nav_bar::Action::DesktopSource(id) => {
-                self.reset_home_cycle();
                 self.connect_front_door_desktop_source(ctx, &id);
             }
             nav_bar::Action::RemoteSession(id) => {
-                self.reset_home_cycle();
                 if self.session_rail.focus_session(&id) {
                     self.drain_focused_session_handoffs(ctx);
                 }
@@ -2025,7 +1947,6 @@ impl Shell {
             self.open_maps_weather();
         }
         if let Some(surface) = self.construct.take_workspace_tray_target() {
-            self.reset_home_cycle();
             self.nav.expanded = true;
             self.nav.surface = surface;
             self.normalize_surface_aliases();
@@ -4420,7 +4341,6 @@ impl Shell {
         let Some(source) = mde_egui::menubar::take_remote_sessions_request(ctx) else {
             return;
         };
-        self.reset_home_cycle();
         self.sessions_picker_open = true;
         self.front_door.close();
         self.nav.expanded = true;
@@ -4672,7 +4592,8 @@ fn dnd_active() -> bool {
 
 fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
     match action {
-        nav_bar::Action::OpenSearch => "open_search",
+        nav_bar::Action::OpenFrontDoor => "open_front_door",
+        nav_bar::Action::FocusSearch => "focus_search",
         nav_bar::Action::Back => "back",
         nav_bar::Action::Home => "home",
         nav_bar::Action::OpenEditor => "open_editor",
@@ -4832,18 +4753,17 @@ mod tests {
     use super::{
         car_home, car_home_vehicle_glance, car_keymap, chat, complete_menu_bar_minimize, console,
         construct, datacenter, desktop_reconnect_should_query_recents, files_panel, front_door,
-        front_door_peer_apps, home_cycle_stage_after_click,
-        install_layout_mode_button_accessibility, install_layout_profile_row_accessibility,
-        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_control_visible,
-        layout_mode_menu_rect, layout_mode_primary_toggle, layout_profile_row_accesskit_value,
-        layout_profile_tooltip, matching_this_node_groups, media_header, media_panel,
-        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, music_browse_topic, nav_bar,
-        nav_bar_action_label, paint_car_speedometer, paint_car_status_tile,
-        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
-        publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
-        remote_sessions_fallback_pos, route_file_operation_request, screenshot, splash, status,
-        surface_needs_remote_sessions_fallback, terminal_panel, this_node_search_is_compact,
-        this_node_system_route, this_node_system_section, vdi, Boot, HomeCycleStage,
+        front_door_peer_apps, install_layout_mode_button_accessibility,
+        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
+        layout_mode_button_rect, layout_mode_control_visible, layout_mode_menu_rect,
+        layout_mode_primary_toggle, layout_profile_row_accesskit_value, layout_profile_tooltip,
+        matching_this_node_groups, media_header, media_panel, menu_bar_shuffle_cards,
+        menu_bar_shuffle_paint_order, music_browse_topic, nav_bar, nav_bar_action_label,
+        paint_car_speedometer, paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
+        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
+        real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
+        screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
+        this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
         WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
         LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
@@ -4995,16 +4915,28 @@ mod tests {
     }
 
     #[test]
-    fn merged_home_sessions_button_has_the_three_step_cycle() {
-        let first = home_cycle_stage_after_click(HomeCycleStage::Active);
-        let second = home_cycle_stage_after_click(first);
-        let third = home_cycle_stage_after_click(second);
-        let fourth = home_cycle_stage_after_click(third);
+    fn taskbar_s2_home_is_an_idempotent_bing_wallpaper_route() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Browser;
+        shell.sessions_picker_open = true;
+        shell.front_door.open();
+        shell.construct.switcher_open = true;
+        shell.construct.notification_center_open = true;
+        shell.construct.control_center_open = true;
 
-        assert_eq!(first, HomeCycleStage::CleanDesktop);
-        assert_eq!(second, HomeCycleStage::Restored);
-        assert_eq!(third, HomeCycleStage::Sessions);
-        assert_eq!(fourth, HomeCycleStage::CleanDesktop);
+        for _ in 0..2 {
+            shell.apply_nav_bar_action(nav_bar::Action::Home, &ctx);
+            assert!(!shell.nav.expanded, "Home must expose the wallpaper base");
+            assert_eq!(shell.nav.surface, Surface::Desktop);
+            assert!(!shell.sessions_picker_open);
+            assert!(!shell.front_door.is_open());
+            assert!(!shell.construct.switcher_open);
+            assert!(!shell.construct.notification_center_open);
+            assert!(!shell.construct.control_center_open);
+        }
     }
 
     #[test]

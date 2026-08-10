@@ -221,15 +221,20 @@ pub fn lighthouse_retire(
     droplet_id: Option<String>,
     force: bool,
 ) -> anyhow::Result<()> {
-    let root = mackesd_core::default_qnm_shared_root();
-    if droplet_id.is_some() && mackesd_core::substrate::etcd::default_endpoints().is_empty() {
-        anyhow::bail!("refusing to delete lighthouse droplet without configured etcd endpoints");
-    }
-    // HA drain gate — never drop below the lighthouse floor without --force.
-    let current =
-        mackesd_core::substrate::etcd_membership::voter_overlays_from_directory(&root).len();
-    mackesd_core::lighthouse_lifecycle::drain_gate(current, force)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // HA drain gate — use the authoritative etcd member list and a direct,
+    // bounded probe of every survivor. Replicated directory rows can be stale
+    // and must never authorize a destructive retirement.
+    let endpoints = mackesd_core::substrate::etcd::default_endpoints();
+    anyhow::ensure!(
+        !endpoints.is_empty(),
+        "refusing lighthouse retirement without configured etcd endpoints"
+    );
+    let members = mackesd_core::substrate::etcd_membership::member_snapshots_blocking(&endpoints)
+        .ok_or_else(|| anyhow::anyhow!("etcd retirement preflight could not run"))?
+        .map_err(|error| anyhow::anyhow!("etcd retirement preflight failed ({error})"))?;
+    let target = node_id.strip_prefix("peer:").unwrap_or(node_id);
+    mackesd_core::lighthouse_lifecycle::drain_gate_members(&members, target, force)
+        .map_err(|error| anyhow::anyhow!(error))?;
     // Decommission + revoke + ban + etcd member-remove (all in remove_peer).
     remove_peer(db_path, node_id, force)?;
     // Delete the droplet LAST (the inverse of `add`'s provision step).

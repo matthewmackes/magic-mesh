@@ -88,8 +88,10 @@ const PIN_CATALOG: [Surface; 9] = [
 /// One action emitted by the painted controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// Open and focus the existing Front Door search overlay.
-    OpenSearch,
+    /// Open the existing Front Door search overlay from Start.
+    OpenFrontDoor,
+    /// Focus the existing Front Door search field, opening its overlay if needed.
+    FocusSearch,
     /// Return to the previously active app or Fleet & Mesh tab.
     Back,
     /// Open the untitled all-icons Desktop.
@@ -1293,6 +1295,7 @@ fn read_bounded_config(path: &Path) -> std::io::Result<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
     Start,
+    Search,
     Back,
     Home,
     /// The Documents editor lives in the Workspace lane, not as a separate
@@ -1309,6 +1312,7 @@ impl ControlKind {
     const fn id_suffix(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Search => "search",
             Self::Back => "back",
             Self::Home => "home",
             Self::Editor => "editor",
@@ -1323,6 +1327,7 @@ impl ControlKind {
     const fn icon(self) -> IconId {
         match self {
             Self::Start => IconId::Grid,
+            Self::Search => IconId::Search,
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Editor => IconId::Editor,
@@ -1339,9 +1344,10 @@ impl ControlKind {
 
     const fn tooltip(self) -> &'static str {
         match self {
-            Self::Start => "Start - Search",
+            Self::Start => "Start",
+            Self::Search => "Search",
             Self::Back => "Back",
-            Self::Home => "Home / Sessions — Desktop, restore, sessions",
+            Self::Home => "Home",
             Self::Editor => "Editor - Workspace",
             Self::Pin => "Taskbar placement menu",
             Self::Overflow => "More taskbar apps",
@@ -1353,7 +1359,8 @@ impl ControlKind {
 
     const fn action(self) -> Action {
         match self {
-            Self::Start => Action::OpenSearch,
+            Self::Start => Action::OpenFrontDoor,
+            Self::Search => Action::FocusSearch,
             Self::Back => Action::Back,
             Self::Home => Action::Home,
             Self::Editor => Action::OpenEditor,
@@ -1412,11 +1419,11 @@ fn dock_launcher_count() -> usize {
 }
 
 fn dock_control_capacity(pinned_count: usize) -> usize {
-    6 + dock_launcher_count() + pinned_count
+    7 + dock_launcher_count() + pinned_count
 }
 
 fn dock_control_capacity_for(pinned_count: usize, surface_count: usize) -> usize {
-    6 + surface_count + pinned_count
+    7 + surface_count + pinned_count
 }
 
 fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
@@ -1428,7 +1435,7 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 }
 
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
-    let left_cluster_end = screen.left() + control_span(4, CONTROL_EDGE, gap);
+    let left_cluster_end = screen.left() + control_span(5, CONTROL_EDGE, gap);
     let left_safe_edge = left_cluster_end + gap;
     // Placement occupies the tray's reserved final 40px lane; do not reserve
     // a phantom second placement target to the left of that tray.
@@ -1466,7 +1473,7 @@ fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
         egui::pos2(screen.center().x, screen.bottom() - TASKBAR_H / 2.0),
         egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
     );
-    let fixed_left_edge = screen.left() + control_span(4, CONTROL_EDGE, gap) + gap;
+    let fixed_left_edge = screen.left() + control_span(5, CONTROL_EDGE, gap) + gap;
     let placement_left = screen.right() - Style::SP_S - CONTROL_EDGE - gap;
     usize::from(centered.left() >= fixed_left_edge && centered.right() <= placement_left)
 }
@@ -1572,12 +1579,13 @@ fn floating_geometry_for_catalog_with_sessions(
     let right_x = (outer.right() - Style::SP_S - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let mut cursor_x = left_start;
-    // Search leads the left cluster. Workloads is the one fixed workspace
-    // immediately after it, followed by Back and the merged Home/Sessions
-    // control. This keeps the high-frequency controls grouped and identical in
-    // bottom and left-rail placements.
+    // Start and Search are distinct typed controls over the one Front Door.
+    // Workloads is the one fixed workspace immediately after them, followed by
+    // Back and Home. This keeps the high-frequency controls grouped and
+    // identical in bottom and left-rail placements.
     for (kind, surface) in [
         (ControlKind::Start, None),
+        (ControlKind::Search, None),
         (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
         (ControlKind::Back, None),
         (ControlKind::Home, None),
@@ -1706,6 +1714,7 @@ fn docked_geometry_for_catalog_with_sessions(
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
     for (kind, surface) in [
         (ControlKind::Start, None),
+        (ControlKind::Search, None),
         (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
         (ControlKind::Back, None),
         (ControlKind::Home, None),
@@ -2558,9 +2567,15 @@ mod tests {
     }
 
     #[test]
-    fn start_search_uses_the_carbon_grid_glyph() {
+    fn taskbar_s2_start_and_search_have_distinct_typed_front_door_actions() {
         let start = Control {
             kind: ControlKind::Start,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: None,
+        };
+        let search = Control {
+            kind: ControlKind::Search,
             rect: egui::Rect::NOTHING,
             surface: None,
             source_index: None,
@@ -2572,8 +2587,10 @@ mod tests {
             source_index: None,
         };
         assert_eq!(control_icon(start), IconId::Grid);
+        assert_eq!(control_icon(search), IconId::Search);
         assert_eq!(control_icon(home), IconId::FileHome);
-        assert_eq!(control_action(start, &[], &[]), Action::OpenSearch);
+        assert_eq!(control_action(start, &[], &[]), Action::OpenFrontDoor);
+        assert_eq!(control_action(search, &[], &[]), Action::FocusSearch);
     }
 
     #[test]
@@ -2654,7 +2671,11 @@ mod tests {
             let centered_controls = geometry.controls.iter().filter(|control| {
                 !matches!(
                     control.kind,
-                    ControlKind::Start | ControlKind::Back | ControlKind::Home | ControlKind::Pin
+                    ControlKind::Start
+                        | ControlKind::Search
+                        | ControlKind::Back
+                        | ControlKind::Home
+                        | ControlKind::Pin
                 ) && control.surface != Some(Surface::InfraCode)
             });
             let (strip_left, strip_right, count) = centered_controls.fold(
@@ -2731,6 +2752,7 @@ mod tests {
             matches!(
                 control.kind,
                 ControlKind::Start
+                    | ControlKind::Search
                     | ControlKind::SurfaceLauncher
                     | ControlKind::Back
                     | ControlKind::Home
@@ -3471,12 +3493,10 @@ mod tests {
                 .as_ref()
                 .expect("headless navigation bar should publish an AccessKit tree");
             for (kind, expected_label) in [
-                (ControlKind::Start, "Start - Search"),
+                (ControlKind::Start, "Start"),
+                (ControlKind::Search, "Search"),
                 (ControlKind::Back, "Back"),
-                (
-                    ControlKind::Home,
-                    "Home / Sessions — Desktop, restore, sessions",
-                ),
+                (ControlKind::Home, "Home"),
                 (ControlKind::Pin, "Taskbar placement menu"),
             ] {
                 let node = update
@@ -3895,7 +3915,8 @@ mod tests {
             }
 
             for (kind, expected) in [
-                (ControlKind::Start, Action::OpenSearch),
+                (ControlKind::Start, Action::OpenFrontDoor),
+                (ControlKind::Search, Action::FocusSearch),
                 (ControlKind::Back, Action::Back),
                 (ControlKind::Home, Action::Home),
                 (ControlKind::Pin, Action::ToggleDock),
@@ -4314,11 +4335,12 @@ mod tests {
             floating
                 .controls
                 .iter()
-                .take(4)
+                .take(5)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
             vec![
                 ControlKind::Start,
+                ControlKind::Search,
                 ControlKind::SurfaceLauncher,
                 ControlKind::Back,
                 ControlKind::Home,
@@ -4329,11 +4351,12 @@ mod tests {
             floating
                 .controls
                 .iter()
-                .take(4)
+                .take(5)
                 .map(|control| control_icon(*control))
                 .collect::<Vec<_>>(),
             vec![
                 IconId::Grid,
+                IconId::Search,
                 IconId::Server,
                 IconId::ArrowLeft,
                 IconId::FileHome,
@@ -4424,11 +4447,12 @@ mod tests {
             settled
                 .controls
                 .iter()
-                .take(4)
+                .take(5)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
             vec![
                 ControlKind::Start,
+                ControlKind::Search,
                 ControlKind::SurfaceLauncher,
                 ControlKind::Back,
                 ControlKind::Home,
@@ -4436,7 +4460,7 @@ mod tests {
         );
         assert!(settled.controls[0].rect.top() < settled.controls[1].rect.top());
         assert!(settled.controls[1].rect.top() < settled.controls[2].rect.top());
-        assert_eq!(settled.controls[3].kind, ControlKind::Home);
+        assert_eq!(settled.controls[4].kind, ControlKind::Home);
     }
 
     fn tempfile_dir() -> PathBuf {

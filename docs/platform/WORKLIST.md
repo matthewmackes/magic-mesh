@@ -379,15 +379,16 @@ behavioral evidence is not completion.
 - Required outcome: six independently supervised mackesd groups publish bounded typed runtime snapshots; one Surface::Workers owns worker tree, graph, inspector, Network
   Operations, and staged Action Console; old surfaces and health duplication are removed.
 - Current state: all 152 registered starts have bounded runtime contracts; six grouped services ship, but complete ownership, UI cutover, and fleet proof remain.
-- **SQLite authority complete (2026-08-08):** migrations reduced 61 direct writes to zero; final host/job and process-owner proof passed 24/24, and the empty baseline is enforced:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
-- **Action Console checkpoints (2026-08-08/09):** authenticated generation-bound Preview/Commit/Cancel and canonical digest recomputation fail closed; `.50`/`.90` passed:
+- **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
+- **Action Console checkpoints (2026-08-08/09):** generation-bound actions and digest recomputation fail closed:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts have stable registry rows; uncensused starts fail closed. Six group maps feed one Observation-owned
   aggregate; release 29 proved exact process owners and six fresh maps live on four seats after correcting legacy runtime-name alias admission. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-runtime-status-aggregate-ownership-r100.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-process-infrastructure-ownership-r103.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-process-infrastructure-ownership-r103.md`,
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
 - Remaining work:
+- **Mirror owner (2026-08-10):** only Data publishes `mirror_syncd`; machine 193 passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-mirror-owner-gate-r109.md`.
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
   Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects
@@ -408,9 +409,7 @@ behavioral evidence is not completion.
   creation and prompt cancellation; the target-file format gate passed. Other
   optional providers still require audit. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-registry-app-quiescence-r6.md`.
-- **App-sync quiescence checkpoint (2026-08-09):** an absent shared probe
-  inventory now leaves the optional media app-sync provider waiting solely for
-  shutdown, without client-state creation or a polling timer; `.50` passed 9/9:
+- **App-sync quiescence checkpoint (2026-08-09):** absent inventory leaves the optional provider shutdown-only without state or polling; `.50` passed 9/9:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-app-sync-quiescence-r7.md`.
 - **Responder group-isolation checkpoint (2026-08-09):** all 20 raw responder
   and maintenance threads now fail closed outside the process group assigned by
@@ -1902,6 +1901,13 @@ behavioral evidence is not completion.
   passed a watchdog hold. Lighthouse `.1` also moved corrected-forward to the
   signed grouped release 9; `.2`/`.3` package access remains explicit:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-lighthouse-quorum-capacity-r107.md`.
+- **Authoritative retirement checkpoint (2026-08-10):** destructive
+  lighthouse retirement no longer counts replicated directory rows. It reads
+  authoritative membership, directly probes every exact member, and refuses
+  before revoke/removal/deletion unless enough reachable started voters
+  survive. The current three-voter fleet therefore requires a converged fourth
+  member before `.2` or `.3` replacement:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-authoritative-retire-gate-r108.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
@@ -2163,6 +2169,11 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-012-2026-08-09-taskbar-control-identity-r2.md`.
 - **Narrow geometry checkpoint (2026-08-09):** center controls are admitted only when a physical 40px slot exists, preserving More at 480px and preventing Home overlap at
   320px; `.50` passed 50/50: `docs/platform/evidence/WL-UX-012-2026-08-09-narrow-center-geometry-r3.md`.
+- **Taskbar action-map checkpoint (2026-08-10):** Start and Search are distinct
+  typed controls over the one Front Door, Back retains typed history, and Home
+  idempotently opens the Bing-wallpaper base. The conflicting Home/Sessions
+  cycle was deleted; focused BigBoy action, pointer, and narrow-geometry gates
+  pass: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-action-map-r4.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
@@ -2241,6 +2252,11 @@ behavioral evidence is not completion.
   outlive its earliest admitted source or the ten-minute contract maximum;
   `.90` passed 14/14 health tests including hostile `u64::MAX` validity:
   `docs/platform/evidence/WL-UX-013-2026-08-09-projection-freshness-r2.md`.
+- **Status-cell provenance checkpoint (2026-08-10):** expired health evidence
+  renders `Stale`, never green `OK`; missing evidence remains unavailable,
+  resolved conditions are excluded, and fresh informational expected absence
+  remains non-outage. Machine 193 passed the exact focused test:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-stale-status-cell-r12.md`.
 - **Recovery target checkpoint (2026-08-09):** a condition cannot authorize remediation on another node; machine 194 passed 13/13:
   `docs/platform/evidence/WL-UX-013-2026-08-09-recovery-target-binding-r3.md`.
 - **Grade E authority checkpoint (2026-08-09):** two distinct active required warnings produce E without duplicate-delivery inflation; machines 9 and 194 passed the

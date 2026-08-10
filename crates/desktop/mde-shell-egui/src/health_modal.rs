@@ -309,11 +309,47 @@ fn status_cell(
     node: Option<&str>,
     components: &[HealthComponent],
 ) {
+    let (text, color) = match status_cell_state(snapshot, node, components, now_ms()) {
+        StatusCellState::Critical => ("Critical", Style::SUPPORT_ERROR),
+        StatusCellState::Warning => ("Warning", Style::SUPPORT_WARNING),
+        StatusCellState::Ok => ("OK", Style::SUPPORT_SUCCESS),
+        StatusCellState::Stale => ("Stale", Style::TEXT_DIM),
+        StatusCellState::Unavailable => ("—", Style::TEXT_DIM),
+    };
+    ui.colored_label(color, text);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusCellState {
+    Critical,
+    Warning,
+    Ok,
+    Stale,
+    Unavailable,
+}
+
+/// Derive a cell only from current provenance. Expected-absence observations
+/// are informational, so a fresh one remains non-outage; once the containing
+/// projection expires, however, its lack of an outage condition is no longer
+/// evidence for `OK`.
+fn status_cell_state(
+    snapshot: Option<&SystemMeshHealthSnapshot>,
+    node: Option<&str>,
+    components: &[HealthComponent],
+    now_ms: u64,
+) -> StatusCellState {
+    let Some(snapshot) = snapshot else {
+        return StatusCellState::Unavailable;
+    };
+    if !snapshot.is_fresh(now_ms) {
+        return StatusCellState::Stale;
+    }
     let worst = snapshot
-        .into_iter()
-        .flat_map(|snapshot| snapshot.active_conditions.iter())
+        .active_conditions
+        .iter()
         .filter(|condition| {
-            condition.requirement == mackes_mesh_types::health::RequirementClass::Required
+            condition.is_active()
+                && condition.requirement == mackes_mesh_types::health::RequirementClass::Required
                 && components.contains(&condition.component)
                 && match (&condition.scope, node) {
                     (HealthScope::Node { node: target }, Some(node)) => target == node,
@@ -323,13 +359,11 @@ fn status_cell(
         })
         .map(|condition| condition.severity)
         .max();
-    let (text, color) = match worst {
-        Some(HealthSeverity::Critical) => ("Critical", Style::SUPPORT_ERROR),
-        Some(HealthSeverity::Warning) => ("Warning", Style::SUPPORT_WARNING),
-        None if snapshot.is_some() => ("OK", Style::SUPPORT_SUCCESS),
-        None => ("—", Style::TEXT_DIM),
-    };
-    ui.colored_label(color, text);
+    match worst {
+        Some(HealthSeverity::Critical) => StatusCellState::Critical,
+        Some(HealthSeverity::Warning) => StatusCellState::Warning,
+        None => StatusCellState::Ok,
+    }
 }
 
 fn active_condition_count(snapshot: Option<&SystemMeshHealthSnapshot>) -> usize {
@@ -1672,6 +1706,54 @@ mod tests {
         snapshot.active_conditions[0].snoozed_until_ms = Some(u64::MAX);
         assert_eq!(active_condition_count(Some(&snapshot)), 1);
         assert_eq!(snapshot.active_issue_count(now_ms()), 0);
+    }
+
+    #[test]
+    fn status_cells_keep_expected_absence_non_outage_but_refuse_stale_ok() {
+        let now = now_ms();
+        let mut snapshot = fixture_snapshot(false, true);
+        let mut expected_absence = condition(
+            "Dell-operations-workstation:expected-absence",
+            "Dell-operations-workstation",
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        expected_absence.requirement = RequirementClass::Informational;
+        expected_absence.evidence.summary =
+            "Dell is sleeping and expected to return within its declared window.".into();
+        snapshot.active_conditions.push(expected_absence);
+        snapshot.fresh_until_ms = now;
+
+        assert_eq!(
+            status_cell_state(
+                Some(&snapshot),
+                Some("Dell-operations-workstation"),
+                &[HealthComponent::System],
+                now,
+            ),
+            StatusCellState::Ok,
+            "a current expected absence is information, not an outage"
+        );
+
+        assert_eq!(
+            status_cell_state(
+                Some(&snapshot),
+                Some("Dell-operations-workstation"),
+                &[HealthComponent::System],
+                now.saturating_add(1),
+            ),
+            StatusCellState::Stale,
+            "expired provenance cannot substantiate an OK status"
+        );
+        assert_eq!(
+            status_cell_state(
+                None,
+                Some("Dell-operations-workstation"),
+                &[HealthComponent::System],
+                now,
+            ),
+            StatusCellState::Unavailable,
+        );
     }
 
     #[test]
