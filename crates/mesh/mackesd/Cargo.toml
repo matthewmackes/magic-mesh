@@ -1019,7 +1019,11 @@ timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
 # fresh installs remain governed by the normal role/start gates.
 systemctl try-restart mde-shell-egui.service >/dev/null 2>&1 || :
 if [ "$mackesd_target_was_active" -eq 1 ]; then
-  systemctl try-restart mackesd.target >/dev/null 2>&1 || :
+  # The grouped target can legitimately spend more than a minute converging
+  # etcd, credentials, and six services. Queue its corrected-forward restart
+  # without holding the RPM database lock; each unit retains its own ordering,
+  # readiness, retry, and failure state while the package transaction returns.
+  systemctl --no-block try-restart mackesd.target >/dev/null 2>&1 || :
 fi
 """
 pre_uninstall_script = """

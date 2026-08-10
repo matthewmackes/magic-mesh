@@ -1848,6 +1848,8 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Non-blocking grouped-upgrade checkpoint (2026-08-10):** after release 31 exposed a >60-second synchronous target restart, the next RPM now queues grouped daemon
+  convergence without retaining the transaction lock; shell replacement remains synchronous: `docs/platform/evidence/WL-CRIT-007-2026-08-10-nonblocking-grouped-upgrade-r114.md`.
 - **Release-31 three-seat return checkpoint (2026-08-10):** Dell, seat 15, and Surface returned from corrected-forward package replacement with exact payloads,
   all six grouped services, Nebula, and zero-restart shells active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release31-three-seat-upgrade-r113.md`.
 - **Resource credential boot-retry checkpoint (2026-08-10):** transient SecretStore ordering failures retry every 30 seconds under a six-start/five-minute ceiling;
