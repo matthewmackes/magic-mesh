@@ -785,11 +785,8 @@ impl ResourceBrowserState {
                 );
                 ui.add_space(Style::SP_XS);
                 ui.horizontal_wrapped(|ui| {
+                    let action_now_ms = current_unix_millis();
                     for action in &card.actions {
-                        let contract_ready = matches!(
-                            action.availability.status,
-                            mackes_mesh_types::resources::ActionAvailabilityStatus::Ready
-                        );
                         let locally_handled = matches!(
                             action.verb,
                             ResourceActionVerb::Inspect
@@ -800,8 +797,11 @@ impl ResourceBrowserState {
                                 | ResourceActionVerb::Remove
                         );
                         let button = ui.add_enabled(
-                            authenticated
-                                && contract_ready
+                            service_action_is_admitted(
+                                action,
+                                authenticated,
+                                action_now_ms,
+                            )
                                 && locally_handled
                                 && self.action_pending.is_none(),
                             egui::Button::new(
@@ -1143,7 +1143,13 @@ impl ResourceBrowserState {
                     );
                     if ui
                         .add_enabled(
-                            authenticated && self.action_pending.is_none(),
+                            authenticated
+                                && current_resource_action_count(
+                                    card,
+                                    ResourceActionVerb::Configure,
+                                    current_unix_millis(),
+                                ) == 1
+                                && self.action_pending.is_none(),
                             egui::Button::new("SAVE SEALED CONFIGURATION"),
                         )
                         .clicked()
@@ -1414,6 +1420,31 @@ fn vdi_connect_binding(
     });
     let binding = matches.next()?;
     matches.next().is_none().then_some(binding)
+}
+
+fn service_action_is_admitted(
+    action: &mackes_mesh_types::resources::ResourceAction,
+    authenticated: bool,
+    now_ms: u64,
+) -> bool {
+    authenticated
+        && action.availability.status == ActionAvailabilityStatus::Ready
+        && action.target == ResourceActionTarget::Resource
+        && action.issued_at_ms <= now_ms
+        && action.expires_at_ms > now_ms
+}
+
+fn current_resource_action_count(
+    card: &ResourceCard,
+    verb: ResourceActionVerb,
+    now_ms: u64,
+) -> usize {
+    card.actions
+        .iter()
+        .filter(|action| {
+            action.verb == verb && service_action_is_admitted(action, true, now_ms)
+        })
+        .count()
 }
 
 fn same_vdi_binding(left: &VdiConnectBinding, right: &VdiConnectBinding) -> bool {
@@ -2019,6 +2050,25 @@ mod tests {
             serde_json::to_string(&catalog).expect("catalog JSON"),
             serde_json::to_string(&discovery).expect("discovery JSON"),
         )
+    }
+
+    #[test]
+    fn expired_ready_service_action_is_not_admitted() {
+        let action = mackes_mesh_types::resources::ResourceAction {
+            schema_version: 1,
+            action_id: "configure-service".into(),
+            verb: ResourceActionVerb::Configure,
+            target: ResourceActionTarget::Resource,
+            availability: mackes_mesh_types::resources::ActionAvailability {
+                status: ActionAvailabilityStatus::Ready,
+                failure: None,
+            },
+            issued_at_ms: NOW - 1_000,
+            expires_at_ms: NOW,
+        };
+
+        assert!(!service_action_is_admitted(&action, true, NOW));
+        assert!(service_action_is_admitted(&action, true, NOW - 1));
     }
 
     #[test]
