@@ -2049,13 +2049,18 @@ behavioral evidence is not completion.
   fail-closed activation, exact device-scoped firmware apply, read-only
   camera/fingerprint discovery, sole-runner DRM mode changes, and local-only
   typed shell projections. Fixed iptsd/SAM activation, a crash-safe local MOK
-  authority minter, and a revision/collector-bound deployment preflight now
-  fail closed around the remaining physical steps. Exact locked sources and
-  unsigned Fedora 44 userspace RPM producer proof exist. Image promotion still fails closed
-  pending the matching kernel-module signing key, kernel build capacity,
-  release-signed artifact publication, governed seat access, and direct Pro 6
-  then Pro 5 physical proof. Focused farm contract, daemon, shell, producer,
-  provenance, and collector gates passed; no physical acceptance is claimed:
+  authority minter, revision/collector-bound deployment preflight, console-only
+  SSH recovery preflight, and hash-bound Pro 6-then-Pro 5 physical recorder now
+  fail closed around the remaining operator steps. A responsive Surface card
+  fixture covers 320/480/960 px, touch/mouse density, large text, and both
+  color schemes without exposing dead activation/reboot controls. Exact locked
+  sources, unsigned Fedora 44 userspace RPM producer proof, and a deterministic
+  signed-stack finalization contract exist. Image promotion still fails closed
+  pending the matching kernel-module signing key, kernel build capacity, an
+  approved SSH public-key artifact/fingerprint, release-signed artifact
+  publication, governed seat access, and direct Pro 6 then Pro 5 physical
+  proof. Focused farm contract, daemon, shell, producer, provenance, and
+  collector gates passed; no physical acceptance is claimed:
   `docs/platform/evidence/WL-UX-011-2026-08-09-surface-pro56-contract-r15.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.

@@ -37,13 +37,18 @@ Changed production paths:
 - `install-helpers/build-surface-kernel-f44.sh`
 - `install-helpers/build-surface-userspace-f44.sh`
 - `install-helpers/fetch-surface-build-inputs.sh`
+- `install-helpers/finalize-surface-stack.py`
 - `install-helpers/mint-surface-mok-import.sh`
 - `install-helpers/preflight-surface-pro56-deployment.py`
+- `install-helpers/preflight-surface-ssh-console-recovery.py`
 - `install-helpers/provision-surface-mok-import-credentials.sh`
+- `install-helpers/record-surface-physical-acceptance.py`
 - `install-helpers/verify-surface-stack.sh`
 - `packaging/systemd/surface-mok-import-credential.conf`
 - `docs/ops/surface-pro56-acceptance-collection.md`
 - `docs/ops/surface-pro56-deployment-preflight.md`
+- `docs/ops/surface-pro56-physical-acceptance.md`
+- `docs/ops/surface-ssh-console-recovery.md`
 
 The shared schema provides:
 
@@ -189,6 +194,40 @@ off argv/environment/hashfiles, and proves the exact pending fingerprint after
 sole DRM runner, which tears down and rebuilds its existing GBM/EGL session at
 an advertised connector mode, acknowledges only after committed scanout, and
 rebuilds the prior mode on a pre-commit target failure.
+
+The final release boundary is now deterministic without importing signing
+authority into the repository. The finalizer consumes the exact locked source
+bundle, all five producer directories, the complete separately release-signed
+RPM directory, the governed public RPM key, the locked Surface certificate,
+and an exact Fedora 44 bootc digest. It rejects unknown, missing, renamed,
+payload-changed, unsigned, or wrong-key RPMs; accepts only the tracked primary
+key and its exact signing subkeys; verifies the signed checksum envelope; and
+checks every kernel module signer plus the certificate packaged by
+`surface-secureboot`. Tool output, duration, RPM/module counts, extraction, and
+publication are bounded. Only after the existing provenance verifier accepts
+the staged candidate is a new no-clobber ready directory published. This is a
+promotion contract, not a claim that the absent kernel signer or release-signed
+set exists.
+
+The physical handoff is likewise explicit. A read-only recorder validates the
+collector's complete file set and hashes, exact Pro 6 identity on canonical
+seat `Surface`, exact Pro 5 SKU on a distinct seat, installed package identity,
+operator-declared 40-character revision, and twelve timestamped hands-on
+observations. It never infers a pass from prose, never overwrites evidence, and
+requires a validated hash-bound Pro 6 record before recording Pro 5. A separate
+console recovery preflight accepts no key, path, fingerprint, password,
+address, private key, or environment override. Repository audit found no
+tracked approved SSH public key plus pinned OpenSSH fingerprint, so its commit
+mode is intentionally non-mutating and always reports the exact blocker.
+
+The Surface card no longer displays disabled controls that imply an unavailable
+generic activation or MOK reboot can be armed in the shell. It renders the
+governed activation result, identifies the separate host-state reboot handoff,
+wraps control and evidence rows, and uses the exact Pro 6/iptsd fixture. A
+headless render regression exercises all tabs at 320, 480, and 960 pixels under
+touch and mouse density, large text, and both Quazar color schemes. Live panel
+capture remains unavailable until governed access to the Surface seat is
+restored.
 
 On 2026-08-09, a bounded direct request for
 `https://pkg.surfacelinux.com/fedora/f44/repodata/repomd.xml` returned HTTP 404.
@@ -424,6 +463,24 @@ farm slots:
   and oversized command output. The live Pro 6 LAN answered in 0.309 ms, but
   the governed root/mm key remained refused and the overlay remained
   unavailable.
+- `.50 / surface-card-polish`: the final Surface-card suite passed 9/9,
+  including every tab at 320/480/960 pixels, touch/mouse density, large text,
+  and Dark/Light schemes after the test exposed and corrected a real narrow
+  Test-tab overflow. `.170` passed exact-file `rustfmt --check`. This is
+  headless layout proof; live Surface pixels remain blocked by seat access.
+- The physical recorder passed Python compilation and hostile duplicate,
+  incomplete, contradictory, and unsafe-text admission tests. It emitted no
+  acceptance record because no live collector bundle or hands-on observations
+  were available. The console SSH recovery preflight passed locally and on
+  `.90 / surface-ssh-preflight`; commit remained deliberately blocked with
+  `mutations: 0` because no repository-approved key/fingerprint pair exists.
+- `.50 / surface-finalize`: the release finalizer rejected 13 hostile fixtures
+  and the provenance verifier rejected 19. The same gate proved the tracked
+  primary plus signing-subkey admission, per-RPM actual signer rows, exact
+  `SIGNER` install-lock membership, schema/mode checks, and the bootc driver's
+  expected blocked-manifest exit 3. No candidate or image is claimed because
+  the real kernel producer output, operator release-signed RPM set, and pinned
+  production bootc digest were not available.
 
 The first secret-bearing kernel producer was correctly rejected because it
 mounted the Secure Boot private key into a networked upstream build container.
