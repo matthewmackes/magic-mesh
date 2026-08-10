@@ -396,6 +396,8 @@ behavioral evidence is not completion.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - Remaining work:
+- **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
+  active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
   `docs/platform/evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
 - **Mirror owner (2026-08-10):** only Data publishes `mirror_syncd`; machine 193 passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-mirror-owner-gate-r109.md`.
@@ -1766,6 +1768,9 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- **Release-32 native-F44 three-seat checkpoint (2026-08-10):** an F42 candidate was rejected before install; the corrected signed F44 artifact then passed integrity,
+  transaction, package, grouped-runtime, and Dell Browser-VM preservation on exactly Dell, seat 15, and Surface:
+  `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Release-31 three-seat upgrade checkpoint (2026-08-10):** signed Fedora 44 bytes passed transaction, payload, grouped-runtime, and shell proof on Dell, seat 15,
   and Surface while preserving Dell's Browser VM: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release31-three-seat-upgrade-r113.md`.
 - **Explicit release-gate matrix checkpoint (2026-08-09):** the historical r9
@@ -1857,6 +1862,9 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Release-32 corrected-forward checkpoint (2026-08-10):** Dell, seat 15, and Surface returned from the signed F44 upgrade with exact package bytes, Nebula, Construct,
+  target, and all six groups active; Surface root-key access is now direct:
+  `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Lighthouse release-11 checkpoint (2026-08-10):** the signed package restores the omitted secret helper and mode-`0444` identity; `.1` passed RPM, grouped-runtime,
   three-voter quorum, peer-publication, watchdog, and recipient convergence after Dell scope-preserved four secrets to six registered recipients. Rollout to the two
   inaccessible voters remains:
