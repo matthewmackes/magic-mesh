@@ -12,8 +12,8 @@
 //! * **Guided MOK enrollment** (lock #6) — on a Secure-Boot host whose
 //!   linux-surface modules are blocked, stage the machine-owner key
 //!   (`mokutil --import`), hand back the **exact blue MOK-Manager firmware
-//!   copy** the operator will see, and require a **typed arming token**
-//!   before the reboot (never an auto-reboot). After the reboot a fresh
+//!   copy** the operator will see, then hand reboot navigation to the shell's
+//!   governed host-state workflow (never an auto-reboot). After the reboot a fresh
 //!   enable call re-classifies the state as [`MokState::Enrolled`] and
 //!   verifies the modules load.
 //!
@@ -84,11 +84,6 @@ const SURFACE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const SHA1_FINGERPRINT_BYTES: usize = 20;
 
-/// The exact token the operator must type to arm the post-import reboot
-/// (lock #6 — never an auto-reboot). Deliberately unambiguous; the Install
-/// tab shows it and the enable request echoes it back in `arm_token`.
-pub const MOK_ARM_TOKEN: &str = "REBOOT-TO-ENROLL-MOK";
-
 // ─────────────────────────────── the seam ───────────────────────────────────
 
 /// A typed configuration knob the enable plan applies. Each maps to a
@@ -128,7 +123,7 @@ pub enum SecureBootState {
 }
 
 /// The injectable seam over every machine-touching action the enable flow
-/// performs (systemd, sysfs/config writes, mokutil, reboot). Tests hand a
+/// performs (systemd, sysfs/config writes, and mokutil). Tests hand a
 /// fake; production hands [`LiveSurfaceActions`].
 ///
 /// Every method is fallible with a typed [`EnableError`] so the fold records
@@ -160,9 +155,6 @@ pub trait SurfaceActions {
     /// Do the linux-surface `modules` all load right now? The post-reboot
     /// verify step.
     fn modules_loaded(&self, modules: &[&str]) -> Result<bool, EnableError>;
-
-    /// Reboot the host. Only ever called after the typed arm matched.
-    fn reboot(&self) -> Result<(), EnableError>;
 }
 
 /// A typed failure from the [`SurfaceActions`] seam.
@@ -199,8 +191,8 @@ impl std::error::Error for EnableError {}
 
 /// The production Surface seam. Activation and read-only posture checks use
 /// fixed, bounded host operations. MOK staging additionally requires a sealed
-/// one-use permit bound to the already-authorized request. Reboot stays gated
-/// until the typed host-state lane lands.
+/// one-use permit bound to the already-authorized request. It deliberately has
+/// no reboot action: reboot authority belongs exclusively to host-state.
 #[derive(Debug, Clone, Default)]
 pub struct LiveSurfaceActions {
     #[cfg(feature = "async-services")]
@@ -652,13 +644,6 @@ impl SurfaceActions for LiveSurfaceActions {
             .iter()
             .all(|module| Path::new("/sys/module").join(module).is_dir()))
     }
-
-    fn reboot(&self) -> Result<(), EnableError> {
-        Self::gated(
-            "reboot requires a separately authorized host-state propose/confirm pair; \
-             surface_enable never mints or retains either exact-body capability",
-        )
-    }
 }
 
 // ─────────────────────────── the enable plan (pure) ─────────────────────────
@@ -734,14 +719,14 @@ pub enum MokState {
 }
 
 /// The next action the MOK state dictates. The one-way flow is
-/// `NotSecureBoot → Skip`; `KeyMissing → ImportThenArmReboot`; `Enrolled →
+/// `NotSecureBoot → Skip`; `KeyMissing → ImportThenAwaitHostReboot`; `Enrolled →
 /// VerifyModules`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MokStep {
     /// Secure Boot off — skip MOK entirely.
     Skip,
-    /// Stage the key, then require a typed-armed reboot.
-    ImportThenArmReboot,
+    /// Stage the key, then await the separately governed host reboot workflow.
+    ImportThenAwaitHostReboot,
     /// Key enrolled — confirm the modules load.
     VerifyModules,
 }
@@ -762,17 +747,17 @@ pub const fn classify_mok(sb: SecureBootState, enrolled: bool) -> MokState {
 pub const fn mok_step(state: MokState) -> MokStep {
     match state {
         MokState::NotSecureBoot => MokStep::Skip,
-        MokState::KeyMissing => MokStep::ImportThenArmReboot,
+        MokState::KeyMissing => MokStep::ImportThenAwaitHostReboot,
         MokState::Enrolled => MokStep::VerifyModules,
     }
 }
 
-/// Is the reboot armed — did the operator type the exact [`MOK_ARM_TOKEN`]?
-/// Pure equality; a missing or wrong token is unarmed. This is the interlock
-/// that makes the reboot never automatic (lock #6).
+/// Exact typed-confirmation equality helper shared by Surface action flows.
+/// This helper carries no authority and has no MOK/reboot semantics; each
+/// caller remains responsible for its own governed action contract.
 #[must_use]
-pub fn is_armed(provided: Option<&str>, expected: &str) -> bool {
-    provided.is_some_and(|t| t == expected)
+pub(crate) fn is_armed(provided: Option<&str>, expected: &str) -> bool {
+    provided.is_some_and(|value| value == expected)
 }
 
 /// The exact copy the blue MOK-Manager firmware screen presents after the
@@ -789,7 +774,7 @@ screen (MOK Manager). It will NOT continue to the desktop on its own:\n\
 mokutil asked for when staging the key).\n\
   4. Select \"Reboot\".\n\
 If you miss the screen (it times out to the OS), re-run enable — the key is \
-still staged until enrolled. Arm the reboot below by typing: {MOK_ARM_TOKEN}"
+still staged until enrolled. Reboot only through System → Power & Battery."
     )
 }
 
@@ -883,18 +868,19 @@ pub enum MokEnrollment {
         /// Do the [`SURFACE_MODULES`] all load?
         modules_loaded: bool,
     },
-    /// Key staged, awaiting the typed-armed reboot. Carries the exact
-    /// firmware copy + the token the operator types to arm + the key
-    /// fingerprint they confirm at the blue screen.
+    /// Key staged, awaiting the separately governed host reboot. Carries the
+    /// exact firmware copy + the key fingerprint confirmed at the blue screen.
     ImportedAwaitingArm {
         /// The blue-screen firmware copy ([`mok_firmware_prompt`]).
         firmware_prompt: String,
-        /// The arm token the operator must type ([`MOK_ARM_TOKEN`]).
+        /// Reserved wire-compatibility field. New producers always emit an
+        /// empty string; reboot authority is never carried in this result.
         arm_token: String,
         /// The staged key's fingerprint (confirmed at the blue screen).
         key_fingerprint: String,
     },
-    /// The typed arm matched and the reboot was issued (or gated live).
+    /// Legacy read compatibility for results produced before reboot authority
+    /// moved exclusively to host-state. New code never produces this variant.
     RebootArmed {
         /// The reboot action's outcome.
         outcome: StepOutcome,
@@ -941,10 +927,8 @@ impl EnableResult {
 /// fake; production hands [`LiveSurfaceActions`] (fixed/bounded reads,
 /// request-bound MOK import, and fail-closed staged actions).
 ///
-/// `arm` is the operator-typed arming token from the enable request; it only
-/// matters in the [`MokState::KeyMissing`] branch, where a matching token
-/// (see [`is_armed`]) triggers the reboot and anything else stages the key +
-/// returns the firmware copy.
+/// `arm` is retained only for shared request compatibility. Any value is an
+/// obsolete reboot-arm request and is refused before activation or MOK effects.
 ///
 /// A non-Surface (or unrecognised-Surface) node is skipped cleanly — no
 /// actions, an honest `skipped` reason, no MOK.
@@ -979,8 +963,15 @@ pub fn run_enable(
         );
     }
 
+    if arm.is_some() {
+        return EnableResult::skipped(
+            device.product.clone(),
+            "obsolete Surface reboot-arm input refused; use the governed System Power & Battery workflow",
+        );
+    }
+
     let activation = run_activation(actions, device);
-    let mok = run_mok(actions, arm);
+    let mok = run_mok(actions);
 
     EnableResult {
         model: device.product.clone(),
@@ -1017,7 +1008,7 @@ fn run_activation(actions: &impl SurfaceActions, device: &SurfaceDevice) -> Acti
 }
 
 /// Walk the guided MOK state machine against the seam.
-fn run_mok(actions: &impl SurfaceActions, arm: Option<&str>) -> MokEnrollment {
+fn run_mok(actions: &impl SurfaceActions) -> MokEnrollment {
     // Classify: read Secure-Boot posture + enrollment.
     let sb = match actions.secure_boot_state() {
         Ok(sb) => sb,
@@ -1049,42 +1040,18 @@ fn run_mok(actions: &impl SurfaceActions, arm: Option<&str>) -> MokEnrollment {
                 reason: e.to_string(),
             },
         },
-        MokStep::ImportThenArmReboot => {
-            if is_armed(arm, MOK_ARM_TOKEN) {
-                // A typed token alone is insufficient: first prove that the
-                // fixed certificate is actually in the pending enrollment
-                // list. This prevents a reboot after a failed/skipped import.
-                match actions.mok_pending(Path::new(MOK_KEY_PATH)) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return MokEnrollment::Undetermined {
-                            reason:
-                                "MOK reboot refused: Surface certificate is not pending enrollment"
-                                    .to_string(),
-                        };
-                    }
-                    Err(error) => {
-                        return MokEnrollment::Undetermined {
-                            reason: error.to_string(),
-                        };
-                    }
-                }
-                MokEnrollment::RebootArmed {
-                    outcome: StepOutcome::from_apply(actions.reboot()),
-                }
-            } else {
-                // Stage the key and hand back the firmware copy; do NOT
-                // reboot (lock #6). A gated/failed import is honest too.
-                match actions.mok_import(Path::new(MOK_KEY_PATH)) {
-                    Ok(key_fingerprint) => MokEnrollment::ImportedAwaitingArm {
-                        firmware_prompt: mok_firmware_prompt(),
-                        arm_token: MOK_ARM_TOKEN.to_string(),
-                        key_fingerprint,
-                    },
-                    Err(e) => MokEnrollment::Undetermined {
-                        reason: e.to_string(),
-                    },
-                }
+        MokStep::ImportThenAwaitHostReboot => {
+            // Stage the key and hand back proof/copy only. Reboot is not part
+            // of this seam and can only be proposed/confirmed through host-state.
+            match actions.mok_import(Path::new(MOK_KEY_PATH)) {
+                Ok(key_fingerprint) => MokEnrollment::ImportedAwaitingArm {
+                    firmware_prompt: mok_firmware_prompt(),
+                    arm_token: String::new(),
+                    key_fingerprint,
+                },
+                Err(e) => MokEnrollment::Undetermined {
+                    reason: e.to_string(),
+                },
             }
         }
     }
@@ -1246,6 +1213,11 @@ mod worker {
                 );
                 return self
                     .refused_result(&format!("surface enable authorization refused: {error}"));
+            }
+            if req.arm_token.is_some() {
+                return self.refused_result(
+                    "obsolete Surface reboot-arm input refused; use the governed System Power & Battery workflow",
+                );
             }
             let Some(authorization) = req
                 .header
@@ -1460,6 +1432,28 @@ mod worker {
         }
 
         #[test]
+        fn authorized_obsolete_reboot_arm_is_refused_before_live_actions() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            let request = signed_request(
+                "node-a",
+                Some("REBOOT-TO-ENROLL-MOK"),
+                "surface-enable-obsolete-reboot",
+            );
+
+            let result = worker.apply_request(Some(&request));
+
+            assert!(result.activation.units.is_empty());
+            assert!(result.activation.configs.is_empty());
+            assert_eq!(result.mok, super::super::MokEnrollment::NotRequired);
+            assert!(
+                result.skipped.as_deref().is_some_and(
+                    |reason| reason.contains("obsolete Surface reboot-arm input refused")
+                )
+            );
+        }
+
+        #[test]
         fn cursor_advances_so_a_request_is_processed_once() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
@@ -1485,7 +1479,7 @@ mod worker {
             );
             let request = serde_json::json!({
                 "schema_version": 1,
-                "arm_token": super::super::MOK_ARM_TOKEN,
+                "arm_token": "obsolete-reboot-arm",
             })
             .to_string();
             persist
@@ -1604,6 +1598,8 @@ mod worker {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::surface::{identify, DmiInfo, SurfaceFamily, MS_VENDOR};
 
@@ -1616,6 +1612,7 @@ mod tests {
         pending: bool,
         modules_loaded: bool,
         import_fingerprint: Option<String>,
+        effects: Cell<usize>,
         // failure injection
         enable_fails: bool,
         sb_read_fails: bool,
@@ -1623,6 +1620,7 @@ mod tests {
 
     impl SurfaceActions for FakeActions {
         fn enable_unit(&self, unit: &str) -> Result<bool, EnableError> {
+            self.effects.set(self.effects.get() + 1);
             if self.enable_fails {
                 return Err(EnableError::Failed {
                     action: format!("enable {unit}"),
@@ -1632,9 +1630,11 @@ mod tests {
             Ok(false)
         }
         fn apply_config(&self, _key: ConfigKey, _value: &str) -> Result<(), EnableError> {
+            self.effects.set(self.effects.get() + 1);
             Ok(())
         }
         fn secure_boot_state(&self) -> Result<SecureBootState, EnableError> {
+            self.effects.set(self.effects.get() + 1);
             if self.sb_read_fails {
                 return Err(EnableError::IntegrationGated {
                     action: "read secure-boot state".into(),
@@ -1643,22 +1643,23 @@ mod tests {
             Ok(self.secure_boot.unwrap_or(SecureBootState::Disabled))
         }
         fn mok_enrolled(&self) -> Result<bool, EnableError> {
+            self.effects.set(self.effects.get() + 1);
             Ok(self.enrolled)
         }
         fn mok_pending(&self, _key_path: &Path) -> Result<bool, EnableError> {
+            self.effects.set(self.effects.get() + 1);
             Ok(self.pending)
         }
         fn mok_import(&self, _key_path: &Path) -> Result<String, EnableError> {
+            self.effects.set(self.effects.get() + 1);
             Ok(self
                 .import_fingerprint
                 .clone()
                 .unwrap_or_else(|| "AA:BB:CC".into()))
         }
         fn modules_loaded(&self, _modules: &[&str]) -> Result<bool, EnableError> {
+            self.effects.set(self.effects.get() + 1);
             Ok(self.modules_loaded)
-        }
-        fn reboot(&self) -> Result<(), EnableError> {
-            Ok(())
         }
     }
 
@@ -1754,7 +1755,10 @@ mod tests {
             classify_mok(SecureBootState::Enabled, false),
             MokState::KeyMissing
         );
-        assert_eq!(mok_step(MokState::KeyMissing), MokStep::ImportThenArmReboot);
+        assert_eq!(
+            mok_step(MokState::KeyMissing),
+            MokStep::ImportThenAwaitHostReboot
+        );
     }
 
     #[test]
@@ -1767,18 +1771,12 @@ mod tests {
     }
 
     #[test]
-    fn arm_requires_the_exact_token() {
-        assert!(is_armed(Some(MOK_ARM_TOKEN), MOK_ARM_TOKEN));
-        assert!(!is_armed(Some("reboot"), MOK_ARM_TOKEN));
-        assert!(!is_armed(None, MOK_ARM_TOKEN));
-    }
-
-    #[test]
-    fn firmware_prompt_names_enroll_mok_and_the_arm_token() {
+    fn firmware_prompt_names_enroll_mok_and_governed_reboot_destination() {
         let copy = mok_firmware_prompt();
         assert!(copy.contains("Enroll MOK"));
         assert!(copy.contains("one-time password"));
-        assert!(copy.contains(MOK_ARM_TOKEN));
+        assert!(copy.contains("System → Power & Battery"));
+        assert!(!copy.contains("REBOOT-TO-ENROLL-MOK"));
     }
 
     // ── the run_enable fold (each MOK branch, with a fake seam) ──────────────
@@ -1830,7 +1828,7 @@ mod tests {
                 ..Default::default()
             },
             &detect_of("Surface Pro 7"),
-            Some(MOK_ARM_TOKEN),
+            Some("obsolete-reboot-arm"),
         );
         assert!(result
             .skipped
@@ -1873,7 +1871,7 @@ mod tests {
                 arm_token,
                 key_fingerprint,
             } => {
-                assert_eq!(arm_token, MOK_ARM_TOKEN);
+                assert!(arm_token.is_empty());
                 assert_eq!(key_fingerprint, "12:34:56");
                 assert!(firmware_prompt.contains("Enroll MOK"));
             }
@@ -1882,35 +1880,26 @@ mod tests {
     }
 
     #[test]
-    fn sb_on_unenrolled_with_arm_issues_the_reboot() {
+    fn obsolete_reboot_arm_is_refused_before_every_effect() {
         let fake = FakeActions {
             secure_boot: Some(SecureBootState::Enabled),
             enrolled: false,
             pending: true,
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), Some(MOK_ARM_TOKEN));
-        assert_eq!(
-            r.mok,
-            MokEnrollment::RebootArmed {
-                outcome: StepOutcome::Applied
-            }
+        let result = run_enable(
+            &fake,
+            &detect_of("Surface Pro 6"),
+            Some("REBOOT-TO-ENROLL-MOK"),
         );
-    }
-
-    #[test]
-    fn sb_on_unenrolled_with_arm_refuses_reboot_without_pending_proof() {
-        let fake = FakeActions {
-            secure_boot: Some(SecureBootState::Enabled),
-            enrolled: false,
-            pending: false,
-            ..Default::default()
-        };
-        let result = run_enable(&fake, &detect_of("Surface Pro 6"), Some(MOK_ARM_TOKEN));
-        let MokEnrollment::Undetermined { reason } = result.mok else {
-            panic!("reboot was not refused without pending proof");
-        };
-        assert!(reason.contains("not pending enrollment"));
+        assert_eq!(fake.effects.get(), 0);
+        assert!(result.activation.units.is_empty());
+        assert!(result.activation.configs.is_empty());
+        assert_eq!(result.mok, MokEnrollment::NotRequired);
+        assert!(result
+            .skipped
+            .as_deref()
+            .is_some_and(|reason| reason.contains("obsolete Surface reboot-arm input refused")));
     }
 
     #[test]
@@ -1986,14 +1975,15 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
     }
 
     #[test]
-    fn wrong_arm_token_does_not_reboot_it_stages() {
+    fn every_non_null_arm_value_is_refused_instead_of_staging() {
         let fake = FakeActions {
             secure_boot: Some(SecureBootState::Enabled),
             enrolled: false,
             ..Default::default()
         };
         let r = run_enable(&fake, &detect_of("Surface Pro 6"), Some("nope"));
-        assert!(matches!(r.mok, MokEnrollment::ImportedAwaitingArm { .. }));
+        assert_eq!(fake.effects.get(), 0);
+        assert!(r.skipped.is_some());
     }
 
     #[test]
@@ -2090,13 +2080,6 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
             fixed_import,
             Err(EnableError::IntegrationGated { action })
                 if action.contains("authorized Surface request binding")
-        ));
-        let reboot = actions.reboot();
-        assert!(matches!(
-            reboot,
-            Err(EnableError::IntegrationGated { action })
-                if action.contains("host-state propose/confirm")
-                    && action.contains("never mints or retains")
         ));
     }
 }
