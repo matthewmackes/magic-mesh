@@ -1363,6 +1363,8 @@ behavioral evidence is not completion.
 - **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
 - Remaining work:
+- **Android catalog identity checkpoint (2026-08-10):** higher-revision signed imports cannot switch catalog identity; seat 90 passed:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-10-android-identity-continuity-r161.md`.
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
     libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
   - **Signed release-artifact admission (2026-08-09):** schema v3 requires one bounded detached signature from the pinned installed MCNF key before provisioning; missing,
@@ -1665,6 +1667,8 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Stopwatch elapsed-deadline checkpoint (2026-08-10):** overdue running stopwatches fail closed during admission and recovery; BigBoy passed:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-stopwatch-elapsed-deadline-r161.md`.
 - **Peer stopwatch transport checkpoint (2026-08-10):** approved targeted mirrors preserve origin/revision and hostile variants fail closed; BigBoy passed 2/2:
   `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-stopwatch-transport-r146.md`.
 - **Peer command budget checkpoint (2026-08-10):** Clock schedule, stopwatch, and
