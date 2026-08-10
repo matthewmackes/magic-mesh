@@ -2251,7 +2251,16 @@ impl WorkloadActuator for SystemWorkloadActuator {
                 attachment: None,
             },
             WorkloadOperationAction::StartAndAttach | WorkloadOperationAction::Start => {
-                Self::run_power_command(request, "start")?;
+                if let Err(error) = Self::run_power_command(request, "start") {
+                    if request.action == WorkloadOperationAction::StartAndAttach {
+                        // A failed start leaves the definition eligible for a
+                        // bounded retry, but it did not establish a guest
+                        // endpoint. Do not retain a live Display1 capability
+                        // across that failed backend boundary.
+                        self.remove_attachment(request);
+                    }
+                    return Err(error.into());
+                }
                 WorkloadActuatorOutcome {
                     phase: WorkloadOperationPhase::WaitingForGuest,
                     power: WorkloadPowerState::Starting,
