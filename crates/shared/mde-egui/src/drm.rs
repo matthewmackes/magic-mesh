@@ -118,6 +118,49 @@ pub enum Display1FramePoll {
     Disconnected,
 }
 
+/// One bounded input action for the currently presented native Display1 guest.
+///
+/// The DRM seat produces these directly from libinput. Implementations bind
+/// them to the authenticated attachment lease before transport; host-reserved
+/// keys never enter this type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Display1Input {
+    /// Explicitly acquire or relinquish guest input focus.
+    Focus(bool),
+    /// Linux evdev key code and edge. The daemon maps only supported guest keys.
+    Key {
+        /// Linux evdev code.
+        code: u32,
+        /// Press (`true`) or release (`false`).
+        pressed: bool,
+    },
+    /// Pointer position and relative delta in physical scanout pixels.
+    PointerMotion {
+        /// Absolute console x pixel.
+        x: u32,
+        /// Absolute console y pixel.
+        y: u32,
+        /// Relative x pixel delta.
+        dx: i32,
+        /// Relative y pixel delta.
+        dy: i32,
+    },
+    /// QEMU mouse button number and edge (left=0, middle=1, right=2).
+    PointerButton {
+        /// QEMU button number.
+        button: u32,
+        /// Press (`true`) or release (`false`).
+        pressed: bool,
+    },
+    /// Bounded vertical wheel direction (-1 or 1).
+    Wheel {
+        /// One bounded signed vertical step.
+        steps: i32,
+    },
+    /// Release every guest key/button retained by the daemon.
+    ReleaseAll,
+}
+
 /// Non-blocking source for the native Display1 scanout path.
 ///
 /// Implementations must perform authentication and bounded protocol checks
@@ -133,6 +176,50 @@ pub trait Display1FrameSource {
     /// readiness depend on presentation rather than socket delivery.
     fn frame_presented(&mut self) -> Result<(), DrmError> {
         Ok(())
+    }
+
+    /// Send one input action through the exact authenticated Display1 lease.
+    /// The default rejects input so a frame-only source can never silently
+    /// claim interactive support.
+    fn send_input(&mut self, _input: Display1Input) -> Result<(), DrmError> {
+        Err(DrmError::Present(
+            "Display1 source does not support lease-bound input".into(),
+        ))
+    }
+}
+
+fn send_display1_input(
+    source: &mut Option<&mut dyn Display1FrameSource>,
+    input: Display1Input,
+) -> Result<(), DrmError> {
+    source
+        .as_mut()
+        .ok_or_else(|| DrmError::Present("Display1 input has no attached source".into()))?
+        .send_input(input)
+}
+
+/// Convert the DRM loop's logical pointer back to the QEMU Display1 contract:
+/// physical console pixels, bounded to `[0,width)` / `[0,height)`.
+fn display1_pointer_pixels(
+    pointer: egui::Pos2,
+    pixels_per_point: f32,
+    width: u32,
+    height: u32,
+) -> (u32, u32) {
+    let max_x = width.saturating_sub(1) as f32;
+    let max_y = height.saturating_sub(1) as f32;
+    (
+        (pointer.x * pixels_per_point).round().clamp(0.0, max_x) as u32,
+        (pointer.y * pixels_per_point).round().clamp(0.0, max_y) as u32,
+    )
+}
+
+fn display1_guest_button(button: egui::PointerButton) -> Option<u32> {
+    match button {
+        egui::PointerButton::Primary => Some(0),
+        egui::PointerButton::Middle => Some(1),
+        egui::PointerButton::Secondary => Some(2),
+        _ => None,
     }
 }
 
@@ -1913,6 +2000,10 @@ fn run_drm_session(
     // The FD remains owned until the last KMS flip using the framebuffer has
     // completed; dropping either earlier can invalidate the imported GEM.
     let mut external_scanout: Option<(drm::control::framebuffer::Handle, OwnedFd)> = None;
+    // Guest focus is explicit and can only exist while a native frame has
+    // completed KMS presentation. A pointer press acquires it; host-reserved
+    // keys, transport loss, and session teardown relinquish it.
+    let mut display1_guest_focused = false;
     // perf-1: one DRM framebuffer per GBM buffer-object, keyed by its stable `gbm_bo`
     // pointer. The surface ring is a handful of buffers, so this stays tiny; destroyed en
     // masse at teardown.
@@ -2093,6 +2184,18 @@ fn run_drm_session(
                     if input_proof {
                         log_drm_pointer("pointer_relative", pointer, ppp, screen);
                     }
+                    if display1_guest_focused && external_scanout.is_some() {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let dx = m.dx().round().clamp(-32_768.0, 32_767.0) as i32;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let dy = m.dy().round().clamp(-32_768.0, 32_767.0) as i32;
+                        let (x, y) = display1_pointer_pixels(pointer, ppp, wp, hp);
+                        send_display1_input(
+                            display1,
+                            Display1Input::PointerMotion { x, y, dx, dy },
+                        )?;
+                        continue;
+                    }
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::MotionAbsolute(m)) => {
@@ -2102,15 +2205,28 @@ fn run_drm_session(
                     if input_proof {
                         log_drm_pointer_abs(raw_x, raw_y, pointer, ppp, screen);
                     }
+                    if display1_guest_focused && external_scanout.is_some() {
+                        send_display1_input(
+                            display1,
+                            Display1Input::PointerMotion {
+                                x: raw_x.round().clamp(0.0, f64::from(wp.saturating_sub(1))) as u32,
+                                y: raw_y.round().clamp(0.0, f64::from(hp.saturating_sub(1))) as u32,
+                                dx: 0,
+                                dy: 0,
+                            },
+                        )?;
+                        continue;
+                    }
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::Button(b)) => {
                     if let Some(button) =
                         crate::pointer_button(b.button(), crate::input_policy().left_handed)
                     {
+                        let pressed = b.button_state() == ButtonState::Pressed;
                         if input_proof {
                             log_drm_pointer(
-                                if b.button_state() == ButtonState::Pressed {
+                                if pressed {
                                     "pointer_button_down"
                                 } else {
                                     "pointer_button_up"
@@ -2120,10 +2236,34 @@ fn run_drm_session(
                                 screen,
                             );
                         }
+                        if external_scanout.is_some() && (display1_guest_focused || pressed) {
+                            // Resolve support before Focus(true): extra buttons
+                            // cannot focus a guest without a deliverable edge.
+                            let Some(guest_button) = display1_guest_button(button) else {
+                                continue;
+                            };
+                            if !display1_guest_focused {
+                                send_display1_input(display1, Display1Input::Focus(true))?;
+                                display1_guest_focused = true;
+                                let (x, y) = display1_pointer_pixels(pointer, ppp, wp, hp);
+                                send_display1_input(
+                                    display1,
+                                    Display1Input::PointerMotion { x, y, dx: 0, dy: 0 },
+                                )?;
+                            }
+                            send_display1_input(
+                                display1,
+                                Display1Input::PointerButton {
+                                    button: guest_button,
+                                    pressed,
+                                },
+                            )?;
+                            continue;
+                        }
                         events.push(egui::Event::PointerButton {
                             pos: pointer,
                             button,
-                            pressed: b.button_state() == ButtonState::Pressed,
+                            pressed,
                             modifiers: egui::Modifiers::default(),
                         });
                     }
@@ -2146,6 +2286,17 @@ fn run_drm_session(
                     }
                     delta *= policy.scroll_scale();
                     if delta != egui::Vec2::ZERO {
+                        if display1_guest_focused && external_scanout.is_some() {
+                            if delta.y != 0.0 {
+                                send_display1_input(
+                                    display1,
+                                    Display1Input::Wheel {
+                                        steps: if delta.y > 0.0 { 1 } else { -1 },
+                                    },
+                                )?;
+                            }
+                            continue;
+                        }
                         events.push(egui::Event::MouseWheel {
                             unit: egui::MouseWheelUnit::Point,
                             delta,
@@ -2251,10 +2402,29 @@ fn run_drm_session(
                     // dispatches them host-first (even over a fullscreen guest); they
                     // are NOT emitted as egui events, so the guest never sees them.
                     if crate::hostkeys::is_host_key(code) {
+                        if pressed && display1_guest_focused {
+                            send_display1_input(display1, Display1Input::Focus(false))?;
+                            display1_guest_focused = false;
+                        }
                         crate::hostkeys::push_host_key(code, pressed);
                         // Host keys aren't forwarded to egui, so force a render for the
                         // shell to dispatch them (launcher/media keys) even when idle.
                         force_render = true;
+                        continue;
+                    }
+                    // Escape is always host-only. It relinquishes guest focus
+                    // even when the development quit switch is disabled.
+                    if code == 1 {
+                        if pressed && display1_guest_focused {
+                            send_display1_input(display1, Display1Input::Focus(false))?;
+                            display1_guest_focused = false;
+                        }
+                        force_render = true;
+                        continue;
+                    }
+                    if display1_guest_focused && external_scanout.is_some() {
+                        send_display1_input(display1, Display1Input::Key { code, pressed })?;
+                        continue;
                     }
                     let modifiers = drm_modifiers(alt, ctrl, shift);
                     if let Some(key) = drm_key(code) {
@@ -2619,6 +2789,7 @@ fn run_drm_session(
                 continue;
             }
             Some(Display1FramePoll::Disconnected) => {
+                display1_guest_focused = false;
                 clear_external_scanout(&gbm, &mut external_scanout)?;
             }
             Some(Display1FramePoll::Idle) | None => {}
@@ -2706,6 +2877,12 @@ fn run_drm_session(
         }
     }
 
+    // Relinquish guest input before any descriptor/socket owner is dropped.
+    let input_release_error = if display1_guest_focused {
+        send_display1_input(display1, Display1Input::ReleaseAll).err()
+    } else {
+        None
+    };
     // teardown (best-effort; the OS reclaims the rest on exit)
     if let Some(bo) = prev.take() {
         drop(bo);
@@ -2731,6 +2908,11 @@ fn run_drm_session(
     let _ = egl.destroy_surface(display, surface);
     let _ = egl.destroy_context(display, context);
     let _ = egl.terminate(display);
+    if let Some(error) = input_release_error {
+        return Err(DrmError::Present(format!(
+            "Display1 input release failed after ordered DRM cleanup: {error}"
+        )));
+    }
     Ok(session_exit)
 }
 
@@ -3349,12 +3531,12 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acknowledge_display1_present, apply_drm_clipboard_owner, clear_rgba,
-        drm_clipboard_output_text, drm_clipboard_poll_delay, drm_modifiers, drm_screen_for_scale,
-        explicit_modifier, open_primary_node, poll_display1_or_cleanup,
-        poll_pending_drm_clipboard_paste, probe_prime_import_liveness, push_drm_clipboard_shortcut,
-        refresh_drm_clipboard_offer, store_drm_clipboard_output, Display1FramePoll,
-        Display1FrameSource, DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
+        acknowledge_display1_present, apply_drm_clipboard_owner, clear_rgba, display1_guest_button,
+        display1_pointer_pixels, drm_clipboard_output_text, drm_clipboard_poll_delay,
+        drm_modifiers, drm_screen_for_scale, explicit_modifier, open_primary_node,
+        poll_display1_or_cleanup, poll_pending_drm_clipboard_paste, probe_prime_import_liveness,
+        push_drm_clipboard_shortcut, refresh_drm_clipboard_offer, store_drm_clipboard_output,
+        Display1FramePoll, Display1FrameSource, DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
         DRM_CLIPBOARD_PASTE_TIMEOUT, DRM_CLIPBOARD_POLL_INTERVAL,
     };
     use crate::{LocalClipboardAuthority, MemoryRichClipboardClient, RichClipboardClient};
@@ -3364,6 +3546,35 @@ mod tests {
     use std::time::Instant;
 
     struct FailedDisplay1Source;
+
+    #[test]
+    fn display1_absolute_pointer_uses_bounded_console_pixels() {
+        assert_eq!(
+            display1_pointer_pixels(egui::pos2(100.0, 50.0), 2.0, 1920, 1080),
+            (200, 100)
+        );
+        assert_eq!(
+            display1_pointer_pixels(egui::pos2(960.0, 540.0), 2.0, 1920, 1080),
+            (1919, 1079),
+            "QEMU rejects x >= width or y >= height"
+        );
+        assert_eq!(
+            display1_pointer_pixels(egui::pos2(-4.0, -2.0), 1.5, 1920, 1080),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn display1_extra_button_cannot_acquire_guest_focus() {
+        assert_eq!(display1_guest_button(egui::PointerButton::Primary), Some(0));
+        assert_eq!(display1_guest_button(egui::PointerButton::Middle), Some(1));
+        assert_eq!(
+            display1_guest_button(egui::PointerButton::Secondary),
+            Some(2)
+        );
+        assert_eq!(display1_guest_button(egui::PointerButton::Extra1), None);
+        assert_eq!(display1_guest_button(egui::PointerButton::Extra2), None);
+    }
 
     impl Display1FrameSource for FailedDisplay1Source {
         fn poll(&mut self, _now: Instant) -> Result<Display1FramePoll, DrmError> {

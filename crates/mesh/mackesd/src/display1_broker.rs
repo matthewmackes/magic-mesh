@@ -10,13 +10,13 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, OwnedFd as StdOwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -48,6 +48,8 @@ pub const DISPLAY1_SOCKET_ROOT: &str = "/run/mde/display1";
 pub const DISPLAY1_HANDSHAKE_SCHEMA_VERSION: u16 = 1;
 const MAX_DISPLAY1_HANDSHAKE_BYTES: usize = 4 * 1024;
 const MAX_DISPLAY1_ENVELOPE_BYTES: usize = 16 * 1024;
+const MAX_DISPLAY1_INPUT_BYTES: usize = 4 * 1024;
+const DISPLAY1_INPUT_DBUS_TIMEOUT: Duration = Duration::from_millis(500);
 const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
 // Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 preserves unknown receive
 // flags but does not expose a named constant for this result-only flag.
@@ -257,6 +259,83 @@ pub struct Display1DamageEnvelope {
     pub generation: u64,
     /// Validated damage rectangle.
     pub damage: Display1Damage,
+}
+
+/// One shell-to-daemon input packet after exact lease binding has been
+/// validated. No input packet is permitted to carry ancillary descriptors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Display1InputMessage {
+    /// Strictly increasing sequence within one authenticated relay epoch.
+    pub sequence: u64,
+    /// Bounded guest input action.
+    pub input: Display1InputAction,
+}
+
+/// Closed Display1 input action set. Linux evdev codes are translated to QEMU
+/// key numbers only at the retained QEMU peer boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Display1InputAction {
+    /// Acquire or relinquish explicit guest focus.
+    Focus {
+        /// Requested focus state.
+        focused: bool,
+    },
+    /// One guest keyboard edge.
+    Key {
+        /// Linux evdev code from the DRM seat.
+        code: u32,
+        /// Press (`true`) or release (`false`).
+        pressed: bool,
+    },
+    /// Absolute and relative console-pixel pointer data.
+    PointerMotion {
+        /// Absolute console x pixel.
+        x: u32,
+        /// Absolute console y pixel.
+        y: u32,
+        /// Relative x pixel delta.
+        dx: i32,
+        /// Relative y pixel delta.
+        dy: i32,
+    },
+    /// One guest pointer button edge.
+    PointerButton {
+        /// QEMU button number.
+        button: u32,
+        /// Press (`true`) or release (`false`).
+        pressed: bool,
+    },
+    /// One bounded vertical wheel step.
+    Wheel {
+        /// Signed step (`-1` or `1`).
+        steps: i32,
+    },
+    /// Release all retained guest edges and focus.
+    ReleaseAll,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Display1InputEnvelope {
+    kind: String,
+    lease_id: String,
+    workload_id: String,
+    generation: u64,
+    sequence: u64,
+    input: Display1InputAction,
+}
+
+/// One non-blocking result from the authenticated shell input channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Display1InputPoll {
+    /// No complete input packet is ready.
+    Idle,
+    /// The authenticated shell relay reached EOF or failed validation.
+    Disconnected,
+    /// One validated exact-lease input action.
+    Input(Display1InputMessage),
 }
 
 /// The first message on a per-lease socket. It proves that the shell holds
@@ -581,6 +660,61 @@ impl Display1ScmRightsRelay {
             ))
         }
     }
+
+    fn poll_input(&self, now_ms: u64) -> Result<Display1InputPoll, Display1Error> {
+        if peer_credentials(&self.stream)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?
+            != self.peer
+        {
+            return Err(Display1Error::Attachment("peer credential mismatch".into()));
+        }
+        self.lease
+            .validate(now_ms)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?;
+        let mut body = [0_u8; MAX_DISPLAY1_INPUT_BYTES];
+        let mut iov = [IoSliceMut::new(&mut body)];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+        let received = match recvmsg(&self.stream, &mut iov, &mut ancillary, RecvFlags::DONTWAIT) {
+            Ok(received) => received,
+            Err(rustix::io::Errno::AGAIN) => return Ok(Display1InputPoll::Idle),
+            Err(error) => {
+                return Err(Display1Error::Attachment(format!(
+                    "read Display1 input: {error}"
+                )))
+            }
+        };
+        reject_truncated_packet(received.flags, "input")?;
+        if ancillary.drain().next().is_some() {
+            return Err(Display1Error::Attachment(
+                "Display1 input must not carry ancillary data".into(),
+            ));
+        }
+        if received.bytes == 0 {
+            return Ok(Display1InputPoll::Disconnected);
+        }
+        let envelope: Display1InputEnvelope = serde_json::from_slice(&body[..received.bytes])
+            .map_err(|error| Display1Error::Attachment(format!("Display1 input JSON: {error}")))?;
+        if envelope.kind != "input"
+            || envelope.lease_id != self.lease.lease_id
+            || envelope.workload_id != self.lease.workload_id.as_str()
+            || envelope.generation != self.lease.generation
+            || envelope.sequence == 0
+        {
+            return Err(Display1Error::Attachment(
+                "Display1 input lease, generation, kind, or sequence mismatch".into(),
+            ));
+        }
+        let scanout = *self
+            .scanout
+            .lock()
+            .map_err(|_| Display1Error::Attachment("scanout state poisoned".into()))?;
+        validate_input_action(&envelope.input, scanout)?;
+        Ok(Display1InputPoll::Input(Display1InputMessage {
+            sequence: envelope.sequence,
+            input: envelope.input,
+        }))
+    }
 }
 
 impl Display1FrameSink for Display1ScmRightsRelay {
@@ -611,6 +745,7 @@ pub struct Display1AttachmentSink {
     relay: Mutex<Option<Display1ScmRightsRelay>>,
     frame_delivered: AtomicBool,
     first_frame: AtomicBool,
+    input_epoch: AtomicU64,
 }
 
 impl Display1AttachmentSink {
@@ -619,6 +754,7 @@ impl Display1AttachmentSink {
             relay: Mutex::new(None),
             frame_delivered: AtomicBool::new(false),
             first_frame: AtomicBool::new(false),
+            input_epoch: AtomicU64::new(0),
         }
     }
 
@@ -627,10 +763,35 @@ impl Display1AttachmentSink {
             .relay
             .lock()
             .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
-        *current = Some(relay);
+        if current.replace(relay).is_some() {
+            self.input_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         self.frame_delivered.store(false, Ordering::Release);
         self.first_frame.store(false, Ordering::Release);
         Ok(())
+    }
+
+    fn poll_input(&self) -> Result<Display1InputPoll, Display1Error> {
+        if !self.first_frame_seen() {
+            return Ok(Display1InputPoll::Idle);
+        }
+        let mut relay = self
+            .relay
+            .lock()
+            .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
+        let Some(current) = relay.as_ref() else {
+            return Ok(Display1InputPoll::Idle);
+        };
+        match current.poll_input(display1_now_ms()) {
+            Ok(Display1InputPoll::Disconnected) | Err(_) => {
+                *relay = None;
+                self.frame_delivered.store(false, Ordering::Release);
+                self.first_frame.store(false, Ordering::Release);
+                self.input_epoch.fetch_add(1, Ordering::AcqRel);
+                Ok(Display1InputPoll::Disconnected)
+            }
+            result => result,
+        }
     }
 
     /// Whether the authenticated shell acknowledged that KMS successfully
@@ -697,7 +858,9 @@ impl Display1FrameSink for Display1AttachmentSink {
             .relay
             .lock()
             .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
-        *relay = None;
+        if relay.take().is_some() {
+            self.input_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         self.frame_delivered.store(false, Ordering::Release);
         self.first_frame.store(false, Ordering::Release);
         Ok(())
@@ -829,6 +992,17 @@ impl Display1AttachmentServer {
     #[must_use]
     pub fn first_frame_seen(&self) -> bool {
         self.sink.first_frame_seen()
+    }
+
+    /// Poll one bounded, exact-lease shell input packet without blocking.
+    pub fn poll_input(&self) -> Result<Display1InputPoll, Display1Error> {
+        self.sink.poll_input()
+    }
+
+    /// Changes whenever a relay is replaced, disconnected, expired, or revoked.
+    #[must_use]
+    pub fn input_epoch(&self) -> u64 {
+        self.sink.input_epoch.load(Ordering::Acquire)
     }
 }
 
@@ -1068,6 +1242,312 @@ pub struct Display1Peer {
     /// The value is retained for lease/audit binding; callers must not accept
     /// a pid or uid supplied on mde-bus.
     pub qemu_peer: PeerCredentials,
+    /// Mouse mode read from QEMU after Console.Interfaces proved support.
+    pub mouse_is_absolute: bool,
+}
+
+/// Daemon-owned held-input state for one retained QEMU peer. All lifecycle
+/// release paths converge here so every admitted edge is released at most once.
+#[derive(Debug, Default)]
+pub struct Display1InputState {
+    focused: bool,
+    last_sequence: u64,
+    held_keys: BTreeSet<u32>,
+    held_buttons: BTreeSet<u32>,
+}
+
+macro_rules! qemu_input_call {
+    ($proxy:expr, $method:literal, $args:expr) => {{
+        tokio::time::timeout(
+            DISPLAY1_INPUT_DBUS_TIMEOUT,
+            $proxy.call::<_, _, ()>($method, $args),
+        )
+        .await
+        .map_err(|_| {
+            Display1Error::Attachment(format!("QEMU Display1 input {} timed out", $method))
+        })?
+        .map_err(input_dbus_error)
+    }};
+}
+
+impl Display1InputState {
+    fn admit_sequence(&mut self, sequence: u64) -> Result<(), Display1Error> {
+        if sequence == 0 || sequence <= self.last_sequence {
+            return Err(Display1Error::Attachment(
+                "replayed or non-monotonic Display1 input sequence".into(),
+            ));
+        }
+        self.last_sequence = sequence;
+        Ok(())
+    }
+
+    /// Reset the per-relay sequence after releasing state held by the old relay.
+    pub async fn replace_relay(&mut self, peer: &Display1Peer) -> Result<(), Display1Error> {
+        let result = self.release_all(peer).await;
+        // A vanished old QEMU endpoint must not retain stale sequence/focus or
+        // prevent a subsequently registered relay from starting cleanly.
+        self.last_sequence = 0;
+        result
+    }
+
+    /// Apply one validated exact-lease input action through QEMU's retained
+    /// Keyboard/Mouse interfaces.
+    pub async fn apply(
+        &mut self,
+        peer: &Display1Peer,
+        message: Display1InputMessage,
+    ) -> Result<(), Display1Error> {
+        self.admit_sequence(message.sequence)?;
+        match message.input {
+            Display1InputAction::Focus { focused: true } => {
+                self.focused = true;
+                Ok(())
+            }
+            Display1InputAction::Focus { focused: false } | Display1InputAction::ReleaseAll => {
+                self.release_all(peer).await
+            }
+            Display1InputAction::Key { code, pressed } => {
+                self.require_focus()?;
+                let keycode = qemu_key_number(code).ok_or_else(|| {
+                    Display1Error::Attachment("unsupported or host-reserved Display1 key".into())
+                })?;
+                let keyboard = zbus::Proxy::new(
+                    &peer.qemu,
+                    "org.qemu",
+                    DISPLAY1_CONSOLE_PATH,
+                    "org.qemu.Display1.Keyboard",
+                )
+                .await
+                .map_err(input_dbus_error)?;
+                if pressed {
+                    if self.held_keys.contains(&keycode) {
+                        return Err(Display1Error::Attachment(
+                            "duplicate Display1 key press".into(),
+                        ));
+                    }
+                    qemu_input_call!(keyboard, "Press", &(keycode,))?;
+                    self.held_keys.insert(keycode);
+                    Ok(())
+                } else {
+                    if !self.held_keys.contains(&keycode) {
+                        return Err(Display1Error::Attachment(
+                            "Display1 key release had no matching press".into(),
+                        ));
+                    }
+                    qemu_input_call!(keyboard, "Release", &(keycode,))?;
+                    self.held_keys.remove(&keycode);
+                    Ok(())
+                }
+            }
+            Display1InputAction::PointerMotion { x, y, dx, dy } => {
+                self.require_focus()?;
+                let mouse = zbus::Proxy::new(
+                    &peer.qemu,
+                    "org.qemu",
+                    DISPLAY1_CONSOLE_PATH,
+                    "org.qemu.Display1.Mouse",
+                )
+                .await
+                .map_err(input_dbus_error)?;
+                if peer.mouse_is_absolute {
+                    qemu_input_call!(mouse, "SetAbsPosition", &(x, y))
+                } else {
+                    qemu_input_call!(mouse, "RelMotion", &(dx, dy))
+                }
+            }
+            Display1InputAction::PointerButton { button, pressed } => {
+                self.require_focus()?;
+                if button > 2 {
+                    return Err(Display1Error::Attachment(
+                        "unsupported Display1 pointer button".into(),
+                    ));
+                }
+                let mouse = zbus::Proxy::new(
+                    &peer.qemu,
+                    "org.qemu",
+                    DISPLAY1_CONSOLE_PATH,
+                    "org.qemu.Display1.Mouse",
+                )
+                .await
+                .map_err(input_dbus_error)?;
+                if pressed {
+                    if self.held_buttons.contains(&button) {
+                        return Err(Display1Error::Attachment(
+                            "duplicate Display1 button press".into(),
+                        ));
+                    }
+                    qemu_input_call!(mouse, "Press", &(button,))?;
+                    self.held_buttons.insert(button);
+                    Ok(())
+                } else {
+                    if !self.held_buttons.contains(&button) {
+                        return Err(Display1Error::Attachment(
+                            "Display1 button release had no matching press".into(),
+                        ));
+                    }
+                    qemu_input_call!(mouse, "Release", &(button,))?;
+                    self.held_buttons.remove(&button);
+                    Ok(())
+                }
+            }
+            Display1InputAction::Wheel { steps } => {
+                self.require_focus()?;
+                if !matches!(steps, -1 | 1) {
+                    return Err(Display1Error::Attachment(
+                        "unbounded Display1 wheel action".into(),
+                    ));
+                }
+                let button = if steps > 0 { 3_u32 } else { 4_u32 };
+                let mouse = zbus::Proxy::new(
+                    &peer.qemu,
+                    "org.qemu",
+                    DISPLAY1_CONSOLE_PATH,
+                    "org.qemu.Display1.Mouse",
+                )
+                .await
+                .map_err(input_dbus_error)?;
+                qemu_input_call!(mouse, "Press", &(button,))?;
+                self.held_buttons.insert(button);
+                qemu_input_call!(mouse, "Release", &(button,))?;
+                self.held_buttons.remove(&button);
+                Ok(())
+            }
+        }
+    }
+
+    fn require_focus(&self) -> Result<(), Display1Error> {
+        if self.focused {
+            Ok(())
+        } else {
+            Err(Display1Error::Attachment(
+                "Display1 input requires explicit guest focus".into(),
+            ))
+        }
+    }
+
+    /// Release each held edge once, then clear explicit focus.
+    pub async fn release_all(&mut self, peer: &Display1Peer) -> Result<(), Display1Error> {
+        self.focused = false;
+        let mut first_error = None;
+        if !self.held_keys.is_empty() {
+            match zbus::Proxy::new(
+                &peer.qemu,
+                "org.qemu",
+                DISPLAY1_CONSOLE_PATH,
+                "org.qemu.Display1.Keyboard",
+            )
+            .await
+            {
+                Ok(keyboard) => {
+                    for keycode in self.held_keys.clone() {
+                        match qemu_input_call!(keyboard, "Release", &(keycode,)) {
+                            Ok(()) => {
+                                self.held_keys.remove(&keycode);
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| input_dbus_error(error));
+                }
+            }
+        }
+        if !self.held_buttons.is_empty() {
+            match zbus::Proxy::new(
+                &peer.qemu,
+                "org.qemu",
+                DISPLAY1_CONSOLE_PATH,
+                "org.qemu.Display1.Mouse",
+            )
+            .await
+            {
+                Ok(mouse) => {
+                    for button in self.held_buttons.clone() {
+                        match qemu_input_call!(mouse, "Release", &(button,)) {
+                            Ok(()) => {
+                                self.held_buttons.remove(&button);
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| input_dbus_error(error));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn input_dbus_error(error: zbus::Error) -> Display1Error {
+    Display1Error::Attachment(format!("QEMU Display1 input: {error}"))
+}
+
+/// Map Linux evdev keys to QEMU's xtkbd number encoding. Host-reserved keys
+/// are deliberately absent. The extended set uses QEMU's documented high-bit
+/// re-encoding of the E0 prefix.
+fn qemu_key_number(code: u32) -> Option<u32> {
+    match code {
+        2..=88 => Some(code),
+        96 => Some(0x9c),
+        97 => Some(0x9d),
+        98 => Some(0xb5),
+        99 => Some(0xb7),
+        100 => Some(0xb8),
+        102 => Some(0xc7),
+        103 => Some(0xc8),
+        104 => Some(0xc9),
+        105 => Some(0xcb),
+        106 => Some(0xcd),
+        107 => Some(0xcf),
+        108 => Some(0xd0),
+        109 => Some(0xd1),
+        110 => Some(0xd2),
+        111 => Some(0xd3),
+        _ => None,
+    }
+}
+
+fn validate_input_action(
+    input: &Display1InputAction,
+    scanout: Option<(u32, u32)>,
+) -> Result<(), Display1Error> {
+    match input {
+        Display1InputAction::Focus { .. } | Display1InputAction::ReleaseAll => Ok(()),
+        Display1InputAction::Key { code, .. } if qemu_key_number(*code).is_some() => Ok(()),
+        Display1InputAction::Key { .. } => Err(Display1Error::Attachment(
+            "unsupported or host-reserved Display1 key".into(),
+        )),
+        Display1InputAction::PointerMotion { x, y, dx, dy } => {
+            let (width, height) = scanout.ok_or_else(|| {
+                Display1Error::Attachment("Display1 pointer has no retained scanout".into())
+            })?;
+            if *x >= width
+                || *y >= height
+                || !(-32_768..=32_767).contains(dx)
+                || !(-32_768..=32_767).contains(dy)
+            {
+                return Err(Display1Error::Attachment(
+                    "Display1 pointer motion is outside the retained scanout".into(),
+                ));
+            }
+            Ok(())
+        }
+        Display1InputAction::PointerButton { button, .. } if *button <= 2 => Ok(()),
+        Display1InputAction::PointerButton { .. } => Err(Display1Error::Attachment(
+            "unsupported Display1 pointer button".into(),
+        )),
+        Display1InputAction::Wheel { steps } if matches!(steps, -1 | 1) => Ok(()),
+        Display1InputAction::Wheel { .. } => Err(Display1Error::Attachment(
+            "unbounded Display1 wheel action".into(),
+        )),
+    }
 }
 
 /// Register a real peer-to-peer Display1 listener with QEMU.
@@ -1097,6 +1577,24 @@ pub async fn register_display1_listener(
         "org.qemu.Display1.Console",
     )
     .await?;
+    let interfaces = proxy.get_property::<Vec<String>>("Interfaces").await?;
+    if !interfaces
+        .iter()
+        .any(|name| name == "org.qemu.Display1.Keyboard")
+        || !interfaces
+            .iter()
+            .any(|name| name == "org.qemu.Display1.Mouse")
+    {
+        return Err("QEMU Display1 console lacks Keyboard or Mouse input support".into());
+    }
+    let mouse = zbus::Proxy::new(
+        &qemu,
+        "org.qemu",
+        DISPLAY1_CONSOLE_PATH,
+        "org.qemu.Display1.Mouse",
+    )
+    .await?;
+    let mouse_is_absolute = mouse.get_property::<bool>("IsAbsolute").await?;
     let std_stream = qemu_stream.into_std()?;
     let qemu_peer = peer_credentials(&std_stream)?;
     let duplicated = rustix::io::dup(std_stream.as_fd())?;
@@ -1108,6 +1606,7 @@ pub async fn register_display1_listener(
         connection: peer,
         qemu,
         qemu_peer,
+        mouse_is_absolute,
     })
 }
 
@@ -1390,6 +1889,139 @@ mod tests {
     }
 
     #[test]
+    fn input_packets_are_exact_lease_bounded_and_fd_free() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-input".into(),
+            nonce: "nonce-input".into(),
+            workload_id: WorkloadId::new("browser-input").expect("workload id"),
+            generation: 13,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: 2_000,
+        };
+        let relay = Display1ScmRightsRelay::attach(
+            daemon,
+            peer,
+            lease,
+            "nonce-input",
+            "nonce-input",
+            1_000,
+        )
+        .expect("relay");
+        let packet = serde_json::to_vec(&serde_json::json!({
+            "kind": "input",
+            "lease_id": "lease-input",
+            "workload_id": "browser-input",
+            "generation": 13,
+            "sequence": 1,
+            "input": {"action": "focus", "focused": true}
+        }))
+        .expect("input JSON");
+        assert_eq!(
+            send(&shell, &packet, SendFlags::empty()).expect("send input"),
+            packet.len()
+        );
+        assert_eq!(
+            relay.poll_input(1_001),
+            Ok(Display1InputPoll::Input(Display1InputMessage {
+                sequence: 1,
+                input: Display1InputAction::Focus { focused: true },
+            }))
+        );
+
+        let mismatched = serde_json::to_vec(&serde_json::json!({
+            "kind": "input",
+            "lease_id": "lease-input",
+            "workload_id": "browser-other",
+            "generation": 13,
+            "sequence": 2,
+            "input": {"action": "release_all"}
+        }))
+        .expect("mismatch JSON");
+        assert_eq!(
+            send(&shell, &mismatched, SendFlags::empty()).expect("send mismatch"),
+            mismatched.len()
+        );
+        assert!(matches!(
+            relay.poll_input(1_002),
+            Err(Display1Error::Attachment(message)) if message.contains("mismatch")
+        ));
+
+        *relay.scanout.lock().expect("scanout") = Some((1920, 1080));
+        let out_of_bounds = serde_json::to_vec(&serde_json::json!({
+            "kind": "input",
+            "lease_id": "lease-input",
+            "workload_id": "browser-input",
+            "generation": 13,
+            "sequence": 3,
+            "input": {
+                "action": "pointer_motion",
+                "x": 1920,
+                "y": 1079,
+                "dx": 0,
+                "dy": 0
+            }
+        }))
+        .expect("hostile pointer JSON");
+        assert_eq!(
+            send(&shell, &out_of_bounds, SendFlags::empty()).expect("send hostile pointer"),
+            out_of_bounds.len()
+        );
+        assert!(matches!(
+            relay.poll_input(1_003),
+            Err(Display1Error::Attachment(message)) if message.contains("retained scanout")
+        ));
+
+        let descriptor = std::fs::File::open("/dev/null").expect("descriptor");
+        let descriptors = [descriptor.as_fd()];
+        let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut control);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+        assert_eq!(
+            sendmsg(
+                &shell,
+                &[IoSlice::new(&packet)],
+                &mut ancillary,
+                SendFlags::empty(),
+            )
+            .expect("send input with fd"),
+            packet.len()
+        );
+        assert!(matches!(
+            relay.poll_input(1_004),
+            Err(Display1Error::Attachment(message)) if message.contains("ancillary")
+        ));
+    }
+
+    #[test]
+    fn input_sequence_admission_rejects_replay_and_regression() {
+        let mut state = Display1InputState::default();
+        assert!(state.admit_sequence(1).is_ok());
+        assert!(matches!(
+            state.admit_sequence(1),
+            Err(Display1Error::Attachment(message))
+                if message.contains("replayed or non-monotonic")
+        ));
+        assert!(state.admit_sequence(3).is_ok());
+        assert!(matches!(
+            state.admit_sequence(2),
+            Err(Display1Error::Attachment(message))
+                if message.contains("replayed or non-monotonic")
+        ));
+    }
+
+    #[test]
+    fn qemu_key_mapping_excludes_every_host_reserved_class() {
+        assert_eq!(qemu_key_number(30), Some(30));
+        assert_eq!(qemu_key_number(97), Some(0x9d));
+        for host_only in [1, 113, 115, 125, 126, 224, 248] {
+            assert_eq!(qemu_key_number(host_only), None);
+        }
+    }
+
+    #[test]
     fn broker_rejects_nonce_replay_before_socket_attachment() {
         let broker = Display1ScmRightsBroker::new();
         let lease = WorkloadAttachmentLease {
@@ -1427,6 +2059,63 @@ mod tests {
             .expect_err("nonce replay must fail");
         assert!(
             matches!(error, Display1Error::Attachment(message) if message.contains("replayed"))
+        );
+    }
+
+    #[test]
+    fn relay_replacement_disconnect_and_revoke_advance_input_epoch_once() {
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-input-epoch".into(),
+            nonce: "nonce-input-epoch".into(),
+            workload_id: WorkloadId::new("browser-input-epoch").expect("workload id"),
+            generation: 3,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: 2_000,
+        };
+        let sink = Display1AttachmentSink::new();
+        let (first_daemon, first_shell) = seqpacket_pair();
+        let first_peer = peer_credentials(&first_daemon).expect("first peer");
+        sink.install(
+            Display1ScmRightsRelay::attach(
+                first_daemon,
+                first_peer,
+                lease.clone(),
+                &lease.nonce,
+                &lease.nonce,
+                1_000,
+            )
+            .expect("first relay"),
+        )
+        .expect("install first");
+        assert_eq!(sink.input_epoch.load(Ordering::Acquire), 0);
+
+        let (second_daemon, second_shell) = seqpacket_pair();
+        let second_peer = peer_credentials(&second_daemon).expect("second peer");
+        sink.install(
+            Display1ScmRightsRelay::attach(
+                second_daemon,
+                second_peer,
+                lease.clone(),
+                &lease.nonce,
+                &lease.nonce,
+                1_001,
+            )
+            .expect("second relay"),
+        )
+        .expect("replace relay");
+        assert_eq!(sink.input_epoch.load(Ordering::Acquire), 1);
+        drop(first_shell);
+
+        sink.first_frame.store(true, Ordering::Release);
+        drop(second_shell);
+        assert_eq!(sink.poll_input(), Ok(Display1InputPoll::Disconnected));
+        assert_eq!(sink.input_epoch.load(Ordering::Acquire), 2);
+        sink.disable().expect("idempotent revoke");
+        assert_eq!(
+            sink.input_epoch.load(Ordering::Acquire),
+            2,
+            "an already disconnected relay is not released twice"
         );
     }
 

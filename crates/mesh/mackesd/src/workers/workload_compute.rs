@@ -43,8 +43,8 @@ use super::cloud::{
 use super::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::{ShutdownToken, Worker};
 use crate::display1_broker::{
-    display1_socket_path_at, register_display1_listener, Display1AttachmentServer, Display1Peer,
-    DISPLAY1_SOCKET_ROOT,
+    display1_socket_path_at, register_display1_listener, Display1AttachmentServer,
+    Display1InputPoll, Display1InputState, Display1Peer, DISPLAY1_SOCKET_ROOT,
 };
 use crate::workload_reconciler::WorkloadOperationLedger;
 
@@ -944,7 +944,7 @@ where
 /// listener while the Workload still reports progress.
 struct Display1AttachmentRuntime {
     server: Arc<Display1AttachmentServer>,
-    peer: Arc<Mutex<Option<Display1Peer>>>,
+    peer: Arc<Mutex<Option<Arc<Display1Peer>>>>,
     registration: Arc<AtomicU8>,
     error: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
@@ -988,6 +988,7 @@ impl Display1AttachmentRuntime {
             return;
         }
         let sink = self.server.frame_sink();
+        let server = Arc::clone(&self.server);
         let peer = Arc::clone(&self.peer);
         let registration = Arc::clone(&self.registration);
         let error = Arc::clone(&self.error);
@@ -998,32 +999,89 @@ impl Display1AttachmentRuntime {
                 self.server.lease().lease_id
             ))
             .spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|runtime| format!("build Display1 runtime: {runtime}"))
-                    .and_then(|runtime| {
-                        runtime
-                            .block_on(tokio::time::timeout(
-                                Duration::from_secs(5),
-                                register_display1_listener(&qemu_address, sink),
-                            ))
-                            .map_err(|_| {
-                                "QEMU Display1 listener registration timed out".to_string()
-                            })?
-                            .map_err(|attach| format!("register QEMU Display1 listener: {attach}"))
-                    });
+                    .map_err(|runtime| format!("build Display1 runtime: {runtime}"));
+                let result = runtime.as_ref().map_err(Clone::clone).and_then(|runtime| {
+                    runtime
+                        .block_on(tokio::time::timeout(
+                            Duration::from_secs(5),
+                            register_display1_listener(&qemu_address, sink),
+                        ))
+                        .map_err(|_| "QEMU Display1 listener registration timed out".to_string())?
+                        .map_err(|attach| format!("register QEMU Display1 listener: {attach}"))
+                });
                 match result {
                     Ok(display1_peer) => {
+                        let display1_peer = Arc::new(display1_peer);
                         if let Ok(mut slot) = peer.lock() {
-                            *slot = Some(display1_peer);
+                            *slot = Some(Arc::clone(&display1_peer));
                             registration.store(DISPLAY1_REGISTRATION_READY, Ordering::Release);
                         } else {
                             registration.store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
                         }
+                        let runtime = runtime.expect("registration requires a runtime");
+                        let mut input = Display1InputState::default();
+                        let mut input_epoch = server.input_epoch();
+                        let mut pending_lifecycle_release = false;
                         while !shutdown.load(Ordering::Acquire) {
-                            thread::sleep(Duration::from_millis(100));
+                            if display1_peer.qemu.is_closed() {
+                                let _ = runtime.block_on(input.release_all(&display1_peer));
+                                if let Ok(mut slot) = error.lock() {
+                                    *slot = Some(
+                                        "QEMU Display1 control connection closed; input authority was revoked"
+                                            .into(),
+                                    );
+                                }
+                                registration
+                                    .store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
+                                break;
+                            }
+                            let current_epoch = server.input_epoch();
+                            if current_epoch != input_epoch {
+                                input_epoch = current_epoch;
+                                pending_lifecycle_release = true;
+                            }
+                            if pending_lifecycle_release {
+                                match runtime.block_on(input.replace_relay(&display1_peer)) {
+                                    Ok(()) => pending_lifecycle_release = false,
+                                    Err(release_error) => {
+                                        // Retain failed held edges and retry. A relay
+                                        // may attach while this converges, but no fresh
+                                        // input is admitted against inverted state.
+                                        tracing::warn!(
+                                            error = %release_error,
+                                            "Display1 lifecycle release will retry"
+                                        );
+                                        thread::sleep(Duration::from_millis(5));
+                                        continue;
+                                    }
+                                }
+                            }
+                            let result = match server.poll_input() {
+                                Ok(Display1InputPoll::Input(message)) => {
+                                    runtime.block_on(input.apply(&display1_peer, message))
+                                }
+                                Ok(Display1InputPoll::Disconnected) => {
+                                    pending_lifecycle_release = true;
+                                    Ok(())
+                                }
+                                Ok(Display1InputPoll::Idle) => Ok(()),
+                                Err(error) => Err(error),
+                            };
+                            if let Err(reason) = result {
+                                let reason = format!("QEMU Display1 input failed closed: {reason}");
+                                if let Ok(mut slot) = error.lock() {
+                                    *slot = Some(reason);
+                                }
+                                registration
+                                    .store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(5));
                         }
+                        let _ = runtime.block_on(input.release_all(&display1_peer));
                     }
                     Err(reason) => {
                         if let Ok(mut slot) = error.lock() {

@@ -20,7 +20,9 @@ use mackes_mesh_types::workloads::{
     WorkloadStateSnapshot,
 };
 use mde_bus::persist::Persist;
-use mde_egui::drm::{self, Display1FramePoll, Display1FrameSource, ExternalDmaBufFrame};
+use mde_egui::drm::{
+    self, Display1FramePoll, Display1FrameSource, Display1Input, ExternalDmaBufFrame,
+};
 use rustix::net::{
     connect_unix, recv, recvmsg, send, socket_with, AddressFamily, RecvAncillaryBuffer,
     RecvAncillaryMessage, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
@@ -31,6 +33,7 @@ const MAX_ENVELOPE_BYTES: usize = 16 * 1024;
 const DISPLAY1_HANDSHAKE_SCHEMA_VERSION: u16 = 1;
 const MAX_HANDSHAKE_BYTES: usize = 4 * 1024;
 const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
+const MAX_INPUT_BYTES: usize = 4 * 1024;
 // Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 retains this result flag but
 // does not publish a named RecvFlags constant for it.
 const DISPLAY1_MSG_CTRUNC: u32 = 0x08;
@@ -161,6 +164,27 @@ struct Display1AttachHello<'a> {
     generation: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct Display1InputEnvelope<'a> {
+    kind: &'static str,
+    lease_id: &'a str,
+    workload_id: &'a str,
+    generation: u64,
+    sequence: u64,
+    input: Display1InputWire,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum Display1InputWire {
+    Focus { focused: bool },
+    Key { code: u32, pressed: bool },
+    PointerMotion { x: u32, y: u32, dx: i32, dy: i32 },
+    PointerButton { button: u32, pressed: bool },
+    Wheel { steps: i32 },
+    ReleaseAll,
+}
+
 enum ReceivedFrame {
     Idle,
     Disconnected,
@@ -200,6 +224,8 @@ pub(crate) struct Display1Client {
     frame_received: bool,
     first_present_acknowledged: bool,
     last_frame_size: Option<(u32, u32)>,
+    input_sequence: u64,
+    guest_focused: bool,
 }
 
 impl Display1Client {
@@ -250,6 +276,8 @@ impl Display1Client {
             frame_received: false,
             first_present_acknowledged: false,
             last_frame_size: None,
+            input_sequence: 0,
+            guest_focused: false,
         })
     }
 
@@ -276,6 +304,103 @@ impl Display1Client {
             ));
         }
         self.first_present_acknowledged = true;
+        Ok(())
+    }
+
+    fn send_input_inner(&mut self, input: Display1Input) -> Result<(), Display1ClientError> {
+        if peer_credentials(&self.stream)? != self.peer {
+            return Err(Display1ClientError::Peer(
+                "kernel credentials changed".into(),
+            ));
+        }
+        self.lease
+            .validate(current_ms())
+            .map_err(|error| Display1ClientError::Lease(error.to_string()))?;
+        if !self.first_present_acknowledged {
+            return Err(Display1ClientError::Protocol(
+                "Display1 input requires a successfully presented native frame".into(),
+            ));
+        }
+        let wire = match input {
+            Display1Input::Focus(focused) => Display1InputWire::Focus { focused },
+            Display1Input::Key { code, pressed } => {
+                if code == 1 || mde_egui::hostkeys::is_host_key(code) {
+                    return Err(Display1ClientError::Protocol(
+                        "host-reserved key cannot enter Display1".into(),
+                    ));
+                }
+                if !self.guest_focused {
+                    return Err(Display1ClientError::Protocol(
+                        "Display1 key requires explicit guest focus".into(),
+                    ));
+                }
+                Display1InputWire::Key { code, pressed }
+            }
+            Display1Input::PointerMotion { x, y, dx, dy } => {
+                let (width, height) = self.last_frame_size.ok_or_else(|| {
+                    Display1ClientError::Protocol("Display1 input has no retained frame".into())
+                })?;
+                if !self.guest_focused
+                    || x >= width
+                    || y >= height
+                    || !(-32_768..=32_767).contains(&dx)
+                    || !(-32_768..=32_767).contains(&dy)
+                {
+                    return Err(Display1ClientError::Protocol(
+                        "Display1 pointer motion is unfocused or out of bounds".into(),
+                    ));
+                }
+                Display1InputWire::PointerMotion { x, y, dx, dy }
+            }
+            Display1Input::PointerButton { button, pressed } => {
+                if !self.guest_focused || button > 2 {
+                    return Err(Display1ClientError::Protocol(
+                        "Display1 pointer button is unfocused or unsupported".into(),
+                    ));
+                }
+                Display1InputWire::PointerButton { button, pressed }
+            }
+            Display1Input::Wheel { steps } => {
+                if !self.guest_focused || !matches!(steps, -1 | 1) {
+                    return Err(Display1ClientError::Protocol(
+                        "Display1 wheel is unfocused or unbounded".into(),
+                    ));
+                }
+                Display1InputWire::Wheel { steps }
+            }
+            Display1Input::ReleaseAll => Display1InputWire::ReleaseAll,
+        };
+        let sequence = self.input_sequence.checked_add(1).ok_or_else(|| {
+            Display1ClientError::Protocol("Display1 input sequence exhausted".into())
+        })?;
+        let packet = serde_json::to_vec(&Display1InputEnvelope {
+            kind: "input",
+            lease_id: &self.lease.lease_id,
+            workload_id: self.lease.workload_id.as_str(),
+            generation: self.lease.generation,
+            sequence,
+            input: wire,
+        })
+        .map_err(|error| Display1ClientError::Protocol(error.to_string()))?;
+        if packet.is_empty() || packet.len() > MAX_INPUT_BYTES {
+            return Err(Display1ClientError::Protocol(
+                "Display1 input exceeds the bounded packet size".into(),
+            ));
+        }
+        let sent = send(&self.stream, &packet, SendFlags::DONTWAIT).map_err(|error| {
+            Display1ClientError::Protocol(format!("send Display1 input: {error}"))
+        })?;
+        if sent != packet.len() {
+            return Err(Display1ClientError::Protocol(
+                "short Display1 input packet".into(),
+            ));
+        }
+        self.input_sequence = sequence;
+        match input {
+            Display1Input::Focus(focused) => self.guest_focused = focused,
+            Display1Input::ReleaseAll => self.guest_focused = false,
+            _ => {}
+        }
         Ok(())
     }
 
@@ -522,6 +647,13 @@ impl Display1FrameSource for Display1Source {
             Self::Dynamic(client) => client.frame_presented(),
         }
     }
+
+    fn send_input(&mut self, input: Display1Input) -> Result<(), drm::DrmError> {
+        match self {
+            Self::Static(client) => client.send_input(input),
+            Self::Dynamic(client) => client.send_input(input),
+        }
+    }
 }
 
 /// Background Workload projection watcher and attachment connector.
@@ -601,10 +733,20 @@ impl DynamicDisplay1Client {
             })?
             .frame_presented()
     }
+
+    fn send_input(&mut self, input: Display1Input) -> Result<(), drm::DrmError> {
+        self.client
+            .as_mut()
+            .ok_or_else(|| drm::DrmError::Present("Display1 input client is disconnected".into()))?
+            .send_input(input)
+    }
 }
 
 impl Drop for DynamicDisplay1Client {
     fn drop(&mut self) {
+        if let Some(client) = self.client.as_mut() {
+            let _ = client.send_input(Display1Input::ReleaseAll);
+        }
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -729,6 +871,19 @@ impl Display1FrameSource for Display1Client {
         self.acknowledge_first_present()
             .map_err(|error| drm::DrmError::Present(error.to_string()))
     }
+
+    fn send_input(&mut self, input: Display1Input) -> Result<(), drm::DrmError> {
+        self.send_input_inner(input)
+            .map_err(|error| drm::DrmError::Present(error.to_string()))
+    }
+}
+
+impl Drop for Display1Client {
+    fn drop(&mut self) {
+        if self.guest_focused {
+            let _ = self.send_input_inner(Display1Input::ReleaseAll);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -761,6 +916,72 @@ mod tests {
             ))
         );
         assert!(socket_path_for_lease("../escape").is_none());
+    }
+
+    #[test]
+    fn input_requires_presented_focus_and_stays_frame_bounded() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-input-boundary".into(),
+            nonce: "nonce-input-boundary".into(),
+            workload_id: WorkloadId::new("browser-input-boundary").expect("workload id"),
+            generation: 12,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: current_ms().saturating_add(5_000),
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, current_ms()).expect("attach");
+        assert!(matches!(
+            client.send_input_inner(Display1Input::Focus(true)),
+            Err(Display1ClientError::Protocol(message)) if message.contains("presented")
+        ));
+
+        client.frame_received = true;
+        client.first_present_acknowledged = true;
+        client.last_frame_size = Some((1920, 1080));
+        client
+            .send_input_inner(Display1Input::Focus(true))
+            .expect("focus after present");
+        let mut packet = [0_u8; MAX_INPUT_BYTES];
+        let bytes = recv(&daemon, &mut packet, RecvFlags::empty()).expect("focus packet");
+        let focus: serde_json::Value =
+            serde_json::from_slice(&packet[..bytes]).expect("focus JSON");
+        assert_eq!(focus["sequence"], 1);
+        assert_eq!(focus["lease_id"], "lease-input-boundary");
+        assert_eq!(focus["workload_id"], "browser-input-boundary");
+        assert_eq!(focus["generation"], 12);
+        assert_eq!(focus["input"]["action"], "focus");
+
+        for code in [1, 125, 126, 115] {
+            assert!(matches!(
+                client.send_input_inner(Display1Input::Key { code, pressed: true }),
+                Err(Display1ClientError::Protocol(message)) if message.contains("host-reserved")
+            ));
+        }
+        assert!(matches!(
+            client.send_input_inner(Display1Input::PointerMotion {
+                x: 1920,
+                y: 1079,
+                dx: 0,
+                dy: 0,
+            }),
+            Err(Display1ClientError::Protocol(message)) if message.contains("out of bounds")
+        ));
+        client
+            .send_input_inner(Display1Input::PointerMotion {
+                x: 1919,
+                y: 1079,
+                dx: 32_767,
+                dy: -32_768,
+            })
+            .expect("last frame pixel is valid");
+        let bytes = recv(&daemon, &mut packet, RecvFlags::empty()).expect("motion packet");
+        let motion: serde_json::Value =
+            serde_json::from_slice(&packet[..bytes]).expect("motion JSON");
+        assert_eq!(motion["sequence"], 2, "rejections do not consume sequence");
+        assert_eq!(motion["input"]["x"], 1919);
+        assert_eq!(motion["input"]["y"], 1079);
     }
 
     #[test]
