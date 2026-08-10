@@ -50,6 +50,7 @@ const MAX_VERIFYING_KEY_FILE_BYTES: usize = 128;
 const MAX_SIGNING_KEY_FILE_BYTES: usize = 128;
 const MAX_MUSIC_SIGNING_KEY_FILE_BYTES: usize = 128;
 const MAX_AUDIO_STATUS_PER_TICK: usize = 512;
+const MAX_PEER_COMMANDS_PER_TICK: usize = 128;
 const AUDIO_RETRY_MS: i64 = 5_000;
 const PEER_RETRY_MS: i64 = 5_000;
 const CLOCK_AUDIO_AUTH_VERB: &str = "music-clock-audio";
@@ -1172,6 +1173,7 @@ impl ClockWorker {
             .clone();
         let local_node_id = self.node_id.clone();
         let approved_peer_ids = self.approved_peer_ids.clone();
+        let mut remaining_commands = MAX_PEER_COMMANDS_PER_TICK;
 
         for schedule in snapshot
             .schedules
@@ -1192,6 +1194,9 @@ impl ClockWorker {
                         && candidate.revision >= schedule.revision
                 });
                 if !delivered {
+                    if remaining_commands == 0 {
+                        return Ok(());
+                    }
                     let request_id = peer_request_id(
                         "schedule",
                         target,
@@ -1209,6 +1214,7 @@ impl ClockWorker {
                             schedule: schedule.clone(),
                         },
                         now_ms,
+                        &mut remaining_commands,
                     )?;
                 }
             }
@@ -1233,6 +1239,9 @@ impl ClockWorker {
                         && candidate.revision >= stopwatch.revision
                 });
                 if !delivered {
+                    if remaining_commands == 0 {
+                        return Ok(());
+                    }
                     let request_id = peer_request_id(
                         "stopwatch",
                         target,
@@ -1250,6 +1259,7 @@ impl ClockWorker {
                             stopwatch: stopwatch.clone(),
                         },
                         now_ms,
+                        &mut remaining_commands,
                     )?;
                 }
             }
@@ -1288,6 +1298,9 @@ impl ClockWorker {
                 if converged {
                     continue;
                 }
+                if remaining_commands == 0 {
+                    return Ok(());
+                }
                 let request_id = peer_request_id(
                     "ack",
                     target,
@@ -1306,6 +1319,7 @@ impl ClockWorker {
                         acknowledgement: acknowledgement.clone(),
                     },
                     now_ms,
+                    &mut remaining_commands,
                 )?;
             }
         }
@@ -1321,7 +1335,11 @@ impl ClockWorker {
         command_origin: &str,
         body: ClockCommandKindV1,
         now_ms: i64,
+        remaining_commands: &mut usize,
     ) -> anyhow::Result<()> {
+        if *remaining_commands == 0 {
+            return Ok(());
+        }
         if self
             .peer_last_sent_ms
             .get(&request_id)
@@ -1351,6 +1369,7 @@ impl ClockWorker {
             &serde_json::to_string(&command)?,
         )?;
         self.peer_last_sent_ms.insert(request_id, now_ms);
+        *remaining_commands -= 1;
         Ok(())
     }
 }
@@ -4733,6 +4752,44 @@ mod tests {
 
         mirror.worker.tick_once().unwrap();
         assert_eq!(mirror.revision(), 2, "converged mirror must not replay");
+    }
+
+    #[test]
+    fn peer_convergence_is_bounded_per_tick() {
+        let mut fixture = Fixture::new();
+        fixture.worker.approved_peer_ids.insert("seat-2".into());
+        fixture.worker.tick_once().unwrap();
+        fixture
+            .worker
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .stopwatches
+            .extend((0..=MAX_PEER_COMMANDS_PER_TICK).map(|index| ClockStopwatchV1 {
+                stopwatch_id: format!("stopwatch-{index}"),
+                origin_node_id: "seat-1".into(),
+                mirror_target_ids: vec!["seat-2".into()],
+                revision: 1,
+                phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
+                started_wall_utc_ms: None,
+                started_monotonic_ms: None,
+                accumulated_elapsed_ms: 0,
+                laps: Vec::new(),
+            }));
+
+        let transaction = fixture.worker.open_bus_transaction().unwrap();
+        let peer_snapshot = fixture.worker.initial_snapshot(NOW);
+        let peer_snapshots = BTreeMap::from([(String::from("seat-2"), peer_snapshot)]);
+        fixture
+            .worker
+            .publish_peer_convergence(&transaction, NOW, &peer_snapshots)
+            .unwrap();
+
+        let messages = transaction
+            .persist
+            .list_since(&clock_command_topic("seat-2").unwrap(), None)
+            .unwrap();
+        assert_eq!(messages.len(), MAX_PEER_COMMANDS_PER_TICK);
     }
 
     #[test]

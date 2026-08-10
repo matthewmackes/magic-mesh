@@ -97,8 +97,8 @@ behavioral evidence is not completion.
 - Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, hostile farm tests, and idempotent stopped-domain cleanup exist.
   Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work:
-- **VM resource-efficiency checkpoint (2026-08-10):** Dom0-safe CPU pinning, bounded virtio-net queues, and guest qcow2 discard propagation passed 3/3 on `.90`:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`.
+- **VM resource-efficiency checkpoints (2026-08-10):** Dom0-safe CPU pinning, bounded queues, qcow2 discard, and shared non-Dom0 CPU pools passed focused `.90` gates:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Terminal attachment revocation checkpoint (2026-08-10):** permanent restart-observation failure clears its Display1 lease before journaling failure; exact machine-9
   proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
@@ -1653,6 +1653,10 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Peer stopwatch transport checkpoint (2026-08-10):** approved targeted mirrors preserve origin/revision and hostile variants fail closed; BigBoy passed 2/2:
   `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-stopwatch-transport-r146.md`.
+- **Peer command budget checkpoint (2026-08-10):** Clock schedule, stopwatch, and
+  acknowledgement convergence emits at most 128 peer commands per tick, leaving
+  later work for the next bounded tick; BigBoy passed the exact regression:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-command-budget-r152.md`.
 - **Ringing schedule-removal checkpoint (2026-08-10):** removal now persists a terminal acknowledgement, queues Music Stop, and cancels pending snooze children before
   deleting the schedule; `.90` passed: `docs/platform/evidence/WL-FUNC-022-2026-08-10-ringing-schedule-removal-r128.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:

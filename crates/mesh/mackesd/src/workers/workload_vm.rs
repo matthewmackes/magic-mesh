@@ -22,8 +22,9 @@ pub struct VmDomainSpec {
     /// Admitted guest memory in MiB.
     pub ram_mb: u64,
     /// Hardware threads visible to the reconciler. When capacity exceeds the
-    /// guest request, CPU 0 is kept outside every QEMU thread affinity mask so
-    /// Dom0 always has one VM-free execution lane.
+    /// guest request, CPU 0 is kept outside the shared QEMU affinity pool so
+    /// Dom0 always has one VM-free execution lane. Individual vCPUs are not
+    /// pinned because every admitted VM shares this pool.
     pub host_threads: u32,
     /// Libvirt network name. `None` selects [`DEFAULT_NETWORK`].
     pub network: Option<String>,
@@ -71,18 +72,15 @@ fn xml_escape(value: &str) -> String {
 /// user's nonexistent PipeWire runtime directory.
 #[must_use]
 pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
-    let cpu_tune = if spec.host_threads > spec.vcpus && spec.vcpus > 0 {
-        let guest_cpus = (1..=spec.vcpus)
-            .map(|cpu| cpu.to_string())
-            .collect::<Vec<_>>();
-        let cpuset = guest_cpus.join(",");
-        let pins = guest_cpus
-            .iter()
-            .enumerate()
-            .map(|(vcpu, cpu)| format!("    <vcpupin vcpu='{vcpu}' cpuset='{cpu}'/>\n"))
-            .collect::<String>();
+    let has_dom0_reserve = spec.host_threads > spec.vcpus && spec.vcpus > 0;
+    let guest_cpuset = if has_dom0_reserve {
+        Some(format!("1-{}", spec.host_threads - 1))
+    } else {
+        None
+    };
+    let cpu_tune = if let Some(cpuset) = guest_cpuset.as_deref() {
         format!(
-            "  <cputune>\n{pins}    <emulatorpin cpuset='{cpuset}'/>\n    <iothreadpin iothread='1' cpuset='{cpuset}'/>\n  </cputune>\n"
+            "  <cputune>\n    <emulatorpin cpuset='{cpuset}'/>\n    <iothreadpin iothread='1' cpuset='{cpuset}'/>\n  </cputune>\n"
         )
     } else {
         String::new()
@@ -100,7 +98,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
          \x20 <name>{name}</name>\n\
          \x20 <memory unit='MiB'>{memory}</memory>\n\
          \x20 <currentMemory unit='MiB'>{memory}</currentMemory>\n\
-         \x20 <vcpu placement='static'>{vcpus}</vcpu>\n\
+         \x20 <vcpu placement='static'{vcpu_cpuset}>{vcpus}</vcpu>\n\
          \x20 <iothreads>1</iothreads>\n\
          {cpu_tune}\
          \x20 <os>\n\
@@ -136,6 +134,9 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
         name = xml_escape(&spec.name),
         memory = spec.ram_mb,
         vcpus = spec.vcpus,
+        vcpu_cpuset = guest_cpuset
+            .as_deref()
+            .map_or_else(String::new, |cpuset| format!(" cpuset='{cpuset}'")),
         cpu_tune = cpu_tune,
         disk = xml_escape(disk_path),
         network = xml_escape(spec.network_or_default()),
@@ -173,11 +174,30 @@ mod tests {
         assert!(xml.contains("<topology sockets='1' dies='1' cores='2' threads='1'/>"));
         assert!(xml
             .contains("<driver name='qemu' type='qcow2' cache='none' io='native' iothread='1' discard='unmap'/>"));
-        assert!(xml.contains("<vcpupin vcpu='0' cpuset='1'/>"));
-        assert!(xml.contains("<vcpupin vcpu='1' cpuset='2'/>"));
-        assert!(xml.contains("<emulatorpin cpuset='1,2'/>"));
-        assert!(xml.contains("<iothreadpin iothread='1' cpuset='1,2'/>"));
+        assert!(xml.contains("<vcpu placement='static' cpuset='1-3'>2</vcpu>"));
+        assert!(xml.contains("<emulatorpin cpuset='1-3'/>"));
+        assert!(xml.contains("<iothreadpin iothread='1' cpuset='1-3'/>"));
+        assert!(!xml.contains("<vcpupin "));
         assert!(xml.contains("<driver queues='2'/>"));
+    }
+
+    #[test]
+    fn shared_guest_pool_avoids_colliding_per_vcpu_pins() {
+        let spec = VmDomainSpec {
+            name: "shared-pool".into(),
+            vcpus: 2,
+            ram_mb: 1024,
+            host_threads: 8,
+            network: None,
+        };
+
+        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/shared-pool.qcow2");
+
+        assert!(xml.contains("<vcpu placement='static' cpuset='1-7'>2</vcpu>"));
+        assert!(xml.contains("<emulatorpin cpuset='1-7'/>"));
+        assert!(xml.contains("<iothreadpin iothread='1' cpuset='1-7'/>"));
+        assert!(!xml.contains("<vcpupin "));
+        assert!(!xml.contains("cpuset='1,2'"));
     }
 
     #[test]
