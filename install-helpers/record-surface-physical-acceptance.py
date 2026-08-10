@@ -35,12 +35,15 @@ COLLECTOR_MANUAL_CHECKS = (
     "ten-finger touch accuracy and edge gestures",
     "pen hover, pressure, eraser, and palm rejection",
     "Type Cover attach, detach, keyboard, touchpad, and backlight",
-    "power/volume buttons and microSD insertion, read, eject, and reinsertion",
+    "power and volume buttons",
+    "microSD insertion, read, eject, and reinsertion",
     "portrait and landscape rotation with correct touch transform",
-    "camera preview and privacy indication (collector captures no frames)",
+    "camera privacy indication observed; one-frame proof passes, discards the frame immediately, and retains no image or device identifier",
     "speaker, microphone, headphone, and Bluetooth audio judgement",
     "suspend/resume, S0ix residency delta, Wi-Fi, Bluetooth, and mesh recovery",
     "cold boot, reboot, upgrade, rollback, and secure-boot recovery",
+    "internal and external DRM modes, scaling, rotation, hotplug, and atomic modesetting",
+    "fingerprint reader availability and authentication judgement without recording biometric data",
 )
 CHECKS = (
     "touch", "pen", "type-cover", "buttons", "microsd", "rotation",

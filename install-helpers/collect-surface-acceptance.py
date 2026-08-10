@@ -10,10 +10,13 @@ the manifest identifies the manual checks that still need an operator.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
+import runpy
 import selectors
 import shutil
 import signal
@@ -23,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -36,6 +39,8 @@ MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 12.0
 CAMERA_PROOF_MAX_AGE_MS = 90_000
 CAMERA_PROOF_FUTURE_SKEW_MS = 5_000
+PREPARED_MAX_AGE_SECONDS = 5 * 60
+PREPARE_MAX_DURATION_SECONDS = 30 * 60
 SYSTEM_BUS_ROOT = Path("/run/mde-bus")
 MAX_SYSFS_ENTRIES = 128
 ALLOWED_SEAT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -92,12 +97,15 @@ MANUAL_CHECKS = (
     "ten-finger touch accuracy and edge gestures",
     "pen hover, pressure, eraser, and palm rejection",
     "Type Cover attach, detach, keyboard, touchpad, and backlight",
-    "power/volume buttons and microSD insertion, read, eject, and reinsertion",
+    "power and volume buttons",
+    "microSD insertion, read, eject, and reinsertion",
     "portrait and landscape rotation with correct touch transform",
-    "camera preview and privacy indication (collector captures no frames)",
+    "camera privacy indication observed; one-frame proof passes, discards the frame immediately, and retains no image or device identifier",
     "speaker, microphone, headphone, and Bluetooth audio judgement",
     "suspend/resume, S0ix residency delta, Wi-Fi, Bluetooth, and mesh recovery",
     "cold boot, reboot, upgrade, rollback, and secure-boot recovery",
+    "internal and external DRM modes, scaling, rotation, hotplug, and atomic modesetting",
+    "fingerprint reader availability and authentication judgement without recording biometric data",
 )
 
 
@@ -832,7 +840,7 @@ def probe_services() -> dict[str, Any]:
     return result("ok" if not inactive_core else "error", data, None if not inactive_core else "inactive core services: " + ", ".join(inactive_core))
 
 
-PROBES = (
+INVENTORY_PROBES = (
     ("identity.json", probe_identity),
     ("release-packages.json", probe_release_packages),
     ("kernel-modules.json", probe_kernel_modules),
@@ -847,10 +855,9 @@ PROBES = (
     ("audio.json", probe_audio),
     ("power.json", probe_power),
     ("services.json", probe_services),
-    # Read the already-completed proof last so manifest creation cannot age it
-    # behind unrelated inventory commands. This remains a read-only Bus query.
-    ("camera-proof.json", probe_camera_proof),
 )
+PROBES = (*INVENTORY_PROBES, ("camera-proof.json", probe_camera_proof))
+PREPARED_FILES = tuple(filename for filename, _probe in INVENTORY_PROBES)
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -861,59 +868,277 @@ def write_json(path: Path, value: Any) -> None:
     path.chmod(0o600)
 
 
-def collect(out: Path, seat: str, expected: int) -> int:
-    if not ALLOWED_SEAT.fullmatch(seat):
-        raise CollectError("seat label must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+def checked_new_output(out: Path) -> Path:
     if out.exists() or out.is_symlink():
         raise CollectError(f"output must not already exist: {out}")
     parent = out.parent.resolve(strict=True)
     if not parent.is_dir():
         raise CollectError("output parent is not a directory")
+    return parent
+
+
+def run_probes(temp: Path, probes: tuple[Any, ...], seat: str, expected: int) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    for filename, probe in probes:
+        try:
+            value = probe(expected, seat) if filename in {"identity.json", "camera-proof.json"} else probe()
+        except Exception as exc:  # each failed probe remains explicit evidence
+            value = result("error", reason=f"collector probe failed: {type(exc).__name__}: {exc}")
+        statuses[filename] = value["status"]
+        write_json(temp / filename, value)
+    return statuses
+
+
+def artifact_descriptors(root: Path, files: tuple[str, ...], statuses: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {"file": filename, "bytes": (root / filename).stat().st_size,
+         "sha256": sha256_file(root / filename), "status": statuses[filename]}
+        for filename in files
+    ]
+
+
+def final_manifest(
+    root: Path, seat: str, expected: int, statuses: dict[str, str],
+    captured_at: datetime | None = None,
+) -> dict[str, Any]:
+    incomplete = sorted(name for name, status in statuses.items() if status != "ok")
+    captured = (captured_at or datetime.now(timezone.utc)).replace(microsecond=0)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector": {
+            "path": "install-helpers/collect-surface-acceptance.py",
+            "sha256": sha256_file(Path(__file__).resolve()),
+            "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
+            "max_command_bytes": MAX_COMMAND_BYTES,
+            "max_artifact_bytes": MAX_ARTIFACT_BYTES,
+        },
+        "seat_label": seat,
+        "captured_at_utc": captured.isoformat().replace("+00:00", "Z"),
+        "expected_surface_pro_generation": expected,
+        "collection_scope": "read-only inventory; no pixels or audio captured",
+        "collection_verdict": "complete" if not incomplete else "incomplete",
+        "incomplete_probes": incomplete,
+        "physical_acceptance_claimed": False,
+        "manual_acceptance_required": list(MANUAL_CHECKS),
+        "artifacts": artifact_descriptors(root, EXPECTED_FILES, statuses),
+    }
+
+
+def publish_temp(temp: Path, out: Path) -> None:
+    if sum(path.stat().st_size for path in temp.iterdir()) > MAX_BUNDLE_BYTES:
+        raise CollectError(f"bundle exceeds {MAX_BUNDLE_BYTES} bytes")
+    # Linux renameat2 gives the directory publication the same atomic,
+    # no-clobber contract as the command-line precondition.
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise CollectError("atomic no-clobber directory publication is unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(temp), -100, os.fsencode(out), 1) != 0:  # AT_FDCWD, RENAME_NOREPLACE
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise CollectError(f"output appeared during collection: {out}")
+        raise CollectError(f"cannot publish output atomically: {os.strerror(error)}")
+
+
+def collect(out: Path, seat: str, expected: int) -> int:
+    if not ALLOWED_SEAT.fullmatch(seat):
+        raise CollectError("seat label must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+    parent = checked_new_output(out)
     old_umask = os.umask(0o077)
     temp: Path | None = Path(tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=parent))
     try:
-        statuses: dict[str, str] = {}
-        for filename, probe in PROBES:
-            try:
-                value = probe(expected, seat) if filename in {"identity.json", "camera-proof.json"} else probe()
-            except Exception as exc:  # each failed probe remains explicit evidence
-                value = result("error", reason=f"collector probe failed: {type(exc).__name__}: {exc}")
-            statuses[filename] = value["status"]
-            write_json(temp / filename, value)
-        artifacts = []
-        for filename in EXPECTED_FILES:
-            path = temp / filename
-            artifacts.append({"file": filename, "bytes": path.stat().st_size, "sha256": sha256_file(path), "status": statuses[filename]})
-        incomplete = sorted(name for name, status in statuses.items() if status != "ok")
-        manifest = {
-            "schema_version": SCHEMA_VERSION,
-            "collector": {
-                "path": "install-helpers/collect-surface-acceptance.py",
-                "sha256": sha256_file(Path(__file__).resolve()),
-                "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
-                "max_command_bytes": MAX_COMMAND_BYTES,
-                "max_artifact_bytes": MAX_ARTIFACT_BYTES,
-            },
-            "seat_label": seat,
-            "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "expected_surface_pro_generation": expected,
-            "collection_scope": "read-only inventory; no pixels or audio captured",
-            "collection_verdict": "complete" if not incomplete else "incomplete",
-            "incomplete_probes": incomplete,
-            "physical_acceptance_claimed": False,
-            "manual_acceptance_required": list(MANUAL_CHECKS),
-            "artifacts": artifacts,
-        }
+        statuses = run_probes(temp, PROBES, seat, expected)
+        manifest = final_manifest(temp, seat, expected, statuses)
         write_json(temp / "manifest.json", manifest)
-        total = sum(path.stat().st_size for path in temp.iterdir())
-        if total > MAX_BUNDLE_BYTES:
-            raise CollectError(f"bundle exceeds {MAX_BUNDLE_BYTES} bytes")
-        os.replace(temp, out)
+        publish_temp(temp, out)
         temp = None
         print(f"Surface acceptance evidence: {out}")
         print(f"collection_verdict={manifest['collection_verdict']}")
+        if manifest["incomplete_probes"]:
+            print("incomplete_probes=" + ",".join(manifest["incomplete_probes"]), file=sys.stderr)
+            return 3
+        return 0
+    finally:
+        os.umask(old_umask)
+        if temp is not None and temp.exists():
+            shutil.rmtree(temp)
+
+
+def prepare(out: Path, seat: str, expected: int) -> int:
+    """Collect slow inventory without requiring the short-lived camera proof."""
+    if not ALLOWED_SEAT.fullmatch(seat):
+        raise CollectError("seat label must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+    parent = checked_new_output(out)
+    old_umask = os.umask(0o077)
+    temp: Path | None = Path(tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=parent))
+    try:
+        started_at = datetime.now(timezone.utc).replace(microsecond=0)
+        statuses = run_probes(temp, INVENTORY_PROBES, seat, expected)
+        prepared_at = datetime.now(timezone.utc).replace(microsecond=0)
+        if (prepared_at - started_at).total_seconds() > PREPARE_MAX_DURATION_SECONDS:
+            raise CollectError("inventory collection exceeded its bounded duration; recollect it")
+        node = read_optional(Path("/etc/hostname"), 128)
+        if node is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node) is None:
+            raise CollectError("local node identity is unavailable or invalid")
+        prepared = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "mcnf-surface-acceptance-prepared",
+            "collector_sha256": sha256_file(Path(__file__).resolve()),
+            "collection_started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
+            "prepared_at_utc": prepared_at.isoformat().replace("+00:00", "Z"),
+            "seat_label": seat,
+            "expected_surface_pro_generation": expected,
+            "node": node,
+            "physical_acceptance_claimed": False,
+            "artifacts": artifact_descriptors(temp, PREPARED_FILES, statuses),
+        }
+        write_json(temp / "prepared.json", prepared)
+        publish_temp(temp, out)
+        temp = None
+        incomplete = sorted(name for name, status in statuses.items() if status != "ok")
+        print(f"Surface acceptance inventory prepared: {out}")
         if incomplete:
             print("incomplete_probes=" + ",".join(incomplete), file=sys.stderr)
+            return 3
+        return 0
+    finally:
+        os.umask(old_umask)
+        if temp is not None and temp.exists():
+            shutil.rmtree(temp)
+
+
+def load_prepared(bundle: Path, now: datetime | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+    if not bundle.is_dir() or bundle.is_symlink():
+        raise CollectError("prepared bundle must be a real directory")
+    bundle_info = bundle.stat()
+    if bundle_info.st_uid != 0 or stat.S_IMODE(bundle_info.st_mode) & 0o077:
+        raise CollectError("prepared bundle must be root-owned and inaccessible by group or other users")
+    if sorted(path.name for path in bundle.iterdir()) != sorted((*PREPARED_FILES, "prepared.json")):
+        raise CollectError("prepared bundle contains missing or unknown files")
+    for path in bundle.iterdir():
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > MAX_ARTIFACT_BYTES:
+            raise CollectError(f"invalid prepared artifact: {path.name}")
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
+            raise CollectError(f"prepared artifact is not root-owned and private: {path.name}")
+    if sum(path.stat().st_size for path in bundle.iterdir()) > MAX_BUNDLE_BYTES:
+        raise CollectError(f"prepared bundle exceeds {MAX_BUNDLE_BYTES} bytes")
+    value = json.loads(read_limited(bundle / "prepared.json", MAX_ARTIFACT_BYTES), object_pairs_hook=strict_object)
+    required = {"schema_version", "kind", "collector_sha256", "collection_started_at_utc", "prepared_at_utc", "seat_label",
+                "expected_surface_pro_generation", "node", "physical_acceptance_claimed", "artifacts"}
+    if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA_VERSION or value.get("kind") != "mcnf-surface-acceptance-prepared":
+        raise CollectError("prepared manifest schema is invalid")
+    if value.get("collector_sha256") != sha256_file(Path(__file__).resolve()):
+        raise CollectError("prepared bundle was made by a different collector revision")
+    if not isinstance(value.get("seat_label"), str) or ALLOWED_SEAT.fullmatch(value["seat_label"]) is None:
+        raise CollectError("prepared seat label is invalid")
+    if value.get("expected_surface_pro_generation") not in (5, 6):
+        raise CollectError("prepared generation is invalid")
+    node = value.get("node")
+    local_node = read_optional(Path("/etc/hostname"), 128)
+    if not isinstance(node, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node) is None or node != local_node:
+        raise CollectError("prepared bundle is for a foreign or invalid node")
+    if value.get("physical_acceptance_claimed") is not False:
+        raise CollectError("prepared inventory may not claim physical acceptance")
+    try:
+        started_at = datetime.strptime(value["collection_started_at_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        prepared_at = datetime.strptime(value["prepared_at_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CollectError("prepared timestamp is invalid") from exc
+    current = now or datetime.now(timezone.utc)
+    age = (current - prepared_at).total_seconds()
+    if age < -(CAMERA_PROOF_FUTURE_SKEW_MS / 1000) or age > PREPARED_MAX_AGE_SECONDS:
+        raise CollectError("prepared inventory is stale or future-dated; recollect it")
+    duration = (prepared_at - started_at).total_seconds()
+    if duration < 0 or duration > PREPARE_MAX_DURATION_SECONDS:
+        raise CollectError("prepared inventory duration is invalid; recollect it")
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != len(PREPARED_FILES):
+        raise CollectError("prepared artifact list is invalid")
+    statuses: dict[str, str] = {}
+    for item in artifacts:
+        if not isinstance(item, dict) or set(item) != {"file", "bytes", "sha256", "status"}:
+            raise CollectError("prepared artifact descriptor is invalid")
+        name = item.get("file")
+        if name not in PREPARED_FILES or name in statuses:
+            raise CollectError("prepared artifact filename is invalid or duplicated")
+        path = bundle / name
+        if item.get("bytes") != path.stat().st_size or item.get("sha256") != sha256_file(path):
+            raise CollectError(f"prepared artifact integrity mismatch: {name}")
+        document = json.loads(read_limited(path, MAX_ARTIFACT_BYTES), object_pairs_hook=strict_object)
+        if not isinstance(document, dict) or document.get("schema_version") != SCHEMA_VERSION or document.get("status") not in ("ok", "error", "unavailable") or set(document) - {"schema_version", "status", "data", "reason"}:
+            raise CollectError(f"prepared artifact envelope is invalid: {name}")
+        if item.get("status") != document["status"]:
+            raise CollectError(f"prepared artifact status mismatch: {name}")
+        statuses[name] = document["status"]
+    identity = json.loads(read_limited(bundle / "identity.json", MAX_ARTIFACT_BYTES), object_pairs_hook=strict_object)
+    identity_data = identity.get("data") if isinstance(identity, dict) else None
+    if not isinstance(identity_data, dict) or identity_data.get("seat_label") != value["seat_label"] or identity_data.get("expected_generation") != value["expected_surface_pro_generation"]:
+        raise CollectError("prepared identity does not match its manifest")
+    return value, statuses
+
+
+def copy_verified(source: Path, destination: Path, expected_size: int, expected_sha256: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size or info.st_size > MAX_ARTIFACT_BYTES:
+            raise CollectError(f"prepared artifact changed while sealing: {source.name}")
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as incoming, destination.open("xb") as outgoing:
+            for chunk in iter(lambda: incoming.read(65536), b""):
+                digest.update(chunk)
+                outgoing.write(chunk)
+        destination.chmod(0o600)
+        if digest.hexdigest() != expected_sha256:
+            raise CollectError(f"prepared artifact changed while sealing: {source.name}")
+    finally:
+        os.close(descriptor)
+
+
+def seal(prepared_path: Path, out: Path) -> int:
+    prepared, statuses = load_prepared(prepared_path)
+    stored_identity = json.loads(
+        read_limited(prepared_path / "identity.json", MAX_ARTIFACT_BYTES),
+        object_pairs_hook=strict_object,
+    )
+    current_identity = probe_identity(
+        prepared["expected_surface_pro_generation"], prepared["seat_label"]
+    )
+    if current_identity.get("status") != "ok" or current_identity != stored_identity:
+        raise CollectError("current local Surface identity no longer matches prepared inventory")
+    parent = checked_new_output(out)
+    old_umask = os.umask(0o077)
+    temp: Path | None = Path(tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=parent))
+    try:
+        descriptors = {item["file"]: item for item in prepared["artifacts"]}
+        for filename in PREPARED_FILES:
+            item = descriptors[filename]
+            copy_verified(prepared_path / filename, temp / filename, item["bytes"], item["sha256"])
+        camera = probe_camera_proof(prepared["expected_surface_pro_generation"], prepared["seat_label"])
+        if camera.get("status") != "ok":
+            raise CollectError("cannot seal without a fresh successful local camera proof: " + str(camera.get("reason", "unavailable")))
+        captured_at = datetime.now(timezone.utc).replace(microsecond=0)
+        validate_camera_proof_projection(
+            camera.get("data"), prepared["expected_surface_pro_generation"],
+            int(captured_at.timestamp() * 1000),
+        )
+        write_json(temp / "camera-proof.json", camera)
+        statuses["camera-proof.json"] = "ok"
+        manifest = final_manifest(
+            temp, prepared["seat_label"], prepared["expected_surface_pro_generation"],
+            statuses, captured_at,
+        )
+        write_json(temp / "manifest.json", manifest)
+        publish_temp(temp, out)
+        temp = None
+        print(f"Surface acceptance evidence sealed: {out}")
+        print(f"collection_verdict={manifest['collection_verdict']}")
+        if manifest["incomplete_probes"]:
+            print("incomplete_probes=" + ",".join(manifest["incomplete_probes"]), file=sys.stderr)
             return 3
         return 0
     finally:
@@ -1060,6 +1285,9 @@ def self_test() -> int:
     body = json.dumps(camera, sort_keys=True, separators=(",", ":")).encode()
     proof = admit_camera_proof(body, "surface-6", 6, now_ms)
     validate_camera_proof_projection(proof, 6, now_ms)
+    boundary = dict(proof)
+    boundary["completed_at_ms"] = now_ms - CAMERA_PROOF_MAX_AGE_MS
+    validate_camera_proof_projection(boundary, 6, now_ms)
     if "camera-proof-self-test" in json.dumps(proof) or proof["result_sha256"] != sha256_bytes(body):
         raise CollectError("camera proof projection retained an identifier or lost its hash binding")
     hostile_camera = []
@@ -1084,9 +1312,189 @@ def self_test() -> int:
             pass
         else:
             raise CollectError("hostile camera proof result was admitted")
+
+    # Exercise the prepare/seal split with inventory deliberately older than
+    # the camera result's entire 90-second freshness window. The split must
+    # remain tamper-evident while allowing proof to happen after slow probes.
+    with tempfile.TemporaryDirectory(prefix="surface-collector-self-test-") as temporary:
+        root = Path(temporary)
+        staged = root / "prepared"
+        staged.mkdir(mode=0o700)
+        statuses = {name: "ok" for name in PREPARED_FILES}
+        for name in PREPARED_FILES:
+            value: dict[str, Any] = result("ok", {})
+            if name == "identity.json":
+                value = result("ok", {
+                    "seat_label": "Surface", "manufacturer": "Microsoft Corporation",
+                    "product_name": "Surface Pro 6", "product_version": None,
+                    "product_sku": "Surface_Pro_6", "expected_generation": 6,
+                    "detected_generation": 6,
+                })
+            elif name == "release-packages.json":
+                value = result("ok", {"packages": [{
+                    "name": "magic-mesh", "status": "installed", "nevra": [{
+                        "name": "magic-mesh", "epoch": "0", "version": "1",
+                        "release": "1", "arch": "x86_64",
+                    }],
+                }]})
+            write_json(staged / name, value)
+        staged_now = datetime.now(timezone.utc)
+        staging_manifest = {
+            "schema_version": 1,
+            "kind": "mcnf-surface-acceptance-prepared",
+            "collector_sha256": sha256_file(Path(__file__).resolve()),
+            "collection_started_at_utc": (staged_now.replace(microsecond=0) - timedelta(seconds=240)).isoformat().replace("+00:00", "Z"),
+            "prepared_at_utc": (staged_now.replace(microsecond=0) - timedelta(seconds=120)).isoformat().replace("+00:00", "Z"),
+            "seat_label": "Surface",
+            "expected_surface_pro_generation": 6,
+            "node": read_limited(Path("/etc/hostname"), 128),
+            "physical_acceptance_claimed": False,
+            "artifacts": artifact_descriptors(staged, PREPARED_FILES, statuses),
+        }
+        write_json(staged / "prepared.json", staging_manifest)
+        load_prepared(staged, staged_now)
+
+        hostile_staged = root / "tampered"
+        shutil.copytree(staged, hostile_staged)
+        with (hostile_staged / "audio.json").open("ab") as stream:
+            stream.write(b" ")
+        try:
+            load_prepared(hostile_staged, staged_now)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("tampered prepared artifact was admitted")
+
+        hostile_unknown = root / "unknown"
+        shutil.copytree(staged, hostile_unknown)
+        write_json(hostile_unknown / "unexpected.json", result("ok", {}))
+        try:
+            load_prepared(hostile_unknown, staged_now)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("unknown prepared artifact was admitted")
+
+        hostile_duplicate = root / "duplicate"
+        shutil.copytree(staged, hostile_duplicate)
+        duplicate_text = (hostile_duplicate / "prepared.json").read_text()
+        (hostile_duplicate / "prepared.json").write_text(duplicate_text.replace('{\n  "artifacts"', '{\n  "kind": "mcnf-surface-acceptance-prepared",\n  "artifacts"', 1))
+        try:
+            load_prepared(hostile_duplicate, staged_now)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("duplicate prepared manifest field was admitted")
+
+        hostile_stale = root / "stale"
+        shutil.copytree(staged, hostile_stale)
+        stale_manifest = json.loads((hostile_stale / "prepared.json").read_text(), object_pairs_hook=strict_object)
+        stale_manifest["prepared_at_utc"] = (staged_now.replace(microsecond=0) - timedelta(seconds=PREPARED_MAX_AGE_SECONDS + 1)).isoformat().replace("+00:00", "Z")
+        write_json(hostile_stale / "prepared.json", stale_manifest)
+        try:
+            load_prepared(hostile_stale, staged_now)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("stale prepared inventory was admitted")
+
+        for label, update in (
+            ("foreign-node", {"node": "foreign-surface"}),
+            ("wrong-collector", {"collector_sha256": "0" * 64}),
+            ("future", {"prepared_at_utc": (staged_now.replace(microsecond=0) + timedelta(seconds=CAMERA_PROOF_FUTURE_SKEW_MS // 1000 + 1)).isoformat().replace("+00:00", "Z")}),
+        ):
+            hostile_manifest = root / label
+            shutil.copytree(staged, hostile_manifest)
+            changed = json.loads((hostile_manifest / "prepared.json").read_text(), object_pairs_hook=strict_object)
+            changed.update(update)
+            write_json(hostile_manifest / "prepared.json", changed)
+            try:
+                load_prepared(hostile_manifest, staged_now)
+            except CollectError:
+                pass
+            else:
+                raise CollectError(f"{label} prepared inventory was admitted")
+
+        hostile_symlink = root / "symlink"
+        shutil.copytree(staged, hostile_symlink)
+        (hostile_symlink / "audio.json").unlink()
+        (hostile_symlink / "audio.json").symlink_to(staged / "audio.json")
+        try:
+            load_prepared(hostile_symlink, staged_now)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("symlinked prepared artifact was admitted")
+
+        hostile_mode = root / "public-mode"
+        shutil.copytree(staged, hostile_mode)
+        (hostile_mode / "audio.json").chmod(0o644)
+        try:
+            load_prepared(hostile_mode, staged_now)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("non-private prepared artifact was admitted")
+
+        if os.geteuid() == 0:
+            hostile_owner = root / "foreign-owner"
+            shutil.copytree(staged, hostile_owner)
+            os.chown(hostile_owner / "audio.json", 65534, 65534)
+            try:
+                load_prepared(hostile_owner, staged_now)
+            except CollectError:
+                pass
+            else:
+                raise CollectError("non-root-owned prepared artifact was admitted")
+
+        original_camera_probe = globals()["probe_camera_proof"]
+        original_identity_probe = globals()["probe_identity"]
+        globals()["probe_identity"] = lambda expected, seat: json.loads(
+            (staged / "identity.json").read_text(), object_pairs_hook=strict_object
+        )
+        completed_at = int(time.time() * 1000)
+        globals()["probe_camera_proof"] = lambda expected, seat: result("error", reason="proof absent")
+        refused = root / "refused"
+        try:
+            seal(staged, refused)
+        except CollectError:
+            if refused.exists():
+                raise CollectError("failed seal published an output bundle")
+        else:
+            raise CollectError("seal accepted an absent camera proof")
+        globals()["probe_camera_proof"] = lambda expected, seat: result("ok", {
+            "topic": f"state/hardware/surface/{staging_manifest['node']}/camera-proof",
+            "node": staging_manifest["node"], "model": "Surface Pro 6", "generation": 6,
+            "completed_at_ms": completed_at, "outcome": "passed", "result_sha256": "a" * 64,
+            "frame_bytes_retained": False, "device_identifier_retained": False,
+            "request_identifier_retained": False,
+        })
+        try:
+            sealed = root / "sealed"
+            if seal(staged, sealed) != 0 or validate(sealed) != 0:
+                raise CollectError("valid prepared inventory did not seal as a complete bundle")
+            try:
+                seal(staged, sealed)
+            except CollectError:
+                pass
+            else:
+                raise CollectError("seal overwrote an existing output")
+        finally:
+            globals()["probe_camera_proof"] = original_camera_probe
+            globals()["probe_identity"] = original_identity_probe
+        sealed_text = "".join(path.read_text() for path in sealed.iterdir())
+        if '"request_id":' in sealed_text or "/dev/video" in sealed_text or '"frame":' in sealed_text:
+            raise CollectError("sealed evidence retained a camera identifier or frame")
+        if stat.S_IMODE(sealed.stat().st_mode) != 0o700 or any(stat.S_IMODE(path.stat().st_mode) != 0o600 for path in sealed.iterdir()):
+            raise CollectError("sealed evidence permissions are not root-only")
+        recorder_path = Path(__file__).resolve().with_name("record-surface-physical-acceptance.py")
+        if recorder_path.is_file():
+            recorder_bundle = runpy.run_path(str(recorder_path))["load_bundle"](sealed)
+            if recorder_bundle.get("collection_verdict") != "complete" or recorder_bundle.get("camera_proof") is None:
+                raise CollectError("sealed bundle is not compatible with the physical recorder")
     print(
         "Surface acceptance collector self-test passed "
-        f"({len(hostile)} hostile strings, bounded fwupd, and {len(hostile_camera)} camera fixtures)"
+        f"({len(hostile)} hostile strings, bounded fwupd, {len(hostile_camera)} camera fixtures, and prepare/seal hostile fixtures)"
     )
     return 0
 
@@ -1099,6 +1507,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     collect_parser.add_argument("--out", required=True, type=Path)
     collect_parser.add_argument("--seat", default="Surface")
     collect_parser.add_argument("--expected-generation", required=True, type=int, choices=(5, 6))
+    prepare_parser = sub.add_parser("prepare", help="collect slow inventory before requesting a camera proof")
+    prepare_parser.add_argument("--out", required=True, type=Path)
+    prepare_parser.add_argument("--seat", default="Surface")
+    prepare_parser.add_argument("--expected-generation", required=True, type=int, choices=(5, 6))
+    seal_parser = sub.add_parser("seal", help="bind fresh local camera proof to prepared inventory")
+    seal_parser.add_argument("--prepared", required=True, type=Path)
+    seal_parser.add_argument("--out", required=True, type=Path)
     validate_parser = sub.add_parser("validate", help="validate hashes and envelope shape")
     validate_parser.add_argument("bundle", type=Path)
     return parser.parse_args(argv)
@@ -1110,9 +1525,13 @@ def main(argv: list[str]) -> int:
         return self_test()
     if args.command == "collect":
         return collect(args.out, args.seat, args.expected_generation)
+    if args.command == "prepare":
+        return prepare(args.out, args.seat, args.expected_generation)
+    if args.command == "seal":
+        return seal(args.prepared, args.out)
     if args.command == "validate":
         return validate(args.bundle)
-    raise CollectError("choose collect, validate, or --self-test")
+    raise CollectError("choose collect, prepare, seal, validate, or --self-test")
 
 
 if __name__ == "__main__":
