@@ -998,9 +998,12 @@ impl ClockStopwatchV1 {
         match self.phase {
             ClockStopwatchPhase::Running => {
                 match (self.started_wall_utc_ms, self.started_monotonic_ms) {
-                    (Some(wall), Some(monotonic))
-                        if wall <= context.wall_utc_ms.saturating_add(MAX_CLOCK_FUTURE_SKEW_MS)
-                            && monotonic <= context.monotonic_ms =>
+                    // A monotonic timestamp is meaningful only in the
+                    // originating process' clock domain.  Its presence binds
+                    // the running state, but a receiver (especially a peer)
+                    // must not compare the opaque value with its own uptime.
+                    (Some(wall), Some(_))
+                        if wall <= context.wall_utc_ms.saturating_add(MAX_CLOCK_FUTURE_SKEW_MS) =>
                     {
                         Ok(())
                     }

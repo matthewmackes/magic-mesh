@@ -558,7 +558,7 @@ impl ClockWorker {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("Clock revision exhausted"))?;
         snapshot.produced_at_utc_ms = now_ms;
-        stamp_revision(snapshot);
+        stamp_revision(snapshot, &self.node_id);
         preserve_unchanged_occurrence_revisions(snapshot, &prior_snapshot);
         let audio_requests =
             clock_audio_transitions(&prior_snapshot, snapshot, now_ms, &self.node_id)?;
@@ -808,7 +808,13 @@ impl ClockWorker {
                     "Clock stopwatch origin mismatch"
                 );
                 if peer_origin {
-                    anyhow::bail!("peer Clock stopwatch mutation is not authoritative");
+                    anyhow::ensure!(
+                        stopwatch
+                            .mirror_target_ids
+                            .iter()
+                            .any(|id| id == &self.node_id),
+                        "Clock peer stopwatch does not target this node"
+                    );
                 }
                 if let Some(existing) = snapshot
                     .stopwatches
@@ -819,6 +825,18 @@ impl ClockWorker {
                         existing.origin_node_id == stopwatch.origin_node_id,
                         "Clock stopwatch identity conflict"
                     );
+                    if peer_origin {
+                        if stopwatch.revision < existing.revision {
+                            return Ok(false);
+                        }
+                        if stopwatch.revision == existing.revision {
+                            anyhow::ensure!(
+                                existing == &stopwatch,
+                                "Clock peer stopwatch revision conflict"
+                            );
+                            return Ok(false);
+                        }
+                    }
                 }
                 let changed = snapshot
                     .stopwatches
@@ -988,7 +1006,7 @@ impl ClockWorker {
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("Clock revision exhausted"))?;
                 snapshot.produced_at_utc_ms = now_ms;
-                stamp_revision(snapshot);
+                stamp_revision(snapshot, &self.node_id);
                 preserve_unchanged_occurrence_revisions(snapshot, &prior_snapshot);
                 let audio_requests =
                     clock_audio_transitions(&prior_snapshot, snapshot, now_ms, &self.node_id)?;
@@ -1189,6 +1207,47 @@ impl ClockWorker {
                         &schedule.origin_node_id,
                         ClockCommandKindV1::UpsertSchedule {
                             schedule: schedule.clone(),
+                        },
+                        now_ms,
+                    )?;
+                }
+            }
+        }
+
+        for stopwatch in snapshot
+            .stopwatches
+            .iter()
+            .filter(|stopwatch| stopwatch.origin_node_id == local_node_id)
+        {
+            for target in stopwatch
+                .mirror_target_ids
+                .iter()
+                .filter(|target| *target != &local_node_id && approved_peer_ids.contains(*target))
+            {
+                let Some(peer) = peer_snapshots.get(target) else {
+                    continue;
+                };
+                let delivered = peer.stopwatches.iter().any(|candidate| {
+                    candidate.stopwatch_id == stopwatch.stopwatch_id
+                        && candidate.origin_node_id == stopwatch.origin_node_id
+                        && candidate.revision >= stopwatch.revision
+                });
+                if !delivered {
+                    let request_id = peer_request_id(
+                        "stopwatch",
+                        target,
+                        &stopwatch.stopwatch_id,
+                        stopwatch.revision,
+                        "",
+                    );
+                    self.publish_peer_command(
+                        transaction,
+                        target,
+                        peer.revision,
+                        request_id,
+                        &stopwatch.origin_node_id,
+                        ClockCommandKindV1::UpsertStopwatch {
+                            stopwatch: stopwatch.clone(),
                         },
                         now_ms,
                     )?;
@@ -1903,7 +1962,7 @@ fn upsert_stopwatch(stopwatches: &mut Vec<ClockStopwatchV1>, stopwatch: ClockSto
     }
 }
 
-fn stamp_revision(snapshot: &mut ClockSnapshotV1) {
+fn stamp_revision(snapshot: &mut ClockSnapshotV1, local_node_id: &str) {
     for occurrence in &mut snapshot.occurrences {
         occurrence.revision = snapshot.revision;
         for target in &mut occurrence.targets {
@@ -1912,7 +1971,9 @@ fn stamp_revision(snapshot: &mut ClockSnapshotV1) {
         }
     }
     for stopwatch in &mut snapshot.stopwatches {
-        stopwatch.revision = snapshot.revision;
+        if stopwatch.origin_node_id == local_node_id {
+            stopwatch.revision = snapshot.revision;
+        }
     }
 }
 
@@ -4287,7 +4348,7 @@ mod tests {
             produced_at_utc_ms: NOW,
             ..persisted
         };
-        stamp_revision(&mut replay);
+        stamp_revision(&mut replay, "seat-1");
         let changed = fixture
             .worker
             .store
@@ -4424,6 +4485,254 @@ mod tests {
             fixture.worker.snapshot.as_ref().unwrap().stopwatches,
             vec![foreign]
         );
+    }
+
+    fn signed_stopwatch_for(
+        key: &SigningKey,
+        signer_id: &str,
+        command_origin: &str,
+        stopwatch_origin: &str,
+        request_id: &str,
+        expected_revision: u64,
+        stopwatch_id: &str,
+        stopwatch_revision: u64,
+        targets: &[&str],
+        accumulated_elapsed_ms: u64,
+    ) -> ClockCommandV1 {
+        ClockCommandV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: request_id.into(),
+            origin_node_id: command_origin.into(),
+            expected_revision,
+            issued_at_utc_ms: NOW,
+            expires_at_utc_ms: NOW + MAX_CLOCK_COMMAND_TTL_MS,
+            body: ClockCommandKindV1::UpsertStopwatch {
+                stopwatch: ClockStopwatchV1 {
+                    stopwatch_id: stopwatch_id.into(),
+                    origin_node_id: stopwatch_origin.into(),
+                    mirror_target_ids: targets.iter().map(|value| (*value).into()).collect(),
+                    revision: stopwatch_revision,
+                    phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
+                    started_wall_utc_ms: None,
+                    started_monotonic_ms: None,
+                    accumulated_elapsed_ms,
+                    laps: Vec::new(),
+                },
+            },
+            signer_id: String::new(),
+            signature: String::new(),
+        }
+        .sign(
+            signer_id,
+            key,
+            &ClockValidationContext {
+                wall_utc_ms: NOW,
+                monotonic_ms: 90_000,
+                zone_exists: &zone_exists,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn approved_peer_stopwatch_admission_fails_closed_for_hostile_variants() {
+        let mut fixture = Fixture::new();
+        fixture.worker.approved_peer_ids = ["seat-2", "seat-3"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        fixture.worker.tick_once().unwrap();
+
+        let admitted = signed_stopwatch_for(
+            &fixture.signing_key,
+            "seat-1-key",
+            "seat-2",
+            "seat-2",
+            "peer-stopwatch-admitted",
+            1,
+            "peer-stopwatch",
+            5,
+            &["seat-1"],
+            5_000,
+        );
+        fixture.publish(&admitted);
+        fixture.worker.tick_once().unwrap();
+        let admitted_snapshot = fixture.worker.snapshot.as_ref().unwrap().clone();
+        assert_eq!(admitted_snapshot.revision, 2);
+        assert_eq!(admitted_snapshot.stopwatches.len(), 1);
+        assert_eq!(admitted_snapshot.stopwatches[0].origin_node_id, "seat-2");
+        assert_eq!(admitted_snapshot.stopwatches[0].revision, 5);
+
+        let hostile = [
+            signed_stopwatch_for(
+                &fixture.signing_key,
+                "seat-1-key",
+                "seat-2",
+                "seat-2",
+                "peer-stopwatch-stale",
+                2,
+                "peer-stopwatch",
+                4,
+                &["seat-1"],
+                9_000,
+            ),
+            signed_stopwatch_for(
+                &fixture.signing_key,
+                "seat-1-key",
+                "seat-2",
+                "seat-2",
+                "peer-stopwatch-revision-conflict",
+                2,
+                "peer-stopwatch",
+                5,
+                &["seat-1"],
+                9_000,
+            ),
+            signed_stopwatch_for(
+                &fixture.signing_key,
+                "seat-1-key",
+                "seat-2",
+                "seat-2",
+                "peer-stopwatch-untargeted",
+                2,
+                "peer-stopwatch",
+                6,
+                &["seat-9"],
+                9_000,
+            ),
+            signed_stopwatch_for(
+                &fixture.signing_key,
+                "seat-1-key",
+                "seat-3",
+                "seat-3",
+                "peer-stopwatch-cross-origin",
+                2,
+                "peer-stopwatch",
+                6,
+                &["seat-1"],
+                9_000,
+            ),
+            signed_stopwatch_for(
+                &fixture.signing_key,
+                "seat-1-key",
+                "seat-4",
+                "seat-4",
+                "peer-stopwatch-unapproved",
+                2,
+                "unapproved-stopwatch",
+                1,
+                &["seat-1"],
+                1_000,
+            ),
+            signed_stopwatch_for(
+                &fixture.signing_key,
+                "seat-1-key",
+                "seat-1",
+                "seat-2",
+                "peer-stopwatch-locally-forged-origin",
+                2,
+                "forged-stopwatch",
+                1,
+                &["seat-1"],
+                1_000,
+            ),
+        ];
+        for command in hostile {
+            fixture.publish(&command);
+            fixture.worker.tick_once().unwrap();
+            assert_eq!(
+                fixture.worker.snapshot.as_ref().unwrap(),
+                &admitted_snapshot,
+                "hostile stopwatch command changed Clock authority"
+            );
+        }
+
+        fixture.worker.blocked_origin_ids.insert("seat-2".into());
+        let blocked = signed_stopwatch_for(
+            &fixture.signing_key,
+            "seat-1-key",
+            "seat-2",
+            "seat-2",
+            "peer-stopwatch-blocked",
+            2,
+            "peer-stopwatch",
+            6,
+            &["seat-1"],
+            9_000,
+        );
+        fixture.publish(&blocked);
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            fixture.worker.snapshot.as_ref().unwrap(),
+            &admitted_snapshot
+        );
+
+        let durable = fixture.worker.store.load("seat-1").unwrap().unwrap();
+        let durable_snapshot: ClockSnapshotV1 =
+            serde_json::from_str(&durable.snapshot_json).unwrap();
+        assert_eq!(durable_snapshot, admitted_snapshot);
+    }
+
+    #[test]
+    fn peer_stopwatch_transport_preserves_origin_revision_and_clock_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus = temp.path().join("bus");
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let mut origin = PeerNode::new(temp.path(), &bus, "node-a", &key);
+        let mut mirror = PeerNode::new(temp.path(), &bus, "node-b", &key);
+        origin.worker.tick_once().unwrap();
+        mirror.worker.tick_once().unwrap();
+
+        let mut command = signed_stopwatch_for(
+            &key,
+            "clock-mesh-key",
+            "node-a",
+            "node-a",
+            "mirror-running-stopwatch",
+            1,
+            "mesh-stopwatch",
+            1,
+            &["node-b"],
+            2_000,
+        );
+        let ClockCommandKindV1::UpsertStopwatch { stopwatch } = &mut command.body else {
+            unreachable!();
+        };
+        stopwatch.phase = mackes_mesh_types::clock::ClockStopwatchPhase::Running;
+        stopwatch.started_wall_utc_ms = Some(NOW);
+        stopwatch.started_monotonic_ms = Some(75_000);
+        command.signature.clear();
+        command.signer_id.clear();
+        command = command
+            .sign(
+                "clock-mesh-key",
+                &key,
+                &ClockValidationContext {
+                    wall_utc_ms: NOW,
+                    monotonic_ms: 90_000,
+                    zone_exists: &zone_exists,
+                },
+            )
+            .unwrap();
+
+        publish_to(&bus, "node-a", &command);
+        origin.worker.tick_once().unwrap();
+        assert_eq!(origin.revision(), 2);
+        assert_eq!(
+            origin.worker.snapshot.as_ref().unwrap().stopwatches[0].revision,
+            2
+        );
+
+        mirror.worker.tick_once().unwrap();
+        let mirrored = &mirror.worker.snapshot.as_ref().unwrap().stopwatches[0];
+        assert_eq!(mirror.revision(), 2);
+        assert_eq!(mirrored.stopwatch_id, "mesh-stopwatch");
+        assert_eq!(mirrored.origin_node_id, "node-a");
+        assert_eq!(mirrored.revision, 2);
+        assert_eq!(mirrored.started_monotonic_ms, Some(75_000));
+
+        mirror.worker.tick_once().unwrap();
+        assert_eq!(mirror.revision(), 2, "converged mirror must not replay");
     }
 
     #[test]
