@@ -1002,6 +1002,7 @@ struct ClipboardEnvelopeV2ReplayMarker {
     source_seat: String,
     source_session: String,
     sequence: u64,
+    expires_at_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1081,12 +1082,21 @@ impl ClipboardEnvelopeV2Ledger {
         Ok(decoded)
     }
 
+    /// Release replay lanes whose signed envelopes can no longer materialize.
+    /// Without this sweep, a bounded flood of short-lived sessions permanently
+    /// consumes the V2 admission table until the daemon restarts.
+    fn cleanup_expired(&mut self, now_ms: u64) {
+        self.latest_by_session
+            .retain(|_, marker| marker.expires_at_ms > now_ms);
+    }
+
     fn record(&mut self, envelope: &ClipboardEnvelopeV2) {
         let marker = ClipboardEnvelopeV2ReplayMarker {
             source_node: envelope.source_node.clone(),
             source_seat: envelope.source_seat.clone(),
             source_session: envelope.source_session.clone(),
             sequence: envelope.sequence,
+            expires_at_ms: envelope.expires_at_ms,
         };
         let replace = self
             .latest_by_session
@@ -2058,6 +2068,7 @@ impl ClipboardSyncWorker {
         consent_ledger: &ClipboardSessionConsentLedger,
         now_ms: u64,
     ) -> usize {
+        ledger.cleanup_expired(now_ms);
         let mut materialized = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -3415,6 +3426,38 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn expired_v2_replay_lanes_release_capacity_before_fresh_admission() {
+        let mut ledger = ClipboardEnvelopeV2Ledger::default();
+        for lane in 0..MAX_V2_SOURCE_LANES {
+            ledger.latest_by_session.insert(
+                format!("expired-session-{lane}"),
+                ClipboardEnvelopeV2ReplayMarker {
+                    source_node: "hostile-node".to_owned(),
+                    source_seat: "seat-a".to_owned(),
+                    source_session: format!("expired-session-{lane}"),
+                    sequence: u64::MAX,
+                    expires_at_ms: 1_700_000_000_000,
+                },
+            );
+        }
+        assert_eq!(ledger.latest_by_session.len(), MAX_V2_SOURCE_LANES);
+
+        ledger.cleanup_expired(1_700_000_000_001);
+        assert!(
+            ledger.latest_by_session.is_empty(),
+            "expired hostile sessions must not retain bounded V2 capacity"
+        );
+
+        let fresh = v2_inline(1, &["text/plain"]);
+        ledger
+            .admit(
+                &serde_json::to_vec(&fresh).expect("encode fresh V2 envelope"),
+                1_700_000_000_001,
+            )
+            .expect("fresh source session must be admitted after expiry cleanup");
     }
 
     #[test]
