@@ -3854,15 +3854,19 @@ impl WorkloadComputeWorker {
             }
         };
         let request_id = request.request_id.clone();
-        if outcome.attachment.is_some() {
-            status.attachment = outcome.attachment.clone();
-        } else if outcome.phase == WorkloadOperationPhase::Cancelled {
-            status.attachment = None;
-        }
+        let received_attachment = outcome.attachment.is_some();
         for phase in steps {
             status.phase = phase;
             status.signals = WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
             if phase == outcome.phase {
+                // The adapter's lease belongs to the outcome commit point, not
+                // to synthetic intermediate phases. Persisting it early could
+                // expose an attachment before its admitting phase survived a
+                // crash. If any transition rejects the outcome, revoke the
+                // still-uncommitted adapter capability before returning.
+                if received_attachment || outcome.phase == WorkloadOperationPhase::Cancelled {
+                    status.attachment = outcome.attachment.clone();
+                }
                 status.power = outcome.power;
                 status.readiness = outcome.readiness;
                 status.signals =
@@ -3875,6 +3879,11 @@ impl WorkloadComputeWorker {
             match ledger.advance(&request_id, status.clone(), now_ms) {
                 Ok(next) => status = next,
                 Err(error) => {
+                    if received_attachment {
+                        let mut uncommitted = status.clone();
+                        uncommitted.attachment = outcome.attachment.clone();
+                        self.actuator.revoke_attachment(&uncommitted);
+                    }
                     tracing::error!(%error, "workload observation result could not be journaled");
                     return;
                 }
@@ -5209,6 +5218,55 @@ mod tests {
         }
     }
 
+    struct HostileAttachmentOutcomeActuator {
+        calls: Arc<Mutex<u32>>,
+        revoked: Arc<Mutex<Vec<(String, u64)>>>,
+        lease: WorkloadAttachmentLease,
+    }
+
+    impl WorkloadActuator for HostileAttachmentOutcomeActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            *self.calls.lock().expect("apply calls") += 1;
+            Ok(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::WaitingForFirstFrame,
+                power: WorkloadPowerState::Running,
+                readiness: WorkloadReadiness::PreparingDisplay,
+                retryable: true,
+                reason: None,
+                remediation: None,
+                attachment: Some(self.lease.clone()),
+            })
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("hostile result is rejected before cleanup")
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            unreachable!("hostile result test does not reconcile again")
+        }
+
+        fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+            if let Some(lease) = status.attachment.as_ref() {
+                self.revoked
+                    .lock()
+                    .expect("revoked attachments")
+                    .push((lease.lease_id.clone(), lease.generation));
+            }
+        }
+    }
+
     struct PermanentActuator;
     impl WorkloadActuator for PermanentActuator {
         fn apply(
@@ -5987,6 +6045,45 @@ mod tests {
             ledger.status("op-1").expect("status").phase,
             WorkloadOperationPhase::WaitingForGuest
         );
+    }
+
+    #[test]
+    fn rejected_attachment_outcome_revokes_uncommitted_lease_without_replay_effect() {
+        let temp = tempfile::tempdir().expect("temp");
+        let started_at = now_ms();
+        let mut request = request();
+        request.deadline_at_ms = started_at.saturating_add(20_000);
+        let hostile_lease = SystemWorkloadActuator::attachment_lease(&request, 2, started_at);
+        let calls = Arc::new(Mutex::new(0));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(HostileAttachmentOutcomeActuator {
+                calls: Arc::clone(&calls),
+                revoked: Arc::clone(&revoked),
+                lease: hostile_lease.clone(),
+            }));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        let raw = serde_json::to_string(&request).expect("wire");
+
+        worker.handle_request(&mut ledger, &raw, request.clone(), started_at);
+
+        let durable = ledger.status(&request.request_id).expect("durable status");
+        assert_eq!(durable.phase, WorkloadOperationPhase::PreparingDisplay);
+        assert!(durable.attachment.is_none());
+        assert_eq!(*calls.lock().expect("apply calls"), 1);
+        assert_eq!(
+            revoked.lock().expect("revoked attachments").as_slice(),
+            &[(hostile_lease.lease_id.clone(), hostile_lease.generation)]
+        );
+
+        // The retained Bus delivery is a read-only replay. It neither applies
+        // the operation again nor recreates the rejected adapter capability.
+        worker.handle_request(&mut ledger, &raw, request, started_at);
+        assert_eq!(*calls.lock().expect("apply calls"), 1);
+        assert_eq!(revoked.lock().expect("revoked attachments").len(), 1);
     }
 
     #[test]
