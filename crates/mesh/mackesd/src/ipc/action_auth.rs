@@ -160,6 +160,61 @@ impl ActionAuthorizer {
         Ok(token)
     }
 
+    /// Verify an exact signed body retained as a durable worker claim.
+    ///
+    /// Unlike live authorization, this admits a capability after wall-clock
+    /// expiry, but only at the signed request's issuance instant and only when
+    /// its complete lifetime was bounded to the normal 30-second window. It
+    /// does not consume or revive the nonce. This lets restart recovery
+    /// authenticate a claim record stored on the untrusted Bus without making
+    /// an expired mutation live again.
+    pub(crate) fn verify_historical_claim(
+        &self,
+        body: &str,
+        context: MutationContext<'_>,
+        issued_at_ms: i64,
+    ) -> Result<(), String> {
+        if !super::body_within_cap(Some(body)) {
+            return Err("request body exceeds the 64 KiB cap".to_string());
+        }
+        let envelope: serde_json::Value = serde_json::from_str(body)
+            .map_err(|_| "request body is not a JSON object".to_string())?;
+        let object = envelope
+            .as_object()
+            .ok_or_else(|| "request body is not a JSON object".to_string())?;
+        if object
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(ACTION_SCHEMA_VERSION)
+        {
+            return Err(format!(
+                "privileged action requires schema_version {ACTION_SCHEMA_VERSION}"
+            ));
+        }
+        let raw_token = object
+            .get("armed_token")
+            .and_then(serde_json::Value::as_str);
+        let verdict = verify_token(
+            raw_token,
+            context.verb,
+            context.node,
+            context.target,
+            body,
+            issued_at_ms,
+            self.verifier.as_ref(),
+        );
+        if !verdict.is_valid() {
+            return Err(verdict.reason().to_string());
+        }
+        let token = raw_token
+            .and_then(CloudArmedToken::parse)
+            .ok_or_else(|| "armed token is malformed".to_string())?;
+        if token.expires_at_ms > issued_at_ms.saturating_add(MAX_AUTH_TTL_MS) {
+            return Err("armed token exceeds the 30-second lifetime".to_string());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn for_test(key: &[u8], auth_root: PathBuf, now_ms: i64) -> Self {
@@ -373,6 +428,26 @@ mod tests {
         let long = authorize_test_body(KEY, unsigned, context(), "nonce-long", NOW + 30_001);
         assert!(gate
             .authorize(&long, context())
+            .unwrap_err()
+            .contains("30-second"));
+    }
+
+    #[test]
+    fn historical_claim_verifies_exact_signature_without_reviving_expired_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = ActionAuthorizer::for_test(KEY, tmp.path().to_path_buf(), NOW + 60_000);
+        let unsigned = r#"{"armed_device":"/dev/sdb","schema_version":1,"verb":"apply"}"#;
+        let armed = authorize_test_body(KEY, unsigned, context(), "nonce-claim", NOW + 30_000);
+
+        assert!(gate.verify_historical_claim(&armed, context(), NOW).is_ok());
+        assert!(gate.authorize(&armed, context()).is_err());
+        assert!(gate
+            .verify_historical_claim(&armed.replace("/dev/sdb", "/dev/sdc"), context(), NOW)
+            .is_err());
+
+        let long = authorize_test_body(KEY, unsigned, context(), "nonce-claim-long", NOW + 30_001);
+        assert!(gate
+            .verify_historical_claim(&long, context(), NOW)
             .unwrap_err()
             .contains("30-second"));
     }

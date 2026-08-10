@@ -33,6 +33,8 @@ pub const SURFACE_CAMERA_PROOF_ARM_TOKEN: &str = "PROVE CAMERA";
 /// Firmware-apply result schema. Version 2 explicitly replaces the former
 /// private daemon JSON shape that carried unbounded free-form reasons.
 pub const SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION: u64 = 2;
+/// Shared schema for pending-only Surface action cancellation requests/results.
+pub const SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION: u64 = 1;
 
 /// Contract admission failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +495,95 @@ pub struct SurfaceFirmwareApplyTarget {
     pub release_checksum: String,
 }
 
+/// Surface mutations that may be cancelled before their worker claims them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceCancellableAction {
+    /// Fixed local activation and MOK staging.
+    Enable,
+    /// Exact device/release-scoped fwupd apply.
+    FirmwareApply,
+}
+
+/// Signed request to cancel one exact, still-unclaimed Surface mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceActionCancellationRequest {
+    /// Cancellation identity, node, freshness, and exact-body capability.
+    #[serde(flatten)]
+    pub header: SurfaceActionHeader,
+    /// Mutation lane that owns the target request.
+    pub action: SurfaceCancellableAction,
+    /// Exact original action request identity.
+    pub target_request_id: String,
+    /// Exact local Pro 5/6 identity copied from the admitted observation.
+    pub model: SurfaceModelIdentity,
+    /// Exact firmware selection, required only for firmware cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_target: Option<SurfaceFirmwareApplyTarget>,
+}
+
+/// Closed pending-only cancellation refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceActionCancellationRefusal {
+    /// Exact-body cancellation authorization was absent, invalid, or replayed.
+    Authorization,
+    /// The repeated action/model/selection identity did not match the target.
+    IdentityMismatch,
+    /// No action with this identity has ever been admitted by this worker.
+    UnknownTarget,
+    /// The worker already claimed or completed the target; effects are never interrupted.
+    TooLate,
+}
+
+/// Closed cancellation outcome. Cancellation is never reported as action success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+pub enum SurfaceActionCancellationOutcome {
+    /// The exact queued request was claimed for cancellation before any effect.
+    Cancelled,
+    /// Cancellation did not claim the action.
+    Refused(SurfaceActionCancellationRefusal),
+}
+
+/// Worker authority that decided a Surface cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceActionCancellationSource {
+    /// Node-local Surface enable/MOK worker.
+    LocalSurfaceEnableWorker,
+    /// Node-local Surface firmware worker.
+    LocalSurfaceFirmwareWorker,
+}
+
+/// Bounded audit/result record correlating cancellation and original action identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceActionCancellationResult {
+    /// Cancellation result schema.
+    pub schema_version: u64,
+    /// Exact node that owns the action queue.
+    pub node: String,
+    /// Exact cancellation request identity.
+    pub cancellation_id: String,
+    /// Exact original action request identity.
+    pub target_request_id: String,
+    /// Mutation lane that decided the cancellation.
+    pub action: SurfaceCancellableAction,
+    /// Exact admitted model/generation.
+    pub model: SurfaceModelIdentity,
+    /// Exact firmware target when `action` is firmware apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_target: Option<SurfaceFirmwareApplyTarget>,
+    /// Fixed worker authority.
+    pub source: SurfaceActionCancellationSource,
+    /// Decision time after the durable exact-body claim record.
+    pub completed_at_ms: u64,
+    /// Closed decision.
+    pub outcome: SurfaceActionCancellationOutcome,
+}
+
 impl SurfaceFirmwareApplyTarget {
     fn validate(&self) -> Result<(), SurfaceContractError> {
         validate_id(&self.device_id, "target.device_id")?;
@@ -503,6 +594,77 @@ impl SurfaceFirmwareApplyTarget {
         }
         validate_id(&self.release_version, "target.release_version")?;
         validate_sha256(&self.release_checksum, "target.release_checksum")
+    }
+}
+
+impl SurfaceActionCancellationRequest {
+    fn validate(&self) -> Result<(), SurfaceContractError> {
+        validate_id(&self.target_request_id, "target_request_id")?;
+        if self.target_request_id == self.header.request_id {
+            return Err(SurfaceContractError::Invalid("target_request_id"));
+        }
+        validate_exact_pro56_model(&self.model)?;
+        match (self.action, &self.firmware_target) {
+            (SurfaceCancellableAction::Enable, None) => Ok(()),
+            (SurfaceCancellableAction::FirmwareApply, Some(target)) => target.validate(),
+            _ => Err(SurfaceContractError::Invalid("cancellation target")),
+        }
+    }
+}
+
+impl SurfaceActionCancellationResult {
+    /// Decode an untrusted result with exact node, cancellation, and freshness binding.
+    pub fn from_json_at(
+        body: &[u8],
+        expected_node: &str,
+        expected_cancellation_id: &str,
+        now_ms: u64,
+    ) -> Result<Self, SurfaceContractError> {
+        decode(body, |value: &Self| {
+            value.validate()?;
+            if value.node != expected_node {
+                return Err(SurfaceContractError::ForeignNode);
+            }
+            if value.cancellation_id != expected_cancellation_id {
+                return Err(SurfaceContractError::Invalid("cancellation_id binding"));
+            }
+            if value.completed_at_ms > now_ms.saturating_add(MAX_SURFACE_ACTION_FUTURE_SKEW_MS)
+                || now_ms.saturating_sub(value.completed_at_ms) > MAX_SURFACE_STATE_AGE_MS
+            {
+                return Err(SurfaceContractError::Stale);
+            }
+            Ok(())
+        })
+    }
+
+    /// Validate the closed result shape and exact worker/action authority.
+    pub fn validate(&self) -> Result<(), SurfaceContractError> {
+        if self.schema_version != SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION {
+            return Err(SurfaceContractError::Invalid("cancellation schema_version"));
+        }
+        validate_id(&self.node, "node")?;
+        validate_id(&self.cancellation_id, "cancellation_id")?;
+        validate_id(&self.target_request_id, "target_request_id")?;
+        if self.cancellation_id == self.target_request_id {
+            return Err(SurfaceContractError::Invalid("target_request_id"));
+        }
+        validate_exact_pro56_model(&self.model)?;
+        if self.completed_at_ms == 0 {
+            return Err(SurfaceContractError::Invalid("completed_at_ms"));
+        }
+        match (self.action, self.source, &self.firmware_target) {
+            (
+                SurfaceCancellableAction::Enable,
+                SurfaceActionCancellationSource::LocalSurfaceEnableWorker,
+                None,
+            ) => Ok(()),
+            (
+                SurfaceCancellableAction::FirmwareApply,
+                SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
+                Some(target),
+            ) => target.validate(),
+            _ => Err(SurfaceContractError::Invalid("cancellation authority")),
+        }
     }
 }
 
@@ -822,6 +984,10 @@ macro_rules! impl_action_decode {
 }
 
 impl_action_decode!(SurfaceEnableRequest, |_value: &SurfaceEnableRequest| Ok(()));
+impl_action_decode!(
+    SurfaceActionCancellationRequest,
+    |value: &SurfaceActionCancellationRequest| value.validate()
+);
 impl_action_decode!(
     SurfaceCameraProofRequest,
     |value: &SurfaceCameraProofRequest| {
@@ -1185,6 +1351,80 @@ mod tests {
         let duplicate = br#"{"schema_version":1,"schema_version":1,"node":"surface","request_id":"request-1","issued_at_ms":1800000000000}"#;
         assert_eq!(
             SurfaceEnableRequest::from_json_at(duplicate, "surface", NOW),
+            Err(SurfaceContractError::Malformed)
+        );
+    }
+
+    #[test]
+    fn cancellation_binds_exact_action_model_selection_and_closed_result() {
+        let target = SurfaceFirmwareApplyTarget {
+            device_id: "uefi-db".into(),
+            inventory_published_at_ms: NOW - 1,
+            release_version: "2026.08".into(),
+            release_checksum: "a".repeat(64),
+        };
+        let request = SurfaceActionCancellationRequest {
+            header: SurfaceActionHeader {
+                request_id: "cancel-1".into(),
+                ..action_header()
+            },
+            action: SurfaceCancellableAction::FirmwareApply,
+            target_request_id: "apply-1".into(),
+            model: publication().model,
+            firmware_target: Some(target.clone()),
+        };
+        let body = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            SurfaceActionCancellationRequest::from_json_at(&body, "surface", NOW),
+            Ok(request.clone())
+        );
+
+        let mut wrong_action = request.clone();
+        wrong_action.action = SurfaceCancellableAction::Enable;
+        assert!(SurfaceActionCancellationRequest::from_json_at(
+            &serde_json::to_vec(&wrong_action).unwrap(),
+            "surface",
+            NOW
+        )
+        .is_err());
+        let mut wrong_model = request.clone();
+        wrong_model.model.generation = SurfaceProGeneration::Pro5;
+        assert!(SurfaceActionCancellationRequest::from_json_at(
+            &serde_json::to_vec(&wrong_model).unwrap(),
+            "surface",
+            NOW
+        )
+        .is_err());
+
+        let result = SurfaceActionCancellationResult {
+            schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+            node: "surface".into(),
+            cancellation_id: "cancel-1".into(),
+            target_request_id: "apply-1".into(),
+            action: SurfaceCancellableAction::FirmwareApply,
+            model: request.model,
+            firmware_target: Some(target),
+            source: SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
+            completed_at_ms: NOW,
+            outcome: SurfaceActionCancellationOutcome::Cancelled,
+        };
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            SurfaceActionCancellationResult::from_json_at(&encoded, "surface", "cancel-1", NOW),
+            Ok(result)
+        );
+        let duplicate = String::from_utf8(encoded).unwrap().replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        );
+        assert_eq!(
+            SurfaceActionCancellationResult::from_json_at(
+                duplicate.as_bytes(),
+                "surface",
+                "cancel-1",
+                NOW
+            ),
             Err(SurfaceContractError::Malformed)
         );
     }

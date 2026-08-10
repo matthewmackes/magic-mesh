@@ -44,9 +44,11 @@ use mackes_mesh_types::surface_enable::{
     MAX_SURFACE_ENABLE_RESULT_AGE_MS, MAX_SURFACE_ENABLE_RESULT_FUTURE_SKEW_MS,
 };
 use mackes_mesh_types::surface_hardware::{
-    SurfaceActionHeader, SurfaceAvailability, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
-    SurfaceCameraProofRefusal, SurfaceCameraProofRequest, SurfaceCameraProofResult,
-    SurfaceCameraProofUnavailable, SurfaceFirmwareApplyFailure, SurfaceFirmwareApplyOutcome,
+    SurfaceActionCancellationOutcome, SurfaceActionCancellationRequest,
+    SurfaceActionCancellationResult, SurfaceActionHeader, SurfaceAvailability,
+    SurfaceCameraProofFailure, SurfaceCameraProofOutcome, SurfaceCameraProofRefusal,
+    SurfaceCameraProofRequest, SurfaceCameraProofResult, SurfaceCameraProofUnavailable,
+    SurfaceCancellableAction, SurfaceFirmwareApplyFailure, SurfaceFirmwareApplyOutcome,
     SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyRequest, SurfaceFirmwareApplyResult,
     SurfaceFirmwareApplyTarget, SurfaceFirmwareApplyUnavailable, SurfaceFirmwareInventory,
     SurfaceFleetSummary, SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration,
@@ -109,6 +111,12 @@ fn fw_apply_action_topic(node: &str) -> String {
 /// The fw-apply typed-result lane (Install tab).
 fn fw_apply_result_topic(node: &str) -> String {
     format!("state/hardware/surface/{node}/fw-apply")
+}
+fn fw_apply_cancel_action_topic(node: &str) -> String {
+    format!("action/hardware/surface/{node}/fw-apply-cancel")
+}
+fn fw_apply_cancel_result_topic(node: &str) -> String {
+    format!("state/hardware/surface/{node}/fw-apply-cancel")
 }
 /// The separately armed privacy-safe camera functional-proof request lane.
 fn camera_proof_action_topic(node: &str) -> String {
@@ -198,6 +206,7 @@ struct FirmwareApplyInFlight {
     model: SurfaceModelIdentity,
     target: SurfaceFirmwareApplyTarget,
     issued_at_ms: u64,
+    cancellation_id: Option<String>,
 }
 
 // ──────────────────────────── the card state ────────────────────────────────
@@ -283,6 +292,7 @@ pub(crate) struct SurfaceCardState {
     cur_enable: Option<String>,
     cur_firmware: Option<String>,
     cur_apply: Option<String>,
+    cur_apply_cancel: Option<String>,
     cur_camera_result: Option<String>,
     /// When the Bus was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
@@ -314,6 +324,7 @@ impl Default for SurfaceCardState {
             cur_enable: None,
             cur_firmware: None,
             cur_apply: None,
+            cur_apply_cancel: None,
             cur_camera_result: None,
             last_poll: None,
         }
@@ -445,6 +456,14 @@ impl SurfaceCardState {
             &mut self.apply,
             now_ms,
         );
+        read_latest_firmware_cancel_result(
+            &persist,
+            &fw_apply_cancel_result_topic(&node),
+            &mut self.cur_apply_cancel,
+            &mut self.firmware_in_flight,
+            &mut self.action_note,
+            now_ms,
+        );
         read_latest_camera_result(
             &persist,
             &camera_proof_result_topic(&node),
@@ -508,6 +527,7 @@ impl SurfaceCardState {
         self.cur_enable = None;
         self.cur_firmware = None;
         self.cur_apply = None;
+        self.cur_apply_cancel = None;
         self.cur_camera_result = None;
     }
 
@@ -1000,11 +1020,43 @@ impl SurfaceCardState {
         model: &SurfaceModelIdentity,
     ) {
         ui.add_space(Style::SP_S);
-        if self.firmware_in_flight.is_some() {
+        if let Some(pending) = self.firmware_in_flight.clone() {
             mde_egui::muted_note(
                 ui,
                 "Firmware apply is in progress; waiting for its exact shared result.",
             );
+            if pending.cancellation_id.is_none() && ui.button("Cancel pending apply").clicked() {
+                let request = SurfaceActionCancellationRequest {
+                    header: surface_action_header(&pending.node),
+                    action: SurfaceCancellableAction::FirmwareApply,
+                    target_request_id: pending.request_id.clone(),
+                    model: pending.model.clone(),
+                    firmware_target: Some(pending.target.clone()),
+                };
+                let unsigned = serde_json::to_string(&request).unwrap_or_default();
+                match crate::iac::authorize_root_mutation_body(
+                    &unsigned,
+                    "surface-firmware-apply-cancel",
+                    &pending.node,
+                    &pending.request_id,
+                ) {
+                    Ok(body) => {
+                        let topic = self.action_topic(fw_apply_cancel_action_topic);
+                        if self.publish(&topic, &body, "Cancellation requested before claim…") {
+                            if let Some(current) = self.firmware_in_flight.as_mut() {
+                                current.cancellation_id = Some(request.header.request_id);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.last_error = Some(format!(
+                            "Firmware cancellation authorization unavailable: {error}"
+                        ));
+                    }
+                }
+            } else if pending.cancellation_id.is_some() {
+                mde_egui::muted_note(ui, "Cancellation is awaiting its exact worker decision.");
+            }
             return;
         }
         ui.vertical(|ui| {
@@ -1069,6 +1121,7 @@ impl SurfaceCardState {
                             release_checksum: request.release_checksum,
                         },
                         issued_at_ms: request.header.issued_at_ms,
+                        cancellation_id: None,
                     });
                     self.apply = None;
                     self.fw_arm_input.clear();
@@ -1855,6 +1908,64 @@ fn read_latest_firmware_apply_result(
     }
 }
 
+/// Admit only the exact pending cancellation decision. A refused/too-late
+/// cancellation never clears the original apply slot, so its eventual action
+/// result remains the sole effect authority.
+fn read_latest_firmware_cancel_result(
+    persist: &Persist,
+    topic: &str,
+    cursor: &mut Option<String>,
+    pending: &mut Option<FirmwareApplyInFlight>,
+    note: &mut Option<String>,
+    now_ms: u64,
+) {
+    let Ok(messages) = persist.list_since(topic, cursor.as_deref()) else {
+        return;
+    };
+    for message in messages {
+        *cursor = Some(message.ulid.clone());
+        let Some(expected) = pending.as_ref() else {
+            continue;
+        };
+        let Some(cancellation_id) = expected.cancellation_id.as_deref() else {
+            continue;
+        };
+        let Some(body) = message.body.as_deref() else {
+            continue;
+        };
+        let Ok(result) = SurfaceActionCancellationResult::from_json_at(
+            body.as_bytes(),
+            &expected.node,
+            cancellation_id,
+            now_ms,
+        ) else {
+            continue;
+        };
+        if result.action != SurfaceCancellableAction::FirmwareApply
+            || result.target_request_id != expected.request_id
+            || result.model != expected.model
+            || result.firmware_target.as_ref() != Some(&expected.target)
+            || result.completed_at_ms < expected.issued_at_ms
+        {
+            continue;
+        }
+        match result.outcome {
+            SurfaceActionCancellationOutcome::Cancelled => {
+                *pending = None;
+                *note = Some("Firmware apply was cancelled before the worker claimed it.".into());
+            }
+            SurfaceActionCancellationOutcome::Refused(reason) => {
+                if let Some(current) = pending.as_mut() {
+                    current.cancellation_id = None;
+                }
+                *note = Some(format!(
+                    "Firmware cancellation was refused ({reason:?}); the apply remains in progress."
+                ));
+            }
+        }
+    }
+}
+
 /// Consume only the result correlated to the sole local in-flight request.
 /// Every other lane body advances the cursor but cannot replace the rendered
 /// closed result or release the pending identity.
@@ -2074,6 +2185,7 @@ mod tests {
                 cur_enable: None,
                 cur_firmware: None,
                 cur_apply: None,
+                cur_apply_cancel: None,
                 cur_camera_result: None,
                 last_poll: None,
             }
@@ -2217,6 +2329,7 @@ mod tests {
                 release_checksum: "a".repeat(64),
             },
             issued_at_ms: ACTION_NOW_MS,
+            cancellation_id: None,
         }
     }
 
@@ -2236,6 +2349,48 @@ mod tests {
             target: Some(pending.target.clone()),
             outcome: SurfaceFirmwareApplyOutcome::Applied,
         }
+    }
+
+    #[test]
+    fn firmware_cancel_result_clears_only_exact_cancelled_pending_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+        let mut pending = firmware_apply_pending();
+        pending.cancellation_id = Some("firmware-cancel-1".into());
+        let result = SurfaceActionCancellationResult {
+            schema_version:
+                mackes_mesh_types::surface_hardware::SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+            node: pending.node.clone(),
+            cancellation_id: pending.cancellation_id.clone().unwrap(),
+            target_request_id: pending.request_id.clone(),
+            action: SurfaceCancellableAction::FirmwareApply,
+            model: pending.model.clone(),
+            firmware_target: Some(pending.target.clone()),
+            source: mackes_mesh_types::surface_hardware::SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
+            completed_at_ms: ACTION_NOW_MS + 1,
+            outcome: SurfaceActionCancellationOutcome::Cancelled,
+        };
+        persist
+            .write(
+                "cancel-result",
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&result).unwrap()),
+            )
+            .unwrap();
+        let mut slot = Some(pending);
+        let mut cursor = None;
+        let mut note = None;
+        read_latest_firmware_cancel_result(
+            &persist,
+            "cancel-result",
+            &mut cursor,
+            &mut slot,
+            &mut note,
+            ACTION_NOW_MS + 1,
+        );
+        assert!(slot.is_none());
+        assert!(note.unwrap().contains("before the worker claimed"));
     }
 
     #[test]

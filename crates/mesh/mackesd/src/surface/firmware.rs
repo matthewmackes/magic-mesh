@@ -1187,8 +1187,9 @@ pub fn run_apply(
 
 #[cfg(feature = "async-services")]
 pub use worker::{
-    fw_apply_topic, fw_result_topic, inventory_topic, FwApplyRequest, SurfaceFirmwareWorker,
-    FW_ACTION_AUTH_VERB,
+    fw_apply_cancel_result_topic, fw_apply_cancel_topic, fw_apply_topic, fw_result_topic,
+    inventory_topic, FwApplyRequest, SurfaceFirmwareWorker, FW_ACTION_AUTH_VERB,
+    FW_CANCEL_AUTH_VERB,
 };
 
 #[cfg(feature = "async-services")]
@@ -1204,15 +1205,19 @@ mod worker {
     //! [`crate::surface::verify::run_verify`]) and re-publishes the board +
     //! summary. On a non-Surface node it idles (never touches the Bus).
 
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     pub use mackes_mesh_types::surface_hardware::SurfaceFirmwareApplyRequest as FwApplyRequest;
     use mackes_mesh_types::surface_hardware::{
-        SurfaceAvailability, SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult,
-        SurfaceFirmwareApplyTarget, SurfaceModelIdentity, SurfaceObservationSource,
-        SurfaceProGeneration, SurfacePublication, SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
+        SurfaceActionCancellationOutcome, SurfaceActionCancellationRefusal,
+        SurfaceActionCancellationRequest, SurfaceActionCancellationResult,
+        SurfaceActionCancellationSource, SurfaceAvailability, SurfaceCancellableAction,
+        SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult, SurfaceFirmwareApplyTarget,
+        SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration, SurfacePublication,
+        SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION, SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
         SURFACE_HARDWARE_SCHEMA_VERSION,
     };
     use mde_bus::hooks::config::Priority;
@@ -1236,6 +1241,8 @@ mod worker {
     /// HMAC v1 capability for this verb, the target node, and the fwupd device
     /// id before it writes the request to the action topic.
     pub const FW_ACTION_AUTH_VERB: &str = "surface-firmware-apply";
+    /// Exact-body authority used only to claim a still-pending firmware apply.
+    pub const FW_CANCEL_AUTH_VERB: &str = "surface-firmware-apply-cancel";
 
     /// The per-node lane the fwupd inventory lands on (the Install tab panel).
     #[must_use]
@@ -1255,6 +1262,26 @@ mod worker {
         format!("state/hardware/surface/{node}/fw-apply")
     }
 
+    /// Per-node pending-only firmware cancellation lane.
+    #[must_use]
+    pub fn fw_apply_cancel_topic(node: &str) -> String {
+        format!("action/hardware/surface/{node}/fw-apply-cancel")
+    }
+
+    /// Per-node closed firmware cancellation result lane.
+    #[must_use]
+    pub fn fw_apply_cancel_result_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/fw-apply-cancel")
+    }
+
+    fn fw_apply_claim_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/fw-apply-claim")
+    }
+
+    fn fw_apply_cancel_claim_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/fw-apply-cancel-claim")
+    }
+
     /// The per-node `surface_firmware` worker.
     pub struct SurfaceFirmwareWorker {
         node_id: String,
@@ -1262,6 +1289,7 @@ mod worker {
         bus_root: Option<PathBuf>,
         poll: Duration,
         action_cursor: Option<String>,
+        cancel_cursor: Option<String>,
         authorizer: Arc<ActionAuthorizer>,
     }
 
@@ -1276,6 +1304,7 @@ mod worker {
                 bus_root: default_bus_root(),
                 poll: POLL,
                 action_cursor: None,
+                cancel_cursor: None,
                 authorizer: Arc::new(ActionAuthorizer::production()),
             }
         }
@@ -1313,6 +1342,7 @@ mod worker {
                 bus_root: Some(bus_root),
                 poll: POLL,
                 action_cursor: None,
+                cancel_cursor: None,
                 authorizer,
             }
         }
@@ -1340,10 +1370,17 @@ mod worker {
             let Ok(msgs) = persist.list_since(&topic, self.action_cursor.as_deref()) else {
                 return;
             };
+            let cancelled = self.drain_cancellations(persist);
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
+                if msg.body.as_deref().is_some_and(|body| {
+                    FwApplyRequest::from_json_at(body.as_bytes(), &self.node_id, wall_now_ms())
+                        .is_ok_and(|request| cancelled.contains(&request.header.request_id))
+                }) {
+                    continue;
+                }
                 let (admitted_request, result) =
-                    self.apply_request_with_admission(msg.body.as_deref());
+                    self.apply_request_with_admission(msg.body.as_deref(), Some(persist));
                 self.publish_result(persist, admitted_request.as_ref(), &result);
                 // Verify re-runs after a successful firmware change (lock #8).
                 debug_assert_eq!(
@@ -1357,13 +1394,207 @@ mod worker {
             }
         }
 
+        /// Authorize cancellations first, then atomically consume the original
+        /// action capability as the durable pending claim. A capability already
+        /// consumed by an effect is always `TooLate`; it is never interrupted.
+        fn drain_cancellations(&mut self, persist: &Persist) -> HashSet<String> {
+            let topic = fw_apply_cancel_topic(&self.node_id);
+            let Ok(messages) = persist.list_since(&topic, self.cancel_cursor.as_deref()) else {
+                return HashSet::new();
+            };
+            let all_actions = persist
+                .list_since(&fw_apply_topic(&self.node_id), None)
+                .unwrap_or_default();
+            let mut cancelled = HashSet::new();
+            for message in messages {
+                self.cancel_cursor = Some(message.ulid.clone());
+                let Some(body) = message.body.as_deref() else {
+                    continue;
+                };
+                let Some(historical) = decode_historical_cancellation(body, &self.node_id) else {
+                    continue;
+                };
+                if let Some(prior) = prior_cancellation_result(
+                    persist,
+                    &fw_apply_cancel_result_topic(&self.node_id),
+                    &historical,
+                ) {
+                    if matches!(prior, SurfaceActionCancellationOutcome::Cancelled) {
+                        cancelled.insert(historical.target_request_id.clone());
+                    }
+                    continue;
+                }
+                let cancel = match SurfaceActionCancellationRequest::from_json_at(
+                    body.as_bytes(),
+                    &self.node_id,
+                    wall_now_ms(),
+                ) {
+                    Ok(live) => live,
+                    Err(_)
+                        if exact_body_seen(
+                            persist,
+                            &fw_apply_cancel_claim_topic(&self.node_id),
+                            body,
+                        ) =>
+                    {
+                        historical
+                    }
+                    Err(_) => continue,
+                };
+                let outcome = self.decide_cancellation(persist, body, &cancel, &all_actions);
+                if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
+                    cancelled.insert(cancel.target_request_id.clone());
+                }
+                self.publish_cancellation_result(persist, &cancel, outcome);
+            }
+            cancelled
+        }
+
+        fn decide_cancellation(
+            &self,
+            persist: &Persist,
+            body: &str,
+            cancel: &SurfaceActionCancellationRequest,
+            actions: &[mde_bus::persist::StoredMessage],
+        ) -> SurfaceActionCancellationOutcome {
+            let refused = SurfaceActionCancellationOutcome::Refused;
+            if cancel.action != SurfaceCancellableAction::FirmwareApply
+                || cancel.model != self.shared_model()
+            {
+                return refused(SurfaceActionCancellationRefusal::IdentityMismatch);
+            }
+            let Some((original_body, original)) = actions.iter().find_map(|message| {
+                let raw = message.body.as_deref()?;
+                let request = decode_historical_apply(raw, &self.node_id)?;
+                (request.header.request_id == cancel.target_request_id).then_some((raw, request))
+            }) else {
+                return refused(SurfaceActionCancellationRefusal::UnknownTarget);
+            };
+            let exact = SurfaceFirmwareApplyTarget {
+                device_id: original.device_id.clone(),
+                inventory_published_at_ms: original.inventory_published_at_ms,
+                release_version: original.release_version.clone(),
+                release_checksum: original.release_checksum.clone(),
+            };
+            if cancel.firmware_target.as_ref() != Some(&exact) {
+                return refused(SurfaceActionCancellationRefusal::IdentityMismatch);
+            }
+            if exact_body_seen(persist, &fw_apply_claim_topic(&self.node_id), original_body) {
+                return refused(SurfaceActionCancellationRefusal::TooLate);
+            }
+            let resumed =
+                exact_body_seen(persist, &fw_apply_cancel_claim_topic(&self.node_id), body);
+            if resumed {
+                let Ok(issued_at_ms) = i64::try_from(cancel.header.issued_at_ms) else {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                };
+                if self
+                    .authorizer
+                    .verify_historical_claim(
+                        body,
+                        MutationContext {
+                            verb: FW_CANCEL_AUTH_VERB,
+                            node: &self.node_id,
+                            target: &cancel.target_request_id,
+                        },
+                        issued_at_ms,
+                    )
+                    .is_err()
+                {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                }
+            } else {
+                if self
+                    .authorizer
+                    .authorize(
+                        body,
+                        MutationContext {
+                            verb: FW_CANCEL_AUTH_VERB,
+                            node: &self.node_id,
+                            target: &cancel.target_request_id,
+                        },
+                    )
+                    .is_err()
+                {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                }
+                if persist
+                    .write(
+                        &fw_apply_cancel_claim_topic(&self.node_id),
+                        Priority::Default,
+                        None,
+                        Some(body),
+                    )
+                    .is_err()
+                {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                }
+            }
+            match self.authorizer.authorize(
+                original_body,
+                MutationContext {
+                    verb: FW_ACTION_AUTH_VERB,
+                    node: &self.node_id,
+                    target: &original.device_id,
+                },
+            ) {
+                Ok(()) => SurfaceActionCancellationOutcome::Cancelled,
+                Err(_) if resumed => SurfaceActionCancellationOutcome::Cancelled,
+                Err(_) => refused(SurfaceActionCancellationRefusal::TooLate),
+            }
+        }
+
+        fn shared_model(&self) -> SurfaceModelIdentity {
+            match &self.detection.model {
+                SurfaceModel::Known(device) => SurfaceModelIdentity {
+                    product: device.product.clone(),
+                    generation: device.contract_generation,
+                },
+                SurfaceModel::UnknownSurface { product } => SurfaceModelIdentity {
+                    product: product.clone(),
+                    generation: SurfaceProGeneration::Unsupported,
+                },
+                SurfaceModel::NotASurface => SurfaceModelIdentity {
+                    product: "not-a-surface".into(),
+                    generation: SurfaceProGeneration::Unsupported,
+                },
+            }
+        }
+
+        fn publish_cancellation_result(
+            &self,
+            persist: &Persist,
+            request: &SurfaceActionCancellationRequest,
+            outcome: SurfaceActionCancellationOutcome,
+        ) {
+            let result = SurfaceActionCancellationResult {
+                schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                cancellation_id: request.header.request_id.clone(),
+                target_request_id: request.target_request_id.clone(),
+                action: request.action,
+                model: request.model.clone(),
+                firmware_target: request.firmware_target.clone(),
+                source: SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
+                completed_at_ms: wall_now_ms(),
+                outcome,
+            };
+            if result.validate().is_ok() {
+                publish(
+                    persist,
+                    &fw_apply_cancel_result_topic(&self.node_id),
+                    &result,
+                );
+            }
+        }
+
         /// Authenticate and decode one raw Bus request, then hand the typed
         /// human-arm token to the firmware verb. Parsing is deliberately
         /// side-effect free; the shared exact-body gate runs before
         /// [`run_apply`] or any fwupd/backend seam is reached.
         #[cfg(test)]
         fn apply_request(&self, body: Option<&str>) -> ApplyResult {
-            self.apply_request_with_admission(body).1
+            self.apply_request_with_admission(body, None).1
         }
 
         /// Parse an untrusted request exactly once so the publication identity
@@ -1372,6 +1603,7 @@ mod worker {
         fn apply_request_with_admission(
             &self,
             body: Option<&str>,
+            persist: Option<&Persist>,
         ) -> (Option<FwApplyRequest>, ApplyResult) {
             let Some(body) = body else {
                 return (
@@ -1415,6 +1647,26 @@ mod worker {
                 node: &self.node_id,
                 target: device_id,
             };
+            if let Some(persist) = persist {
+                if persist
+                    .write(
+                        &fw_apply_claim_topic(&self.node_id),
+                        Priority::Default,
+                        None,
+                        Some(body),
+                    )
+                    .is_err()
+                {
+                    return (
+                        Some(req.clone()),
+                        self.refused_result_with_wire(
+                            device_id,
+                            "firmware apply durable claim could not be recorded",
+                            SurfaceFirmwareApplyRefusal::Contract,
+                        ),
+                    );
+                }
+            }
             if let Err(error) = self.authorizer.authorize(body, context) {
                 tracing::warn!(
                     target: "mackesd::surface_firmware",
@@ -1564,6 +1816,56 @@ mod worker {
             .unwrap_or(u64::MAX)
     }
 
+    fn decode_historical_apply(body: &str, node: &str) -> Option<FwApplyRequest> {
+        mackes_mesh_types::workloads::reject_duplicate_json_keys(body).ok()?;
+        let envelope: FwApplyRequest = serde_json::from_str(body).ok()?;
+        FwApplyRequest::from_json_at(body.as_bytes(), node, envelope.header.issued_at_ms).ok()
+    }
+
+    fn decode_historical_cancellation(
+        body: &str,
+        node: &str,
+    ) -> Option<SurfaceActionCancellationRequest> {
+        mackes_mesh_types::workloads::reject_duplicate_json_keys(body).ok()?;
+        let envelope: SurfaceActionCancellationRequest = serde_json::from_str(body).ok()?;
+        SurfaceActionCancellationRequest::from_json_at(
+            body.as_bytes(),
+            node,
+            envelope.header.issued_at_ms,
+        )
+        .ok()
+    }
+
+    fn exact_body_seen(persist: &Persist, topic: &str, expected: &str) -> bool {
+        persist.list_since(topic, None).is_ok_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message.body.as_deref() == Some(expected))
+        })
+    }
+
+    fn prior_cancellation_result(
+        persist: &Persist,
+        topic: &str,
+        request: &SurfaceActionCancellationRequest,
+    ) -> Option<SurfaceActionCancellationOutcome> {
+        persist
+            .list_since(topic, None)
+            .ok()?
+            .iter()
+            .find_map(|message| {
+                let body = message.body.as_deref()?;
+                let result: SurfaceActionCancellationResult = serde_json::from_str(body).ok()?;
+                (result.validate().is_ok()
+                    && result.cancellation_id == request.header.request_id
+                    && result.target_request_id == request.target_request_id
+                    && result.action == request.action
+                    && result.model == request.model
+                    && result.firmware_target == request.firmware_target)
+                    .then_some(result.outcome)
+            })
+    }
+
     /// Publish a serializable payload to `topic` (best-effort; a failed write
     /// is logged, not fatal).
     fn publish<T: serde::Serialize>(persist: &Persist, topic: &str, payload: &T) {
@@ -1630,7 +1932,7 @@ mod worker {
 
         use super::*;
         use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
-        use crate::surface::firmware::ApplyOutcome;
+        use crate::surface::firmware::{ApplyOutcome, FW_ARM_TOKEN};
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
         use mackes_mesh_types::surface_hardware::{
             SurfaceFirmwareApplyOutcome, SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult,
@@ -1638,7 +1940,6 @@ mod worker {
         };
 
         const AUTH_KEY: &[u8] = b"surface-firmware-action-auth-test-key";
-        const AUTH_NOW: i64 = 1_700_000_000_000;
 
         fn detection(product: &str) -> SurfaceDetection {
             let dmi = DmiInfo {
@@ -1678,7 +1979,7 @@ mod worker {
             let authorizer = Arc::new(ActionAuthorizer::for_test(
                 AUTH_KEY,
                 root.join("auth"),
-                AUTH_NOW,
+                wall_now_ms() as i64,
             ));
             SurfaceFirmwareWorker::with_parts_and_authorizer(
                 node.to_string(),
@@ -1694,13 +1995,14 @@ mod worker {
             arm_token: Option<&str>,
             nonce: &str,
         ) -> String {
+            let issued_at_ms = wall_now_ms();
             let unsigned = serde_json::to_string(&FwApplyRequest {
                 header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
                     schema_version:
                         mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
                     node: node.to_string(),
                     request_id: nonce.to_string(),
-                    issued_at_ms: wall_now_ms(),
+                    issued_at_ms,
                     armed_token: None,
                 },
                 device_id: device_id.to_string(),
@@ -1719,8 +2021,89 @@ mod worker {
                     target: device_id,
                 },
                 nonce,
-                AUTH_NOW + 30_000,
+                issued_at_ms as i64 + 30_000,
             )
+        }
+
+        fn signed_cancel(node: &str, action: &str, cancellation_id: &str) -> String {
+            let original: FwApplyRequest = serde_json::from_str(action).unwrap();
+            let target = SurfaceFirmwareApplyTarget {
+                device_id: original.device_id,
+                inventory_published_at_ms: original.inventory_published_at_ms,
+                release_version: original.release_version,
+                release_checksum: original.release_checksum,
+            };
+            let issued_at_ms = wall_now_ms();
+            let unsigned = serde_json::to_string(&SurfaceActionCancellationRequest {
+                header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
+                    schema_version:
+                        mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: node.into(),
+                    request_id: cancellation_id.into(),
+                    issued_at_ms,
+                    armed_token: None,
+                },
+                action: SurfaceCancellableAction::FirmwareApply,
+                target_request_id: original.header.request_id,
+                model: SurfaceModelIdentity {
+                    product: "Surface Pro 6".into(),
+                    generation: SurfaceProGeneration::Pro6,
+                },
+                firmware_target: Some(target),
+            })
+            .unwrap();
+            authorize_test_body(
+                AUTH_KEY,
+                &unsigned,
+                MutationContext {
+                    verb: FW_CANCEL_AUTH_VERB,
+                    node,
+                    target: "firmware-pending",
+                },
+                cancellation_id,
+                issued_at_ms as i64 + 30_000,
+            )
+        }
+
+        #[test]
+        fn cancellation_claims_pending_firmware_without_invoking_or_interrupting_fwupd() {
+            let dir = tempfile::tempdir().unwrap();
+            let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+            let action = signed_request("node-a", "dev-1", Some(FW_ARM_TOKEN), "firmware-pending");
+            let cancel = signed_cancel("node-a", &action, "firmware-cancel");
+            persist
+                .write(
+                    &fw_apply_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&action),
+                )
+                .unwrap();
+            persist
+                .write(
+                    &fw_apply_cancel_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&cancel),
+                )
+                .unwrap();
+            let mut worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            worker.poll_once(&persist);
+            let results = persist
+                .list_since(&fw_apply_cancel_result_topic("node-a"), None)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let result: SurfaceActionCancellationResult =
+                serde_json::from_str(results[0].body.as_deref().unwrap()).unwrap();
+            assert_eq!(result.outcome, SurfaceActionCancellationOutcome::Cancelled);
+            assert!(persist
+                .list_since(&fw_result_topic("node-a"), None)
+                .unwrap()
+                .is_empty());
+            assert!(persist
+                .list_since(&fw_apply_claim_topic("node-a"), None)
+                .unwrap()
+                .is_empty());
         }
 
         fn decode_result(item: &mde_bus::persist::StoredMessage) -> SurfaceFirmwareApplyResult {

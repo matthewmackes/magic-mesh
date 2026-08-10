@@ -890,6 +890,13 @@ enum Cmd {
     #[command(hide = true)]
     SurfaceMokMint,
 
+    /// Cancel one exact Surface MOK request only if the worker has not claimed it.
+    #[command(hide = true)]
+    SurfaceMokCancel {
+        /// Exact request id printed/recorded by the governed minting invocation.
+        target_request_id: String,
+    },
+
     /// PLANES-13 — the policy engine surface. `mded policy list --json`
     /// emits every loaded policy (the W50 core pack + any TOML in
     /// `<root>/policies/`) with the peers that currently violate it,
@@ -2247,6 +2254,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Peers { json } => cli::peers::run(json, db_path)?,
         Cmd::Remediate { cmd } => cli::remediate::run(cmd, db_path)?,
         Cmd::SurfaceMokMint => cli::surface_mok_mint::run(&default_node_id())?,
+        Cmd::SurfaceMokCancel { target_request_id } => {
+            cli::surface_mok_mint::cancel(&default_node_id(), &target_request_id)?
+        }
         Cmd::Policy { cmd } => cli::policy::run(cmd, db_path)?,
         Cmd::Netstate { cmd } => cli::netstate::run(cmd)?,
         Cmd::Dns { cmd } => cli::dns::run(cmd, db_path)?,

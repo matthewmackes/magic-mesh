@@ -3,7 +3,8 @@
 use anyhow::{ensure, Context};
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mackes_mesh_types::surface_hardware::{
-    SurfaceActionHeader, SurfaceEnableRequest, SURFACE_HARDWARE_SCHEMA_VERSION,
+    SurfaceActionCancellationRequest, SurfaceActionHeader, SurfaceCancellableAction,
+    SurfaceEnableRequest, SurfaceModelIdentity, SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 use sha1::{Digest as _, Sha1};
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -114,8 +115,107 @@ pub fn run(node: &str) -> anyhow::Result<()> {
         Some(&request_body),
     )
     .context("publishing the bound Surface enable request")?;
-    println!("mint-surface-mok-import: submitted one request-bound local import");
+    println!(
+        "mint-surface-mok-import: submitted pending request {request_id}; cancellation is accepted only before worker claim"
+    );
     Ok(())
+}
+
+/// Submit a separately authorized, pending-only cancellation for one exact
+/// enable request. The worker decides `Cancelled` versus `TooLate`; this command
+/// never stops a running service, fwupd process, or MOK import.
+pub fn cancel(node: &str, target_request_id: &str) -> anyhow::Result<()> {
+    ensure!(
+        rustix::process::geteuid().is_root(),
+        "Surface MOK cancellation requires root"
+    );
+    ensure!(
+        node != "peer:unknown" && !node.is_empty(),
+        "local node identity is unavailable"
+    );
+    let _mint_lock = acquire_mint_lock()?;
+    let detection = mackesd_core::surface::detect();
+    let mackesd_core::surface::SurfaceModel::Known(device) = detection.model else {
+        anyhow::bail!("local hardware is not an admitted Surface Pro 5/6")
+    };
+    ensure!(
+        matches!(
+            device.contract_generation,
+            mackes_mesh_types::surface_hardware::SurfaceProGeneration::Pro5
+                | mackes_mesh_types::surface_hardware::SurfaceProGeneration::Pro6
+        ),
+        "local hardware is not an admitted Surface Pro 5/6"
+    );
+    let signer =
+        mackesd_core::ipc::action_auth::production_action_signer().map_err(anyhow::Error::msg)?;
+    let now = wall_now_ms()?;
+    let request = build_cancellation(
+        node,
+        target_request_id,
+        SurfaceModelIdentity {
+            product: device.product,
+            generation: device.contract_generation,
+        },
+        &signer,
+        now,
+        &format!("surface-mok-cancel-{}", uuid::Uuid::new_v4()),
+        &uuid::Uuid::new_v4().to_string(),
+    )?;
+    let body = serde_json::to_string(&request).context("serializing armed cancellation")?;
+    SurfaceActionCancellationRequest::from_json_at(
+        body.as_bytes(),
+        node,
+        u64::try_from(now).context("negative system clock")?,
+    )
+    .map_err(|error| anyhow::anyhow!("Surface cancellation contract refused: {error}"))?;
+    let bus = mde_bus::persist::Persist::open(PathBuf::from("/run/mde-bus"))
+        .context("opening the local Bus spool")?;
+    bus.write(
+        &format!("action/hardware/surface/{node}/enable-cancel"),
+        mde_bus::hooks::config::Priority::Default,
+        None,
+        Some(&body),
+    )
+    .context("publishing the pending-only Surface enable cancellation")?;
+    println!("cancel-surface-mok-import: submitted pending-only cancellation");
+    Ok(())
+}
+
+fn build_cancellation(
+    node: &str,
+    target_request_id: &str,
+    model: SurfaceModelIdentity,
+    signer: &CloudArmSigner,
+    now: i64,
+    cancellation_id: &str,
+    nonce: &str,
+) -> anyhow::Result<SurfaceActionCancellationRequest> {
+    let mut request = SurfaceActionCancellationRequest {
+        header: SurfaceActionHeader {
+            schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+            node: node.to_owned(),
+            request_id: cancellation_id.to_owned(),
+            issued_at_ms: u64::try_from(now).context("negative system clock")?,
+            armed_token: None,
+        },
+        action: SurfaceCancellableAction::Enable,
+        target_request_id: target_request_id.to_owned(),
+        model,
+        firmware_target: None,
+    };
+    let unsigned = serde_json::to_string(&request).context("serializing Surface cancellation")?;
+    let token = CloudArmedToken::mint(
+        signer,
+        nonce,
+        now.checked_add(TTL_MS)
+            .context("capability expiry overflow")?,
+        "surface-enable-cancel",
+        node,
+        target_request_id,
+        &cloud_request_digest(&unsigned).map_err(anyhow::Error::msg)?,
+    );
+    request.header.armed_token = Some(token.encode());
+    Ok(request)
 }
 
 fn build_bound_material(
@@ -464,6 +564,44 @@ mod tests {
         let passphrase = random_hex(32);
         assert_eq!(passphrase.len(), 64);
         assert!(passphrase.iter().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cancellation_is_separately_signed_and_exact_target_bound() {
+        let signer = CloudArmSigner::new(b"surface-mok-test-key".to_vec()).unwrap();
+        let now = 1_700_000_000_000_i64;
+        let request = build_cancellation(
+            "peer:surface",
+            "surface-mok-request-1",
+            SurfaceModelIdentity {
+                product: "Surface Pro 6".into(),
+                generation: mackes_mesh_types::surface_hardware::SurfaceProGeneration::Pro6,
+            },
+            &signer,
+            now,
+            "surface-mok-cancel-1",
+            "surface-mok-cancel-nonce",
+        )
+        .unwrap();
+        let body = serde_json::to_string(&request).unwrap();
+        SurfaceActionCancellationRequest::from_json_at(
+            body.as_bytes(),
+            "peer:surface",
+            u64::try_from(now).unwrap(),
+        )
+        .unwrap();
+        let token = CloudArmedToken::parse(request.header.armed_token.as_deref().unwrap()).unwrap();
+        assert_eq!(token.verb, "surface-enable-cancel");
+        assert_eq!(token.node, "peer:surface");
+        assert_eq!(token.target, "surface-mok-request-1");
+        assert_eq!(token.request_sha256, cloud_request_digest(&body).unwrap());
+
+        let tampered = body.replace("surface-mok-request-1", "surface-mok-request-2");
+        assert_ne!(
+            token.request_sha256,
+            cloud_request_digest(&tampered).unwrap(),
+            "target substitution cannot reuse the cancellation capability"
+        );
     }
 
     #[test]

@@ -1171,7 +1171,8 @@ fn run_mok(actions: &impl SurfaceActions) -> MokEnrollment {
 
 #[cfg(feature = "async-services")]
 pub use worker::{
-    enable_topic, result_topic, EnableRequest, SurfaceEnableWorker, ENABLE_ACTION_AUTH_VERB,
+    enable_cancel_result_topic, enable_cancel_topic, enable_topic, result_topic, EnableRequest,
+    SurfaceEnableWorker, ENABLE_ACTION_AUTH_VERB, ENABLE_CANCEL_AUTH_VERB,
 };
 
 #[cfg(feature = "async-services")]
@@ -1183,11 +1184,18 @@ mod worker {
     //! typed [`super::EnableResult`] to [`result_topic`]. SURFACE-4 folds
     //! that into the fleet enablement summary.
 
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     pub use mackes_mesh_types::surface_hardware::SurfaceEnableRequest as EnableRequest;
+    use mackes_mesh_types::surface_hardware::{
+        SurfaceActionCancellationOutcome, SurfaceActionCancellationRefusal,
+        SurfaceActionCancellationRequest, SurfaceActionCancellationResult,
+        SurfaceActionCancellationSource, SurfaceCancellableAction, SurfaceModelIdentity,
+        SurfaceProGeneration, SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+    };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
@@ -1205,6 +1213,8 @@ mod worker {
     /// Publishers must mint schema-v1 HMAC authority for this verb, the target
     /// node, and that same node as the mutation target.
     pub const ENABLE_ACTION_AUTH_VERB: &str = "surface-enable";
+    /// Exact-body authority used only to claim a still-pending enable action.
+    pub const ENABLE_CANCEL_AUTH_VERB: &str = "surface-enable-cancel";
 
     /// The per-node request lane the Install tab publishes enable requests on.
     #[must_use]
@@ -1218,6 +1228,26 @@ mod worker {
         format!("state/hardware/surface/{node}/enable")
     }
 
+    /// Per-node pending-only enable cancellation lane.
+    #[must_use]
+    pub fn enable_cancel_topic(node: &str) -> String {
+        format!("action/hardware/surface/{node}/enable-cancel")
+    }
+
+    /// Per-node closed enable cancellation result lane.
+    #[must_use]
+    pub fn enable_cancel_result_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/enable-cancel")
+    }
+
+    fn enable_claim_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/enable-claim")
+    }
+
+    fn enable_cancel_claim_topic(node: &str) -> String {
+        format!("state/hardware/surface/{node}/enable-cancel-claim")
+    }
+
     /// The per-node `surface_enable` worker.
     pub struct SurfaceEnableWorker {
         node_id: String,
@@ -1225,6 +1255,7 @@ mod worker {
         bus_root: Option<PathBuf>,
         poll: Duration,
         action_cursor: Option<String>,
+        cancel_cursor: Option<String>,
         authorizer: Arc<ActionAuthorizer>,
     }
 
@@ -1239,6 +1270,7 @@ mod worker {
                 bus_root: default_bus_root(),
                 poll: POLL,
                 action_cursor: None,
+                cancel_cursor: None,
                 authorizer: Arc::new(ActionAuthorizer::production()),
             }
         }
@@ -1257,6 +1289,7 @@ mod worker {
                 bus_root: Some(bus_root),
                 poll: POLL,
                 action_cursor: None,
+                cancel_cursor: None,
                 authorizer: Arc::new(ActionAuthorizer::production()),
             }
         }
@@ -1276,6 +1309,7 @@ mod worker {
                 bus_root: Some(bus_root),
                 poll: POLL,
                 action_cursor: None,
+                cancel_cursor: None,
                 authorizer,
             }
         }
@@ -1288,10 +1322,17 @@ mod worker {
             let Ok(msgs) = persist.list_since(&topic, self.action_cursor.as_deref()) else {
                 return;
             };
+            let cancelled = self.drain_cancellations(persist);
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
+                if msg.body.as_deref().is_some_and(|body| {
+                    EnableRequest::from_json_at(body.as_bytes(), &self.node_id, wall_now_ms())
+                        .is_ok_and(|request| cancelled.contains(&request.header.request_id))
+                }) {
+                    continue;
+                }
                 let (admitted_request_id, result) =
-                    self.apply_request_with_admission(msg.body.as_deref());
+                    self.apply_request_with_admission(msg.body.as_deref(), Some(persist));
                 // Publication freshness starts after every activation/MOK
                 // effect completes, never when the request was received.
                 let published_at_ms = wall_now_ms();
@@ -1304,12 +1345,198 @@ mod worker {
             }
         }
 
+        fn drain_cancellations(&mut self, persist: &Persist) -> HashSet<String> {
+            let topic = enable_cancel_topic(&self.node_id);
+            let Ok(messages) = persist.list_since(&topic, self.cancel_cursor.as_deref()) else {
+                return HashSet::new();
+            };
+            let all_actions = persist
+                .list_since(&enable_topic(&self.node_id), None)
+                .unwrap_or_default();
+            let mut cancelled = HashSet::new();
+            for message in messages {
+                self.cancel_cursor = Some(message.ulid.clone());
+                let Some(body) = message.body.as_deref() else {
+                    continue;
+                };
+                let Some(historical) = decode_historical_cancellation(body, &self.node_id) else {
+                    continue;
+                };
+                if let Some(prior) = prior_cancellation_result(
+                    persist,
+                    &enable_cancel_result_topic(&self.node_id),
+                    &historical,
+                ) {
+                    if matches!(prior, SurfaceActionCancellationOutcome::Cancelled) {
+                        cancelled.insert(historical.target_request_id.clone());
+                    }
+                    continue;
+                }
+                let cancel = match SurfaceActionCancellationRequest::from_json_at(
+                    body.as_bytes(),
+                    &self.node_id,
+                    wall_now_ms(),
+                ) {
+                    Ok(live) => live,
+                    Err(_)
+                        if exact_body_seen(
+                            persist,
+                            &enable_cancel_claim_topic(&self.node_id),
+                            body,
+                        ) =>
+                    {
+                        historical
+                    }
+                    Err(_) => continue,
+                };
+                let outcome = self.decide_cancellation(persist, body, &cancel, &all_actions);
+                if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
+                    cancelled.insert(cancel.target_request_id.clone());
+                }
+                self.publish_cancellation_result(persist, &cancel, outcome);
+            }
+            cancelled
+        }
+
+        fn decide_cancellation(
+            &self,
+            persist: &Persist,
+            body: &str,
+            cancel: &SurfaceActionCancellationRequest,
+            actions: &[mde_bus::persist::StoredMessage],
+        ) -> SurfaceActionCancellationOutcome {
+            let refused = SurfaceActionCancellationOutcome::Refused;
+            if cancel.action != SurfaceCancellableAction::Enable
+                || cancel.model != self.shared_model()
+                || cancel.firmware_target.is_some()
+            {
+                return refused(SurfaceActionCancellationRefusal::IdentityMismatch);
+            }
+            let Some((original_body, _original)) = actions.iter().find_map(|message| {
+                let raw = message.body.as_deref()?;
+                let request = decode_historical_enable(raw, &self.node_id)?;
+                (request.header.request_id == cancel.target_request_id).then_some((raw, request))
+            }) else {
+                return refused(SurfaceActionCancellationRefusal::UnknownTarget);
+            };
+            if exact_body_seen(persist, &enable_claim_topic(&self.node_id), original_body) {
+                return refused(SurfaceActionCancellationRefusal::TooLate);
+            }
+            let resumed = exact_body_seen(persist, &enable_cancel_claim_topic(&self.node_id), body);
+            if resumed {
+                let Ok(issued_at_ms) = i64::try_from(cancel.header.issued_at_ms) else {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                };
+                if self
+                    .authorizer
+                    .verify_historical_claim(
+                        body,
+                        MutationContext {
+                            verb: ENABLE_CANCEL_AUTH_VERB,
+                            node: &self.node_id,
+                            target: &cancel.target_request_id,
+                        },
+                        issued_at_ms,
+                    )
+                    .is_err()
+                {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                }
+            } else {
+                if self
+                    .authorizer
+                    .authorize(
+                        body,
+                        MutationContext {
+                            verb: ENABLE_CANCEL_AUTH_VERB,
+                            node: &self.node_id,
+                            target: &cancel.target_request_id,
+                        },
+                    )
+                    .is_err()
+                {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                }
+                if persist
+                    .write(
+                        &enable_cancel_claim_topic(&self.node_id),
+                        Priority::Default,
+                        None,
+                        Some(body),
+                    )
+                    .is_err()
+                {
+                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                }
+            }
+            match self.authorizer.authorize(
+                original_body,
+                MutationContext {
+                    verb: ENABLE_ACTION_AUTH_VERB,
+                    node: &self.node_id,
+                    target: &self.node_id,
+                },
+            ) {
+                Ok(()) => SurfaceActionCancellationOutcome::Cancelled,
+                Err(_) if resumed => SurfaceActionCancellationOutcome::Cancelled,
+                Err(_) => refused(SurfaceActionCancellationRefusal::TooLate),
+            }
+        }
+
+        fn shared_model(&self) -> SurfaceModelIdentity {
+            match &self.detection.model {
+                SurfaceModel::Known(device) => SurfaceModelIdentity {
+                    product: device.product.clone(),
+                    generation: device.contract_generation,
+                },
+                SurfaceModel::UnknownSurface { product } => SurfaceModelIdentity {
+                    product: product.clone(),
+                    generation: SurfaceProGeneration::Unsupported,
+                },
+                SurfaceModel::NotASurface => SurfaceModelIdentity {
+                    product: "not-a-surface".into(),
+                    generation: SurfaceProGeneration::Unsupported,
+                },
+            }
+        }
+
+        fn publish_cancellation_result(
+            &self,
+            persist: &Persist,
+            request: &SurfaceActionCancellationRequest,
+            outcome: SurfaceActionCancellationOutcome,
+        ) {
+            let result = SurfaceActionCancellationResult {
+                schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                cancellation_id: request.header.request_id.clone(),
+                target_request_id: request.target_request_id.clone(),
+                action: request.action,
+                model: request.model.clone(),
+                firmware_target: None,
+                source: SurfaceActionCancellationSource::LocalSurfaceEnableWorker,
+                completed_at_ms: wall_now_ms(),
+                outcome,
+            };
+            if result.validate().is_ok() {
+                let Ok(body) = serde_json::to_string(&result) else {
+                    return;
+                };
+                let _ = persist.write(
+                    &enable_cancel_result_topic(&self.node_id),
+                    Priority::Default,
+                    None,
+                    Some(&body),
+                );
+            }
+        }
+
         /// Authenticate and decode one raw Bus request, then run the typed
         /// enable verb. Parsing is side-effect free; the shared exact-body
         /// gate runs before [`run_enable`] or any privileged seam call.
         #[cfg(test)]
         fn apply_request(&self, body: Option<&str>) -> EnableResult {
-            self.apply_request_with_admission(body).1
+            self.apply_request_with_admission(body, None).1
         }
 
         /// Parse the shared request exactly once, preserving the same admitted
@@ -1317,6 +1544,7 @@ mod worker {
         fn apply_request_with_admission(
             &self,
             body: Option<&str>,
+            persist: Option<&Persist>,
         ) -> (Option<String>, EnableResult) {
             let Some(body) = body else {
                 return (
@@ -1345,6 +1573,25 @@ mod worker {
                 node: &self.node_id,
                 target: &self.node_id,
             };
+            if let Some(persist) = persist {
+                if persist
+                    .write(
+                        &enable_claim_topic(&self.node_id),
+                        Priority::Default,
+                        None,
+                        Some(body),
+                    )
+                    .is_err()
+                {
+                    return (
+                        Some(request_id),
+                        self.refused_result(
+                            EnableRefusal::Contract,
+                            "surface enable durable claim could not be recorded",
+                        ),
+                    );
+                }
+            }
             if let Err(error) = self.authorizer.authorize(body, context) {
                 tracing::warn!(
                     target: "mackesd::surface_enable",
@@ -1445,6 +1692,56 @@ mod worker {
             .unwrap_or(u64::MAX)
     }
 
+    fn decode_historical_enable(body: &str, node: &str) -> Option<EnableRequest> {
+        mackes_mesh_types::workloads::reject_duplicate_json_keys(body).ok()?;
+        let envelope: EnableRequest = serde_json::from_str(body).ok()?;
+        EnableRequest::from_json_at(body.as_bytes(), node, envelope.header.issued_at_ms).ok()
+    }
+
+    fn decode_historical_cancellation(
+        body: &str,
+        node: &str,
+    ) -> Option<SurfaceActionCancellationRequest> {
+        mackes_mesh_types::workloads::reject_duplicate_json_keys(body).ok()?;
+        let envelope: SurfaceActionCancellationRequest = serde_json::from_str(body).ok()?;
+        SurfaceActionCancellationRequest::from_json_at(
+            body.as_bytes(),
+            node,
+            envelope.header.issued_at_ms,
+        )
+        .ok()
+    }
+
+    fn exact_body_seen(persist: &Persist, topic: &str, expected: &str) -> bool {
+        persist.list_since(topic, None).is_ok_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message.body.as_deref() == Some(expected))
+        })
+    }
+
+    fn prior_cancellation_result(
+        persist: &Persist,
+        topic: &str,
+        request: &SurfaceActionCancellationRequest,
+    ) -> Option<SurfaceActionCancellationOutcome> {
+        persist
+            .list_since(topic, None)
+            .ok()?
+            .iter()
+            .find_map(|message| {
+                let body = message.body.as_deref()?;
+                let result: SurfaceActionCancellationResult = serde_json::from_str(body).ok()?;
+                (result.validate().is_ok()
+                    && result.cancellation_id == request.header.request_id
+                    && result.target_request_id == request.target_request_id
+                    && result.action == request.action
+                    && result.model == request.model
+                    && result.firmware_target.is_none())
+                .then_some(result.outcome)
+            })
+    }
+
     /// The default Bus root (same shape the other bus workers use).
     fn default_bus_root() -> Option<PathBuf> {
         mde_bus::default_data_dir()
@@ -1502,7 +1799,6 @@ mod worker {
         };
 
         const AUTH_KEY: &[u8] = b"surface-enable-action-auth-test-key";
-        const AUTH_NOW: i64 = 1_700_000_000_000;
 
         fn detection(product: &str) -> SurfaceDetection {
             let dmi = DmiInfo {
@@ -1543,7 +1839,7 @@ mod worker {
             let authorizer = Arc::new(ActionAuthorizer::for_test(
                 AUTH_KEY,
                 root.join("auth"),
-                AUTH_NOW,
+                wall_now_ms() as i64,
             ));
             SurfaceEnableWorker::with_parts_and_authorizer(
                 node.to_string(),
@@ -1554,13 +1850,14 @@ mod worker {
         }
 
         fn signed_request(node: &str, nonce: &str) -> String {
+            let issued_at_ms = wall_now_ms();
             let unsigned = serde_json::to_string(&EnableRequest {
                 header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
                     schema_version:
                         mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
                     node: node.to_string(),
                     request_id: nonce.to_string(),
-                    issued_at_ms: wall_now_ms(),
+                    issued_at_ms,
                     armed_token: None,
                 },
             })
@@ -1574,8 +1871,113 @@ mod worker {
                     target: node,
                 },
                 nonce,
-                AUTH_NOW + 30_000,
+                issued_at_ms as i64 + 30_000,
             )
+        }
+
+        fn signed_cancel(node: &str, target: &str, cancellation_id: &str) -> String {
+            let issued_at_ms = wall_now_ms();
+            let unsigned = serde_json::to_string(&SurfaceActionCancellationRequest {
+                header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
+                    schema_version:
+                        mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: node.into(),
+                    request_id: cancellation_id.into(),
+                    issued_at_ms,
+                    armed_token: None,
+                },
+                action: SurfaceCancellableAction::Enable,
+                target_request_id: target.into(),
+                model: SurfaceModelIdentity {
+                    product: "Surface Pro 6".into(),
+                    generation: SurfaceProGeneration::Pro6,
+                },
+                firmware_target: None,
+            })
+            .unwrap();
+            authorize_test_body(
+                AUTH_KEY,
+                &unsigned,
+                MutationContext {
+                    verb: ENABLE_CANCEL_AUTH_VERB,
+                    node,
+                    target,
+                },
+                cancellation_id,
+                issued_at_ms as i64 + 30_000,
+            )
+        }
+
+        #[test]
+        fn pending_cancellation_is_restart_idempotent_and_crash_after_claim_recovers() {
+            let dir = tempfile::tempdir().unwrap();
+            let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+            let action = signed_request("node-a", "enable-pending");
+            let cancel = signed_cancel("node-a", "enable-pending", "enable-cancel");
+            persist
+                .write(
+                    &enable_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&action),
+                )
+                .unwrap();
+            persist
+                .write(
+                    &enable_cancel_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&cancel),
+                )
+                .unwrap();
+
+            // Model a crash after durable cancellation claim + original-token
+            // consumption but before terminal result publication.
+            persist
+                .write(
+                    &enable_cancel_claim_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&cancel),
+                )
+                .unwrap();
+            let authorizer =
+                ActionAuthorizer::for_test(AUTH_KEY, dir.path().join("auth"), wall_now_ms() as i64);
+            authorizer
+                .authorize(
+                    &action,
+                    MutationContext {
+                        verb: ENABLE_ACTION_AUTH_VERB,
+                        node: "node-a",
+                        target: "node-a",
+                    },
+                )
+                .unwrap();
+
+            let mut worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            worker.poll_once(&persist);
+            let results = persist
+                .list_since(&enable_cancel_result_topic("node-a"), None)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let result: SurfaceActionCancellationResult =
+                serde_json::from_str(results[0].body.as_deref().unwrap()).unwrap();
+            assert_eq!(result.outcome, SurfaceActionCancellationOutcome::Cancelled);
+            assert!(persist
+                .list_since(&result_topic("node-a"), None)
+                .unwrap()
+                .is_empty());
+
+            let mut restarted = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            restarted.poll_once(&persist);
+            assert_eq!(
+                persist
+                    .list_since(&enable_cancel_result_topic("node-a"), None)
+                    .unwrap()
+                    .len(),
+                1,
+                "restart preserves the exact terminal cancellation"
+            );
         }
 
         #[test]
