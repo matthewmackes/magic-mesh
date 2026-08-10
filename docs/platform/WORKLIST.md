@@ -384,9 +384,9 @@ behavioral evidence is not completion.
 - **Action Console checkpoints (2026-08-08/09):** authenticated generation-bound Preview/Commit/Cancel and canonical digest recomputation fail closed; `.50`/`.90` passed:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts have stable registry rows; uncensused starts fail closed. Six group maps feed one Observation-owned
-  aggregate, while service-key retry, etcd startup probe, and all watchdogs now have exact process owners. Evidence:
+  aggregate; release 29 proved exact process owners and six fresh maps live on four seats after correcting legacy runtime-name alias admission. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-runtime-status-aggregate-ownership-r100.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-process-infrastructure-ownership-r103.md`.
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-process-infrastructure-ownership-r103.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
 - Remaining work:
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
