@@ -2206,16 +2206,23 @@ impl WorkloadActuator for SystemWorkloadActuator {
             self.ensure_container_unit(request)?;
         }
         let attachment = if request.action == WorkloadOperationAction::StartAndAttach {
-            Some(
-                self.ensure_attachment(
+            let runtime = match self.ensure_attachment(
                     request,
                     request.expected_generation.saturating_add(1).max(1),
                     now_ms(),
-                )?
-                .server
-                .lease()
-                .clone(),
-            )
+                ) {
+                Ok(runtime) => runtime,
+                Err(error) if request.backend == WorkloadBackend::QuadletSystemd => {
+                    if let Err(cleanup) = Self::remove_container_unit(request) {
+                        return Err(WorkloadActuatorError::Retryable(format!(
+                            "attachment setup failed ({error}); Quadlet cleanup failed: {cleanup}"
+                        )));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            Some(runtime.server.lease().clone())
         } else {
             None
         };
