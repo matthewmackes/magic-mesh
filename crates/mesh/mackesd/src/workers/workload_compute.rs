@@ -3693,7 +3693,23 @@ impl WorkloadComputeWorker {
             });
         let recovered: Vec<_> = ledger
             .statuses()
-            .filter(|status| status.phase.is_terminal() && status.attachment.is_some())
+            .filter(|status| {
+                if !status.phase.is_terminal() {
+                    return false;
+                }
+                if status.attachment.is_some() {
+                    return true;
+                }
+                // A completed StartAndAttach that survived without its lease
+                // must still be inspected.  Otherwise a stale journal can
+                // publish Ready without an authenticated Display1 capability.
+                status.readiness == WorkloadReadiness::Ready
+                    && ledger
+                        .request(&status.request_id)
+                        .is_some_and(|request| {
+                            request.action == WorkloadOperationAction::StartAndAttach
+                        })
+            })
             .cloned()
             .collect();
 
@@ -3723,6 +3739,15 @@ impl WorkloadComputeWorker {
                     ledger,
                     status,
                     "the recovered Display1 lease is not owned by a completed Start and attach operation and was revoked",
+                    now_ms,
+                );
+                continue;
+            }
+            if status.attachment.is_none() && status.readiness == WorkloadReadiness::Ready {
+                self.refuse_recovered_attachment(
+                    ledger,
+                    status,
+                    "the recovered StartAndAttach record reported Ready without a journaled Display1 lease and was revoked",
                     now_ms,
                 );
                 continue;
@@ -5918,6 +5943,55 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("without an authoritative lease")));
+    }
+
+    #[test]
+    fn recovered_ready_without_journaled_lease_is_refused_and_unpublished() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let request = request();
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, now);
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        seed_completed_attachment(&mut ledger, request.clone(), lease, now);
+        let mut status = ledger
+            .status(&request.request_id)
+            .expect("completed status")
+            .clone();
+        status.attachment = None;
+        status.readiness = WorkloadReadiness::Ready;
+        status.signals = WorkloadRuntimeSignals::from_readiness(
+            WorkloadOperationPhase::Completed,
+            WorkloadReadiness::Ready,
+        );
+        ledger
+            .advance(&request.request_id, status, now)
+            .expect("remove stale lease from recovered journal");
+        let calls = Arc::new(Mutex::new(0));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            RecoveryActuator {
+                calls: Arc::clone(&calls),
+                revoked: Arc::new(Mutex::new(Vec::new())),
+                outcome: WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::Ready,
+                    retryable: false,
+                    reason: None,
+                    remediation: None,
+                    attachment: None,
+                },
+            },
+        ));
+
+        worker.reconcile_recovered_attachments(&mut ledger, now);
+
+        assert_eq!(*calls.lock().expect("recovery calls"), 0);
+        let refused = ledger.status(&request.request_id).expect("refused status");
+        assert!(refused.attachment.is_none());
+        assert_eq!(refused.readiness, WorkloadReadiness::Unavailable);
+        assert!(refused.reason.as_deref().is_some_and(|reason| {
+            reason.contains("without a journaled Display1 lease")
+        }));
     }
 
     #[test]
