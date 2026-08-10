@@ -412,11 +412,16 @@ fn registered_card(
     let auth_credential_ref = SecretReference::new(credential_ref.clone())?;
     let is_configured = configured.is_some();
     let is_enabled = configured.is_some_and(|config| config.enabled);
+    let is_launchable = configured
+        .is_some_and(|config| config.enabled && config.last_test_ok == Some(true));
+    let health_failure = configured
+        .is_some_and(|config| config.last_test_ok == Some(false))
+        .then(|| failure(FailureCode::Unreachable, "latest service endpoint test failed"));
     let actions = [
         ("inspect", ResourceActionVerb::Inspect, true),
         ("configure", ResourceActionVerb::Configure, true),
         ("test", ResourceActionVerb::Test, is_configured),
-        ("launch", ResourceActionVerb::Launch, is_enabled),
+        ("launch", ResourceActionVerb::Launch, is_launchable),
         (
             "enable",
             ResourceActionVerb::Enable,
@@ -450,7 +455,7 @@ fn registered_card(
             observed_at_ms: now,
             expires_at_ms: now + FRESH_MS,
             latency_ms: None,
-            failure: None,
+            failure: health_failure,
         },
         auth: AuthState {
             schema_version: RESOURCE_CONTRACT_VERSION,
@@ -1783,6 +1788,56 @@ SERVER: MCNF/1.0\r\n\r\n";
                 action.verb == verb && action.availability.status == ActionAvailabilityStatus::Ready
             }));
         }
+    }
+
+    #[test]
+    fn failed_latest_test_revokes_launch_admission_even_when_enabled() {
+        let root = tempfile::tempdir().unwrap();
+        persist_configuration(
+            root.path(),
+            &StoredServiceConfiguration {
+                schema_version: SERVICE_CONFIG_VERSION,
+                service_kind: "jellyfin".into(),
+                non_secret_values: BTreeMap::from([(
+                    "endpoint".into(),
+                    "https://media.example.test".into(),
+                )]),
+                secret_fields: vec!["api-key".into()],
+                credential_ref: "service/jellyfin/jellyfin".into(),
+                enabled: true,
+                last_test_ok: Some(false),
+                updated_at_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("persist service state");
+
+        let catalog = catalog_from_services_with_root(
+            &ServicesState {
+                host: "seat-15".into(),
+                records: vec![],
+                published_at_ms: 1_700_000_000_000,
+            },
+            root.path(),
+        )
+        .expect("valid catalog");
+        let card = catalog
+            .cards
+            .iter()
+            .find(|card| card.identity.canonical_key == "provider/jellyfin/jellyfin")
+            .expect("Jellyfin service card");
+        let launch = card
+            .actions
+            .iter()
+            .find(|action| action.verb == ResourceActionVerb::Launch)
+            .expect("Launch action");
+        assert_eq!(
+            launch.availability.status,
+            ActionAvailabilityStatus::Unavailable
+        );
+        assert_eq!(
+            card.service.as_ref().expect("service interface").lifecycle,
+            ServiceLifecycleStatus::Offline
+        );
     }
 
     #[test]
