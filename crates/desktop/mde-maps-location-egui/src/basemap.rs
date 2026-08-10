@@ -208,13 +208,33 @@ pub fn read_meta(mbtiles: &Path) -> Option<RawMeta> {
     let mut max_zoom: Option<u8> = None;
     let mut bounds: Option<(f64, f64, f64, f64)> = None;
     let mut center: Option<(f64, f64)> = None;
-    for row in rows.flatten() {
-        let (name, value) = row;
+    for row in rows {
+        let (name, value) = row.ok()?;
         match name.as_str() {
-            "minzoom" => min_zoom = value.trim().parse().ok(),
-            "maxzoom" => max_zoom = value.trim().parse().ok(),
-            "bounds" => bounds = parse_bounds(&value),
-            "center" => center = parse_center(&value),
+            "minzoom" => {
+                if min_zoom.is_some() {
+                    return None;
+                }
+                min_zoom = Some(value.trim().parse().ok()?);
+            }
+            "maxzoom" => {
+                if max_zoom.is_some() {
+                    return None;
+                }
+                max_zoom = Some(value.trim().parse().ok()?);
+            }
+            "bounds" => {
+                if bounds.is_some() {
+                    return None;
+                }
+                bounds = Some(parse_bounds(&value)?);
+            }
+            "center" => {
+                if center.is_some() {
+                    return None;
+                }
+                center = Some(parse_center(&value)?);
+            }
             _ => {}
         }
     }
@@ -226,11 +246,28 @@ pub fn read_meta(mbtiles: &Path) -> Option<RawMeta> {
             f64::midpoint(min_lat, max_lat),
         )
     });
+    let min_zoom = min_zoom.unwrap_or(0);
+    let max_zoom = max_zoom.unwrap_or(19);
+    if min_zoom > max_zoom
+        || max_zoom > FALLBACK_MAX_ZOOM
+        || !(-180.0..=180.0).contains(&min_lon)
+        || !(-180.0..=180.0).contains(&max_lon)
+        || !(-MERCATOR_LAT_LIMIT..=MERCATOR_LAT_LIMIT).contains(&min_lat)
+        || !(-MERCATOR_LAT_LIMIT..=MERCATOR_LAT_LIMIT).contains(&max_lat)
+        || min_lon >= max_lon
+        || min_lat >= max_lat
+        || !center_lon.is_finite()
+        || !center_lat.is_finite()
+        || !(min_lon..=max_lon).contains(&center_lon)
+        || !(min_lat..=max_lat).contains(&center_lat)
+    {
+        return None;
+    }
     Some(RawMeta {
         center_lat,
         center_lon,
-        min_zoom: min_zoom.unwrap_or(0),
-        max_zoom: max_zoom.unwrap_or(19),
+        min_zoom,
+        max_zoom,
         min_lon,
         min_lat,
         max_lon,
@@ -242,8 +279,9 @@ pub fn read_meta(mbtiles: &Path) -> Option<RawMeta> {
 fn parse_bounds(value: &str) -> Option<(f64, f64, f64, f64)> {
     let parts: Vec<f64> = value
         .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
+        .map(|part| part.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
     match parts.as_slice() {
         [a, b, c, d] => Some((*a, *b, *c, *d)),
         _ => None,
@@ -254,10 +292,16 @@ fn parse_bounds(value: &str) -> Option<(f64, f64, f64, f64)> {
 fn parse_center(value: &str) -> Option<(f64, f64)> {
     let parts: Vec<f64> = value
         .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
+        .map(|part| part.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
     match parts.as_slice() {
-        [lon, lat] | [lon, lat, _] => Some((*lon, *lat)),
+        [lon, lat] => Some((*lon, *lat)),
+        [lon, lat, zoom]
+            if zoom.is_finite() && (0.0..=f64::from(FALLBACK_MAX_ZOOM)).contains(zoom) =>
+        {
+            Some((*lon, *lat))
+        }
         _ => None,
     }
 }
@@ -266,7 +310,11 @@ fn parse_center(value: &str) -> Option<(f64, f64)> {
 /// converting the XYZ `y` to the on-disk TMS row. `None` when the tile is absent.
 #[must_use]
 pub fn read_tile_conn(conn: &Connection, z: u8, x: u32, y_xyz: u32) -> Option<Vec<u8>> {
-    let y_tms = ((1u32 << z) - 1).checked_sub(y_xyz)?;
+    let side = 1_u32.checked_shl(u32::from(z))?;
+    if x >= side || y_xyz >= side {
+        return None;
+    }
+    let y_tms = (side - 1).checked_sub(y_xyz)?;
     conn.query_row(
         "SELECT tile_data FROM tiles \
          WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3",
@@ -737,6 +785,67 @@ mod tests {
     }
 
     #[test]
+    fn read_meta_rejects_hostile_bounds_centres_and_zooms() {
+        for (name, value) in [
+            ("bounds", "-96.4,bad,-95.3,32.6"),
+            ("bounds", "-95.3,31.7,-96.4,32.6"),
+            ("bounds", "-196.4,31.7,-95.3,32.6"),
+            ("bounds", "-96.4,31.7,-95.3,NaN"),
+            ("center", "NaN,32.168,12"),
+            ("center", "-70.0,32.168,12"),
+            ("center", "-95.849,32.168,NaN"),
+            ("minzoom", "13"),
+            ("maxzoom", "23"),
+            ("maxzoom", "not-a-zoom"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mb = dir.path().join("hostile.mbtiles");
+            synth_mbtiles(&mb);
+            let conn = Connection::open(&mb).unwrap();
+            conn.execute(
+                "UPDATE metadata SET value = ?1 WHERE name = ?2",
+                rusqlite::params![value, name],
+            )
+            .unwrap();
+            drop(conn);
+            assert!(
+                read_meta(&mb).is_none(),
+                "hostile {name}={value:?} must not become a basemap"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mb = dir.path().join("duplicate.mbtiles");
+        synth_mbtiles(&mb);
+        let conn = Connection::open(&mb).unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES ('bounds', '-180,-80,180,80')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            read_meta(&mb).is_none(),
+            "ambiguous duplicate placement metadata must fail closed"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mb = dir.path().join("wrong-type.mbtiles");
+        synth_mbtiles(&mb);
+        let conn = Connection::open(&mb).unwrap();
+        conn.execute(
+            "UPDATE metadata SET value = x'00' WHERE name = 'bounds'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            read_meta(&mb).is_none(),
+            "a metadata row with the wrong SQLite type must fail closed"
+        );
+    }
+
+    #[test]
     fn read_tile_honours_tms_row_order() {
         let dir = tempfile::tempdir().unwrap();
         let mb = dir.path().join("synth.mbtiles");
@@ -749,6 +858,17 @@ mod tests {
         // The bytes decode back to a 2×2 image.
         let img = decode_tile(&png).unwrap();
         assert_eq!(img.size, [2, 2]);
+    }
+
+    #[test]
+    fn read_tile_rejects_out_of_domain_coordinates_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mb = dir.path().join("synth.mbtiles");
+        synth_mbtiles(&mb);
+
+        assert!(read_tile(&mb, u8::MAX, 0, 0).is_none());
+        assert!(read_tile(&mb, 12, 1_u32 << 12, 0).is_none());
+        assert!(read_tile(&mb, 12, 0, 1_u32 << 12).is_none());
     }
 
     #[test]
