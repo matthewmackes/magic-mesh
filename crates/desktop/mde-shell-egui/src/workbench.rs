@@ -118,7 +118,8 @@ pub fn show(
     // Mutable: the Spawn Lighthouse flow (OW-7) publishes
     // spawn-lighthouse requests onto the Bus and holds the daemon's typed answer.
     spawn_lighthouse: &mut crate::spawn_lighthouse_flow::SpawnLighthouseFlowState,
-) {
+) -> Option<crate::surface_card::SurfaceCardHandoff> {
+    let mut surface_handoff = None;
     // MENU-1 — the shared top bar, retitled **State of the Mesh** (operator
     // retitle; the `Surface` enum name stays Workbench). The full MenuBarModel:
     // **View** (plane navigation — the same `selected` seam the rail below
@@ -190,7 +191,7 @@ pub fn show(
                     // card. It draws only on a detected Surface (the summary
                     // topic is the gate); on every other node it's inert.
                     if surface_card.is_surface() {
-                        surface_card.show(ui);
+                        surface_handoff = surface_card.show(ui);
                     }
                 }
                 // WB-Network — the mesh fabric's live status (overlay IP + cipher,
@@ -218,6 +219,7 @@ pub fn show(
             }
         });
     });
+    surface_handoff
 }
 
 /// WL-ARCH-009 S5 — the production Workers Action Console slice. State lives in

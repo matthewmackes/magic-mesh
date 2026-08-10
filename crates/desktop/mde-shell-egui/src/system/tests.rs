@@ -587,6 +587,21 @@ fn the_confirm_gate_arms_before_a_host_down_verb_acts() {
     assert!(st.confirm.is_none());
 }
 
+#[test]
+fn surface_reboot_handoff_opens_power_but_never_reuses_confirmation() {
+    let mut state = SystemState::default();
+    state.apply(vec![SysAction::ArmConfirm(PowerVerb::Reboot)]);
+    assert_eq!(state.confirm, Some(PowerVerb::Reboot));
+
+    state.open_fresh_reboot_workflow();
+
+    assert_eq!(state.settings_section_for_test(), SettingsSection::Power);
+    assert!(
+        state.confirm.is_none(),
+        "navigation must require a new Power-page arm and confirmation"
+    );
+}
+
 // ── Power Settings (POWER-4) ──────────────────────────────────────────────
 
 #[test]

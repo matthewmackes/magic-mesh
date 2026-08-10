@@ -2323,33 +2323,33 @@ impl Shell {
     /// unambiguously `Surface::Workers`.
     fn show_fleet_mesh(&mut self, ui: &mut egui::Ui) {
         let mut tab = self.fleet_mesh_tab;
-        ui.push_id("shell-workers-mesh-control", |ui| {
-            // Workbench owns the shared MenuBar, including its View menu. Do
-            // not mount the legacy Fleet & Mesh wrapper menu above it: at
-            // narrow/large-text sizes that produced a detached duplicate
-            // `View` button before a workspace's own shared frame. Mesh Map
-            // remains the one exception because its canvas is intentionally
-            // headerless and needs a route switcher; Explorer owns its shared
-            // AppFrame/domain header and must not receive a second wrapper control.
-            if tab == FleetMeshTab::MeshMap {
-                ui.horizontal(|ui| {
-                    ui.menu_button("View", |ui| {
-                        for (candidate, label) in [
-                            (FleetMeshTab::Workbench, "Workbench"),
-                            (FleetMeshTab::MeshMap, "Mesh Map"),
-                            (FleetMeshTab::Explorer, "Explorer"),
-                        ] {
-                            if ui.radio_value(&mut tab, candidate, label).clicked() {
-                                ui.close_menu();
+        let surface_handoff = ui
+            .push_id("shell-workers-mesh-control", |ui| {
+                // Workbench owns the shared MenuBar, including its View menu. Do
+                // not mount the legacy Fleet & Mesh wrapper menu above it: at
+                // narrow/large-text sizes that produced a detached duplicate
+                // `View` button before a workspace's own shared frame. Mesh Map
+                // remains the one exception because its canvas is intentionally
+                // headerless and needs a route switcher; Explorer owns its shared
+                // AppFrame/domain header and must not receive a second wrapper control.
+                if tab == FleetMeshTab::MeshMap {
+                    ui.horizontal(|ui| {
+                        ui.menu_button("View", |ui| {
+                            for (candidate, label) in [
+                                (FleetMeshTab::Workbench, "Workbench"),
+                                (FleetMeshTab::MeshMap, "Mesh Map"),
+                                (FleetMeshTab::Explorer, "Explorer"),
+                            ] {
+                                if ui.radio_value(&mut tab, candidate, label).clicked() {
+                                    ui.close_menu();
+                                }
                             }
-                        }
+                        });
                     });
-                });
-                ui.separator();
-            }
-            match tab {
-                FleetMeshTab::Workbench => {
-                    workbench::show(
+                    ui.separator();
+                }
+                match tab {
+                    FleetMeshTab::Workbench => workbench::show(
                         ui,
                         &mut tab,
                         &mut self.nav.plane,
@@ -2361,13 +2361,40 @@ impl Shell {
                         &self.controller,
                         &self.provisioning,
                         &mut self.spawn_lighthouse,
-                    );
+                    ),
+                    FleetMeshTab::MeshMap => {
+                        self.show_mesh_map(ui);
+                        None
+                    }
+                    FleetMeshTab::Explorer => {
+                        self.show_explorer(ui);
+                        None
+                    }
                 }
-                FleetMeshTab::MeshMap => self.show_mesh_map(ui),
-                FleetMeshTab::Explorer => self.show_explorer(ui),
-            }
-        });
+            })
+            .inner;
         self.fleet_mesh_tab = tab;
+        if let Some(handoff) = surface_handoff {
+            self.apply_surface_card_handoff(handoff);
+        }
+    }
+
+    /// Apply the Surface card's navigation-only post-MOK handoff. Authority is
+    /// deliberately absent from the handoff: System opens Power with no armed
+    /// confirmation, and its existing provider remains the only execution path.
+    fn apply_surface_card_handoff(&mut self, handoff: surface_card::SurfaceCardHandoff) {
+        match handoff {
+            surface_card::SurfaceCardHandoff::OpenGovernedReboot => {
+                self.system.open_fresh_reboot_workflow();
+                self.nav.surface = Surface::Workers;
+                self.nav.expanded = true;
+                self.workers_tab = WorkersTab::LocalNode;
+                self.this_node_tab = ThisNodeTab::System;
+                self.this_node_section = this_node_catalog::Section::Overview;
+                self.this_node_page = this_node_catalog::page_for_route("this-node/overview")
+                    .unwrap_or(this_node_catalog::page_index()[0]);
+            }
+        }
     }
 
     /// Render the local-node child mode inside Workers. System, Storage, and
@@ -5818,6 +5845,28 @@ mod tests {
                 "{legacy:?} local-node tab"
             );
         }
+    }
+
+    #[test]
+    fn surface_mok_handoff_routes_only_to_the_existing_power_workflow() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.surface = Surface::Desktop;
+        shell.nav.expanded = false;
+
+        shell.apply_surface_card_handoff(
+            crate::surface_card::SurfaceCardHandoff::OpenGovernedReboot,
+        );
+
+        assert_eq!(shell.nav.surface, Surface::Workers);
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.workers_tab, WorkersTab::LocalNode);
+        assert_eq!(shell.this_node_tab, ThisNodeTab::System);
+        assert_eq!(
+            shell.system.settings_section_for_test(),
+            crate::system::SettingsSection::Power
+        );
     }
 
     #[test]

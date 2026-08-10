@@ -1654,6 +1654,15 @@ impl SystemState {
         self.nav.save();
     }
 
+    /// Navigation-only entry from a staged Surface MOK result. Any unrelated
+    /// confirmation left in the Settings state is cleared before opening Power
+    /// & Battery, so the handoff cannot become a confirm click or reuse prior
+    /// arming. The normal Power UI remains the sole local execution owner.
+    pub(crate) fn open_fresh_reboot_workflow(&mut self) {
+        self.confirm = None;
+        self.open_settings_section(SettingsSection::Power);
+    }
+
     /// Test seam (the U12 Control Center deep-link tests): the section the
     /// Settings rail currently rests on.
     #[cfg(test)]
