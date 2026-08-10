@@ -1107,6 +1107,10 @@ behavioral evidence is not completion.
 - **App VM generation rollback (2026-08-10):** later lower-generation runtime
   rows are refused; `.90` passed:
   `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-generation-rollback-r156.md`.
+- **App VM target admission (2026-08-10):** empty, control-bearing, and
+  path-like serving/client peer or VM identities are refused before session
+  roster mutation; `.50` passed the hostile regression:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-target-admission-r186.md`.
 - **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
   only after governed projection/status effects succeed, and expiry retains
   authority until its retraction publishes. Machine 194 passed the exact

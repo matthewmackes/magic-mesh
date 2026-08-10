@@ -225,6 +225,14 @@ pub enum SessionError {
         /// The bounded reason for refusing the replay.
         reason: &'static str,
     },
+    /// An App VM open carried a target identity that cannot safely cross the
+    /// session/Workloads boundary.  Reject it before it enters the roster so
+    /// the later actuator cannot interpret a path-like or control-bearing
+    /// identity as a VM, serving peer, or client peer.
+    InvalidAppVmTarget {
+        /// The target field that failed the bounded identity grammar.
+        field: &'static str,
+    },
     /// A Browser VM workload/profile pairing failed validation.
     InvalidDesktopProfile {
         /// The VM identity carried by the rejected request.
@@ -250,6 +258,9 @@ impl std::fmt::Display for SessionError {
             }
             Self::ConflictingAppSession { id, reason } => {
                 write!(f, "conflicting App VM session `{id}`: {reason}")
+            }
+            Self::InvalidAppVmTarget { field } => {
+                write!(f, "invalid App VM target identity: {field}")
             }
             Self::InvalidDesktopProfile { vm_id, reason } => write!(
                 f,
@@ -444,6 +455,15 @@ pub fn apply_request(
             requested_capabilities,
             resume,
         } => {
+            for (field, value) in [
+                ("serving_peer", serving_peer.as_str()),
+                ("vm_id", vm_id.as_str()),
+                ("client_peer", client_peer.as_str()),
+            ] {
+                if !valid_app_vm_target_identity(value) {
+                    return Err(SessionError::InvalidAppVmTarget { field });
+                }
+            }
             let session = open_app_session(
                 id.clone(),
                 serving_peer,
@@ -570,6 +590,18 @@ pub fn apply_request(
             Ok(())
         }
     }
+}
+
+/// Validate identities supplied alongside an admitted App VM declaration.
+/// These values are later reused by Workloads, libvirt, and replicated session
+/// paths; accepting an empty, control-bearing, or path-like value here would
+/// defer a malformed request until after roster admission.
+fn valid_app_vm_target_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.chars().any(char::is_control)
+        && !value.contains('/')
+        && !value.contains('\\')
 }
 
 /// Look up `id` in `roster`, apply the fallible transition `f`, and store the
@@ -2224,6 +2256,48 @@ mod tests {
         );
         assert!(matches!(result, Err(SessionError::InvalidAppVm(_))));
         assert!(roster.is_empty());
+    }
+
+    #[test]
+    fn app_vm_open_rejects_path_like_or_empty_target_identities() {
+        for (field, value) in [
+            ("serving_peer", "peer/host"),
+            ("vm_id", "../app-vm"),
+            ("client_peer", "peer\nseat"),
+            ("vm_id", ""),
+        ] {
+            let mut roster = BTreeMap::new();
+            let mut request = SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            };
+            match &mut request {
+                SessionRequest::OpenApp {
+                    serving_peer,
+                    vm_id,
+                    client_peer,
+                    ..
+                } => match field {
+                    "serving_peer" => *serving_peer = value.into(),
+                    "vm_id" => *vm_id = value.into(),
+                    "client_peer" => *client_peer = value.into(),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                apply_request(&mut roster, request, 42),
+                Err(SessionError::InvalidAppVmTarget { field })
+            );
+            assert!(roster.is_empty(), "rejected target entered the roster");
+        }
     }
 
     #[test]
