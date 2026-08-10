@@ -597,6 +597,7 @@ impl Caster for NetworkCaster {
             return Err(CastError::Invalid("no media is loaded to cast".to_owned()));
         }
         if !valid_cast_text(&req.media_url)
+            || !valid_media_url(&req.media_url)
             || req
                 .title
                 .as_deref()
@@ -850,6 +851,52 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
 /// a remote control caller from making an unbounded in-memory request.
 fn valid_cast_text(value: &str) -> bool {
     value.len() <= MAX_CAST_REQUEST_TEXT_BYTES && !value.chars().any(char::is_control)
+}
+
+/// A renderer can only fetch a network media resource.  Refuse local paths,
+/// alternate schemes, credentials, and malformed authorities before any SOAP
+/// request is sent; otherwise a cast could look admitted while the renderer
+/// has no usable source.
+fn valid_media_url(value: &str) -> bool {
+    if !valid_http_field(value) {
+        return false;
+    }
+    let Some(rest) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return false;
+        };
+        if bracketed[..close].parse::<IpAddr>().is_err() {
+            return false;
+        }
+        let suffix = &bracketed[close + 1..];
+        suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.parse::<u16>().is_ok() && port != "0")
+    } else if authority.matches(':').count() > 1 {
+        false
+    } else {
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, port)| {
+                if port.parse::<u16>().is_ok() && port != "0" {
+                    host
+                } else {
+                    ""
+                }
+            });
+        !host.is_empty() && valid_http_field(host)
+    }
 }
 
 /// Raw HTTP fields must never contain controls or whitespace, which would otherwise
@@ -1528,6 +1575,38 @@ id=bad\nhost=192.0.2.22\nport=not-a-port\n";
                 caster.cast(&target, &request),
                 Err(CastError::Invalid(_))
             ));
+        }
+    }
+
+    #[test]
+    fn non_network_or_malformed_media_urls_fail_before_cast_admission() {
+        let caster = NetworkCaster::default();
+        let target = CastTarget {
+            kind: CastKind::Chromecast,
+            id: "cc".to_owned(),
+            name: "TV".to_owned(),
+            location: "192.0.2.2:8009".to_owned(),
+        };
+        for media_url in [
+            "file:///tmp/track.mp3",
+            "ftp://music.example/track.mp3",
+            "http:///track.mp3",
+            "https://:443/track.mp3",
+            "http://user:secret@music.example/track.mp3",
+            "http://music.example:0/track.mp3",
+            "http://music.example/track name.mp3",
+        ] {
+            let request = CastRequest {
+                media_url: media_url.to_owned(),
+                ..CastRequest::default()
+            };
+            assert!(
+                matches!(
+                    caster.cast(&target, &request),
+                    Err(CastError::Invalid(message)) if message.contains("media metadata")
+                ),
+                "media URL should be refused before the cast gate: {media_url}"
+            );
         }
     }
 

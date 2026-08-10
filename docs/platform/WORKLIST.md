@@ -1452,22 +1452,22 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
 - **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
   `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
-- Remaining work: **Music Bus replacement checkpoint (2026-08-10):** the workspace reader reopens the Bus index after inode replacement and converges;
-  seat 90 passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
+- Remaining work: **Music Bus replacement checkpoint (2026-08-10):** Bus index inode replacement converges; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
+- **Cast media URL admission checkpoint (2026-08-10):** refuses local, alternate-scheme, malformed-authority,
+  credential-bearing, whitespace-bearing, and non-network locators before renderer admission; BigBoy passed:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
-- **Signed live-radio checkpoint (2026-08-08):** native F44 release 8 is live
-  on all five seats with host-encrypted Music credentials. Dell and seat 15
-  pass exact retained C-SPAN signed Play/Stop; Dell sink capture is non-silent
-  (2,621,440 bytes, 287,035 non-zero samples, peak 20,092, RMS 1,677.73).
-  T480/Eagle/Surface mutating playback and human speaker judgment remain open.
+- **Signed live-radio checkpoint (2026-08-08):** release 8 is live on five seats with encrypted Music credentials; Dell/15 pass retained C-SPAN Play/Stop.
+  Dell capture is non-silent (2,621,440 bytes, 287,035 non-zero, peak 20,092, RMS 1,677.73); T480/Eagle/Surface mutation and speaker judgment remain open.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-radio-release8-r1.md`.
 - **Library checkpoint (2026-08-06):** typed collections replace Airsonic rows; UI 44/44 on `.50`, fmt `.90`; `evidence/WL-FUNC-021-2026-08-06-daemon-library-r1.md`.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
 - **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-search-replay-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-source-identity-r1.md`.
-- **Cache checkpoints (2026-08-07/09):** Jellyfin bytes reject truncation; daemon index and Jellyfin metadata replacement are atomic and preserve last-good.
-  BigBoy passed 2/2 plus 1/1; mde-jellyfin 114/114, Media UI 104/104, and `.50` cache 16/16 passed. Live/package proof remains open.
+- **Cache checkpoints (2026-08-07/09):** Jellyfin truncation is rejected; index and metadata replacement preserve last-good.
+  BigBoy 2/2+1/1; mde-jellyfin 114/114; Media UI 104/104; `.50` cache 16/16; live/package proof remains open.
   `evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`,
   `evidence/WL-FUNC-021-2026-08-09-jellyfin-metadata-atomic-r12.md`.
 - **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
