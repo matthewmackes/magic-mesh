@@ -604,6 +604,7 @@ where
         local_node_id,
         &publishers,
         &mut candidate_state,
+        now_ms,
         &mut report,
     );
     candidate_state
@@ -726,6 +727,7 @@ fn restore_health_checkpoint(
     local_node_id: &str,
     publishers: &BTreeSet<String>,
     state: &mut HealthIngressState,
+    now_ms: u64,
     report: &mut HealthIngressReport,
 ) {
     if state.checkpoint_loaded {
@@ -762,7 +764,7 @@ fn restore_health_checkpoint(
             publisher != &publication.publisher
                 || !is_safe_health_publisher(publisher)
                 || publication
-                    .validate_at(publication.published_at_ms)
+                    .validate_at(now_ms)
                     .is_err()
         })
     {
@@ -1024,6 +1026,7 @@ fn restore_retained_projection(
     report: &mut HealthIngressReport,
 ) {
     let Some(retained) = ledger.retained(publisher) else {
+        clear_invalid_health_projection(workgroup_root, publisher, report);
         return;
     };
     match project_health_state(workgroup_root, retained) {
@@ -1036,6 +1039,31 @@ fn restore_retained_projection(
                 "health-reconciler: failed to restore retained health projection",
             );
         }
+    }
+}
+
+/// Remove a rejected derived projection when no last-good state can restore it.
+/// Never follow or remove a symlink; leaving it in place keeps subsequent reads
+/// fail-closed while avoiding a path-redirection primitive.
+fn clear_invalid_health_projection(
+    workgroup_root: &Path,
+    publisher: &str,
+    report: &mut HealthIngressReport,
+) {
+    let path = health_projection_path(workgroup_root, publisher);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            report.projection_failures += 1;
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return;
+    }
+    if std::fs::remove_file(path).is_err() {
+        report.projection_failures += 1;
     }
 }
 
@@ -1657,6 +1685,57 @@ mod tests {
         assert_eq!(
             after_restart.bus_cursors.get("node-a").map(String::as_str),
             Some(message.ulid.as_str())
+        );
+    }
+
+    #[test]
+    fn health_ingress_drops_expired_checkpoint_state_and_stale_projection() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
+        let conn = fresh_store();
+        seed_node(&conn, "node-a");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let first = health_publication("node-a", 1, 100);
+        let body = serde_json::to_string(&first).expect("encode state");
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish state");
+
+        let mut before_expiry = HealthIngressState::default();
+        ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut before_expiry,
+            500,
+        )
+        .expect("initial ingress");
+        let projection = health_projection_path(workgroup.path(), "node-a");
+        assert!(projection.is_file(), "initial state is projected");
+
+        let mut after_expiry = HealthIngressState::default();
+        let report = ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut after_expiry,
+            2_001,
+        )
+        .expect("expired ingress remains bounded");
+
+        assert!(!report.checkpoint_restored);
+        assert_eq!(report.checkpoint_failures, 1);
+        assert!(after_expiry.ledger.retained("node-a").is_none());
+        assert!(
+            !projection.exists(),
+            "expired derived state must not remain visible without a last-good replacement"
         );
     }
 
