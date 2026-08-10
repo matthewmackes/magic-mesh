@@ -256,6 +256,14 @@ impl Persist {
         }
         std::fs::create_dir_all(&bus_root)
             .map_err(|e| PersistError::Io(format!("mkdir {}: {e}", bus_root.display())))?;
+        // A desktop process can win the cold-boot create race inside the
+        // tmpfiles-created 01777 spool.  SQLite then opens its user-owned WAL
+        // read-only from the root daemon because the sticky directory blocks
+        // cross-uid sidecar replacement.  Relax the shared directory and any
+        // existing sidecars before schema initialization; doing this after
+        // `open_conn` is too late because SCHEMA is the first write.
+        relax_shared(&bus_root, true);
+        relax_db(&bus_root);
         let mut conn = Self::open_conn(&db_path)?;
         // SETUP-fix — a SHARED spool (MDE_BUS_ROOT) is read+written by both the
         // root mackesd daemon AND the uid-1000 desktop GUIs, so the spool dir +
