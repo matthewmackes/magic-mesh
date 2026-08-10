@@ -1537,7 +1537,10 @@ impl SystemWorkloadActuator {
             }),
             network: Some("default".to_string()),
         };
-        let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string);
+        let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string)
+            .map_err(|error| {
+                WorkloadActuatorError::Permanent(format!("invalid VM resources: {error}"))
+            })?;
         let xml_path = std::env::temp_dir().join(format!("mde-workload-{domain}.xml"));
         fs::write(&xml_path, xml.as_bytes()).map_err(|error| {
             WorkloadActuatorError::Retryable(format!("write VM definition: {error}"))

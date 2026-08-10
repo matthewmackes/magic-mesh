@@ -99,8 +99,8 @@ behavioral evidence is not completion.
 - Remaining work:
 - **VM resource-efficiency checkpoints (2026-08-10):** Dom0-safe CPU pinning, bounded queues, qcow2 discard, and shared non-Dom0 CPU pools passed focused `.90` gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
-- **Terminal attachment revocation checkpoint (2026-08-10):** permanent restart-observation failure clears its Display1 lease before journaling failure; exact machine-9
-  proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
+- **Dom0 reserve (2026-08-10):** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-dom0-cpu-reserve-r154.md`.
+- **Terminal attachment revocation (2026-08-10):** exact machine-9 proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
 - **Recovered attachment lease checkpoints (2026-08-10):** restart recovery refuses false Ready without its Display1 lease, requires its full journaled identity, and revokes
@@ -1215,6 +1215,9 @@ behavioral evidence is not completion.
   desktop source rosters are withheld before they can revive an approval-gated RDP card;
   `.90` passed the exact regression. Authenticated login/render proof remains:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-stale-desktop-roster-r151.md`.
+- **Zero-observation checkpoint (2026-08-10):** desktop/RDP projection refuses
+  sources with no observation timestamp; `.50` passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-zero-observation-r154.md`.
 - **Live Windows discovery checkpoint (2026-08-09):** Basement seat 15 now
   explicitly targets the quiet Windows endpoint at `172.20.146.54`; its fresh
   shared probe inventory contains `ms-wbt-server` on TCP 3389. Authenticated
@@ -1935,6 +1938,10 @@ behavioral evidence is not completion.
   remains. Evidence:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`,
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-recovery-readiness-order-r149.md`.
+- **Syncthing reconcile bound (2026-08-10):** timer/manual runs now serialize
+  and bound CLI/registry calls, preventing stalled overlap from amplifying CPU;
+  `.50` passed the device-scope self-test:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-reconcile-bound-r154.md`.
 - **Peer-publication failover checkpoint (2026-08-09):** Dell exposed a false
   healthy state when one reachable etcd voter could not commit. Client
   operations now remember and fail over to a committing member, heartbeat
@@ -2211,6 +2218,9 @@ behavioral evidence is not completion.
   interfaces with exact control-compatible sysfs identity and truthful link
   state; `.90` passed the exact regression:
   `docs/platform/evidence/WL-UX-011-2026-08-10-network-interface-provider-r19.md`.
+- **Sensor inventory bound (2026-08-10):** thermal/hwmon entities are capped
+  and selected deterministically without credential-shaped payloads; `.90`
+  passed: `docs/platform/evidence/WL-UX-011-2026-08-10-sensor-cap-r155.md`.
 - **Deterministic thermal source checkpoint (2026-08-10):** sysfs thermal zones
   are sorted before the bounded provider limit, preventing directory-order
   churn in hardware summaries; `.50` passed the focused hostile-sensor gate:

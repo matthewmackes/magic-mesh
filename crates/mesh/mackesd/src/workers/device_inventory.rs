@@ -35,7 +35,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::device_inventory::{
@@ -710,8 +710,17 @@ fn class_named_devices(
     class: &str,
     name_file: Option<&str>,
 ) -> Vec<DeviceRecord> {
+    class_named_devices_bounded(roots, class, name_file, usize::MAX)
+}
+
+fn class_named_devices_bounded(
+    roots: &SysfsRoots,
+    class: &str,
+    name_file: Option<&str>,
+    limit: usize,
+) -> Vec<DeviceRecord> {
     let mut out = Vec::new();
-    for dir in sorted_children(&roots.sys.join("class").join(class)) {
+    for dir in sorted_children_bounded(&roots.sys.join("class").join(class), limit) {
         let node = dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -753,15 +762,27 @@ const MAX_NETWORK_INTERFACES: usize = 256;
 const MAX_DRM_CONNECTORS: usize = 128;
 /// Maximum advertised modes retained for one connector.
 const MAX_DRM_CONNECTOR_MODES: usize = 16;
+/// Maximum thermal and hwmon entities retained in one inventory generation.
+const MAX_SENSOR_DEVICES: usize = 128;
 
-/// Read at most `limit` children and sort that bounded sample for stable output.
+/// Read at most `limit` lexicographically first children with bounded memory.
 fn sorted_children_bounded(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<PathBuf> = rd.take(limit).flatten().map(|entry| entry.path()).collect();
-    out.sort();
-    out
+    let mut out = BTreeSet::new();
+    for entry in rd.flatten() {
+        out.insert(entry.path());
+        if out.len() > limit {
+            if let Some(last) = out.iter().next_back().cloned() {
+                out.remove(&last);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn drm_connector_name(node: &str) -> Option<&str> {
@@ -943,9 +964,10 @@ pub fn network_interfaces(roots: &SysfsRoots) -> Vec<DeviceRecord> {
 #[allow(clippy::cast_precision_loss)] // a millidegree i64 → °C f64 is lossless in range
 pub fn sensors(roots: &SysfsRoots) -> Vec<DeviceRecord> {
     let mut out = Vec::new();
-    for dir in sorted_children(&roots.sys.join("class").join("thermal")) {
+    for dir in sorted_children_bounded(&roots.sys.join("class").join("thermal"), MAX_SENSOR_DEVICES)
+    {
         let node = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if !node.starts_with("thermal_zone") {
+        if !node.starts_with("thermal_zone") || out.len() >= MAX_SENSOR_DEVICES {
             continue;
         }
         let kind = read_trim(&dir.join("type")).unwrap_or_else(|| node.to_string());
@@ -958,7 +980,14 @@ pub fn sensors(roots: &SysfsRoots) -> Vec<DeviceRecord> {
         }
         out.push(rec);
     }
-    out.extend(class_named_devices(roots, "hwmon", Some("name")));
+    if out.len() < MAX_SENSOR_DEVICES {
+        out.extend(class_named_devices_bounded(
+            roots,
+            "hwmon",
+            Some("name"),
+            MAX_SENSOR_DEVICES - out.len(),
+        ));
+    }
     out
 }
 
@@ -1536,6 +1565,31 @@ mod tests {
         assert!(power_supplies(&roots)
             .iter()
             .any(|r| r.name.contains("Battery")));
+    }
+
+    #[test]
+    fn sensors_are_bounded_and_do_not_publish_untrusted_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        for index in 0..MAX_SENSOR_DEVICES.saturating_add(16) {
+            let zone = roots
+                .sys
+                .join("class/thermal")
+                .join(format!("thermal_zone{index:03}"));
+            put(&zone.join("type"), &format!("sensor-{index}\n"));
+            put(&zone.join("temp"), "42000\n");
+        }
+        put(
+            &roots.sys.join("class/hwmon/hwmon999/name"),
+            "credential-like-sensor-payload\n",
+        );
+
+        let records = sensors(&roots);
+        assert_eq!(records.len(), MAX_SENSOR_DEVICES);
+        assert_eq!(records[0].name, "Thermal zone: sensor-0");
+        assert!(!serde_json::to_string(&records)
+            .unwrap()
+            .contains("credential-like"));
     }
 
     #[test]

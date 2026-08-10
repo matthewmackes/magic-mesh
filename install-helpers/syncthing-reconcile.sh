@@ -18,14 +18,30 @@ ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
 FOLDER_ID="${MCNF_SYNCTHING_FOLDER_ID:-mcnf-mesh}"
 HOST="${MCNF_HOSTNAME:-$(hostname -s)}"
 DEV_RE='^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$'
+COMMAND_TIMEOUT_SEC="${MCNF_SYNCTHING_RECONCILE_TIMEOUT_SEC:-15}"
+case "$COMMAND_TIMEOUT_SEC" in
+  ''|*[!0-9]*) COMMAND_TIMEOUT_SEC=15 ;;
+esac
+
+# The timer is deliberately shorter than its two-minute period, but a slow
+# etcd/Syncthing CLI must not leave overlapping oneshots behind.  Keep the
+# lock beside the daemon's private state so direct/manual invocations share
+# the same exclusion without requiring a pre-created /run directory.
+mkdir -p "$H"
+exec 9>"$H/reconcile.lock"
+flock -n 9 || exit 0
+
+bounded() {
+  timeout --kill-after=5s "${COMMAND_TIMEOUT_SEC}s" "$@"
+}
 
 [ -s "$ENDPOINTS_FILE" ] || exit 0                       # no etcd substrate → nothing to do
 command -v etcdctl   >/dev/null 2>&1 || exit 0
 command -v syncthing >/dev/null 2>&1 || exit 0
-systemctl is-active --quiet syncthing || exit 0          # daemon down → nothing to reconcile live
+bounded systemctl is-active --quiet syncthing || exit 0  # daemon down → nothing to reconcile live
 
 EPS="$(tr '\n' ',' < "$ENDPOINTS_FILE" | sed 's/,$//')"
-cli() { HOME="$H" syncthing cli --home="$H" "$@"; }
+cli() { HOME="$H" bounded syncthing cli --home="$H" "$@"; }
 
 # Devices already in the running config (one base32 id per line, incl. self).
 CURRENT="$(cli config devices list 2>/dev/null || true)"
@@ -35,7 +51,7 @@ FOLDER_CURRENT="$(cli config folders "$FOLDER_ID" devices list 2>/dev/null || tr
 
 # Registry → "host<TAB>device-id@overlay-ip" pairs (clean alternating key/value
 # lines from etcdctl, paired by awk — matching setup-syncthing.sh's parser).
-ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/null \
+ETCDCTL_API=3 bounded etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/null \
   | awk 'NR%2==1{sub(/.*\/mesh\/syncthing\//,"",$0); k=$0; next} {print k"\t"$0}' \
   | while IFS=$'\t' read -r rhost val; do
       [ "$rhost" = "$HOST" ] && continue                 # never re-add ourselves

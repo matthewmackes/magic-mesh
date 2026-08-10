@@ -30,7 +30,35 @@ pub struct VmDomainSpec {
     pub network: Option<String>,
 }
 
+/// Why a VM domain definition was refused before it could reach libvirt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmDomainSpecError {
+    /// A guest must have at least one vCPU and one MiB of memory.
+    EmptyResources,
+    /// The host must retain one CPU lane for Dom0 and QEMU services.
+    NoDom0Reserve,
+}
+
+impl std::fmt::Display for VmDomainSpecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyResources => formatter.write_str("VM resources must be non-zero"),
+            Self::NoDom0Reserve => formatter.write_str("VM requires one host CPU reserved for Dom0"),
+        }
+    }
+}
+
 impl VmDomainSpec {
+    fn validate(&self) -> Result<(), VmDomainSpecError> {
+        if self.vcpus == 0 || self.ram_mb == 0 {
+            return Err(VmDomainSpecError::EmptyResources);
+        }
+        if self.host_threads <= self.vcpus {
+            return Err(VmDomainSpecError::NoDom0Reserve);
+        }
+        Ok(())
+    }
+
     /// The configured network, or the managed default.
     #[must_use]
     pub fn network_or_default(&self) -> &str {
@@ -71,29 +99,21 @@ fn xml_escape(value: &str) -> String {
 /// PipeWire-Pulse loopback endpoint instead of guessing at a system QEMU
 /// user's nonexistent PipeWire runtime directory.
 #[must_use]
-pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
-    let has_dom0_reserve = spec.host_threads > spec.vcpus && spec.vcpus > 0;
-    let guest_cpuset = if has_dom0_reserve {
-        Some(format!("1-{}", spec.host_threads - 1))
-    } else {
-        None
-    };
-    let cpu_tune = if let Some(cpuset) = guest_cpuset.as_deref() {
+pub fn build_domain_xml(
+    spec: &VmDomainSpec,
+    disk_path: &str,
+) -> Result<String, VmDomainSpecError> {
+    spec.validate()?;
+    let guest_cpuset = format!("1-{}", spec.host_threads - 1);
+    let cpu_tune = {
         format!(
-            "  <cputune>\n    <emulatorpin cpuset='{cpuset}'/>\n    <iothreadpin iothread='1' cpuset='{cpuset}'/>\n  </cputune>\n"
+            "  <cputune>\n    <emulatorpin cpuset='{guest_cpuset}'/>\n    <iothreadpin iothread='1' cpuset='{guest_cpuset}'/>\n  </cputune>\n"
         )
-    } else {
-        String::new()
     };
     // A queue per admitted guest vCPU avoids serializing desktop traffic on one
-    // virtqueue. Keep the single-queue fallback whenever the host cannot retain
-    // its required VM-free Dom0 thread, and cap queue-created host work.
-    let network_queues = if spec.host_threads > spec.vcpus && spec.vcpus > 0 {
-        spec.vcpus.min(MAX_VIRTIO_NET_QUEUES)
-    } else {
-        1
-    };
-    format!(
+    // virtqueue while the cap bounds queue-created host work.
+    let network_queues = spec.vcpus.min(MAX_VIRTIO_NET_QUEUES);
+    Ok(format!(
         "<domain type='kvm'>\n\
          \x20 <name>{name}</name>\n\
          \x20 <memory unit='MiB'>{memory}</memory>\n\
@@ -134,14 +154,12 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
         name = xml_escape(&spec.name),
         memory = spec.ram_mb,
         vcpus = spec.vcpus,
-        vcpu_cpuset = guest_cpuset
-            .as_deref()
-            .map_or_else(String::new, |cpuset| format!(" cpuset='{cpuset}'")),
+        vcpu_cpuset = format!(" cpuset='{guest_cpuset}'"),
         cpu_tune = cpu_tune,
         disk = xml_escape(disk_path),
         network = xml_escape(spec.network_or_default()),
         network_queues = network_queues,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -159,7 +177,8 @@ mod tests {
                 network: None,
             },
             "/var/lib/mde-vms/a'&.qcow2",
-        );
+        )
+        .expect("valid VM domain spec");
         assert!(xml.contains("<graphics type='dbus' p2p='yes'>"));
         assert!(xml.contains("<gl enable='yes'/></graphics>"));
         assert_eq!(xml.matches("<graphics type=").count(), 1);
@@ -191,7 +210,8 @@ mod tests {
             network: None,
         };
 
-        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/shared-pool.qcow2");
+        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/shared-pool.qcow2")
+            .expect("valid VM domain spec");
 
         assert!(xml.contains("<vcpu placement='static' cpuset='1-7'>2</vcpu>"));
         assert!(xml.contains("<emulatorpin cpuset='1-7'/>"));
@@ -213,11 +233,28 @@ mod tests {
                 },
                 "/var/lib/mde-vms/queue-test.qcow2",
             )
+            .expect("valid VM domain spec")
         };
 
         assert!(domain(3, 4).contains("<driver queues='3'/>"));
-        assert!(domain(4, 4).contains("<driver queues='1'/>"));
+        assert!(domain(1, 2).contains("<driver queues='1'/>"));
         assert!(domain(64, 65).contains("<driver queues='8'/>"));
+    }
+
+    #[test]
+    fn definition_refuses_to_overcommit_dom0_cpu_reserve() {
+        let spec = VmDomainSpec {
+            name: "overcommitted".into(),
+            vcpus: 4,
+            ram_mb: 4096,
+            host_threads: 4,
+            network: None,
+        };
+
+        assert_eq!(
+            build_domain_xml(&spec, "/var/lib/mde-vms/overcommitted.qcow2"),
+            Err(VmDomainSpecError::NoDom0Reserve)
+        );
     }
 
     #[test]
