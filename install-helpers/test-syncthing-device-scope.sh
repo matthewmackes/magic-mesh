@@ -63,6 +63,11 @@ case " $* " in
     *" get "*)
         case "${TEST_ETCD_MODE:-authoritative}" in
             authoritative) sed -n '1,$p' "${TEST_REGISTRY_FILE:?}" ;;
+            amplified)
+                for _ in $(seq 1 400); do
+                    sed -n '1,$p' "${TEST_REGISTRY_FILE:?}"
+                done
+                ;;
             empty) exit 0 ;;
             offline) exit 1 ;;
             *) exit 64 ;;
@@ -382,4 +387,28 @@ run_reconcile_case authoritative
 run_reconcile_case offline
 printf 'ok: timer reconciler adds missing global/folder membership without restart or deletion\n'
 printf 'ok: offline timer reconciler performs no Syncthing mutation\n'
+
+# A duplicated/hostile registry response must not amplify one timer tick into
+# unbounded repeated CLI mutations. The cap is intentionally exercised below
+# the normal default so this stays a deterministic bounded-recovery regression.
+AMPLIFIED_CALLS="$TEST_ROOT/reconcile-amplified.calls"
+AMPLIFIED_GLOBAL="$TEST_ROOT/reconcile-amplified-global.txt"
+AMPLIFIED_FOLDER="$TEST_ROOT/reconcile-amplified-folder.txt"
+: > "$AMPLIFIED_CALLS"
+printf '%s\n' "$SELF_ID" > "$AMPLIFIED_GLOBAL"
+printf '%s\n' "$SELF_ID" > "$AMPLIFIED_FOLDER"
+TEST_CALL_LOG="$AMPLIFIED_CALLS" TEST_ETCD_MODE=amplified \
+TEST_GLOBAL_DEVICES_FILE="$AMPLIFIED_GLOBAL" \
+TEST_FOLDER_DEVICES_FILE="$AMPLIFIED_FOLDER" \
+TEST_SYSTEM_FILE="$SYSTEM_FILE" TEST_CONNECTIONS_FILE="$HEALTHY_CONNECTIONS" \
+MCNF_ETCD_ENDPOINTS_FILE="$TEST_ROOT/endpoints" MCNF_SYNCTHING_HOME="$TEST_ROOT/reconcile-amplified-home" \
+MCNF_HOSTNAME=seat15 MCNF_SYNCTHING_RECONCILE_MAX_ENTRIES=2 "$RECONCILE"
+if grep -q "config devices add --device-id $PEER_TWO" "$AMPLIFIED_CALLS" || \
+   [ "$(grep -c "config devices add --device-id $PEER_ONE" "$AMPLIFIED_CALLS")" -ne 1 ] || \
+   [ "$(grep -c "config folders mcnf-mesh devices add --device-id $PEER_ONE" "$AMPLIFIED_CALLS")" -ne 1 ]; then
+    printf 'reconciler exceeded its per-run registry entry cap under amplified input\n' >&2
+    sed -n '1,20p' "$AMPLIFIED_CALLS" >&2
+    exit 1
+fi
+printf 'ok: amplified registry input is capped before it can amplify Syncthing CLI mutations\n'
 printf 'PASS: Syncthing managed-folder device-scope self-test\n'

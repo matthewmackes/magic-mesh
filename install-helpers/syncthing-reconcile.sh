@@ -22,6 +22,10 @@ COMMAND_TIMEOUT_SEC="${MCNF_SYNCTHING_RECONCILE_TIMEOUT_SEC:-15}"
 case "$COMMAND_TIMEOUT_SEC" in
   ''|*[!0-9]*) COMMAND_TIMEOUT_SEC=15 ;;
 esac
+MAX_REGISTRY_ENTRIES="${MCNF_SYNCTHING_RECONCILE_MAX_ENTRIES:-256}"
+case "$MAX_REGISTRY_ENTRIES" in
+  ''|*[!0-9]*) MAX_REGISTRY_ENTRIES=256 ;;
+esac
 
 # The timer is deliberately shorter than its two-minute period, but a slow
 # etcd/Syncthing CLI must not leave overlapping oneshots behind.  Keep the
@@ -52,7 +56,11 @@ FOLDER_CURRENT="$(cli config folders "$FOLDER_ID" devices list 2>/dev/null || tr
 # Registry → "host<TAB>device-id@overlay-ip" pairs (clean alternating key/value
 # lines from etcdctl, paired by awk — matching setup-syncthing.sh's parser).
 ETCDCTL_API=3 bounded etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/null \
-  | awk 'NR%2==1{sub(/.*\/mesh\/syncthing\//,"",$0); k=$0; next} {print k"\t"$0}' \
+  | awk -v max="$MAX_REGISTRY_ENTRIES" '
+      NR%2==1 {sub(/.*\/mesh\/syncthing\//,"",$0); k=$0; next}
+      ++n <= max {print k"\t"$0}
+      n >= max {exit}
+    ' \
   | while IFS=$'\t' read -r rhost val; do
       [ "$rhost" = "$HOST" ] && continue                 # never re-add ourselves
       dev="${val%@*}"; ip="${val#*@}"
