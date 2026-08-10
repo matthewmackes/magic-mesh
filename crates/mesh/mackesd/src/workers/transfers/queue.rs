@@ -100,7 +100,7 @@ impl TransferQueue {
     /// Accept a (client-minted, Queued) job into the ledger.
     ///
     /// # Errors
-    /// A ledger write failure.
+    /// A duplicate ID or ledger write failure.
     pub fn submit(&self, mut job: TransferJob) -> io::Result<String> {
         // Normalize: a submit always enters Queued (the client sets it, but the
         // daemon is the authority — never trust an inbound Running/Done state).
@@ -108,6 +108,12 @@ impl TransferQueue {
             job.set_state(TransferState::Queued);
         }
         let id = job.id.clone();
+        if self.ledger.get(&id).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("transfer `{id}` is already admitted"),
+            ));
+        }
         self.ledger.upsert(&job)?;
         Ok(id)
     }
@@ -451,6 +457,25 @@ mod tests {
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].state, TransferState::Queued);
         assert_eq!(queue.get(&id).unwrap().source, "/a");
+    }
+
+    #[test]
+    fn duplicate_submit_cannot_replace_running_authority() {
+        let (_t, queue) = q(1);
+        let original = queue.submit(job("/authoritative")).unwrap();
+        let running = queue.claim_next().expect("original occupies the lane");
+        assert_eq!(running.id, original);
+
+        let mut replay = job("/attacker-replacement");
+        replay.id = original.clone();
+        assert!(matches!(
+            queue.submit(replay),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        let retained = queue.get(&original).expect("original ledger row retained");
+        assert_eq!(retained.source, "/authoritative");
+        assert_eq!(retained.state, TransferState::Running);
+        assert_eq!(queue.running_count(), 1, "replay cannot free or replace the lane");
     }
 
     #[test]

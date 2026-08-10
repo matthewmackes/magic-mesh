@@ -660,6 +660,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-chat-bus-recovery-r26.md`.
 - **Notification recovery checkpoint (2026-08-09):** replacement activation skips retained Cloud alerts, preserves failed folds, and primes lanes idempotently:
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-replacement-r85.md`.
+- **Transfer duplicate-admission checkpoint (2026-08-10):** the daemon refuses a replayed
+  legacy transfer ID instead of replacing an already-running ledger row; `.90` passed the
+  hostile replacement regression: `docs/platform/evidence/WL-FUNC-011-2026-08-10-transfer-duplicate-admission-r186.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
