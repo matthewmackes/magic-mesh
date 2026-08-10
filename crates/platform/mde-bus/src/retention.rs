@@ -2,14 +2,13 @@
 //!
 //! Per `docs/design/v6.x-mackes-bus.md` §8:
 //!
-//! - **Per-priority TTL**:
-//!     - `urgent`  — forever (never deleted)
-//!     - `high`    — 30 days
-//!     - `default` — 7 days
-//!     - `min`     — 24 hours
-//!   Operators can override per-topic via `policy.yaml` (deferred
-//!   to BUS-7.3 — the default policy ships hardcoded here).
-//! - **`audit/*` is BOUNDED, not exempt** (AUDIT-RUN-CAP-1): the audit
+//! - **Universal privacy ceiling**: every priority and topic, including
+//!   `urgent` and `audit/*`, has a hard maximum age of six hours. The regular
+//!   GC cutoff is two minutes shorter than that ceiling so the next scheduled
+//!   pass does not intentionally retain a message past six hours. Ephemeral
+//!   request/reply topics remain shorter at one hour. There is no forever
+//!   exception.
+//! - **`audit/*` is additionally size-bounded** (AUDIT-RUN-CAP-1): the audit
 //!   trail rides the bus on the `/run` tmpfs, so each pass prunes the
 //!   oldest audit records once the lane exceeds [`AUDIT_RUN_CAP_BYTES`],
 //!   keeping only the most-recent window resident. The old
@@ -42,16 +41,25 @@ use thiserror::Error;
 
 use crate::persist::Persist;
 
-/// TTL per priority class. Operators can override per-topic in
-/// BUS-7.3's policy.yaml (deferred); the defaults here match
-/// the design-doc lock.
-pub const DEFAULT_TTL_MIN_SECS: u64 = 24 * 60 * 60;
-pub const DEFAULT_TTL_DEFAULT_SECS: u64 = 7 * 24 * 60 * 60;
-pub const DEFAULT_TTL_HIGH_SECS: u64 = 30 * 24 * 60 * 60;
+/// Hard privacy ceiling for every persisted Bus message, regardless of topic
+/// or priority. No configuration may raise an effective TTL above this value.
+pub const MAX_RETENTION_SECS: u64 = 6 * 60 * 60;
+
+/// Allowance for the two-minute scheduled GC cadence. The policy cutoff is
+/// this much earlier than the privacy ceiling so a message that narrowly misses
+/// one pass is eligible on the next pass before reaching six hours of age.
+pub const RETENTION_SWEEP_ALLOWANCE_SECS: u64 = 120;
+
+/// Default effective TTL for every non-ephemeral priority. Separate constants
+/// remain for API compatibility, but all are constrained by the same privacy
+/// boundary and [`RetentionPolicy::ttl_secs`] clamps custom values as well.
+pub const DEFAULT_TTL_MIN_SECS: u64 = MAX_RETENTION_SECS - RETENTION_SWEEP_ALLOWANCE_SECS;
+pub const DEFAULT_TTL_DEFAULT_SECS: u64 = MAX_RETENTION_SECS - RETENTION_SWEEP_ALLOWANCE_SECS;
+pub const DEFAULT_TTL_HIGH_SECS: u64 = MAX_RETENTION_SECS - RETENTION_SWEEP_ALLOWANCE_SECS;
 /// EFF-47 — ephemeral RPC topics (`reply/<ulid>` + `action/…`).
 /// Interactive request/response pairs are garbage minutes after
 /// the exchange; without this class they sat at the `default`
-/// 7-day TTL and accumulated one row + file per RPC. One hour
+/// general Bus TTL and accumulated one row + file per RPC. One hour
 /// comfortably covers any in-flight poll/retry window.
 pub const DEFAULT_TTL_EPHEMERAL_SECS: u64 = 60 * 60;
 
@@ -121,8 +129,8 @@ pub const AUDIT_RUN_CAP_ENTRIES: usize = 2_000;
 /// BROKER-RESILIENCE-1 — per-topic byte cap for EVERY non-audit topic on `/run`.
 ///
 /// The audit lane already has its own ([`AUDIT_RUN_CAP_BYTES`]); this is the
-/// matching bound for every OTHER topic. The TTL reap shortest class is the
-/// `min` 24 h / ephemeral 1 h window, and the global quota / fs-pressure
+/// matching bound for every OTHER topic. The TTL reap has a universal six-hour
+/// ceiling / ephemeral 1 h window, and the global quota / fs-pressure
 /// evictor only fires under whole-`/run` pressure — so between those, a single
 /// high-frequency topic can balloon for a long time. When the broker is down
 /// that is exactly what happens: the alert/state sources keep publishing
@@ -209,7 +217,8 @@ pub const DEFAULT_PASS_INTERVAL: Duration = Duration::from_secs(120);
 /// for the design-locked defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct RetentionPolicy {
-    /// Seconds before `min`-priority messages are GC'd.
+    /// Seconds before `min`-priority messages are eligible for GC. Values above
+    /// the universal privacy limit are clamped by [`Self::ttl_secs`].
     pub ttl_min_secs: u64,
     /// Seconds before `default`-priority messages are GC'd.
     pub ttl_default_secs: u64,
@@ -272,17 +281,27 @@ impl Default for RetentionPolicy {
 }
 
 impl RetentionPolicy {
-    /// TTL in seconds for a given priority. `urgent` returns
-    /// `None` (never expires).
+    /// Effective TTL in seconds for a priority. Every class, including urgent
+    /// and unknown future classes, is capped below the six-hour privacy ceiling
+    /// by the scheduled-sweep allowance. There is no forever result.
     #[must_use]
     pub fn ttl_secs(&self, priority: &str) -> Option<u64> {
-        match priority {
-            "min" => Some(self.ttl_min_secs),
-            "default" => Some(self.ttl_default_secs),
-            "high" => Some(self.ttl_high_secs),
-            "urgent" => None,
-            _ => Some(self.ttl_default_secs),
-        }
+        let configured = match priority {
+            "min" => self.ttl_min_secs,
+            "default" => self.ttl_default_secs,
+            "high" => self.ttl_high_secs,
+            "urgent" => MAX_RETENTION_SECS,
+            _ => self.ttl_default_secs,
+        };
+        Some(configured.min(MAX_RETENTION_SECS - RETENTION_SWEEP_ALLOWANCE_SECS))
+    }
+
+    /// Effective ephemeral TTL. A malformed/custom policy may shorten this
+    /// window but can never raise it above the universal privacy cutoff.
+    #[must_use]
+    pub fn ephemeral_ttl_secs(&self) -> u64 {
+        self.ttl_ephemeral_secs
+            .min(MAX_RETENTION_SECS - RETENTION_SWEEP_ALLOWANCE_SECS)
     }
 }
 
@@ -695,25 +714,22 @@ fn run_pass_at_inner(
 ) -> Result<PassReport, RetentionError> {
     let conn = open_index(bus_root)?;
 
-    // Build cutoff per priority class and collect rows to delete.
-    // EPIC-BUS-EXT-AUDIT-BUS (Q28) — `audit/*` topics are
-    // retention=forever (the audit trail must never be reaped, even
-    // though audit records are `min` priority); exclude them from the
-    // victim query regardless of TTL.
-    let audit_like = format!("{}%", crate::persist::AUDIT_TOPIC_PREFIX);
+    // Build cutoff per priority class and collect rows to delete. The privacy
+    // ceiling has no topic exception: urgent and audit records are eligible in
+    // exactly the same pass as every other persisted Bus message.
     let mut victims: Vec<(String, String)> = Vec::new(); // (ulid, file_path)
-    for priority in ["min", "default", "high"] {
+    for priority in ["min", "default", "high", "urgent"] {
         let Some(cutoff) = ttl_cutoff_unix_ms(policy, priority, now_unix_ms) else {
             continue;
         };
         let mut stmt = conn
             .prepare(
                 "SELECT ulid, file_path FROM messages \
-                 WHERE priority = ?1 AND ts_unix_ms < ?2 AND topic NOT LIKE ?3",
+                 WHERE priority = ?1 AND ts_unix_ms < ?2",
             )
             .map_err(|e| RetentionError::Sql(format!("prepare: {e}")))?;
         let rows = stmt
-            .query_map(params![priority, cutoff, audit_like], |r| {
+            .query_map(params![priority, cutoff], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(|e| RetentionError::Sql(format!("query: {e}")))?;
@@ -722,24 +738,48 @@ fn run_pass_at_inner(
         }
     }
 
+    // Fail closed for rows written by a future or corrupt producer with an
+    // unknown priority string. Privacy retention is topic/priority universal;
+    // an unrecognized class must never become an accidental forever lane.
+    {
+        let cutoff = ttl_cutoff_unix_ms(policy, "unknown", now_unix_ms)
+            .expect("universal retention always has a cutoff");
+        let mut stmt = conn
+            .prepare(
+                "SELECT ulid, file_path FROM messages \
+                 WHERE priority NOT IN ('min', 'default', 'high', 'urgent') \
+                   AND ts_unix_ms < ?1",
+            )
+            .map_err(|e| RetentionError::Sql(format!("prepare unknown priority: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| RetentionError::Sql(format!("query unknown priority: {e}")))?;
+        for row in rows {
+            victims.push(
+                row.map_err(|e| RetentionError::Sql(format!("decode unknown priority: {e}")))?,
+            );
+        }
+    }
+
     // EFF-47 — ephemeral RPC topics (`reply/<ulid>` request-response
     // pairs + the `action/…` requests that produced them) reap on the
     // short ephemeral TTL regardless of priority class. Without this,
     // every interactive RPC accumulated a row + file for the full
-    // 7-day default TTL. `audit/*` can't match either prefix, but the
-    // exclusion is kept for defense in depth.
+    // universal non-ephemeral TTL, including when their priority is urgent.
     {
         let cutoff =
-            now_unix_ms - i64::try_from(policy.ttl_ephemeral_secs * 1000).unwrap_or(i64::MAX);
+            now_unix_ms - i64::try_from(policy.ephemeral_ttl_secs() * 1000).unwrap_or(i64::MAX);
         let mut stmt = conn
             .prepare(
                 "SELECT ulid, file_path FROM messages \
                  WHERE (topic LIKE 'reply/%' OR topic LIKE 'action/%') \
-                   AND ts_unix_ms < ?1 AND topic NOT LIKE ?2",
+                   AND ts_unix_ms < ?1",
             )
             .map_err(|e| RetentionError::Sql(format!("prepare ephemeral: {e}")))?;
         let rows = stmt
-            .query_map(params![cutoff, audit_like], |r| {
+            .query_map(params![cutoff], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(|e| RetentionError::Sql(format!("query ephemeral: {e}")))?;
@@ -770,9 +810,9 @@ fn run_pass_at_inner(
         removed += 1;
     }
 
-    // AUDIT-RUN-CAP-1 — bound the `audit/*` lane on `/run`. The TTL reap above
-    // deliberately skips `audit/*` (so the audit window isn't governed by the
-    // `min` 24 h class), but audit is no longer EXEMPT: prune the oldest audit
+    // AUDIT-RUN-CAP-1 — additionally bound the `audit/*` lane on `/run`. The TTL
+    // reap above enforces the universal privacy ceiling; this independent size
+    // and entry cap can prune the oldest audit records even sooner. Prune the
     // records whenever the lane exceeds its per-topic cap, keeping the
     // most-recent window resident on the tmpfs. This runs every pass — it is the
     // primary bound on audit growth, so the lane can never fill a small `/run`
@@ -1059,8 +1099,8 @@ fn delete_message_file_and_row(
 /// Returns the number of audit records pruned.
 ///
 /// This is what makes `audit/*` BOUNDED rather than exempt: unlike the TTL reap
-/// (which still skips `audit/*` so the audit window isn't governed by the `min`
-/// 24 h class) and unlike the hard-cap evictor (which only fires under quota /
+/// (which enforces the universal age ceiling) and unlike the hard-cap evictor
+/// (which only fires under quota /
 /// fs pressure), this runs every pass and keeps the audit lane itself from ever
 /// growing unbounded on the tmpfs.
 ///
@@ -1449,8 +1489,7 @@ mod tests {
         // audit/<peer> record. Purge them (row + files) so the
         // retention fixture contains exactly the seeded messages —
         // retention behavior is what's under test here, not the audit
-        // doubling (audit/* is retention-exempt anyway, exercised in
-        // its own test below).
+        // doubling (audit retention is exercised in its own test below).
         let conn = Connection::open(bus_root.join("index.sqlite")).unwrap();
         conn.execute("DELETE FROM messages WHERE topic LIKE 'audit/%'", [])
             .unwrap();
@@ -1464,9 +1503,25 @@ mod tests {
         assert_eq!(p.ttl_secs("min"), Some(DEFAULT_TTL_MIN_SECS));
         assert_eq!(p.ttl_secs("default"), Some(DEFAULT_TTL_DEFAULT_SECS));
         assert_eq!(p.ttl_secs("high"), Some(DEFAULT_TTL_HIGH_SECS));
-        assert_eq!(p.ttl_secs("urgent"), None);
+        assert_eq!(p.ttl_secs("urgent"), Some(DEFAULT_TTL_HIGH_SECS));
         // Unknown priorities fall back to `default`.
         assert_eq!(p.ttl_secs("garbage"), Some(DEFAULT_TTL_DEFAULT_SECS));
+    }
+
+    #[test]
+    fn custom_policy_cannot_exceed_six_hour_privacy_ceiling() {
+        let policy = RetentionPolicy {
+            ttl_min_secs: u64::MAX,
+            ttl_default_secs: u64::MAX,
+            ttl_high_secs: u64::MAX,
+            ttl_ephemeral_secs: u64::MAX,
+            ..RetentionPolicy::default()
+        };
+        let bounded = MAX_RETENTION_SECS - RETENTION_SWEEP_ALLOWANCE_SECS;
+        for priority in ["min", "default", "high", "urgent", "future"] {
+            assert_eq!(policy.ttl_secs(priority), Some(bounded), "{priority}");
+        }
+        assert_eq!(policy.ephemeral_ttl_secs(), bounded);
     }
 
     #[test]
@@ -1475,28 +1530,35 @@ mod tests {
         // 1_000_000_000_000 ms = 2001-09-09T01:46:40Z
         let now = 1_000_000_000_000_i64;
         let cutoff_default = ttl_cutoff_unix_ms(&p, "default", now).unwrap();
-        // default TTL = 7 days = 604800 seconds = 604_800_000 ms
-        assert_eq!(now - cutoff_default, 604_800_000);
+        assert_eq!(
+            now - cutoff_default,
+            i64::try_from(DEFAULT_TTL_DEFAULT_SECS * 1000).unwrap()
+        );
     }
 
     #[test]
-    fn urgent_messages_never_expire() {
+    fn urgent_messages_expire_under_six_hour_privacy_ceiling() {
         let now = 1_000_000_000_000_i64;
-        // 20 years ago — still urgent, still kept.
-        let twenty_years = 20_i64 * 365 * 24 * 60 * 60 * 1000;
-        let ancient = now - twenty_years;
-        let (_tmp, root) = open_tmp_with(&[("t", Priority::Urgent, ancient)]);
+        let six_hours_ago = now - i64::try_from(MAX_RETENTION_SECS * 1000).unwrap_or(i64::MAX);
+        let one_hour_ago = now - (60_i64 * 60 * 1000);
+        let (_tmp, root) = open_tmp_with(&[
+            ("t/old", Priority::Urgent, six_hours_ago),
+            ("t/new", Priority::Urgent, one_hour_ago),
+        ]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
-        assert_eq!(report.removed, 0);
+        assert_eq!(report.removed, 1);
+        let p = Persist::open(root).unwrap();
+        assert!(p.list_since("t/old", None).unwrap().is_empty());
+        assert_eq!(p.list_since("t/new", None).unwrap().len(), 1);
     }
 
     #[test]
-    fn min_messages_expire_after_24h() {
+    fn min_messages_expire_under_six_hours() {
         let now = 1_000_000_000_000_i64;
-        let day_ago_plus = now - (25_i64 * 60 * 60 * 1000); // 25h ago
+        let seven_hours_ago = now - (7_i64 * 60 * 60 * 1000);
         let recent = now - (1_i64 * 60 * 60 * 1000); // 1h ago
         let (_tmp, root) = open_tmp_with(&[
-            ("t/old", Priority::Min, day_ago_plus),
+            ("t/old", Priority::Min, seven_hours_ago),
             ("t/new", Priority::Min, recent),
         ]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
@@ -1507,40 +1569,27 @@ mod tests {
     }
 
     #[test]
-    fn audit_topics_not_ttl_reaped_but_bounded_by_cap() {
-        // AUDIT-RUN-CAP-1 — audit/* is NOT governed by the per-priority TTL
-        // (so an old-but-within-cap audit window survives a reap), but it is no
-        // longer retention=forever/exempt: it is BOUNDED by the per-topic cap
-        // (asserted in `audit_lane_pruned_to_cap_keeps_most_recent` below). Here
-        // we prove the TTL reap alone still leaves a small audit window intact
-        // while reaping the same-age non-audit message — with a cap far above
-        // the tiny audit footprint so the cap doesn't fire.
+    fn audit_topics_have_no_retention_exception() {
         let now = 1_000_000_000_000_i64;
-        let ten_days = now - (10 * 24 * 60 * 60 * 1000);
+        let six_hours_ago = now - i64::try_from(MAX_RETENTION_SECS * 1000).unwrap_or(i64::MAX);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let p = Persist::open(root.clone()).unwrap();
-        // audit/peerx is cycle-guarded (no further audit); the regular
-        // write also emits an audit/<peer> record.
+        // audit/peerx is cycle-guarded, so this fixture has exactly one row.
         p.write("audit/peerx", Priority::Min, None, Some("{}"))
             .unwrap();
-        p.write("t/regular", Priority::Min, None, Some("body"))
-            .unwrap();
-        // Back-date everything to 10 days ago — well past the 24h min TTL.
         let conn = Connection::open(root.join("index.sqlite")).unwrap();
-        conn.execute("UPDATE messages SET ts_unix_ms = ?1", params![ten_days])
-            .unwrap();
+        conn.execute(
+            "UPDATE messages SET ts_unix_ms = ?1",
+            params![six_hours_ago],
+        )
+        .unwrap();
         drop(conn);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
-        // Only the non-audit message is TTL-reaped; the tiny audit window is
-        // under the 8 MiB cap so the audit prune doesn't fire either.
-        assert_eq!(report.removed, 1, "only the non-audit message reaped");
+        assert_eq!(report.removed, 1, "old audit record must be TTL-reaped");
         assert_eq!(report.audit_pruned, 0, "tiny audit window is under the cap");
         let p = Persist::open(root.clone()).unwrap();
-        assert!(
-            !p.list_since("audit/peerx", None).unwrap().is_empty(),
-            "audit/peerx within the cap survives the TTL reap"
-        );
+        assert!(p.list_since("audit/peerx", None).unwrap().is_empty());
     }
 
     #[test]
@@ -1906,8 +1955,7 @@ mod tests {
     #[test]
     fn ephemeral_rpc_topics_reap_after_one_hour() {
         // EFF-47 — reply/* + action/* reap on the 1h ephemeral TTL
-        // while a same-age default-priority normal topic survives its
-        // 7-day class TTL.
+        // while a same-age normal topic survives the universal six-hour TTL.
         let now = 1_000_000_000_000_i64;
         let two_hours_ago = now - (2_i64 * 60 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[
@@ -1955,26 +2003,26 @@ mod tests {
     }
 
     #[test]
-    fn default_messages_expire_after_7d() {
+    fn default_messages_expire_under_six_hours() {
         let now = 1_000_000_000_000_i64;
-        let eight_days = now - (8_i64 * 24 * 60 * 60 * 1000);
-        let three_days = now - (3_i64 * 24 * 60 * 60 * 1000);
+        let seven_hours = now - (7_i64 * 60 * 60 * 1000);
+        let one_hour = now - (1_i64 * 60 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[
-            ("t/old", Priority::Default, eight_days),
-            ("t/new", Priority::Default, three_days),
+            ("t/old", Priority::Default, seven_hours),
+            ("t/new", Priority::Default, one_hour),
         ]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
         assert_eq!(report.removed, 1);
     }
 
     #[test]
-    fn high_messages_expire_after_30d() {
+    fn high_messages_expire_under_six_hours() {
         let now = 1_000_000_000_000_i64;
-        let thirty_one = now - (31_i64 * 24 * 60 * 60 * 1000);
-        let ten = now - (10_i64 * 24 * 60 * 60 * 1000);
+        let seven_hours = now - (7_i64 * 60 * 60 * 1000);
+        let one_hour = now - (1_i64 * 60 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[
-            ("t/old", Priority::High, thirty_one),
-            ("t/new", Priority::High, ten),
+            ("t/old", Priority::High, seven_hours),
+            ("t/new", Priority::High, one_hour),
         ]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
         assert_eq!(report.removed, 1);
@@ -2021,19 +2069,17 @@ mod tests {
     #[test]
     fn unknown_priority_falls_back_to_default_ttl() {
         let now = 1_000_000_000_000_i64;
-        let eight_days = now - (8 * 24 * 60 * 60 * 1000);
-        let (_tmp, root) = open_tmp_with(&[("t/x", Priority::Default, eight_days)]);
+        let seven_hours = now - (7_i64 * 60 * 60 * 1000);
+        let (_tmp, root) = open_tmp_with(&[("t/x", Priority::Default, seven_hours)]);
         // Hack: write a row with an unknown priority string by
         // bypassing the typed write path.
         let conn = Connection::open(root.join("index.sqlite")).unwrap();
         conn.execute("UPDATE messages SET priority = 'wat'", [])
             .unwrap();
-        // The run_pass only walks min/default/high — 'wat' isn't
-        // any of those, so it survives. This documents the
-        // safety semantics: unknown priorities are immortal
-        // until the operator backfills them.
+        // Unknown classes fail closed to the default bounded TTL rather than
+        // becoming an accidental forever exception.
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
-        assert_eq!(report.removed, 0);
+        assert_eq!(report.removed, 1);
     }
 
     // BULLETPROOF-1 — hard-cap eviction safety valve.
@@ -2068,7 +2114,7 @@ mod tests {
         let now = 1_000_000_000_000_i64;
         let mut ulids = Vec::new();
         for i in 0..6 {
-            // Recent, ascending ts so High's 30d TTL never reaps them — the
+            // Recent, ascending ts so the six-hour TTL never reaps them — the
             // hard-cap valve is the only thing that should fire.
             ulids.push(write_sized(
                 &root,
@@ -2079,8 +2125,8 @@ mod tests {
             ));
         }
         purge_audit(&root);
-        // BUS-RETENTION-1 — the footprint counts the index DB too (it duplicates
-        // bodies, ~1 MB/msg here), so the total ≈ 2× the spool. Caps are sized so
+        // Bodies over 64 KiB remain only in the JSON spool, so the index no
+        // longer doubles this 1 MiB/message fixture. Caps are sized so
         // a few oldest messages are shed while the newest survives + the result
         // lands under the hard cap (soft=2 MB would round to "shed everything"
         // once the DB is counted).
@@ -2090,7 +2136,7 @@ mod tests {
             ..RetentionPolicy::default()
         };
         let report = run_pass_at(&policy, &root, now).unwrap();
-        assert_eq!(report.removed, 0, "no TTL expiry — High survives 30d");
+        assert_eq!(report.removed, 0, "no TTL expiry for recent High rows");
         assert!(report.evicted >= 1, "hard cap must shed oldest");
         assert!(
             report.bytes_after <= policy.quota_hard_bytes,
@@ -2492,7 +2538,7 @@ mod tests {
         // `inodes = None` isolates the CONFIGURED file cap from any coincidental
         // inode pressure on the build host's tmp filesystem (hermetic).
         let report = run_pass_at_inner(&policy, &root, now, None, None).unwrap();
-        assert_eq!(report.removed, 0, "no TTL expiry — High survives 30d");
+        assert_eq!(report.removed, 0, "no TTL expiry for recent High rows");
         assert_eq!(report.evicted, 0, "bytes are trivial — no byte eviction");
         assert!(report.inode_evicted >= 1, "inode guard must shed files");
         // The bound holds: spool file count is at/under the cap.

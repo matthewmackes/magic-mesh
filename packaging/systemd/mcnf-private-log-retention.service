@@ -1,0 +1,12 @@
+[Unit]
+Description=Enforce MCNF six-hour system-log privacy retention
+Documentation=https://github.com/matthewmackes/magic-mesh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mackesd/mcnf-private-log-retention --sweep
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=false
+PrivateTmp=true
+NoNewPrivileges=true

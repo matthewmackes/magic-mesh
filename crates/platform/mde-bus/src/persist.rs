@@ -8,8 +8,9 @@
 //!   inotify-friendly + lives on the GFS mesh-home so every peer
 //!   sees every message.
 //! - **Queryable index**: per-peer `<bus_root>/index.sqlite`.
-//!   Stores enough to answer tail / history / retention queries
-//!   without walking the file tree. NOT on GFS — SQLite plus
+//!   Stores metadata and small bodies for tail / history / retention queries;
+//!   bodies over [`MAX_INDEXED_BODY_BYTES`] stay only in the authoritative JSON
+//!   envelope and are hydrated transparently when read. NOT on GFS — SQLite plus
 //!   networked FS is a known footgun (lock-stealing,
 //!   journal-replay edge cases). Each peer maintains its own
 //!   index against the shared file tree.
@@ -81,9 +82,15 @@ pub const DEFAULT_BUS_ROOT: &str = "~/.local/share/mde/bus";
 /// re-audited (the cycle guard in [`Persist::write`]).
 pub const AUDIT_TOPIC_PREFIX: &str = "audit/";
 
+/// Maximum body bytes duplicated into the SQLite query index. Larger payloads
+/// remain in the authoritative JSON envelope and are loaded only when a caller
+/// reads that message. This prevents a single multi-megabyte state/log envelope
+/// from being written once to JSON and again to both SQLite and its WAL.
+pub const MAX_INDEXED_BODY_BYTES: usize = 64 * 1024;
+
 /// BUS-AUDIT-FLOOD — whether a published topic warrants a metadata audit
-/// record (§8: "security events are hash-chain audited"). Audit records are
-/// EXEMPT from retention, so auditing must be reserved for control-plane
+/// record (§8: "security events are hash-chain audited"). Audit records share
+/// the universal six-hour privacy ceiling, but auditing is still reserved for
 /// **mutations + events** — never the high-frequency observational classes:
 /// `audit/*` (recursion guard), `state/*` status broadcasts, `reply/*`
 /// responses, and read-only query verbs (`get-*`, `list-*`, `peer-states`,
@@ -367,7 +374,31 @@ impl Persist {
             .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| PersistError::Sql(format!("schema: {e}")))?;
+        Self::ensure_body_external_column(&conn)?;
         Ok(conn)
+    }
+
+    /// Upgrade pre-BUS-BODY-BOUND-1 indexes in place. SQLite's ADD COLUMN with
+    /// a constant default is metadata-only, including on Dell-sized indexes.
+    fn ensure_body_external_column(conn: &Connection) -> Result<(), PersistError> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(messages)")
+            .map_err(|e| PersistError::Sql(format!("inspect messages schema: {e}")))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| PersistError::Sql(format!("query messages schema: {e}")))?;
+        for column in columns {
+            if column.map_err(|e| PersistError::Sql(format!("decode messages schema: {e}")))?
+                == "body_external"
+            {
+                return Ok(());
+            }
+        }
+        drop(stmt);
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN body_external INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| PersistError::Sql(format!("add body_external column: {e}")))
     }
 
     /// perf-3 — open the SQLite index WITHOUT the schema exec, for the fast path
@@ -384,6 +415,8 @@ impl Persist {
             .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL;")
             .map_err(|e| PersistError::Sql(format!("synchronous: {e}")))?;
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 256; PRAGMA journal_size_limit = 8388608;")
+            .map_err(|e| PersistError::Sql(format!("wal bounds: {e}")))?;
         Ok(conn)
     }
 
@@ -512,18 +545,28 @@ impl Persist {
         // it on the next audit — that's the documented recovery
         // mode (we don't want to delete the authoritative copy
         // because of an index hiccup).
+        let body_external = msg
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_INDEXED_BODY_BYTES);
+        let indexed_body = if body_external {
+            None
+        } else {
+            msg.body.as_deref()
+        };
         self.conn
             .execute(
-                "INSERT INTO messages (ulid, topic, priority, title, body, ts_unix_ms, file_path) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO messages (ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    msg.ulid,
-                    msg.topic,
-                    msg.priority,
-                    msg.title,
-                    msg.body,
+                    &msg.ulid,
+                    &msg.topic,
+                    &msg.priority,
+                    &msg.title,
+                    indexed_body,
                     msg.ts_unix_ms,
-                    msg.file_path
+                    &msg.file_path,
+                    body_external
                 ],
             )
             .map_err(|e| PersistError::Sql(format!("insert {ulid}: {e}")))?;
@@ -540,7 +583,7 @@ impl Persist {
         // hash-chain audited"). Observational `state/*` broadcasts, read-only
         // query verbs (`get-*`/`list-*`/`peer-states`/`*-stats`/`mesh/directory`)
         // and their `reply/*` carry NO security value — and the `audit/<peer>`
-        // topic is EXEMPT from retention (see retention.rs), so auditing a
+        // topic once had an unbounded retention exception, so auditing a
         // chatty poller (music `get-state` @2s + the notify-center) grew it
         // unbounded to 122k records / 479M on the 3.9G tmpfs `/run`, tripping
         // the bus-full alert. Skipping the read/observational classes keeps the
@@ -621,29 +664,31 @@ impl Persist {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external \
                      FROM messages WHERE topic = ?1 AND ulid > ?2 ORDER BY ulid",
                 )
                 .map_err(|e| PersistError::Sql(format!("prepare list_since: {e}")))?;
             let rows = stmt
-                .query_map(params![topic, s], row_to_message)
+                .query_map(params![topic, s], row_to_indexed_message)
                 .map_err(|e| PersistError::Sql(format!("query list_since: {e}")))?;
             for r in rows {
-                out.push(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+                let indexed = r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?;
+                out.push(self.hydrate_external_body(indexed)?);
             }
         } else {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external \
                      FROM messages WHERE topic = ?1 ORDER BY ulid",
                 )
                 .map_err(|e| PersistError::Sql(format!("prepare list_all: {e}")))?;
             let rows = stmt
-                .query_map(params![topic], row_to_message)
+                .query_map(params![topic], row_to_indexed_message)
                 .map_err(|e| PersistError::Sql(format!("query list_all: {e}")))?;
             for r in rows {
-                out.push(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+                let indexed = r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?;
+                out.push(self.hydrate_external_body(indexed)?);
             }
         }
         Ok(out)
@@ -671,29 +716,31 @@ impl Persist {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external \
                      FROM messages WHERE topic = ?1 AND ulid > ?2 ORDER BY ulid LIMIT ?3",
                 )
                 .map_err(|e| PersistError::Sql(format!("prepare list_since_limit: {e}")))?;
             let rows = stmt
-                .query_map(params![topic, since_ulid, limit], row_to_message)
+                .query_map(params![topic, since_ulid, limit], row_to_indexed_message)
                 .map_err(|e| PersistError::Sql(format!("query list_since_limit: {e}")))?;
             for row in rows {
-                out.push(row.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+                let indexed = row.map_err(|e| PersistError::Sql(format!("decode: {e}")))?;
+                out.push(self.hydrate_external_body(indexed)?);
             }
         } else {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external \
                      FROM messages WHERE topic = ?1 ORDER BY ulid LIMIT ?2",
                 )
                 .map_err(|e| PersistError::Sql(format!("prepare list_limit: {e}")))?;
             let rows = stmt
-                .query_map(params![topic, limit], row_to_message)
+                .query_map(params![topic, limit], row_to_indexed_message)
                 .map_err(|e| PersistError::Sql(format!("query list_limit: {e}")))?;
             for row in rows {
-                out.push(row.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+                let indexed = row.map_err(|e| PersistError::Sql(format!("decode: {e}")))?;
+                out.push(self.hydrate_external_body(indexed)?);
             }
         }
         Ok(out)
@@ -723,19 +770,20 @@ impl Persist {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external \
                  FROM messages WHERE topic = ?1 ORDER BY ulid DESC LIMIT ?2",
             )
             .map_err(|e| PersistError::Sql(format!("prepare read_tail: {e}")))?;
         let rows = stmt
             .query_map(
                 params![topic, i64::try_from(n).unwrap_or(i64::MAX)],
-                row_to_message,
+                row_to_indexed_message,
             )
             .map_err(|e| PersistError::Sql(format!("query read_tail: {e}")))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+            let indexed = r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?;
+            out.push(self.hydrate_external_body(indexed)?);
         }
         // The DESC query yields newest-first; reverse to OLDEST-first so callers
         // see `list_since`'s ascending order and `read_latest` finds the newest
@@ -753,7 +801,7 @@ impl Persist {
     pub fn list_topics(&self) -> Result<Vec<String>, PersistError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT topic FROM messages ORDER BY topic")
+            .prepare("SELECT topic FROM active_topics ORDER BY topic")
             .map_err(|e| PersistError::Sql(format!("prepare list_topics: {e}")))?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
@@ -761,6 +809,34 @@ impl Persist {
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// Return active topics whose names begin with `prefix`, using a bounded
+    /// primary-key range over the compact topic catalog. An empty prefix is
+    /// equivalent to [`Self::list_topics`].
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on query failure.
+    pub fn list_topics_with_prefix(&self, prefix: &str) -> Result<Vec<String>, PersistError> {
+        if prefix.is_empty() {
+            return self.list_topics();
+        }
+        let upper = format!("{prefix}\u{10ffff}");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT topic FROM active_topics \
+                 WHERE topic >= ?1 AND topic < ?2 ORDER BY topic",
+            )
+            .map_err(|e| PersistError::Sql(format!("prepare list_topics_with_prefix: {e}")))?;
+        let rows = stmt
+            .query_map(params![prefix, upper], |row| row.get::<_, String>(0))
+            .map_err(|e| PersistError::Sql(format!("query list_topics_with_prefix: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| PersistError::Sql(format!("decode topic: {e}")))?);
         }
         Ok(out)
     }
@@ -901,19 +977,29 @@ impl Persist {
     }
 
     fn insert_existing_message(&self, msg: &StoredMessage) -> Result<bool, PersistError> {
+        let body_external = msg
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_INDEXED_BODY_BYTES);
+        let indexed_body = if body_external {
+            None
+        } else {
+            msg.body.as_deref()
+        };
         let changed = self
             .conn
             .execute(
-                "INSERT OR IGNORE INTO messages (ulid, topic, priority, title, body, ts_unix_ms, file_path) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO messages (ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     &msg.ulid,
                     &msg.topic,
                     &msg.priority,
                     &msg.title,
-                    &msg.body,
+                    indexed_body,
                     msg.ts_unix_ms,
-                    &msg.file_path
+                    &msg.file_path,
+                    body_external
                 ],
             )
             .map_err(|e| PersistError::Sql(format!("reindex {}: {e}", msg.file_path)))?;
@@ -953,18 +1039,57 @@ impl Persist {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path, body_external \
                  FROM messages WHERE file_path = ?1",
             )
             .map_err(|e| PersistError::Sql(format!("prepare missing-row export: {e}")))?;
         for path in paths {
-            match stmt.query_row(params![path], row_to_message) {
-                Ok(msg) => out.push(msg),
+            match stmt.query_row(params![path], row_to_indexed_message) {
+                // The file is known missing in this repair path, so an
+                // externalized body cannot be hydrated. Preserve the indexed
+                // metadata in the export; the missing authoritative body is
+                // already the divergence being reported.
+                Ok(indexed) => out.push(indexed.message),
                 Err(rusqlite::Error::QueryReturnedNoRows) => {}
                 Err(e) => return Err(PersistError::Sql(format!("load missing row {path}: {e}"))),
             }
         }
         Ok(out)
+    }
+
+    fn hydrate_external_body(
+        &self,
+        mut indexed: IndexedMessage,
+    ) -> Result<StoredMessage, PersistError> {
+        if !indexed.body_external {
+            return Ok(indexed.message);
+        }
+        let rel = indexed.message.file_path.clone();
+        let disk = match read_indexable_message(&self.bus_root, &rel)? {
+            MessageFile::Message(message) => message,
+            MessageFile::Invalid(reason) => {
+                return Err(PersistError::Json(format!(
+                    "hydrate external body {rel}: {reason}"
+                )))
+            }
+            MessageFile::NonMessage => {
+                return Err(PersistError::Json(format!(
+                    "hydrate external body {rel}: not a Bus message"
+                )))
+            }
+        };
+        if disk.ulid != indexed.message.ulid || disk.topic != indexed.message.topic {
+            return Err(PersistError::Json(format!(
+                "hydrate external body {rel}: index/envelope identity mismatch"
+            )));
+        }
+        let Some(body) = disk.body else {
+            return Err(PersistError::Json(format!(
+                "hydrate external body {rel}: marker set but envelope body is absent"
+            )));
+        };
+        indexed.message.body = Some(body);
+        Ok(indexed.message)
     }
 
     fn delete_rows_by_file_paths(&self, paths: &[String]) -> Result<(), PersistError> {
@@ -1186,6 +1311,15 @@ enum MessageFile {
 
 fn read_indexable_message(root: &Path, rel: &str) -> Result<MessageFile, PersistError> {
     let path = Path::new(rel);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(MessageFile::Invalid(
+            "file_path is not a normalized relative path".to_string(),
+        ));
+    }
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return Ok(MessageFile::NonMessage);
     };
@@ -1241,21 +1375,29 @@ fn export_missing_rows(root: &Path, rows: &[StoredMessage]) -> Result<String, Pe
     Ok(rel)
 }
 
-fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
-    Ok(StoredMessage {
-        ulid: row.get(0)?,
-        topic: row.get(1)?,
-        priority: row.get(2)?,
-        title: row.get(3)?,
-        body: row.get(4)?,
-        ts_unix_ms: row.get(5)?,
-        file_path: row.get(6)?,
-        // BUS-2.7: the SQLite index is a query layer and does not carry
-        // actions; the full message (incl. actions) lives in the on-disk
-        // JSON at `file_path`, which consumers read when they render.
-        actions: Vec::new(),
-        // BUS-2.7.d: `reply_to` is likewise on-disk-JSON only — not indexed.
-        reply_to: None,
+struct IndexedMessage {
+    message: StoredMessage,
+    body_external: bool,
+}
+
+fn row_to_indexed_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedMessage> {
+    Ok(IndexedMessage {
+        message: StoredMessage {
+            ulid: row.get(0)?,
+            topic: row.get(1)?,
+            priority: row.get(2)?,
+            title: row.get(3)?,
+            body: row.get(4)?,
+            ts_unix_ms: row.get(5)?,
+            file_path: row.get(6)?,
+            // BUS-2.7: the SQLite index is a query layer and does not carry
+            // actions; the full message (incl. actions) lives in the on-disk
+            // JSON at `file_path`, which consumers read when they render.
+            actions: Vec::new(),
+            // BUS-2.7.d: `reply_to` is likewise on-disk-JSON only — not indexed.
+            reply_to: None,
+        },
+        body_external: row.get(7)?,
     })
 }
 
@@ -1641,6 +1783,146 @@ mod tests {
         assert!(
             topics.iter().any(|t| t == "audit/localhost.localdomain"),
             "fresh Fedora's default dotted hostname must be a listable topic"
+        );
+    }
+
+    #[test]
+    fn active_topic_catalog_tracks_insert_delete_and_prefix_ranges() {
+        let (_tmp, p) = open_tmp();
+        let first = p
+            .write("catalog/alpha", Priority::Default, None, Some("one"))
+            .unwrap();
+        let second = p
+            .write("catalog/alpha", Priority::Default, None, Some("two"))
+            .unwrap();
+        p.write("catalog/beta", Priority::Default, None, Some("three"))
+            .unwrap();
+        p.write("other/topic", Priority::Default, None, Some("four"))
+            .unwrap();
+
+        assert_eq!(
+            p.list_topics_with_prefix("catalog/").unwrap(),
+            vec!["catalog/alpha".to_string(), "catalog/beta".to_string()]
+        );
+        assert_eq!(p.list_topics_with_prefix("catalog/a").unwrap().len(), 1);
+        assert_eq!(p.list_topics_with_prefix("missing/").unwrap().len(), 0);
+
+        p.conn
+            .execute("DELETE FROM messages WHERE ulid = ?1", params![first.ulid])
+            .unwrap();
+        assert!(p
+            .list_topics_with_prefix("catalog/")
+            .unwrap()
+            .contains(&"catalog/alpha".to_string()));
+        p.conn
+            .execute("DELETE FROM messages WHERE ulid = ?1", params![second.ulid])
+            .unwrap();
+        assert!(!p
+            .list_topics_with_prefix("catalog/")
+            .unwrap()
+            .contains(&"catalog/alpha".to_string()));
+
+        let mut plan = p
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT topic FROM active_topics \
+                 WHERE topic >= ?1 AND topic < ?2 ORDER BY topic",
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map(params!["catalog/", "catalog0"], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("SEARCH active_topics USING PRIMARY KEY")),
+            "prefix discovery must be a catalog key-range search: {details:?}"
+        );
+    }
+
+    #[test]
+    fn large_body_stays_out_of_sqlite_and_hydrates_through_existing_api() {
+        let (_tmp, p) = open_tmp();
+        let body = "x".repeat(MAX_INDEXED_BODY_BYTES + 1);
+        let written = p
+            .write("state/large", Priority::Default, None, Some(&body))
+            .unwrap();
+        let (indexed_body, external): (Option<String>, i64) = p
+            .conn
+            .query_row(
+                "SELECT body, body_external FROM messages WHERE ulid = ?1",
+                params![written.ulid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(indexed_body.is_none(), "large body must not be duplicated");
+        assert_eq!(external, 1);
+
+        let read = p.read_latest("state/large").unwrap().unwrap();
+        assert_eq!(read.body.as_deref(), Some(body.as_str()));
+        assert_eq!(
+            p.list_since("state/large", None).unwrap()[0].body,
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn external_body_hydration_rejects_tampered_relative_path_before_read() {
+        let (_tmp, p) = open_tmp();
+        let body = "x".repeat(MAX_INDEXED_BODY_BYTES + 1);
+        let written = p
+            .write("state/tampered", Priority::Default, None, Some(&body))
+            .unwrap();
+        p.conn
+            .execute(
+                "UPDATE messages SET file_path = ?1 WHERE ulid = ?2",
+                params![format!("../../{}.json", written.ulid), written.ulid],
+            )
+            .unwrap();
+        let error = p.read_latest("state/tampered").unwrap_err().to_string();
+        assert!(error.contains("normalized relative path"), "{error}");
+    }
+
+    #[test]
+    fn open_upgrades_pre_external_body_schema_without_rebuilding_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("index.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                ulid TEXT NOT NULL PRIMARY KEY,
+                topic TEXT NOT NULL,
+                priority TEXT NOT NULL DEFAULT 'default',
+                title TEXT,
+                body TEXT,
+                ts_unix_ms INTEGER NOT NULL,
+                file_path TEXT NOT NULL UNIQUE
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let p = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let has_column: bool = p
+            .conn
+            .prepare("PRAGMA table_info(messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .any(|name| name == "body_external");
+        assert!(has_column);
+        p.write("state/upgraded", Priority::Default, None, Some("ok"))
+            .unwrap();
+        assert_eq!(
+            p.read_latest("state/upgraded")
+                .unwrap()
+                .unwrap()
+                .body
+                .as_deref(),
+            Some("ok")
         );
     }
 

@@ -33,6 +33,13 @@ tasks.
   subject, but must remain at three or fewer. Historical five-seat evidence stays
   factual but creates no forward five-seat requirement. Lighthouses are not test
   seats and retain their independently governed three-node quorum proof.
+- **Privacy-retention lock (operator lock 2026-08-10):** system logs, Bus
+  history, transfer ledgers, collaboration JSONL, application histories, and
+  audit records have a fleet-wide maximum lifetime of six hours. No priority or
+  audit class is exempt. Configuration, identities, credentials, current
+  materialized state, user media, queued payloads, and VM disks are not history
+  and must survive each epoch. Offline replicas must not be able to restore an
+  expired record after they rejoin.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
   never run filler tests.
@@ -343,7 +350,7 @@ behavioral evidence is not completion.
      - Validation: workspace/package/architecture/supersession gates.
      - Done when: scan is clean in a fresh checkout.
   4. S4 Build and integrate browser-vm.
-     - Objective: create the 4-vCPU/8-GiB/64-GiB baseline image and typed Workload profile with Chromium, GPU/video, PipeWire, guest agents, RDP preferred, Sunshine
+     - Objective: create the 3-vCPU/8-GiB/64-GiB Dell-safe baseline image and typed Workload profile with Chromium, GPU/video, PipeWire, guest agents, RDP preferred, Sunshine
        alternate, and host_browser=false.
      - Inputs: ARCH-010 adapter/readiness contracts and image builder.
      - Deliverable: reproducible image/profile and readiness fixture.

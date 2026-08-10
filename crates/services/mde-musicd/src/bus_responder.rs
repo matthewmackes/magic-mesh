@@ -5624,7 +5624,14 @@ fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
     if engine.is_playing() {
         write_playback_state(true, queue.current().unwrap_or(""), engine.position_ms());
     } else if !engine.is_active() {
-        write_playback_state(false, queue.current().unwrap_or(""), engine.position_ms());
+        let idle = MusicState {
+            peer: state::local_host(),
+            playing: false,
+            song_id: queue.current().unwrap_or("").to_string(),
+            position_ms: engine.position_ms(),
+            updated_ms: state::now_ms(),
+        };
+        let _ = state::write_peer_state(&state::coordination_dir(), &idle);
     }
 }
 

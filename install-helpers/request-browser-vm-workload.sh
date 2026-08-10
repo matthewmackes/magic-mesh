@@ -71,7 +71,10 @@ SUPPORTED_ACTIONS = frozenset({
 IMAGE_REQUIRED_ACTIONS = frozenset({"start_and_attach", "start"})
 EXISTING_WORKLOAD_ACTIONS = frozenset({"stop", "restart", "resume", "destroy"})
 ATTACHMENT = "qemu_display1_dmabuf"
-BROWSER_VCPU = 4
+# Keep one hardware thread available to Dom0 on the four-thread Dell seat.
+# Three guest cores preserve interactive parallelism without letting QEMU
+# contend for every host thread during shell, sync, and Bus activity.
+BROWSER_VCPU = 3
 BROWSER_MEMORY_MB = 8192
 BROWSER_DISK_GB = 64
 TOKEN_TTL_MS = 25_000
@@ -439,7 +442,7 @@ def self_test():
     assert request["action"] == DEFAULT_ACTION
     assert request["preferred_attachment"] == ATTACHMENT
     assert request["backend"] == BACKEND
-    assert request["resources"] == {"vcpu": 4, "memory_mb": 8192, "disk_gb": 64}
+    assert request["resources"] == {"vcpu": 3, "memory_mb": 8192, "disk_gb": 64}
     assert request["armed_token"].split("|")[3:6] == [ACTION_VERB, node, "workload:vm:seat15:browser-vm"]
     assert "armed_token" not in canonical_json({key: value for key, value in request.items() if key != "armed_token"})
     assert generation_from_snapshot(None, node) == 0

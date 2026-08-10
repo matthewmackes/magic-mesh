@@ -749,6 +749,11 @@ pub fn input_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
 /// hostile fixture or malformed sysfs mount from expanding the mesh artifact.
 const MAX_NETWORK_INTERFACES: usize = 256;
 
+/// Maximum physical DRM connectors retained in one inventory generation.
+const MAX_DRM_CONNECTORS: usize = 128;
+/// Maximum advertised modes retained for one connector.
+const MAX_DRM_CONNECTOR_MODES: usize = 16;
+
 /// Read at most `limit` children and sort that bounded sample for stable output.
 fn sorted_children_bounded(dir: &Path, limit: usize) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -757,6 +762,95 @@ fn sorted_children_bounded(dir: &Path, limit: usize) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = rd.take(limit).flatten().map(|entry| entry.path()).collect();
     out.sort();
     out
+}
+
+fn drm_connector_name(node: &str) -> Option<&str> {
+    if node.len() > 64 {
+        return None;
+    }
+    let (card, connector) = node.split_once('-')?;
+    let card_index = card.strip_prefix("card")?;
+    if card_index.is_empty()
+        || !card_index.bytes().all(|byte| byte.is_ascii_digit())
+        || connector.is_empty()
+        || !connector
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    Some(connector)
+}
+
+fn admitted_drm_mode(mode: &str) -> Option<&str> {
+    if mode.len() > 16 {
+        return None;
+    }
+    let (width, height) = mode.split_once('x')?;
+    let width = width.parse::<u16>().ok()?;
+    let height = height.parse::<u16>().ok()?;
+    (width > 0 && width <= 16_384 && height > 0 && height <= 16_384).then_some(mode)
+}
+
+/// Physical DRM connectors (`/sys/class/drm/card*-*`).
+///
+/// Only allowlisted kernel state is published. EDID blobs, display names, and
+/// other potentially identifying payloads are deliberately not read. A
+/// disconnected connector is normal inventory evidence, not a health fault.
+#[must_use]
+pub fn display_connectors(roots: &SysfsRoots) -> Vec<DeviceRecord> {
+    sorted_children_bounded(
+        &roots.sys.join("class").join("drm"),
+        MAX_DRM_CONNECTORS,
+    )
+    .into_iter()
+    .filter_map(|dir| {
+        let node = dir.file_name()?.to_str()?;
+        let connector = drm_connector_name(node)?;
+        let connection = read_trim(&dir.join("status")).filter(|value| {
+            matches!(value.as_str(), "connected" | "disconnected" | "unknown")
+        });
+        let enabled = read_trim(&dir.join("enabled"))
+            .filter(|value| matches!(value.as_str(), "enabled" | "disabled" | "unknown"));
+        let modes = read_trim(&dir.join("modes"))
+            .map(|body| {
+                body.lines()
+                    .filter_map(admitted_drm_mode)
+                    .take(MAX_DRM_CONNECTOR_MODES)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let status = if connection.as_deref() == Some("connected") {
+            DeviceStatus::Ok
+        } else {
+            DeviceStatus::Unknown
+        };
+        let problem = connection
+            .is_none()
+            .then(|| "connector state unavailable".to_string());
+        let mut events = Vec::with_capacity(3);
+        if let Some(connection) = connection {
+            events.push(format!("connection: {connection}"));
+        }
+        if let Some(enabled) = enabled {
+            events.push(format!("enabled: {enabled}"));
+        }
+        if !modes.is_empty() {
+            events.push(format!("modes: {}", modes.join(", ")));
+        }
+        Some(DeviceRecord {
+            name: format!("Display connector {connector}"),
+            sysfs_path: Some(dir.to_string_lossy().into_owned()),
+            driver: bound_driver(&dir.join("device")),
+            driver_version: driver_version(&dir.join("device")),
+            status,
+            problem,
+            events,
+            ..DeviceRecord::new(node, status)
+        })
+    })
+    .collect()
 }
 
 /// Physical network interfaces (`/sys/class/net/*`).
@@ -1029,6 +1123,7 @@ pub fn enumerate(
     add(&mut buckets, category::PROCESSORS, processors(roots));
     add(&mut buckets, category::MEMORY, memory(roots));
     add(&mut buckets, category::DISK_DRIVES, block_devices(roots));
+    add(&mut buckets, category::DISPLAY, display_connectors(roots));
     add(
         &mut buckets,
         category::NETWORK_ADAPTERS,
@@ -1203,6 +1298,12 @@ mod tests {
         put(&sys.join("class/power_supply/BAT0/type"), "Battery\n");
         put(&sys.join("class/power_supply/BAT0/capacity"), "82\n");
         put(&sys.join("class/power_supply/BAT0/status"), "Discharging\n");
+        put(&sys.join("class/drm/card0-eDP-1/status"), "connected\n");
+        put(&sys.join("class/drm/card0-eDP-1/enabled"), "enabled\n");
+        put(
+            &sys.join("class/drm/card0-eDP-1/modes"),
+            "1920x1080\n1280x720\n",
+        );
     }
 
     fn fixture_ids() -> IdsDb {
@@ -1485,6 +1586,55 @@ mod tests {
         assert!(!published.contains("credential-like"));
         assert!(!published.contains("veth0"));
         assert!(!published.contains("\"lo\""));
+    }
+
+    #[test]
+    fn physical_display_connectors_are_bounded_sourced_and_credential_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let drm = roots.sys.join("class/drm");
+        put(&drm.join("card0-eDP-1/status"), "connected\n");
+        put(&drm.join("card0-eDP-1/enabled"), "enabled\n");
+        put(
+            &drm.join("card0-eDP-1/modes"),
+            "1920x1080\n1280x720\ninvalid\n99999x1\n",
+        );
+        put(
+            &drm.join("card0-eDP-1/edid"),
+            "credential-like-display-identity-must-not-publish\n",
+        );
+        put(&drm.join("card0-HDMI-A-1/status"), "disconnected\n");
+        put(&drm.join("card0-HDMI-A-1/enabled"), "disabled\n");
+        put(&drm.join("card0/status"), "connected\n");
+        put(&drm.join("renderD128/status"), "connected\n");
+
+        let records = display_connectors(&roots);
+        assert_eq!(records.len(), 2);
+        let embedded = records
+            .iter()
+            .find(|record| record.name.contains("eDP-1"))
+            .unwrap();
+        assert_eq!(embedded.status, DeviceStatus::Ok);
+        assert_eq!(
+            embedded.events,
+            [
+                "connection: connected",
+                "enabled: enabled",
+                "modes: 1920x1080, 1280x720",
+            ]
+        );
+        let hdmi = records
+            .iter()
+            .find(|record| record.name.contains("HDMI-A-1"))
+            .unwrap();
+        assert_eq!(hdmi.status, DeviceStatus::Unknown);
+        assert_eq!(hdmi.problem, None);
+
+        let published = serde_json::to_string(&records).unwrap();
+        assert!(!published.contains("credential-like"));
+        assert!(!published.contains("invalid"));
+        assert!(!published.contains("99999x1"));
+        assert!(!published.contains("renderD128"));
     }
 
     #[test]

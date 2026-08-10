@@ -384,7 +384,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
 
     // BUS-1.9 — retention loop. Spawns a tokio task that runs
-    // one GC pass every hour: walks the SQLite index by
+    // one GC pass every two minutes: walks the SQLite index by
     // ts_unix_ms, deletes messages past their priority's TTL,
     // and publishes a bus/sys/quota warning when the soft
     // quota is exceeded. Skipped when bus_root resolution
@@ -406,7 +406,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             tracing::info!(
                 target: "mde_bus::retention",
                 bus_root = %bus_root.display(),
-                "retention loop active (hourly passes)"
+                "retention loop active (two-minute passes)"
             );
             (Some(shutdown_tx), Some(task))
         }

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// The `priority_default` and `retention` fields are seeded by
 /// [`crate::seed`] for the 12 curated defaults; ad-hoc topics created
 /// via [`Registry::create`] take the bus-wide fallback (`default`
-/// priority, 7-day retention per Round 4).
+/// priority, subject to the Bus-wide six-hour privacy ceiling).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Topic {
     /// Canonical slash-hierarchy name, e.g. `fleet/sec`.
@@ -31,8 +31,8 @@ pub struct Topic {
     /// Default priority for publishes that do not specify one.
     pub priority_default: Priority,
     /// Retention TTL in seconds. `None` means "follow the bus-wide
-    /// per-priority default" (Round 4):
-    /// urgent = forever, high = 30d, default = 7d, min = 24h.
+    /// per-priority default". Every explicit or default value is capped by the
+    /// Bus-wide six-hour privacy ceiling; ephemeral topics may expire sooner.
     pub retention_s: Option<u64>,
 }
 

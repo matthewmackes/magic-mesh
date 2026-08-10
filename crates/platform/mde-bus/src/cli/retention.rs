@@ -12,14 +12,15 @@ use clap::Subcommand;
 
 use crate::retention::{
     disk_usage_bytes, RetentionPolicy, DEFAULT_QUOTA_HARD_BYTES, DEFAULT_QUOTA_SOFT_BYTES,
+    MAX_RETENTION_SECS,
 };
 
 /// CLI sub-verbs for `mde-bus retention`.
 #[derive(Subcommand, Debug)]
 pub enum RetentionOp {
     /// Print the resolved retention policy + current disk usage.
-    /// Reports per-priority TTLs (`min` / `default` / `high` —
-    /// `urgent` is forever), soft + hard GFS quotas, and the
+    /// Reports every per-priority TTL (all under the universal six-hour privacy
+    /// ceiling), soft + hard GFS quotas, and the
     /// `<bus_root>` byte total relative to those quotas. Useful
     /// for operators wondering "why hasn't this message expired
     /// yet" or "are we close to the quota."
@@ -58,9 +59,12 @@ fn format_bytes(b: u64) -> String {
 
 fn format_ttl(secs: u64) -> String {
     let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
     if hours >= 24 {
         let days = hours / 24;
         format!("{days}d")
+    } else if hours > 0 && minutes > 0 {
+        format!("{hours}h {minutes}m")
     } else if hours > 0 {
         format!("{hours}h")
     } else {
@@ -81,7 +85,8 @@ pub fn run(op: RetentionOp) -> Result<()> {
                     "ttl_min_secs": policy.ttl_min_secs,
                     "ttl_default_secs": policy.ttl_default_secs,
                     "ttl_high_secs": policy.ttl_high_secs,
-                    "ttl_urgent": "forever",
+                    "ttl_urgent_secs": policy.ttl_secs("urgent"),
+                    "privacy_ceiling_secs": MAX_RETENTION_SECS,
                     "quota_soft_bytes": DEFAULT_QUOTA_SOFT_BYTES,
                     "quota_hard_bytes": DEFAULT_QUOTA_HARD_BYTES,
                     "used_bytes": used,
@@ -93,7 +98,11 @@ pub fn run(op: RetentionOp) -> Result<()> {
                 println!("  min     TTL: {}", format_ttl(policy.ttl_min_secs));
                 println!("  default TTL: {}", format_ttl(policy.ttl_default_secs));
                 println!("  high    TTL: {}", format_ttl(policy.ttl_high_secs));
-                println!("  urgent  TTL: forever (never auto-expired)");
+                println!(
+                    "  urgent  TTL: {}",
+                    format_ttl(policy.ttl_secs("urgent").unwrap_or(MAX_RETENTION_SECS))
+                );
+                println!("  maximum retained age: {}", format_ttl(MAX_RETENTION_SECS));
                 println!();
                 println!("Disk quota:");
                 println!("  soft: {}", format_bytes(DEFAULT_QUOTA_SOFT_BYTES));
@@ -154,6 +163,7 @@ mod tests {
     fn format_ttl_handles_all_units() {
         assert_eq!(format_ttl(60), "60s");
         assert_eq!(format_ttl(3600), "1h");
+        assert_eq!(format_ttl(5 * 3600 + 58 * 60), "5h 58m");
         assert_eq!(format_ttl(86_400), "1d");
         assert_eq!(format_ttl(7 * 86_400), "7d");
         assert_eq!(format_ttl(30 * 86_400), "30d");

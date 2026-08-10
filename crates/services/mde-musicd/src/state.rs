@@ -419,23 +419,41 @@ where
     result
 }
 
-/// Write `music-state.json` (+ this peer's by-peer snapshot).
-///
-/// # Errors
-/// IO / serialization failures, or an unsafe state identity.
-pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
+fn encode_state_record(state: &MusicState) -> std::io::Result<String> {
     if !valid_state_record(state) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "music state identity or song id exceeds its contract",
         ));
     }
-    std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(&StateFileV1 {
+    serde_json::to_string_pretty(&StateFileV1 {
         schema_version: STATE_SCHEMA_VERSION,
         state: state.clone(),
     })
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Write only this peer's roster heartbeat.
+///
+/// Idle peers use this path so they remain discoverable without competing for
+/// the mesh-global playback authority file. The global record changes only on
+/// an ownership transition or a heartbeat from the actively playing owner.
+///
+/// # Errors
+/// IO / serialization failures, or an unsafe state identity.
+pub fn write_peer_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
+    let json = encode_state_record(state)?;
+    std::fs::create_dir_all(dir)?;
+    write_record_atomically(&by_peer_path(dir, &state.peer), json.as_bytes())
+}
+
+/// Write `music-state.json` (+ this peer's by-peer snapshot).
+///
+/// # Errors
+/// IO / serialization failures, or an unsafe state identity.
+pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
+    let json = encode_state_record(state)?;
+    std::fs::create_dir_all(dir)?;
     let bp = by_peer_path(dir, &state.peer);
     // These two records are independently atomic, not a filesystem transaction.
     // Commit authority first: if the derived snapshot then fails, remote roster
@@ -873,6 +891,23 @@ mod tests {
         assert!(bp.exists());
         let snap: MusicState = serde_json::from_str(&std::fs::read_to_string(bp).unwrap()).unwrap();
         assert_eq!(snap, s);
+    }
+
+    #[test]
+    fn idle_peer_heartbeat_does_not_replace_playback_authority() {
+        let dir = tempdir().unwrap();
+        let authority = state("anvil", true, 1234);
+        write_state(dir.path(), &authority).unwrap();
+
+        let idle = state("forge", false, 2345);
+        write_peer_state(dir.path(), &idle).unwrap();
+
+        assert_eq!(read_state(dir.path()), Some(authority));
+        let snapshot: MusicState = serde_json::from_str(
+            &std::fs::read_to_string(by_peer_path(dir.path(), "forge")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot, idle);
     }
 
     #[test]

@@ -1,0 +1,11 @@
+[Unit]
+Description=Enforce MCNF six-hour system-log privacy retention hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+Unit=mcnf-private-log-retention.service
+
+[Install]
+WantedBy=timers.target

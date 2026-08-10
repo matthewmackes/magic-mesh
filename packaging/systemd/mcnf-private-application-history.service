@@ -1,0 +1,11 @@
+[Unit]
+Description=Start a new MCNF six-hour application-history privacy epoch
+Documentation=https://github.com/matthewmackes/magic-mesh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mackesd/mcnf-private-log-retention --application-epoch
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=false
+PrivateTmp=true

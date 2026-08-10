@@ -87,6 +87,8 @@ done
 # The seat unit, its preset, and the role gate.
 [ -f /usr/lib/systemd/system/mde-shell-egui.service ] \
     && ok "seat unit installed" || bad "seat unit missing"
+[ -f /usr/lib/systemd/system/mcnf-boot-status.service ] \
+    && ok "informative boot status unit installed" || bad "informative boot status unit missing"
 [ -f /usr/lib/systemd/system-preset/45-mcnf-quasar.preset ] \
     && ok "seat preset installed" || bad "seat preset missing"
 grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd/system/mde-shell-egui.service \
@@ -105,7 +107,7 @@ grep -q '^OnFailure=getty@tty1.service$' /usr/lib/systemd/system/mde-shell-egui.
     || bad "seat unit still has unconditional ExecStopPost recovery"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
-for u in mde-shell-egui.service podman.socket mackesd.target nebula.service \
+for u in mde-shell-egui.service mcnf-boot-status.service podman.socket mackesd.target nebula.service \
          magic-setup.service mesh-health.timer \
          cloud-init-local.service cloud-init.service cloud-config.service \
          cloud-final.service qemu-guest-agent.service openvswitch.service; do

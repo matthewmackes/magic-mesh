@@ -1532,6 +1532,9 @@ impl SystemWorkloadActuator {
             name: domain.to_string(),
             vcpus: u32::from(request.resources.vcpu),
             ram_mb: u64::from(request.resources.memory_mb),
+            host_threads: std::thread::available_parallelism().map_or(1, |parallelism| {
+                u32::try_from(parallelism.get()).unwrap_or(u32::MAX)
+            }),
             network: Some("default".to_string()),
         };
         let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string);

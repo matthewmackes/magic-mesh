@@ -1,0 +1,13 @@
+[Unit]
+Description=Discard MCNF application histories every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+Persistent=true
+# Every replica begins the epoch together. Staggering destructive history
+# sweeps lets a late Syncthing peer republish records already erased elsewhere.
+AccuracySec=1s
+Unit=mcnf-private-application-history.service
+
+[Install]
+WantedBy=timers.target

@@ -5,6 +5,7 @@
 # The seat unit still self-gates on the role flag at runtime (§5) — preset
 # "enable" here never lights a seat on a Lighthouse.
 enable mde-shell-egui.service
+enable mcnf-boot-status.service
 enable podman.socket
 enable mackesd.target
 disable mackesd.service

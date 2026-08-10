@@ -460,7 +460,7 @@ payload_compress = "xz"
 # correct taskbar/health presentation truth.
 # -32 (2026-08-10): admit RDP-only Windows discovery, enforce one kernel-leased
 # owner per grouped worker process, and revoke stale terminal Display1 leases.
-release = "32"
+release = "33"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -522,6 +522,8 @@ assets = [
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # WL-ARCH-009 — six independently supervised daemon process groups.
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
+    { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },
+    { source = "packaging/systemd/mcnf-boot-status.service", dest = "/usr/lib/systemd/system/mcnf-boot-status.service", mode = "644" },
     { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
     { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
     { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
@@ -636,6 +638,11 @@ assets = [
     # gives the user session the same MDE_BUS_ROOT the unit sets).
     { source = "packaging/tmpfiles/magic-mesh.conf",     dest = "/usr/lib/tmpfiles.d/magic-mesh.conf",          mode = "644" },
     { source = "packaging/systemd/journald.conf.d/90-mcnf-retention.conf", dest = "/usr/lib/systemd/journald.conf.d/90-mcnf-retention.conf", mode = "644" },
+    { source = "install-helpers/mcnf-private-log-retention.sh", dest = "/usr/libexec/mackesd/mcnf-private-log-retention", mode = "755" },
+    { source = "packaging/systemd/mcnf-private-log-retention.service", dest = "/usr/lib/systemd/system/mcnf-private-log-retention.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-log-retention.timer", dest = "/usr/lib/systemd/system/mcnf-private-log-retention.timer", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-application-history.service", dest = "/usr/lib/systemd/system/mcnf-private-application-history.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-application-history.timer", dest = "/usr/lib/systemd/system/mcnf-private-application-history.timer", mode = "644" },
     { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
     # Same split-brain fix for the QNM-Shared mount: the user session gets the
     # MDE_WORKGROUP_ROOT the unit sets, so GUI panels read the daemon's mount.
@@ -858,7 +865,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
 # the grouped mackesd supervisor. Each process self-gates on the pinned role,
 # so enabling the target pre-enrollment is safe.
-systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-resource-publisher-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mcnf-boot-status.service mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-resource-publisher-credential.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 timeout 45 systemctl restart mcnf-resource-publisher-credential.service >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
@@ -1336,6 +1343,8 @@ assets = [
     { source = "target/release/mackesd", dest = "/usr/bin/mackesd", mode = "755" },
     { source = "target/release/meshctl", dest = "/usr/bin/meshctl", mode = "755" },
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
+    { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },
+    { source = "packaging/systemd/mcnf-boot-status.service", dest = "/usr/lib/systemd/system/mcnf-boot-status.service", mode = "644" },
     { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
     { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
     { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
@@ -1377,6 +1386,12 @@ assets = [
     { source = "packaging/systemd/etcd.service", dest = "/etc/systemd/system/etcd.service", mode = "644" },
     { source = "packaging/systemd/magic-mesh-selinux-policy.service", dest = "/usr/lib/systemd/system/magic-mesh-selinux-policy.service", mode = "644" },
     { source = "packaging/tmpfiles/magic-mesh.conf", dest = "/usr/lib/tmpfiles.d/magic-mesh.conf", mode = "644" },
+    { source = "packaging/systemd/journald.conf.d/90-mcnf-retention.conf", dest = "/usr/lib/systemd/journald.conf.d/90-mcnf-retention.conf", mode = "644" },
+    { source = "install-helpers/mcnf-private-log-retention.sh", dest = "/usr/libexec/mackesd/mcnf-private-log-retention", mode = "755" },
+    { source = "packaging/systemd/mcnf-private-log-retention.service", dest = "/usr/lib/systemd/system/mcnf-private-log-retention.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-log-retention.timer", dest = "/usr/lib/systemd/system/mcnf-private-log-retention.timer", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-application-history.service", dest = "/usr/lib/systemd/system/mcnf-private-application-history.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-application-history.timer", dest = "/usr/lib/systemd/system/mcnf-private-application-history.timer", mode = "644" },
     { source = "install-helpers/mesh-health-check.sh", dest = "/usr/libexec/mackesd/mesh-health-check", mode = "755" },
     { source = "install-helpers/mesh-alert.sh", dest = "/usr/libexec/mackesd/mesh-alert", mode = "755" },
     { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
@@ -1411,7 +1426,7 @@ rm -f /etc/systemd/system/mackesd.service \
       /usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf || :
 rmdir /etc/systemd/system/mackesd.service.d /usr/lib/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
-systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mcnf-boot-status.service mackesd.target mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
 fi
@@ -1478,6 +1493,8 @@ assets = [
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     # WL-ARCH-009 — six independently supervised daemon process groups.
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
+    { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },
+    { source = "packaging/systemd/mcnf-boot-status.service", dest = "/usr/lib/systemd/system/mcnf-boot-status.service", mode = "644" },
     { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
     { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
     { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
@@ -1532,6 +1549,12 @@ assets = [
     { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — the shared bus spool (tmpfiles + environment.d).
     { source = "packaging/tmpfiles/magic-mesh.conf",     dest = "/usr/lib/tmpfiles.d/magic-mesh.conf",          mode = "644" },
+    { source = "packaging/systemd/journald.conf.d/90-mcnf-retention.conf", dest = "/usr/lib/systemd/journald.conf.d/90-mcnf-retention.conf", mode = "644" },
+    { source = "install-helpers/mcnf-private-log-retention.sh", dest = "/usr/libexec/mackesd/mcnf-private-log-retention", mode = "755" },
+    { source = "packaging/systemd/mcnf-private-log-retention.service", dest = "/usr/lib/systemd/system/mcnf-private-log-retention.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-log-retention.timer", dest = "/usr/lib/systemd/system/mcnf-private-log-retention.timer", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-application-history.service", dest = "/usr/lib/systemd/system/mcnf-private-application-history.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-private-application-history.timer", dest = "/usr/lib/systemd/system/mcnf-private-application-history.timer", mode = "644" },
     { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
     { source = "packaging/environment.d/90-mde-workgroup.conf", dest = "/usr/lib/environment.d/90-mde-workgroup.conf", mode = "644" },
     # EFF-43 / VV-1 — the voice-stack units (disabled; server-side render via

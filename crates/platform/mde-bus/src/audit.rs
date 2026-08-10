@@ -16,9 +16,8 @@
 //! per-peer trees converge). Properties:
 //!
 //! - **`priority = min`** — audit records are the lowest-noise class.
-//! - **`retention = forever`** — the retention reaper exempts
-//!   `audit/*` topics regardless of priority
-//!   (see [`crate::retention::run_pass_at`]).
+//! - **Retention is at most six hours** — audit has no privacy exception. Its
+//!   independent byte/entry caps may rotate a busy lane sooner.
 //! - **Cycle-guarded** — `Persist::write` does NOT audit a write whose
 //!   topic is already under `audit/` (else infinite recursion).
 //! - **Best-effort** — a failed audit emit never fails the original
@@ -75,13 +74,10 @@ pub fn read_entries_from_bus(bus_root: &std::path::Path) -> Result<Vec<AuditEntr
     let persist = crate::persist::Persist::open(bus_root.to_path_buf())
         .map_err(|e| AuditError::Io(format!("open index: {e}")))?;
     let topics = persist
-        .list_topics()
-        .map_err(|e| AuditError::Io(format!("list_topics: {e}")))?;
+        .list_topics_with_prefix(crate::persist::AUDIT_TOPIC_PREFIX)
+        .map_err(|e| AuditError::Io(format!("list audit topics: {e}")))?;
     let mut out = Vec::new();
     for topic in topics {
-        if !topic.starts_with(crate::persist::AUDIT_TOPIC_PREFIX) {
-            continue;
-        }
         let msgs = persist
             .list_since(&topic, None)
             .map_err(|e| AuditError::Io(format!("list_since {topic}: {e}")))?;

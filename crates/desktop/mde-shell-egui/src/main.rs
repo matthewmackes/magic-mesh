@@ -2941,6 +2941,10 @@ struct Boot {
     /// Makes the desktop handoff observable once per process without turning
     /// the normal frame loop into a log source.
     handoff_logged: bool,
+    /// Prevents a stale marker from a prior shell instance from suppressing
+    /// the console renderer during this boot, then marks the handoff once the
+    /// graphical shell really owns the seat.
+    boot_status_marker_cleared: bool,
 }
 
 impl Boot {
@@ -2956,6 +2960,10 @@ impl Boot {
     /// the eased bar settled), the shell renders — the first dock frame
     /// replaces the splash.
     fn frame(&mut self, ctx: &egui::Context) {
+        if !self.boot_status_marker_cleared {
+            let _ = std::fs::remove_file("/run/mde/shell-ready");
+            self.boot_status_marker_cleared = true;
+        }
         // WL-UX-009 direct-DRM proof owns the first scanout frame. Do not paint
         // the transient boot lockup before the routed workspace: a bare DRM
         // seat can retain that first buffer when the shell takes over, making
@@ -2964,12 +2972,16 @@ impl Boot {
         if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some()
             || std::env::var_os("MDE_DRM_PROOF_READBACK").is_some()
         {
+            let _ = std::fs::write("/run/mde/shell-ready", b"ready\n");
             self.shell
                 .get_or_insert_with(|| Shell::new_for_ctx(ctx))
                 .render(ctx);
             return;
         }
-        if !self.splash.dismissed() && self.splash_settle_frames < Self::SPLASH_SETTLE_FRAMES {
+        if !self.splash.dismissed()
+            || !self.splash.services_settled()
+            || self.splash_settle_frames < Self::SPLASH_SETTLE_FRAMES
+        {
             self.splash.show(ctx);
             if !self.splash.is_complete(splash::Milestone::Seat) {
                 // This callback running at all proves the seat came up — the
@@ -2995,8 +3007,10 @@ impl Boot {
                 self.splash.complete(splash::Milestone::MeshSnapshot);
                 tracing::info!(target: "shell::boot", milestone = "mesh_snapshot", "boot milestone completed");
             }
-            if self.splash.finished() {
+            if self.splash.finished() && self.splash.services_settled() {
                 self.splash_settle_frames = self.splash_settle_frames.saturating_add(1);
+            } else {
+                self.splash_settle_frames = 0;
             }
             // Keep boot frames flowing while the eased bar plays out. A finite
             // deadline is important for the DRM runner: unlike an eframe event
@@ -3006,6 +3020,7 @@ impl Boot {
             return;
         }
         if !self.handoff_logged {
+            let _ = std::fs::write("/run/mde/shell-ready", b"ready\n");
             tracing::info!(
                 target: "shell::boot",
                 settle_frames = self.splash_settle_frames,

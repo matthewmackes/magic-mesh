@@ -16,6 +16,10 @@ pub struct VmDomainSpec {
     pub vcpus: u32,
     /// Admitted guest memory in MiB.
     pub ram_mb: u64,
+    /// Hardware threads visible to the reconciler. When capacity exceeds the
+    /// guest request, CPU 0 is kept outside every QEMU thread affinity mask so
+    /// Dom0 always has one VM-free execution lane.
+    pub host_threads: u32,
     /// Libvirt network name. `None` selects [`DEFAULT_NETWORK`].
     pub network: Option<String>,
 }
@@ -62,18 +66,36 @@ fn xml_escape(value: &str) -> String {
 /// user's nonexistent PipeWire runtime directory.
 #[must_use]
 pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
+    let cpu_tune = if spec.host_threads > spec.vcpus && spec.vcpus > 0 {
+        let guest_cpus = (1..=spec.vcpus)
+            .map(|cpu| cpu.to_string())
+            .collect::<Vec<_>>();
+        let cpuset = guest_cpus.join(",");
+        let pins = guest_cpus
+            .iter()
+            .enumerate()
+            .map(|(vcpu, cpu)| format!("    <vcpupin vcpu='{vcpu}' cpuset='{cpu}'/>\n"))
+            .collect::<String>();
+        format!(
+            "  <cputune>\n{pins}    <emulatorpin cpuset='{cpuset}'/>\n    <iothreadpin iothread='1' cpuset='{cpuset}'/>\n  </cputune>\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "<domain type='kvm'>\n\
          \x20 <name>{name}</name>\n\
          \x20 <memory unit='MiB'>{memory}</memory>\n\
          \x20 <currentMemory unit='MiB'>{memory}</currentMemory>\n\
          \x20 <vcpu placement='static'>{vcpus}</vcpu>\n\
+         \x20 <iothreads>1</iothreads>\n\
+         {cpu_tune}\
          \x20 <os>\n\
          \x20   <type arch='x86_64' machine='q35'>hvm</type>\n\
          \x20   <boot dev='hd'/>\n\
          \x20 </os>\n\
          \x20 <features><acpi/><apic/></features>\n\
-         \x20 <cpu mode='host-passthrough' check='none'/>\n\
+         \x20 <cpu mode='host-passthrough' check='none'><topology sockets='1' dies='1' cores='{vcpus}' threads='1'/></cpu>\n\
          \x20 <clock offset='utc'/>\n\
          \x20 <on_poweroff>destroy</on_poweroff>\n\
          \x20 <on_reboot>restart</on_reboot>\n\
@@ -81,7 +103,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
          \x20 <resource><partition>/machine.slice</partition></resource>\n\
          \x20 <devices>\n\
          \x20   <disk type='file' device='disk'>\n\
-         \x20     <driver name='qemu' type='qcow2'/>\n\
+         \x20     <driver name='qemu' type='qcow2' cache='none' io='native' iothread='1'/>\n\
          \x20     <source file='{disk}'/>\n\
          \x20     <target dev='vda' bus='virtio'/>\n\
          \x20   </disk>\n\
@@ -101,6 +123,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
         name = xml_escape(&spec.name),
         memory = spec.ram_mb,
         vcpus = spec.vcpus,
+        cpu_tune = cpu_tune,
         disk = xml_escape(disk_path),
         network = xml_escape(spec.network_or_default()),
     )
@@ -117,6 +140,7 @@ mod tests {
                 name: "guest<&".to_string(),
                 vcpus: 2,
                 ram_mb: 4096,
+                host_threads: 4,
                 network: None,
             },
             "/var/lib/mde-vms/a'&.qcow2",
@@ -127,12 +151,18 @@ mod tests {
         assert!(!xml.contains("type='spice'"));
         assert!(xml.contains("guest&lt;&amp;"));
         assert!(xml.contains("a&apos;&amp;.qcow2"));
-        assert!(xml.contains(
-            "<audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'>"
-        ));
+        assert!(xml.contains("<audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'>"));
         assert!(xml.contains("<input streamName='vm-guest&lt;&amp;-capture'/>"));
         assert!(xml.contains("<output streamName='vm-guest&lt;&amp;-playback'/>"));
         assert!(!xml.contains("type='pipewire'"));
+        assert!(xml.contains("<iothreads>1</iothreads>"));
+        assert!(xml.contains("<topology sockets='1' dies='1' cores='2' threads='1'/>"));
+        assert!(xml
+            .contains("<driver name='qemu' type='qcow2' cache='none' io='native' iothread='1'/>"));
+        assert!(xml.contains("<vcpupin vcpu='0' cpuset='1'/>"));
+        assert!(xml.contains("<vcpupin vcpu='1' cpuset='2'/>"));
+        assert!(xml.contains("<emulatorpin cpuset='1,2'/>"));
+        assert!(xml.contains("<iothreadpin iothread='1' cpuset='1,2'/>"));
     }
 
     #[test]

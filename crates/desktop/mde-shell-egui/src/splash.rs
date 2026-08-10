@@ -34,6 +34,8 @@
               (ChromeState, ChooserState, …); the boot driver in main.rs consumes them"
 )]
 
+use std::fs;
+
 use mde_egui::egui::{self, Align2, Color32, Rect, TextureHandle, TextureOptions};
 use mde_egui::{Motion, MotionPreset, Style, TypographyRole};
 
@@ -85,6 +87,140 @@ const EASE_KEY: &str = "construct-splash-progress";
 /// The eased fill fraction at which the full bar counts as visually settled and
 /// the splash may dismiss.
 const EASE_DONE: f32 = 0.999;
+const BOOT_STATUS_FILE: &str = "/run/mde/boot-status.tsv";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootService {
+    label: String,
+    active: String,
+    sub: String,
+    result: String,
+}
+
+fn boot_services() -> Vec<BootService> {
+    let Ok(raw) = fs::read_to_string(BOOT_STATUS_FILE) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let unit = fields.next()?;
+            if unit == "version" {
+                return None;
+            }
+            Some(BootService {
+                label: fields.next()?.to_owned(),
+                active: fields.next()?.to_owned(),
+                sub: fields.next()?.to_owned(),
+                result: fields.next()?.to_owned(),
+            })
+        })
+        .take(16)
+        .collect()
+}
+
+fn boot_service_style(service: &BootService, blink: bool) -> (char, Color32) {
+    match service.active.as_str() {
+        "active" => ('✓', Style::SUPPORT_SUCCESS),
+        "failed" if blink => ('✕', Style::SUPPORT_ERROR),
+        "failed" => ('✕', Style::SUPPORT_ERROR.gamma_multiply(0.65)),
+        "skipped" | "inactive" => ('·', Style::TEXT_DIM),
+        _ => ('◌', Style::SUPPORT_WARNING),
+    }
+}
+
+fn paint_boot_services(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    free: Rect,
+    track: Rect,
+    services: &[BootService],
+) {
+    if services.is_empty() {
+        return;
+    }
+    let compact = free.width() < 560.0;
+    let row_h = if compact { 21.0 } else { 24.0 };
+    let gap = if compact { 3.0 } else { 4.0 };
+    let top = track.bottom() + Style::SP_M;
+    let available_h = (free.bottom() - top - Style::SP_M).max(0.0);
+    let max_rows = (available_h / (row_h + gap)).floor() as usize;
+    let count = services.len().min(max_rows.max(1));
+    let blink = (ctx.input(|input| input.time) * 2.0) as u64 % 2 == 0;
+    let meter_w = if compact { 42.0 } else { 76.0 };
+    for (index, service) in services.iter().take(count).enumerate() {
+        let y = top + index as f32 * (row_h + gap);
+        let row = Rect::from_min_max(
+            egui::pos2(free.left() + Style::SP_M, y),
+            egui::pos2(free.right() - Style::SP_M, y + row_h),
+        );
+        painter.rect_filled(row, Style::RADIUS_S, Style::SURFACE);
+        let (glyph, color) = boot_service_style(service, blink);
+        painter.text(
+            egui::pos2(row.left() + Style::SP_S, row.center().y),
+            Align2::LEFT_CENTER,
+            glyph,
+            Style::typography_font(TypographyRole::Label),
+            color,
+        );
+        let label_max = (row.width() - meter_w - Style::SP_XL * 1.5).max(24.0);
+        let label = if compact {
+            service.label.chars().take(24).collect::<String>()
+        } else {
+            service.label.clone()
+        };
+        let galley = painter.layout_job(Style::typography_job(
+            &label,
+            TypographyRole::Caption,
+            Style::TEXT,
+            label_max,
+        ));
+        painter.galley(
+            egui::pos2(
+                row.left() + Style::SP_XL,
+                row.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            Style::TEXT,
+        );
+        let meter = Rect::from_min_max(
+            egui::pos2(
+                row.right() - meter_w - Style::SP_S,
+                row.top() + row_h * 0.33,
+            ),
+            egui::pos2(row.right() - Style::SP_S, row.bottom() - row_h * 0.33),
+        );
+        let filled = service.active == "active";
+        painter.rect_filled(meter, Style::RADIUS_S, Style::BG);
+        if filled {
+            painter.rect_filled(meter, Style::RADIUS_S, color.gamma_multiply(0.8));
+        } else if service.active != "failed" && service.active != "skipped" {
+            let phase = ((ctx.input(|input| input.time) * 6.0) as usize + index) % 6;
+            let segment_w = (meter.width() / 6.0 - 1.0).max(1.0);
+            let segment = Rect::from_min_max(
+                egui::pos2(meter.left() + phase as f32 * (segment_w + 1.0), meter.top()),
+                egui::pos2(
+                    (meter.left() + (phase as f32 + 1.0) * (segment_w + 1.0) - 1.0)
+                        .min(meter.right()),
+                    meter.bottom(),
+                ),
+            );
+            painter.rect_filled(segment, Style::RADIUS_S, color);
+        }
+        if service.active != "active" && service.active != "skipped" {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+    }
+    if count < services.len() {
+        painter.text(
+            egui::pos2(free.center().x, free.bottom() - Style::SP_XS),
+            Align2::CENTER_BOTTOM,
+            format!("+{} more node services", services.len() - count),
+            Style::typography_font(TypographyRole::Caption),
+            Style::TEXT_DIM,
+        );
+    }
+}
 
 // ──────────────────────────── milestones ────────────────────────────
 
@@ -194,6 +330,20 @@ impl Splash {
         self.done.iter().all(|d| *d)
     }
 
+    /// The systemd feed is allowed to settle only when every discovered node
+    /// service is active, intentionally skipped, inactive/oneshot-complete, or
+    /// failed and therefore visible as a terminal red result. An absent feed
+    /// is treated as settled so recovery and minimal images never deadlock the
+    /// graphical shell on an optional status helper.
+    pub(crate) fn services_settled(&self) -> bool {
+        boot_services().iter().all(|service| {
+            matches!(
+                service.active.as_str(),
+                "active" | "skipped" | "inactive" | "failed"
+            )
+        })
+    }
+
     /// Whether the splash has fully played out — init finished AND the eased
     /// bar reached full — so the first dock frame may replace it.
     pub(crate) fn dismissed(&self) -> bool {
@@ -278,6 +428,8 @@ impl Splash {
             } else {
                 painter.circle_filled(head_center, track.height() * 0.48, Style::ACCENT);
             }
+
+            paint_boot_services(ctx, &painter, free, track, &boot_services());
         });
     }
 
