@@ -2493,6 +2493,11 @@ pub fn resource_card_from_desktop_source(
     source: &DesktopSource,
     observed_at_ms: u64,
 ) -> Result<ResourceCard, ResourceValidationError> {
+    if observed_at_ms == 0 {
+        return Err(ResourceValidationError::InvalidTimestamp(
+            "desktop_resource_card.observed_at",
+        ));
+    }
     if source.protocols.len() > MAX_DESKTOP_ADAPTER_PROTOCOLS {
         return Err(ResourceValidationError::CapacityExceeded {
             field: "desktop_source.protocols",
@@ -4861,6 +4866,18 @@ mod tests {
         assert_eq!(
             hostile_endpoint.validate(),
             Err(ResourceValidationError::InvalidField("endpoint.host"))
+        );
+    }
+
+    #[test]
+    fn desktop_resource_projection_rejects_zero_observation_timestamp() {
+        let source = source_from_mdns(&ep("OfficePC", "192.168.1.60", 3389, DesktopProtocol::Rdp));
+
+        assert_eq!(
+            resource_card_from_desktop_source(&source, 0),
+            Err(ResourceValidationError::InvalidTimestamp(
+                "desktop_resource_card.observed_at",
+            ))
         );
     }
 
