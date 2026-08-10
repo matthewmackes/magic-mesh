@@ -261,7 +261,7 @@ impl VdiProtocol {
         match self {
             Self::WebRtc => "clipboard unavailable: Cuttlefish WebRTC adapter is not attached",
             Self::Moonlight => "clipboard unavailable: Moonlight adapter is not attached",
-            Self::Rdp => "clipboard: bidirectional RDP CLIPRDR text",
+            Self::Rdp => "clipboard: bidirectional RDP CLIPRDR text + HTML",
             Self::Vnc => "clipboard: bidirectional RFB cut text",
             Self::Spice => "clipboard: bidirectional SPICE vdagent UTF-8 text",
         }
@@ -921,6 +921,16 @@ fn vdi_clipboard_lease(
     now_ms: u64,
 ) -> Result<VdiClipboardLeaseV2, String> {
     let generation = next_vdi_clipboard_generation(now_ms);
+    let permitted_mime_offers = if protocol.eq_ignore_ascii_case("rdp") {
+        vec![
+            "text/html;charset=utf-8".into(),
+            "text/html".into(),
+            "text/plain;charset=utf-8".into(),
+            "text/plain".into(),
+        ]
+    } else {
+        vec!["text/plain;charset=utf-8".into(), "text/plain".into()]
+    };
     let lease = VdiClipboardLeaseV2 {
         schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
@@ -928,7 +938,7 @@ fn vdi_clipboard_lease(
         lease_id: format!("{protocol}-clip-{generation}"),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(MAX_VDI_CLIPBOARD_LEASE_TTL_MS),
-        permitted_mime_offers: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+        permitted_mime_offers,
     };
     lease.validate_at(now_ms).map_err(|error| {
         format!(
@@ -1033,6 +1043,44 @@ fn vdi_guest_clipboard_message(
 }
 
 #[cfg(feature = "live-vdi")]
+fn rdp_guest_html_clipboard_message(
+    lease: &VdiClipboardLeaseV2,
+    message_sequence: u64,
+    html: String,
+    now_ms: u64,
+) -> Result<VdiClipboardMessageV2, String> {
+    let expires_at_ms = now_ms.saturating_add(60_000).min(lease.expires_at_ms);
+    let envelope = ClipboardEnvelopeV2::new_inline_text(
+        "vdi-guest",
+        "rdp",
+        lease.session_id.clone(),
+        message_sequence,
+        now_ms,
+        vec!["text/html;charset=utf-8".into()],
+        "",
+        VdiClipboardText::new(html)
+            .map_err(|error| format!("RDP guest HTML clipboard refused: {error}"))?,
+        expires_at_ms,
+    )
+    .map_err(|error| format!("RDP guest HTML clipboard refused: {error}"))?;
+    let message = VdiClipboardMessageV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: lease.session_id.clone(),
+        generation: lease.generation,
+        lease_id: lease.lease_id.clone(),
+        lease_expires_at_ms: lease.expires_at_ms,
+        message_sequence,
+        selected_mime: "text/html;charset=utf-8".into(),
+        disclosure: VdiClipboardDisclosureV2::Shareable,
+        envelope,
+    };
+    message
+        .admit(lease, None, now_ms)
+        .map_err(|error| format!("RDP guest HTML clipboard refused: {error}"))?;
+    Ok(message)
+}
+
+#[cfg(feature = "live-vdi")]
 fn publish_vdi_clipboard_lease(root: &Path, lease: &VdiClipboardLeaseV2) -> Result<(), String> {
     let topic = vdi_clipboard_session_topic(VDI_CLIPBOARD_LEASE_TOPIC_PREFIX, &lease.session_id)
         .map_err(|error| error.to_string())?;
@@ -1072,15 +1120,47 @@ fn read_vdi_clipboard_receipt(
     Ok(Some(receipt))
 }
 
-/// Read and admit the newest typed host-to-guest command for this exact live
-/// VNC lease. Rich envelopes may contain richer fallbacks, but VNC can select
-/// only its truthfully advertised UTF-8 plain-text representation.
 #[cfg(feature = "live-vdi")]
-fn read_latest_vnc_host_clipboard(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RdpClipboardPayload {
+    Text(String),
+    Html(String),
+}
+
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RdpClipboardMaterialization {
+    Pending,
+    Refused,
+    Complete,
+}
+
+/// Keep RDP text and HTML behind the same one-use permission decision. The
+/// callbacks are invoked only for a ticket that has reached `Materialize`.
+#[cfg(feature = "live-vdi")]
+fn materialize_rdp_host_clipboard<E>(
+    readiness: ClipboardGateReadiness,
+    payload: &RdpClipboardPayload,
+    mut send: impl FnMut(&RdpClipboardPayload) -> Result<(), E>,
+) -> Result<RdpClipboardMaterialization, E> {
+    match readiness {
+        ClipboardGateReadiness::Pending => Ok(RdpClipboardMaterialization::Pending),
+        ClipboardGateReadiness::Refused => Ok(RdpClipboardMaterialization::Refused),
+        ClipboardGateReadiness::Materialize => {
+            send(payload)?;
+            Ok(RdpClipboardMaterialization::Complete)
+        }
+    }
+}
+
+/// Read and admit the newest typed host-to-guest command for this exact live
+/// lease before selecting a protocol representation.
+#[cfg(feature = "live-vdi")]
+fn read_latest_host_clipboard_command(
     root: &std::path::Path,
     lease: &VdiClipboardLeaseV2,
     now_ms: u64,
-) -> Result<Option<(VdiClipboardMessageV2, String)>, String> {
+) -> Result<Option<VdiClipboardMessageV2>, String> {
     let persist = Persist::open(root.to_path_buf())
         .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
     let topic =
@@ -1096,17 +1176,24 @@ fn read_latest_vnc_host_clipboard(
         return Ok(None);
     };
     let command = VdiClipboardMessageV2::from_json_bytes(body.as_bytes())
-        .map_err(|error| format!("VNC clipboard command refused: {error}"))?;
+        .map_err(|error| format!("VDI clipboard command refused: {error}"))?;
     let receipt = read_vdi_clipboard_receipt(&persist, lease)?;
     command
         .admit(lease, receipt.as_ref(), now_ms)
-        .map_err(|error| format!("VNC clipboard command refused: {error}"))?;
-    let text = command
-        .envelope
-        .inline_text
-        .as_ref()
-        .map(|text| text.as_str().to_owned())
-        .ok_or_else(|| "VNC clipboard command refused: protocol does not carry Files".to_owned())?;
+        .map_err(|error| format!("VDI clipboard command refused: {error}"))?;
+    Ok(Some(command))
+}
+
+/// VNC and SPICE truthfully select only the UTF-8 plain-text representation.
+#[cfg(feature = "live-vdi")]
+fn read_latest_vnc_host_clipboard(
+    root: &std::path::Path,
+    lease: &VdiClipboardLeaseV2,
+    now_ms: u64,
+) -> Result<Option<(VdiClipboardMessageV2, String)>, String> {
+    let Some(command) = read_latest_host_clipboard_command(root, lease, now_ms)? else {
+        return Ok(None);
+    };
     if !command.selected_mime.eq_ignore_ascii_case("text/plain")
         && !command
             .selected_mime
@@ -1114,7 +1201,48 @@ fn read_latest_vnc_host_clipboard(
     {
         return Err("VNC clipboard command refused: protocol supports plain text only".to_owned());
     }
+    let text = command
+        .envelope
+        .inline_text
+        .as_ref()
+        .map(|text| text.as_str().to_owned())
+        .ok_or_else(|| "VNC clipboard command refused: protocol does not carry Files".to_owned())?;
     Ok(Some((command, text)))
+}
+
+/// RDP selects only bounded inline Unicode text or HTML admitted by the exact
+/// current typed lease. No preview or Files reference is materialized.
+#[cfg(feature = "live-vdi")]
+fn read_latest_rdp_host_clipboard(
+    root: &std::path::Path,
+    lease: &VdiClipboardLeaseV2,
+    now_ms: u64,
+) -> Result<Option<(VdiClipboardMessageV2, RdpClipboardPayload)>, String> {
+    let Some(command) = read_latest_host_clipboard_command(root, lease, now_ms)? else {
+        return Ok(None);
+    };
+    let value = command
+        .envelope
+        .inline_text
+        .as_ref()
+        .map(|text| text.as_str().to_owned())
+        .ok_or_else(|| "RDP clipboard command refused: protocol does not carry Files".to_owned())?;
+    let payload = if command.selected_mime.eq_ignore_ascii_case("text/html")
+        || command
+            .selected_mime
+            .eq_ignore_ascii_case("text/html;charset=utf-8")
+    {
+        RdpClipboardPayload::Html(value)
+    } else if command.selected_mime.eq_ignore_ascii_case("text/plain")
+        || command
+            .selected_mime
+            .eq_ignore_ascii_case("text/plain;charset=utf-8")
+    {
+        RdpClipboardPayload::Text(value)
+    } else {
+        return Err("RDP clipboard command refused: unsupported MIME representation".to_owned());
+    };
+    Ok(Some((command, payload)))
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1144,29 +1272,40 @@ fn try_publish_vnc_clipboard_event(
     clip: &ClipboardClipBody,
     rich: &VdiClipboardMessageV2,
 ) -> Result<(), String> {
+    try_publish_vdi_clipboard_event(root, Some(clip), rich)
+}
+
+#[cfg(feature = "live-vdi")]
+fn try_publish_vdi_clipboard_event(
+    root: Option<&std::path::Path>,
+    legacy_text: Option<&ClipboardClipBody>,
+    rich: &VdiClipboardMessageV2,
+) -> Result<(), String> {
     let Some(root) = root else {
-        return Err("VNC clipboard Bus root is unavailable".to_owned());
+        return Err("VDI clipboard Bus root is unavailable".to_owned());
     };
     let persist = Persist::open(root.to_path_buf())
         .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
-    let body = serde_json::to_string(clip)
-        .map_err(|error| format!("VNC legacy clipboard encoding failed: {error}"))?;
-    persist
-        .write(
-            CLIPBOARD_CAPTURE_TOPIC,
-            Priority::Default,
-            None,
-            Some(&body),
-        )
-        .map_err(|error| format!("VNC legacy clipboard publish failed: {error}"))?;
+    if let Some(clip) = legacy_text {
+        let body = serde_json::to_string(clip)
+            .map_err(|error| format!("VDI legacy clipboard encoding failed: {error}"))?;
+        persist
+            .write(
+                CLIPBOARD_CAPTURE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(|error| format!("VDI legacy clipboard publish failed: {error}"))?;
+    }
     let topic =
         vdi_clipboard_session_topic(VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX, &rich.session_id)
             .map_err(|error| error.to_string())?;
     let body = serde_json::to_string(rich)
-        .map_err(|error| format!("VNC V2 clipboard encoding failed: {error}"))?;
+        .map_err(|error| format!("VDI V2 clipboard encoding failed: {error}"))?;
     persist
         .write(&topic, Priority::Default, None, Some(&body))
-        .map_err(|error| format!("VNC V2 clipboard publish failed: {error}"))?;
+        .map_err(|error| format!("VDI V2 clipboard publish failed: {error}"))?;
     Ok(())
 }
 
@@ -1306,14 +1445,18 @@ fn run_live_rdp(
         }
     }
 
-    let mut gated_host_clipboard = None::<(VdiClipboardMessageV2, String, ClipboardGateTicket)>;
+    let mut gated_host_clipboard = None::<(
+        VdiClipboardMessageV2,
+        RdpClipboardPayload,
+        ClipboardGateTicket,
+    )>;
     let mut last_gated_host_clipboard = None::<(String, u64, u64)>;
     let mut gated_guest_clipboard = None::<(
-        ClipboardClipBody,
+        Option<ClipboardClipBody>,
         VdiClipboardMessageV2,
         ClipboardGateTicket,
     )>;
-    let mut pending_guest_clipboard = None::<(ClipboardClipBody, VdiClipboardMessageV2)>;
+    let mut pending_guest_clipboard = None::<(Option<ClipboardClipBody>, VdiClipboardMessageV2)>;
     let mut guest_message_sequence = 0_u64;
 
     loop {
@@ -1346,34 +1489,35 @@ fn run_live_rdp(
             }
         }
 
-        if let Some((command, text, ticket)) = gated_host_clipboard.take() {
-            match ticket.try_begin_materialization() {
-                ClipboardGateReadiness::Pending => {
-                    gated_host_clipboard = Some((command, text, ticket));
+        if let Some((command, payload, ticket)) = gated_host_clipboard.take() {
+            let readiness = ticket.try_begin_materialization();
+            match materialize_rdp_host_clipboard(readiness, &payload, |payload| match payload {
+                RdpClipboardPayload::Text(text) => conn.send_clipboard_to_guest(text.clone()),
+                RdpClipboardPayload::Html(html) => conn.send_html_clipboard_to_guest(html.clone()),
+            }) {
+                Ok(RdpClipboardMaterialization::Pending) => {
+                    gated_host_clipboard = Some((command, payload, ticket));
                 }
-                ClipboardGateReadiness::Refused => {}
-                ClipboardGateReadiness::Materialize => match conn.send_clipboard_to_guest(text) {
-                    Ok(()) => {
-                        ticket.report_progress(command.envelope.byte_count);
-                        if let Some(root) = clipboard_root.as_deref() {
-                            if let Err(error) =
-                                publish_vdi_clipboard_receipt(root, &command.receipt())
-                            {
-                                ticket.report_failure(ClipboardFailure::Transport, now_ms);
-                                let _ = event_tx.send(LiveRdpEvent::Error(error));
-                                return;
-                            }
+                Ok(RdpClipboardMaterialization::Refused) => {}
+                Ok(RdpClipboardMaterialization::Complete) => {
+                    ticket.report_progress(command.envelope.byte_count);
+                    if let Some(root) = clipboard_root.as_deref() {
+                        if let Err(error) = publish_vdi_clipboard_receipt(root, &command.receipt())
+                        {
+                            ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                            let _ = event_tx.send(LiveRdpEvent::Error(error));
+                            return;
                         }
-                        ticket.report_complete(now_ms);
                     }
-                    Err(error) => {
-                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
-                        let _ = event_tx.send(LiveRdpEvent::Error(format!(
-                            "RDP host clipboard refused: {error}"
-                        )));
-                        return;
-                    }
-                },
+                    ticket.report_complete(now_ms);
+                }
+                Err(error) => {
+                    ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                    let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                        "RDP host clipboard refused: {error}"
+                    )));
+                    return;
+                }
             }
         }
 
@@ -1384,8 +1528,11 @@ fn run_live_rdp(
                 }
                 ClipboardGateReadiness::Refused => {}
                 ClipboardGateReadiness::Materialize => {
-                    match try_publish_vnc_clipboard_event(clipboard_root.as_deref(), &legacy, &rich)
-                    {
+                    match try_publish_vdi_clipboard_event(
+                        clipboard_root.as_deref(),
+                        legacy.as_ref(),
+                        &rich,
+                    ) {
                         Ok(()) => {
                             ticket.report_progress(rich.envelope.byte_count);
                             ticket.report_complete(now_ms);
@@ -1419,8 +1566,8 @@ fn run_live_rdp(
 
         if gated_host_clipboard.is_none() {
             if let Some(root) = clipboard_root.as_deref() {
-                if let Ok(Some((command, text))) =
-                    read_latest_vnc_host_clipboard(root, &clipboard_lease, now_ms)
+                if let Ok(Some((command, payload))) =
+                    read_latest_rdp_host_clipboard(root, &clipboard_lease, now_ms)
                 {
                     let key = (
                         command.lease_id.clone(),
@@ -1444,7 +1591,7 @@ fn run_live_rdp(
                             ) {
                                 Ok(ticket) => {
                                     last_gated_host_clipboard = Some(key);
-                                    gated_host_clipboard = Some((command, text, ticket));
+                                    gated_host_clipboard = Some((command, payload, ticket));
                                 }
                                 Err(
                                     crate::clipboard_permissions::ClipboardPermissionError::Busy,
@@ -1494,8 +1641,20 @@ fn run_live_rdp(
             }
         }
 
-        if gated_guest_clipboard.is_none() {
-            if let Some(text) = conn.take_guest_clipboard() {
+        if gated_guest_clipboard.is_none() && pending_guest_clipboard.is_none() {
+            if let Some(html) = conn.take_guest_html_clipboard() {
+                guest_message_sequence = guest_message_sequence.saturating_add(1);
+                if guest_message_sequence != 0 {
+                    if let Ok(rich) = rdp_guest_html_clipboard_message(
+                        &clipboard_lease,
+                        guest_message_sequence,
+                        html,
+                        now_ms,
+                    ) {
+                        pending_guest_clipboard = Some((None, rich));
+                    }
+                }
+            } else if let Some(text) = conn.take_guest_clipboard() {
                 guest_message_sequence = guest_message_sequence.saturating_add(1);
                 let clip = ClipboardClipBody::from_text(
                     text.clone(),
@@ -1510,7 +1669,7 @@ fn run_live_rdp(
                         text,
                         now_ms,
                     ) {
-                        pending_guest_clipboard = Some((clip, rich));
+                        pending_guest_clipboard = Some((Some(clip), rich));
                     }
                 }
             }

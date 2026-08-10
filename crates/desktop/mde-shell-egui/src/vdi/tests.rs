@@ -627,6 +627,116 @@ fn vnc_host_clipboard_reader_rejects_secret_oversized_and_expired_lease() {
     );
 }
 
+#[cfg(feature = "live-vdi")]
+#[test]
+fn rdp_html_uses_typed_lease_and_the_same_one_use_materialization_gate() {
+    let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
+    let now_ms = 1_700_000_000_000;
+    let lease = super::vdi_clipboard_lease("rdp", "rdp:oak:session", now_ms)
+        .expect("RDP rich clipboard lease");
+    assert!(lease
+        .permitted_mime_offers
+        .iter()
+        .any(|mime| mime.eq_ignore_ascii_case("text/html;charset=utf-8")));
+
+    let html = "<p>approved <strong>HTML</strong></p>";
+    let envelope = mackes_mesh_types::vdi_clipboard::ClipboardEnvelopeV2::new_inline_text(
+        "node-host",
+        "seat-host",
+        "drm-session",
+        4,
+        now_ms,
+        vec!["text/html;charset=utf-8".into()],
+        "rich clipboard",
+        mackes_mesh_types::vdi_clipboard::VdiClipboardText::new(html).expect("bounded HTML text"),
+        now_ms + 30_000,
+    )
+    .expect("bounded HTML envelope");
+    let command = mackes_mesh_types::vdi_clipboard::VdiClipboardMessageV2 {
+        schema_version: mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: lease.session_id.clone(),
+        generation: lease.generation,
+        lease_id: lease.lease_id.clone(),
+        lease_expires_at_ms: lease.expires_at_ms,
+        message_sequence: 1,
+        selected_mime: "text/html;charset=utf-8".into(),
+        disclosure: mackes_mesh_types::vdi_clipboard::VdiClipboardDisclosureV2::Shareable,
+        envelope,
+    };
+    let topic = mackes_mesh_types::vdi_clipboard::vdi_clipboard_session_topic(
+        mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
+        &lease.session_id,
+    )
+    .expect("command topic");
+    let persist =
+        mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
+    persist
+        .write(
+            &topic,
+            mde_bus::hooks::config::Priority::Default,
+            None,
+            Some(&serde_json::to_string(&command).expect("encode HTML command")),
+        )
+        .expect("write HTML command");
+
+    let (_, payload) = super::read_latest_rdp_host_clipboard(dir.path(), &lease, now_ms + 1)
+        .expect("read typed HTML")
+        .expect("HTML command admitted");
+    assert_eq!(payload, super::RdpClipboardPayload::Html(html.into()));
+
+    let materialized = std::cell::RefCell::new(Vec::new());
+    for readiness in [
+        super::ClipboardGateReadiness::Pending,
+        super::ClipboardGateReadiness::Refused,
+    ] {
+        let outcome = super::materialize_rdp_host_clipboard(readiness, &payload, |payload| {
+            materialized.borrow_mut().push(payload.clone());
+            Ok::<_, ()>(())
+        })
+        .expect("non-materializing gate outcome");
+        assert_ne!(outcome, super::RdpClipboardMaterialization::Complete);
+    }
+    assert!(
+        materialized.borrow().is_empty(),
+        "denied HTML escaped the gate"
+    );
+    assert_eq!(
+        super::materialize_rdp_host_clipboard(
+            super::ClipboardGateReadiness::Materialize,
+            &payload,
+            |payload| {
+                materialized.borrow_mut().push(payload.clone());
+                Ok::<_, ()>(())
+            },
+        )
+        .expect("approved materialization"),
+        super::RdpClipboardMaterialization::Complete
+    );
+    assert_eq!(materialized.into_inner(), vec![payload]);
+
+    let mut stale = command;
+    stale.generation = stale.generation.saturating_add(1);
+    persist
+        .write(
+            &topic,
+            mde_bus::hooks::config::Priority::Default,
+            None,
+            Some(&serde_json::to_string(&stale).expect("encode stale command")),
+        )
+        .expect("write stale command");
+    assert!(
+        super::read_latest_rdp_host_clipboard(dir.path(), &lease, now_ms + 2)
+            .expect_err("stale generation must fail before materialization")
+            .contains("lease identity")
+    );
+
+    let guest = super::rdp_guest_html_clipboard_message(&lease, 2, html.into(), now_ms + 2)
+        .expect("guest HTML enters the typed contract");
+    assert_eq!(guest.selected_mime, "text/html;charset=utf-8");
+    assert_eq!(guest.generation, lease.generation);
+    assert_eq!(guest.lease_id, lease.lease_id);
+}
+
 #[test]
 fn a_connect_request_carries_the_three_display_choices() {
     // The request-construction fold: the picked target + the three choices
