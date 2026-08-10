@@ -53,7 +53,8 @@ EXPECTED = ("kernel-surface", "iptsd", "libwacom-surface", "surface-control", "s
 SIGNING_REQUIRED = {"kernel-surface", "surface-secureboot"}
 ROOT_KEYS = {"schema_version", "kind", "target", "signing_key", "status", "blockers", "packages"}
 TARGET_KEYS = {"os", "release", "arch", "profile", "bootc_base"}
-KEY_KEYS = {"filename", "sha256", "fingerprint"}
+KEY_KEYS_BLOCKED = {"filename", "sha256", "fingerprint"}
+KEY_KEYS_READY = KEY_KEYS_BLOCKED | {"rpm_signing_fingerprints"}
 PACKAGE_KEYS = {"name", "availability", "blocker", "source", "rpm", "kernel_module_signing"}
 SOURCE_KEYS = {"filename", "url", "ref", "sha256", "license"}
 RPM_KEYS = {"filename", "nevra", "sha256", "signing_fingerprint"}
@@ -104,7 +105,7 @@ def validate(document):
     exact_keys(target, TARGET_KEYS, "target")
     fixed_target = {"os": "fedora", "release": 44, "arch": "x86_64", "profile": "workstation-bootc"}
     if {k: target[k] for k in fixed_target} != fixed_target: fail("target must be Fedora 44 x86_64 workstation-bootc")
-    exact_keys(document["signing_key"], KEY_KEYS, "signing_key")
+    if not isinstance(document["signing_key"], dict): fail("signing_key must be an object")
     status = document["status"]
     if status not in {"ready", "blocked"}: fail("status is unknown")
     blockers = document["blockers"]
@@ -156,12 +157,19 @@ def validate(document):
         if status != "ready" or blockers: fail("a complete manifest must be ready with no blockers")
         if not isinstance(target["bootc_base"], str) or not BASE.fullmatch(target["bootc_base"]) or target["bootc_base"].endswith("0" * 64): fail("ready manifest requires non-null digest-pinned quay.io Fedora 44 bootc base")
         key = document["signing_key"]
+        exact_keys(key, KEY_KEYS_READY, "signing_key")
         filename(key["filename"], "signing_key.filename", ".asc"); pinned_sha(key["sha256"], "signing_key.sha256"); fingerprint(key["fingerprint"], "signing_key.fingerprint")
+        admitted = key["rpm_signing_fingerprints"]
+        if (not isinstance(admitted, list) or not admitted or admitted != sorted(set(admitted))):
+            fail("signing_key.rpm_signing_fingerprints must be a non-empty sorted unique array")
+        for index, item in enumerate(admitted): fingerprint(item, f"signing_key.rpm_signing_fingerprints[{index}]")
+        if key["fingerprint"] not in admitted: fail("primary signing-key fingerprint must be admitted for RPM signing")
         for row in packages:
-            if row["rpm"]["signing_fingerprint"] != key["fingerprint"]: fail(f"{row['name']} signing fingerprint differs from governed key")
+            if row["rpm"]["signing_fingerprint"] not in admitted: fail(f"{row['name']} signing fingerprint is not admitted by the governed key")
         return "ready"
     if ready_count != 0: fail("partial package provenance is not admissible; manifest must be wholly ready or wholly unavailable")
     if status != "blocked" or not blockers: fail("an incomplete manifest must be blocked with exact blockers")
+    exact_keys(document["signing_key"], KEY_KEYS_BLOCKED, "signing_key")
     if target["bootc_base"] is not None or any(v is not None for v in document["signing_key"].values()):
         fail("blocked manifest must not guess a base digest or signing key")
     return "blocked"
@@ -184,7 +192,24 @@ def run(command, what):
     if result.returncode != 0: fail(f"{what} failed: {result.stdout.strip()}")
     return result.stdout.strip()
 
-def admitted_signature_fingerprint(output, expected_fingerprint):
+def signing_key_fingerprints(output):
+    primary, admitted, pending, pub_count = None, set(), None, 0
+    for line in output.splitlines():
+        fields = line.split(":")
+        if fields[0] in {"pub", "sub"}:
+            pending = (fields[0], len(fields) > 11 and "s" in fields[11].lower())
+            if fields[0] == "pub": pub_count += 1
+        elif fields[0] == "fpr" and pending is not None:
+            if len(fields) <= 9: fail("signing key artifact has a malformed fingerprint record")
+            value = fields[9].upper()
+            if pending[0] == "pub": primary = value
+            if pending[1]: admitted.add(value)
+            pending = None
+    if pub_count != 1 or primary is None or primary not in admitted:
+        fail("signing key artifact must contain one signing-capable primary key")
+    return primary, admitted
+
+def admitted_signature_fingerprint(output, expected_fingerprints):
     key_ids = []
     for line in output.splitlines():
         if "signature" not in line.lower() or not line.rstrip().endswith(": OK"):
@@ -192,9 +217,13 @@ def admitted_signature_fingerprint(output, expected_fingerprint):
         match = re.search(r"(?i)key ID ([0-9a-f]{8,16})", line)
         if match: key_ids.append(match.group(1).upper())
     if not key_ids: fail("RPM signature verification did not report a valid signature key ID")
-    if any(not expected_fingerprint.endswith(key_id) for key_id in key_ids):
-        fail("RPM signature key ID does not match the governed fingerprint")
-    return expected_fingerprint
+    matches = []
+    for key_id in key_ids:
+        found = [item for item in expected_fingerprints if item.endswith(key_id)]
+        if len(found) != 1: fail("RPM signature key ID does not uniquely match a governed fingerprint")
+        matches.append(found[0])
+    if len(set(matches)) != 1: fail("RPM carries signatures from inconsistent governed keys")
+    return matches[0]
 
 def verify_artifacts(document, artifact_dir, inspector=None):
     root = Path(artifact_dir)
@@ -208,15 +237,16 @@ def verify_artifacts(document, artifact_dir, inspector=None):
     if sha256(key) != document["signing_key"]["sha256"]: fail("signing key artifact SHA-256 mismatch")
     rows, sources = [], []
     if inspector is None:
-        fprs = [line.split(":")[9].upper() for line in run(["gpg", "--batch", "--show-keys", "--with-colons", str(key)], "signing key inspection").splitlines() if line.startswith("fpr:")]
-        if not fprs or fprs[0] != document["signing_key"]["fingerprint"]: fail("signing key artifact fingerprint mismatch")
+        primary, admitted = signing_key_fingerprints(run(["gpg", "--batch", "--show-keys", "--with-colons", str(key)], "signing key inspection"))
+        if primary != document["signing_key"]["fingerprint"]: fail("signing key artifact primary fingerprint mismatch")
+        if admitted != set(document["signing_key"]["rpm_signing_fingerprints"]): fail("signing key artifact admitted RPM fingerprints differ")
         rpmdb = tempfile.TemporaryDirectory(prefix="mcnf-surface-rpmdb-")
         run(["rpm", "--dbpath", rpmdb.name, "--initdb"], "temporary RPM database initialization")
         run(["rpm", "--dbpath", rpmdb.name, "--import", str(key)], "governed signing key import")
         def inspector(path):
             nevra = run(["rpm", "-qp", "--qf", "%{NAME}-%|EPOCH?{%{EPOCH}:}:{}|%{VERSION}-%{RELEASE}.%{ARCH}", str(path)], f"NEVRA inspection for {path.name}")
             signature = run(["rpmkeys", "--dbpath", rpmdb.name, "--checksig", "--verbose", str(path)], f"signature verification for {path.name}")
-            signer = admitted_signature_fingerprint(signature, document["signing_key"]["fingerprint"])
+            signer = admitted_signature_fingerprint(signature, admitted)
             return nevra, signer
     for row in sorted(document["packages"], key=lambda item: item["name"]):
         source = row["source"]; source_path = safe_artifact(root, source["filename"])
@@ -230,6 +260,14 @@ def verify_artifacts(document, artifact_dir, inspector=None):
         rows.append((rpm["sha256"], rpm["nevra"], signer, rpm["filename"]))
     return rows, sources
 
+def install_lock_lines(document, rows, sources, manifest_sha):
+    lines = [f"MANIFEST\t{manifest_sha}", f"BASE\t{document['target']['bootc_base']}",
+             "KEY\t" + "\t".join((document["signing_key"]["sha256"], document["signing_key"]["fingerprint"], document["signing_key"]["filename"]))]
+    lines += ["SIGNER\t" + value for value in document["signing_key"]["rpm_signing_fingerprints"]]
+    lines += ["SOURCE\t" + "\t".join(source) for source in sources]
+    lines += ["RPM\t" + "\t".join(row) for row in rows]
+    return lines
+
 def fixture():
     sha, fpr = "a" * 64, "B" * 40
     rows = []
@@ -241,7 +279,7 @@ def fixture():
           "kernel_module_signing": {"applicability": "required" if required else "not-applicable", "signer": "SELF-TEST" if required else None, "certificate_sha256": sha if required else None}})
     return {"schema_version": 2, "kind": "mcnf-surface-stack-provenance",
       "target": {"os": "fedora", "release": 44, "arch": "x86_64", "profile": "workstation-bootc", "bootc_base": "quay.io/fedora/fedora-bootc:44@sha256:" + "c" * 64},
-      "signing_key": {"filename": "surface-signing-key.asc", "sha256": sha, "fingerprint": fpr}, "status": "ready", "blockers": [], "packages": rows}
+      "signing_key": {"filename": "surface-signing-key.asc", "sha256": sha, "fingerprint": fpr, "rpm_signing_fingerprints": [fpr]}, "status": "ready", "blockers": [], "packages": rows}
 
 def expect_invalid(name, function):
     try: function()
@@ -250,6 +288,14 @@ def expect_invalid(name, function):
 
 def self_test():
     base = fixture(); validate(base)
+    primary, admitted = signing_key_fingerprints(
+        "pub:u:255:22:AAAA:1:2::u:::scSC:::::ed25519:::0:\n"
+        + "fpr:::::::::" + "B"*40 + ":\n"
+        + "sub:u:4096:1:CCCC:1:2:::::s::::::23:\n"
+        + "fpr:::::::::" + "C"*40 + ":"
+    )
+    assert primary == "B"*40 and admitted == {"B"*40, "C"*40}
+    assert [line for line in install_lock_lines(base, [], [], "d"*64) if line.startswith("SIGNER\t")] == ["SIGNER\t" + "B"*40]
     mutations = []
     def mutated(name, edit):
         value = copy.deepcopy(base); edit(value); mutations.append((name, value))
@@ -260,6 +306,7 @@ def self_test():
     mutated("duplicate source artifact", lambda x: x["packages"][1]["source"].update({"filename": x["packages"][0]["source"]["filename"]}))
     mutated("unconstrained package", lambda x: x["packages"][0]["rpm"].update({"nevra": "kernel-surface-latest.x86_64"}))
     mutated("different package signer", lambda x: x["packages"][0]["rpm"].update({"signing_fingerprint": "C"*40}))
+    mutated("missing primary signer", lambda x: x["signing_key"].update({"rpm_signing_fingerprints": ["C"*40]}))
     mutated("lowercase fingerprint", lambda x: x["signing_key"].update({"fingerprint": "b"*40}))
     mutated("zero base digest", lambda x: x["target"].update({"bootc_base": "quay.io/fedora/fedora-bootc:44@sha256:" + "0"*64}))
     for name, value in mutations: expect_invalid(name, lambda value=value: validate(value))
@@ -296,10 +343,15 @@ def self_test():
         (root / measured["packages"][0]["source"]["filename"]).write_bytes((measured["packages"][0]["name"] + "-source").encode())
         assert admitted_signature_fingerprint(
             "Header V4 RSA/SHA256 Signature, key ID " + measured["signing_key"]["fingerprint"][-16:] + ": OK",
-            measured["signing_key"]["fingerprint"],
+            set(measured["signing_key"]["rpm_signing_fingerprints"]),
         ) == measured["signing_key"]["fingerprint"]
-        expect_invalid("unsigned RPM output", lambda: admitted_signature_fingerprint("Header SHA256 digest: OK", measured["signing_key"]["fingerprint"]))
-        expect_invalid("wrong RPM key ID", lambda: admitted_signature_fingerprint("Header V4 RSA/SHA256 Signature, key ID DEADBEEF: OK", measured["signing_key"]["fingerprint"]))
+        subkey = "C" * 40
+        assert admitted_signature_fingerprint(
+            "Header V4 RSA/SHA256 Signature, key ID " + subkey[-16:] + ": OK",
+            {measured["signing_key"]["fingerprint"], subkey},
+        ) == subkey
+        expect_invalid("unsigned RPM output", lambda: admitted_signature_fingerprint("Header SHA256 digest: OK", set(measured["signing_key"]["rpm_signing_fingerprints"])))
+        expect_invalid("wrong RPM key ID", lambda: admitted_signature_fingerprint("Header V4 RSA/SHA256 Signature, key ID DEADBEEF: OK", set(measured["signing_key"]["rpm_signing_fingerprints"])))
         key.unlink(); key.symlink_to("outside.asc")
         expect_invalid("symlink signing key", lambda: verify_artifacts(measured, root, fake))
         key.unlink(); key.write_bytes(b"key")
@@ -318,10 +370,7 @@ try:
     rows, sources = verify_artifacts(document, sys.argv[2])
     if sys.argv[3]:
         lock = Path(sys.argv[3]); manifest_sha = sha256(path)
-        lines = [f"MANIFEST\t{manifest_sha}", f"BASE\t{document['target']['bootc_base']}",
-                 "KEY\t" + "\t".join((document["signing_key"]["sha256"], document["signing_key"]["fingerprint"], document["signing_key"]["filename"]))]
-        lines += ["SOURCE\t" + "\t".join(source) for source in sources]
-        lines += ["RPM\t" + "\t".join(row) for row in rows]
+        lines = install_lock_lines(document, rows, sources, manifest_sha)
         lock.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("OK: Fedora 44 Surface stack local artifacts, identities, signatures, and base digest are pinned")
 except (OSError, UnicodeError, json.JSONDecodeError) as exc:

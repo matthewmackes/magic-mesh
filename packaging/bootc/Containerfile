@@ -200,6 +200,11 @@ RUN set -eux; \
     case "${key_file}" in ''|*[!A-Za-z0-9._+~-]*) exit 1;; esac; \
     echo "${key_sha}  /tmp/surface-artifacts/${key_file}" | sha256sum -c -; \
     rpm --import "/tmp/surface-artifacts/${key_file}"; \
+    test "$(awk -F '\t' '$1 == "SIGNER" {count++} END {print count+0}' /usr/share/magic-mesh/surface-install.lock)" -ge 1; \
+    test "$(awk -F '\t' '$1 == "SIGNER" {print $2}' /usr/share/magic-mesh/surface-install.lock | sort -u | wc -l)" = \
+         "$(awk -F '\t' '$1 == "SIGNER" {count++} END {print count+0}' /usr/share/magic-mesh/surface-install.lock)"; \
+    awk -F '\t' '$1 == "SIGNER" {if ($2 !~ /^[0-9A-F]{40}([0-9A-F]{24})?$/) exit 1}' /usr/share/magic-mesh/surface-install.lock; \
+    awk -F '\t' -v wanted="${key_fpr}" '$1 == "SIGNER" && $2 == wanted {found=1} END {exit !found}' /usr/share/magic-mesh/surface-install.lock; \
     test "$(awk -F '\t' '$1 == "SOURCE" {count++} END {print count+0}' /usr/share/magic-mesh/surface-install.lock)" = 5; \
     while IFS="$(printf '\t')" read -r kind source_sha source_file; do \
         test "${kind}" = SOURCE || continue; \
@@ -211,7 +216,7 @@ RUN set -eux; \
         test "${kind}" = RPM || continue; \
         case "${rpm_file}" in ''|*[!A-Za-z0-9._+~-]*|*.rpm.rpm) exit 1;; esac; \
         case "${rpm_file}" in *.rpm) :;; *) exit 1;; esac; \
-        test "${rpm_fpr}" = "${key_fpr}"; \
+        awk -F '\t' -v wanted="${rpm_fpr}" '$1 == "SIGNER" && $2 == wanted {found=1} END {exit !found}' /usr/share/magic-mesh/surface-install.lock; \
         echo "${rpm_sha}  /tmp/surface-artifacts/${rpm_file}" | sha256sum -c -; \
         test "$(rpm -qp --qf '%{NAME}-%|EPOCH?{%{EPOCH}:}:{}|%{VERSION}-%{RELEASE}.%{ARCH}' "/tmp/surface-artifacts/${rpm_file}")" = "${rpm_nevra}"; \
         rpmkeys --checksig --verbose "/tmp/surface-artifacts/${rpm_file}"; \
