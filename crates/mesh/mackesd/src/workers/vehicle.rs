@@ -61,7 +61,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1808,7 +1808,7 @@ impl VehicleRoster {
     /// Expire manager rows that have stopped delivering their declared bounded
     /// heartbeat. Three missed intervals matches the vehicle consumer contract.
     pub fn expire_unavailable(&mut self, now: Instant) {
-        let mut lost_sources = Vec::new();
+        let mut expired_sources = BTreeSet::new();
         for assignment in self.assignments.values_mut() {
             let Some(received_at) = assignment.latest_received_at else {
                 continue;
@@ -1823,13 +1823,26 @@ impl VehicleRoster {
                 })
                 .unwrap_or(assignment.source.plan.heartbeat.saturating_mul(3));
             if now.saturating_duration_since(received_at) > expiry {
-                lost_sources.push(assignment.source.source_id.clone());
+                expired_sources.insert(assignment.source.source_id.clone());
                 assignment.latest = None;
                 assignment.latest_received_at = None;
             }
         }
-        for source_id in lost_sources {
-            self.published.remove(&source_id);
+        for source_id in expired_sources {
+            // A source may have several independent managers. Expiring one
+            // manager must not reset the source publication epoch while
+            // another manager still has an accepted snapshot; doing so emits
+            // a false Changed publication and makes a healthy MG90 look like
+            // it churned during manager failover.
+            let has_live_manager = self
+                .assignments
+                .iter()
+                .any(|((candidate, _), assignment)| {
+                    candidate == &source_id && assignment.latest.is_some()
+                });
+            if !has_live_manager {
+                self.published.remove(&source_id);
+            }
         }
     }
 
@@ -6607,6 +6620,57 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             roster_snapshot(&source_b, "manager-b", 100, 100, 1)
                 .snapshot
                 .telem
+        );
+    }
+
+    #[test]
+    fn expiring_one_manager_preserves_live_source_publication_epoch() {
+        let source = roster_source_id();
+        let plan = VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT).unwrap();
+        let t0 = Instant::now();
+        let mut roster = VehicleRoster::new(t0);
+        for manager in ["manager-a", "manager-b"] {
+            roster
+                .register(VehicleRosterSource::remote(source.clone(), manager, plan).unwrap())
+                .unwrap();
+        }
+
+        roster
+            .ingest_at(
+                roster_snapshot(&source, "manager-a", 100, 100, 1),
+                t0,
+            )
+            .unwrap();
+        roster
+            .ingest_at(
+                roster_snapshot(&source, "manager-b", 100, 100, 1),
+                t0,
+            )
+            .unwrap();
+        assert_eq!(roster.take_publications(t0).len(), 1);
+
+        // Manager A refreshed recently; manager B stopped delivering. At the
+        // source level this is a manager failover condition, not MG90 loss.
+        roster
+            .ingest_at(
+                roster_snapshot(&source, "manager-a", 200, 200, 2),
+                t0 + Duration::from_secs(14),
+            )
+            .unwrap();
+        // Drain the legitimate content change before checking the expiry
+        // path; otherwise the assertion would observe manager A's new
+        // snapshot instead of the manager-B failover behavior.
+        assert_eq!(
+            roster.take_publications(t0 + Duration::from_secs(14)).len(),
+            1
+        );
+        let publications = roster.take_publications(t0 + Duration::from_secs(20));
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].manager_id, "manager-a");
+        assert_eq!(
+            publications[0].reason,
+            VehiclePublicationReason::Heartbeat,
+            "manager expiry must not manufacture a source Changed epoch"
         );
     }
 
