@@ -18,9 +18,16 @@ sample, so the Syncthing load is a convergence burst rather than a sustained
 runaway loop. The shell service had an attached remote diagnostic shell and
 SSH child, which explains part of its live CPU sample.
 
+## Corrective slice
+
+`node_grade` now coalesces semantically unchanged canonical node files, health
+Bus rows, and folded snapshots. Node files heartbeat within 60 seconds and
+folded snapshots within 15 seconds, below their 30-second freshness bound;
+Bus replacement resets the gates. The focused BigBoy `.130` gate passed:
+`steady_health_reuses_bus_row_until_bounded_heartbeat` — 1 passed, 0 failed.
+
 ## Boundary
 
-No service was stopped, restarted, or throttled. The next corrective slice
-should reduce high-churn mesh writes or make them coalesce before replication,
-then repeat a bounded seat-15 CPU sample after Syncthing reaches steady state.
-
+No service was stopped, restarted, or throttled. Repeat a bounded seat-15 CPU
+sample after Syncthing reaches steady state; live improvement is not claimed
+until that observation exists.

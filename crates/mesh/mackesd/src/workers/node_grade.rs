@@ -41,6 +41,14 @@ const MAX_INITIAL_PHASE_MS: u64 = 1_500;
 // two minutes when a publisher genuinely disappears.
 const PUBLICATION_VALIDITY_MS: u64 = 120_000;
 const SNAPSHOT_VALIDITY_MS: u64 = 30_000;
+// Health observations are sampled every 10s, but unchanged condition state
+// does not need a new retained Bus row on every sample. Keep the publication
+// comfortably inside the node-row validity window so a healthy publisher still
+// refreshes its authority even when its observations are steady.
+const HEALTH_PUBLICATION_HEARTBEAT_MS: u64 = 60_000;
+// Keep the folded snapshot file and Bus projection fresh without rewriting
+// them for every 10-second sample. This remains below SNAPSHOT_VALIDITY_MS.
+const SNAPSHOT_PUBLICATION_HEARTBEAT_MS: u64 = 15_000;
 const SUSTAINED_SAMPLES: usize = 3;
 const MAX_HEALTH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MESH_STATUS_PATH: &str = "/run/mde/mesh-status.json";
@@ -1705,6 +1713,10 @@ pub struct NodeGradeWorker {
     pressure: PressureWindow,
     action_cursor: Option<String>,
     last_snapshot: Option<SystemMeshHealthSnapshot>,
+    last_health_publication: Option<(NodeHealthState, u64)>,
+    last_health_file_publication: Option<(NodeHealthState, u64)>,
+    last_snapshot_file_publication: Option<(SystemMeshHealthSnapshot, u64)>,
+    last_snapshot_bus_publication: Option<(SystemMeshHealthSnapshot, u64)>,
     #[cfg(test)]
     fail_terminal_result_writes: usize,
     #[cfg(test)]
@@ -1735,6 +1747,10 @@ impl NodeGradeWorker {
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            last_health_publication: None,
+            last_health_file_publication: None,
+            last_snapshot_file_publication: None,
+            last_snapshot_bus_publication: None,
             #[cfg(test)]
             fail_terminal_result_writes: 0,
             #[cfg(test)]
@@ -1987,6 +2003,13 @@ impl NodeGradeWorker {
         let pending = self.stage_action_results(persist)?;
         self.flush_staged_action_results(persist, &pending)?;
         self.action_cursor = tail;
+        // A replacement Bus has no retained health row. Force the next
+        // projection to republish even when the semantic health state is
+        // unchanged from the retired Bus.
+        self.last_health_publication = None;
+        self.last_health_file_publication = None;
+        self.last_snapshot_file_publication = None;
+        self.last_snapshot_bus_publication = None;
         self.active_bus = Some(identity.clone());
         Ok(())
     }
@@ -2051,6 +2074,21 @@ impl NodeGradeWorker {
             active_conditions: active.clone(),
             resolved_conditions: resolved,
         };
+        let health_key = health_publication_key(&state);
+        let publish_health =
+            self.last_health_publication
+                .as_ref()
+                .is_none_or(|(previous, published_at_ms)| {
+                    previous != &health_key
+                        || now.saturating_sub(*published_at_ms) >= HEALTH_PUBLICATION_HEARTBEAT_MS
+                });
+        let health_file_due =
+            self.last_health_file_publication
+                .as_ref()
+                .is_none_or(|(previous, published_at_ms)| {
+                    previous != &health_key
+                        || now.saturating_sub(*published_at_ms) >= HEALTH_PUBLICATION_HEARTBEAT_MS
+                });
         let previous_critical: BTreeSet<_> = previous
             .iter()
             .flat_map(|old| old.active_conditions.iter())
@@ -2073,18 +2111,52 @@ impl NodeGradeWorker {
             SNAPSHOT_VALIDITY_MS,
             observations.reachable_lighthouses,
         );
-        write_json_atomic(&path, &state)
-            .map_err(|error| format!("node health state publication failed: {error}"))?;
-        #[cfg(test)]
-        if self.fail_snapshot_file_writes > 0 {
-            self.fail_snapshot_file_writes -= 1;
-            return Err("injected canonical snapshot publication failure".into());
+        let snapshot_key = snapshot_publication_key(&snapshot);
+        let snapshot_file_due = self.last_snapshot_file_publication.as_ref().is_none_or(
+            |(previous, published_at_ms)| {
+                previous != &snapshot_key
+                    || now.saturating_sub(*published_at_ms) >= SNAPSHOT_PUBLICATION_HEARTBEAT_MS
+            },
+        ) || {
+            #[cfg(test)]
+            {
+                self.fail_snapshot_file_writes > 0
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        let snapshot_bus_due = self.last_snapshot_bus_publication.as_ref().is_none_or(
+            |(previous, published_at_ms)| {
+                previous != &snapshot_key
+                    || now.saturating_sub(*published_at_ms) >= SNAPSHOT_PUBLICATION_HEARTBEAT_MS
+            },
+        );
+        if health_file_due {
+            write_json_atomic(&path, &state)
+                .map_err(|error| format!("node health state publication failed: {error}"))?;
+            self.last_health_file_publication = Some((health_key.clone(), now));
         }
-        write_json_atomic(&snapshot_path(&self.workgroup_root, &self.host), &snapshot)
-            .map_err(|error| format!("health snapshot publication failed: {error}"))?;
+        if snapshot_file_due {
+            write_json_atomic(&snapshot_path(&self.workgroup_root, &self.host), &snapshot)
+                .map_err(|error| format!("health snapshot publication failed: {error}"))?;
+            #[cfg(test)]
+            if self.fail_snapshot_file_writes > 0 {
+                self.fail_snapshot_file_writes -= 1;
+                return Err("injected canonical snapshot publication failure".into());
+            }
+            self.last_snapshot_file_publication = Some((snapshot_key.clone(), now));
+        }
         if let Some(bus) = persist.as_deref_mut() {
-            emit_json(bus, &node_health_topic(&self.host), &state)?;
-            emit_json(bus, SNAPSHOT_TOPIC, &snapshot)?;
+            if publish_health {
+                emit_json(bus, &node_health_topic(&self.host), &state)?;
+                self.last_health_publication = Some((health_key, now));
+            }
+            if snapshot_bus_due {
+                emit_json(bus, SNAPSHOT_TOPIC, &snapshot)?;
+                self.last_snapshot_bus_publication = Some((snapshot_key, now));
+            }
             for condition in &active {
                 if condition.requirement == RequirementClass::Required
                     && condition.severity == HealthSeverity::Critical
@@ -2383,6 +2455,46 @@ impl NodeGradeWorker {
                 .map_err(|error| format!("condition state publication failed: {error}"))?;
         }
         Ok(())
+    }
+}
+
+/// Remove publication clock fields from a health row before comparing it with
+/// the last Bus publication. Generation and timestamps advance on every local
+/// sample; condition/grade changes remain immediately publishable.
+fn health_publication_key(state: &NodeHealthState) -> NodeHealthState {
+    let mut key = state.clone();
+    key.generation = 0;
+    key.published_at_ms = 0;
+    key.valid_until_ms = 0;
+    key.grade.evaluated_at_ms = 0;
+    normalize_condition_timestamps(&mut key.active_conditions);
+    normalize_condition_timestamps(&mut key.resolved_conditions);
+    key
+}
+
+/// Remove publication clock fields before comparing folded snapshots. The
+/// health contents remain immediately publishable while steady snapshots use
+/// the bounded validity-preserving heartbeat.
+fn snapshot_publication_key(snapshot: &SystemMeshHealthSnapshot) -> SystemMeshHealthSnapshot {
+    let mut key = snapshot.clone();
+    key.generation = 0;
+    key.generated_at_ms = 0;
+    key.fresh_until_ms = 0;
+    for grade in &mut key.current_node_grades {
+        grade.evaluated_at_ms = 0;
+    }
+    normalize_condition_timestamps(&mut key.active_conditions);
+    normalize_condition_timestamps(&mut key.resolved_conditions);
+    key
+}
+
+fn normalize_condition_timestamps(conditions: &mut [HealthCondition]) {
+    for condition in conditions {
+        condition.last_observed_ms = 0;
+        condition.evidence.observed_at_ms = 0;
+        for remediation in &mut condition.remediation {
+            remediation.expected_snapshot_generation = 0;
+        }
     }
 }
 
@@ -2828,6 +2940,10 @@ mod tests {
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            last_health_publication: None,
+            last_health_file_publication: None,
+            last_snapshot_file_publication: None,
+            last_snapshot_bus_publication: None,
             fail_terminal_result_writes: 0,
             fail_snapshot_file_writes: 0,
             action_execution_count: 0,
@@ -2842,6 +2958,31 @@ mod tests {
             "a restarted producer must immediately clear the retained ingress high-water"
         );
         assert!(recovered.generation > stale_counter.generation);
+    }
+
+    #[test]
+    fn steady_health_reuses_bus_row_until_bounded_heartbeat() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = action_test_worker(workgroup.path(), bus.path());
+
+        worker.cycle(Some(&mut persist)).unwrap();
+        worker.cycle(Some(&mut persist)).unwrap();
+
+        assert_eq!(
+            persist
+                .list_since(&node_health_topic("node"), None)
+                .unwrap()
+                .len(),
+            1,
+            "unchanged condition state is not appended every 10-second sample"
+        );
+        assert_eq!(
+            persist.list_since(SNAPSHOT_TOPIC, None).unwrap().len(),
+            1,
+            "unchanged folded snapshots are not appended every 10-second sample"
+        );
     }
 
     #[test]
@@ -2925,6 +3066,10 @@ mod tests {
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            last_health_publication: None,
+            last_health_file_publication: None,
+            last_snapshot_file_publication: None,
+            last_snapshot_bus_publication: None,
             fail_terminal_result_writes: 0,
             fail_snapshot_file_writes: 0,
             action_execution_count: 0,
@@ -3016,6 +3161,10 @@ mod tests {
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            last_health_publication: None,
+            last_health_file_publication: None,
+            last_snapshot_file_publication: None,
+            last_snapshot_bus_publication: None,
             fail_terminal_result_writes: 0,
             fail_snapshot_file_writes: 0,
             action_execution_count: 0,

@@ -97,8 +97,8 @@ behavioral evidence is not completion.
 - Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, hostile farm tests, and idempotent stopped-domain cleanup exist.
   Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work:
-- **Bounded virtio-net checkpoint (2026-08-10):** VM XML requests capped multiqueue only when Dom0 retains a VM-free thread; `.90` passed 3/3:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtio-net-queue-bound-r144.md`.
+- **VM resource-efficiency checkpoint (2026-08-10):** Dom0-safe CPU pinning, bounded virtio-net queues, and guest qcow2 discard propagation passed 3/3 on `.90`:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`.
 - **Terminal attachment revocation checkpoint (2026-08-10):** permanent restart-observation failure clears its Display1 lease before journaling failure; exact machine-9
   proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
@@ -1925,7 +1925,8 @@ behavioral evidence is not completion.
   backoff, then requires configured etcd and Syncthing before XDG/grouped
   mutation. `.90` fault/systemd checks passed. Live laptop/fleet convergence
   remains. Evidence:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`.
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`,
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-recovery-readiness-order-r149.md`.
 - **Peer-publication failover checkpoint (2026-08-09):** Dell exposed a false
   healthy state when one reachable etcd voter could not commit. Client
   operations now remember and fail over to a committing member, heartbeat
