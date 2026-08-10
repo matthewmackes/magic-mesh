@@ -38,9 +38,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::surface_hardware::{
-    SurfaceActionHeader, SurfaceAvailability, SurfaceFirmwareApplyRequest,
-    SurfaceFirmwareInventory, SurfaceFleetSummary, SurfaceProbeState, SurfaceSubsystem,
-    SurfaceVerifyBoard, SURFACE_HARDWARE_SCHEMA_VERSION,
+    SurfaceActionHeader, SurfaceAvailability, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
+    SurfaceCameraProofRefusal, SurfaceCameraProofRequest, SurfaceCameraProofResult,
+    SurfaceCameraProofUnavailable, SurfaceFirmwareApplyRequest, SurfaceFirmwareInventory,
+    SurfaceFleetSummary, SurfaceModelIdentity, SurfaceProGeneration, SurfaceProbeState,
+    SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
+    SURFACE_HARDWARE_SCHEMA_VERSION,
 };
 use mde_egui::egui::{self, RichText};
 use mde_egui::{DisplayController, ModeClass, ModesetDispatch, PanelInfo, Style};
@@ -63,10 +66,15 @@ const MAX_SURFACE_STATE_FUTURE_SKEW_MS: u64 = 5_000;
 /// local enable result that proved the staged key is as fresh as the hardware
 /// publication itself. It carries no reboot token or execution authority.
 const MAX_MOK_HANDOFF_AGE_MS: u64 = 90_000;
+/// A camera request cannot hold the single local in-flight slot indefinitely.
+const MAX_CAMERA_PROOF_IN_FLIGHT_MS: u64 = 90_000;
 
 /// The exact token the operator types to arm a firmware apply (mirror of
 /// `mackesd::surface::firmware::FW_ARM_TOKEN`, lock #8).
 const FW_ARM_TOKEN: &str = "APPLY-SURFACE-FIRMWARE";
+/// Must match the verifier's closed exact-body capability context.
+const CAMERA_PROOF_ACTION_AUTH_VERB: &str = "surface-camera-functional-proof";
+const CAMERA_PROOF_ACTION_AUTH_TARGET: &str = "one-frame-discard";
 
 // ─────────────────────────── the topic helpers (§6) ─────────────────────────
 
@@ -93,6 +101,14 @@ fn fw_apply_action_topic(node: &str) -> String {
 /// The fw-apply typed-result lane (Install tab).
 fn fw_apply_result_topic(node: &str) -> String {
     format!("state/hardware/surface/{node}/fw-apply")
+}
+/// The separately armed privacy-safe camera functional-proof request lane.
+fn camera_proof_action_topic(node: &str) -> String {
+    format!("action/hardware/surface/{node}/camera-proof")
+}
+/// The closed camera functional-proof outcome lane.
+fn camera_proof_result_topic(node: &str) -> String {
+    format!("state/hardware/surface/{node}/camera-proof")
 }
 
 // ───────────────────────── the wire mirrors — state (§6) ────────────────────
@@ -283,14 +299,8 @@ struct ApplyResult {
 
 // ───────────────────────── shared action contract (§6) ─────────────────────
 
-fn surface_action_header(node: &str) -> SurfaceActionHeader {
+fn surface_action_header_at(node: &str, issued_at_ms: u64) -> SurfaceActionHeader {
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    let issued_at_ms: u64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
     let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     SurfaceActionHeader {
         schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
@@ -299,6 +309,18 @@ fn surface_action_header(node: &str) -> SurfaceActionHeader {
         issued_at_ms,
         armed_token: None,
     }
+}
+
+fn surface_action_header(node: &str) -> SurfaceActionHeader {
+    surface_action_header_at(node, wall_clock_ms())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CameraProofInFlight {
+    node: String,
+    request_id: String,
+    model: SurfaceModelIdentity,
+    issued_at_ms: u64,
 }
 
 // ──────────────────────────── the card state ────────────────────────────────
@@ -360,10 +382,16 @@ pub(crate) struct SurfaceCardState {
     firmware: Option<SurfaceFirmwareInventory>,
     /// The last fw-apply typed result (Install tab).
     apply: Option<ApplyResult>,
+    /// One local, exact-identity camera functional proof awaiting a closed result.
+    camera_in_flight: Option<CameraProofInFlight>,
+    /// Last correlated privacy-safe result; never contains provider output.
+    camera_result: Option<SurfaceCameraProofResult>,
     /// The showing tab.
     tab: Tab,
     /// The operator's typed firmware arm token.
     fw_arm_input: String,
+    /// Explicit local confirmation phrase for one camera functional proof.
+    camera_arm_input: String,
     /// The firmware device the operator selected to apply.
     selected_fw: Option<String>,
     /// A transient "request sent" note surfaced until the next state update.
@@ -382,6 +410,7 @@ pub(crate) struct SurfaceCardState {
     cur_enable: Option<String>,
     cur_firmware: Option<String>,
     cur_apply: Option<String>,
+    cur_camera_result: Option<String>,
     /// When the Bus was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
 }
@@ -398,8 +427,11 @@ impl Default for SurfaceCardState {
             enable_node: None,
             firmware: None,
             apply: None,
+            camera_in_flight: None,
+            camera_result: None,
             tab: Tab::default(),
             fw_arm_input: String::new(),
+            camera_arm_input: String::new(),
             selected_fw: None,
             action_note: None,
             last_error: None,
@@ -410,6 +442,7 @@ impl Default for SurfaceCardState {
             cur_enable: None,
             cur_firmware: None,
             cur_apply: None,
+            cur_camera_result: None,
             last_poll: None,
         }
     }
@@ -523,6 +556,14 @@ impl SurfaceCardState {
             &mut self.cur_apply,
             &mut self.apply,
         );
+        read_latest_camera_result(
+            &persist,
+            &camera_proof_result_topic(&node),
+            &mut self.cur_camera_result,
+            &mut self.camera_in_flight,
+            &mut self.camera_result,
+            wall_clock_ms(),
+        );
         // Re-age retained facts on every poll as well as on decode. Otherwise
         // a last-good `Fresh` value would stay cosmetically fresh forever when
         // the producer stops publishing and the cursor sees no new messages.
@@ -536,6 +577,16 @@ impl SurfaceCardState {
         if let Some(firmware) = self.firmware.as_mut() {
             let _ = admit_publication_freshness(&mut firmware.publication, &node, now_ms);
         }
+        if self.camera_in_flight.as_ref().is_some_and(|pending| {
+            pending.node != node
+                || now_ms.saturating_sub(pending.issued_at_ms) > MAX_CAMERA_PROOF_IN_FLIGHT_MS
+        }) {
+            self.camera_in_flight = None;
+            self.action_note = Some(
+                "Camera proof timed out without a correlated privacy-safe result; retry if needed."
+                    .to_string(),
+            );
+        }
     }
 
     fn clear_surface_state(&mut self) {
@@ -547,11 +598,15 @@ impl SurfaceCardState {
         self.enable_node = None;
         self.firmware = None;
         self.apply = None;
+        self.camera_in_flight = None;
+        self.camera_result = None;
+        self.camera_arm_input.clear();
         self.cur_summary = None;
         self.cur_board = None;
         self.cur_enable = None;
         self.cur_firmware = None;
         self.cur_apply = None;
+        self.cur_camera_result = None;
     }
 
     /// Force an immediate re-read (the Test tab's re-read control + used after a
@@ -562,10 +617,10 @@ impl SurfaceCardState {
     }
 
     /// Publish a typed action body to `topic`, recording an honest note / error.
-    fn publish(&mut self, topic: &str, body: &str, note: &str) {
+    fn publish(&mut self, topic: &str, body: &str, note: &str) -> bool {
         let Some(root) = self.bus_root.clone() else {
             self.last_error = Some("No mesh Bus \u{2014} can't send the request.".to_string());
-            return;
+            return false;
         };
         // arch-11: writer — the shared BusReader seam is read-only; this publish
         // keeps Persist::open because it needs the write Result to set `last_error`.
@@ -575,8 +630,12 @@ impl SurfaceCardState {
                 self.last_error = None;
                 self.action_note = Some(note.to_string());
                 self.force_refresh();
+                true
             }
-            Err(e) => self.last_error = Some(format!("Couldn't send the request: {e}")),
+            Err(e) => {
+                self.last_error = Some(format!("Couldn't send the request: {e}"));
+                false
+            }
         }
     }
 
@@ -1094,6 +1153,11 @@ impl SurfaceCardState {
         });
         ui.add_space(Style::SP_S);
 
+        self.show_camera_proof(ui);
+        ui.add_space(Style::SP_M);
+        ui.separator();
+        ui.add_space(Style::SP_S);
+
         let Some(board) = self.board.clone() else {
             mde_egui::muted_note(ui, "No probe board published yet.");
             return;
@@ -1127,6 +1191,153 @@ impl SurfaceCardState {
             });
             ui.add_space(Style::SP_XS);
         }
+    }
+
+    /// Render and dispatch the separately armed, privacy-safe one-frame proof.
+    /// The control is omitted unless the summary is a fresh exact local Pro 5/6
+    /// identity; replicated remote summaries therefore cannot expose it.
+    fn show_camera_proof(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("CAMERA FUNCTIONAL PROOF")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        mde_egui::muted_note(
+            ui,
+            "Runs one bounded frame through libcamera and discards it; no image or device identifier is retained.",
+        );
+
+        if let Some(result) = self.camera_result.as_ref() {
+            let (tone, label) = camera_outcome_label(result.outcome);
+            ui.horizontal_wrapped(|ui| {
+                mde_egui::status_dot(ui, tone);
+                ui.add_space(Style::SP_XS);
+                mde_egui::muted_note(ui, label);
+            });
+        }
+
+        let local_node = crate::explorer::local_hostname();
+        if self
+            .camera_model_for_local_at(&local_node, wall_clock_ms())
+            .is_none()
+        {
+            mde_egui::muted_note(
+                ui,
+                "Camera proof is available only from a fresh local Surface Pro 5/6 summary.",
+            );
+            return;
+        }
+
+        if self.camera_in_flight.is_some() {
+            mde_egui::muted_note(
+                ui,
+                "Camera proof is in progress; waiting for its closed result.",
+            );
+            return;
+        }
+
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new("Type to arm")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.camera_arm_input)
+                .hint_text(SURFACE_CAMERA_PROOF_ARM_TOKEN)
+                .desired_width(ui.available_width().min(Style::SP_XL * 6.0)),
+        );
+        let armed = self.camera_arm_input.trim() == SURFACE_CAMERA_PROOF_ARM_TOKEN;
+        if ui
+            .add_enabled(
+                armed,
+                egui::Button::new(RichText::new("Prove camera").size(Style::BODY)),
+            )
+            .clicked()
+        {
+            self.publish_camera_proof_at(&local_node, wall_clock_ms());
+        }
+        if !armed {
+            mde_egui::muted_note(ui, "Type the exact phrase above to arm one proof.");
+        }
+    }
+
+    fn camera_model_for_local_at(
+        &self,
+        local_node: &str,
+        now_ms: u64,
+    ) -> Option<SurfaceModelIdentity> {
+        let summary = self.summary.as_ref()?;
+        let publication = &summary.publication;
+        if self.node.as_deref() != Some(local_node)
+            || publication.node != local_node
+            || !matches!(publication.availability, SurfaceAvailability::Fresh)
+            || publication.published_at_ms > now_ms.saturating_add(MAX_SURFACE_STATE_FUTURE_SKEW_MS)
+            || now_ms.saturating_sub(publication.published_at_ms) > MAX_SURFACE_STATE_AGE_MS
+        {
+            return None;
+        }
+        match (
+            publication.model.product.as_str(),
+            publication.model.generation,
+        ) {
+            ("Surface Pro 5", SurfaceProGeneration::Pro5)
+            | ("Surface Pro 6", SurfaceProGeneration::Pro6) => Some(publication.model.clone()),
+            _ => None,
+        }
+    }
+
+    fn publish_camera_proof_at(&mut self, local_node: &str, now_ms: u64) -> bool {
+        if self.camera_in_flight.is_some()
+            || self.camera_arm_input.trim() != SURFACE_CAMERA_PROOF_ARM_TOKEN
+        {
+            return false;
+        }
+        let Some(model) = self.camera_model_for_local_at(local_node, now_ms) else {
+            self.last_error = Some(
+                "Camera proof requires a fresh exact local Surface Pro 5/6 summary.".to_string(),
+            );
+            return false;
+        };
+        let request = SurfaceCameraProofRequest {
+            header: surface_action_header_at(local_node, now_ms),
+            generation: model.generation,
+            arm_token: Some(SURFACE_CAMERA_PROOF_ARM_TOKEN.to_string()),
+        };
+        let Ok(unsigned) = serde_json::to_string(&request) else {
+            self.last_error = Some("Couldn't encode the camera proof request.".to_string());
+            return false;
+        };
+        let body = match crate::iac::authorize_root_mutation_body(
+            &unsigned,
+            CAMERA_PROOF_ACTION_AUTH_VERB,
+            local_node,
+            CAMERA_PROOF_ACTION_AUTH_TARGET,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                self.last_error = Some(format!("Camera proof authorization unavailable: {error}"));
+                return false;
+            }
+        };
+        let topic = camera_proof_action_topic(local_node);
+        if !self.publish(
+            &topic,
+            &body,
+            "Camera proof armed; waiting for a privacy-safe result…",
+        ) {
+            return false;
+        }
+        self.camera_in_flight = Some(CameraProofInFlight {
+            node: local_node.to_string(),
+            request_id: request.header.request_id,
+            model,
+            issued_at_ms: request.header.issued_at_ms,
+        });
+        self.camera_result = None;
+        self.camera_arm_input.clear();
+        true
     }
 
     // ──────────────────────────── Config tab ────────────────────────────
@@ -1499,6 +1710,85 @@ fn decode_surface_board_at(
     Some(value)
 }
 
+fn camera_outcome_label(outcome: SurfaceCameraProofOutcome) -> (egui::Color32, &'static str) {
+    match outcome {
+        SurfaceCameraProofOutcome::Passed => (
+            Style::OK,
+            "Passed — one frame completed and was immediately discarded.",
+        ),
+        SurfaceCameraProofOutcome::Unavailable(SurfaceCameraProofUnavailable::UnsupportedModel) => {
+            (
+                Style::WARN,
+                "Unavailable — the local model is outside the Pro 5/6 proof contract.",
+            )
+        }
+        SurfaceCameraProofOutcome::Unavailable(SurfaceCameraProofUnavailable::ProviderMissing) => (
+            Style::WARN,
+            "Unavailable — the fixed libcamera proof provider is not installed.",
+        ),
+        SurfaceCameraProofOutcome::Failed(SurfaceCameraProofFailure::TimedOut) => {
+            (Style::DANGER, "Failed — the bounded proof timed out.")
+        }
+        SurfaceCameraProofOutcome::Failed(SurfaceCameraProofFailure::CaptureFailed) => (
+            Style::DANGER,
+            "Failed — the provider did not complete one frame.",
+        ),
+        SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Contract) => {
+            (Style::WARN, "Refused — the request contract was invalid.")
+        }
+        SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::Authorization) => (
+            Style::WARN,
+            "Refused — exact-body local authorization was not admitted.",
+        ),
+        SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::OperatorArm) => {
+            (Style::WARN, "Refused — the operator phrase did not match.")
+        }
+        SurfaceCameraProofOutcome::Refused(SurfaceCameraProofRefusal::GenerationMismatch) => (
+            Style::WARN,
+            "Refused — the requested generation did not match local hardware.",
+        ),
+    }
+}
+
+/// Consume only the result correlated to the sole local in-flight request.
+/// Every other lane body advances the cursor but cannot replace the rendered
+/// closed result or release the pending identity.
+fn read_latest_camera_result(
+    persist: &Persist,
+    topic: &str,
+    cursor: &mut Option<String>,
+    pending: &mut Option<CameraProofInFlight>,
+    slot: &mut Option<SurfaceCameraProofResult>,
+    now_ms: u64,
+) {
+    let Ok(messages) = persist.list_since(topic, cursor.as_deref()) else {
+        return;
+    };
+    for message in messages {
+        *cursor = Some(message.ulid.clone());
+        let Some(expected) = pending.as_ref() else {
+            continue;
+        };
+        let Some(body) = message.body.as_deref() else {
+            continue;
+        };
+        let Ok(result) = SurfaceCameraProofResult::from_json(body.as_bytes()) else {
+            continue;
+        };
+        if result.node != expected.node
+            || result.request_id != expected.request_id
+            || result.model.as_ref() != Some(&expected.model)
+            || result.completed_at_ms < expected.issued_at_ms
+            || result.completed_at_ms > now_ms.saturating_add(MAX_SURFACE_STATE_FUTURE_SKEW_MS)
+            || now_ms.saturating_sub(result.completed_at_ms) > MAX_CAMERA_PROOF_IN_FLIGHT_MS
+        {
+            continue;
+        }
+        *slot = Some(result);
+        *pending = None;
+    }
+}
+
 /// Read an untrusted Bus lane through its bounded contract decoder. The cursor
 /// advances over rejected messages so a hostile record cannot pin polling;
 /// the last admitted value remains visible until a valid replacement arrives.
@@ -1526,8 +1816,7 @@ fn read_latest_with<T>(
 mod tests {
     use super::*;
     use mackes_mesh_types::surface_hardware::{
-        SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration, SurfaceProbeVerdict,
-        SurfacePublication, MAX_SURFACE_WIRE_BYTES,
+        SurfaceObservationSource, SurfaceProbeVerdict, SurfacePublication, MAX_SURFACE_WIRE_BYTES,
     };
     use mde_bus::persist::Persist;
     use mde_egui::egui::{pos2, vec2, Rect};
@@ -1659,8 +1948,11 @@ mod tests {
                 enable_node: None,
                 firmware: None,
                 apply: None,
+                camera_in_flight: None,
+                camera_result: None,
                 tab: Tab::default(),
                 fw_arm_input: String::new(),
+                camera_arm_input: String::new(),
                 selected_fw: None,
                 action_note: None,
                 last_error: None,
@@ -1671,6 +1963,7 @@ mod tests {
                 cur_enable: None,
                 cur_firmware: None,
                 cur_apply: None,
+                cur_camera_result: None,
                 last_poll: None,
             }
         }
@@ -1799,6 +2092,218 @@ mod tests {
             SurfaceFirmwareApplyRequest::from_json_at(&firmware_json, "this-node", ACTION_NOW_MS),
             Ok(firmware)
         );
+    }
+
+    #[test]
+    fn camera_proof_topics_and_request_match_the_worker_contract() {
+        assert_eq!(
+            camera_proof_action_topic("this-node"),
+            "action/hardware/surface/this-node/camera-proof"
+        );
+        assert_eq!(
+            camera_proof_result_topic("this-node"),
+            "state/hardware/surface/this-node/camera-proof"
+        );
+
+        let request = SurfaceCameraProofRequest {
+            header: test_action_header("camera-proof"),
+            generation: SurfaceProGeneration::Pro6,
+            arm_token: Some(SURFACE_CAMERA_PROOF_ARM_TOKEN.to_string()),
+        };
+        let body = serde_json::to_vec(&request).expect("camera request JSON");
+        assert_eq!(
+            SurfaceCameraProofRequest::from_json_at(&body, "this-node", ACTION_NOW_MS),
+            Ok(request)
+        );
+    }
+
+    #[test]
+    fn camera_proof_publish_is_local_fresh_exact_body_and_single_flight() {
+        let dir = tempfile::tempdir().expect("camera proof bus");
+        let now_ms = wall_clock_ms();
+        let mut state = fixture();
+        state.bus_root = Some(dir.path().to_path_buf());
+        state.summary.as_mut().unwrap().publication.published_at_ms = now_ms;
+        state.camera_arm_input = SURFACE_CAMERA_PROOF_ARM_TOKEN.to_string();
+
+        assert!(state.publish_camera_proof_at("this-node", now_ms));
+        assert!(state.camera_arm_input.is_empty(), "arm phrase is spent");
+        let pending = state
+            .camera_in_flight
+            .clone()
+            .expect("one pending identity");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open proof bus");
+        let messages = persist
+            .list_since(&camera_proof_action_topic("this-node"), None)
+            .expect("read action");
+        assert_eq!(messages.len(), 1);
+        let body = messages[0].body.as_deref().expect("action body");
+        let request = SurfaceCameraProofRequest::from_json_at(body.as_bytes(), "this-node", now_ms)
+            .expect("authorized shared request");
+        assert_eq!(request.header.request_id, pending.request_id);
+        assert_eq!(request.generation, SurfaceProGeneration::Pro6);
+        assert_eq!(
+            request.arm_token.as_deref(),
+            Some(SURFACE_CAMERA_PROOF_ARM_TOKEN)
+        );
+        let capability = mackes_mesh_types::cloud::CloudArmedToken::parse(
+            request
+                .header
+                .armed_token
+                .as_deref()
+                .expect("root capability"),
+        )
+        .expect("parse root capability");
+        assert_eq!(capability.verb, CAMERA_PROOF_ACTION_AUTH_VERB);
+        assert_eq!(capability.node, "this-node");
+        assert_eq!(capability.target, CAMERA_PROOF_ACTION_AUTH_TARGET);
+
+        state.camera_arm_input = SURFACE_CAMERA_PROOF_ARM_TOKEN.to_string();
+        assert!(!state.publish_camera_proof_at("this-node", now_ms + 1));
+        assert_eq!(
+            persist
+                .list_since(&camera_proof_action_topic("this-node"), None)
+                .expect("read actions")
+                .len(),
+            1,
+            "a pending identity excludes a second request"
+        );
+    }
+
+    #[test]
+    fn camera_proof_never_publishes_from_remote_stale_or_mismatched_identity() {
+        let dir = tempfile::tempdir().expect("camera gate bus");
+        for mutation in 0..3 {
+            let mut state = fixture();
+            state.bus_root = Some(dir.path().to_path_buf());
+            state.camera_arm_input = SURFACE_CAMERA_PROOF_ARM_TOKEN.to_string();
+            match mutation {
+                0 => state.summary.as_mut().unwrap().publication.node = "remote".into(),
+                1 => {
+                    state.summary.as_mut().unwrap().publication.availability =
+                        SurfaceAvailability::Stale {
+                            reason: "test stale".into(),
+                        }
+                }
+                _ => {
+                    state.summary.as_mut().unwrap().publication.model = SurfaceModelIdentity {
+                        product: "Surface Pro 5".into(),
+                        generation: SurfaceProGeneration::Pro6,
+                    }
+                }
+            }
+            assert!(!state.publish_camera_proof_at("this-node", ACTION_NOW_MS));
+            assert!(state.camera_in_flight.is_none());
+        }
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open gate bus");
+        assert!(persist
+            .list_since(&camera_proof_action_topic("this-node"), None)
+            .expect("read gate lane")
+            .is_empty());
+    }
+
+    #[test]
+    fn camera_gate_admits_the_producer_wire_identity_for_both_generations() {
+        let mut state = fixture();
+        assert_eq!(
+            state
+                .camera_model_for_local_at("this-node", ACTION_NOW_MS)
+                .map(|model| model.generation),
+            Some(SurfaceProGeneration::Pro6)
+        );
+        state.summary.as_mut().unwrap().publication.model = SurfaceModelIdentity {
+            product: "Surface Pro 5".into(),
+            generation: SurfaceProGeneration::Pro5,
+        };
+        assert_eq!(
+            state
+                .camera_model_for_local_at("this-node", ACTION_NOW_MS)
+                .map(|model| model.generation),
+            Some(SurfaceProGeneration::Pro5)
+        );
+        state.summary.as_mut().unwrap().publication.model.product = "Surface Pro".into();
+        assert!(state
+            .camera_model_for_local_at("this-node", ACTION_NOW_MS)
+            .is_none());
+    }
+
+    #[test]
+    fn camera_result_requires_exact_pending_identity_and_closed_model() {
+        let dir = tempfile::tempdir().expect("camera result bus");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open result bus");
+        let model = test_publication().model;
+        let pending = CameraProofInFlight {
+            node: "this-node".into(),
+            request_id: "camera-proof-expected".into(),
+            model: model.clone(),
+            issued_at_ms: ACTION_NOW_MS,
+        };
+        let result =
+            |node: &str, request_id: &str, model: SurfaceModelIdentity| SurfaceCameraProofResult {
+                schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                node: node.into(),
+                request_id: request_id.into(),
+                model: Some(model),
+                completed_at_ms: ACTION_NOW_MS + 1,
+                outcome: SurfaceCameraProofOutcome::Passed,
+            };
+        for hostile in [
+            result("remote", "camera-proof-expected", model.clone()),
+            result("this-node", "camera-proof-other", model.clone()),
+            result(
+                "this-node",
+                "camera-proof-expected",
+                SurfaceModelIdentity {
+                    product: "Surface Pro 5".into(),
+                    generation: SurfaceProGeneration::Pro5,
+                },
+            ),
+        ] {
+            persist
+                .write(
+                    &camera_proof_result_topic("this-node"),
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(&hostile).unwrap()),
+                )
+                .expect("write hostile result");
+        }
+        let mut cursor = None;
+        let mut in_flight = Some(pending);
+        let mut slot = None;
+        read_latest_camera_result(
+            &persist,
+            &camera_proof_result_topic("this-node"),
+            &mut cursor,
+            &mut in_flight,
+            &mut slot,
+            ACTION_NOW_MS + 2,
+        );
+        assert!(slot.is_none());
+        assert!(
+            in_flight.is_some(),
+            "foreign results cannot release pending"
+        );
+
+        let valid = result("this-node", "camera-proof-expected", model);
+        persist
+            .write(
+                &camera_proof_result_topic("this-node"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&valid).unwrap()),
+            )
+            .expect("write valid result");
+        read_latest_camera_result(
+            &persist,
+            &camera_proof_result_topic("this-node"),
+            &mut cursor,
+            &mut in_flight,
+            &mut slot,
+            ACTION_NOW_MS + 2,
+        );
+        assert_eq!(slot, Some(valid));
+        assert!(in_flight.is_none());
     }
 
     #[test]
