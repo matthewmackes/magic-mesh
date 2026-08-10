@@ -102,6 +102,18 @@ pub enum Display1FramePoll {
         /// Metadata validated by the broker/client before import.
         metadata: ExternalDmaBufFrame,
     },
+    /// The producer updated a bounded region of the retained DMA-BUF. No new
+    /// descriptor is transferred; the DRM owner refreshes the current FB.
+    Damage {
+        /// Left edge in scanout pixels.
+        x: u32,
+        /// Top edge in scanout pixels.
+        y: u32,
+        /// Non-zero damaged width.
+        width: u32,
+        /// Non-zero damaged height.
+        height: u32,
+    },
     /// The attachment lease/socket/producer is no longer usable.
     Disconnected,
 }
@@ -2582,6 +2594,20 @@ fn run_drm_session(
                 }
                 continue;
             }
+            Some(Display1FramePoll::Damage {
+                x,
+                y,
+                width,
+                height,
+            }) if external_scanout.is_some() => {
+                refresh_external_scanout(&gbm, &heads, &external_scanout, (x, y, width, height))?;
+                continue;
+            }
+            Some(Display1FramePoll::Damage { .. }) => {
+                return Err(DrmError::Present(
+                    "Display1 damage arrived without a retained native framebuffer".into(),
+                ));
+            }
             Some(Display1FramePoll::Idle) if external_scanout.is_some() => {
                 // The last native frame is still valid. Do not lock a GBM BO
                 // or replace it merely because egui repainted internally.
@@ -3103,6 +3129,44 @@ fn clear_external_scanout(
     let result = destroy_external_framebuffer(gbm, framebuffer);
     drop(fd);
     result
+}
+
+/// Refresh a retained same-buffer Display1 scanout. QEMU has already written
+/// the validated damaged region into the DMA-BUF; a page flip to the retained
+/// framebuffer gives KMS a bounded completion event without importing or
+/// transferring another descriptor.
+fn refresh_external_scanout(
+    gbm: &gbm::Device<Card>,
+    heads: &[Output],
+    external: &Option<(drm::control::framebuffer::Handle, OwnedFd)>,
+    _damage: (u32, u32, u32, u32),
+) -> Result<(), DrmError> {
+    let Some((framebuffer, _fd)) = external.as_ref() else {
+        return Err(DrmError::Present(
+            "Display1 damage has no retained framebuffer".into(),
+        ));
+    };
+    for head in heads {
+        gbm.page_flip(
+            head.crtc,
+            *framebuffer,
+            drm::control::PageFlipFlags::EVENT,
+            None,
+        )
+        .map_err(|error| DrmError::Present(format!("Display1 damage page_flip: {error}")))?;
+    }
+    let mut pending = heads.len();
+    while pending > 0 {
+        let events = gbm.receive_events().map_err(|error| {
+            DrmError::Present(format!("Display1 damage receive_events: {error}"))
+        })?;
+        for event in events {
+            if matches!(event, drm::control::Event::PageFlip(_)) {
+                pending -= 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Import and present one native Display1 frame without staging it through

@@ -68,6 +68,7 @@ fn peer_credentials(stream: &UnixStream) -> Result<Display1PeerCredentials, Disp
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrameEnvelope {
+    kind: String,
     lease_id: String,
     workload_id: String,
     generation: u64,
@@ -77,6 +78,32 @@ struct FrameEnvelope {
     fourcc: u32,
     modifier: u64,
     y0_top: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DamageEnvelope {
+    kind: String,
+    lease_id: String,
+    workload_id: String,
+    generation: u64,
+    damage: Display1Damage,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Display1Damage {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RelayEnvelope {
+    Frame(FrameEnvelope),
+    Damage(DamageEnvelope),
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +119,7 @@ enum ReceivedFrame {
     Idle,
     Disconnected,
     Frame(OwnedFd, ExternalDmaBufFrame),
+    Damage(Display1Damage),
 }
 
 /// Errors before a frame reaches KMS.
@@ -125,6 +153,7 @@ pub(crate) struct Display1Client {
     lease: WorkloadAttachmentLease,
     frame_received: bool,
     first_present_acknowledged: bool,
+    last_frame_size: Option<(u32, u32)>,
 }
 
 impl Display1Client {
@@ -174,6 +203,7 @@ impl Display1Client {
             lease,
             frame_received: false,
             first_present_acknowledged: false,
+            last_frame_size: None,
         })
     }
 
@@ -236,40 +266,72 @@ impl Display1Client {
         if received.bytes == 0 {
             return Ok(ReceivedFrame::Disconnected);
         }
-        let envelope: FrameEnvelope = serde_json::from_slice(&bytes[..received.bytes])
-            .map_err(|error| Display1ClientError::Protocol(format!("frame envelope: {error}")))?;
-        if envelope.lease_id != self.lease.lease_id
-            || envelope.workload_id != self.lease.workload_id.as_str()
-            || envelope.generation != self.lease.generation
-        {
-            return Err(Display1ClientError::Lease(
-                "frame lease or generation mismatch".into(),
-            ));
-        }
-        if !envelope.y0_top {
-            return Err(Display1ClientError::Protocol(
-                "bottom-up scanout is unsupported by the native KMS path".into(),
-            ));
-        }
-        let frame = ExternalDmaBufFrame {
-            width: envelope.width,
-            height: envelope.height,
-            stride: envelope.stride,
-            fourcc: envelope.fourcc,
-            modifier: envelope.modifier,
-        };
-        frame.validate().map_err(Display1ClientError::Import)?;
         let mut descriptor = None;
         for message in ancillary.drain() {
             if let RecvAncillaryMessage::ScmRights(mut fds) = message {
-                descriptor = fds.next();
-                break;
+                let first = fds.next();
+                if descriptor.is_some() || fds.next().is_some() {
+                    return Err(Display1ClientError::Protocol(
+                        "Display1 message carried multiple descriptors".into(),
+                    ));
+                }
+                descriptor = first;
             }
         }
-        let descriptor =
-            descriptor.ok_or_else(|| Display1ClientError::Protocol("missing DMA-BUF FD".into()))?;
-        self.frame_received = true;
-        Ok(ReceivedFrame::Frame(descriptor, frame))
+        let envelope: RelayEnvelope = serde_json::from_slice(&bytes[..received.bytes])
+            .map_err(|error| Display1ClientError::Protocol(format!("relay envelope: {error}")))?;
+        match envelope {
+            RelayEnvelope::Frame(envelope) => {
+                validate_envelope_binding(
+                    &envelope.kind,
+                    "frame",
+                    &envelope.lease_id,
+                    &envelope.workload_id,
+                    envelope.generation,
+                    &self.lease,
+                )?;
+                if !envelope.y0_top {
+                    return Err(Display1ClientError::Protocol(
+                        "bottom-up scanout is unsupported by the native KMS path".into(),
+                    ));
+                }
+                let frame = ExternalDmaBufFrame {
+                    width: envelope.width,
+                    height: envelope.height,
+                    stride: envelope.stride,
+                    fourcc: envelope.fourcc,
+                    modifier: envelope.modifier,
+                };
+                frame.validate().map_err(Display1ClientError::Import)?;
+                let descriptor = descriptor
+                    .ok_or_else(|| Display1ClientError::Protocol("missing DMA-BUF FD".into()))?;
+                self.frame_received = true;
+                self.last_frame_size = Some((frame.width, frame.height));
+                Ok(ReceivedFrame::Frame(descriptor, frame))
+            }
+            RelayEnvelope::Damage(envelope) => {
+                validate_envelope_binding(
+                    &envelope.kind,
+                    "damage",
+                    &envelope.lease_id,
+                    &envelope.workload_id,
+                    envelope.generation,
+                    &self.lease,
+                )?;
+                if descriptor.is_some() {
+                    return Err(Display1ClientError::Protocol(
+                        "Display1 damage must not carry a descriptor".into(),
+                    ));
+                }
+                let (width, height) = self.last_frame_size.ok_or_else(|| {
+                    Display1ClientError::Protocol(
+                        "Display1 damage arrived before an accepted frame".into(),
+                    )
+                })?;
+                validate_damage(envelope.damage, width, height)?;
+                Ok(ReceivedFrame::Damage(envelope.damage))
+            }
+        }
     }
 
     /// Receive and validate one metadata+SCM_RIGHTS frame. This compatibility
@@ -287,6 +349,9 @@ impl Display1Client {
             ReceivedFrame::Disconnected => Err(Display1ClientError::Protocol(
                 "Display1 peer disconnected".into(),
             )),
+            ReceivedFrame::Damage(_) => Err(Display1ClientError::Protocol(
+                "unexpected damage while waiting for a complete frame".into(),
+            )),
         }
     }
 
@@ -299,8 +364,61 @@ impl Display1Client {
             ReceivedFrame::Idle => Display1FramePoll::Idle,
             ReceivedFrame::Disconnected => Display1FramePoll::Disconnected,
             ReceivedFrame::Frame(fd, metadata) => Display1FramePoll::Frame { fd, metadata },
+            ReceivedFrame::Damage(damage) => Display1FramePoll::Damage {
+                x: damage.x,
+                y: damage.y,
+                width: damage.width,
+                height: damage.height,
+            },
         })
     }
+}
+
+fn validate_envelope_binding(
+    actual_kind: &str,
+    expected_kind: &str,
+    lease_id: &str,
+    workload_id: &str,
+    generation: u64,
+    lease: &WorkloadAttachmentLease,
+) -> Result<(), Display1ClientError> {
+    if actual_kind != expected_kind {
+        return Err(Display1ClientError::Protocol(
+            "unknown Display1 relay message kind".into(),
+        ));
+    }
+    if lease_id != lease.lease_id
+        || workload_id != lease.workload_id.as_str()
+        || generation != lease.generation
+    {
+        return Err(Display1ClientError::Lease(
+            "relay lease or generation mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_damage(
+    damage: Display1Damage,
+    scanout_width: u32,
+    scanout_height: u32,
+) -> Result<(), Display1ClientError> {
+    if damage.width == 0
+        || damage.height == 0
+        || damage
+            .x
+            .checked_add(damage.width)
+            .is_none_or(|right| right > scanout_width)
+        || damage
+            .y
+            .checked_add(damage.height)
+            .is_none_or(|bottom| bottom > scanout_height)
+    {
+        return Err(Display1ClientError::Protocol(
+            "Display1 damage is outside the retained frame".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A display source that can receive a lease after the shell has already
@@ -388,7 +506,9 @@ impl DynamicDisplay1Client {
             return Ok(Display1FramePoll::Idle);
         };
         match client.poll(now) {
-            Ok(frame @ Display1FramePoll::Frame { .. }) => Ok(frame),
+            Ok(frame @ (Display1FramePoll::Frame { .. } | Display1FramePoll::Damage { .. })) => {
+                Ok(frame)
+            }
             Ok(Display1FramePoll::Idle) => Ok(Display1FramePoll::Idle),
             Ok(Display1FramePoll::Disconnected) => {
                 self.client = None;
@@ -629,6 +749,7 @@ mod tests {
         ));
 
         let envelope = serde_json::to_vec(&serde_json::json!({
+            "kind": "frame",
             "lease_id": "lease-presented",
             "workload_id": "browser-presented",
             "generation": 3,
@@ -664,6 +785,41 @@ mod tests {
         let mut ack = [0_u8; 1];
         daemon.read_exact(&mut ack).expect("daemon receives ack");
         assert_eq!(ack, [DISPLAY1_PRESENT_ACK]);
+
+        let damage = serde_json::to_vec(&serde_json::json!({
+            "kind": "damage",
+            "lease_id": "lease-presented",
+            "workload_id": "browser-presented",
+            "generation": 3,
+            "damage": {"x": 4, "y": 5, "width": 16, "height": 8}
+        }))
+        .expect("damage envelope");
+        daemon.write_all(&damage).expect("send damage");
+        assert!(matches!(
+            client.try_receive(1_002),
+            Ok(Display1FramePoll::Damage {
+                x: 4,
+                y: 5,
+                width: 16,
+                height: 8
+            })
+        ));
+        let hostile_damage = serde_json::to_vec(&serde_json::json!({
+            "kind": "damage",
+            "lease_id": "lease-presented",
+            "workload_id": "browser-presented",
+            "generation": 3,
+            "damage": {"x": 60, "y": 0, "width": 8, "height": 1}
+        }))
+        .expect("hostile damage envelope");
+        daemon
+            .write_all(&hostile_damage)
+            .expect("send hostile damage");
+        assert!(matches!(
+            client.try_receive(1_003),
+            Err(Display1ClientError::Protocol(message))
+                if message.contains("outside the retained frame")
+        ));
 
         client
             .frame_presented()

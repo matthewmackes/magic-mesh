@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use mackes_mesh_types::workloads::WorkloadAttachmentLease;
 use rustix::net::{
-    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags,
+    recvmsg, send, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
 };
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::OwnedFd as ZvariantOwnedFd;
@@ -110,6 +110,20 @@ pub struct Display1DmaBufFrame {
     pub y0_top: bool,
 }
 
+/// One bounded damage rectangle for the most recently accepted scanout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Display1Damage {
+    /// Left edge in scanout pixels.
+    pub x: u32,
+    /// Top edge in scanout pixels.
+    pub y: u32,
+    /// Non-zero damaged width in pixels.
+    pub width: u32,
+    /// Non-zero damaged height in pixels.
+    pub height: u32,
+}
+
 /// Errors produced before a native frame reaches the KMS/EGL sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Display1Error {
@@ -139,6 +153,8 @@ impl std::error::Error for Display1Error {}
 pub trait Display1FrameSink: Send + Sync + 'static {
     /// Consume one validated frame.
     fn accept(&self, frame: Display1DmaBufFrame) -> Result<(), Display1Error>;
+    /// Refresh one validated region of the current native scanout.
+    fn damage(&self, damage: Display1Damage) -> Result<(), Display1Error>;
     /// Clear the current native scanout.
     fn disable(&self) -> Result<(), Display1Error>;
 }
@@ -148,6 +164,8 @@ pub trait Display1FrameSink: Send + Sync + 'static {
 /// SCM_RIGHTS ancillary message on the authenticated local socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Display1FrameEnvelope {
+    /// Closed message discriminator.
+    pub kind: String,
     /// Expiring Workload attachment lease name.
     pub lease_id: String,
     /// Stable Workload identity bound by the reconciler.
@@ -166,6 +184,24 @@ pub struct Display1FrameEnvelope {
     pub modifier: u64,
     /// Whether the first row is the top of the image.
     pub y0_top: bool,
+}
+
+/// Bounded metadata for one same-buffer damage notification. No descriptor is
+/// transferred; the shell retains the frame imported by the preceding frame
+/// envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Display1DamageEnvelope {
+    /// Closed message discriminator.
+    pub kind: String,
+    /// Expiring Workload attachment lease name.
+    pub lease_id: String,
+    /// Stable Workload identity bound by the reconciler.
+    pub workload_id: String,
+    /// Desired-state generation bound by the reconciler.
+    pub generation: u64,
+    /// Validated damage rectangle.
+    pub damage: Display1Damage,
 }
 
 /// The first message on a per-lease socket. It proves that the shell holds
@@ -225,6 +261,7 @@ pub struct Display1ScmRightsRelay {
     stream: UnixStream,
     peer: PeerCredentials,
     lease: WorkloadAttachmentLease,
+    scanout: Mutex<Option<(u32, u32)>>,
 }
 
 /// Node-local broker that consumes attachment nonces exactly once before it
@@ -334,6 +371,7 @@ impl Display1ScmRightsRelay {
             stream,
             peer,
             lease,
+            scanout: Mutex::new(None),
         })
     }
 
@@ -362,6 +400,7 @@ impl Display1ScmRightsRelay {
             frame.modifier,
         )?;
         let envelope = serde_json::to_vec(&Display1FrameEnvelope {
+            kind: "frame".into(),
             lease_id: self.lease.lease_id.clone(),
             workload_id: self.lease.workload_id.as_str().to_owned(),
             generation: self.lease.generation,
@@ -394,6 +433,49 @@ impl Display1ScmRightsRelay {
         .map_err(|error| Display1Error::Attachment(format!("SCM_RIGHTS send: {error}")))?;
         if sent != envelope.len() {
             return Err(Display1Error::Attachment("short SCM_RIGHTS frame".into()));
+        }
+        *self
+            .scanout
+            .lock()
+            .map_err(|_| Display1Error::Attachment("scanout state poisoned".into()))? =
+            Some((frame.width, frame.height));
+        Ok(())
+    }
+
+    /// Send one same-buffer damage notification without transferring another
+    /// descriptor. The QEMU callback remains non-blocking under socket pressure.
+    pub fn send_damage(&self, damage: Display1Damage, now_ms: u64) -> Result<(), Display1Error> {
+        if peer_credentials(&self.stream)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?
+            != self.peer
+        {
+            return Err(Display1Error::Attachment("peer credential mismatch".into()));
+        }
+        self.lease
+            .validate(now_ms)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?;
+        let (scanout_width, scanout_height) = self
+            .scanout
+            .lock()
+            .map_err(|_| Display1Error::Attachment("scanout state poisoned".into()))?
+            .ok_or_else(|| {
+                Display1Error::Attachment("damage arrived before an accepted scanout".into())
+            })?;
+        validate_damage(damage, scanout_width, scanout_height)?;
+        let envelope = serde_json::to_vec(&Display1DamageEnvelope {
+            kind: "damage".into(),
+            lease_id: self.lease.lease_id.clone(),
+            workload_id: self.lease.workload_id.as_str().to_owned(),
+            generation: self.lease.generation,
+            damage,
+        })
+        .map_err(|error| Display1Error::Attachment(error.to_string()))?;
+        let sent = send(&self.stream, &envelope, SendFlags::DONTWAIT)
+            .map_err(|error| Display1Error::Attachment(format!("damage send: {error}")))?;
+        if sent != envelope.len() {
+            return Err(Display1Error::Attachment(
+                "short Display1 damage message".into(),
+            ));
         }
         Ok(())
     }
@@ -433,6 +515,10 @@ impl Display1FrameSink for Display1ScmRightsRelay {
             .and_then(|duration| u64::try_from(duration.as_millis()).ok())
             .unwrap_or(0);
         self.send_frame(&frame, now_ms)
+    }
+
+    fn damage(&self, damage: Display1Damage) -> Result<(), Display1Error> {
+        self.send_damage(damage, display1_now_ms())
     }
 
     fn disable(&self) -> Result<(), Display1Error> {
@@ -515,6 +601,19 @@ impl Display1FrameSink for Display1AttachmentSink {
         relay.send_frame(&frame, display1_now_ms())?;
         self.frame_delivered.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn damage(&self, damage: Display1Damage) -> Result<(), Display1Error> {
+        let relay = self
+            .relay
+            .lock()
+            .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
+        relay
+            .as_ref()
+            .ok_or_else(|| {
+                Display1Error::Attachment("no authenticated shell relay is attached".into())
+            })?
+            .send_damage(damage, display1_now_ms())
     }
 
     fn disable(&self) -> Result<(), Display1Error> {
@@ -773,7 +872,8 @@ pub fn receive_display1_frame(
         .map_err(|error| Display1Error::Attachment(format!("SCM_RIGHTS receive: {error}")))?;
     let envelope: Display1FrameEnvelope = serde_json::from_slice(&bytes[..received.bytes])
         .map_err(|error| Display1Error::Attachment(format!("frame envelope: {error}")))?;
-    if envelope.lease_id != lease.lease_id
+    if envelope.kind != "frame"
+        || envelope.lease_id != lease.lease_id
         || envelope.workload_id != lease.workload_id.as_str()
         || envelope.generation != lease.generation
     {
@@ -827,6 +927,28 @@ pub fn validate_scanout(
     }
     if fourcc == 0 {
         return Err(Display1Error::InvalidGeometry("fourcc"));
+    }
+    Ok(())
+}
+
+/// Validate a QEMU damage rectangle against the exact retained scanout.
+pub fn validate_damage(
+    damage: Display1Damage,
+    scanout_width: u32,
+    scanout_height: u32,
+) -> Result<(), Display1Error> {
+    if damage.width == 0
+        || damage.height == 0
+        || damage
+            .x
+            .checked_add(damage.width)
+            .is_none_or(|right| right > scanout_width)
+        || damage
+            .y
+            .checked_add(damage.height)
+            .is_none_or(|bottom| bottom > scanout_height)
+    {
+        return Err(Display1Error::InvalidGeometry("damage"));
     }
     Ok(())
 }
@@ -931,12 +1053,24 @@ impl Display1Listener {
     #[zbus(name = "UpdateDMABUF")]
     async fn update_dmabuf(
         &self,
-        _x: i32,
-        _y: i32,
-        _width: i32,
-        _height: i32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
     ) -> zbus::fdo::Result<()> {
-        Ok(())
+        let damage = Display1Damage {
+            x: u32::try_from(x)
+                .map_err(|_| zbus::fdo::Error::InvalidArgs("negative damage x".into()))?,
+            y: u32::try_from(y)
+                .map_err(|_| zbus::fdo::Error::InvalidArgs("negative damage y".into()))?,
+            width: u32::try_from(width)
+                .map_err(|_| zbus::fdo::Error::InvalidArgs("negative damage width".into()))?,
+            height: u32::try_from(height)
+                .map_err(|_| zbus::fdo::Error::InvalidArgs("negative damage height".into()))?,
+        };
+        self.sink
+            .damage(damage)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     /// Disable native scanout and return to the shell's normal surface.
@@ -963,6 +1097,7 @@ mod tests {
     #[derive(Default)]
     struct Sink {
         frames: Mutex<Vec<(u32, u32, u32, u32)>>,
+        damages: Mutex<Vec<Display1Damage>>,
         disabled: Mutex<u32>,
     }
 
@@ -975,6 +1110,11 @@ mod tests {
                 frame.stride,
                 frame.fourcc,
             ));
+            Ok(())
+        }
+
+        fn damage(&self, damage: Display1Damage) -> Result<(), Display1Error> {
+            self.damages.lock().expect("damages").push(damage);
             Ok(())
         }
 
@@ -999,6 +1139,36 @@ mod tests {
             Err(Display1Error::InvalidGeometry("fourcc"))
         ));
         assert!(validate_scanout(1920, 1080, 7680, 0x34325258, 0).is_ok());
+        let valid = Display1Damage {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        assert_eq!(validate_damage(valid, 100, 100), Ok(()));
+        for hostile in [
+            Display1Damage { width: 0, ..valid },
+            Display1Damage { height: 0, ..valid },
+            Display1Damage {
+                x: 90,
+                width: 11,
+                ..valid
+            },
+            Display1Damage {
+                y: 90,
+                height: 11,
+                ..valid
+            },
+            Display1Damage {
+                x: u32::MAX,
+                ..valid
+            },
+        ] {
+            assert_eq!(
+                validate_damage(hostile, 100, 100),
+                Err(Display1Error::InvalidGeometry("damage"))
+            );
+        }
     }
 
     #[test]
@@ -1027,7 +1197,7 @@ mod tests {
 
     #[test]
     fn scm_rights_relay_binds_frame_to_one_use_lease_and_peer() {
-        let (sender, receiver) = UnixStream::pair().expect("socketpair");
+        let (sender, mut receiver) = UnixStream::pair().expect("socketpair");
         let sender_peer = peer_credentials(&sender).expect("sender peer");
         let receiver_peer = peer_credentials(&receiver).expect("receiver peer");
         let workload_id = WorkloadId::new("browser-seat15").expect("workload id");
@@ -1064,6 +1234,25 @@ mod tests {
         assert_eq!(received.width, 64);
         assert_eq!(received.height, 32);
         assert!(received.dmabuf.as_fd().as_raw_fd() >= 0);
+        let damage = Display1Damage {
+            x: 4,
+            y: 5,
+            width: 16,
+            height: 8,
+        };
+        relay.send_damage(damage, 1_003).expect("send damage");
+        let mut damage_bytes = [0_u8; 1024];
+        let damage_len = receiver.read(&mut damage_bytes).expect("receive damage");
+        let envelope: Display1DamageEnvelope =
+            serde_json::from_slice(&damage_bytes[..damage_len]).expect("damage envelope");
+        assert_eq!(envelope.kind, "damage");
+        assert_eq!(envelope.lease_id, "lease-display1");
+        assert_eq!(envelope.generation, 7);
+        assert_eq!(envelope.damage, damage);
+        assert!(matches!(
+            relay.send_damage(damage, 2_001),
+            Err(Display1Error::Attachment(message)) if message.contains("lease")
+        ));
         assert!(matches!(
             Display1ScmRightsRelay::attach(
                 UnixStream::pair().expect("second socketpair").0,

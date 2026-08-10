@@ -139,9 +139,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON rejects duplicate keys; `.50` passed 9/9. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
-- **Display1 readiness/expiry checkpoints (2026-08-06/09):** socket delivery no longer claims readiness; one lease-bound shell acknowledgement follows a received frame's
-  successful KMS presentation. Pre-frame, idle, EOF, invalid-byte, send-failure, and expiry paths fail closed; isolated BigBoy/`.50`/`.90` gates passed 9/9, 5/5, and 22/22:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-present-ack-r19.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
+- **Display1 readiness/damage checkpoints (2026-08-06/09):** presentation acknowledgement, expiry, and bounded same-buffer KMS damage now fail closed; stream packetization
+  and live Dell/seat-15 proof remain. Focused farm gates pass: `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-present-ack-r19.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-damage-delivery-r20.md`.
 - **Storage path-boundary checkpoint (2026-08-06):** virtual-storage validation rejects symlinks/outside-root images; `.90` passed:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
 - **Storage Bus transaction checkpoint (2026-08-09):** stable reads precede effects; late/replaced storage and failed publication correct forward without repeated operations.
