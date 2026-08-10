@@ -99,6 +99,7 @@ behavioral evidence is not completion.
 - **VM resource-efficiency checkpoints (2026-08-10):** Dom0-safe CPU pinning, bounded queues, qcow2 discard, and shared non-Dom0 CPU pools passed focused `.90` gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Dom0 reserve (2026-08-10):** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-dom0-cpu-reserve-r154.md`.
+- **VM overlay cleanup:** BigBoy: `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
