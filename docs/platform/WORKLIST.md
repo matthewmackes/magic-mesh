@@ -87,7 +87,6 @@ behavioral evidence is not completion.
 
 
 ### WL-ARCH-010 - Make Workloads the sole VM/container runtime, readiness, and presentation authority
-
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
@@ -96,7 +95,8 @@ behavioral evidence is not completion.
   The shell consumes bounded typed projections, with tested local Display1/KMS attachment and RDP/SPICE/VNC recovery.
 - Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, hostile farm tests, and idempotent stopped-domain cleanup exist.
   Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
-- Remaining work:
+- Remaining work: **Recovered lease deadline checkpoint (2026-08-10):** expired recovered attachment leases are refused; BigBoy passed the focused gate:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **VM resource-efficiency checkpoints (2026-08-10):** Dom0-safe CPU pinning, bounded queues, qcow2 discard, and shared non-Dom0 CPU pools passed focused `.90` gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Dom0 reserve (2026-08-10):** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-dom0-cpu-reserve-r154.md`.
@@ -305,7 +305,6 @@ behavioral evidence is not completion.
   @farm:{cargo test -p mde-shell-egui --features live-vdi}
   and BigBoy release/package gates with explicit host and slot; capture live evidence on required seats.
 - Origin or merged source IDs: Job One 2026-08-05; archived ARCH-006/007, CRIT-001; VDI zero-copy design; current Dell/seat-15 incidents.
-
 ### WL-ARCH-008 - Extract the host Browser stack and replace it with a VM Browser
 
 - Status: Remaining
@@ -390,7 +389,6 @@ behavioral evidence is not completion.
 - Origin or merged source IDs: 2026-07-28 Option 3; archived WL-PERF-003, FUNC-001..004, ARCH-005; browser-perf-native design.
 
 ### WL-ARCH-009 - Process-isolated mackesd and unified Workers interface
-
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
@@ -403,7 +401,8 @@ behavioral evidence is not completion.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
-- Remaining work:
+- Remaining work: **Explicit worker-alias checkpoint (2026-08-10):** unknown normalized aliases fail closed; seat 90 passed:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-10-explicit-worker-aliases-r158.md`.
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
@@ -608,7 +607,6 @@ behavioral evidence is not completion.
   4. Fleet chaos and at-most-three-seat/three-lighthouse evidence passes.
 - Verification method: registry, contract, process/chaos, action-auth, route/render, package, format, and live fleet cargo gates; longest job on BigBoy.
 - Origin or merged source IDs: 2026-08-01 process isolation evaluation; 2026-08-03 Workers merge survey; 2026-08-04 Network Operations directive.
-
 ### WL-FUNC-011 - Build the native Mesh Collaboration Suite and hard-cut legacy collaboration
 
 - Status: Remaining
@@ -1433,7 +1431,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
 - **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
   `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
-- Remaining work:
+- Remaining work: **Music Bus replacement checkpoint (2026-08-10):** the workspace reader reopens the Bus index after inode replacement and converges;
+  seat 90 passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
 - **Signed live-radio checkpoint (2026-08-08):** native F44 release 8 is live
