@@ -41,6 +41,39 @@ wait_exact_bind() {
     return 1
 }
 
+validate_desktop_homes() {
+    local home name source target found=0
+    while IFS= read -r home; do
+        [ -n "$home" ] || continue
+        found=1
+        [ -d "$home" ] && [ ! -L "$home" ] \
+            || { fail "desktop home is unavailable or unsafe: $home"; return 1; }
+        for name in "${XDG_DIRS[@]}"; do
+            source="$MESH_HOME/$name"
+            target="$home/$name"
+            # Do not let install(1) follow a hostile source or target symlink.
+            # Validate every desktop home before the first mount so a later
+            # hostile home cannot leave an earlier home partially restored.
+            if [ -L "$source" ] || { [ -e "$source" ] && [ ! -d "$source" ]; }; then
+                fail "communal source is unavailable or unsafe: $source"
+                return 1
+            fi
+            if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target" ]; }; then
+                fail "desktop target is unavailable or unsafe: $target"
+                return 1
+            fi
+            if "$MOUNTPOINT" -q "$target"; then
+                wait_exact_bind "$source" "$target" \
+                    || { fail "existing mount is not the exact communal source: $target"; return 1; }
+            elif [ -d "$target" ]; then
+                directory_empty "$target" \
+                    || { fail "local data would be obscured: $target"; return 1; }
+            fi
+        done
+    done < <(desktop_homes)
+    [ "$found" -eq 1 ] || { fail 'no-workstation-desktop-home'; return 1; }
+}
+
 main() {
     local home name source target found=0
     [ "$(id -u)" -eq 0 ] || { fail 'must-run-as-root'; return 1; }
@@ -53,6 +86,8 @@ main() {
     [ -d "$MESH_HOME" ] && [ ! -L "$MESH_HOME" ] \
         || { fail "communal source root unavailable: $MESH_HOME"; return 1; }
 
+    validate_desktop_homes || return 1
+
     while IFS= read -r home; do
         [ -n "$home" ] || continue
         found=1
@@ -61,6 +96,8 @@ main() {
         for name in "${XDG_DIRS[@]}"; do
             source="$MESH_HOME/$name"
             target="$home/$name"
+            [ ! -L "$source" ] && [ ! -L "$target" ] \
+                || { fail "source or target symlink appeared during restore: $target"; return 1; }
             /usr/bin/install -d -m 0777 -- "$source" \
                 || { fail "could not create communal source: $source"; return 1; }
             /usr/bin/install -d -m 0755 -o "$(/usr/bin/stat -Lc %u "$home")" -g "$(/usr/bin/stat -Lc %g "$home")" -- "$target" \
