@@ -18,7 +18,7 @@ helper was therefore a manifest omission, not live filesystem corruption.
 
 ## Corrected-forward source
 
-Based on repository revision `e1b960df`:
+Implemented at repository revision `6d812175a6d459744f92bf9a54abd47ca1dc6654`:
 
 - the lighthouse variant advances to release 11 and ships the secret helper;
 - all daemon-bearing RPM shapes are required to carry the helper, reconciler,
@@ -49,10 +49,48 @@ watchdog run at `10:28:03 UTC` reported `mesh-health: ok` and completed
 successfully. `/run` had recovered to 49% free; the earlier 0% warning stopped
 once transient package pressure cleared and was not an arithmetic defect.
 
+## Release build and signature
+
+BigBoy built the exact revision as a promotable locked release. The optimized
+build completed in 12 minutes 48 seconds, and both lighthouse size and payload
+verification passed. The final 13.5 MiB artifact is:
+
+```text
+magic-mesh-lighthouse-12.1.6-11.x86_64.rpm
+sha256 90f239dba648a0b20cf1c4535fcdc670c0649e65874a12d7dcef7aa766c6df6c
+```
+
+The RPM carries the project RSA signing-subkey signature. Fedora 44 reported
+`digests signatures OK`; the signed `SHA256SUMS` bundle also passed checksum and
+GPG verification. `rpm -Uvh --test` passed before deployment.
+
+## Corrected-forward deployment
+
+Lighthouse `.1` was upgraded from release 10 to release 11 after the operator
+alert and five-second hold. The transaction preserved the exact hashes of
+`/etc/etcd/etcd.env` and `/etc/machine-id`. Post-upgrade proof established:
+
+- `rpm -V magic-mesh-lighthouse` passes;
+- `/etc/machine-id` is root-owned mode `0444` and the packaged secret helper is
+  root-owned mode `0755`;
+- etcd, Nebula, the six grouped daemons, their target, and both recovery timers
+  are active;
+- all three etcd voters remain healthy at term 5534 and applied index 462538;
+- authenticated peer publication remains fresh; and
+- `mesh-health.service` reports `mesh-health: ok` with result/status `success/0`.
+
+The newly executable recipient service then exposed pre-existing key drift:
+`.1` had registered a valid local public recipient but could not decrypt the
+current ciphertext. Surface and seat 15 also failed closed; Dell was the
+current holder. After a second alerted hold, Dell ran the designed
+scope-preserving `reseal-all`: all four stored secrets were re-encrypted to the
+six registered public recipients. Dell retained decryption authority, and `.1`
+then completed recipient reconciliation twice with result/status `success/0`.
+No private identity or plaintext secret was printed or transferred.
+
 ## Remaining boundary
 
-Release 11 has not yet been built, signed, or deployed. The installed release
-10 lighthouse still lacks the secret helper, so
-`mcnf-mesh-secret-recipient.service` remains failed until corrected-forward
-package deployment. This checkpoint does not claim three-lighthouse or
-six-node convergence.
+Lighthouses `.2` and `.3` remain healthy voters but have not received release
+11 because the available root key does not authenticate to those existing
+droplets. This checkpoint proves the corrected package and recipient recovery
+on `.1`; it does not claim three-lighthouse release convergence.
