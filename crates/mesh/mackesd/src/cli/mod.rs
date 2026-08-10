@@ -75,6 +75,7 @@ pub mod set_external_addr;
 pub mod show_passcode;
 pub mod state_restore;
 pub mod status;
+pub mod surface_mok_mint;
 pub mod surrounding_list;
 pub mod surrounding_trust;
 pub mod tag;

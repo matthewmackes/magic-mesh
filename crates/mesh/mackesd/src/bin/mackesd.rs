@@ -886,6 +886,10 @@ enum Cmd {
         cmd: RemediateCmd,
     },
 
+    /// Mint and submit one local, request-bound Surface MOK import.
+    #[command(hide = true)]
+    SurfaceMokMint,
+
     /// PLANES-13 — the policy engine surface. `mded policy list --json`
     /// emits every loaded policy (the W50 core pack + any TOML in
     /// `<root>/policies/`) with the peers that currently violate it,
@@ -2242,6 +2246,7 @@ fn main() -> anyhow::Result<()> {
         } => cli::join::run(token, role.as_deref(), name, workgroup_root)?,
         Cmd::Peers { json } => cli::peers::run(json, db_path)?,
         Cmd::Remediate { cmd } => cli::remediate::run(cmd, db_path)?,
+        Cmd::SurfaceMokMint => cli::surface_mok_mint::run(&default_node_id())?,
         Cmd::Policy { cmd } => cli::policy::run(cmd, db_path)?,
         Cmd::Netstate { cmd } => cli::netstate::run(cmd)?,
         Cmd::Dns { cmd } => cli::dns::run(cmd, db_path)?,

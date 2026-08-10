@@ -274,6 +274,7 @@ COPY packaging/systemd/mackesd-integrations.service /usr/lib/systemd/system/mack
 # only the explicit runtime activator and its fixed LoadCredentialEncrypted
 # contract; neither is installed into mackesd-actions.service by default.
 COPY install-helpers/provision-surface-mok-import-credentials.sh /usr/libexec/mackesd/provision-surface-mok-import-credentials
+COPY install-helpers/mint-surface-mok-import.sh /usr/libexec/mackesd/mint-surface-mok-import
 COPY packaging/systemd/surface-mok-import-credential.conf /usr/libexec/mackesd/surface-mok-import-credential.conf
 COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
 COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-mesh.toml

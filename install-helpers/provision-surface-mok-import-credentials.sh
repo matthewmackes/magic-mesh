@@ -21,6 +21,9 @@ export PATH
 readonly UNIT="mackesd-actions.service"
 readonly RUNTIME_ROOT="${MCNF_SURFACE_MOK_RUNTIME_ROOT:-/run}"
 readonly INCOMING_DIR="$RUNTIME_ROOT/mcnf-surface-mok-import/incoming"
+readonly LOCK_PATH="$RUNTIME_ROOT/mcnf-surface-mok-import/mint.lock"
+readonly GENERATION_PATH="$INCOMING_DIR/.generation"
+readonly TRANSACTION_ROOT="$RUNTIME_ROOT/mcnf-surface-mok-import/transactions"
 readonly CREDSTORE_DIR="$RUNTIME_ROOT/credstore.encrypted"
 readonly ENVELOPE_NAME="surface-mok-import.sealed"
 readonly PASSPHRASE_NAME="surface-mok-import-passphrase"
@@ -31,10 +34,29 @@ readonly PASSPHRASE_OUT="$CREDSTORE_DIR/$PASSPHRASE_NAME"
 readonly DROPIN_SOURCE="${MCNF_SURFACE_MOK_DROPIN_SOURCE:-/usr/libexec/mackesd/surface-mok-import-credential.conf}"
 readonly DROPIN_DIR="${MCNF_SURFACE_MOK_SYSTEMD_ROOT:-/etc/systemd/system}/$UNIT.d"
 readonly DROPIN_PATH="$DROPIN_DIR/70-surface-mok-import-credential.conf"
+readonly COMMAND_TIMEOUT_SECS=3
 
 fail() {
   printf 'provision-surface-mok-import-credentials: %s\n' "$1" >&2
   exit 1
+}
+
+bounded() {
+  /usr/bin/timeout --signal=KILL --kill-after=2s "${COMMAND_TIMEOUT_SECS}s" "$@"
+}
+
+validate_generation() {
+  validate_private_input "$GENERATION_PATH"
+  validate_generation_value
+}
+
+validate_generation_value() {
+  local value
+  [ "$(/usr/bin/stat -c '%s' "$GENERATION_PATH")" -eq 36 ] \
+    || fail "incoming credential generation identifier has the wrong byte length"
+  value=$(/usr/bin/head -c 65 "$GENERATION_PATH")
+  [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || fail "incoming credential generation identifier is malformed"
 }
 
 validate_private_input() {
@@ -114,6 +136,22 @@ self_test() {
     fail "self-test accepted a NUL-bearing passphrase"
   fi
 
+  /usr/bin/install -d -m 0700 "$fixture/runtime/mcnf-surface-mok-import/incoming"
+  printf '%s' '01234567-89ab-cdef-0123-456789abcdef' \
+    >"$fixture/runtime/mcnf-surface-mok-import/incoming/.generation"
+  /usr/bin/chmod 0600 "$fixture/runtime/mcnf-surface-mok-import/incoming/.generation"
+  MCNF_SURFACE_MOK_RUNTIME_ROOT="$fixture/runtime" "$0" --test-generation >/dev/null
+  printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' \
+    >"$fixture/runtime/mcnf-surface-mok-import/incoming/.generation"
+  if MCNF_SURFACE_MOK_RUNTIME_ROOT="$fixture/runtime" "$0" --test-generation 2>/dev/null; then
+    fail "self-test accepted a newline-suffixed generation identifier"
+  fi
+  printf '%s' 'hostile-generation' \
+    >"$fixture/runtime/mcnf-surface-mok-import/incoming/.generation"
+  if MCNF_SURFACE_MOK_RUNTIME_ROOT="$fixture/runtime" "$0" --test-generation 2>/dev/null; then
+    fail "self-test accepted a malformed generation identifier"
+  fi
+
   MCNF_SURFACE_MOK_DROPIN_SOURCE="$repo/packaging/systemd/surface-mok-import-credential.conf" \
     "$0" --verify-contract >/dev/null
   /usr/bin/grep -Fq 'readonly PATH="/usr/sbin:/usr/bin"' "$0"
@@ -122,6 +160,12 @@ self_test() {
   /usr/bin/grep -Fq "/usr/bin/env -i PATH=\"\$PATH\" /usr/bin/systemd-creds" "$0"
   /usr/bin/grep -Fq "/usr/bin/env -i PATH=\"\$PATH\" /usr/bin/systemctl --system" "$0"
   /usr/bin/grep -Fq 'systemd credentials cannot be added' "$0"
+  /usr/bin/grep -Fq '/usr/bin/flock -x 9' "$0"
+  /usr/bin/grep -Fq '/usr/bin/timeout --signal=KILL --kill-after=2s' "$0"
+  /usr/bin/grep -Fq 'credential-bearing action service did not reach active state' "$0"
+  /usr/bin/grep -Fq 'rollback()' "$0"
+  /usr/bin/grep -Fq -- '--property=RuntimeMaxSec=60s' \
+    "$repo/install-helpers/mint-surface-mok-import.sh"
   handoff_literal="host-state \`propose\` then \`confirm\` pair"
   /usr/bin/grep -Fq "$handoff_literal" "$0"
   /usr/bin/grep -Fq 'surface_enable never mints or retains either exact-body capability' \
@@ -141,6 +185,8 @@ verify_contract() {
 }
 
 activate() {
+  local lock_mode=${1:-standalone} transaction active_deadline was_active=0 mutation_started=0 committed=0
+  local had_envelope=0 had_passphrase=0 had_dropin=0
   [ "$(id -u)" -eq 0 ] || fail "must run as root"
   for override in \
     MCNF_SURFACE_MOK_RUNTIME_ROOT \
@@ -149,44 +195,114 @@ activate() {
     [ -z "${!override+x}" ] \
       || fail "$override is test-only and cannot override the production activation contract"
   done
-  for command_name in systemd-creds systemctl install stat python3 grep; do
+  for command_name in systemd-creds systemctl install stat python3 grep timeout flock head; do
     command -v "$command_name" >/dev/null || fail "required command unavailable: $command_name"
   done
+  /usr/bin/install -d -m 0700 -o root -g root "$(dirname "$LOCK_PATH")" "$TRANSACTION_ROOT"
+  if [ "$lock_mode" = standalone ]; then
+    exec 9>"$LOCK_PATH"
+    /usr/bin/flock -x 9
+  elif [ "$lock_mode" != parent-locked ]; then
+    fail "invalid activation lock mode"
+  fi
   validate_dropin
   validate_private_directory "$INCOMING_DIR"
+  validate_generation
   validate_private_input "$ENVELOPE_IN"
   validate_private_input "$PASSPHRASE_IN"
+  [ ! -L "$ENVELOPE_OUT" ] || fail "refusing symlinked installed envelope credential"
+  [ ! -L "$PASSPHRASE_OUT" ] || fail "refusing symlinked installed passphrase credential"
+  [ ! -L "$DROPIN_PATH" ] || fail "refusing symlinked credential drop-in"
 
   # --name binds each ciphertext to the only credential leaf mackesd accepts.
   # Plaintext flows directly through a pipe into a bounded validator.
-  /usr/bin/env -i PATH="$PATH" /usr/bin/systemd-creds \
+  bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemd-creds \
     decrypt --name="$ENVELOPE_NAME" "$ENVELOPE_IN" - 2>/dev/null \
     | validate_envelope_stream
-  /usr/bin/env -i PATH="$PATH" /usr/bin/systemd-creds \
+  bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemd-creds \
     decrypt --name="$PASSPHRASE_NAME" "$PASSPHRASE_IN" - 2>/dev/null \
     | validate_passphrase_stream
 
+  transaction=$(/usr/bin/mktemp -d "$TRANSACTION_ROOT/txn.XXXXXXXX")
+  if bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system is-active --quiet "$UNIT"; then
+    was_active=1
+  fi
+  if [ -f "$ENVELOPE_OUT" ] && [ ! -L "$ENVELOPE_OUT" ]; then
+    /usr/bin/install -m 0600 -o root -g root "$ENVELOPE_OUT" "$transaction/$ENVELOPE_NAME"
+    had_envelope=1
+  fi
+  if [ -f "$PASSPHRASE_OUT" ] && [ ! -L "$PASSPHRASE_OUT" ]; then
+    /usr/bin/install -m 0600 -o root -g root "$PASSPHRASE_OUT" "$transaction/$PASSPHRASE_NAME"
+    had_passphrase=1
+  fi
+  if [ -f "$DROPIN_PATH" ] && [ ! -L "$DROPIN_PATH" ]; then
+    /usr/bin/install -m 0644 -o root -g root "$DROPIN_PATH" "$transaction/dropin.conf"
+    had_dropin=1
+  fi
+
+  rollback() {
+    [ "$committed" -eq 0 ] || return 0
+    [ "$mutation_started" -eq 1 ] || return 0
+    bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system stop "$UNIT" >/dev/null 2>&1 || :
+    if [ "$had_envelope" -eq 1 ]; then
+      /usr/bin/install -m 0600 -o root -g root "$transaction/$ENVELOPE_NAME" "$ENVELOPE_OUT"
+    else
+      /usr/bin/rm -f -- "$ENVELOPE_OUT"
+    fi
+    if [ "$had_passphrase" -eq 1 ]; then
+      /usr/bin/install -m 0600 -o root -g root "$transaction/$PASSPHRASE_NAME" "$PASSPHRASE_OUT"
+    else
+      /usr/bin/rm -f -- "$PASSPHRASE_OUT"
+    fi
+    if [ "$had_dropin" -eq 1 ]; then
+      /usr/bin/install -m 0644 -o root -g root "$transaction/dropin.conf" "$DROPIN_PATH"
+    else
+      /usr/bin/rm -f -- "$DROPIN_PATH"
+    fi
+    bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system daemon-reload >/dev/null 2>&1 || :
+    if [ "$was_active" -eq 1 ]; then
+      bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system start --no-block "$UNIT" >/dev/null 2>&1 || :
+    fi
+  }
+  cleanup_transaction() {
+    rollback
+    [ -z "${transaction:-}" ] || /usr/bin/find "$transaction" -depth -delete 2>/dev/null || :
+  }
+  trap cleanup_transaction EXIT HUP INT TERM
+
   # Credentials are immutable to a running service. Stop first, install the
-  # complete pair, then start; any intermediate failure leaves mutations off.
-  /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system stop "$UNIT"
+  # complete pair, then admit the queued start before consuming staging.
+  mutation_started=1
+  bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system stop "$UNIT"
   /usr/bin/install -d -m 0700 -o root -g root "$CREDSTORE_DIR" "$DROPIN_DIR"
   /usr/bin/install -m 0600 -o root -g root "$ENVELOPE_IN" "$ENVELOPE_OUT"
   /usr/bin/install -m 0600 -o root -g root "$PASSPHRASE_IN" "$PASSPHRASE_OUT"
   /usr/bin/install -m 0644 -o root -g root "$DROPIN_SOURCE" "$DROPIN_PATH"
-  /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system daemon-reload
-  /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system start "$UNIT"
-  /usr/bin/find "$INCOMING_DIR" -maxdepth 1 -type f \
-    \( -name "$ENVELOPE_NAME" -o -name "$PASSPHRASE_NAME" \) -delete
+  bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system daemon-reload
+  bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system start --no-block "$UNIT"
+  active_deadline=$((SECONDS + 5))
+  until bounded /usr/bin/env -i PATH="$PATH" /usr/bin/systemctl --system is-active --quiet "$UNIT"; do
+    [ "$SECONDS" -lt "$active_deadline" ] || fail "credential-bearing action service did not reach active state"
+    /usr/bin/sleep 0.25
+  done
+
+  committed=1
+  /usr/bin/find "$INCOMING_DIR" -depth -delete
+  /usr/bin/find "$transaction" -depth -delete
+  transaction=
+  trap - EXIT HUP INT TERM
   printf '%s\n' \
-    'provision-surface-mok-import-credentials: activated one request-bound credential generation' \
+    'provision-surface-mok-import-credentials: admitted one active request-bound credential generation' \
     'provision-surface-mok-import-credentials: publish the bound Surface enable request before its 30-second permit expires' \
     'provision-surface-mok-import-credentials: reboot remains a separate host-state propose/confirm operation'
 }
 
 case "${1:-}" in
-  --activate) activate ;;
+  --activate) activate standalone ;;
+  --activate-under-lock) activate parent-locked ;;
   --verify-contract) verify_contract ;;
   --self-test) self_test ;;
+  --test-generation) validate_generation_value ;;
   *)
     printf 'usage: %s --activate | --verify-contract | --self-test\n' "$0" >&2
     exit 2

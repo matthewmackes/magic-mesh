@@ -175,7 +175,7 @@ impl ActionAuthorizer {
 /// This is deliberately separate from [`ActionAuthorizer`]'s verifier API:
 /// callers use it only for a narrowly named producer envelope, never for an
 /// arbitrary UI-controlled mutation.
-pub(crate) fn production_action_signer() -> Result<CloudArmSigner, String> {
+pub fn production_action_signer() -> Result<CloudArmSigner, String> {
     if !rustix::process::geteuid().is_root() {
         return Err("privileged action signing requires the root service process".to_string());
     }
