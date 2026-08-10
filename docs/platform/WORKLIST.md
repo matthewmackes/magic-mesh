@@ -1145,6 +1145,9 @@ behavioral evidence is not completion.
 - Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
   fixtures, responsive captures, and live recovery proof remain.
 - Remaining work:
+- **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card
+  plus matching discovery revision, and now retains provenance for the full bounded probe lease; `.90` passed the exact lifetime regression. Authenticated login/render
+  remains: `docs/platform/evidence/WL-FUNC-019-2026-08-10-seat15-rdp-resource-provenance-r129.md`.
 - **RDP host-discovery checkpoint (2026-08-10):** bounded fast and deep probes preserve the default privileged discovery set and add TCP/3389 without `-Pn` or
   target/port expansion; machine 9 passed the exact regression. Seat-15 deployment and live authenticated-card proof remain:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-rdp-host-discovery-r117.md`.

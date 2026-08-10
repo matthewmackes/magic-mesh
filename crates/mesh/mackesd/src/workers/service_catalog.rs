@@ -689,7 +689,7 @@ fn probed_rdp_card(
         }],
     )?;
     card.summary = Some("Bounded nmap RDP observation · local approval required".into());
-    card.provenance = vec![provenance(
+    let mut rdp_provenance = provenance(
         // The universal catalog consumes this observation through the
         // authenticated mesh service mirror. `ServiceRecord` does not retain
         // the probing interface, so claiming direct LAN-source provenance here
@@ -699,7 +699,17 @@ fn probed_rdp_card(
         ProvenanceTrust::AuthenticatedMesh,
         format!("services/{}/probe-rdp/{}", safe_id(publisher), safe_id(&ip)),
         observed_at_ms,
-    )];
+    );
+    // The probe observation is the authority for this card and remains valid
+    // for the same bounded five-minute window as the probe-only service row.
+    // Leaving the generic one-minute provenance TTL here made the UI present a
+    // still-connectable RDP card whose only provenance had already expired.
+    rdp_provenance.expires_at_ms = observed_at_ms
+        .checked_add(PROBED_RDP_MAX_AGE_MS)
+        .ok_or(ResourceValidationError::InvalidTimestamp(
+            "probed_rdp.provenance_freshness",
+        ))?;
+    card.provenance = vec![rdp_provenance];
     card.validate()?;
     Ok(Some(card))
 }
@@ -1426,10 +1436,13 @@ mod tests {
         })
         .expect("probe-fresh RDP observation remains a valid catalog input");
 
-        assert!(catalog
+        let card = catalog
             .cards
             .iter()
-            .any(|card| card.identity.canonical_key == "probe-rdp/172.20.146.54"));
+            .find(|card| card.identity.canonical_key == "probe-rdp/172.20.146.54")
+            .expect("RDP card remains promoted");
+        assert!(card.expires_at_ms > u64::try_from(NOW).unwrap());
+        assert!(card.provenance[0].expires_at_ms > u64::try_from(NOW).unwrap());
         catalog.validate().expect("validated catalog");
     }
 
