@@ -40,7 +40,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mackes_mesh_types::surface_hardware::{
     SurfaceActionHeader, SurfaceAvailability, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
     SurfaceCameraProofRefusal, SurfaceCameraProofRequest, SurfaceCameraProofResult,
-    SurfaceCameraProofUnavailable, SurfaceFirmwareApplyRequest, SurfaceFirmwareInventory,
+    SurfaceCameraProofUnavailable, SurfaceFirmwareApplyFailure, SurfaceFirmwareApplyOutcome,
+    SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyRequest, SurfaceFirmwareApplyResult,
+    SurfaceFirmwareApplyTarget, SurfaceFirmwareApplyUnavailable, SurfaceFirmwareInventory,
     SurfaceFleetSummary, SurfaceModelIdentity, SurfaceProGeneration, SurfaceProbeState,
     SurfaceSubsystem, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
     SURFACE_HARDWARE_SCHEMA_VERSION,
@@ -68,6 +70,11 @@ const MAX_SURFACE_STATE_FUTURE_SKEW_MS: u64 = 5_000;
 const MAX_MOK_HANDOFF_AGE_MS: u64 = 90_000;
 /// A camera request cannot hold the single local in-flight slot indefinitely.
 const MAX_CAMERA_PROOF_IN_FLIGHT_MS: u64 = 90_000;
+/// Firmware apply can legitimately spend 10 minutes downloading plus 30
+/// minutes in the local-install provider. Keep the single-flight exclusion for
+/// a bounded 45 minutes so a slow valid apply cannot be duplicated, while
+/// leaving result-publication freshness at the independent 90-second bound.
+const MAX_FIRMWARE_APPLY_IN_FLIGHT_MS: u64 = 45 * 60 * 1_000;
 
 /// The exact token the operator types to arm a firmware apply (mirror of
 /// `mackesd::surface::firmware::FW_ARM_TOKEN`, lock #8).
@@ -275,28 +282,6 @@ struct EnableResult {
     mok: MokEnrollment,
 }
 
-/// Mirror of the daemon's `ApplyOutcome`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-enum ApplyOutcome {
-    Refused { reason: String },
-    Applied,
-    Gated { reason: String },
-    Failed { reason: String },
-}
-
-/// Mirror of the daemon's `ApplyResult` (SURFACE-5 fw-apply).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct ApplyResult {
-    #[allow(dead_code)]
-    model: String,
-    #[serde(default)]
-    skipped: Option<String>,
-    device_id: String,
-    outcome: ApplyOutcome,
-    #[allow(dead_code)]
-    reverify: bool,
-}
-
 // ───────────────────────── shared action contract (§6) ─────────────────────
 
 fn surface_action_header_at(node: &str, issued_at_ms: u64) -> SurfaceActionHeader {
@@ -320,6 +305,15 @@ struct CameraProofInFlight {
     node: String,
     request_id: String,
     model: SurfaceModelIdentity,
+    issued_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirmwareApplyInFlight {
+    node: String,
+    request_id: String,
+    model: SurfaceModelIdentity,
+    target: SurfaceFirmwareApplyTarget,
     issued_at_ms: u64,
 }
 
@@ -380,8 +374,10 @@ pub(crate) struct SurfaceCardState {
     enable_node: Option<String>,
     /// The fwupd inventory (Install tab).
     firmware: Option<SurfaceFirmwareInventory>,
-    /// The last fw-apply typed result (Install tab).
-    apply: Option<ApplyResult>,
+    /// The last exactly correlated shared v2 fw-apply result (Install tab).
+    apply: Option<SurfaceFirmwareApplyResult>,
+    /// One exact local firmware selection awaiting its shared v2 result.
+    firmware_in_flight: Option<FirmwareApplyInFlight>,
     /// One local, exact-identity camera functional proof awaiting a closed result.
     camera_in_flight: Option<CameraProofInFlight>,
     /// Last correlated privacy-safe result; never contains provider output.
@@ -427,6 +423,7 @@ impl Default for SurfaceCardState {
             enable_node: None,
             firmware: None,
             apply: None,
+            firmware_in_flight: None,
             camera_in_flight: None,
             camera_result: None,
             tab: Tab::default(),
@@ -520,6 +517,18 @@ impl SurfaceCardState {
         let Some(node) = self.node.clone() else {
             return;
         };
+        let now_ms = wall_clock_ms();
+        if self
+            .firmware_in_flight
+            .as_ref()
+            .is_some_and(|pending| firmware_apply_in_flight_expired(pending, &node, now_ms))
+        {
+            self.firmware_in_flight = None;
+            self.action_note = Some(
+                "Firmware apply timed out without a correlated shared result; re-read inventory before retrying."
+                    .to_string(),
+            );
+        }
         read_latest_surface_summary(
             &persist,
             &summary_topic(&node),
@@ -550,11 +559,13 @@ impl SurfaceCardState {
             &mut self.cur_firmware,
             &mut self.firmware,
         );
-        read_latest(
+        read_latest_firmware_apply_result(
             &persist,
             &fw_apply_result_topic(&node),
             &mut self.cur_apply,
+            &mut self.firmware_in_flight,
             &mut self.apply,
+            now_ms,
         );
         read_latest_camera_result(
             &persist,
@@ -567,7 +578,6 @@ impl SurfaceCardState {
         // Re-age retained facts on every poll as well as on decode. Otherwise
         // a last-good `Fresh` value would stay cosmetically fresh forever when
         // the producer stops publishing and the cursor sees no new messages.
-        let now_ms = wall_clock_ms();
         if let Some(summary) = self.summary.as_mut() {
             let _ = admit_publication_freshness(&mut summary.publication, &node, now_ms);
         }
@@ -598,6 +608,7 @@ impl SurfaceCardState {
         self.enable_node = None;
         self.firmware = None;
         self.apply = None;
+        self.firmware_in_flight = None;
         self.camera_in_flight = None;
         self.camera_result = None;
         self.camera_arm_input.clear();
@@ -1017,28 +1028,15 @@ impl SurfaceCardState {
             });
         }
 
-        // The last apply result, rendered as-is (§7).
+        // Only a shared v2 result correlated to this exact local request and
+        // release selection can reach this slot.
         if let Some(res) = self.apply.clone() {
             ui.add_space(Style::SP_XS);
-            let (tone, msg) = match &res.outcome {
-                ApplyOutcome::Applied => (Style::OK, "applied \u{2014} re-verifying".to_string()),
-                ApplyOutcome::Refused { reason } => {
-                    (Style::WARN, format!("refused \u{2014} {reason}"))
-                }
-                ApplyOutcome::Gated { reason } => {
-                    (Style::WARN, format!("integration-gated \u{2014} {reason}"))
-                }
-                ApplyOutcome::Failed { reason } => {
-                    (Style::DANGER, format!("failed \u{2014} {reason}"))
-                }
-            };
-            let msg = res
-                .skipped
-                .map_or(msg, |reason| format!("skipped \u{2014} {reason}"));
+            let (tone, msg) = firmware_apply_outcome_label(res.outcome);
             ui.horizontal_wrapped(|ui| {
                 mde_egui::status_dot(ui, tone);
                 ui.add_space(Style::SP_XS);
-                mde_egui::muted_note(ui, format!("{}: {msg}", res.device_id));
+                mde_egui::muted_note(ui, msg);
             });
         }
 
@@ -1059,6 +1057,7 @@ impl SurfaceCardState {
                         inv.publication.published_at_ms,
                         version,
                         checksum,
+                        &inv.publication.model,
                     );
                 }
             }
@@ -1075,8 +1074,16 @@ impl SurfaceCardState {
         inventory_published_at_ms: u64,
         release_version: &str,
         release_checksum: &str,
+        model: &SurfaceModelIdentity,
     ) {
         ui.add_space(Style::SP_S);
+        if self.firmware_in_flight.is_some() {
+            mde_egui::muted_note(
+                ui,
+                "Firmware apply is in progress; waiting for its exact shared result.",
+            );
+            return;
+        }
         ui.vertical(|ui| {
             ui.label(
                 RichText::new("Type to arm")
@@ -1099,20 +1106,20 @@ impl SurfaceCardState {
                 )
                 .clicked()
             {
-                let node = self.node.as_deref().unwrap_or_default();
-                let unsigned = serde_json::to_string(&SurfaceFirmwareApplyRequest {
-                    header: surface_action_header(node),
+                let node = self.node.clone().unwrap_or_default();
+                let request = SurfaceFirmwareApplyRequest {
+                    header: surface_action_header(&node),
                     device_id: device_id.to_string(),
                     inventory_published_at_ms,
                     release_version: release_version.to_string(),
                     release_checksum: release_checksum.to_string(),
                     arm_token: Some(FW_ARM_TOKEN.to_string()),
-                })
-                .unwrap_or_default();
+                };
+                let unsigned = serde_json::to_string(&request).unwrap_or_default();
                 let body = match crate::iac::authorize_root_mutation_body(
                     &unsigned,
                     "surface-firmware-apply",
-                    node,
+                    &node,
                     device_id.trim(),
                 ) {
                     Ok(body) => body,
@@ -1123,12 +1130,26 @@ impl SurfaceCardState {
                     }
                 };
                 let topic = self.action_topic(fw_apply_action_topic);
-                self.publish(
+                if self.publish(
                     &topic,
                     &body,
                     "Firmware apply armed \u{2014} the node is applying it\u{2026}",
-                );
-                self.fw_arm_input.clear();
+                ) {
+                    self.firmware_in_flight = Some(FirmwareApplyInFlight {
+                        node,
+                        request_id: request.header.request_id,
+                        model: model.clone(),
+                        target: SurfaceFirmwareApplyTarget {
+                            device_id: request.device_id,
+                            inventory_published_at_ms: request.inventory_published_at_ms,
+                            release_version: request.release_version,
+                            release_checksum: request.release_checksum,
+                        },
+                        issued_at_ms: request.header.issued_at_ms,
+                    });
+                    self.apply = None;
+                    self.fw_arm_input.clear();
+                }
             }
             if !armed {
                 mde_egui::muted_note(ui, "Type the exact token above to arm the apply.");
@@ -1568,27 +1589,6 @@ fn discover_node(persist: &Persist, expected_node: &str) -> Option<String> {
         .then(|| expected_node.to_string())
 }
 
-/// Read the latest message on `topic`, advancing `cursor`, decoding into `slot`.
-/// A message that fails to decode is skipped (the last good value is kept).
-fn read_latest<T: for<'de> Deserialize<'de>>(
-    persist: &Persist,
-    topic: &str,
-    cursor: &mut Option<String>,
-    slot: &mut Option<T>,
-) {
-    let Ok(msgs) = persist.list_since(topic, cursor.as_deref()) else {
-        return;
-    };
-    for msg in msgs {
-        *cursor = Some(msg.ulid.clone());
-        if let Some(body) = msg.body.as_deref() {
-            if let Ok(decoded) = serde_json::from_str::<T>(body) {
-                *slot = Some(decoded);
-            }
-        }
-    }
-}
-
 /// Read the local enable-result lane while retaining the Bus write timestamp
 /// and exact topic node needed to admit a short-lived post-MOK handoff.
 fn read_latest_enable(
@@ -1747,6 +1747,104 @@ fn camera_outcome_label(outcome: SurfaceCameraProofOutcome) -> (egui::Color32, &
             Style::WARN,
             "Refused — the requested generation did not match local hardware.",
         ),
+    }
+}
+
+fn firmware_apply_outcome_label(
+    outcome: SurfaceFirmwareApplyOutcome,
+) -> (egui::Color32, &'static str) {
+    match outcome {
+        SurfaceFirmwareApplyOutcome::Applied => (
+            Style::OK,
+            "Applied — fwupd accepted the selected release; verification is refreshing.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::MissingBody) => (
+            Style::WARN,
+            "Refused — the request body was absent; reselect the release and retry.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::Contract) => (
+            Style::WARN,
+            "Refused — the request contract was invalid; re-read inventory and retry.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::Authorization) => (
+            Style::WARN,
+            "Refused — exact-body local authorization was not admitted.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::OperatorArm) => (
+            Style::WARN,
+            "Refused — the firmware confirmation phrase did not match.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::SelectionBinding) => (
+            Style::WARN,
+            "Refused — the selected inventory generation was stale; re-read inventory.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::ReleaseChanged) => (
+            Style::WARN,
+            "Refused — the selected release changed; re-read inventory before retrying.",
+        ),
+        SurfaceFirmwareApplyOutcome::Refused(SurfaceFirmwareApplyRefusal::UnsupportedModel) => (
+            Style::WARN,
+            "Refused — local hardware is outside the Surface Pro 5/6 firmware contract.",
+        ),
+        SurfaceFirmwareApplyOutcome::Unavailable(
+            SurfaceFirmwareApplyUnavailable::ProviderUnavailable,
+        ) => (
+            Style::WARN,
+            "Unavailable — the fwupd apply provider is not available on this node.",
+        ),
+        SurfaceFirmwareApplyOutcome::Failed(SurfaceFirmwareApplyFailure::ProviderFailed) => (
+            Style::DANGER,
+            "Failed — fwupd did not accept the selected release; re-read inventory before retrying.",
+        ),
+    }
+}
+
+fn firmware_apply_in_flight_expired(
+    pending: &FirmwareApplyInFlight,
+    expected_node: &str,
+    now_ms: u64,
+) -> bool {
+    pending.node != expected_node
+        || now_ms.saturating_sub(pending.issued_at_ms) > MAX_FIRMWARE_APPLY_IN_FLIGHT_MS
+}
+
+/// Consume only the shared v2 result bound to the sole exact local apply.
+/// Hostile or unrelated results advance the cursor but cannot clear pending.
+fn read_latest_firmware_apply_result(
+    persist: &Persist,
+    topic: &str,
+    cursor: &mut Option<String>,
+    pending: &mut Option<FirmwareApplyInFlight>,
+    slot: &mut Option<SurfaceFirmwareApplyResult>,
+    now_ms: u64,
+) {
+    let Ok(messages) = persist.list_since(topic, cursor.as_deref()) else {
+        return;
+    };
+    for message in messages {
+        *cursor = Some(message.ulid.clone());
+        let Some(expected) = pending.as_ref() else {
+            continue;
+        };
+        let Some(body) = message.body.as_deref() else {
+            continue;
+        };
+        let Ok(result) = SurfaceFirmwareApplyResult::from_json(body.as_bytes()) else {
+            continue;
+        };
+        if result.publication.node != expected.node
+            || result.publication.model != expected.model
+            || result.request_id != expected.request_id
+            || result.target.as_ref() != Some(&expected.target)
+            || result.publication.published_at_ms < expected.issued_at_ms
+            || result.publication.published_at_ms
+                > now_ms.saturating_add(MAX_SURFACE_STATE_FUTURE_SKEW_MS)
+            || now_ms.saturating_sub(result.publication.published_at_ms) > MAX_SURFACE_STATE_AGE_MS
+        {
+            continue;
+        }
+        *slot = Some(result);
+        *pending = None;
     }
 }
 
@@ -1948,6 +2046,7 @@ mod tests {
                 enable_node: None,
                 firmware: None,
                 apply: None,
+                firmware_in_flight: None,
                 camera_in_flight: None,
                 camera_result: None,
                 tab: Tab::default(),
@@ -2092,6 +2191,160 @@ mod tests {
             SurfaceFirmwareApplyRequest::from_json_at(&firmware_json, "this-node", ACTION_NOW_MS),
             Ok(firmware)
         );
+    }
+
+    fn firmware_apply_pending() -> FirmwareApplyInFlight {
+        FirmwareApplyInFlight {
+            node: "this-node".into(),
+            request_id: "firmware-apply-expected".into(),
+            model: test_publication().model,
+            target: SurfaceFirmwareApplyTarget {
+                device_id: "dev-uefi".into(),
+                inventory_published_at_ms: ACTION_NOW_MS,
+                release_version: "1.2.10".into(),
+                release_checksum: "a".repeat(64),
+            },
+            issued_at_ms: ACTION_NOW_MS,
+        }
+    }
+
+    fn firmware_apply_result(pending: &FirmwareApplyInFlight) -> SurfaceFirmwareApplyResult {
+        SurfaceFirmwareApplyResult {
+            result_schema_version:
+                mackes_mesh_types::surface_hardware::SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
+            publication: SurfacePublication {
+                schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                node: pending.node.clone(),
+                model: pending.model.clone(),
+                source: SurfaceObservationSource::Fwupd,
+                published_at_ms: ACTION_NOW_MS + 1,
+                availability: SurfaceAvailability::Fresh,
+            },
+            request_id: pending.request_id.clone(),
+            target: Some(pending.target.clone()),
+            outcome: SurfaceFirmwareApplyOutcome::Applied,
+        }
+    }
+
+    #[test]
+    fn firmware_result_consumer_requires_exact_local_request_and_release_identity() {
+        let dir = tempfile::tempdir().expect("firmware result bus");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open firmware result bus");
+        let pending = firmware_apply_pending();
+        let valid = firmware_apply_result(&pending);
+        let mut hostile = Vec::new();
+
+        let mut remote = valid.clone();
+        remote.publication.node = "remote-surface".into();
+        hostile.push(serde_json::to_string(&remote).unwrap());
+
+        let mut wrong_request = valid.clone();
+        wrong_request.request_id = "firmware-apply-other".into();
+        hostile.push(serde_json::to_string(&wrong_request).unwrap());
+
+        let mut substituted = valid.clone();
+        substituted.target.as_mut().unwrap().release_checksum = "b".repeat(64);
+        hostile.push(serde_json::to_string(&substituted).unwrap());
+
+        let mut too_early = valid.clone();
+        too_early.publication.published_at_ms = ACTION_NOW_MS - 1;
+        hostile.push(serde_json::to_string(&too_early).unwrap());
+
+        let mut future = valid.clone();
+        future.publication.published_at_ms = ACTION_NOW_MS + MAX_SURFACE_STATE_FUTURE_SKEW_MS + 3;
+        hostile.push(serde_json::to_string(&future).unwrap());
+
+        let unknown =
+            serde_json::to_string(&valid)
+                .unwrap()
+                .replacen("{", r#"{"unexpected":true,"#, 1);
+        hostile.push(unknown);
+        let duplicate = serde_json::to_string(&valid).unwrap().replacen(
+            "{",
+            r#"{"result_schema_version":2,"result_schema_version":2,"#,
+            1,
+        );
+        hostile.push(duplicate);
+        hostile.push(" ".repeat(MAX_SURFACE_WIRE_BYTES + 1));
+        hostile.push(
+            r#"{"model":"Surface Pro 6","device_id":"dev-uefi","outcome":"Applied","reverify":true}"#
+                .to_string(),
+        );
+
+        for body in hostile {
+            persist
+                .write(
+                    &fw_apply_result_topic("this-node"),
+                    Priority::Default,
+                    None,
+                    Some(&body),
+                )
+                .expect("write hostile firmware result");
+        }
+        let mut cursor = None;
+        let mut in_flight = Some(pending.clone());
+        let mut slot = None;
+        read_latest_firmware_apply_result(
+            &persist,
+            &fw_apply_result_topic("this-node"),
+            &mut cursor,
+            &mut in_flight,
+            &mut slot,
+            ACTION_NOW_MS + 2,
+        );
+        assert!(slot.is_none());
+        assert_eq!(
+            in_flight,
+            Some(pending.clone()),
+            "remote or mismatched results must not clear the local pending apply"
+        );
+
+        persist
+            .write(
+                &fw_apply_result_topic("this-node"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&valid).unwrap()),
+            )
+            .expect("write exact firmware result");
+        read_latest_firmware_apply_result(
+            &persist,
+            &fw_apply_result_topic("this-node"),
+            &mut cursor,
+            &mut in_flight,
+            &mut slot,
+            ACTION_NOW_MS + 2,
+        );
+        assert_eq!(slot, Some(valid));
+        assert!(in_flight.is_none());
+    }
+
+    #[test]
+    fn firmware_single_flight_outlives_state_freshness_and_expires_after_provider_budget() {
+        let pending = firmware_apply_pending();
+        assert!(
+            !firmware_apply_in_flight_expired(
+                &pending,
+                "this-node",
+                ACTION_NOW_MS + MAX_SURFACE_STATE_AGE_MS + 1,
+            ),
+            "90-second result freshness must not release a potentially running apply"
+        );
+        assert!(!firmware_apply_in_flight_expired(
+            &pending,
+            "this-node",
+            ACTION_NOW_MS + MAX_FIRMWARE_APPLY_IN_FLIGHT_MS,
+        ));
+        assert!(firmware_apply_in_flight_expired(
+            &pending,
+            "this-node",
+            ACTION_NOW_MS + MAX_FIRMWARE_APPLY_IN_FLIGHT_MS + 1,
+        ));
+        assert!(firmware_apply_in_flight_expired(
+            &pending,
+            "remote-surface",
+            ACTION_NOW_MS,
+        ));
     }
 
     #[test]
