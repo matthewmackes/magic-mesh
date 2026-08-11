@@ -2035,6 +2035,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-xdg-all-home-preflight-r178.md`.
 - **Missing Workstation session return (2026-08-10):** inactive shell sessions are restored additively without restarting healthy mesh services; `.90` passed:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-session-return-r205.md`.
+- **Stale-session duplicate guard (2026-08-10):** orphaned shell processes block
+  duplicate recovery before XDG mutation; `.90` fixtures passed:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-stale-session-guard-r213.md`.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.
@@ -2236,6 +2239,9 @@ behavioral evidence is not completion.
 - Current state: shared style and many primitives exist; adoption gaps, icon audit, responsive outliers, and integrated visual proof remain.
 - **Workspace-state checkpoint (2026-08-09):** shared panels stay bounded and use active Light tokens at narrow touch geometry; `.50` passed 12/12:
   `docs/platform/evidence/WL-UX-009-2026-08-09-workspace-state-responsive-light-r1.md`.
+- **Carbon icon registry drift gate (2026-08-10):** exact 44-asset parity,
+  symbolic SVG, safe-name, and Apache-2.0 checks passed:
+  `docs/platform/evidence/WL-UX-009-2026-08-10-carbon-registry-r213.md`.
 - Remaining work:
   1. S1 Freeze tokens, fonts, and icon registry.
      - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.
