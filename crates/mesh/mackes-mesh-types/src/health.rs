@@ -1324,6 +1324,13 @@ fn validate_condition(
             "condition.lifecycle",
         ));
     }
+    if condition.evidence.observed_at_ms < condition.active_since_ms
+        || condition.evidence.observed_at_ms > condition.last_observed_ms
+    {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "condition.evidence_lifecycle",
+        ));
+    }
     for (field, timestamp) in [
         ("condition.resolved_at_ms", condition.resolved_at_ms),
         ("condition.acknowledged_at_ms", condition.acknowledged_at_ms),
@@ -2336,6 +2343,47 @@ mod tests {
             malformed.validate_at(100),
             Err(NodeHealthValidationError::InvalidTimestamp(
                 "condition.lifecycle"
+            ))
+        );
+
+        let mut evidence_before_activation = state("node", 1, 100);
+        let mut lifecycle_condition = condition("node", HealthSeverity::Warning);
+        lifecycle_condition.active_since_ms = 60;
+        lifecycle_condition.last_observed_ms = 90;
+        lifecycle_condition.evidence.observed_at_ms = 59;
+        evidence_before_activation
+            .active_conditions
+            .push(lifecycle_condition.clone());
+        evidence_before_activation.grade = NodeGrade::evaluate(
+            "node",
+            evidence_before_activation.grade.capability_score,
+            evidence_before_activation.grade.factors,
+            &evidence_before_activation.active_conditions,
+            evidence_before_activation.grade.evaluated_at_ms,
+        );
+        assert_eq!(
+            evidence_before_activation.validate_at(100),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "condition.evidence_lifecycle"
+            ))
+        );
+
+        lifecycle_condition.evidence.observed_at_ms = 91;
+        let mut evidence_after_observation = state("node", 2, 100);
+        evidence_after_observation
+            .active_conditions
+            .push(lifecycle_condition);
+        evidence_after_observation.grade = NodeGrade::evaluate(
+            "node",
+            evidence_after_observation.grade.capability_score,
+            evidence_after_observation.grade.factors,
+            &evidence_after_observation.active_conditions,
+            evidence_after_observation.grade.evaluated_at_ms,
+        );
+        assert_eq!(
+            evidence_after_observation.validate_at(100),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "condition.evidence_lifecycle"
             ))
         );
 
