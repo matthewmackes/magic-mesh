@@ -391,20 +391,18 @@ impl DeviceControlExecWorker {
             .cloned()
     }
 
-    /// A provider-owned record with no resolved state or explanatory evidence is
-    /// not safe to mutate. This applies to every control verb: a module reload
-    /// and a bus rescan are mutations too, even though they do not look like a
-    /// simple enable/disable toggle. Keep known operational states (for example
-    /// a network link explicitly reported `down`) actionable, while refusing an
-    /// absent driver/unknown device whose provider could not establish
-    /// availability.
+    /// A provider-owned record with no resolved state is not safe to mutate.
+    /// This applies to every control verb: a module reload and a bus rescan are
+    /// mutations too, even though they do not look like a simple enable/disable
+    /// toggle. Keep known operational states (for example a network link
+    /// explicitly reported `down`) actionable, while refusing every unknown
+    /// device. A problem string explains the refusal; it does not establish
+    /// capability or make an unresolved provider state safe.
     fn admit_control_state(
         op: DeviceControlOp,
         device: &device_inventory::DeviceRecord,
     ) -> Result<(), String> {
-        if device.status == device_inventory::DeviceStatus::Unknown
-            && device.problem.is_none()
-        {
+        if device.status == device_inventory::DeviceStatus::Unknown {
             return Err(format!(
                 "{}: provider state for `{}` is unavailable — refused before mutation",
                 op.as_str(), device.name
@@ -1197,6 +1195,55 @@ mod tests {
             "1",
             "unavailable state must be refused before the sysfs seam"
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_state_with_problem_cannot_reach_any_control_seam() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+        write_inventory(
+            tmp.path(),
+            "edge-2",
+            vec![DeviceRecord {
+                sysfs_path: Some(sysfs_path.clone()),
+                status: DeviceStatus::Unknown,
+                problem: Some("provider probe failed".into()),
+                ..DeviceRecord::new("Unresolved USB device", DeviceStatus::Unknown)
+            }],
+        );
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        );
+        let request = DeviceControlRequest {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: "01UNKNOWN-PROBLEM".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget {
+                name: "Unresolved USB device".into(),
+                category: category::NETWORK_ADAPTERS.into(),
+                sysfs_path: Some(sysfs_path),
+                driver: None,
+            },
+            target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1,
+            from: "peer:laptop-mm".into(),
+        };
+
+        for op in DeviceControlOp::ALL {
+            let mut request = request.clone();
+            request.id = format!("01UNKNOWN-PROBLEM-{}", op.as_str());
+            request.op = op;
+            let result = worker.handle_request(&request).await;
+            assert!(!result.ok, "unknown provider state must refuse {}", op.as_str());
+            assert!(result.error.contains("provider state"), "{} escaped admission: {}", op.as_str(), result.error);
+        }
+        assert_eq!(std::fs::read_to_string(dev_dir.join("authorized")).unwrap(), "1");
     }
 
     #[tokio::test]
