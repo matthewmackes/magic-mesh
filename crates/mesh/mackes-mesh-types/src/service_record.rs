@@ -165,6 +165,7 @@ impl ServiceRecord {
 }
 
 /// The `state/services/<node>` mirror body — the aggregated unified set one node
+///
 /// publishes. Every node folds + publishes its OWN merge of the (replicated)
 /// sources, so any node's mirror carries the mesh-wide picture (no center).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
