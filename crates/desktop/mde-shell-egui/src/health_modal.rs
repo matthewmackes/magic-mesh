@@ -1846,6 +1846,7 @@ fn filtered_recurrence_history<'a>(
     let applies_to_page = |condition: &HealthCondition| {
         matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
             && filter.admits(condition.severity)
+            && !condition.is_active()
             && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
                 (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
             })
@@ -2596,6 +2597,31 @@ mod tests {
             .len(),
             0,
             "a filter never widens node scope"
+        );
+    }
+
+    #[test]
+    fn history_excludes_active_rows_from_the_resolved_page() {
+        let active = condition(
+            "node:active-with-resolution",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+
+        let mut resolved = active.clone();
+        resolved.id = "node:resolved".into();
+        resolved.resolved_at_ms = Some(2_000);
+        resolved.last_observed_ms = 2_000;
+
+        let conditions = [active, resolved];
+        let page = recurrence_history(&conditions, "node", 2_000);
+        assert_eq!(
+            page.iter()
+                .map(|recurrence| recurrence.condition.id.as_str())
+                .collect::<Vec<_>>(),
+            ["node:resolved"],
+            "history must contain only inactive lifecycle rows"
         );
     }
 
