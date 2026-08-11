@@ -5,6 +5,17 @@
 //! state. This type is that shared status surface: it is serializable for retained
 //! Bus records and also cheap for the RDP/SPICE session crates to expose directly.
 
+// This is a large, stable wire-contract surface. Keep its public constructors
+// and validation signatures unchanged; these allowances avoid API or
+// wire-format churn for documentation-shape and complexity-only lints.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_many_arguments,
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn
+)]
+
 use serde::{de, Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;

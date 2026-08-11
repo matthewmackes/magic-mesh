@@ -12,6 +12,17 @@
 //! re-exports it from `session_broker` so its own `SessionRequest` paths are
 //! unchanged.
 
+// This is a stable wire-contract surface. Keep its public API and serialized
+// representation unchanged while avoiding documentation-only protocol churn.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_value,
+    clippy::double_must_use
+)]
+
 use serde::{Deserialize, Serialize};
 
 const MAX_APP_VM_FIELD_BYTES: usize = 255;
@@ -174,23 +185,22 @@ impl AppVmLifecycleState {
     /// explicit so stale or hostile updates cannot claim a false connection.
     #[must_use]
     pub fn can_transition_to(self, next: Self) -> bool {
-        use AppVmLifecycleState::*;
         if self == next {
             return true;
         }
         matches!(
             (self, next),
-            (WaitingForPlacement,
-                Installing | StartingGuest | Denied | StaleCatalog | Failed)
-                | (Installing, StartingGuest | Denied | StaleCatalog | Failed)
-                | (StartingGuest, Installing | StartingApp | Unavailable | Failed)
-                | (StartingApp, Connected | Unavailable | Failed)
-                | (Connected, Paused | Reconnecting | Unavailable | Failed)
-                | (Paused, StartingGuest | Reconnecting | Connected | Failed)
-                | (Reconnecting, StartingGuest | StartingApp | Connected | Unavailable | Failed)
-                | (Unavailable, WaitingForPlacement | Installing | StartingGuest | Failed)
-                | (Denied | StaleCatalog, WaitingForPlacement | Installing)
-                | (Failed, WaitingForPlacement | Installing | StartingGuest)
+            (Self::WaitingForPlacement,
+                Self::Installing | Self::StartingGuest | Self::Denied | Self::StaleCatalog | Self::Failed)
+                | (Self::Installing, Self::StartingGuest | Self::Denied | Self::StaleCatalog | Self::Failed)
+                | (Self::StartingGuest, Self::Installing | Self::StartingApp | Self::Unavailable | Self::Failed)
+                | (Self::StartingApp, Self::Connected | Self::Unavailable | Self::Failed)
+                | (Self::Connected, Self::Paused | Self::Reconnecting | Self::Unavailable | Self::Failed)
+                | (Self::Paused, Self::StartingGuest | Self::Reconnecting | Self::Connected | Self::Failed)
+                | (Self::Reconnecting, Self::StartingGuest | Self::StartingApp | Self::Connected | Self::Unavailable | Self::Failed)
+                | (Self::Unavailable, Self::WaitingForPlacement | Self::Installing | Self::StartingGuest | Self::Failed)
+                | (Self::Denied | Self::StaleCatalog, Self::WaitingForPlacement | Self::Installing)
+                | (Self::Failed, Self::WaitingForPlacement | Self::Installing | Self::StartingGuest)
         )
     }
 }
@@ -253,7 +263,7 @@ impl AppVmLaunchRequest {
             ("session_id", self.session_id.as_str()),
         ] {
             if value.trim().is_empty()
-                || value.chars().any(|c| c.is_control())
+                || value.chars().any(char::is_control)
                 || value.contains('/')
                 || value.contains('\\')
             {
@@ -475,6 +485,7 @@ pub enum SessionRequest {
     },
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_generation(generation: &u64) -> bool {
     *generation == 0
 }
