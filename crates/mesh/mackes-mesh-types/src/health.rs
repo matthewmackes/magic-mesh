@@ -656,24 +656,27 @@ fn availability_transition_allowed(
         return previous != NodeAvailabilityState::Returned;
     }
     match (previous, current) {
-        (NodeAvailabilityState::Awake, NodeAvailabilityState::Sleeping)
-        | (NodeAvailabilityState::Awake, NodeAvailabilityState::ShuttingDown)
-        | (NodeAvailabilityState::Awake, NodeAvailabilityState::ScheduledReboot)
-        | (NodeAvailabilityState::Awake, NodeAvailabilityState::Maintenance)
-        | (NodeAvailabilityState::Awake, NodeAvailabilityState::AdapterMigration)
-        | (NodeAvailabilityState::ShuttingDown, NodeAvailabilityState::ShutDown)
-        | (NodeAvailabilityState::ShuttingDown, NodeAvailabilityState::Rebooting)
-        | (NodeAvailabilityState::ShuttingDown, NodeAvailabilityState::Returned)
-        | (NodeAvailabilityState::Sleeping, NodeAvailabilityState::Returned)
+        (NodeAvailabilityState::Awake,
+            NodeAvailabilityState::Sleeping
+                | NodeAvailabilityState::ShuttingDown
+                | NodeAvailabilityState::ScheduledReboot
+                | NodeAvailabilityState::Maintenance
+                | NodeAvailabilityState::AdapterMigration)
+        | (NodeAvailabilityState::ShuttingDown | NodeAvailabilityState::ScheduledReboot,
+            NodeAvailabilityState::ShutDown)
+        | (NodeAvailabilityState::ShuttingDown
+            | NodeAvailabilityState::ShutDown
+            | NodeAvailabilityState::ScheduledReboot,
+            NodeAvailabilityState::Rebooting)
+        | (NodeAvailabilityState::ShuttingDown
+            | NodeAvailabilityState::Sleeping
+            | NodeAvailabilityState::ShutDown
+            | NodeAvailabilityState::ScheduledReboot
+            | NodeAvailabilityState::Rebooting
+            | NodeAvailabilityState::Maintenance
+            | NodeAvailabilityState::AdapterMigration,
+            NodeAvailabilityState::Returned)
         | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::ScheduledReboot)
-        | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::Rebooting)
-        | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::Returned)
-        | (NodeAvailabilityState::ScheduledReboot, NodeAvailabilityState::Rebooting)
-        | (NodeAvailabilityState::ScheduledReboot, NodeAvailabilityState::ShutDown)
-        | (NodeAvailabilityState::ScheduledReboot, NodeAvailabilityState::Returned)
-        | (NodeAvailabilityState::Rebooting, NodeAvailabilityState::Returned)
-        | (NodeAvailabilityState::Maintenance, NodeAvailabilityState::Returned)
-        | (NodeAvailabilityState::AdapterMigration, NodeAvailabilityState::Returned)
         | (NodeAvailabilityState::Returned, NodeAvailabilityState::Awake) => true,
         _ => false,
     }

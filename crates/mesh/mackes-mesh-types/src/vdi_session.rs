@@ -180,27 +180,16 @@ impl AppVmLifecycleState {
         }
         matches!(
             (self, next),
-            (
-                WaitingForPlacement,
-                Installing | StartingGuest | Denied | StaleCatalog | Failed
-            ) | (Installing, StartingGuest | Denied | StaleCatalog | Failed)
-                | (
-                    StartingGuest,
-                    Installing | StartingApp | Unavailable | Failed
-                )
+            (WaitingForPlacement,
+                Installing | StartingGuest | Denied | StaleCatalog | Failed)
+                | (Installing, StartingGuest | Denied | StaleCatalog | Failed)
+                | (StartingGuest, Installing | StartingApp | Unavailable | Failed)
                 | (StartingApp, Connected | Unavailable | Failed)
                 | (Connected, Paused | Reconnecting | Unavailable | Failed)
                 | (Paused, StartingGuest | Reconnecting | Connected | Failed)
-                | (
-                    Reconnecting,
-                    StartingGuest | StartingApp | Connected | Unavailable | Failed
-                )
-                | (
-                    Unavailable,
-                    WaitingForPlacement | Installing | StartingGuest | Failed
-                )
-                | (Denied, WaitingForPlacement | Installing)
-                | (StaleCatalog, WaitingForPlacement | Installing)
+                | (Reconnecting, StartingGuest | StartingApp | Connected | Unavailable | Failed)
+                | (Unavailable, WaitingForPlacement | Installing | StartingGuest | Failed)
+                | (Denied | StaleCatalog, WaitingForPlacement | Installing)
                 | (Failed, WaitingForPlacement | Installing | StartingGuest)
         )
     }

@@ -401,7 +401,7 @@ fn read_bounded_inventory_json(path: &Path) -> Option<String> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        options.custom_flags(0o400_000 | 0o4000 | 0o2_000_000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 

@@ -1568,6 +1568,7 @@ impl VdiClipboardMessageV2 {
 
     /// Admit this message only for an exact live lease and strictly newer
     /// payload-free receipt.
+    #[allow(clippy::suspicious_operation_groupings)]
     pub fn admit(
         &self,
         lease: &VdiClipboardLeaseV2,
