@@ -293,7 +293,7 @@ pub fn app_vm_session_request(req: &LaunchRequest) -> Option<SessionRequest> {
     let catalog_revision = req.catalog_revision.clone()?;
     let guest_profile = req.guest_profile.clone()?;
     let client_peer = req.client_peer.clone()?;
-    AppVmLaunchRequest::new(
+    let launch = AppVmLaunchRequest::new(
         req.app_id.clone(),
         catalog_revision.clone(),
         guest_profile.clone(),
@@ -302,6 +302,10 @@ pub fn app_vm_session_request(req: &LaunchRequest) -> Option<SessionRequest> {
         req.resume,
     )
     .ok()?;
+    // The wire constructor only checks shape.  This boundary is where an
+    // authorized launch becomes a lifecycle mutation, so enforce the stronger
+    // App-VM admission policy before projecting it onto the session bus.
+    launch.validate_admitted().ok()?;
     Some(SessionRequest::OpenApp {
         id: session_id,
         serving_peer: req.node.clone(),
@@ -1552,6 +1556,18 @@ mod tests {
         )
         .expect("source and mode still parse");
         assert!(app_vm_session_request(&req).is_none());
+    }
+
+    #[test]
+    fn guest_launch_rejects_capabilities_outside_admitted_policy() {
+        let req = parse_launch_request(
+            r#"{"node":"node-a","app_id":"org.example.Guest","source":"flatpak","mode":"guest-app-vm","session_id":"sess-1","vm_id":"vm-1","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":["host-files"],"client_peer":"peer:seat"}"#,
+        )
+        .expect("guest launch parses before policy admission");
+        assert!(
+            app_vm_session_request(&req).is_none(),
+            "unsupported capabilities must not become an OpenApp lifecycle mutation"
+        );
     }
 
     #[test]
