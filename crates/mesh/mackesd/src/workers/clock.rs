@@ -1240,11 +1240,14 @@ impl ClockWorker {
                 let Some(peer) = peer_snapshots.get(target) else {
                     continue;
                 };
-                let delivered = peer.stopwatches.iter().any(|candidate| {
-                    candidate.stopwatch_id == stopwatch.stopwatch_id
-                        && candidate.origin_node_id == stopwatch.origin_node_id
-                        && candidate.revision >= stopwatch.revision
-                });
+                // Revision alone is not proof that the peer retained the
+                // origin's stopwatch payload. A torn or replayed delivery can
+                // leave a newer conflicting generation that would otherwise
+                // suppress every future repair command.
+                let delivered = peer
+                    .stopwatches
+                    .iter()
+                    .any(|candidate| peer_stopwatch_is_converged(candidate, stopwatch));
                 if !delivered {
                     if remaining_commands == 0 {
                         return Ok(());
@@ -1535,6 +1538,13 @@ fn due_now_or_before(schedule: &ClockScheduleV1, now_ms: i64) -> anyhow::Result<
 fn peer_schedule_is_converged(
     candidate: &ClockScheduleV1,
     desired: &ClockScheduleV1,
+) -> bool {
+    candidate == desired
+}
+
+fn peer_stopwatch_is_converged(
+    candidate: &ClockStopwatchV1,
+    desired: &ClockStopwatchV1,
 ) -> bool {
     candidate == desired
 }
@@ -4996,6 +5006,59 @@ mod tests {
             &newer_revision_conflict,
             &desired
         ));
+    }
+
+    #[test]
+    fn peer_stopwatch_convergence_repairs_newer_conflicting_payload() {
+        let mut fixture = Fixture::new();
+        fixture.worker.approved_peer_ids.insert("seat-2".into());
+        fixture.worker.tick_once().unwrap();
+        let desired = ClockStopwatchV1 {
+            stopwatch_id: "mesh-stopwatch".into(),
+            origin_node_id: "seat-1".into(),
+            mirror_target_ids: vec!["seat-2".into()],
+            revision: 4,
+            phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
+            started_wall_utc_ms: None,
+            started_monotonic_ms: None,
+            accumulated_elapsed_ms: 9_000,
+            laps: Vec::new(),
+        };
+
+        fixture
+            .worker
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .stopwatches
+            .push(desired.clone());
+        let mut peer = fixture.worker.initial_snapshot(NOW);
+        let mut conflict = desired.clone();
+        conflict.revision += 1;
+        conflict.accumulated_elapsed_ms += 1;
+        peer.stopwatches.push(conflict);
+
+        let transaction = fixture.worker.open_bus_transaction().unwrap();
+        fixture
+            .worker
+            .publish_peer_convergence(
+                &transaction,
+                NOW,
+                &BTreeMap::from([(String::from("seat-2"), peer)]),
+            )
+            .unwrap();
+
+        let messages = transaction
+            .persist
+            .list_since(&clock_command_topic("seat-2").unwrap(), None)
+            .unwrap();
+        assert_eq!(messages.len(), 1, "conflicting peer payload needs repair");
+        let command: ClockCommandV1 = serde_json::from_str(messages[0].body.as_deref().unwrap())
+            .unwrap();
+        let ClockCommandKindV1::UpsertStopwatch { stopwatch } = command.body else {
+            panic!("peer repair must carry the stopwatch payload");
+        };
+        assert_eq!(stopwatch, desired);
     }
 
     #[test]
