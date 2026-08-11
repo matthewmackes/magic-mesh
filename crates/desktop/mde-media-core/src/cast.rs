@@ -648,6 +648,11 @@ impl NetworkCaster {
         })?;
         let control_ep = parse_endpoint(&control)
             .ok_or_else(|| CastError::Invalid(format!("bad control URL: {control}")))?;
+        if !same_endpoint_host(&device, &control_ep) {
+            return Err(CastError::Rejected(
+                "AVTransport control URL changes the discovered renderer host".to_owned(),
+            ));
+        }
 
         // SetAVTransportURI, then Play — the two SOAP actions that start a DLNA cast.
         let set = http_request(
@@ -842,6 +847,18 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
             path.to_owned()
         },
     })
+}
+
+/// Keep a renderer's follow-up control request on the host that answered its
+/// device description.  An absolute `controlURL` is renderer-provided input;
+/// following it to another host would turn discovery into a confused-deputy
+/// network pivot.  Ports may differ because some UPnP devices publish their
+/// description and SOAP service on separate listeners.
+fn same_endpoint_host(left: &Endpoint, right: &Endpoint) -> bool {
+    match (left.host.parse::<IpAddr>(), right.host.parse::<IpAddr>()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.host.eq_ignore_ascii_case(&right.host),
+    }
 }
 
 /// Whether a media field can safely be transported in a bounded SOAP request.
@@ -1408,6 +1425,21 @@ id=bad\nhost=192.0.2.22\nport=not-a-port\n";
         );
         // No AVTransport service → no control URL.
         assert_eq!(dlna_control_url("<root/>", &base), None);
+    }
+
+    #[test]
+    fn dlna_control_authority_cannot_pivot_to_another_renderer_host() {
+        let discovered = parse_endpoint("http://renderer.local:1400/desc.xml").unwrap();
+        let same_host = parse_endpoint("http://RENDERER.local:1600/upnp/control").unwrap();
+        let other_host = parse_endpoint("http://unexpected.local:1600/upnp/control").unwrap();
+        assert!(same_endpoint_host(&discovered, &same_host));
+        assert!(!same_endpoint_host(&discovered, &other_host));
+
+        let discovered_ip = parse_endpoint("http://[2001:db8::10]:1400/desc.xml").unwrap();
+        let same_ip = parse_endpoint("http://[2001:0db8:0:0:0:0:0:10]:1600/control").unwrap();
+        let other_ip = parse_endpoint("http://[2001:db8::11]:1600/control").unwrap();
+        assert!(same_endpoint_host(&discovered_ip, &same_ip));
+        assert!(!same_endpoint_host(&discovered_ip, &other_ip));
     }
 
     // ── SOAP + HTTP builders ────────────────────────────────────────────────────
