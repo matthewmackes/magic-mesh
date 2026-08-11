@@ -94,6 +94,11 @@ impl AirspaceContact {
     ///
     /// Invalid numeric values are rejected rather than clamped into a plausible
     /// looking contact. Text is control-character filtered and UTF-8 bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier is empty, the signal is outside
+    /// the accepted range, or the bearing is non-finite or out of range.
     pub fn bounded(self) -> Result<Self, &'static str> {
         let id = bounded_text(&self.id);
         if id.is_empty() {
@@ -131,7 +136,7 @@ pub struct AirspaceSurvey {
     /// Source observation time, when the scanner supplies one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanned_at_ms: Option<i64>,
-    /// Raw contacts. The daemon applies MAX_SURVEY_CONTACTS and validation.
+    /// Raw contacts. The daemon applies `MAX_SURVEY_CONTACTS` and validation.
     #[serde(default)]
     pub contacts: Vec<AirspaceContact>,
     /// Honest source/parser notes supplied with the survey.
@@ -207,7 +212,7 @@ impl AirspaceSnapshot {
             );
             push_gap(
                 &mut gaps,
-                format!("survey contact count capped at {MAX_SURVEY_CONTACTS}; excess omitted"),
+                &format!("survey contact count capped at {MAX_SURVEY_CONTACTS}; excess omitted"),
             );
         }
 
@@ -217,7 +222,7 @@ impl AirspaceSnapshot {
                 Ok(contact) => contact,
                 Err(reason) => {
                     omitted = omitted.saturating_add(1);
-                    push_gap(&mut gaps, format!("contact omitted: {reason}"));
+                    push_gap(&mut gaps, &format!("contact omitted: {reason}"));
                     continue;
                 }
             };
@@ -230,7 +235,7 @@ impl AirspaceSnapshot {
         if omitted > 0 && !gaps.iter().any(|gap| gap.contains("retention")) {
             push_gap(
                 &mut gaps,
-                format!("contact retention capped at {MAX_RETAINED_CONTACTS}"),
+                &format!("contact retention capped at {MAX_RETAINED_CONTACTS}"),
             );
         }
 
@@ -246,6 +251,10 @@ impl AirspaceSnapshot {
     }
 
     /// Return the wire body's UTF-8 length, or an encoding error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON serialization error if the snapshot cannot be encoded.
     pub fn encoded_len(&self) -> Result<usize, serde_json::Error> {
         serde_json::to_vec(self).map(|body| body.len())
     }
@@ -271,9 +280,9 @@ fn bounded_gaps(gaps: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn push_gap(gaps: &mut Vec<String>, gap: String) {
+fn push_gap(gaps: &mut Vec<String>, gap: &str) {
     if gaps.len() < MAX_GAPS {
-        let gap = bounded_text(&gap);
+        let gap = bounded_text(gap);
         if !gap.is_empty() {
             gaps.push(gap);
         }

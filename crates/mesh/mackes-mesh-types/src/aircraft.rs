@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Topic prefix for per-node aircraft snapshots.
 pub const AIRCRAFT_STATE_PREFIX: &str = "state/overlay/adsb-aircraft/";
-/// Release-audit tag for ODbL data requiring attribution.
+/// Release-audit tag for `ODbL` data requiring attribution.
 pub const LICENSE_TIER: &str = "open-data-attribution";
 /// Attribution shown whenever the aircraft layer is enabled.
 pub const ATTRIBUTION: &str = "adsb.lol · ODbL";

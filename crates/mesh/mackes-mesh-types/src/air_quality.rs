@@ -7,20 +7,20 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Per-node AirNow AQI snapshot topic prefix.
+/// Per-node `AirNow` AQI snapshot topic prefix.
 pub const AIR_QUALITY_STATE_PREFIX: &str = "state/overlay/airnow-aqi/";
-/// AirNow requires a free government-issued API key.
+/// `AirNow` requires a free government-issued API key.
 pub const LICENSE_TIER: &str = "free-key-gov";
 /// Attribution and preliminary-data warning shown with the active layer.
 pub const ATTRIBUTION: &str = "US EPA AirNow (preliminary)";
 
-/// Retained AirNow AQI topic for one workstation adapter.
+/// Retained `AirNow` AQI topic for one workstation adapter.
 #[must_use]
 pub fn air_quality_state_topic(node: &str) -> String {
     format!("{AIR_QUALITY_STATE_PREFIX}{node}")
 }
 
-/// Whether the credential-gated adapter can contact AirNow.
+/// Whether the credential-gated adapter can contact `AirNow`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AirNowAvailability {
@@ -32,12 +32,12 @@ pub enum AirNowAvailability {
     SecretStoreError,
 }
 
-/// One normalized hourly AQI observation at an AirNow monitoring site.
+/// One normalized hourly AQI observation at an `AirNow` monitoring site.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AirQualityStation {
     /// Stable AQS site identifier, or a bounded coordinate-derived fallback.
     pub id: String,
-    /// Site name when AirNow's verbose response supplies one.
+    /// Site name when `AirNow`'s verbose response supplies one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Normalized pollutant (`PM2.5` or `OZONE`).
@@ -50,18 +50,18 @@ pub struct AirQualityStation {
     pub longitude: f64,
     /// Great-circle distance from the vehicle query point.
     pub distance_km: f32,
-    /// AirNow observation hour in Unix milliseconds.
+    /// `AirNow` observation hour in Unix milliseconds.
     pub observed_at_ms: i64,
 }
 
-/// Complete vehicle-centred AirNow AQI state.
+/// Complete vehicle-centred `AirNow` AQI state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AirQualitySnapshot {
     /// Adapter node.
     pub host: String,
     /// Time this status/snapshot was published, Unix milliseconds.
     pub published_at_ms: i64,
-    /// Last successful AirNow fetch, absent when no keyed request succeeded.
+    /// Last successful `AirNow` fetch, absent when no keyed request succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetched_at_ms: Option<i64>,
     /// Vehicle latitude used for the bounding box, when a valid fix existed.

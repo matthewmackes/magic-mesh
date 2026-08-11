@@ -232,6 +232,11 @@ impl From<serde_json::Error> for TagStoreError {
 impl TagStore {
     /// Load the tag store from `<XDG_DATA_HOME>/mde/tags.json`.
     /// Missing file returns an empty store (first-run path).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the default path cannot be resolved or the store
+    /// cannot be read or decoded.
     pub fn load_default() -> Result<Self, TagStoreError> {
         let path = default_tags_path()?;
         Self::load_from(&path)
@@ -240,6 +245,10 @@ impl TagStore {
     /// Load the tag store from an explicit path. Missing file is
     /// NOT an error — returns an empty store so the first-run
     /// path is the same as load-then-add.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or its JSON is invalid.
     pub fn load_from(path: &Path) -> Result<Self, TagStoreError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -250,6 +259,11 @@ impl TagStore {
     }
 
     /// Save the tag store to `<XDG_DATA_HOME>/mde/tags.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the default path cannot be resolved or the store
+    /// cannot be serialized or written.
     pub fn save_default(&self) -> Result<(), TagStoreError> {
         let path = default_tags_path()?;
         self.save_to(&path)
@@ -258,6 +272,11 @@ impl TagStore {
     /// Save to an explicit path. Atomic via temp + rename so a
     /// crash mid-write leaves the existing file intact. Creates
     /// the parent directory if missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be serialized or the temporary
+    /// file cannot be created, written, or renamed.
     pub fn save_to(&self, path: &Path) -> Result<(), TagStoreError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -274,6 +293,10 @@ impl TagStore {
     /// name already exists. The name is trimmed before insertion;
     /// after trimming, an empty name is rejected as
     /// `DuplicateName("")` to keep the error surface simple.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DuplicateName` if the trimmed name is empty or already exists.
     pub fn add(&mut self, mut tag: Tag) -> Result<(), TagStoreError> {
         tag.name = tag.name.trim().to_string();
         if tag.name.is_empty() {
@@ -309,6 +332,10 @@ impl TagStore {
 /// Resolve `<XDG_DATA_HOME>/mde/tags.json`. Returns
 /// `TagStoreError::PathResolution` only if BOTH `$XDG_DATA_HOME`
 /// and `$HOME` are unset (the `dirs` crate's fallback chain).
+///
+/// # Errors
+///
+/// Returns `PathResolution` when neither environment provides a data directory.
 pub fn default_tags_path() -> Result<PathBuf, TagStoreError> {
     let data_home = dirs::data_dir().ok_or(TagStoreError::PathResolution)?;
     Ok(data_home.join("mde").join("tags.json"))
