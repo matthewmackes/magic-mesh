@@ -148,6 +148,13 @@ verify_desktop_chain() {
         || fail "runtime does not pin executable lookup to the immutable guest image"
     has_active_line "$runtime" 'export PATH' \
         || fail "runtime does not export its image-owned executable lookup path"
+    has_active_line "$runtime" 'unset MCNF_BROWSER_VM_INPUT_ROOT' \
+        || fail "runtime accepts an xrdp-selected identity directory"
+    has_active_line "$runtime" 'input_root=/etc/mcnf-browser-vm' \
+        || fail "runtime does not use the canonical guest identity directory"
+    if active_code_contains "$runtime" 'input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-'; then
+        fail "runtime still permits an environment-directed identity directory"
+    fi
     has_active_line "$runtime" \
         'for candidate in /usr/bin/chromium /usr/bin/chromium-browser; do' \
         || fail "runtime does not select Chromium from fixed image-owned entrypoints"

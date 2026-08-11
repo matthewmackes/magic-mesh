@@ -51,9 +51,13 @@ if [ "$runtime_phase" = bootstrap ]; then
     log 'prior session evidence invalidated before runtime admission'
 fi
 
+# The validator retains an explicit override for disposable contract fixtures,
+# but an authenticated xrdp environment must not redirect the production
+# runtime to a caller-selected identity directory.
+unset MCNF_BROWSER_VM_INPUT_ROOT
+input_root=/etc/mcnf-browser-vm
 /usr/local/libexec/mcnf-browser-vm-validate
 log 'runtime inputs validated'
-input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mcnf-browser-vm}
 transport=$(cat "$input_root/transport")
 transport_health=$(cat "$input_root/transport-health")
 source_commit=$(cat /usr/share/mcnf/browser-vm/source-commit)
