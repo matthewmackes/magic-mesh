@@ -39,7 +39,7 @@ macro_rules! define_id {
         pub struct $name(Uuid);
 
         impl $name {
-            /// Mint a fresh, random (UUIDv4) id. Two calls never collide.
+            /// Mint a fresh, random (`UUIDv4`) id. Two calls never collide.
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::new_v4())

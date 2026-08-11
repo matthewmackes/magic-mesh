@@ -116,7 +116,7 @@ impl TryFrom<&TransferJobV2> for TransferJobView {
     }
 }
 
-fn legacy_method(kind: TransferKind) -> Result<TransferMethod, TransferLedgerAdmissionError> {
+const fn legacy_method(kind: TransferKind) -> Result<TransferMethod, TransferLedgerAdmissionError> {
     match kind {
         TransferKind::Mesh => Ok(TransferMethod::Node),
         TransferKind::Rsync => Ok(TransferMethod::Rsync),
@@ -127,7 +127,7 @@ fn legacy_method(kind: TransferKind) -> Result<TransferMethod, TransferLedgerAdm
     }
 }
 
-fn legacy_direction(
+const fn legacy_direction(
     kind: TransferKind,
     operation: &TransferOperation,
 ) -> Result<TransferDirection, TransferLedgerAdmissionError> {
@@ -136,8 +136,7 @@ fn legacy_direction(
             TransferKind::Mesh | TransferKind::Rsync | TransferKind::Sftp,
             TransferOperation::Copy { direction } | TransferOperation::Sync { direction, .. },
         ) => Ok(*direction),
-        (TransferKind::Sftp, TransferOperation::Download)
-        | (TransferKind::Http, TransferOperation::Download)
+        (TransferKind::Sftp | TransferKind::Http, TransferOperation::Download)
         | (TransferKind::Scrape, TransferOperation::Scrape { .. }) => {
             Ok(TransferDirection::Inbound)
         }
@@ -146,7 +145,7 @@ fn legacy_direction(
     }
 }
 
-fn file_on_direction_side(job: &TransferJobV2, direction: TransferDirection) -> Option<FileRefId> {
+const fn file_on_direction_side(job: &TransferJobV2, direction: TransferDirection) -> Option<FileRefId> {
     let location = match direction {
         TransferDirection::Inbound => &job.endpoint.destination,
         TransferDirection::Outbound => &job.endpoint.source,

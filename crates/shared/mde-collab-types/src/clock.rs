@@ -99,7 +99,7 @@ impl ActorClock {
     /// and reset the counter; otherwise hold the (non-decreasing) wall time and
     /// bump the counter.
     #[must_use]
-    pub fn tick(self, now_unix_ms: u64) -> Self {
+    pub const fn tick(self, now_unix_ms: u64) -> Self {
         if now_unix_ms > self.wall_ms {
             Self {
                 wall_ms: now_unix_ms,

@@ -98,6 +98,11 @@ impl TaskAction {
     ///
     /// Title-bearing actions trim surrounding whitespace and reject blank or
     /// oversized values. Non-title actions cannot fail validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a title-bearing action has an empty or oversized
+    /// title after trimming.
     pub fn into_command(self) -> Result<CollabCommand, TaskActionValidationError> {
         match self {
             Self::Create {
@@ -106,13 +111,13 @@ impl TaskAction {
                 source,
             } => Ok(CollabCommand::CreateTask {
                 space,
-                title: normalize_task_title(title)?,
+                title: normalize_task_title(&title)?,
                 source,
             }),
             Self::Update { space, task, title } => Ok(CollabCommand::UpdateTask {
                 space,
                 task,
-                title: normalize_task_title(title)?,
+                title: normalize_task_title(&title)?,
             }),
             Self::SetChecked {
                 space,
@@ -129,7 +134,7 @@ impl TaskAction {
     }
 }
 
-fn normalize_task_title(title: String) -> Result<String, TaskActionValidationError> {
+fn normalize_task_title(title: &str) -> Result<String, TaskActionValidationError> {
     let title = title.trim();
     if title.is_empty() {
         return Err(TaskActionValidationError::EmptyTitle);

@@ -55,7 +55,7 @@ pub mod projection {
     pub const CALL_MEDIA_READINESS: &str = "call-media-readiness";
     /// Local media adapter live-proof results for active calls.
     pub const CALL_MEDIA_VERIFICATION: &str = "call-media-verification";
-    /// DigitalOcean AI suggestion request state.
+    /// `DigitalOcean` AI suggestion request state.
     pub const AI_REQUESTS: &str = "ai-requests";
     /// The launcher/dock badge rollup.
     pub const BADGES: &str = "badges";

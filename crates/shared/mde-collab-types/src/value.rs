@@ -2,6 +2,7 @@
 //! from. Pure data — no logic beyond a SHA-256 constructor for content refs.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,7 +71,6 @@ impl PayloadRef {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
-    use std::fmt::Write;
     for b in digest {
         let _ = write!(out, "{b:02x}");
     }
@@ -157,9 +157,10 @@ pub struct AlertAction {
     pub kind: AlertActionKind,
 }
 
-/// The substance of an alert, folded from any truthful Bus alert lane (the
-/// `fold_alert` successor). Emitters keep publishing their events unchanged; the
-/// collab worker adapts them into this shape at ingest.
+/// The substance of an alert, folded from any truthful Bus alert lane.
+///
+/// The `fold_alert` successor keeps publishing events unchanged; the collab
+/// worker adapts them into this shape at ingest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertPayload {
     /// Severity band.
@@ -421,10 +422,11 @@ pub enum ReviewVerdict {
     Commented,
 }
 
-/// A change to a collaboratively-edited document. The actual edit bytes (a CRDT
-/// update / yrs delta) are content-addressed via [`PayloadRef`], so a large
-/// change never bloats the signed envelope; the base clock records what the
-/// change was applied against.
+/// A change to a collaboratively-edited document.
+///
+/// The actual edit bytes (a CRDT update / yrs delta) are content-addressed via
+/// [`PayloadRef`], so a large change never bloats the signed envelope; the base
+/// clock records what the change was applied against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentChange {
     /// The content-addressed edit payload (the CRDT update blob).

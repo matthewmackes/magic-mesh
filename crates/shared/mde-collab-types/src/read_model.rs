@@ -53,7 +53,7 @@ pub enum CollabReadModel {
     CallMediaReadiness(CallMediaReadiness),
     /// Local media-adapter live-proof results for active calls.
     CallMediaVerification(CallMediaVerification),
-    /// DigitalOcean AI suggestion request state.
+    /// `DigitalOcean` AI suggestion request state.
     AiSuggestionRequests(AiSuggestionRequests),
     /// External Discord bridge worker status.
     DiscordBridgeBoard(DiscordBridgeBoard),
@@ -480,7 +480,7 @@ pub enum CallMediaRequirement {
 pub enum CallMediaAdapter {
     /// Mesh peer-to-peer WebRTC.
     WebRtcP2p,
-    /// Mesh-reachable LiveKit SFU/SIP bridge.
+    /// Mesh-reachable `LiveKit` SFU/SIP bridge.
     LiveKitSfu,
     /// SIP/PSTN gateway path.
     SipGateway,
@@ -557,7 +557,7 @@ pub struct CallMediaFrameEvidence {
     pub data_messages: u64,
 }
 
-/// The bounded DigitalOcean AI suggestion request board.
+/// The bounded `DigitalOcean` AI suggestion request board.
 ///
 /// This is worker-owned sidecar state, not signed collaboration history: it lets
 /// surfaces render honest pending/canceled/failed provider state while the
@@ -569,7 +569,7 @@ pub struct AiSuggestionRequests {
     pub requests: Vec<AiSuggestionRequestView>,
 }
 
-/// One DigitalOcean AI request row.
+/// One `DigitalOcean` AI request row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiSuggestionRequestView {
     /// Caller-minted opaque request id.
@@ -597,7 +597,7 @@ pub struct AiSuggestionRequestView {
     pub updated_unix_ms: i64,
 }
 
-/// Sidecar state for a DigitalOcean AI suggestion request.
+/// Sidecar state for a `DigitalOcean` AI suggestion request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiSuggestionRequestStatus {

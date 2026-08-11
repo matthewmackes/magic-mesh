@@ -6,7 +6,7 @@
 //! import these types so a change to the wire shape is a change *here*, in one
 //! reviewed place. It is deliberately minimal in behaviour — **pure types +
 //! serialization + Ed25519 signing, with no business logic and no I/O**. There
-//! is no Bus, no SQLite, no wall-clock: every timestamp and logical-clock value
+//! is no Bus, no `SQLite`, no wall-clock: every timestamp and logical-clock value
 //! is injected by the caller, so the same event log replays deterministically.
 //!
 //! # What lives here

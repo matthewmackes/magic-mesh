@@ -84,6 +84,11 @@ macro_rules! bounded_identity {
 
         impl $name {
             /// Validate and construct a safe opaque identity token.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when the token is empty, oversized, or contains
+            /// a character outside the bounded identity alphabet.
             pub fn new(
                 value: impl Into<String>,
             ) -> Result<Self, ClipboardIdentityValidationError> {
@@ -321,6 +326,7 @@ pub enum ClipboardDisclosureV2 {
 }
 
 impl ClipboardDisclosureV2 {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     const fn is_shareable(&self) -> bool {
         matches!(self, Self::Shareable)
     }
@@ -431,6 +437,11 @@ pub struct ClipboardMimeOfferV2 {
 
 impl ClipboardMimeOfferV2 {
     /// Construct and validate an inline text representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the text or resulting offer violates validation
+    /// bounds.
     pub fn inline_text(
         mime: ClipboardMimeKind,
         text: impl Into<String>,
@@ -450,6 +461,11 @@ impl ClipboardMimeOfferV2 {
     }
 
     /// Construct and validate a Files-backed representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the digest, size, or resulting offer violates
+    /// validation bounds.
     pub fn files_reference(
         mime: ClipboardMimeKind,
         file_ref: FileRefId,
@@ -498,6 +514,10 @@ impl ClipboardMimeOfferV2 {
     }
 
     /// Validate representation bounds, digest metadata, and payload shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when representation metadata or payload is invalid.
     pub fn validate(&self) -> Result<(), ClipboardEnvelopeV2ValidationError> {
         if self.disclosure == ClipboardDisclosureV2::Secret {
             return Err(ClipboardEnvelopeV2ValidationError::Denied {
@@ -895,7 +915,7 @@ pub struct ClipboardSignedAttributionV2 {
 }
 
 impl ClipboardSignedAttributionV2 {
-    fn unsigned(signer: ClipboardNodeId) -> Self {
+    const fn unsigned(signer: ClipboardNodeId) -> Self {
         Self {
             signer,
             pubkey_hex: String::new(),
@@ -960,6 +980,11 @@ impl<'de> Deserialize<'de> for ClipboardEnvelopeV2 {
 
 impl ClipboardEnvelopeV2 {
     /// Construct an unsigned envelope. Call [`Self::signed`] before transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the envelope fails intrinsic validation.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         clip_id: ClipboardClipId,
         source: ClipboardSourceV2,
@@ -1045,6 +1070,10 @@ impl ClipboardEnvelopeV2 {
     }
 
     /// Verify the detached signature and all intrinsic contract invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any envelope field or its signature is invalid.
     pub fn validate(&self) -> Result<(), ClipboardEnvelopeV2ValidationError> {
         self.validate_fields(true)
     }
@@ -1054,6 +1083,11 @@ impl ClipboardEnvelopeV2 {
     /// `last_sequence` is the last accepted sequence for this source/session
     /// ledger. The caller must scope that ledger by the typed identities before
     /// invoking this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when intrinsic validation, expiry, or replay ordering
+    /// fails.
     pub fn validate_at(
         &self,
         now_unix_ms: u64,
@@ -1084,6 +1118,10 @@ impl ClipboardEnvelopeV2 {
     }
 
     /// Admit and return the envelope at an injected time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation errors from [`Self::validate_at`].
     pub fn admitted_at(
         self,
         now_unix_ms: u64,
@@ -1094,11 +1132,21 @@ impl ClipboardEnvelopeV2 {
     }
 
     /// Decode and admit an intrinsically valid JSON envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when JSON is malformed, duplicated, oversized, or fails
+    /// envelope validation.
     pub fn from_json(body: &str) -> Result<Self, ClipboardEnvelopeV2DecodeError> {
         Self::from_json_bytes(body.as_bytes())
     }
 
     /// Decode and admit a bounded JSON body before it reaches a worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when JSON is malformed, duplicated, oversized, or fails
+    /// envelope validation.
     pub fn from_json_bytes(body: &[u8]) -> Result<Self, ClipboardEnvelopeV2DecodeError> {
         if body.len() > MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES {
             return Err(ClipboardEnvelopeV2DecodeError::BodyTooLarge {

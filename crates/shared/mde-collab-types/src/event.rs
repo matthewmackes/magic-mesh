@@ -197,7 +197,7 @@ pub enum CollabEventKind {
         action_id: String,
         /// Whether a destructive action was armed.
         armed: bool,
-        /// The outcome, once known (fired/refused_unarmed/…).
+        /// The outcome, once known (`fired/refused_unarmed`/…).
         #[serde(default)]
         outcome: Option<String>,
     },
@@ -326,7 +326,7 @@ pub enum CollabEventKind {
     CallEnded {
         /// The call id.
         call: CallId,
-        /// A short reason (hung_up/declined/failed/…).
+        /// A short reason (`hung_up/declined/failed`/…).
         #[serde(default)]
         reason: Option<String>,
     },

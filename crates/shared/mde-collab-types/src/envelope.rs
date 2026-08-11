@@ -77,7 +77,7 @@ impl CollabEventEnvelope {
     /// Assemble a new, **unsigned** envelope at [`SCHEMA_VERSION`]. Sign it with
     /// [`sign`](Self::sign) before it leaves the node.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         event_id: EventId,
         space_id: SpaceId,
         actor: ActorId,
@@ -112,7 +112,7 @@ impl CollabEventEnvelope {
     /// ordering component; the event id makes concurrent equal-clock writes
     /// resolve identically on every node, regardless of arrival order.
     #[must_use]
-    pub fn lww_key(&self) -> (ActorClock, EventId) {
+    pub const fn lww_key(&self) -> (ActorClock, EventId) {
         (self.clock, self.event_id)
     }
 
