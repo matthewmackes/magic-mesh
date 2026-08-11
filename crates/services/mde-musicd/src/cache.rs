@@ -244,7 +244,7 @@ pub fn read_cached_track_bytes(dir: &Path, song_id: &str, now_ms: u64) -> Option
     let entry = index.entries.get(song_id)?.clone();
     let path = track_path(dir, song_id, &entry.suffix);
     let bytes = std::fs::read(path).ok()?;
-    if bytes.is_empty() {
+    if entry.bytes == 0 || u64::try_from(bytes.len()).ok()? != entry.bytes {
         return None;
     }
     index.record_play(song_id, now_ms);
@@ -264,7 +264,7 @@ pub fn cached_track_suffix(dir: &Path, song_id: &str) -> Option<String> {
     }
     let path = track_path(dir, song_id, &entry.suffix);
     let metadata = std::fs::metadata(path).ok()?;
-    (metadata.is_file() && metadata.len() > 0).then(|| entry.suffix.clone())
+    (metadata.is_file() && metadata.len() == entry.bytes).then(|| entry.suffix.clone())
 }
 
 /// Write a fully-fetched finite stream into the recently-played audio cache.
@@ -665,6 +665,42 @@ mod tests {
         );
         std::fs::remove_file(track_path(dir.path(), "song/7", "flac")).unwrap();
         assert_eq!(cached_track_suffix(dir.path(), "song/7"), None);
+    }
+
+    #[test]
+    fn truncated_cached_track_is_not_admitted_as_complete() {
+        let dir = tempdir().unwrap();
+        write_cached_track(
+            dir.path(),
+            "song-truncated",
+            "flac",
+            b"complete-audio",
+            10,
+            false,
+        )
+        .unwrap();
+
+        // Keep the file non-empty: a presence-only check would incorrectly
+        // admit this as an offline playback source.
+        std::fs::write(
+            track_path(dir.path(), "song-truncated", "flac"),
+            b"partial",
+        )
+        .unwrap();
+
+        assert_eq!(cached_track_suffix(dir.path(), "song-truncated"), None);
+        assert_eq!(
+            read_cached_track_bytes(dir.path(), "song-truncated", 99),
+            None
+        );
+        assert_eq!(
+            read_index(dir.path())
+                .entries
+                .get("song-truncated")
+                .map(|entry| entry.last_played_ms),
+            Some(10),
+            "a rejected partial file must not refresh cache recency"
+        );
     }
 
     #[test]
