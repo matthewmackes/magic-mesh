@@ -47,7 +47,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -196,6 +196,8 @@ struct HttpsFallbackSection {
 fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
+    reject_symlinked_policy_parents(path).ok()?;
+
     #[cfg(unix)]
     let file: std::fs::File = {
         use rustix::fs::{Mode, OFlags};
@@ -230,6 +232,41 @@ fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     (bytes.len() <= usize::try_from(max_bytes).ok()?).then_some(bytes)
+}
+
+/// Refuse to resolve the policy through a redirected directory component.
+/// `O_NOFOLLOW` protects only the final file; without this check an otherwise
+/// safe-looking `connect/policy.toml` can still be reached through a
+/// symlinked `connect` (or higher) directory.
+fn reject_symlinked_policy_parents(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTPS fallback policy has no parent directory",
+        )
+    })?;
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing symlinked HTTPS fallback policy parent {}", current.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("HTTPS fallback policy parent is not a directory: {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn build_pinned_client_config(fingerprint: &str) -> Arc<rustls::ClientConfig> {
@@ -625,6 +662,30 @@ mod tests {
         std::fs::write(&policy, vec![b'x'; MAX_FALLBACK_POLICY_BYTES + 1])
             .expect("write oversized policy");
         assert!(FallbackHostConfig::from_policy_file(&policy).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_file_loader_rejects_a_symlinked_parent_without_reading_outside() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let redirected = dir.path().join("connect");
+        let outside_policy = outside.path().join("policy.toml");
+        std::fs::write(
+            &outside_policy,
+            "[https_fallback]\nhost = \"outside.example.com\"\n",
+        )
+        .expect("write outside policy");
+        symlink(outside.path(), &redirected).expect("symlink policy parent");
+
+        let escaped_policy = redirected.join("policy.toml");
+        assert!(
+            FallbackHostConfig::from_policy_file(&escaped_policy).is_none(),
+            "a symlinked policy parent must not activate an outside endpoint"
+        );
+        assert!(outside_policy.exists(), "the outside policy must remain untouched");
     }
 
     #[test]
