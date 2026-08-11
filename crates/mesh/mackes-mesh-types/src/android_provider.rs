@@ -6,6 +6,8 @@
 //! operations. It deliberately has no executable, path, URL, ADB, socket, or
 //! arbitrary intent fields.
 
+#![allow(clippy::missing_errors_doc)]
+
 use serde::{de, Deserialize, Serialize};
 
 /// The only Cuttlefish provider contract schema currently admitted.
@@ -588,28 +590,13 @@ impl CuttlefishGuestReadinessEvidence {
     pub fn validate(&self) -> Result<(), CuttlefishContractError> {
         let valid_pair = matches!(
             (self.boot_state, self.readiness),
-            (
-                CuttlefishGuestBootState::Pending,
-                CuttlefishGuestReadiness::Unknown
-            ) | (
-                CuttlefishGuestBootState::Pending,
-                CuttlefishGuestReadiness::NotReady
-            ) | (
-                CuttlefishGuestBootState::Booting,
-                CuttlefishGuestReadiness::NotReady
-            ) | (
-                CuttlefishGuestBootState::Ready,
-                CuttlefishGuestReadiness::Ready
-            ) | (
-                CuttlefishGuestBootState::Stopped,
-                CuttlefishGuestReadiness::NotReady
-            ) | (
-                CuttlefishGuestBootState::Failed,
-                CuttlefishGuestReadiness::Unavailable
-            ) | (
-                CuttlefishGuestBootState::Unavailable,
-                CuttlefishGuestReadiness::Unavailable
-            )
+            (CuttlefishGuestBootState::Pending,
+CuttlefishGuestReadiness::Unknown | CuttlefishGuestReadiness::NotReady) |
+(CuttlefishGuestBootState::Booting | CuttlefishGuestBootState::Stopped,
+CuttlefishGuestReadiness::NotReady) |
+(CuttlefishGuestBootState::Ready, CuttlefishGuestReadiness::Ready) |
+(CuttlefishGuestBootState::Failed | CuttlefishGuestBootState::Unavailable,
+CuttlefishGuestReadiness::Unavailable)
         );
         if !valid_pair {
             return Err(CuttlefishContractError::InvalidGuestEvidence);
@@ -813,29 +800,15 @@ impl CuttlefishLifecycleOperation {
     pub const fn is_allowed_from(self, state: CuttlefishVmLifecycleState) -> bool {
         matches!(
             (self, state),
-            (Self::Provision, CuttlefishVmLifecycleState::Absent)
-                | (Self::Start, CuttlefishVmLifecycleState::Stopped)
-                | (
-                    Self::Stop,
-                    CuttlefishVmLifecycleState::Starting
-                        | CuttlefishVmLifecycleState::Running
-                        | CuttlefishVmLifecycleState::Rebooting
-                )
-                | (
-                    Self::Reboot,
-                    CuttlefishVmLifecycleState::Starting
-                        | CuttlefishVmLifecycleState::Running
-                        | CuttlefishVmLifecycleState::Rebooting
-                )
-                | (
-                    Self::Destroy,
-                    CuttlefishVmLifecycleState::Stopped
-                        | CuttlefishVmLifecycleState::Starting
-                        | CuttlefishVmLifecycleState::Running
-                        | CuttlefishVmLifecycleState::Rebooting
-                        | CuttlefishVmLifecycleState::Unavailable
-                        | CuttlefishVmLifecycleState::Failed
-                )
+            (Self::Provision, CuttlefishVmLifecycleState::Absent) |
+(Self::Start, CuttlefishVmLifecycleState::Stopped) |
+(Self::Stop | Self::Reboot,
+CuttlefishVmLifecycleState::Starting | CuttlefishVmLifecycleState::Running |
+CuttlefishVmLifecycleState::Rebooting) |
+(Self::Destroy,
+CuttlefishVmLifecycleState::Stopped | CuttlefishVmLifecycleState::Starting |
+CuttlefishVmLifecycleState::Running | CuttlefishVmLifecycleState::Rebooting |
+CuttlefishVmLifecycleState::Unavailable | CuttlefishVmLifecycleState::Failed)
         )
     }
 }
@@ -962,7 +935,9 @@ fn is_valid_sha256_digest(value: &str) -> bool {
 
 fn is_valid_mesh_host(value: &str) -> bool {
     value.len() <= MAX_ID_BYTES
-        && value.ends_with(".mesh")
+        && value
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension == "mesh")
         && value.split('.').all(|label| {
             let bytes = label.as_bytes();
             !bytes.is_empty()
