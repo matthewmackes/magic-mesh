@@ -62,8 +62,7 @@ fn source_revision_stamp() -> String {
         .filter(|value| !value.is_empty());
 
     if promotable {
-        let revision = receipt
-            .unwrap_or_else(|| panic!("promotable build requires MCNF_BUILD_SOURCE_REVISION"));
+        let revision = receipt.expect("promotable build requires MCNF_BUILD_SOURCE_REVISION");
         assert!(
             exact_revision(&revision),
             "promotable source revision must be an exact lowercase 40- or 64-hex Git object ID"
