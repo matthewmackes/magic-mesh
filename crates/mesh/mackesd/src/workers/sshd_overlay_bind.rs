@@ -31,10 +31,12 @@
 
 #![cfg(feature = "async-services")]
 
-use std::path::{Path, PathBuf};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::{ShutdownToken, Worker};
 
 /// Default sweep cadence. Overlay-IP changes are infrequent +
@@ -53,6 +55,8 @@ pub const DEFAULT_DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/mackes-mesh.conf";
 
 /// Default systemd unit reloaded on overlay-IP change.
 pub const DEFAULT_SSHD_UNIT: &str = "sshd.service";
+
+const MAX_OVERLAY_IP_BYTES: usize = 256;
 
 /// Worker handle. Tracks the last-observed mtime + last-written
 /// overlay IP so reloads only fire on real changes.
@@ -149,8 +153,8 @@ impl SshdOverlayBindWorker {
         }
         // mtime advanced — read the IP + write the drop-in if
         // changed.
-        let overlay_ip = match std::fs::read_to_string(&self.overlay_ip_path) {
-            Ok(s) => s.trim().to_string(),
+        let overlay_ip = match read_overlay_ip(&self.overlay_ip_path) {
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     target: "mackesd::sshd_overlay_bind",
@@ -285,6 +289,26 @@ fn write_dropin_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn read_overlay_ip(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("read {} metadata: {e}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_OVERLAY_IP_BYTES as u64 {
+        return Err(format!("{} is not a bounded regular file", path.display()));
+    }
+    let mut raw = String::new();
+    std::fs::File::open(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .take((MAX_OVERLAY_IP_BYTES + 1) as u64)
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if raw.len() > MAX_OVERLAY_IP_BYTES {
+        return Err(format!("{} exceeds its byte bound", path.display()));
+    }
+    Ok(raw.trim().to_string())
+}
+
 /// Reload sshd via `systemctl reload <unit>`. `reload` (not
 /// `try-reload-or-restart`) matches the Python helper's behavior +
 /// keeps existing sessions alive during the rebind.
@@ -296,12 +320,12 @@ fn reload_sshd(unit: &str) -> Result<(), String> {
     // live sshd in place AND revives a dead one, so applying the additive
     // drop-in always restores SSH instead of silently leaving it down.
     // First clear any failed/start-limited state so the (re)start isn't refused.
-    let _ = std::process::Command::new("systemctl")
-        .args(["reset-failed", unit])
-        .output();
-    let out = std::process::Command::new("systemctl")
-        .args(["reload-or-restart", unit])
-        .output()
+    let mut reset = Command::new("systemctl");
+    reset.args(["reset-failed", unit]);
+    let _ = output_with_timeout(reset, DEFAULT_CMD_TIMEOUT);
+    let mut reload = Command::new("systemctl");
+    reload.args(["reload-or-restart", unit]);
+    let out = output_with_timeout(reload, DEFAULT_CMD_TIMEOUT)
         .map_err(|e| format!("systemctl reload-or-restart {unit}: {e}"))?;
     if out.status.success() {
         Ok(())
@@ -423,6 +447,21 @@ mod tests {
         let overlay = tmp.path().join("overlay-ip");
         let dropin = tmp.path().join("mackes-mesh.conf");
         std::fs::write(&overlay, "not-an-ip\n").expect("seed invalid overlay");
+        let mut w = SshdOverlayBindWorker::new()
+            .with_overlay_ip_path(overlay)
+            .with_dropin_path(dropin.clone())
+            .with_sshd_unit("");
+
+        assert_eq!(w.tick_once(), TickOutcome::Idle);
+        assert!(!dropin.exists());
+    }
+
+    #[test]
+    fn oversized_overlay_publish_file_defers_without_writing_dropin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay-ip");
+        let dropin = tmp.path().join("mackes-mesh.conf");
+        std::fs::write(&overlay, vec![b'9'; MAX_OVERLAY_IP_BYTES + 1]).expect("seed oversized overlay");
         let mut w = SshdOverlayBindWorker::new()
             .with_overlay_ip_path(overlay)
             .with_dropin_path(dropin.clone())

@@ -60,6 +60,18 @@ fn read_bounded_text(path: impl AsRef<std::path::Path>) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn load_exposure_config(workgroup_root: &std::path::Path) -> exposure::ExposureConfig {
+    read_bounded_text(exposure::config_path(workgroup_root))
+        .and_then(|raw| exposure::ExposureConfig::from_toml_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn load_ddns_config(workgroup_root: &std::path::Path) -> ddns::DdnsConfig {
+    read_bounded_text(ddns::config_path(workgroup_root))
+        .and_then(|raw| ddns::DdnsConfig::from_toml_str(&raw).ok())
+        .unwrap_or_default()
+}
+
 /// CONNECT-3 — the public-zone ports that are legitimately open but are NOT
 /// CONNECT's to manage: the foundational always-public layer (§1/§6 — SSH/22,
 /// Nebula/4242, enroll/4243, owned by [`super::firewall_preset`] + firewalld's
@@ -411,7 +423,7 @@ impl ConnectFirewallWorker {
     /// DDNS record. Writes the durable record only; the `ddns` reconcile worker
     /// publishes it (no second DNS path). Returns the new owned-label set to persist.
     fn reconcile_ddns(&self, cfg: &exposure::ExposureConfig, prev_owned: &[String]) -> Vec<String> {
-        let mut dcfg = ddns::load(&self.workgroup_root);
+        let mut dcfg = load_ddns_config(&self.workgroup_root);
         let desired = desired_ingress_ddns_labels(cfg, &self.hostname, &dcfg.zone);
         let mut changed = false;
         // Add / update each desired ingress name.
@@ -517,7 +529,7 @@ impl ConnectFirewallWorker {
     /// Returns the number of `firewall-cmd` mutations (adds + removes) that ran
     /// (0 when nothing changed / Caddy-only / no firewalld).
     pub fn tick_once(&self) -> usize {
-        let cfg = exposure::load(&self.workgroup_root);
+        let cfg = load_exposure_config(&self.workgroup_root);
         // CONNECT-4 — render/write this node's Caddy ingress fragment (runs even
         // when no firewall ports change, e.g. to clear the fragment after an
         // unexpose). Best-effort + no-op when Caddy isn't installed here.
@@ -813,6 +825,16 @@ mod tests {
         let path = tmp.path().join("fragment");
         std::fs::write(&path, vec![b'x'; MAX_MANAGED_TEXT_BYTES as usize + 1]).unwrap();
         assert!(read_bounded_text(&path).is_none());
+    }
+
+    #[test]
+    fn oversized_exposure_policy_fails_closed_to_empty_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = exposure::config_path(tmp.path());
+        std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+        std::fs::write(&policy, vec![b'x'; MAX_MANAGED_TEXT_BYTES as usize + 1]).unwrap();
+
+        assert!(load_exposure_config(tmp.path()).service.is_empty());
     }
 
     #[test]

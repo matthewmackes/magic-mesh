@@ -93,13 +93,13 @@ behavioral evidence is not completion.
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
 - Current state: typed contracts, journals, cancellation, Display1, hostile tests, cleanup; adapters, recovery, KMS/EGL, packaging, and Dell/seat-15 proof remain.
-- Remaining work: **Recovered lease deadline checkpoint (2026-08-10):** expired recovered attachment leases are refused; BigBoy passed the focused gate:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
+- Remaining work: **Recovered lease deadline (2026-08-10):** expired attachment leases refused; BigBoy: `evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
 - **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
 - **VM resource-efficiency/Dom0 reserve (2026-08-10):** CPU pinning, bounded queues, qcow2 discard, shared non-Dom0 pools, and Dom0 reserve passed focused farm gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Storage probe timeout (2026-08-11):** hanging `df` fails closed; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-storage-probe-timeout-r232.md`.
+- **Bounded mountinfo (2026-08-11):** storage protection/topology refuse over-1 MiB input; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-mountinfo-bound-r233.md`.
 - **VM/image cleanup:** BigBoy passed overlay and virtual-image cleanup:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
 - **Attachment cleanup:** BigBoy passed start-failure revocation and Quadlet cleanup:
@@ -2091,6 +2091,7 @@ behavioral evidence is not completion.
 - **SSH overlay-IP admission (2026-08-11):** invalid values defer before drop-in
   or reload; BigBoy passed 1/1:
   `evidence/WL-CRIT-007-2026-08-11-sshd-overlay-admission-r231.md`.
+- **Bounded SSH overlay (2026-08-11):** file and reset/reload commands are bounded; BigBoy passed 9/9: `evidence/WL-CRIT-007-2026-08-11-sshd-bounded-r233.md`.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.
@@ -2374,6 +2375,7 @@ behavioral evidence is not completion.
   30-second deadline with child termination on drop; `.90` passed:
   `docs/platform/evidence/WL-UX-011-2026-08-11-command-timeout-r224.md`.
 - **CONNECT text bound (2026-08-11):** state/Caddy reads cap content at 128 KiB; BigBoy: `docs/platform/evidence/WL-UX-011-2026-08-11-connect-managed-text-bound-r225.md`.
+- **CONNECT policy bound (2026-08-11):** exposure/DDNS reads cap at 128 KiB; BigBoy passed 1/1: `evidence/WL-UX-011-2026-08-11-connect-config-bound-r233.md`.
 - **Unavailable control all-verbs admission (2026-08-11):** unresolved provider state blocks Enable, Disable, Reload Module, and Rescan Bus without sysfs mutation;
   BigBoy passed:
   `docs/platform/evidence/WL-UX-011-2026-08-11-unavailable-control-all-verbs-r217.md`.

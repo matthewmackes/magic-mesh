@@ -56,6 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,6 +106,18 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Slow heartbeat for the topology mirror republish (between action-triggered
 /// republishes) — keeps the `UDisks2` enumerate off the hot path.
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Refuse an unexpectedly large mount table before it can consume unbounded
+/// memory in either the protection wall or topology annotation path.
+const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
+
+fn read_mountinfo(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut limited = file.take(MAX_MOUNTINFO_BYTES + 1);
+    let mut text = String::new();
+    limited.read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_MOUNTINFO_BYTES).then_some(text)
+}
 
 /// A Workloads projection older than two publication heartbeats cannot prove a
 /// destructive physical-storage target is free.
@@ -1738,8 +1751,7 @@ impl ProtectedDevices for MountProtectedDevices {
         // Fail-safe: if we can't read the mount table we protect nothing here, but
         // the in-use probe's Unknown default still refuses unverifiable devices, so
         // a create/format never lands on an unclassified disk.
-        std::fs::read_to_string(&path)
-            .map_or_else(|_| BTreeMap::new(), |text| protected_from_mountinfo(&text))
+        read_mountinfo(&path).map_or_else(BTreeMap::new, |text| protected_from_mountinfo(&text))
     }
 }
 
@@ -2919,7 +2931,7 @@ impl UDisks2Client for ZbusUDisks2Client {
             .map_err(|e| StorageError::Unavailable(format!("GetManagedObjects: {e}")))?;
         let blocks = blocks_from_managed(&objects);
         let mut topo = assemble_topology(&blocks);
-        if let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") {
+        if let Some(mi) = read_mountinfo(Path::new("/proc/self/mountinfo")) {
             annotate_mounts(&mut topo, &mi);
         }
         Ok(topo)
@@ -4456,6 +4468,19 @@ mod tests {
 ";
         let got = protected_from_mountinfo(mi);
         assert_eq!(got.get("/dev/sda"), Some(&ProtectedReason::RootBootEfi));
+    }
+
+    #[test]
+    fn oversized_mountinfo_fails_closed_before_parsing() {
+        let dir = tempfile::tempdir().expect("temporary storage root");
+        let path = dir.path().join("mountinfo");
+        fs::write(&path, vec![b'x'; (MAX_MOUNTINFO_BYTES + 1) as usize])
+            .expect("write oversized mountinfo");
+
+        let protected = MountProtectedDevices::new()
+            .with_mountinfo_path(path)
+            .protected();
+        assert!(protected.is_empty());
     }
 
     fn workload_projection_body(
