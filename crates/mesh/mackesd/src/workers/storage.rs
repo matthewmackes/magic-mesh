@@ -110,6 +110,9 @@ pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
 /// destructive physical-storage target is free.
 const WORKLOAD_PROJECTION_MAX_AGE_MS: u64 = 120_000;
 
+/// Keep filesystem labels bounded when they cross into privileged commands.
+const MAX_FILESYSTEM_LABEL_BYTES: usize = 255;
+
 // ───────────────────────────── op model ─────────────────────────────
 
 /// A partition-table scheme (lock 5).
@@ -1027,6 +1030,12 @@ pub enum OpInvalid {
         /// The rejected destination.
         mountpoint: String,
     },
+    /// A filesystem label is too large or contains command/log-confusing control characters.
+    #[error("unsafe filesystem label ({bytes} bytes)")]
+    UnsafeFilesystemLabel {
+        /// The rejected UTF-8 byte length (the label itself is not echoed).
+        bytes: usize,
+    },
     /// A LUKS mapper name is empty, path-like, or otherwise unsafe for device-mapper.
     #[error("unsafe mapper name {mapper_name}")]
     UnsafeMapperName {
@@ -1086,9 +1095,13 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
             device,
             size_mib,
             start_mib,
+            label,
             ..
         } => {
             let disk = require_device(topo, device)?;
+            if let Some(label) = label {
+                validate_filesystem_label(label)?;
+            }
             if *size_mib == 0 || start_mib.checked_add(*size_mib).is_none() {
                 return Err(OpInvalid::InvalidPartitionGeometry {
                     device: device.clone(),
@@ -1118,16 +1131,29 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
         }
         // Destructive/relocating ops (+ a LUKS-format, which erases contents) must be
         // unmounted.
-        StorageOp::DeletePartition { partition }
-        | StorageOp::Format { partition, .. }
-        | StorageOp::Move { partition, .. } => {
+        StorageOp::DeletePartition { partition } | StorageOp::Move { partition, .. } => {
             let p = require_partition(topo, partition)?;
             require_unmounted(p)?;
             Ok(())
         }
+        StorageOp::Format {
+            partition, label, ..
+        } => {
+            let p = require_partition(topo, partition)?;
+            require_unmounted(p)?;
+            if let Some(label) = label {
+                validate_filesystem_label(label)?;
+            }
+            Ok(())
+        }
         // Ops that only need the partition to exist (label/flags + LUKS open/close,
         // which address the container itself with no mount precondition).
-        StorageOp::SetLabel { partition, .. } | StorageOp::SetFlags { partition, .. } => {
+        StorageOp::SetLabel { partition, label } => {
+            require_partition(topo, partition)?;
+            validate_filesystem_label(label)?;
+            Ok(())
+        }
+        StorageOp::SetFlags { partition, .. } => {
             require_partition(topo, partition)?;
             Ok(())
         }
@@ -1151,6 +1177,7 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
         StorageOp::LuksFormat {
             partition,
             mapper_name,
+            label,
             ..
         } => {
             let p = require_partition(topo, partition)?;
@@ -1159,6 +1186,9 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
                 return Err(OpInvalid::UnsafeMapperName {
                     mapper_name: mapper_name.clone(),
                 });
+            }
+            if let Some(label) = label {
+                validate_filesystem_label(label)?;
             }
             Ok(())
         }
@@ -1213,6 +1243,15 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
             validate_subvolume_name(source)?;
             validate_subvolume_name(dest)
         }
+    }
+}
+
+/// Refuse labels before they become arguments to mkfs/udisks filesystem tools.
+fn validate_filesystem_label(label: &str) -> Result<(), OpInvalid> {
+    if label.len() <= MAX_FILESYSTEM_LABEL_BYTES && !label.chars().any(char::is_control) {
+        Ok(())
+    } else {
+        Err(OpInvalid::UnsafeFilesystemLabel { bytes: label.len() })
     }
 }
 
@@ -4044,6 +4083,24 @@ mod tests {
             validate_op(&too_big, &topo),
             Err(OpInvalid::NotEnoughSpace { .. })
         ));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_filesystem_label_before_command_admission() {
+        let op = StorageOp::CreatePartition {
+            device: "/dev/sdb".into(),
+            start_mib: 10 * 1024 + 1,
+            size_mib: 1_024,
+            filesystem: Some(Filesystem::Xfs),
+            label: Some("x".repeat(MAX_FILESYSTEM_LABEL_BYTES + 1)),
+        };
+
+        assert_eq!(
+            validate_op(&op, &sample_topo()),
+            Err(OpInvalid::UnsafeFilesystemLabel {
+                bytes: MAX_FILESYSTEM_LABEL_BYTES + 1,
+            })
+        );
     }
 
     #[test]

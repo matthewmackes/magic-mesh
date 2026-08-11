@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -404,39 +404,21 @@ impl LiveQemuImg {
 
     fn run(&self, op: &'static str, argv: &[String]) -> Result<String, QemuImgError> {
         let mut cmd = Command::new("qemu-img");
-        cmd.args(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| QemuImgError::Unavailable(format!("spawn qemu-img: {e}")))?;
-        let deadline = Instant::now() + self.timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(QemuImgError::Failed {
-                            op,
-                            reason: format!("timed out after {:?}", self.timeout),
-                        });
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
+        cmd.args(argv);
+        let out = output_with_timeout(cmd, self.timeout).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                QemuImgError::Unavailable(format!("spawn qemu-img: {e}"))
+            } else if e.kind() == std::io::ErrorKind::TimedOut {
+                QemuImgError::Failed {
+                    op,
+                    reason: format!("timed out after {:?}", self.timeout),
                 }
-                Err(e) => {
-                    return Err(QemuImgError::Failed {
-                        op,
-                        reason: format!("wait: {e}"),
-                    });
+            } else {
+                QemuImgError::Failed {
+                    op,
+                    reason: format!("collect output: {e}"),
                 }
             }
-        }
-        let out = child.wait_with_output().map_err(|e| QemuImgError::Failed {
-            op,
-            reason: format!("collect output: {e}"),
         })?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -2794,6 +2776,14 @@ mod tests {
     fn parse_pruned_lists_names() {
         assert_eq!(parse_pruned("a\n\nb\n  c \n"), vec!["a", "b", "c"]);
         assert!(parse_pruned("").is_empty());
+    }
+
+    #[test]
+    fn live_command_output_is_bounded_per_stream() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 131072 /dev/zero"]);
+        let output = output_with_timeout(cmd, Duration::from_secs(5)).unwrap();
+        assert_eq!(output.stdout.len(), 64 * 1024);
     }
 
     // ── queue executor ──

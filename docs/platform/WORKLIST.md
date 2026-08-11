@@ -97,8 +97,7 @@ behavioral evidence is not completion.
 - Remaining work: **Recovered lease deadline checkpoint (2026-08-10):** expired recovered attachment leases are refused; BigBoy passed the focused gate:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
-- **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
+- **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
 - **VM resource-efficiency/Dom0 reserve (2026-08-10):** CPU pinning, bounded queues, qcow2 discard, shared non-Dom0 pools, and Dom0 reserve passed focused farm gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **VM/image cleanup:** BigBoy passed overlay and virtual-image cleanup:
@@ -108,6 +107,8 @@ behavioral evidence is not completion.
 - **Storage safety:** seat `.90` passed partition geometry, mountpoint, and storage-name refusal:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
+- **Label bound (2026-08-11):** 255-byte/control refusal before filesystem commands; BigBoy: `evidence/WL-ARCH-010-2026-08-11-storage-label-admission-r225.md`.
+- **Virtual output bound (2026-08-11):** qemu-img drains both streams, retaining 64 KiB each; BigBoy: `evidence/WL-ARCH-010-2026-08-11-virtual-storage-output-bound-r225.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
@@ -123,8 +124,7 @@ behavioral evidence is not completion.
   Typed Workload Open plus authenticated Display1 leases remain; focused BigBoy/`.90` gates pass. Only the Workload reconciler executes cold-migration VM effects;
   Restart persists Stop/Starting before effects, replays starts, and owns cancelled Restart; evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`. Other evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
 - **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and libvirt inventory shortcuts and Datacenter's retired Nova-name heuristic were
   deleted. One typed Workloads link/projection remains; the strengthened
   authority guard and three focused BigBoy shell tests pass. Evidence:
@@ -2362,6 +2362,7 @@ behavioral evidence is not completion.
 - **Device command timeout (2026-08-11):** fixed device helpers now have a
   30-second deadline with child termination on drop; `.90` passed:
   `docs/platform/evidence/WL-UX-011-2026-08-11-command-timeout-r224.md`.
+- **CONNECT text bound (2026-08-11):** state/Caddy reads cap content at 128 KiB; BigBoy: `docs/platform/evidence/WL-UX-011-2026-08-11-connect-managed-text-bound-r225.md`.
 - **Unavailable control all-verbs admission (2026-08-11):** unresolved provider state blocks Enable, Disable, Reload Module, and Rescan Bus without sysfs mutation;
   BigBoy passed:
   `docs/platform/evidence/WL-UX-011-2026-08-11-unavailable-control-all-verbs-r217.md`.

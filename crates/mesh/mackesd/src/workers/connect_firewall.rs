@@ -24,6 +24,7 @@
 
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{fs::File, io::Read};
 
 use mackes_mesh_types::ddns;
 use mackes_mesh_types::exposure::{self, ProtoMode};
@@ -41,6 +42,23 @@ pub const CONNECT_STATE_DIR: &str = "/var/lib/mackesd/connect";
 /// shared with `firewall_preset` / the Caddy listener; reclaiming them is not
 /// worth a flap). Service-specific raw stream ports ARE reclaimed on unexpose.
 const SHARED_HTTP_PORTS: [(u16, &str); 2] = [(80, "tcp"), (443, "tcp")];
+
+/// CONNECT-owned text files are small state/config fragments. Refuse oversized
+/// content before parsing or comparing it so a damaged file cannot consume an
+/// unbounded amount of worker memory.
+const MAX_MANAGED_TEXT_BYTES: u64 = 128 * 1024;
+
+fn read_bounded_text(path: impl AsRef<std::path::Path>) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MANAGED_TEXT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_MANAGED_TEXT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 /// CONNECT-3 — the public-zone ports that are legitimately open but are NOT
 /// CONNECT's to manage: the foundational always-public layer (§1/§6 — SSH/22,
@@ -353,8 +371,7 @@ impl ConnectFirewallWorker {
 
     /// Load the last-applied reconcile state (default/empty on missing/garbage).
     fn load_applied(&self) -> AppliedState {
-        std::fs::read_to_string(self.state_path())
-            .ok()
+        read_bounded_text(self.state_path())
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default()
     }
@@ -471,7 +488,7 @@ impl ConnectFirewallWorker {
         }
         let rendered = exposure::render_caddyfile(cfg, &self.hostname);
         let path = self.caddy_dir.join("mcnf-ingress.caddy");
-        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let current = read_bounded_text(&path).unwrap_or_default();
         if current == rendered {
             return false; // unchanged
         }
@@ -788,6 +805,14 @@ mod tests {
         };
         w.save_applied(&s);
         assert_eq!(w.load_applied(), s);
+    }
+
+    #[test]
+    fn managed_text_reader_rejects_oversized_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fragment");
+        std::fs::write(&path, vec![b'x'; MAX_MANAGED_TEXT_BYTES as usize + 1]).unwrap();
+        assert!(read_bounded_text(&path).is_none());
     }
 
     #[test]
