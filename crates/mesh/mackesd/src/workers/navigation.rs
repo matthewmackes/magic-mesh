@@ -807,6 +807,8 @@ impl NavigationWorker {
             NavigationPhase::Active { route, progress } => {
                 request.route_id == route.route_id
                     && request.progress.observed_at_ms >= progress.observed_at_ms
+                    && now_ms.saturating_sub(request.progress.observed_at_ms)
+                        <= MAX_ACTION_AGE_MS
                     && request.progress.validate_for(route, now_ms).is_ok()
             }
             _ => false,
@@ -1399,6 +1401,41 @@ mod tests {
             fixture.worker.authority.as_ref().unwrap().snapshot.phase,
             NavigationPhase::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn stale_progress_cannot_advance_an_active_route() {
+        let mut fixture = Fixture::new(Arc::new(FixtureProvider));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-stale-progress"),
+        );
+        fixture.worker.tick_once().unwrap();
+        let active = fixture.worker.authority.as_ref().unwrap().snapshot.clone();
+        let (route, progress) = match active.phase {
+            NavigationPhase::Active { route, progress } => (route, progress),
+            phase => panic!("unexpected {phase:?}"),
+        };
+        let mut stale = progress;
+        stale.observed_at_ms = NOW - MAX_ACTION_AGE_MS - 1;
+        fixture.publish(
+            &navigation_progress_action_topic("seat-1"),
+            &NavigationProgressRequest {
+                schema_version: 1,
+                request_id: "stale-progress".into(),
+                host: "seat-1".into(),
+                expected_generation: 1,
+                issued_at_ms: NOW,
+                route_id: route.route_id,
+                progress: stale,
+            },
+        );
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.generation,
+            1,
+            "stale progress must not advance navigation authority"
+        );
     }
 
     #[test]
