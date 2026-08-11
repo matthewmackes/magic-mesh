@@ -1028,6 +1028,54 @@ fn load_cache(path: &Path) -> io::Result<Option<WeatherCache>> {
     Ok(Some(cache))
 }
 
+/// A cache is an acceleration layer, not an authority. A malformed regular
+/// cache must not prevent a fresh NWS transaction from repairing it, while an
+/// unsafe path (such as a symlink) must remain fail-closed for the later write.
+fn load_cache_for_refresh(path: &Path) -> io::Result<Option<WeatherCache>> {
+    match load_cache(path) {
+        Ok(cache) => Ok(cache),
+        Err(error) if quarantine_regular_cache(path)? => {
+            tracing::warn!(
+                target: "mackesd::weather_forecast",
+                %error,
+                path = %path.display(),
+                "quarantined unusable weather cache; continuing without cache"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn quarantine_regular_cache(path: &Path) -> io::Result<bool> {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let quarantine = parent.join(format!(
+        ".corrupt-weather-cache-{}-{}",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    match fs::rename(path, &quarantine) {
+        Ok(()) => {
+            File::open(parent)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 fn store_cache(path: &Path, cache: &WeatherCache) -> io::Result<()> {
     let body = serde_json::to_vec(cache).map_err(io_other)?;
     if body.len() > MAX_CACHE_BYTES {
@@ -1425,7 +1473,7 @@ fn blocking_provider_refresh(
     fetch_forecast: bool,
     cache_path: &Path,
 ) -> io::Result<ProviderResult> {
-    let cache = load_cache(cache_path)?;
+    let cache = load_cache_for_refresh(cache_path)?;
     if location.coverage != WeatherCoverage::NwsUnitedStates {
         return Ok(ProviderResult {
             current: fetch_current
@@ -1929,6 +1977,36 @@ mod tests {
         let _: WeatherForecastSnapshot =
             latest(&cache_root, &weather_forecast_state_topic("workstation-1"));
         assert!(!cache_worker.cache_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_regular_cache_is_quarantined_and_provider_refresh_recovers() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        write_location(&root, &location(7, -71.0589));
+        let worker = worker(&temp, fixture_probe(24));
+        worker
+            .refresh_once(location(7, -71.0589), true, true)
+            .await
+            .expect("initial cache write");
+
+        fs::write(&worker.cache_path, b"{malformed weather cache").expect("corrupt cache");
+        let recovered = worker
+            .refresh_once(location(7, -71.0589), true, true)
+            .await
+            .expect("fresh provider data must repair malformed cache");
+        assert_eq!(recovered.current_fresh, Some(true));
+        assert_eq!(recovered.forecast_fresh, Some(true));
+        assert!(load_cache(&worker.cache_path)
+            .expect("load repaired cache")
+            .is_some());
+        assert!(fs::read_dir(temp.path())
+            .expect("cache directory")
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".corrupt-weather-cache-")));
     }
 
     #[test]
