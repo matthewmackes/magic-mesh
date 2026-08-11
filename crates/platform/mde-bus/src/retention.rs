@@ -742,24 +742,24 @@ fn run_pass_at_inner(
     // unknown priority string. Privacy retention is topic/priority universal;
     // an unrecognized class must never become an accidental forever lane.
     {
-        let cutoff = ttl_cutoff_unix_ms(policy, "unknown", now_unix_ms)
-            .expect("universal retention always has a cutoff");
-        let mut stmt = conn
+        if let Some(cutoff) = ttl_cutoff_unix_ms(policy, "unknown", now_unix_ms) {
+            let mut stmt = conn
             .prepare(
                 "SELECT ulid, file_path FROM messages \
                  WHERE priority NOT IN ('min', 'default', 'high', 'urgent') \
                    AND ts_unix_ms < ?1",
             )
             .map_err(|e| RetentionError::Sql(format!("prepare unknown priority: {e}")))?;
-        let rows = stmt
+            let rows = stmt
             .query_map(params![cutoff], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| RetentionError::Sql(format!("query unknown priority: {e}")))?;
-        for row in rows {
-            victims.push(
-                row.map_err(|e| RetentionError::Sql(format!("decode unknown priority: {e}")))?,
-            );
+            for row in rows {
+                victims.push(
+                    row.map_err(|e| RetentionError::Sql(format!("decode unknown priority: {e}")))?,
+                );
+            }
         }
     }
 
@@ -1386,8 +1386,8 @@ pub async fn run_loop(
 }
 
 /// Publish a `bus/sys/quota` warning into the per-peer Persist
-/// + on-disk tree. Pure sync helper — the retention loop calls
-/// this from inside the tokio task.
+/// + on-disk tree. Pure sync helper — the retention loop calls this from inside
+///   the tokio task.
 fn publish_quota_warning(
     bus_root: &Path,
     bytes_used: u64,

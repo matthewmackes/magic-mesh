@@ -43,19 +43,14 @@ pub struct Topic {
 /// badge. `High` opens the status-zone slide-up strip with sound.
 /// `Urgent` triggers the Theater takeover + wallpaper stripe + phone
 /// push.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
     Min,
+    #[default]
     Default,
     High,
     Urgent,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// Errors a [`Registry`] operation can produce.

@@ -41,7 +41,7 @@ const MAX_DND_FILE_BYTES: usize = 64 * 1024;
 /// Mesh-wide DND state. Single bool per the design lock —
 /// per-topic mute is handled by the `subs.yaml` manifest (per
 /// BUS-1.7), not by the DND toggle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DndState {
     /// `true` when DND is active; `false` when off.
     #[serde(default)]
@@ -65,17 +65,6 @@ pub struct DndState {
     /// (which are local, not fleet-wide).
     #[serde(default)]
     pub snoozes: Vec<TopicSnooze>,
-}
-
-impl Default for DndState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            since_unix_ms: 0,
-            set_by_peer: String::new(),
-            snoozes: Vec::new(),
-        }
-    }
 }
 
 /// BUS-6.7 — one fleet-wide timed topic snooze. Lives in the
@@ -191,16 +180,14 @@ pub fn is_quiet_hour(now_local_seconds: u32, hours: TopicQuietHours) -> bool {
 }
 
 /// Pure-fn — true if the message should be SUPPRESSED (not
-/// routed to display surfaces). The message still gets persisted
-/// + audited regardless; suppression is a routing decision, not
-/// a storage decision.
+/// routed to display surfaces). The message still gets persisted and audited
+/// regardless; suppression is a routing decision, not a storage decision.
 ///
 /// Rules (in priority order):
-///   1. `override=dnd` tag → never suppressed (genuine
-///      emergency bypass).
-///   2. Global DND toggle active → suppressed.
-///   3. Topic quiet-hour window active → suppressed.
-///   4. Otherwise → not suppressed.
+/// 1. `override=dnd` tag → never suppressed (genuine emergency bypass).
+/// 2. Global DND toggle active → suppressed.
+/// 3. Topic quiet-hour window active → suppressed.
+/// 4. Otherwise → not suppressed.
 #[must_use]
 pub fn is_suppressed(
     state: &DndState,

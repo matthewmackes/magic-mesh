@@ -2,8 +2,7 @@
 //!
 //! Given an inbound webhook request (adapter name + HTTP headers
 //! + JSON body) and a parsed [`HooksConfig`], produce a
-//! [`RenderedPublish`] when any rule matches, or `None` when no
-//! rule fires.
+//!   [`RenderedPublish`] when any rule matches, or `None` when no rule fires.
 //!
 //! The flow per request:
 //!
