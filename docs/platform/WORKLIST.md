@@ -1418,6 +1418,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-vdi-source-identity-r187.md`.
 - **Android catalog identity checkpoint (2026-08-10):** higher-revision signed imports cannot switch catalog identity; seat 90 passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-android-identity-continuity-r161.md`.
+- **Android catalog state-parent checkpoint (2026-08-10):** cache replay and replacement refuse symlinked or non-directory parent components; seat 90 passed the hostile regression:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-10-catalog-state-parent-nofollow-r196.md`.
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
     libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
   - **Signed release-artifact admission (2026-08-09):** schema v3 requires one bounded detached signature from the pinned installed MCNF key before provisioning; missing,

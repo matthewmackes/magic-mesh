@@ -321,6 +321,9 @@ fn load_verifying_key(path: &Path) -> io::Result<VerifyingKey> {
 }
 
 fn load_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<AndroidSignedCatalog>> {
+    ensure_directory_chain_nofollow(config.state_file.parent().ok_or_else(|| {
+        io::Error::other("Android catalog state path has no parent")
+    })?)?;
     if !config.state_file.exists() {
         return Ok(None);
     }
@@ -366,6 +369,7 @@ fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("Android catalog state path has no parent"))?;
+    ensure_directory_chain_nofollow(parent)?;
     fs::create_dir_all(parent)?;
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(io::Error::other("Android catalog state path is a symlink"));
@@ -399,6 +403,30 @@ fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Refuse an existing symlink or non-directory anywhere in the cache parent
+/// before `create_dir_all` or a cache replay can follow it. The final state
+/// file is separately opened/replaced with no-follow semantics.
+fn ensure_directory_chain_nofollow(path: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "Android catalog state parent contains a symlink",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::other(
+                "Android catalog state parent is not a directory",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn open_regular_nofollow(path: &Path, max_bytes: u64) -> io::Result<File> {
@@ -678,6 +706,40 @@ mod tests {
         );
         fs::write(path, b"not-json").unwrap();
         assert!(load_last_good(worker.config.as_ref().unwrap(), NOW).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_cache_rejects_a_symlinked_state_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let catalog = signed_catalog(&key, 7);
+        let real_parent = temp.path().join("real-state");
+        let real_path = real_parent.join("catalog.json");
+        store_last_good(&real_path, &catalog).unwrap();
+        let before = fs::read(&real_path).unwrap();
+        let link_parent = temp.path().join("linked-state");
+        symlink(&real_parent, &link_parent).unwrap();
+        let linked_path = link_parent.join("catalog.json");
+        let linked_config = CatalogConfig {
+            state_file: linked_path.clone(),
+            ..worker.config.as_ref().unwrap().clone()
+        };
+
+        assert!(load_last_good(&linked_config, NOW).is_err());
+        assert!(store_last_good(&linked_path, &catalog).is_err());
+        assert_eq!(fs::read(&real_path).unwrap(), before);
+        let real_config = CatalogConfig {
+            state_file: real_path,
+            ..worker.config.as_ref().unwrap().clone()
+        };
+        assert_eq!(
+            load_last_good(&real_config, NOW).unwrap(),
+            Some(catalog)
+        );
     }
 
     #[test]
