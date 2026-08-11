@@ -332,6 +332,10 @@ behavioral evidence is not completion.
 - **Special-node refusal (2026-08-10):** `.90` passed the migration boundary
   fixture that refuses an allowlisted FIFO instead of silently omitting it:
   `docs/platform/evidence/WL-ARCH-008-2026-08-10-special-node-refusal-r185.md`.
+- **Portable destination-parent integrity (2026-08-10):** migration now refuses
+  an existing symlink or non-directory in the bundle output parent before
+  staging, and `.90` proved that a redirected target receives no bundle:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-10-output-parent-integrity-r192.md`.
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
      - Inputs: current repo commit, Browser inventory, licenses.

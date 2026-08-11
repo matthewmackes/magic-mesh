@@ -221,6 +221,35 @@ def validate_roots(roots: list[tuple[Path, str]], output: Path) -> None:
             raise MigrationError("output must not be inside a source root")
 
 
+def validate_output_parent(output: Path) -> None:
+    """Refuse an existing symlink or non-directory in the output path.
+
+    The bundle is published with ``os.replace`` only after staging, but a
+    symlinked parent would still redirect the staging directory and final
+    bundle outside the caller-selected destination.  Inspect without
+    resolving so the portable boundary remains explicit and fail-closed.
+    """
+
+    parent = output.absolute().parent
+    current = Path(parent.anchor)
+    relative_parts = parent.relative_to(parent.anchor).parts
+    for part in relative_parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            # Missing descendants are created below this point.  Existing
+            # ancestors have already been checked and are the only paths that
+            # can redirect this migration before mkdir.
+            break
+        except OSError as error:
+            raise MigrationError(f"output parent is unreadable: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise MigrationError(f"output parent must not contain a symlink: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise MigrationError(f"output parent is not a directory: {current}")
+
+
 def manifest_for(output: Path) -> dict:
     manifest_path = output / "manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
@@ -314,6 +343,7 @@ def verify_existing_bundle(output: Path, manifest: dict) -> None:
 
 def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) -> dict:
     validate_roots(roots, output)
+    validate_output_parent(output)
     if output.exists() and output.is_symlink():
         raise MigrationError("output must not be a symlink")
     if output.exists() and not output.is_dir():
