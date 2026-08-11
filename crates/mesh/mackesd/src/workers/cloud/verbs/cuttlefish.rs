@@ -701,7 +701,19 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
     }
 
     fn vdi_source(&self, generation: u64) -> Option<AndroidVdiSource> {
-        self.client.vdi_source(generation)
+        let observation = self.observation.lock().ok()?;
+        if observation.generation != generation || !observation.is_guest_ready() {
+            return None;
+        }
+        let source = self.client.vdi_source(generation)?;
+        source.validate().ok()?;
+        if source.workload_id != self.workload_id
+            || source.image_provenance != self.target.image_provenance
+            || source.generation != generation
+        {
+            return None;
+        }
+        Some(source)
     }
 
     fn cleanup(&self, request_id: &str, generation: u64) -> bool {
@@ -814,6 +826,7 @@ mod tests {
             Arc<Mutex<Option<Result<CuttlefishVmObservation, CuttlefishProviderError>>>>,
         launch_result:
             Arc<Mutex<Option<Result<AndroidGuestLaunchOutcome, CuttlefishProviderError>>>>,
+        vdi_source_result: Arc<Mutex<Option<AndroidVdiSource>>>,
     }
 
     impl FakeClient {
@@ -823,6 +836,7 @@ mod tests {
                 launch_calls: Arc::new(AtomicUsize::new(0)),
                 observe_result: Arc::new(Mutex::new(Some(observe_result))),
                 launch_result: Arc::new(Mutex::new(Some(Ok(AndroidGuestLaunchOutcome::Started)))),
+                vdi_source_result: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -851,6 +865,13 @@ mod tests {
                 .expect("launch result lock")
                 .take()
                 .expect("one launch call")
+        }
+
+        fn vdi_source(&self, _generation: u64) -> Option<AndroidVdiSource> {
+            self.vdi_source_result
+                .lock()
+                .expect("VDI source lock")
+                .clone()
         }
     }
 
@@ -1053,6 +1074,37 @@ mod tests {
 
         assert_eq!(adapter.launch(&request), AndroidGuestLaunchOutcome::Started);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn adapter_refuses_vdi_source_with_mismatched_workload_identity() {
+        let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
+        let client = FakeClient::new(Ok(initial.clone()));
+        *client.vdi_source_result.lock().expect("VDI source lock") = Some(
+            AndroidVdiSource {
+                schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+                workload_id: "android-other".to_owned(),
+                image_provenance: target().image_provenance,
+                catalog_digest: DIGEST.to_owned(),
+                generation: 7,
+                protocol: AndroidVdiProtocol::WebRtc,
+                mesh_host: "android-t480.mesh".to_owned(),
+                port: 8_443,
+                session_id: "session-7".to_owned(),
+                observed_at_unix_ms: now_unix_ms(),
+                expires_at_unix_ms: now_unix_ms().saturating_add(60_000),
+            },
+        );
+        let adapter = CuttlefishProviderAdapter::new(
+            "android-t480",
+            target(),
+            package_manifest(),
+            initial,
+            client,
+        )
+        .expect("adapter");
+
+        assert!(adapter.vdi_source(7).is_none());
     }
 
     #[test]
