@@ -51,6 +51,7 @@ const MAX_SIGNING_KEY_FILE_BYTES: usize = 128;
 const MAX_MUSIC_SIGNING_KEY_FILE_BYTES: usize = 128;
 const MAX_AUDIO_STATUS_PER_TICK: usize = 512;
 const MAX_PEER_COMMANDS_PER_TICK: usize = 128;
+const MAX_PEER_CONVERGENCE_PROBES_PER_TICK: usize = 512;
 const AUDIO_RETRY_MS: i64 = 5_000;
 const PEER_RETRY_MS: i64 = 5_000;
 const CLOCK_AUDIO_AUTH_VERB: &str = "music-clock-audio";
@@ -1205,6 +1206,7 @@ impl ClockWorker {
         let local_node_id = self.node_id.clone();
         let approved_peer_ids = self.approved_peer_ids.clone();
         let mut remaining_commands = MAX_PEER_COMMANDS_PER_TICK;
+        let mut remaining_probes = MAX_PEER_CONVERGENCE_PROBES_PER_TICK;
 
         for schedule in snapshot
             .schedules
@@ -1216,6 +1218,10 @@ impl ClockWorker {
                 .iter()
                 .filter(|target| *target != &local_node_id && approved_peer_ids.contains(*target))
             {
+                if remaining_probes == 0 {
+                    return Ok(());
+                }
+                remaining_probes -= 1;
                 let Some(peer) = peer_snapshots.get(target) else {
                     continue;
                 };
@@ -1265,6 +1271,10 @@ impl ClockWorker {
                 .iter()
                 .filter(|target| *target != &local_node_id && approved_peer_ids.contains(*target))
             {
+                if remaining_probes == 0 {
+                    return Ok(());
+                }
+                remaining_probes -= 1;
                 let Some(peer) = peer_snapshots.get(target) else {
                     continue;
                 };
@@ -1324,6 +1334,10 @@ impl ClockWorker {
                 .iter()
                 .filter(|target| *target != &local_node_id && approved_peer_ids.contains(*target))
             {
+                if remaining_probes == 0 {
+                    return Ok(());
+                }
+                remaining_probes -= 1;
                 let Some(peer) = peer_snapshots.get(target) else {
                     continue;
                 };
@@ -5127,6 +5141,60 @@ mod tests {
             .list_since(&clock_command_topic("seat-2").unwrap(), None)
             .unwrap();
         assert_eq!(messages.len(), MAX_PEER_COMMANDS_PER_TICK);
+    }
+
+    #[test]
+    fn peer_convergence_probe_budget_bounds_retry_suppressed_work() {
+        let mut fixture = Fixture::new();
+        fixture.worker.approved_peer_ids.insert("seat-2".into());
+        fixture.worker.tick_once().unwrap();
+
+        let stopwatches: Vec<_> = (0..=MAX_PEER_CONVERGENCE_PROBES_PER_TICK)
+            .map(|index| ClockStopwatchV1 {
+                stopwatch_id: format!("probe-budget-{index}"),
+                origin_node_id: "seat-1".into(),
+                mirror_target_ids: vec!["seat-2".into()],
+                revision: 1,
+                phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
+                started_wall_utc_ms: None,
+                started_monotonic_ms: None,
+                accumulated_elapsed_ms: 0,
+                laps: Vec::new(),
+            })
+            .collect();
+        for stopwatch in stopwatches.iter().take(MAX_PEER_CONVERGENCE_PROBES_PER_TICK) {
+            fixture.worker.peer_last_sent_ms.insert(
+                peer_request_id(
+                    "stopwatch",
+                    "seat-2",
+                    &stopwatch.stopwatch_id,
+                    stopwatch.revision,
+                    "",
+                ),
+                NOW,
+            );
+        }
+        fixture.worker.snapshot.as_mut().unwrap().stopwatches = stopwatches;
+
+        let transaction = fixture.worker.open_bus_transaction().unwrap();
+        let peer_snapshot = fixture.worker.initial_snapshot(NOW);
+        fixture
+            .worker
+            .publish_peer_convergence(
+                &transaction,
+                NOW,
+                &BTreeMap::from([(String::from("seat-2"), peer_snapshot)]),
+            )
+            .unwrap();
+
+        let messages = transaction
+            .persist
+            .list_since(&clock_command_topic("seat-2").unwrap(), None)
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "retry-suppressed convergence must stop at the probe budget"
+        );
     }
 
     #[test]

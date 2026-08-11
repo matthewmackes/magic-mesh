@@ -326,6 +326,10 @@ behavioral evidence is not completion.
 - **Dell Display1/RDP (2026-08-09):** guest RDP boot proof: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
 - **Host-browser profile (2026-08-10):** manifest self-test passed: `docs/platform/evidence/WL-ARCH-008-2026-08-10-host-browser-profile-refusal-r156.md`.
 - Remaining work:
+- **Early file-count admission (2026-08-11):** Browser migration carries the
+  remaining `MAX_FILES` budget into traversal and refuses the next source entry
+  before retaining more candidates; `.50` passed the self-test:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-11-file-count-admission-r223.md`.
 - **Portable bundle integrity (2026-08-10):** payload size/hash, symlink,
   duplicate, and unexpected-file checks passed `.90`:
   `docs/platform/evidence/WL-ARCH-008-2026-08-10-portable-bundle-integrity-r176.md`.
@@ -1530,6 +1534,7 @@ behavioral evidence is not completion.
 - **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
 - Remaining work: **Shared artwork byte bound (2026-08-11):** cache reads refuse non-regular or over-4-MiB files and writes refuse oversized payloads; `.50` passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
+- **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
 - **Cast media URL admission checkpoint (2026-08-10):** unsafe/local/credential-bearing URLs refused; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
 - **Direct media URL admission (2026-08-10):** `.90` passed malformed/credential-bearing/unsafe URL refusal:
@@ -1542,8 +1547,7 @@ behavioral evidence is not completion.
 - **Library checkpoint (2026-08-06):** typed collections replace Airsonic rows; UI 44/44 on `.50`, fmt `.90`; `evidence/WL-FUNC-021-2026-08-06-daemon-library-r1.md`.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
 - **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass.
-- **Cache checkpoints (2026-08-07/09):** truncation rejected; replacements preserve last-good; BigBoy/UI/cache tests pass; live/package proof remains open.
-  Evidence: `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`.
+- **Cache checkpoints:** truncation refused; replacement keeps last-good; live/package proof open; evidence: `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`.
 - **Music cache completeness (2026-08-10):** `.90` passed truncated/replaced-file refusal: `docs/platform/evidence/WL-FUNC-021-2026-08-10-cache-completeness-r208.md`.
 - **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
   Live proof remains: `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`, `evidence/WL-FUNC-021-2026-08-09-mpv-playlist-continuation-r11.md`.
@@ -1553,8 +1557,7 @@ behavioral evidence is not completion.
 - **Typed target handoff checkpoint (2026-08-06):** bounded peer heartbeats project honestly; fresh idle mesh seats publish typed `transfer`, stale/owning peers remain browse-only.
   Music UI is 48/48 on `.50`, format is clean, and the hostile test covers `peer:seat-15`; live owner-yield/resume and DLNA/provider/package proof remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-target-handoff-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-peer-targets-r1.md`.
-- **Handoff target-routing checkpoint (2026-08-09):** owner and bystander pumps no longer erase another seat's completion; BigBoy passed 12/12.
-  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-09-handoff-target-routing-r95.md`.
+- **Handoff routing:** owner/bystander pumps preserve another seat's completion; BigBoy 12/12; evidence: `evidence/WL-FUNC-021-08-09-handoff-target-routing-r95.md`.
 - **Cast checkpoints (2026-08-06/09):** real DLNA control and off-render native Chromecast discovery are bounded; authenticated CastV2/live-seat proof remain open.
   `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`.
 - **Live provider-loss checkpoint (2026-08-08):** release 11 on seat 15 passed a controlled healthy → provider loss → healthy transition with cached catalog/state available.
@@ -1756,6 +1759,10 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Peer convergence probe budget (2026-08-11):** retry-suppressed peer probes
+  are capped independently at 512 per tick, preventing large retained snapshots
+  from consuming unbounded convergence work; evidence:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-11-peer-probe-budget-r223.md`.
 - **Clock local-target admission (2026-08-11):** locally authored schedules and stopwatch mirrors reject unapproved peers while approved peers persist; `.50` passed:
   `docs/platform/evidence/WL-FUNC-022-2026-08-11-clock-target-admission-r217.md`.
 - **Replay cursor recovery checkpoint (2026-08-10):** duplicate Clock request

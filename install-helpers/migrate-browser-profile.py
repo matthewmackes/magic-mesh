@@ -141,7 +141,7 @@ def denied(relative: str) -> str | None:
     return None
 
 
-def iter_files(root: Path) -> Iterable[tuple[Path, str]]:
+def iter_files(root: Path, max_entries: int | None = None) -> Iterable[tuple[Path, str]]:
     """Yield every non-directory entry beneath *root* without following links.
 
     ``os.walk`` omits FIFOs, sockets, and device nodes.  Omitting one from the
@@ -155,7 +155,10 @@ def iter_files(root: Path) -> Iterable[tuple[Path, str]]:
     if root.is_symlink() or not root.is_dir():
         raise MigrationError(f"source root is not a real directory: {root}")
 
+    yielded = 0
+
     def walk(directory: Path) -> Iterable[tuple[Path, str]]:
+        nonlocal yielded
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
         except OSError as error:
@@ -171,6 +174,9 @@ def iter_files(root: Path) -> Iterable[tuple[Path, str]]:
                 else:
                     # Includes regular files and special nodes.  The caller
                     # records a failed entry for anything non-regular.
+                    yielded += 1
+                    if max_entries is not None and yielded > max_entries:
+                        raise MigrationError(f"source contains too many files: {max_entries + 1}")
                     yield path, relative
             except OSError as error:
                 raise MigrationError(f"source entry is unreadable: {path}") from error
@@ -178,10 +184,10 @@ def iter_files(root: Path) -> Iterable[tuple[Path, str]]:
     yield from walk(root)
 
 
-def profile_candidates(root: Path) -> Iterable[tuple[Path, str, str | None]]:
+def profile_candidates(root: Path, max_entries: int | None = None) -> Iterable[tuple[Path, str, str | None]]:
     """Return (path, relative, category) for the portable profile allowlist."""
 
-    for path, relative in iter_files(root):
+    for path, relative in iter_files(root, max_entries):
         if "/" not in relative:
             category = {
                 "Bookmarks": "bookmarks",
@@ -202,8 +208,8 @@ def profile_candidates(root: Path) -> Iterable[tuple[Path, str, str | None]]:
             yield path, relative, None
 
 
-def all_candidates(root: Path, category: str) -> Iterable[tuple[Path, str, str]]:
-    for path, relative in iter_files(root):
+def all_candidates(root: Path, category: str, max_entries: int | None = None) -> Iterable[tuple[Path, str, str]]:
+    for path, relative in iter_files(root, max_entries):
         yield path, relative, category
 
 
@@ -380,7 +386,12 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
                 {"category": category, "path": ".", "status": "skipped", "reason": "source-missing"}
             )
             continue
-        iterator = profile_candidates(root) if category == "profile" else all_candidates(root, category)
+        remaining = MAX_FILES - candidates
+        iterator = (
+            profile_candidates(root, remaining)
+            if category == "profile"
+            else all_candidates(root, category, remaining)
+        )
         for path, relative, actual_category in iterator:
             candidates += 1
             record = {"category": actual_category or "profile", "path": relative}
@@ -448,8 +459,6 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
             total_bytes += size
             entries.append((path, record, source_identity))
 
-    if candidates > MAX_FILES:
-        raise MigrationError(f"source contains too many files: {candidates}")
     entries.sort(key=lambda item: (item[1]["category"], item[1]["path"]) if isinstance(item, tuple) else (item["category"], item["path"]))
     serial_entries = [item[1] if isinstance(item, tuple) else item for item in entries]
     counts = {status: sum(entry["status"] == status for entry in serial_entries) for status in ("imported", "skipped", "failed")}
@@ -544,6 +553,17 @@ def self_test() -> None:
         assert first["counts"]["failed"] == 0
         assert not any("SECRET" in path.read_text(errors="ignore") for path in output.rglob("*") if path.is_file())
         assert (output / "payload" / "downloads" / "report.pdf").read_bytes() == b"download"
+
+        overflow = Path(raw) / "overflow"
+        overflow.mkdir()
+        for index in range(MAX_FILES + 1):
+            (overflow / f"Bookmarks-{index:05d}").write_bytes(b"x")
+        try:
+            migrate([(overflow, "profile")], Path(raw) / "overflow-bundle")
+        except MigrationError as error:
+            assert str(error) == f"source contains too many files: {MAX_FILES + 1}"
+        else:
+            raise AssertionError("file-count admission accepted an oversized source")
     print("migrate-browser-profile: self-test passed")
 
 

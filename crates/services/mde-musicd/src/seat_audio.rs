@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_ADMITTED_STREAMS: usize = 64;
+const MAX_PW_DUMP_BYTES: usize = 16 * 1024 * 1024;
 const DUCK_FACTOR: f64 = 0.25;
 const MAX_ADMITTED_GAIN: f64 = 4.0;
 const CLASS_STREAM_OUTPUT: &str = "Stream/Output/Audio";
@@ -73,7 +74,7 @@ impl PipeWireIo for WirePlumberCli {
         if !output.status.success() {
             return Err(SeatAudioError::Unavailable);
         }
-        serde_json::from_slice(&output.stdout).map_err(|_| SeatAudioError::InvalidGraph)
+        parse_pw_dump(&output.stdout)
     }
 
     fn set_volume(&self, node_id: u32, exact_level: f64) -> Result<(), SeatAudioError> {
@@ -90,6 +91,13 @@ impl PipeWireIo for WirePlumberCli {
             .then_some(())
             .ok_or(SeatAudioError::ControlFailed)
     }
+}
+
+fn parse_pw_dump(bytes: &[u8]) -> Result<serde_json::Value, SeatAudioError> {
+    if bytes.len() > MAX_PW_DUMP_BYTES {
+        return Err(SeatAudioError::InvalidGraph);
+    }
+    serde_json::from_slice(bytes).map_err(|_| SeatAudioError::InvalidGraph)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -361,6 +369,12 @@ mod tests {
                 "params": { "Props": [{ "channelVolumes": [volume, volume] }] }
             }
         })
+    }
+
+    #[test]
+    fn pw_dump_refuses_oversized_provider_output_before_json_parse() {
+        let oversized = vec![b' '; MAX_PW_DUMP_BYTES + 1];
+        assert_eq!(parse_pw_dump(&oversized), Err(SeatAudioError::InvalidGraph));
     }
 
     fn client(id: u32, process: u32) -> serde_json::Value {
