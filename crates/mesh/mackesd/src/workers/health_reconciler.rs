@@ -1211,7 +1211,7 @@ fn atomic_replace_bytes(
     temporary_stem: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(parent)?;
+    ensure_regular_directory(parent)?;
     let sequence = PROJECTION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
         ".{}.health-reconciler-{}-{sequence}.tmp",
@@ -1233,6 +1233,49 @@ fn atomic_replace_bytes(
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Create the projection/checkpoint parent without following an attacker-owned
+/// symlink.  The health writer is used for derived state, so redirecting an
+/// atomic rename through a substituted directory would turn a bounded
+/// projection into an arbitrary filesystem write.
+fn ensure_regular_directory(path: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "health writer parent is not a regular directory",
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current);
+                current = current.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "health writer parent has no existing ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        std::fs::create_dir(directory)?;
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "health writer created an unsafe parent",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Connection-injected variant — tests pass an `:memory:` store
@@ -1730,6 +1773,37 @@ mod tests {
             Some(&first),
             "the truthful active outage and its history remain authoritative"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_projection_refuses_symlinked_parent_without_redirecting_write() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let outside = tempfile::tempdir().expect("outside");
+        let health_root = workgroup.path().join("system-mesh-health");
+        std::fs::create_dir_all(&health_root).expect("health root");
+        std::os::unix::fs::symlink(outside.path(), health_root.join("nodes"))
+            .expect("symlink nodes directory");
+
+        let state = health_publication("node-a", 1, 100);
+        let error = project_health_state(workgroup.path(), &state)
+            .expect_err("symlinked projection parent must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!outside.path().join("node-a.json").exists());
+    }
+
+    #[test]
+    fn health_projection_refuses_non_directory_parent() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let health_root = workgroup.path().join("system-mesh-health");
+        std::fs::create_dir_all(&health_root).expect("health root");
+        std::fs::write(health_root.join("nodes"), b"not a directory")
+            .expect("regular file parent");
+
+        let state = health_publication("node-a", 1, 100);
+        let error = project_health_state(workgroup.path(), &state)
+            .expect_err("non-directory projection parent must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
