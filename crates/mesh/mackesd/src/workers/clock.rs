@@ -1025,7 +1025,7 @@ impl ClockWorker {
 
         for (cursor, body) in actions {
             let checkpoint = self.checkpoint();
-            self.action_cursor = Some(cursor);
+            advance_clock_cursor(&mut self.action_cursor, &cursor);
             if let Err(error) =
                 self.process_command(transaction, body.as_bytes(), self.clock.now_ms())
             {
@@ -1064,15 +1064,15 @@ impl ClockWorker {
         for message in messages {
             let cursor = message.ulid;
             let Some(body) = message.body else {
-                self.audio_status_cursor = Some(cursor);
+                advance_clock_cursor(&mut self.audio_status_cursor, &cursor);
                 continue;
             };
             if mackes_mesh_types::workloads::reject_duplicate_json_keys(&body).is_err() {
-                self.audio_status_cursor = Some(cursor);
+                advance_clock_cursor(&mut self.audio_status_cursor, &cursor);
                 continue;
             }
             let Ok(status) = serde_json::from_str::<ClockAudioStatusV1>(&body) else {
-                self.audio_status_cursor = Some(cursor);
+                advance_clock_cursor(&mut self.audio_status_cursor, &cursor);
                 continue;
             };
             if status.validate_at(now_ms).is_ok() {
@@ -1085,7 +1085,7 @@ impl ClockWorker {
             }
             // A durable acknowledgement failure returns before this cursor
             // advances, so the same status is retried by this worker.
-            self.audio_status_cursor = Some(cursor);
+            advance_clock_cursor(&mut self.audio_status_cursor, &cursor);
         }
         Ok(())
     }
@@ -1431,6 +1431,15 @@ impl Worker for ClockWorker {
 
 fn clock_bus_root(override_root: Option<PathBuf>) -> PathBuf {
     clock_bus_root_or_system(override_root.or_else(crate::bus_publish::default_bus_root))
+}
+
+fn advance_clock_cursor(cursor: &mut Option<String>, candidate: &str) {
+    if cursor
+        .as_deref()
+        .is_none_or(|current| candidate > current)
+    {
+        *cursor = Some(candidate.to_owned());
+    }
 }
 
 fn clock_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
@@ -4475,6 +4484,29 @@ mod tests {
         assert_eq!(
             fixture.worker.store.load("seat-1").unwrap().unwrap().action_cursor,
             Some(cursor)
+        );
+    }
+
+    #[test]
+    fn stale_clock_action_and_audio_cursors_cannot_regress() {
+        let mut action_cursor = Some(String::from("01J00000000000000000000002"));
+        advance_clock_cursor(&mut action_cursor, "01J00000000000000000000001");
+        assert_eq!(
+            action_cursor.as_deref(),
+            Some("01J00000000000000000000002")
+        );
+        advance_clock_cursor(&mut action_cursor, "01J00000000000000000000003");
+        assert_eq!(
+            action_cursor.as_deref(),
+            Some("01J00000000000000000000003")
+        );
+
+        let mut audio_cursor = None;
+        advance_clock_cursor(&mut audio_cursor, "01J00000000000000000000007");
+        advance_clock_cursor(&mut audio_cursor, "01J00000000000000000000006");
+        assert_eq!(
+            audio_cursor.as_deref(),
+            Some("01J00000000000000000000007")
         );
     }
 

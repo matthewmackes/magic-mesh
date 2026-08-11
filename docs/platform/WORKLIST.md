@@ -1734,6 +1734,11 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-command-budget-r152.md`.
 - **Ringing schedule-removal checkpoint (2026-08-10):** removal now persists a terminal acknowledgement, queues Music Stop, and cancels pending snooze children before
   deleting the schedule; `.90` passed: `docs/platform/evidence/WL-FUNC-022-2026-08-10-ringing-schedule-removal-r128.md`.
+- **Audio replay cursor monotonicity checkpoint (2026-08-10):** Clock action and
+  Music audio-status replay boundaries advance only for newer Bus ULIDs, so
+  stale or reordered status delivery cannot regress a consumed cursor; focused
+  farm result is recorded in
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-audio-replay-cursor-monotonic-r195.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Clock documentation/package hard-cut checkpoint (2026-08-09):** the visible
