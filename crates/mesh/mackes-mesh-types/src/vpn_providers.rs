@@ -144,8 +144,9 @@ impl Provider {
 /// host. Fetched *through the tunnel*, it reports the observed public IP.
 pub const NEUTRAL_EXIT_CHECK_HOST: &str = "https://ipinfo.io/json";
 
-/// The operator-supplied inputs for a WireGuard-based provider setup. The
-/// secret material (the private key) is referenced, not inlined into the durable
+/// The operator-supplied inputs for a WireGuard-based provider setup.
+///
+/// Secret material (the private key) is referenced, not inlined into the durable
 /// [`TunnelDef`]; the rendered config (which DOES contain the key) is handed to
 /// the secret store for age-encryption + distribution (VPN-GW-2/3).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,10 +175,11 @@ pub struct WgSetup {
     pub preshared_key: String,
 }
 
-/// A produced tunnel: the [`TunnelDef`] for the durable config + the rendered
-/// secret material (a `WireGuard` `.conf` body or an `.ovpn` body) to hand to the
-/// secret store. The secret is kept OUT of the `TunnelDef` (which only carries a
-/// `creds_ref`); callers age-encrypt `secret` and set `def.creds_ref`.
+/// A produced tunnel: the [`TunnelDef`] for the durable config plus rendered
+/// secret material.
+///
+/// A `WireGuard` `.conf` or `.ovpn` body is handed to the secret store. The
+/// secret stays out of the [`TunnelDef`], which carries only a `creds_ref`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProducedTunnel {
     /// The durable definition (no secret material).
@@ -325,8 +327,9 @@ fn normalize_endpoint(endpoint: &str, default_port: u16) -> Result<String, Adapt
     }
 }
 
-/// Build a `WireGuard` adapter setup for a first-class provider (or generic-wg),
-/// producing a `wg-quick` config + the [`TunnelDef`]. The five providers share
+/// Build a `WireGuard` adapter setup for a first-class provider (or generic-wg).
+///
+/// It produces a `wg-quick` config + the [`TunnelDef`]. The five providers share
 /// the `WireGuard` config shape; only the defaults (port, label, verification
 /// host) differ — captured by [`Provider`]. Pure + deterministic.
 ///
@@ -393,8 +396,10 @@ pub fn build_wg(provider: Provider, setup: &WgSetup) -> Result<ProducedTunnel, A
     })
 }
 
-/// Render a `wg-quick(8)` interface config from a [`WgSetup`]. `endpoint` is the
-/// already-normalized `host:port`. `AllowedIPs = 0.0.0.0/0, ::/0` routes ALL
+/// Render a `wg-quick(8)` interface config from a [`WgSetup`].
+/// The `endpoint` is the already-normalized `host:port`.
+///
+/// `AllowedIPs = 0.0.0.0/0, ::/0` routes ALL
 /// egress through the tunnel (the gateway carves out Nebula's overlay subnet via
 /// policy-routing — VPN-GW-3 — not here). Pure string rendering.
 #[must_use]
@@ -434,8 +439,10 @@ fn normalize_dns(dns: &str) -> String {
     out.join(", ")
 }
 
-/// A parsed `WireGuard` config (the "paste any WG config" generic path). Captures
-/// just the fields the adapter needs to (a) sanity-check the paste and (b)
+/// A parsed `WireGuard` config (the "paste any WG config" generic path).
+///
+/// It captures just the fields the adapter needs to (a) sanity-check the paste
+/// and (b)
 /// derive a [`WgSetup`] so the same render/standup path is reused.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedWgConf {
@@ -455,14 +462,18 @@ pub struct ParsedWgConf {
     pub allowed_ips: String,
 }
 
-/// Parse a pasted `WireGuard` `.conf` (the generic path). Tolerant of comments
-/// (`#`/`;`), blank lines, and `key=value` with surrounding spaces; section
+/// Parse a pasted `WireGuard` `.conf` (the generic path).
+///
+/// The parser tolerates comments (`#`/`;`), blank lines, and `key=value` with
+/// surrounding spaces; section
 /// headers (`[Interface]`/`[Peer]`) are honored so a `PublicKey` under `[Peer]`
-/// isn't confused with an interface key. Pure.
+/// isn't confused with an interface key.
+///
+/// This parser is pure.
 ///
 /// # Errors
-/// [`AdapterError`] if the required `WireGuard` fields (`PrivateKey`, Address, the
-/// peer `PublicKey`, Endpoint) are absent — an unusable paste is caught here.
+/// [`AdapterError`] if required `WireGuard` fields are absent. An unusable paste
+/// is caught here.
 pub fn parse_wg_conf(text: &str) -> Result<ParsedWgConf, AdapterError> {
     #[derive(PartialEq)]
     enum Section {
@@ -521,6 +532,7 @@ pub fn parse_wg_conf(text: &str) -> Result<ParsedWgConf, AdapterError> {
 }
 
 /// The "paste a WG config" path: parse the pasted config, then run it through
+///
 /// the same `WireGuard` adapter so the produced tunnel is identical in shape to a
 /// first-class one. `id`/`server` are operator-supplied (the paste has no tunnel
 /// id). `provider` tags the result — usually [`Provider::GenericWg`], but a
@@ -661,9 +673,11 @@ pub fn parse_ovpn(text: &str) -> Result<ParsedOvpn, AdapterError> {
     Ok(p)
 }
 
-/// The generic "import any .ovpn" path: parse the `.ovpn`, then build the
-/// [`TunnelDef`] + carry the verbatim `.ovpn` body as the secret. `id`/`server`
-/// operator-supplied. Tagged `provider = "generic-ovpn"`, method `Ovpn`.
+/// The generic path for importing any `.ovpn` file.
+///
+/// It builds the [`TunnelDef`] and carries the verbatim body as the secret.
+/// `id` and `server` are operator-supplied. The result is tagged with the
+/// `generic-ovpn` provider and `Ovpn` method.
 ///
 /// # Errors
 /// [`AdapterError`] from [`parse_ovpn`] or from the produced def's validation.
@@ -694,7 +708,9 @@ pub fn import_ovpn(id: &str, server: &str, ovpn: &str) -> Result<ProducedTunnel,
 }
 
 /// The exit-IP check target for a produced tunnel's provider: the provider's
-/// first-party reflector where one exists, else the neutral reflector. The
+/// first-party reflector where one exists, else the neutral reflector.
+///
+/// The
 /// daemon-side verifier curls this *through the tunnel* and compares the
 /// reported IP to the WAN IP (different ⇒ egress really goes out the tunnel).
 #[must_use]

@@ -1028,9 +1028,7 @@ fn decode_bounded_base64(
         let b = base64_value(chunk[1]).ok_or(WeatherContractError::InvalidField(field))?;
         let c_padding = chunk[2] == b'=';
         let d_padding = chunk[3] == b'=';
-        if c_padding && !d_padding
-            || (!final_chunk && (c_padding || d_padding))
-            || (c_padding && b & 0x0f != 0)
+        if (c_padding && !d_padding) || (d_padding && !final_chunk) || (c_padding && b & 0x0f != 0)
         {
             return Err(WeatherContractError::InvalidField(field));
         }
@@ -1064,7 +1062,7 @@ fn decode_bounded_base64(
     Ok(decoded)
 }
 
-fn base64_value(value: u8) -> Option<u8> {
+const fn base64_value(value: u8) -> Option<u8> {
     match value {
         b'A'..=b'Z' => Some(value - b'A'),
         b'a'..=b'z' => Some(value - b'a' + 26),
