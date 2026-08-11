@@ -112,6 +112,8 @@ def freeze_file(
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size == 0:
             refuse(f"required artifact is not a non-empty regular file: {source}")
+        if before.st_nlink != 1:
+            refuse(f"required artifact must have exactly one filesystem link: {source}")
         if before.st_size > MAX_RPM:
             refuse(f"artifact exceeds the finalizer input bound: {source.name}")
         value = hashlib.sha256()
@@ -324,6 +326,8 @@ def digest_opened_file(path: Path, descriptor: int) -> str:
     before = os.fstat(descriptor)
     if not stat.S_ISREG(before.st_mode) or before.st_size == 0:
         refuse(f"required artifact is not a non-empty regular file: {path}")
+    if before.st_nlink != 1:
+        refuse(f"required artifact must have exactly one filesystem link: {path}")
     value = hashlib.sha256()
     with os.fdopen(descriptor, "rb", closefd=False) as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -868,12 +872,16 @@ def self_test() -> None:
             raise AssertionError("no-replace publication altered source or destination")
         hostile_source = root / "hostile-producer"
         hostile_snapshot = root / "hostile-snapshot"
+        clean_snapshot = root / "clean-snapshot"
         hostile_source.mkdir()
         (hostile_source / "validated.rpm").write_bytes(b"validated producer bytes")
+        os.link(hostile_source / "validated.rpm", hostile_source / "validated-alias.rpm")
         frozen_files: list[FrozenFile] = []
         frozen_directories: list[FrozenDirectory] = []
-        freeze_directory(hostile_source, hostile_snapshot, frozen_files, frozen_directories)
-        if digest(hostile_snapshot / "validated.rpm") != digest(hostile_source / "validated.rpm"):
+        rejected(lambda: freeze_directory(hostile_source, hostile_snapshot, frozen_files, frozen_directories))
+        (hostile_source / "validated-alias.rpm").unlink()
+        freeze_directory(hostile_source, clean_snapshot, frozen_files, frozen_directories)
+        if digest(clean_snapshot / "validated.rpm") != digest(hostile_source / "validated.rpm"):
             raise AssertionError("input snapshot did not preserve the validated bytes")
         replacement = root / "replacement.rpm"
         replacement.write_bytes(b"hostile replacement bytes")
@@ -903,9 +911,9 @@ def self_test() -> None:
         replacement.write_bytes(b"verified signed rpm")
         os.replace(replacement, sealed_artifacts / "signed.rpm")
         rejected(lambda: recheck_frozen_inputs(sealed_files, sealed_directories))
-    if failures != 17:
-        raise AssertionError(f"expected 17 hostile refusals, saw {failures}")
-    print("Surface stack finalizer self-test passed (17 hostile fixtures rejected)")
+    if failures != 18:
+        raise AssertionError(f"expected 18 hostile refusals, saw {failures}")
+    print("Surface stack finalizer self-test passed (18 hostile fixtures rejected)")
 
 
 def parser() -> argparse.ArgumentParser:
