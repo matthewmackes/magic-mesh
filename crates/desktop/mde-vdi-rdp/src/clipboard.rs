@@ -334,8 +334,10 @@ impl CliprdrBackend for TextCliprdrBackend {
                 return;
             }
             let Some(format) = state.pending_remote_request.take() else {
-                state.remote_text = None;
-                state.remote_html = None;
+                // CLIPRDR has no response nonce.  Once a response has been
+                // admitted, an unsolicited duplicate is only a replay; it
+                // must not erase the already-published value or turn a
+                // successful transfer into an unexplained empty clipboard.
                 return;
             };
             if response.is_error() {
@@ -757,6 +759,23 @@ mod tests {
             .take_local_data_response()
             .expect("fail-closed response")
             .is_error());
+    }
+
+    #[test]
+    fn duplicate_remote_response_cannot_erase_admitted_clipboard() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        backend.on_remote_copy(&[UNICODE_TEXT_FORMAT]);
+        assert_eq!(
+            bridge.take_remote_format_request(),
+            Some(ClipboardFormatId::CF_UNICODETEXT)
+        );
+
+        backend.on_format_data_response(FormatDataResponse::new_unicode_string("admitted"));
+        // CLIPRDR supplies no response nonce, so a duplicate callback can
+        // arrive before the accepted value has been consumed by the caller.
+        // It is not authorized to clear that successful transfer.
+        backend.on_format_data_response(FormatDataResponse::new_unicode_string("replay"));
+        assert_eq!(bridge.take_remote_text().as_deref(), Some("admitted"));
     }
 
     #[test]

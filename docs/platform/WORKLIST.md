@@ -781,6 +781,10 @@ behavioral evidence is not completion.
   negotiation, CF_HTML offset validation, and stale/replacement refusal; four
   focused exact `.50` tests pass:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-cf-html-r125.md`.
+- **RDP duplicate-response checkpoint (2026-08-10):** an unsolicited CLIPRDR
+  format-data response is now treated as a replay and cannot erase an already
+  admitted clipboard value; the focused exact farm regression is recorded in
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-duplicate-response-r194.md`.
 - **RDP image materialization checkpoint (2026-08-10):** host-to-guest PNG/JPEG
   now crosses the one-use permission gate through an exact lease/command-bound,
   root-local Files descriptor authority, bounded decode, and validated
