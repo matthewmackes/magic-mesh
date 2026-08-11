@@ -6,6 +6,8 @@
 
 /// Default libvirt network for managed Workload VMs.
 pub const DEFAULT_NETWORK: &str = "default";
+/// Managed VM overlay root. Domain XML must never attach a path outside it.
+const MANAGED_VM_ROOT: &str = "/var/lib/mde-vms";
 
 /// Bound virtio-net queue fan-out so a large admitted VM cannot turn one NIC
 /// into an unbounded host task/FD multiplier. Eight queues are enough to spread
@@ -37,6 +39,8 @@ pub enum VmDomainSpecError {
     EmptyResources,
     /// The host must retain one CPU lane for Dom0 and QEMU services.
     NoDom0Reserve,
+    /// The disk attachment is outside the reconciler-owned VM pool.
+    UnsafeDiskPath,
 }
 
 impl std::fmt::Display for VmDomainSpecError {
@@ -44,6 +48,9 @@ impl std::fmt::Display for VmDomainSpecError {
         match self {
             Self::EmptyResources => formatter.write_str("VM resources must be non-zero"),
             Self::NoDom0Reserve => formatter.write_str("VM requires one host CPU reserved for Dom0"),
+            Self::UnsafeDiskPath => {
+                formatter.write_str("VM disk attachment is outside the managed VM pool")
+            }
         }
     }
 }
@@ -104,6 +111,21 @@ pub fn build_domain_xml(
     disk_path: &str,
 ) -> Result<String, VmDomainSpecError> {
     spec.validate()?;
+    let disk = std::path::Path::new(disk_path);
+    let managed_root = std::path::Path::new(MANAGED_VM_ROOT);
+    if !disk.is_absolute()
+        || !disk.starts_with(managed_root)
+        || disk.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || disk.parent() != Some(managed_root)
+        || disk.extension().and_then(|extension| extension.to_str()) != Some("qcow2")
+    {
+        return Err(VmDomainSpecError::UnsafeDiskPath);
+    }
     let guest_cpuset = format!("1-{}", spec.host_threads - 1);
     let cpu_tune = {
         format!(
@@ -255,6 +277,31 @@ mod tests {
             build_domain_xml(&spec, "/var/lib/mde-vms/overcommitted.qcow2"),
             Err(VmDomainSpecError::NoDom0Reserve)
         );
+    }
+
+    #[test]
+    fn definition_refuses_disk_attachment_outside_managed_pool() {
+        let spec = VmDomainSpec {
+            name: "unsafe-disk".into(),
+            vcpus: 1,
+            ram_mb: 1024,
+            host_threads: 2,
+            network: None,
+        };
+
+        for path in [
+            "/var/lib/mde-vms/../etc/shadow.qcow2",
+            "/var/lib/mde-vms/nested/guest.qcow2",
+            "/tmp/guest.qcow2",
+            "var/lib/mde-vms/guest.qcow2",
+            "/var/lib/mde-vms/guest.raw",
+        ] {
+            assert_eq!(
+                build_domain_xml(&spec, path),
+                Err(VmDomainSpecError::UnsafeDiskPath),
+                "unsafe disk path must be rejected: {path}"
+            );
+        }
     }
 
     #[test]
