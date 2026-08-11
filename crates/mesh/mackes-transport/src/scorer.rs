@@ -230,7 +230,9 @@ pub fn score(
     let scored: Vec<(f32, TransportKind)> = candidates
         .iter()
         .map(|s| {
-            let base = *rank_of.get(&s.kind).unwrap_or(&99) as f32;
+            let base = f32::from(
+                u16::try_from(*rank_of.get(&s.kind).unwrap_or(&99)).unwrap_or(u16::MAX),
+            );
             let weighted = base * class_weight;
             // Degraded penalty must dominate any base*weight
             // outcome so a Degraded transport always loses to a
@@ -247,7 +249,7 @@ pub fn score(
                 HealthState::Down => 1000.0,
             };
             let flap = if s.recent_failures > 0 {
-                policy.flap_penalty * s.recent_failures.min(4) as f32
+                policy.flap_penalty * f32::from(s.recent_failures.min(4) as u8)
             } else {
                 0.0
             };

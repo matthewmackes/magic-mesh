@@ -84,10 +84,11 @@ impl EncryptionKind {
         match kind {
             // Nebula tunnel cipher (§3): AES-256-GCM (relay paths may
             // negotiate ChaCha20-Poly1305 — equal rank either way).
-            crate::TransportKind::NebulaDirect => Self::Aes256Gcm,
             crate::TransportKind::NebulaLighthouseRelay => Self::ChaCha20Poly1305,
             // TLS 1.3 inside the overlay.
-            crate::TransportKind::NebulaHttps443 | crate::TransportKind::KdcTls => Self::Aes256Gcm,
+            crate::TransportKind::NebulaDirect
+            | crate::TransportKind::NebulaHttps443
+            | crate::TransportKind::KdcTls => Self::Aes256Gcm,
         }
     }
 }

@@ -61,7 +61,7 @@ pub async fn run_conformance(
     }
 
     // C2: capabilities() is stable across calls.
-    if !c2_capabilities_stable(transport).await {
+    if !c2_capabilities_stable(transport) {
         report.add("C2_capabilities_stable");
     }
 
@@ -103,7 +103,7 @@ pub async fn run_conformance(
 
     // C10: capabilities() reports `carries.control == true`.
     // Every transport must carry control messages — KDC2 lock.
-    if !c10_carries_control(transport).await {
+    if !c10_carries_control(transport) {
         report.add("C10_carries_control");
     }
 
@@ -113,7 +113,7 @@ pub async fn run_conformance(
     }
 
     // C12: Capabilities's label is non-empty.
-    if !c12_capabilities_label_non_empty(transport).await {
+    if !c12_capabilities_label_non_empty(transport) {
         report.add("C12_capabilities_label_non_empty");
     }
 
@@ -123,7 +123,7 @@ pub async fn run_conformance(
     }
 
     // C14: TransportKind matches via Display + serde token.
-    if !c14_kind_token_matches(transport).await {
+    if !c14_kind_token_matches(transport) {
         report.add("C14_kind_token_matches");
     }
 
@@ -162,7 +162,7 @@ async fn c1_kind_stable(t: &dyn Transport) -> bool {
     k1 == k2
 }
 
-async fn c2_capabilities_stable(t: &dyn Transport) -> bool {
+fn c2_capabilities_stable(t: &dyn Transport) -> bool {
     let c1 = t.capabilities();
     let c2 = t.capabilities();
     c1 == c2
@@ -213,7 +213,7 @@ async fn c9_open_idempotent_or_distinct(t: &dyn Transport, f: &dyn ConformanceFi
     !c1.is_empty() && !c2.is_empty()
 }
 
-async fn c10_carries_control(t: &dyn Transport) -> bool {
+fn c10_carries_control(t: &dyn Transport) -> bool {
     t.capabilities().carries.carries(MessageClass::Control)
 }
 
@@ -221,7 +221,7 @@ async fn c11_degraded_probe(t: &dyn Transport, f: &dyn ConformanceFixture) -> bo
     matches!(t.probe(f.degraded_peer_id()).await, HealthState::Degraded)
 }
 
-async fn c12_capabilities_label_non_empty(t: &dyn Transport) -> bool {
+fn c12_capabilities_label_non_empty(t: &dyn Transport) -> bool {
     !t.capabilities().label.is_empty()
 }
 
@@ -231,7 +231,7 @@ async fn c13_probe_idempotent(t: &dyn Transport, f: &dyn ConformanceFixture) -> 
     h1 == h2
 }
 
-async fn c14_kind_token_matches(t: &dyn Transport) -> bool {
+fn c14_kind_token_matches(t: &dyn Transport) -> bool {
     let k = t.kind();
     let display = format!("{k}");
     let as_str = k.as_str();
