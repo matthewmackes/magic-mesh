@@ -1210,6 +1210,10 @@ impl ClockWorker {
             return Ok(());
         };
         for pending in self.store.pending_audio(&self.node_id)? {
+            // The outbox is durable, but the Bus generation is not. Re-check
+            // before spending work on a signed publication and again after
+            // signing so a replaced index cannot receive a stale request.
+            transaction.verify_current()?;
             if self
                 .audio_last_sent_ms
                 .get(&pending.request_id)
@@ -1246,7 +1250,9 @@ impl ClockWorker {
             )
             .map_err(anyhow::Error::msg)?;
             ClockAudioRequestV1::from_json_at(signed.as_bytes(), now_ms)?;
+            transaction.verify_current()?;
             transaction.write(CLOCK_AUDIO_ACTION_TOPIC, &signed)?;
+            transaction.verify_current()?;
             self.audio_last_sent_ms.insert(pending.request_id, now_ms);
         }
         Ok(())
@@ -3175,9 +3181,12 @@ mod tests {
         std::fs::remove_dir_all(&state_root).unwrap();
         std::fs::write(&state_root, b"blocks Clock state publication").unwrap();
         assert!(fixture.worker.tick_once().is_err());
-        assert_eq!(fixture.worker.action_cursor, first_cursor);
-        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 2);
-        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().schedules.len(), 1);
+        // The SQLite authority commit may win before Bus publication fails.
+        // Adopt its cursor so the next sweep repairs publication without
+        // replaying the already durable command.
+        assert!(fixture.worker.action_cursor > first_cursor);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 3);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().schedules.len(), 2);
 
         std::fs::remove_file(&state_root).unwrap();
         fixture.worker.tick_once().unwrap();
