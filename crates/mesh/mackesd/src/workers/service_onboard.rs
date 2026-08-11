@@ -63,6 +63,10 @@ pub const SERVICE_ONBOARD_NODE_SCOPE: &str = "service-onboard";
 /// Current wire schema for service-add actions.
 pub const SERVICE_ACTION_SCHEMA_VERSION: u64 = 1;
 
+/// Bound the caller-controlled correlation identity before it reaches the
+/// authenticated action target or durable event echo.
+const MAX_SERVICE_ACTION_ID_BYTES: usize = 128;
+
 /// Poll cadence. The bus read is a cheap local log scan and a service add is a
 /// slow, operator-paced event, so the 2 s `session_broker` cadence is responsive
 /// without spinning.
@@ -136,7 +140,24 @@ const fn default_service_action_schema_version() -> u64 {
 /// # Errors
 /// A human-readable message on malformed JSON.
 pub fn parse_action(body: &str) -> Result<ServiceAddAction, String> {
-    serde_json::from_str(body).map_err(|e| format!("malformed service-add action: {e}"))
+    let action: ServiceAddAction =
+        serde_json::from_str(body).map_err(|e| format!("malformed service-add action: {e}"))?;
+    if action.schema_version != SERVICE_ACTION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported service-add action schema version {}",
+            action.schema_version
+        ));
+    }
+    if action.id.is_empty()
+        || action.id.len() > MAX_SERVICE_ACTION_ID_BYTES
+        || !action
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+    {
+        return Err("service-add action id is invalid".to_string());
+    }
+    Ok(action)
 }
 
 /// The typed [`ServiceError`] on the wire — the same two variants, tagged on
@@ -718,6 +739,22 @@ mod tests {
         assert!(m.sip.is_none());
         assert!(!m.dry_run);
         assert!(parse_action("not json").is_err());
+    }
+
+    #[test]
+    fn action_parser_rejects_future_schema_and_unbounded_correlation_ids() {
+        assert!(parse_action(r#"{"schema_version":2,"id":"svc-1","kind":"files"}"#)
+            .is_err());
+        assert!(parse_action(r#"{"schema_version":1,"id":"","kind":"files"}"#).is_err());
+        assert!(parse_action(
+            &format!(
+                r#"{{"schema_version":1,"id":"{}","kind":"files"}}"#,
+                "x".repeat(MAX_SERVICE_ACTION_ID_BYTES + 1)
+            )
+        )
+        .is_err());
+        assert!(parse_action(r#"{"schema_version":1,"id":"svc/escape","kind":"files"}"#)
+            .is_err());
     }
 
     #[test]

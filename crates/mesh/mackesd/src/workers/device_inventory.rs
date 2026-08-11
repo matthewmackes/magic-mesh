@@ -764,6 +764,12 @@ const MAX_DRM_CONNECTORS: usize = 128;
 const MAX_DRM_CONNECTOR_MODES: usize = 16;
 /// Maximum thermal and hwmon entities retained in one inventory generation.
 const MAX_SENSOR_DEVICES: usize = 128;
+/// Maximum power-supply entities retained in one inventory generation.
+///
+/// Power supplies are kernel class entries, but the inventory is a bounded
+/// mesh artifact.  Keep admission deterministic so a malformed or hostile
+/// class tree cannot expand one host's published hardware state without limit.
+const MAX_POWER_SUPPLIES: usize = 64;
 
 /// Read at most `limit` lexicographically first children with bounded memory.
 fn sorted_children_bounded(dir: &Path, limit: usize) -> Vec<PathBuf> {
@@ -1021,7 +1027,10 @@ fn short_node(path: Option<&str>) -> String {
 #[must_use]
 pub fn power_supplies(roots: &SysfsRoots) -> Vec<DeviceRecord> {
     let mut out = Vec::new();
-    for dir in sorted_children(&roots.sys.join("class").join("power_supply")) {
+    for dir in sorted_children_bounded(
+        &roots.sys.join("class").join("power_supply"),
+        MAX_POWER_SUPPLIES,
+    ) {
         let node = dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -1590,6 +1599,25 @@ mod tests {
         assert!(!serde_json::to_string(&records)
             .unwrap()
             .contains("credential-like"));
+    }
+
+    #[test]
+    fn power_supplies_are_bounded_and_deterministically_admitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let power = roots.sys.join("class/power_supply");
+        for index in 0..MAX_POWER_SUPPLIES.saturating_add(16) {
+            let supply = power.join(format!("supply-{index:03}"));
+            put(&supply.join("type"), "Battery\n");
+            put(&supply.join("model_name"), &format!("Model {index}\n"));
+            put(&supply.join("capacity"), "82\n");
+            put(&supply.join("status"), "Discharging\n");
+        }
+
+        let records = power_supplies(&roots);
+        assert_eq!(records.len(), MAX_POWER_SUPPLIES);
+        assert_eq!(records[0].name, "Model 0");
+        assert_eq!(records.last().unwrap().name, "Model 63");
     }
 
     #[test]

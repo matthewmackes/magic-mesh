@@ -1223,6 +1223,13 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Fresh-probe action projection (2026-08-11):** advertised-only and stale service rows expose no action; only fresh probe-confirmed rows receive one; `.90` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-11-service-action-fresh-probe-r217.md`.
+- **Android readiness action projection (2026-08-11):** catalog Start remains
+  visible as evidence but is unavailable until live guest readiness; `.90`
+  passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-11-android-readiness-action-r220.md`.
+- **Service action schema admission (2026-08-11):** future schemas and unsafe
+  correlation IDs fail before capability targeting; `.50` passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-11-service-action-schema-r220.md`.
 - **Service-action admission checkpoint (2026-08-10):** ready service actions fail closed when authentication, target identity,
   issuance, expiry, or ambiguity checks do not hold;
   seat 50 passed:
@@ -2337,6 +2344,10 @@ behavioral evidence is not completion.
 - **Unavailable control all-verbs admission (2026-08-11):** unresolved provider state blocks Enable, Disable, Reload Module, and Rescan Bus without sysfs mutation;
   BigBoy passed:
   `docs/platform/evidence/WL-UX-011-2026-08-11-unavailable-control-all-verbs-r217.md`.
+- **Power-supply inventory bound (2026-08-11):** published power-supply
+  entities are capped at 64 in deterministic lexical order; `.50` passed the
+  oversized fixture:
+  `docs/platform/evidence/WL-UX-011-2026-08-11-power-supply-bound-r220.md`.
 - **Device-control cancellation checkpoint (2026-08-09):** a signed cancellation
   can atomically claim only the exact still-pending request; late/refused
   cancellation cannot replace its eventual execution result, and the shell

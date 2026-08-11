@@ -1461,8 +1461,15 @@ fn android_start_action(observed: u64, expires: u64) -> ResourceAction {
         verb: ResourceActionVerb::Start,
         target: ResourceActionTarget::Resource,
         availability: ActionAvailability {
-            status: ActionAvailabilityStatus::Ready,
-            failure: None,
+            // A signed catalog proves that this app/workload pairing is
+            // governed, but it does not prove that the guest is booted and
+            // launcher-ready. Keep Start visible as evidence while making
+            // the browser's executable-action projection truthful.
+            status: ActionAvailabilityStatus::Unavailable,
+            failure: Some(failure(
+                FailureCode::NotObserved,
+                "Android guest readiness has not been observed",
+            )),
         },
         issued_at_ms: observed,
         expires_at_ms: expires,
@@ -1999,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn android_catalog_cards_bind_exact_workload_and_ready_start_action() {
+    fn android_catalog_cards_bind_exact_workload_and_gate_unobserved_start_action() {
         let mut adapted = AdaptedSources::default();
         let body = serde_json::to_string(&android_catalog()).unwrap();
         let cloud = android_cloud_state(&["android-vm-b", "android-vm-a"]);
@@ -2026,8 +2033,11 @@ mod tests {
                         verb: ResourceActionVerb::Start,
                         target: ResourceActionTarget::Resource,
                         availability: ActionAvailability {
-                            status: ActionAvailabilityStatus::Ready,
-                            failure: None,
+                            status: ActionAvailabilityStatus::Unavailable,
+                            failure: Some(FailureReason {
+                                code: FailureCode::NotObserved,
+                                message: "Android guest readiness has not been observed".into(),
+                            }),
                         },
                         issued_at_ms: NOW,
                         expires_at_ms: NOW + 60_000,
