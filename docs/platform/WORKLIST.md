@@ -2610,6 +2610,10 @@ behavioral evidence is not completion.
   production and exact 15-second critical dwell; unknown grades fail closed. Machines 9, 194, and 196 passed focused gates:
   `docs/platform/evidence/WL-UX-014-2026-08-09-shared-health-kiron-contract-r4.md`,
   `docs/platform/evidence/WL-UX-013-WL-UX-014-2026-08-09-grade-e-authority-r5.md`.
+- **Future-timestamp admission checkpoint (2026-08-10):** the ToastHost health
+  boundary refuses a KIRON alert whose lifecycle start or observation timestamp
+  is ahead of the seat clock; the focused hostile regression is recorded in
+  `docs/platform/evidence/WL-UX-014-2026-08-10-future-timestamp-admission-r194.md`.
 - Remaining work:
   1. S1 Freeze authority, payload, and queue.
      - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.

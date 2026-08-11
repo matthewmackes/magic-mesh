@@ -149,15 +149,34 @@ fn health_kiron_toast(alert: HealthKironAlert) -> Toast {
 /// malformed body — a bad emitter never crashes the shell (it's silently dropped,
 /// same as the Clipboard / Notifications tails).
 fn decode(body: &str) -> Option<Toast> {
+    decode_at(body, current_unix_ms())
+}
+
+/// Decode at an explicit clock value so the health lower-third admission rule
+/// can be tested without depending on wall-clock timing.
+fn decode_at(body: &str, now_ms: u64) -> Option<Toast> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     if value.get("kind").and_then(serde_json::Value::as_str) == Some("health_kiron") {
         let alert: HealthKironAlert = serde_json::from_value(value).ok()?;
         alert.validate().ok()?;
+        // UX-014 must not animate an alert from the future: doing so would
+        // display a false lower third and make its duration/timeline depend on
+        // a publisher clock that is ahead of the seat. UX-013 remains the sole
+        // authority for the timestamps; this is presentation admission only.
+        if alert.active_since_ms > now_ms || alert.observed_at_ms > now_ms {
+            return None;
+        }
         return Some(health_kiron_toast(alert));
     }
     serde_json::from_value::<ToastMsg>(value)
         .ok()
         .map(ToastMsg::into_toast)
+}
+
+fn current_unix_ms() -> u64 {
+    u64::try_from(crate::timers::now_unix())
+        .unwrap_or_default()
+        .saturating_mul(1_000)
 }
 
 /// The alert severity a [`Toast`] carries, or `None` for the OSD tier (which never
@@ -1334,6 +1353,15 @@ mod tests {
     }
 
     fn health_kiron_body(grade: mackes_mesh_types::health::GradeLetter) -> String {
+        let now_ms = super::current_unix_ms();
+        health_kiron_body_at(grade, now_ms.saturating_sub(70_000), now_ms)
+    }
+
+    fn health_kiron_body_at(
+        grade: mackes_mesh_types::health::GradeLetter,
+        active_since_ms: u64,
+        observed_at_ms: u64,
+    ) -> String {
         let alert = mackes_mesh_types::health::HealthKironAlert {
             kind: mackes_mesh_types::health::HealthKironKind::HealthKiron,
             schema_version: mackes_mesh_types::health::HEALTH_KIRON_SCHEMA_VERSION,
@@ -1343,8 +1371,8 @@ mod tests {
             device: Some("nvme0n1".into()),
             grade,
             headline: "Storage pressure remains active".into(),
-            active_since_ms: 10_000,
-            observed_at_ms: 80_000,
+            active_since_ms,
+            observed_at_ms,
         };
         serde_json::to_string(&alert).expect("serialize shared health contract")
     }
@@ -1386,6 +1414,30 @@ mod tests {
         assert!(
             decode(&unsupported).is_none(),
             "typed health must not fall back to generic severity decoding"
+        );
+    }
+
+    #[test]
+    fn typed_health_marker_rejects_future_dated_lower_thirds() {
+        let now_ms = 1_000_000;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&health_kiron_body_at(
+                mackes_mesh_types::health::GradeLetter::D,
+                now_ms - 10_000,
+                now_ms - 1_000,
+            ))
+            .expect("valid health body");
+        value["observed_at_ms"] = serde_json::json!(now_ms + 1);
+        assert!(
+            super::decode_at(&value.to_string(), now_ms).is_none(),
+            "a future observation must not reach the cinematic lower third"
+        );
+
+        value["observed_at_ms"] = serde_json::json!(now_ms);
+        value["active_since_ms"] = serde_json::json!(now_ms + 1);
+        assert!(
+            super::decode_at(&value.to_string(), now_ms).is_none(),
+            "a future lifecycle start must not reach the cinematic lower third"
         );
     }
 
