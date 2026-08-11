@@ -1255,13 +1255,21 @@ impl SystemWorkloadActuator {
                 ))
             })?;
             let key = request.workload_id.as_str().to_owned();
-            if let Ok(attachments) = self.attachments.lock() {
-                if let Some(runtime) = attachments.get(&key) {
-                    if runtime.server.lease() == lease {
+            let stale_runtime = {
+                let mut attachments = self.attachments.lock().map_err(|_| {
+                    WorkloadActuatorError::Retryable("Display1 attachment store poisoned".into())
+                })?;
+                match attachments.get(&key) {
+                    Some(runtime) if runtime.server.lease() == lease => {
                         return Ok(Arc::clone(runtime));
                     }
+                    Some(_) => attachments.remove(&key),
+                    None => None,
                 }
-            }
+            };
+            // Dropping the evicted Arc outside the map lock joins its input
+            // relay and removes the old node-local socket before replacement.
+            drop(stale_runtime);
             let runtime = Display1AttachmentRuntime::start(&self.display1_root, lease.clone())?;
             self.attachments
                 .lock()
@@ -5908,6 +5916,45 @@ mod tests {
         assert_eq!(runtime.server.lease().generation, status.generation);
         assert!(runtime.server.lease().expires_at_ms > now);
         assert_ne!(runtime.server.lease(), status.attachment.as_ref().unwrap());
+    }
+
+    #[test]
+    fn conflicting_display1_runtime_is_evicted_before_recovery_replacement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let request = request();
+        let actuator = SystemWorkloadActuator::new(temp.path().join("state"))
+            .with_display1_root(temp.path().join("display1"));
+        let old_runtime = actuator
+            .ensure_attachment(&request, 1, now)
+            .expect("old server");
+        let old_socket = old_runtime.server.socket_path().to_path_buf();
+        let mut replacement_request = request.clone();
+        replacement_request.request_id = "op-2".into();
+        let replacement_lease = SystemWorkloadActuator::attachment_lease(
+            &replacement_request,
+            1,
+            now,
+        );
+        let mut status = queued_status(&request);
+        status.attachment = Some(replacement_lease.clone());
+        drop(old_runtime);
+
+        let replacement = actuator
+            .attachment_for_status(&request, &status, now)
+            .expect("replacement server");
+
+        assert!(!old_socket.exists());
+        assert_eq!(replacement.server.lease(), &replacement_lease);
+        assert!(replacement.server.socket_path().exists());
+        assert_eq!(
+            actuator
+                .attachments
+                .lock()
+                .expect("attachments")
+                .len(),
+            1
+        );
     }
 
     #[test]
