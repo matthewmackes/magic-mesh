@@ -1924,6 +1924,11 @@ behavioral evidence is not completion.
   reordered, or source-revision-mismatched gate manifest; the helper self-test
   covers both the canonical matrix and a hostile revision. Farm proof:
   `docs/platform/evidence/WL-CRIT-006-2026-08-10-production-matrix-identity-r190.md`.
+- **Required three-seat command boundary (2026-08-10):** the matrix verifier
+  now rejects both whitespace and equals-form `--inspect-seat` arguments in a
+  required seat command, preventing optional Eagle/T480 inspections from being
+  smuggled into the Dell/seat-15/Surface release baseline. Farm proof:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-10-three-seat-command-boundary-r196.md`.
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
      - Inputs: governance, current CI, all active P0/P1 epics.

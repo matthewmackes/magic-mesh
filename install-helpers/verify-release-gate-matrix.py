@@ -204,7 +204,9 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
                 fail(f"{label}.command must use the bounded three-seat collector")
             if "--required-baseline" not in command:
                 fail(f"{label}.command must explicitly select the required three-seat baseline")
-            if "--inspect-seat" in command:
+            # Reject both spellings: a required gate must never smuggle an
+            # optional-seat inspection into the release baseline.
+            if re.search(r"(?:^|\s)--inspect-seat(?:=|\s|$)", command):
                 fail(f"{label}.command cannot promote optional seat inspection to a required gate")
         evidence = gate["evidence_filename"]
         if not EVIDENCE_RE.fullmatch(evidence) or f"/{revision}/" not in evidence:
@@ -339,6 +341,15 @@ def self_test() -> None:
             index for index, gate in enumerate(value["gates"])
             if gate["scope_kind"] == "seat"
         )].__setitem__("command", "install-helpers/test-five-seat-core.py"),
+    )
+    case(
+        "equals-form optional seat inspection promoted to required gate",
+        lambda value: value["gates"][next(
+            index for index, gate in enumerate(value["gates"])
+            if gate["scope_kind"] == "seat"
+        )].__setitem__(
+            "command", "install-helpers/test-five-seat-core.py --required-baseline --inspect-seat=eagle"
+        ),
     )
     case("unknown category", lambda value: value["gates"][0]["categories"].append("implied"))
     case("optional required gate", lambda value: value["gates"][0].__setitem__("required", False))
