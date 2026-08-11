@@ -5,6 +5,11 @@
 //! catalog or inventory record cannot smuggle an executable, shell fragment,
 //! arbitrary component, URI, or intent extra across the Workloads boundary.
 
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "this established wire contract exposes validation errors through its typed Result APIs"
+)]
+
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -635,7 +640,7 @@ pub struct AndroidImagePackage {
 impl AndroidImagePackage {
     /// Construct a package entry from the canonical package identity.
     #[must_use]
-    pub fn for_app(app: AospStarterApp, version: AndroidPackageVersion) -> Self {
+    pub const fn for_app(app: AospStarterApp, version: AndroidPackageVersion) -> Self {
         Self {
             app,
             package_id: app.package_id(),
@@ -830,7 +835,7 @@ pub struct AndroidResourceProfile {
 
 impl AndroidResourceProfile {
     /// Validate non-zero ceilings against the production Android bounds.
-    pub fn validate(&self) -> Result<(), AndroidCatalogAdmissionError> {
+    pub const fn validate(&self) -> Result<(), AndroidCatalogAdmissionError> {
         if self.vcpus == 0
             || self.vcpus > MAX_ANDROID_VCPUS
             || self.memory_mib < 512
@@ -1115,7 +1120,7 @@ fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
     Some(decoded)
 }
 
-fn hex_nibble(byte: u8) -> Option<u8> {
+const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -1126,8 +1131,10 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 /// Closed state of the inner Android guest at inventory observation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AndroidGuestBootState {
     /// No guest observation has been admitted yet.
+    #[default]
     Pending,
     /// The outer VM is present and the inner guest is booting.
     Booting,
@@ -1137,11 +1144,6 @@ pub enum AndroidGuestBootState {
     Unavailable,
 }
 
-impl Default for AndroidGuestBootState {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 impl AndroidGuestBootState {
     /// Honest user-facing boot-state label.
@@ -1208,8 +1210,10 @@ impl AndroidUnavailableReason {
 /// Whether the closed MAIN + LAUNCHER entry was resolved in the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AndroidLauncherResolvability {
     /// No guest package/launcher observation has arrived.
+    #[default]
     Pending,
     /// The package manager resolved the canonical launcher entry.
     Resolved,
@@ -1217,11 +1221,6 @@ pub enum AndroidLauncherResolvability {
     Unavailable,
 }
 
-impl Default for AndroidLauncherResolvability {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// Bounded package version evidence from the Android guest package manager.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2193,22 +2192,21 @@ fn validate_workload_id(value: &str) -> Result<(), AndroidAppContractError> {
     }
 }
 
-fn validate_observation_pair(
+const fn validate_observation_pair(
     observed_at_unix_ms: Option<u64>,
     observation_age_ms: Option<u64>,
 ) -> Result<(), AndroidAppContractError> {
     match (observed_at_unix_ms, observation_age_ms) {
-        (None, None) => Ok(()),
         (Some(0), _) => Err(AndroidAppContractError::InvalidObservationTime),
         (Some(_), None) | (None, Some(_)) => Err(AndroidAppContractError::MissingObservation),
         (Some(_), Some(age)) if age > MAX_ANDROID_OBSERVATION_AGE_MS => {
             Err(AndroidAppContractError::InvalidObservationAge)
         }
-        (Some(_), Some(_)) => Ok(()),
+        (None, None) | (Some(_), Some(_)) => Ok(()),
     }
 }
 
-fn is_guest_unavailable_reason(reason: AndroidUnavailableReason) -> bool {
+const fn is_guest_unavailable_reason(reason: AndroidUnavailableReason) -> bool {
     !matches!(
         reason,
         AndroidUnavailableReason::PackageMissing | AndroidUnavailableReason::LauncherUnresolvable

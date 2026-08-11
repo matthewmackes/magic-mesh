@@ -11,6 +11,13 @@
     missing_docs,
     reason = "public field names are the documented versioned wire contract"
 )]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::too_long_first_doc_paragraph,
+    reason = "the versioned worker wire contract keeps established constructors and validation boundaries stable"
+)]
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
@@ -324,7 +331,7 @@ pub struct WorkerQueueContract {
 }
 
 impl WorkerQueueContract {
-    fn validate(&self, field: &'static str) -> Result<(), WorkerRuntimeContractError> {
+    const fn validate(&self, field: &'static str) -> Result<(), WorkerRuntimeContractError> {
         if self.max_items == 0 || self.max_bytes == 0 {
             return Err(WorkerRuntimeContractError::InvalidField(field));
         }
@@ -348,7 +355,7 @@ pub enum WorkerCachePolicy {
 }
 
 impl WorkerCachePolicy {
-    fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
+    const fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
         if let Self::Bounded {
             max_items,
             max_bytes,
@@ -378,7 +385,7 @@ pub struct WorkerResourceBudget {
 }
 
 impl WorkerResourceBudget {
-    fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
+    const fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
         if self.memory_high_bytes == 0
             || self.memory_max_bytes == 0
             || self.memory_high_bytes > self.memory_max_bytes
@@ -413,7 +420,7 @@ pub struct WorkerOwnership {
 }
 
 impl WorkerOwnership {
-    fn validate(&self, declared_group: WorkerGroup) -> Result<(), WorkerRuntimeContractError> {
+    fn validate(self, declared_group: WorkerGroup) -> Result<(), WorkerRuntimeContractError> {
         if self.state_group != declared_group
             || self.health_group != declared_group
             || self.action_group != declared_group
@@ -430,21 +437,13 @@ impl WorkerOwnership {
 /// that the worker applies to every node role unless configuration says otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct WorkerApplicability {
     pub roles: Vec<WorkerRole>,
     pub capabilities: Vec<String>,
     pub requires_configuration: bool,
 }
 
-impl Default for WorkerApplicability {
-    fn default() -> Self {
-        Self {
-            roles: Vec::new(),
-            capabilities: Vec::new(),
-            requires_configuration: false,
-        }
-    }
-}
 
 impl WorkerApplicability {
     fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
@@ -1871,7 +1870,7 @@ where
     serde_json::from_str(body).map_err(|_| WorkerRuntimeContractError::MalformedWire)
 }
 
-fn validate_schema(field: &'static str, found: u16) -> Result<(), WorkerRuntimeContractError> {
+const fn validate_schema(field: &'static str, found: u16) -> Result<(), WorkerRuntimeContractError> {
     if found != WORKER_RUNTIME_SCHEMA_VERSION {
         return Err(WorkerRuntimeContractError::UnsupportedSchema { field, found });
     }
@@ -2000,7 +1999,7 @@ fn validate_unique_topics(
     Ok(())
 }
 
-fn validate_timestamp(field: &'static str, value: u64) -> Result<(), WorkerRuntimeContractError> {
+const fn validate_timestamp(field: &'static str, value: u64) -> Result<(), WorkerRuntimeContractError> {
     if value == 0 {
         return Err(WorkerRuntimeContractError::InvalidTimestamp(field));
     }
@@ -2019,7 +2018,7 @@ fn validate_digest(field: &'static str, value: &str) -> Result<(), WorkerRuntime
     Ok(())
 }
 
-fn validate_state_reason(
+const fn validate_state_reason(
     state: WorkerRuntimeState,
     reason: Option<WorkerRuntimeReason>,
 ) -> Result<(), WorkerRuntimeContractError> {
@@ -2033,31 +2032,46 @@ fn validate_state_reason(
             "worker_runtime_snapshot.state_reason.unexpected",
         ));
     }
-    let valid = match (state, reason) {
-        (WorkerRuntimeState::NotApplicable, Some(WorkerRuntimeReason::NotApplicable)) => true,
-        (WorkerRuntimeState::Unconfigured, Some(WorkerRuntimeReason::NotConfigured)) => true,
-        (WorkerRuntimeState::Backoff, Some(WorkerRuntimeReason::CrashLoop))
-        | (WorkerRuntimeState::Backoff, Some(WorkerRuntimeReason::ResourceLimit))
-        | (WorkerRuntimeState::Backoff, Some(WorkerRuntimeReason::DependencyUnavailable)) => true,
-        (WorkerRuntimeState::Paused, Some(WorkerRuntimeReason::OperatorPaused)) => true,
-        (WorkerRuntimeState::Failed, Some(WorkerRuntimeReason::CrashLoop))
-        | (WorkerRuntimeState::Failed, Some(WorkerRuntimeReason::DependencyUnavailable))
-        | (WorkerRuntimeState::Failed, Some(WorkerRuntimeReason::ProviderUnavailable))
-        | (WorkerRuntimeState::Failed, Some(WorkerRuntimeReason::Unknown)) => true,
-        (WorkerRuntimeState::Stale, Some(WorkerRuntimeReason::ObservationStale)) => true,
-        (WorkerRuntimeState::Unavailable, Some(WorkerRuntimeReason::CapabilityMissing))
-        | (WorkerRuntimeState::Unavailable, Some(WorkerRuntimeReason::DependencyUnavailable))
-        | (WorkerRuntimeState::Unavailable, Some(WorkerRuntimeReason::ProviderUnavailable))
-        | (WorkerRuntimeState::Unavailable, Some(WorkerRuntimeReason::ResourceLimit))
-        | (WorkerRuntimeState::Unavailable, Some(WorkerRuntimeReason::Unknown)) => true,
-        (
-            WorkerRuntimeState::Starting
-            | WorkerRuntimeState::Running
-            | WorkerRuntimeState::Stopped,
-            None,
-        ) => true,
-        _ => false,
-    };
+    let valid = matches!(
+        (state, reason),
+        (WorkerRuntimeState::NotApplicable, Some(WorkerRuntimeReason::NotApplicable))
+            | (WorkerRuntimeState::Unconfigured, Some(WorkerRuntimeReason::NotConfigured))
+            | (
+                WorkerRuntimeState::Backoff,
+                Some(
+                    WorkerRuntimeReason::CrashLoop
+                        | WorkerRuntimeReason::ResourceLimit
+                        | WorkerRuntimeReason::DependencyUnavailable,
+                ),
+            )
+            | (WorkerRuntimeState::Paused, Some(WorkerRuntimeReason::OperatorPaused))
+            | (
+                WorkerRuntimeState::Failed,
+                Some(
+                    WorkerRuntimeReason::CrashLoop
+                        | WorkerRuntimeReason::DependencyUnavailable
+                        | WorkerRuntimeReason::ProviderUnavailable
+                        | WorkerRuntimeReason::Unknown,
+                ),
+            )
+            | (WorkerRuntimeState::Stale, Some(WorkerRuntimeReason::ObservationStale))
+            | (
+                WorkerRuntimeState::Unavailable,
+                Some(
+                    WorkerRuntimeReason::CapabilityMissing
+                        | WorkerRuntimeReason::DependencyUnavailable
+                        | WorkerRuntimeReason::ProviderUnavailable
+                        | WorkerRuntimeReason::ResourceLimit
+                        | WorkerRuntimeReason::Unknown,
+                ),
+            )
+            | (
+                WorkerRuntimeState::Starting
+                    | WorkerRuntimeState::Running
+                    | WorkerRuntimeState::Stopped,
+                None,
+            )
+    );
     if valid {
         Ok(())
     } else {
