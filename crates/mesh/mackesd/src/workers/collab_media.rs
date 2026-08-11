@@ -243,7 +243,17 @@ fn candidate_matches_session(session: &CallMediaSession, adapter: CallMediaAdapt
             ),
         };
 
-    session.requirements == requirements && adapters.contains(&adapter)
+    session.requirements == requirements
+        && !session.candidate_adapters.is_empty()
+        && session
+            .candidate_adapters
+            .iter()
+            .enumerate()
+            .all(|(index, candidate)| {
+                adapters.contains(candidate)
+                    && !session.candidate_adapters[..index].contains(candidate)
+            })
+        && adapters.contains(&adapter)
 }
 
 fn row(
@@ -1028,6 +1038,47 @@ mod tests {
 
         let board =
             verify_call_media_readiness(&readiness, &providers).expect("verification board");
+
+        assert_eq!(board.rows.len(), 2);
+        assert!(board.rows.iter().all(|row| {
+            row.status == CallMediaVerificationStatus::MediaNotProven
+                && row.evidence.is_none()
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("do not match"))
+        }));
+    }
+
+    #[test]
+    fn verifier_refuses_duplicate_candidate_attribution_before_provider_probe() {
+        struct HostileProvider;
+        impl CallMediaFrameVerifier for HostileProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                panic!("duplicate candidate readiness must not consume provider evidence");
+            }
+        }
+
+        let mut session = ready_audio_session();
+        session.candidate_adapters = vec![
+            CallMediaAdapter::WebRtcP2p,
+            CallMediaAdapter::WebRtcP2p,
+        ];
+        let readiness = CallMediaReadiness {
+            local_actor: ActorId::new("alice"),
+            sessions: vec![session],
+        };
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, HostileProvider)
+            .expect("register hostile WebRTC provider");
+
+        let board = verify_call_media_readiness(&readiness, &providers)
+            .expect("duplicate readiness should be represented as failed proof");
 
         assert_eq!(board.rows.len(), 2);
         assert!(board.rows.iter().all(|row| {
