@@ -1719,6 +1719,13 @@ fn docked_geometry_for_catalog_with_sessions(
         (ControlKind::Back, None),
         (ControlKind::Home, None),
     ] {
+        // A short portrait/remote viewport may not have room for the complete
+        // fixed cluster. Admit controls one at a time so the Left rail never
+        // paints a hit target outside its owned display rect; the remaining
+        // catalog is handled by the bounded More path below.
+        if !docked_control_fits(screen, cursor_y) {
+            break;
+        }
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(
@@ -2775,6 +2782,40 @@ mod tests {
                 assert!(
                     !control.rect.intersects(other.rect),
                     "narrow taskbar controls overlap: {control:?} and {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_left_rail_admits_only_controls_inside_its_display_rect() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
+        let geometry = docked_geometry_for_catalog_with_sessions(
+            screen,
+            MAX_PINNED_SOURCES,
+            &default_taskbar_pins(),
+            &[SessionRailEntry::with_session_id(
+                "short-rail-session",
+                "Short rail desktop",
+                "LIVE",
+            )],
+        );
+
+        assert!(
+            geometry.controls.len() < 5,
+            "a short Left rail must shed fixed controls instead of painting below the display"
+        );
+        for (index, control) in geometry.controls.iter().enumerate() {
+            assert!(
+                geometry.outer.contains(control.rect.min)
+                    && geometry.outer.contains(control.rect.max),
+                "control {control:?} escaped the Left rail {outer:?}",
+                outer = geometry.outer
+            );
+            for other in geometry.controls.iter().skip(index + 1) {
+                assert!(
+                    !control.rect.intersects(other.rect),
+                    "short Left rail controls overlap: {control:?} and {other:?}"
                 );
             }
         }
