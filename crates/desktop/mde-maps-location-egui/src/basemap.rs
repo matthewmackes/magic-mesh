@@ -20,6 +20,10 @@
 //! too, so an absent tile is not re-queried each frame.
 
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use mde_egui::egui::{
     self, Color32, Context, FontId, Painter, Pos2, Rect, TextureHandle, TextureOptions,
@@ -116,6 +120,23 @@ pub struct BasemapMeta {
     pub mbtiles: PathBuf,
     /// Parsed region metadata.
     pub raw: RawMeta,
+    fingerprint: FileFingerprint,
+}
+
+/// Identity of the regular MBTiles file that supplied [`BasemapMeta`].
+///
+/// The renderer caches parsed metadata, but an operator can replace a region
+/// atomically while the shell is running. Keeping the file identity with the
+/// projection prevents a replaced bundle from inheriting stale bounds/zoom
+/// metadata until restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified_ns: u128,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
 }
 
 /// A filesystem region admitted as one unambiguous, catalog-compatible bundle.
@@ -354,6 +375,34 @@ pub fn read_meta(mbtiles: &Path) -> Option<RawMeta> {
     })
 }
 
+fn regular_file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(FileFingerprint {
+        len: metadata.len(),
+        modified_ns,
+        #[cfg(unix)]
+        dev: metadata.dev(),
+        #[cfg(unix)]
+        ino: metadata.ino(),
+    })
+}
+
+fn read_stable_meta(mbtiles: &Path) -> Option<(RawMeta, FileFingerprint)> {
+    let before = regular_file_fingerprint(mbtiles)?;
+    let raw = read_meta(mbtiles)?;
+    let after = regular_file_fingerprint(mbtiles)?;
+    (before == after).then_some((raw, after))
+}
+
 /// Parse an `MBTiles` `bounds` value `minlon,minlat,maxlon,maxlat`.
 fn parse_bounds(value: &str) -> Option<(f64, f64, f64, f64)> {
     let parts: Vec<f64> = value
@@ -421,21 +470,29 @@ fn decode_tile(bytes: &[u8]) -> Option<egui::ColorImage> {
 /// Resolve + cache the installed region metadata in `ctx` temp memory.
 ///
 /// Absence is *not* cached (re-discovered each frame) so a region installed
-/// mid-session appears without a restart; a resolved region is cached so the
-/// filesystem + metadata parse happen once.
+/// mid-session appears without a restart. A resolved region is reused only
+/// while its regular-file fingerprint is unchanged; atomic replacement causes
+/// fresh filesystem admission and metadata parsing without a restart.
 #[must_use]
 pub fn cached_meta(ctx: &Context) -> Option<BasemapMeta> {
+    cached_meta_in(ctx, &maps_roots())
+}
+
+fn cached_meta_in(ctx: &Context, roots: &[PathBuf]) -> Option<BasemapMeta> {
     let key = egui::Id::new("mde-maps-basemap-meta");
     if let Some(meta) = ctx.data_mut(|d| d.get_temp::<BasemapMeta>(key)) {
-        return Some(meta);
+        if regular_file_fingerprint(&meta.mbtiles) == Some(meta.fingerprint) {
+            return Some(meta);
+        }
     }
-    let installed = installed_region()?;
+    let installed = installed_region_in(roots)?;
     let mbtiles = installed.mbtiles?;
-    let raw = read_meta(&mbtiles)?;
+    let (raw, fingerprint) = read_stable_meta(&mbtiles)?;
     let meta = BasemapMeta {
         region: installed.id.as_str().to_owned(),
         mbtiles,
         raw,
+        fingerprint,
     };
     ctx.data_mut(|d| d.insert_temp(key, meta.clone()));
     Some(meta)
@@ -1093,6 +1150,36 @@ mod tests {
             vec![override_root],
             "MDE_MAPS_DIR must remain the exact operator/test override"
         );
+    }
+
+    #[test]
+    fn cached_metadata_reloads_after_atomic_mbtiles_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let region = root.path().join("east-texas");
+        std::fs::create_dir(&region).unwrap();
+        let mbtiles = region.join("east-texas.mbtiles");
+        synth_mbtiles(&mbtiles);
+
+        let ctx = Context::default();
+        let roots = vec![root.path().to_path_buf()];
+        let first = cached_meta_in(&ctx, &roots).expect("initial bundle admitted");
+        assert!((first.raw.center_lat - 32.168).abs() < 1e-6);
+
+        let replacement_dir = tempfile::tempdir().unwrap();
+        let replacement = replacement_dir.path().join("replacement.mbtiles");
+        synth_mbtiles(&replacement);
+        let conn = Connection::open(&replacement).unwrap();
+        conn.execute(
+            "UPDATE metadata SET value = ?1 WHERE name = 'center'",
+            ["-95.849,32.268,12"],
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::rename(replacement, &mbtiles).unwrap();
+
+        let second = cached_meta_in(&ctx, &roots).expect("replacement bundle admitted");
+        assert!((second.raw.center_lat - 32.268).abs() < 1e-6);
+        assert_ne!(first.fingerprint, second.fingerprint);
     }
 
     #[test]
