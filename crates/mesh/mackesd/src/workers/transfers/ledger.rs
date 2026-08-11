@@ -131,10 +131,7 @@ impl V2Ledger {
         if job.state != V2State::Queued {
             return Err(V2LedgerError::InitialState(job.state));
         }
-        if self.path(job.transfer).exists() {
-            return Err(V2LedgerError::Duplicate(job.transfer));
-        }
-        self.upsert(&job)
+        self.insert(&job)
     }
 
     /// Read one admitted V2 record. Corrupt/oversized/symlink records fail closed.
@@ -219,6 +216,26 @@ impl V2Ledger {
     }
 
     fn upsert(&self, job: &TransferJobV2) -> Result<(), V2LedgerError> {
+        self.write_record(job, false)
+    }
+
+    /// Install a new record without ever replacing an existing transfer id.
+    ///
+    /// A prior `exists` check followed by `rename` was vulnerable to two
+    /// concurrent/replayed admissions racing between those operations.  The
+    /// temporary file is fully written first, then a same-directory hard-link
+    /// provides the atomic no-replace commit; an existing record (including a
+    /// hostile symlink) wins the race and is never overwritten.
+    fn insert(&self, job: &TransferJobV2) -> Result<(), V2LedgerError> {
+        match self.write_record(job, true) {
+            Err(V2LedgerError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(V2LedgerError::Duplicate(job.transfer))
+            }
+            result => result,
+        }
+    }
+
+    fn write_record(&self, job: &TransferJobV2, no_replace: bool) -> Result<(), V2LedgerError> {
         let body = serde_json::to_string_pretty(job)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if body.len() > MAX_LEDGER_RECORD_BYTES {
@@ -229,7 +246,20 @@ impl V2Ledger {
         }
         let tmp = self.dir.join(format!(".{}.json.tmp", job.transfer));
         std::fs::write(&tmp, body)?;
-        std::fs::rename(tmp, self.path(job.transfer))?;
+        let result = if no_replace {
+            std::fs::hard_link(&tmp, self.path(job.transfer))
+        } else {
+            std::fs::rename(&tmp, self.path(job.transfer))
+        };
+        let cleanup = std::fs::remove_file(&tmp);
+        result?;
+        cleanup.or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
         Ok(())
     }
 }
@@ -534,10 +564,13 @@ mod tests {
         let id = job.transfer;
         let ledger = V2Ledger::open(tmp.path()).unwrap();
         ledger.submit(job.clone()).unwrap();
+        let mut replay = job.clone();
+        replay.updated_unix_ms = 999;
         assert!(matches!(
-            ledger.submit(job),
+            ledger.submit(replay),
             Err(V2LedgerError::Duplicate(duplicate)) if duplicate == id
         ));
+        assert_eq!(ledger.get(id).unwrap(), job, "replay cannot replace the admitted row");
 
         let paused = ledger
             .apply_control(id, TransferControlV2::Pause, 101)

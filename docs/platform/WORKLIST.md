@@ -667,6 +667,10 @@ behavioral evidence is not completion.
 - **Transfer duplicate-admission checkpoint (2026-08-10):** the daemon refuses a replayed
   legacy transfer ID instead of replacing an already-running ledger row; `.90` passed the
   hostile replacement regression: `docs/platform/evidence/WL-FUNC-011-2026-08-10-transfer-duplicate-admission-r186.md`.
+- **V2 transfer no-replace checkpoint (2026-08-10):** new typed transfer admission now
+  commits with an atomic same-directory no-replace install, closing the check-then-replace
+  race that could let a concurrent replay overwrite the first durable row. `.90` passed the
+  exact regression: `docs/platform/evidence/WL-FUNC-011-2026-08-10-v2-transfer-no-replace-r195.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
