@@ -420,12 +420,22 @@ def validate_post(snapshot: dict[str, Any], before_boot_id: str) -> None:
     if snapshot.get("substrate_healthy") is not True:
         refuse("coordination/file substrate is not healthy")
     quorum = snapshot.get("coordination_quorum")
-    if quorum is not None and (
-        not isinstance(quorum, dict)
-        or quorum.get("healthy", 0) < quorum.get("required", 1)
-        or quorum.get("configured", 0) < quorum.get("required", 1)
-    ):
-        refuse("coordination strict-quorum evidence is invalid")
+    if quorum is not None:
+        if not isinstance(quorum, dict):
+            refuse("coordination strict-quorum evidence is invalid")
+        configured = quorum.get("configured")
+        healthy = quorum.get("healthy")
+        required = quorum.get("required")
+        # Evidence is untrusted JSON.  Validate the scalar types before doing
+        # comparisons so hostile strings/bools cannot escape as verifier
+        # exceptions or be treated as quorum counts.
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in (configured, healthy, required)
+        ):
+            refuse("coordination strict-quorum evidence is invalid")
+        if healthy < required or configured < required or healthy > configured:
+            refuse("coordination strict-quorum evidence is invalid")
     session_state = snapshot.get("session_state")
     if snapshot.get("role") == "workstation":
         if session_state not in ("active", "online"):
@@ -571,6 +581,17 @@ def self_test() -> None:
             },
             "Lost quorum",
         ),
+        (
+            {
+                **valid,
+                "coordination_quorum": {
+                    "configured": "3",
+                    "healthy": 2,
+                    "required": 2,
+                },
+            },
+            "Malformed quorum count",
+        ),
         ({**valid, "session_processes": 2}, "Duplicate shell session"),
         (
             {**valid, "xdg_binds": {**valid["xdg_binds"], "Music": False}},
@@ -629,7 +650,7 @@ def self_test() -> None:
     assert strict_majority(1) == 1
     assert strict_majority(3) == 2
     assert strict_majority(5) == 3
-    print("verify-corrected-forward-recovery: self-test passed 14/14")
+    print("verify-corrected-forward-recovery: self-test passed 15/15")
 
 
 def parser() -> argparse.ArgumentParser:
