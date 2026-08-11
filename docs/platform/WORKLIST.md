@@ -2009,6 +2009,8 @@ behavioral evidence is not completion.
 - Remaining work:
 - **All-home XDG preflight:** seat `.50` refused a later hostile target before any mount mutation:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-xdg-all-home-preflight-r178.md`.
+- **Missing Workstation session return (2026-08-10):** inactive shell sessions are restored additively without restarting healthy mesh services; `.90` passed:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-session-return-r205.md`.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.
