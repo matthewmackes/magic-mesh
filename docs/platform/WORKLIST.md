@@ -336,6 +336,9 @@ behavioral evidence is not completion.
   an existing symlink or non-directory in the bundle output parent before
   staging, and `.90` proved that a redirected target receives no bundle:
   `docs/platform/evidence/WL-ARCH-008-2026-08-10-output-parent-integrity-r192.md`.
+- **Browser source-parent integrity (2026-08-10):** symlinked/non-directory
+  ancestors are rejected before bundle publication; farm self-tests passed:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-10-source-parent-integrity-r212.md`.
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
      - Inputs: current repo commit, Browser inventory, licenses.
@@ -2665,6 +2668,7 @@ behavioral evidence is not completion.
   boundary refuses a KIRON alert whose lifecycle start or observation timestamp
   is ahead of the seat clock; the focused hostile regression is recorded in
   `docs/platform/evidence/WL-UX-014-2026-08-10-future-timestamp-admission-r194.md`.
+- **Kiron asset admission (2026-08-10):** self-test passed coverage/license/size/path/digest rules: `docs/platform/evidence/WL-UX-014-2026-08-10-kiron-asset-admission-r212.md`.
 - Remaining work:
   1. S1 Freeze authority, payload, and queue.
      - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.
