@@ -94,10 +94,11 @@ behavioral evidence is not completion.
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
 - Current state: typed authority exists; KMS/EGL and live proof remain. Evidence: `evidence/WL-ARCH-010-2026-08-11-running-reservation-restart-r458.md`.
-- **Native DRM/PRIME + shell wiring (2026-08-11):** bounded native gates passed
-  3/3 on `.90`; full `mde-shell-egui --features drm` build passed on `.50`.
-  Live KMS/Display1 scanout remains: `docs/platform/evidence/WL-ARCH-010-2026-08-11-native-drm-prime-boundary-r474.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-11-shell-drm-build-r475.md`.
+- **Native DRM/PRIME + shell wiring (2026-08-11):** native gates passed 3/3;
+  DRM shell build and VDI module passed 33/33. Live KMS/Display1 remains:
+  `evidence/WL-ARCH-010-2026-08-11-native-drm-prime-boundary-r474.md`,
+  `evidence/WL-ARCH-010-2026-08-11-shell-drm-build-r475.md`,
+  `evidence/WL-ARCH-010-2026-08-11-vdi-drm-module-r477.md`.
 - Remaining work: **Recovered lease deadline (2026-08-10):** expired attachment leases refused; BigBoy: `evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
 - **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
@@ -301,8 +302,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Duplicate/replayed/stale/deadline/cancelled operations are deterministic and side-effect safe.
   2. Capacity and Lighthouse placement fail closed; no four-thread host receives four guest vCPUs.
-  3. Native and recovery transports pass frame, input, audio, clipboard, reconnect, resize, and cleanup tests.
-  4. The shell only sends typed intent and renders bounded state.
+  3. Native/recovery transports pass frame, input, audio, clipboard, reconnect, resize, and cleanup tests; the shell sends typed intent and renders bounded state.
 - Verification method: run lint-workload-authority first; use @farm:{cargo test -p mackes-mesh-types}
   @farm:{cargo test -p mackesd workload_compute}
   @farm:{cargo test -p mde-shell-egui --features live-vdi}; BigBoy release/package gates use explicit host/slot and capture live evidence.
