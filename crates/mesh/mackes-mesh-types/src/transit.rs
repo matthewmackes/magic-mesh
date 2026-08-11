@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 /// Topic prefix for per-node transit snapshots.
 pub const TRANSIT_STATE_PREFIX: &str = "state/overlay/gtfs-transit/";
-/// Release-audit tier for the attribution-bearing MassDOT license.
+/// Release-audit tier for the attribution-bearing `MassDOT` license.
 pub const LICENSE_TIER: &str = "open-data-attribution";
-/// Attribution required by the MassDOT Developers License Agreement.
+/// Attribution required by the `MassDOT` Developers License Agreement.
 pub const ATTRIBUTION: &str = "MassDOT · MBTA";
 
 /// Latest-wins transit topic for one workstation adapter.

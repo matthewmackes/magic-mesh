@@ -37,7 +37,7 @@ pub enum PagerAlert {
     Red,
 }
 
-/// One normalized USGS GeoJSON feature.
+/// One normalized USGS `GeoJSON` feature.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EarthquakeEvent {
     /// Stable USGS event id (for example `us7000abcd`).
@@ -50,7 +50,7 @@ pub struct EarthquakeEvent {
     pub latitude: f64,
     /// Epicentre longitude in decimal degrees.
     pub longitude: f64,
-    /// Hypocentre depth in kilometres. This is the third GeoJSON coordinate,
+    /// Hypocentre depth in kilometres. This is the third `GeoJSON` coordinate,
     /// not altitude.
     pub depth_km: f32,
     /// Reported magnitude. `None` preserves USGS `null`; it is never changed to

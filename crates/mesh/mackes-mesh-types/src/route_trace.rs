@@ -268,7 +268,9 @@ impl PathGraph {
 use crate::exposure::ExposurePolicy;
 
 /// Build the **ingress** path for a published service from its CONNECT exposure
-/// policy: `Internet → Ingress(lighthouse) → <hosting node> → Service`. The
+/// policy.
+///
+/// The path is `Internet → Ingress(lighthouse) → <hosting node> → Service`. The
 /// control point on the internet→ingress edge is the public boundary: a
 /// public-via-ingress service is `Allow` (the firewalld profile + Caddy open it),
 /// a mesh-only service is `Block` ("not published — mesh-only"), so a trace to an
@@ -282,10 +284,10 @@ pub fn assemble_ingress(
     lighthouse_public_ip: Option<&str>,
 ) -> PathGraph {
     let public = svc.is_public();
-    let (lh_label, hostname) = match &svc.ingress {
-        Some(b) => (b.lighthouse.clone(), Some(b.hostname.clone())),
-        None => ("(no ingress)".to_string(), None),
-    };
+    let (lh_label, hostname) = svc.ingress.as_ref().map_or_else(
+        || ("(no ingress)".to_string(), None),
+        |b| (b.lighthouse.clone(), Some(b.hostname.clone())),
+    );
     let host_node = &svc.source.node;
 
     let net = PathNode {
@@ -362,8 +364,10 @@ pub fn assemble_ingress(
     g
 }
 
-/// Build the **egress** path from a mesh node to an external destination. Without
-/// VPN-GW this is the plain WAN egress: `Host(source) → Internet(dest)`; once
+/// Build the **egress** path from a mesh node to an external destination.
+///
+/// Without VPN-GW this is the plain WAN egress: `Host(source) → Internet(dest)`;
+/// once
 /// VPN-GW exists the gateway + tunnel + exit nodes splice between them. `source`
 /// is the originating node's label + overlay IP; `dest_label` is the destination
 /// (a hostname/IP). Pure — no VPN placeholder is invented.

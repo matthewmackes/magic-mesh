@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Per-node NASA FIRMS hotspot snapshot topic prefix.
 pub const FIRMS_STATE_PREFIX: &str = "state/overlay/firms-hotspots/";
-/// NASA open data with a free MAP_KEY required by the official API.
+/// NASA open data with a free `MAP_KEY` required by the official API.
 pub const LICENSE_TIER: &str = "free-key-gov";
 /// Attribution and the provider's near-real-time safety disclaimer.
 pub const ATTRIBUTION: &str = "NASA FIRMS (NRT; not for safety-of-life decisions)";
@@ -25,7 +25,7 @@ pub fn firms_state_topic(node: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FirmsAvailability {
-    /// The operator has not sealed the free FIRMS MAP_KEY.
+    /// The operator has not sealed the free FIRMS `MAP_KEY`.
     Unconfigured,
     /// A sealed key is present and the adapter is ready or has fetched data.
     Ready,

@@ -339,8 +339,10 @@ pub struct ServiceDescriptors {
     pub mesh_fs: MeshFsUsage,
 }
 
-/// MESHFS-2 — a peer's Mesh-Sync mount `df` usage. `present` is false on a
-/// pre-MESHFS-2 writer (serde-defaulted) or a missing mount, so an aggregator
+/// MESHFS-2 — a peer's Mesh-Sync mount `df` usage.
+///
+/// `present` is false on a pre-MESHFS-2 writer (serde-defaulted) or a missing
+/// mount, so an aggregator
 /// skips it rather than reporting a phantom 0-byte share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -442,8 +444,9 @@ pub fn default_mesh_home() -> PathBuf {
     PathBuf::from(home).join(".mde-mesh")
 }
 
-/// Resolve the workgroup-root directory — the single source of truth
-/// shared by `mackesd` (directory/healthz) and the GUI shell (every
+/// Resolve the workgroup-root directory — the single source of truth.
+///
+/// It is shared by `mackesd` (directory/healthz) and the GUI shell (every
 /// panel that reads off mesh-storage). Under SUBSTRATE-V2 this is the
 /// plain Syncthing-replicated dir at `/mnt/mesh-storage`.
 ///
@@ -491,16 +494,16 @@ pub fn write_peer_record(dir: &Path, rec: &PeerRecord) -> io::Result<PathBuf> {
     Ok(final_path)
 }
 
-/// Union every `*.json` in `dir` into a `PeerRecord` list (one per
-/// file). Malformed or unreadable files are skipped (not fatal) — a
+/// Union every `*.json` in `dir` into a `PeerRecord` list.
+///
+/// Malformed or unreadable files are skipped (not fatal) — a
 /// half-written file from a concurrent writer must not break a reader.
 /// A missing dir yields an empty list. Sorted by hostname.
 #[must_use]
 pub fn read_peers(dir: &Path) -> Vec<PeerRecord> {
     let mut out = Vec::new();
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return out,
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
     };
     for entry in entries.flatten() {
         let path = entry.path();

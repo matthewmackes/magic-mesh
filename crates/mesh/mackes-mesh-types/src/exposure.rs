@@ -1,12 +1,15 @@
-//! CONNECT-1 — the unified connectivity / **exposure policy** model + state
+//! CONNECT-1 — the unified connectivity / **exposure policy** model + state.
+//!
 //! (design: `docs/design/connect.md`). Per-service records declaring how each
 //! host/VM/container service is reached: mesh-only (overlay) or published to the
 //! public through the lighthouse reverse-proxy ingress. The one-state doctrine
 //! (§9 W88): durable state is TOML on the shared substrate; `mackesd`'s
 //! `action/connect/*` responders are the typed surface over it; GUIs render it.
 //!
-//! Naming: this is **exposure** (the public boundary), distinct from the
-//! KDE-Connect device facts in [`crate::connect`]. CONNECT governs ONLY the
+//! Naming: this is **exposure** (the public boundary), distinct from KDE-Connect
+//! device facts in [`crate::connect`].
+//!
+//! CONNECT governs ONLY the
 //! public boundary — intra-mesh trust stays flat / open-mesh (`AI_GOVERNANCE`
 //! §8 unchanged).
 
@@ -14,9 +17,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Where a service may be reached from. (Tier 1 — Public = Nebula + SSH only —
-/// is the foundational layer and not a per-service choice; a service is either
-/// overlay-only or additionally published via the ingress.)
+/// Where a service may be reached from.
+///
+/// Tier 1 — Public = Nebula + SSH only — is the foundational layer and not a
+/// per-service choice; a service is either overlay-only or additionally
+/// published via the ingress.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tier {
@@ -232,6 +237,7 @@ pub const CADDY_MANAGED_HEADER: &str =
     "# Managed by MCNF CONNECT — do not edit (rendered from connect/policy.toml).";
 
 /// CONNECT-4 — render the Caddy ingress config for `lighthouse` from the policy:
+///
 /// one auto-HTTPS site per public **HTTP** service bound to this lighthouse,
 /// reverse-proxying the public hostname to the hosting node over the mesh
 /// (`<node>.mesh:<port>`, resolved by the mesh DNS). Caddy obtains a Let's
@@ -258,9 +264,11 @@ pub fn render_caddyfile(cfg: &ExposureConfig, lighthouse: &str) -> String {
     let mut out = String::from(CADDY_MANAGED_HEADER);
     out.push('\n');
     for (hostname, node, port) in sites {
-        out.push_str(&format!(
-            "{hostname} {{\n\treverse_proxy {node}.mesh:{port}\n}}\n"
-        ));
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "{hostname} {{\n\treverse_proxy {node}.mesh:{port}\n}}"
+        );
     }
     out
 }
