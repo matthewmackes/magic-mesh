@@ -901,9 +901,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
 - **Weather cache identity checkpoint (2026-08-09):** restart recovery now
   binds nested current/forecast snapshots to exact host, location generation,
-  point, and timezone; mismatches publish typed unavailable state. Machine 194
-  passed the exact hostile-cache test:
+  point, and timezone; mismatches publish typed unavailable state. Machine 194 passed the exact hostile-cache test:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
+- **Malformed weather cache (2026-08-10):** `.90` passed recovery evidence: `docs/platform/evidence/WL-FUNC-017-2026-08-10-weather-cache-recovery-r204.md`.
 - **Navigation action retry checkpoint (2026-08-09):** route, progress, and
   cancellation cursors now acknowledge only after governed effects succeed;
   interrupted calculations roll back their replay reservation, while final
@@ -1741,6 +1741,9 @@ behavioral evidence is not completion.
   stale or reordered status delivery cannot regress a consumed cursor; focused
   farm result is recorded in
   `docs/platform/evidence/WL-FUNC-022-2026-08-10-audio-replay-cursor-monotonic-r195.md`.
+- **Exact peer schedule convergence (2026-08-10):** same-revision Clock
+  schedules require exact payload equality; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-schedule-convergence-r198.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Clock documentation/package hard-cut checkpoint (2026-08-09):** the visible
@@ -2407,10 +2410,7 @@ behavioral evidence is not completion.
 - **Taskbar pin identity (2026-08-10):** BigBoy passed stable deduplication: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-pin-dedupe-r156.md`.
 - **Front Door command-input boundary (2026-08-10):** BigBoy passed rejection of control-separated and over-budget `>` command input before terminal activation:
   `docs/platform/evidence/WL-UX-012-2026-08-10-command-input-boundary-r187.md`.
-- **Short Left-rail geometry (2026-08-10):** `.90` passed bounded admission on a
-  320×160 viewport; fixed controls are shed before any hit target can escape the
-  owned rail or overlap a surviving control:
-  `docs/platform/evidence/WL-UX-012-2026-08-10-short-left-rail-r197.md`.
+- **Short Left rail (2026-08-10):** `.90` passed bounded 320×160 containment: `docs/platform/evidence/WL-UX-012-2026-08-10-short-left-rail-r197.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
