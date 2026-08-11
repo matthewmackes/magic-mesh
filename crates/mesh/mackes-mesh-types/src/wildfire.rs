@@ -29,8 +29,10 @@ pub struct WildfirePoint {
     pub longitude: f64,
 }
 
-/// One GeoJSON polygon. The first ring is the exterior and later rings are
-/// holes. MultiPolygon features become multiple values in a perimeter.
+/// One `GeoJSON` polygon.
+///
+/// The first ring is the exterior and later rings are holes. `MultiPolygon`
+/// features become multiple values in a perimeter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct WildfirePolygon {
     /// Exterior and optional interior rings.
@@ -40,7 +42,7 @@ pub struct WildfirePolygon {
 /// One normalized current WFIGS wildfire perimeter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WildfirePerimeter {
-    /// Stable ArcGIS object id, namespaced as a string on the wire.
+    /// Stable `ArcGIS` object id, namespaced as a string on the wire.
     pub id: String,
     /// WFIGS incident name.
     pub incident_name: String,
@@ -56,7 +58,7 @@ pub struct WildfirePerimeter {
     /// Producer perimeter timestamp, Unix milliseconds, when supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perimeter_updated_at_ms: Option<i64>,
-    /// Polygon or MultiPolygon geometry normalized to polygons with rings.
+    /// Polygon or `MultiPolygon` geometry normalized to polygons with rings.
     #[serde(default)]
     pub polygons: Vec<WildfirePolygon>,
 }

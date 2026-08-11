@@ -68,9 +68,11 @@ impl FirewallEditOp {
     }
 }
 
-/// One typed Vyatta firewall-rule leaf (`<attr> <val>`), e.g. `action accept`,
-/// `protocol tcp`, `destination port 443`. A space in `attr` is a nested node
-/// (mirrors `scripts/apply-firewall.sh`). §9: a typed pair, never a command.
+/// One typed Vyatta firewall-rule leaf (`<attr> <val>`).
+///
+/// Examples include `action accept`, `protocol tcp`, and `destination port 443`.
+/// A space in `attr` is a nested node (mirrors `scripts/apply-firewall.sh`).
+/// §9: a typed pair, never a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallLeaf {
     /// The leaf attribute path (`action`, `protocol`, `destination port`, …).
@@ -90,9 +92,11 @@ impl FirewallLeaf {
     }
 }
 
-/// A typed, bounded firewall edit — ONE rule in ONE named ruleset (§9 — typed
-/// params, never a shell/command string). The executor maps it onto FIXED
-/// `set/delete firewall name …` Vyatta lines or refuses it.
+/// A typed, bounded firewall edit — one rule in one named ruleset.
+///
+/// §9 requires typed parameters rather than a shell or command string. The
+/// executor maps this onto fixed `set/delete firewall name …` Vyatta lines or
+/// refuses it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallEdit {
     /// The `firewall name` ruleset (`WAN_IN`, `LAN_LOCAL`, …).
@@ -224,13 +228,20 @@ impl FirewallEdit {
 /// `scripts/apply-firewall.sh` (`EDGEOS_FW_CONFIRM_MIN` default 2).
 pub const DEFAULT_COMMIT_CONFIRM_MIN: u32 = 2;
 
-/// Clamp a requested commit-confirm window into a sane 1..=60 minute range (a
-/// too-short window can revert before the reachability check; a too-long one keeps
-/// a bad edit live). Applied by the executor, so a hostile request can't disable
-/// the auto-revert with a huge window.
+/// Clamp a requested commit-confirm window into a sane 1..=60 minute range.
+///
+/// A too-short window can revert before the reachability check; a too-long one
+/// keeps a bad edit live. Applied by the executor, so a hostile request cannot
+/// disable the auto-revert with a huge window.
 #[must_use]
-pub fn clamp_confirm_min(requested: u32) -> u32 {
-    requested.clamp(1, 60)
+pub const fn clamp_confirm_min(requested: u32) -> u32 {
+    if requested < 1 {
+        1
+    } else if requested > 60 {
+        60
+    } else {
+        requested
+    }
 }
 
 /// A typed router firewall-edit request (§9 — typed params, never a command).
@@ -256,7 +267,7 @@ pub struct RouterActionRequest {
     pub commit_confirm_min: u32,
 }
 
-fn default_commit_min() -> u32 {
+const fn default_commit_min() -> u32 {
     DEFAULT_COMMIT_CONFIRM_MIN
 }
 
@@ -529,9 +540,11 @@ pub fn take_result(
 // primitive — `crate::audit`) so the chain algorithm is single-sourced there.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// The replicated audit-chain file for a node's router edits —
-/// `<workgroup_root>/<host>/router-audit.jsonl` (one JSON [`AuditRecord`] per
-/// line, hash-chained). Co-located with `<host>/router-registry.json`.
+/// The replicated audit-chain file for a node's router edits.
+///
+/// It is `<workgroup_root>/<host>/router-audit.jsonl`, with one JSON
+/// [`AuditRecord`] per hash-chained line. It is co-located with
+/// `<host>/router-registry.json`.
 pub const ROUTER_AUDIT_FILE: &str = "router-audit.jsonl";
 
 /// The audit-chain path for `host` under the replicated root.
@@ -540,10 +553,12 @@ pub fn audit_log_path(workgroup_root: &Path, host: &str) -> PathBuf {
     workgroup_root.join(host).join(ROUTER_AUDIT_FILE)
 }
 
-/// One tamper-evident audit row for a router firewall edit. The hash covers every
-/// field except `prev_hash`/`hash` themselves (see [`Self::hash_payload`]); the
-/// writer chains each row on the previous row's `hash` (genesis = 32 zero bytes),
-/// so a rewritten row breaks the chain from that point on.
+/// One tamper-evident audit row for a router firewall edit.
+///
+/// The hash covers every field except `prev_hash`/`hash` themselves (see
+/// [`Self::hash_payload`]). The writer chains each row on the previous row's
+/// `hash` (genesis = 32 zero bytes), so a rewritten row breaks the chain from
+/// that point on.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuditRecord {
@@ -600,9 +615,11 @@ struct AuditPayload<'a> {
     from: &'a str,
 }
 
-/// Read every [`AuditRecord`] from a chain file, in file (chain) order. Malformed
-/// lines are skipped. Empty/absent file → empty vec. The shell uses this to render
-/// the audit trail; `mackesd` uses it to walk + verify the chain.
+/// Read every [`AuditRecord`] from a chain file in file (chain) order.
+///
+/// Malformed lines are skipped, and an empty or absent file produces an empty
+/// vector. The shell uses this to render the audit trail; `mackesd` uses it to
+/// walk and verify the chain.
 #[must_use]
 pub fn read_audit(path: &Path) -> Vec<AuditRecord> {
     let Some(raw) = read_bounded_router_record(path, MAX_ROUTER_AUDIT_BYTES) else {
@@ -614,10 +631,11 @@ pub fn read_audit(path: &Path) -> Vec<AuditRecord> {
         .collect()
 }
 
-/// The canonical per-appliance tofu var-file (`infra/tofu/edgeos/appliances/`) an
-/// appliance id selects — `appliances/<sanitized-id>.tfvars`. The wrapper
-/// `scripts/tofu-appliance.sh` mirrors this mapping. `gateway` is the reserved
-/// alias for the auto-loaded default (`terraform.tfvars`).
+/// The canonical per-appliance tofu var-file selected by an appliance id.
+///
+/// The path is `appliances/<sanitized-id>.tfvars` under
+/// `infra/tofu/edgeos/appliances/`; `scripts/tofu-appliance.sh` mirrors this
+/// mapping. `gateway` is the reserved alias for `terraform.tfvars`.
 #[must_use]
 pub fn appliance_var_file(appliance_id: &str) -> String {
     let id = appliance_id.trim();

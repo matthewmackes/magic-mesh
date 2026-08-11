@@ -255,6 +255,10 @@ pub struct SurfaceEnableResult {
 
 impl SurfaceEnableResult {
     /// Validate all bounds and exact Pro 5/6 identity bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a field violates the Surface Enable contract.
     pub fn validate(&self) -> Result<(), SurfaceEnableContractError> {
         if self.schema_version != SURFACE_ENABLE_RESULT_SCHEMA_VERSION {
             return Err(SurfaceEnableContractError::Invalid("schema_version"));
@@ -284,6 +288,11 @@ impl SurfaceEnableResult {
 
     /// Decode untrusted JSON with size, UTF-8, duplicate-key, unknown-field,
     /// semantic, source, and freshness admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed, oversized, stale, or
+    /// violates an identity or semantic binding.
     pub fn from_json_at(
         body: &[u8],
         expected_node: &str,
@@ -300,6 +309,11 @@ impl SurfaceEnableResult {
     /// Decode for a local observation consumer that did not originate the
     /// action. This binds exact node/source/freshness/model and validates the
     /// embedded request identity without requiring the caller to preparse it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed, oversized, stale, or
+    /// violates an identity or semantic binding.
     pub fn from_json_for_node_at(
         body: &[u8],
         expected_node: &str,
@@ -328,6 +342,11 @@ impl SurfaceEnableResult {
     }
 
     /// Encode only after semantic and wire-size validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this result violates the contract or exceeds the
+    /// maximum wire size.
     pub fn to_json(&self) -> Result<String, SurfaceEnableContractError> {
         self.validate()?;
         let body =
