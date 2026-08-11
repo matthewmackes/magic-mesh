@@ -22,6 +22,7 @@ printf '%s\n' configured >"$ROOT/syncthing.conf"
 : >"$STATE/restarts"
 : >"$STATE/notifies"
 : >"$STATE/sleeps"
+: >"$STATE/active-mde-shell-egui.service"
 
 cat >"$BIN/systemctl" <<'SH'
 #!/bin/sh
@@ -109,6 +110,10 @@ case "$1" in
             printf '%s\n' "$unit" >>"$state/mutations"
             [ ! -f "$state/fail-start-$unit" ] || exit 1
             : >"$state/active-$unit"
+        elif [ "${2:-}" = mde-shell-egui.service ]; then
+            printf '%s\n' "$2" >>"$state/mutations"
+            [ ! -f "$state/fail-start-mde-shell-egui.service" ] || exit 1
+            : >"$state/active-mde-shell-egui.service"
         elif [ "${2:-}" = mackesd.target ]; then
             printf '%s\n' mackesd.target >>"$state/mutations"
             if [ ! -f "$state/target-active" ]; then
@@ -379,6 +384,23 @@ cmp "$STATE/expected-mutations" "$STATE/mutations"
 [ ! -s "$STATE/sleeps" ]
 grep -Fq 'status=already-recovered' "$STATE/notifies"
 echo 'PASS repeated healthy event: no overlay or service restart'
+
+# A healthy mesh substrate does not prove that the Workstation session survived
+# boot/resume. Recovery must start a missing shell without restarting healthy
+# overlay, substrate, or grouped daemon processes.
+rm -f "$STATE/active-mde-shell-egui.service"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+cat >"$STATE/expected-mutations" <<'EOF'
+xdg-binds
+mde-shell-egui.service
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=restoring-workstation-session' "$STATE/notifies"
+grep -Fq 'status=recovered' "$STATE/notifies"
+: >"$STATE/active-mde-shell-egui.service"
+echo 'PASS missing-session fixture: healthy substrate restores only the Workstation shell'
 
 # A network-return event can find the target active while one grouped daemon is
 # missing. Recovery must start only that group. Restarting the target creates a

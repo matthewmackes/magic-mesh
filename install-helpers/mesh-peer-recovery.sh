@@ -137,6 +137,23 @@ restore_xdg_binds() {
     bounded_systemctl start mcnf-xdg-bind-recovery.service >/dev/null 2>&1
 }
 
+restore_workstation_session() {
+    # The grouped daemon set can be healthy while the DRM seat has crashed or
+    # was not started during a boot race.  Treat the packaged shell as part of
+    # the Workstation session contract, but recover it additively so a healthy
+    # shell is never restarted and its DRM master is not disrupted.
+    if bounded_systemctl is-active --quiet mde-shell-egui.service >/dev/null 2>&1; then
+        publish "workstation-session-already-ready"
+        return 0
+    fi
+    publish "restoring-workstation-session"
+    if ! bounded_systemctl start mde-shell-egui.service >/dev/null 2>&1 \
+        || ! wait_active mde-shell-egui.service; then
+        publish "failed-workstation-session"
+        return 1
+    fi
+}
+
 restore_role_desktop_state() {
     local role="$1"
     if [ "$role" = lighthouse ]; then
@@ -148,6 +165,7 @@ restore_role_desktop_state() {
         publish "failed-workstation-xdg-binds"
         return 1
     fi
+    restore_workstation_session
 }
 
 configured_substrate_ready() {
