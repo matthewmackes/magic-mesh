@@ -1604,12 +1604,19 @@ fn floating_geometry_for_catalog_with_sessions(
         (ControlKind::Back, None),
         (ControlKind::Home, None),
     ] {
-        controls.push(Control {
-            kind,
-            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
-            surface,
-            source_index: None,
-        });
+        let rect = egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge));
+        // At widths below the normal supported profile, keep the placement
+        // escape reachable instead of letting the fixed left cluster steal
+        // its hit region. The omitted controls remain available through
+        // Front Door/search and the overflow catalog.
+        if rect.right() <= right_x {
+            controls.push(Control {
+                kind,
+                rect,
+                surface,
+                source_index: None,
+            });
+        }
         cursor_x += edge + gap;
     }
     let center_count = usize::from(show_editor)
@@ -2819,6 +2826,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn very_narrow_bottom_taskbar_keeps_placement_escape_disjoint() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 240.0));
+        let geometry = floating_geometry_for_catalog_with_sessions(
+            screen,
+            MAX_PINNED_SOURCES,
+            &default_taskbar_pins(),
+            &[],
+        );
+
+        let placement = geometry
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Pin)
+            .copied()
+            .expect("the narrow taskbar must retain a placement escape");
+        assert!(geometry.outer.contains_rect(placement.rect));
+        assert!(geometry.controls.iter().all(|control| {
+            control.kind == ControlKind::Pin || !control.rect.intersects(placement.rect)
+        }));
+        assert!(geometry
+            .controls
+            .iter()
+            .all(|control| { geometry.outer.contains_rect(control.rect) }));
     }
 
     #[test]
