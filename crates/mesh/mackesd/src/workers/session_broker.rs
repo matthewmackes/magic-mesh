@@ -252,6 +252,12 @@ pub enum SessionError {
         /// The target field that failed the bounded identity grammar.
         field: &'static str,
     },
+    /// A generic Desktop/Browser session open carried an identity that cannot
+    /// safely cross the resource-browser boundary.
+    InvalidSessionTarget {
+        /// The request field that failed the bounded identity grammar.
+        field: &'static str,
+    },
     /// A Browser VM workload/profile pairing failed validation.
     InvalidDesktopProfile {
         /// The VM identity carried by the rejected request.
@@ -286,6 +292,9 @@ impl std::fmt::Display for SessionError {
             }
             Self::InvalidAppVmTarget { field } => {
                 write!(f, "invalid App VM target identity: {field}")
+            }
+            Self::InvalidSessionTarget { field } => {
+                write!(f, "invalid session target identity: {field}")
             }
             Self::InvalidDesktopProfile { vm_id, reason } => write!(
                 f,
@@ -455,6 +464,16 @@ pub fn apply_request(
             client_peer,
             profile,
         } => {
+            for (field, value) in [
+                ("id", id.as_str()),
+                ("serving_peer", serving_peer.as_str()),
+                ("vm_id", vm_id.as_str()),
+                ("client_peer", client_peer.as_str()),
+            ] {
+                if !valid_session_target_identity(value) {
+                    return Err(SessionError::InvalidSessionTarget { field });
+                }
+            }
             browser_transport.map_err(|reason| SessionError::InvalidDesktopProfile {
                 vm_id: vm_id.clone(),
                 reason,
@@ -668,6 +687,19 @@ pub fn apply_request(
 fn valid_app_vm_target_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 255
+        && !value.chars().any(char::is_control)
+        && !value.contains('/')
+        && !value.contains('\\')
+}
+
+/// Validate identities on the generic Desktop/Browser open path before they
+/// become resource-browser session authority. The same bounded grammar is used
+/// for the session key and every route identity so a malformed card cannot be
+/// admitted and interpreted differently by a later actuator.
+fn valid_session_target_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.trim() == value
         && !value.chars().any(char::is_control)
         && !value.contains('/')
         && !value.contains('\\')
@@ -2058,6 +2090,35 @@ mod tests {
             roster["s1"].updated_at_ms, 4,
             "updated_at tracks the last op"
         );
+    }
+
+    #[test]
+    fn generic_open_rejects_path_like_or_control_bearing_target_identities() {
+        let cases = [
+            ("id", "session/one", "peer:a", "uuid-1", "peer:b"),
+            ("serving_peer", "session-1", "peer/a", "uuid-1", "peer:b"),
+            ("vm_id", "session-1", "peer:a", "../vm", "peer:b"),
+            ("client_peer", "session-1", "peer:a", "uuid-1", "peer\nclient"),
+            ("id", " session-1", "peer:a", "uuid-1", "peer:b"),
+        ];
+        for (field, id, serving_peer, vm_id, client_peer) in cases {
+            let mut roster = BTreeMap::new();
+            assert_eq!(
+                apply_request(
+                    &mut roster,
+                    SessionRequest::Open {
+                        id: id.into(),
+                        serving_peer: serving_peer.into(),
+                        vm_id: vm_id.into(),
+                        client_peer: client_peer.into(),
+                        profile: None,
+                    },
+                    1,
+                ),
+                Err(SessionError::InvalidSessionTarget { field })
+            );
+            assert!(roster.is_empty());
+        }
     }
 
     #[test]
