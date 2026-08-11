@@ -99,6 +99,9 @@ fn parse(raw: &str) -> Result<Request, String> {
     if request.operation == Operation::Start && request.app.is_none() {
         return Err("start requires an approved `app`".to_owned());
     }
+    if request.operation == Operation::Stop && request.expected_generation == 0 {
+        return Err("stop requires a non-zero expected workload generation".to_owned());
+    }
     if matches!(request.operation, Operation::Stop | Operation::Cancel) && request.app.is_some() {
         return Err("stop/cancel must not carry an app".to_owned());
     }
@@ -605,5 +608,23 @@ mod tests {
         first.armed_token = None;
         replay.armed_token = None;
         assert_eq!(first, replay, "only the delivery capability may rotate");
+    }
+
+    #[test]
+    fn stop_rejects_unbound_generation_before_any_backend_effect() {
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "node": "node-a",
+            "workload_id": "android-one",
+            "request_id": "android-stop-zero",
+            "expected_generation": 0,
+            "operation": "stop",
+            "app": null,
+            "armed_token": null,
+            "typed_name": null
+        });
+
+        let refusal = parse(&document.to_string()).expect_err("zero-generation Stop must refuse");
+        assert!(refusal.contains("non-zero expected workload generation"));
     }
 }

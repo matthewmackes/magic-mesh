@@ -208,6 +208,9 @@ fs2 = "0.4"
 # `unsafe_code = "forbid"` lint rejects).
 rustix = { version = "0.38", features = ["fs", "process", "net"] }
 
+# Android inventory snapshots use O_NOFOLLOW for race-resistant reads.
+libc = "0.2"
+
 # NF-2 CA module — error-derive macro used across the
 # ca::{mint,sign,seal,bundle} modules. tokio-rustls already
 # pulls thiserror transitively; declaring it here makes the

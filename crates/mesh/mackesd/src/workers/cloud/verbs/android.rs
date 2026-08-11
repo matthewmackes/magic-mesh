@@ -24,6 +24,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     sync::Arc,
 };
@@ -464,14 +465,43 @@ impl AndroidInventoryLedger {
             )));
         }
 
-        let file = File::open(path).map_err(|error| persistence_error(path, error))?;
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(path)
+            .map_err(|error| persistence_error(path, error))?;
+        let opened = file
+            .metadata()
+            .map_err(|error| persistence_error(path, error))?;
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.len() != metadata.len()
+        {
+            return Err(snapshot_error(format!(
+                "{} changed before validation",
+                path.display()
+            )));
+        }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take((MAX_ANDROID_INVENTORY_LEDGER_BYTES + 1) as u64)
+        (&file)
+            .take((MAX_ANDROID_INVENTORY_LEDGER_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|error| persistence_error(path, error))?;
         if bytes.len() > MAX_ANDROID_INVENTORY_LEDGER_BYTES {
             return Err(snapshot_error(format!(
                 "{} exceeds the {MAX_ANDROID_INVENTORY_LEDGER_BYTES}-byte bound",
+                path.display()
+            )));
+        }
+        let closed = file
+            .metadata()
+            .map_err(|error| persistence_error(path, error))?;
+        if closed.dev() != opened.dev()
+            || closed.ino() != opened.ino()
+            || closed.len() != opened.len()
+        {
+            return Err(snapshot_error(format!(
+                "{} changed during validation",
                 path.display()
             )));
         }
