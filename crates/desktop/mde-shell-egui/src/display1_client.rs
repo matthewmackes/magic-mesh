@@ -1254,7 +1254,7 @@ mod tests {
             workload_id: WorkloadId::new("browser-presented").expect("workload id"),
             generation: 3,
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
-            expires_at_ms: u64::MAX,
+            expires_at_ms: 20_000,
         };
         let mut client = Display1Client::attach(shell, peer, lease, 1_000).expect("attach");
 
