@@ -7,6 +7,7 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::Value;
+use std::fmt::Write as _;
 
 /// Contract version for Music workspace authorization.
 pub const MUSIC_AUTH_SCHEMA_VERSION: u64 = 1;
@@ -121,6 +122,11 @@ impl MusicAuthToken {
 }
 
 /// Sign a request body with the root-only seed and insert `music_auth`.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a JSON object or cannot be serialized
+/// into the signed request representation.
 pub fn sign_request(
     body: &str,
     context: MusicAuthContext<'_>,
@@ -152,6 +158,11 @@ pub fn sign_request(
 }
 
 /// Verify a request's public-key signature and return its bounded token.
+///
+/// # Errors
+///
+/// Returns an error when the request, token fields, digest, or signature is
+/// malformed or fails verification.
 pub fn verify_request(
     body: &str,
     context: MusicAuthContext<'_>,
@@ -198,6 +209,10 @@ pub fn verify_request(
 }
 
 /// Compute the digest of a request with the auth object removed.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a JSON object or canonicalization fails.
 pub fn request_digest(body: &str) -> Result<String, String> {
     let mut document: Value = serde_json::from_str(body)
         .map_err(|_| "Music mutation body is not valid JSON".to_string())?;
@@ -216,7 +231,7 @@ fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), String
         Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
         Value::Number(value) => output.push_str(&value.to_string()),
         Value::String(value) => {
-            output.push_str(&serde_json::to_string(value).map_err(|error| error.to_string())?)
+            output.push_str(&serde_json::to_string(value).map_err(|error| error.to_string())?);
         }
         Value::Array(values) => {
             output.push('[');
@@ -254,7 +269,11 @@ fn sha256(value: &[u8]) -> [u8; 32] {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
@@ -268,7 +287,7 @@ fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-fn hex_nibble(byte: u8) -> Option<u8> {
+const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),

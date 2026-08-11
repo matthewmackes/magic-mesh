@@ -69,7 +69,7 @@ impl std::error::Error for SubsonicValidationError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubsonicProviderFamily {
-    /// Navidrome, including its OpenSubsonic extensions.
+    /// Navidrome, including its `OpenSubsonic` extensions.
     Navidrome,
     /// Airsonic or an Airsonic-compatible deployment.
     AirsonicCompatible,
@@ -81,7 +81,7 @@ pub enum SubsonicProviderFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubsonicApiProfile {
-    /// The OpenSubsonic JSON/XML-compatible contract.
+    /// The `OpenSubsonic` JSON/XML-compatible contract.
     OpenSubsonic,
     /// A legacy Subsonic-compatible JSON/XML contract accepted by the adapter.
     SubsonicCompatible,
@@ -98,6 +98,11 @@ pub struct SubsonicResourceId(String);
 
 impl SubsonicResourceId {
     /// Validate and construct a resource identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is blank, malformed, or exceeds the
+    /// contract's size limit.
     pub fn new(value: impl Into<String>) -> Result<Self, SubsonicValidationError> {
         let value = value.into();
         validate_opaque_identifier("resource_id", &value, MAX_RESOURCE_ID_BYTES)?;
@@ -129,6 +134,11 @@ pub struct SubsonicEndpointRef(String);
 
 impl SubsonicEndpointRef {
     /// Validate and construct an endpoint-record reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is blank, malformed, or exceeds the
+    /// contract's size limit.
     pub fn new(value: impl Into<String>) -> Result<Self, SubsonicValidationError> {
         let value = value.into();
         validate_opaque_identifier("endpoint_ref", &value, MAX_OPAQUE_REFERENCE_BYTES)?;
@@ -161,6 +171,10 @@ pub struct SubsonicCredentialRef(SecretReference);
 
 impl SubsonicCredentialRef {
     /// Validate and construct a secret-store reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is not a valid secret-store reference.
     pub fn new(value: impl Into<String>) -> Result<Self, SubsonicValidationError> {
         SecretReference::new(value)
             .map(Self)
@@ -211,12 +225,12 @@ pub enum SubsonicAuthState {
 }
 
 impl SubsonicAuthState {
-    fn can_launch(&self) -> bool {
+    const fn can_launch(&self) -> bool {
         matches!(self, Self::NotRequired | Self::Authorized { .. })
     }
 }
 
-/// Features the typed OpenSubsonic adapter may expose.
+    /// Features the typed `OpenSubsonic` adapter may expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubsonicCapability {
@@ -350,6 +364,11 @@ pub struct SubsonicResourceCard {
 
 impl SubsonicResourceCard {
     /// Validate all bounded fields and cross-field admission relationships.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bounded field or cross-field admission
+    /// relationship is invalid.
     pub fn validate(&self) -> Result<(), SubsonicValidationError> {
         if self.schema_version != SUBSONIC_CONTRACT_VERSION {
             return Err(SubsonicValidationError::UnsupportedSchema(
@@ -388,6 +407,10 @@ impl SubsonicResourceCard {
     }
 
     /// Validate and retain a provider card at an adapter boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the card fails validation.
     pub fn admitted(self) -> Result<Self, SubsonicValidationError> {
         self.validate()?;
         Ok(self)
@@ -465,15 +488,14 @@ fn validate_actions(card: &SubsonicResourceCard) -> Result<(), SubsonicValidatio
             "actions.authenticate",
         ));
     }
-    if card.actions.contains(&SubsonicAction::Launch) {
-        if !matches!(card.admission, SubsonicAdmissionState::Launchable)
+    if card.actions.contains(&SubsonicAction::Launch)
+        && (!matches!(card.admission, SubsonicAdmissionState::Launchable)
             || !card.capabilities.contains(&SubsonicCapability::Stream)
-            || !card.auth.can_launch()
-        {
-            return Err(SubsonicValidationError::InvalidRelationship(
-                "actions.launch",
-            ));
-        }
+            || !card.auth.can_launch())
+    {
+        return Err(SubsonicValidationError::InvalidRelationship(
+            "actions.launch",
+        ));
     }
     if matches!(card.admission, SubsonicAdmissionState::Launchable)
         && !card.actions.contains(&SubsonicAction::Launch)

@@ -54,6 +54,10 @@ fn safe_path_component(value: &str) -> bool {
 ///
 /// The exact request body additionally binds operation, host, generation, and
 /// device identity; this target keeps the shared nonce ledger request-scoped.
+///
+/// # Errors
+///
+/// Returns an error when `request_id` is not a safe path component.
 pub fn authorization_target(request_id: &str) -> Result<String, &'static str> {
     let request_id = request_id.trim();
     if !safe_path_component(request_id) {
@@ -349,6 +353,11 @@ pub fn write_request(
 }
 
 /// Publish a signed cancellation for executor-side authorization and claiming.
+///
+/// # Errors
+///
+/// Returns an I/O error when the cancellation identity is unsafe, serialization
+/// fails, or the cancellation cannot be atomically written.
 pub fn write_cancellation(
     workgroup_root: &Path,
     cancellation: &DeviceControlCancellation,
@@ -517,6 +526,11 @@ pub fn take_cancellations(
 
 /// Atomically claim and remove the exact pending request named by a cancellation.
 /// A missing request means it has already been claimed for execution or completed.
+///
+/// # Errors
+///
+/// Returns an error when the cancellation identity is unsafe or the request is
+/// no longer pending.
 pub fn claim_pending_cancellation(
     workgroup_root: &Path,
     cancellation: &DeviceControlCancellation,
