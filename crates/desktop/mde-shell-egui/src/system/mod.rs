@@ -3147,7 +3147,13 @@ impl WallpaperServiceConfig {
     /// from making the shell read an arbitrary local path.
     pub(crate) fn bing_wallpaper_path() -> Option<PathBuf> {
         let path = Self::cache_dir()?.join(BING_DAILY_IMAGE_FILE);
-        path.is_file().then_some(path)
+        // `is_file` follows symlinks. Use the directory entry's own type here so
+        // a replaced cache name cannot redirect the Home decoder before its
+        // descriptor-level `O_NOFOLLOW` check runs.
+        fs::symlink_metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|_| path)
     }
 
     fn load_from(path: &Path) -> Self {

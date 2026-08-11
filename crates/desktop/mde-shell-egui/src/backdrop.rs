@@ -552,7 +552,7 @@ mod wallpaper_decode_tests {
 
     #[cfg(unix)]
     #[test]
-    fn replaced_home_wallpaper_path_cannot_redirect_decode() {
+    fn replaced_or_non_regular_home_wallpaper_path_cannot_redirect_decode() {
         use std::os::unix::fs::symlink;
 
         let nonce = std::time::SystemTime::now()
@@ -569,6 +569,13 @@ mod wallpaper_decode_tests {
         assert!(
             read_wallpaper_payload(&cache).is_none(),
             "Home must not follow a replaced Bing cache path to unrelated local data"
+        );
+
+        let non_regular = root.join("non-regular-cache");
+        fs::create_dir(&non_regular).expect("create non-regular cache replacement");
+        assert!(
+            read_wallpaper_payload(&non_regular).is_none(),
+            "Home must not decode a directory substituted for the Bing cache"
         );
 
         let _ = fs::remove_dir_all(root);
