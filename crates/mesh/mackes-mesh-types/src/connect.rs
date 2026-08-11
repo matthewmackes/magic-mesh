@@ -131,7 +131,7 @@ impl BatterySnapshot {
         reported_at: i64,
     ) -> Self {
         let charge_pct = if (0..=100).contains(&charge) {
-            Some(charge as u8)
+            u8::try_from(charge).ok()
         } else {
             None
         };

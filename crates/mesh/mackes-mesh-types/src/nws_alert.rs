@@ -24,7 +24,7 @@ pub struct GeoPoint {
     pub longitude: f64,
 }
 
-/// One GeoJSON polygon. The first ring is the exterior; later rings are holes.
+/// One `GeoJSON` polygon. The first ring is the exterior; later rings are holes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AlertPolygon {
     /// Closed or open coordinate rings; consumers close them while painting.

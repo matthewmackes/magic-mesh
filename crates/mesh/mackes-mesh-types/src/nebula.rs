@@ -15,11 +15,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Nebula-specific facts about one peer. Optional on
-/// [`mde-peer-card::PeerCardData`] — `None` for peers that
-/// haven't been signed under the active CA yet (e.g. a
-/// freshly enrolled peer before the supervisor's reconcile
-/// tick lands the bundle).
+/// Nebula-specific facts about one peer.
+///
+/// Optional on [`mde-peer-card::PeerCardData`] — `None` for peers that haven't
+/// been signed under the active CA yet (e.g. a freshly enrolled peer before the
+/// supervisor's reconcile tick lands the bundle).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NebulaFacts {
     /// Overlay IP this peer was allocated (e.g.
