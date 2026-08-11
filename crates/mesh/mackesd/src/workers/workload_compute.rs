@@ -3248,7 +3248,15 @@ impl WorkloadComputeWorker {
             };
         }
         if status.phase == WorkloadOperationPhase::Validating {
-            let (host, storage) = self.capacities(ledger.statuses());
+            // The request is already journaled while it is being validated.
+            // Do not count that same request as an existing reservation or an
+            // exact-fit admission is rejected before it can reach the
+            // backend. Other non-terminal operations remain accounted for.
+            let (host, storage) = self.capacities(
+                ledger
+                    .statuses()
+                    .filter(|candidate| candidate.request_id != request.request_id),
+            );
             let admission =
                 admit_workload_for_backend(request.resources, request.backend, host, storage);
             if !admission.admitted {
@@ -7251,6 +7259,40 @@ mod tests {
             .with_state_root(temp.path().to_path_buf())
             .with_authorizer(Box::new(AllowAuthorizer))
             .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: calls.clone(),
+            }));
+
+        worker.reconcile_inflight(&mut ledger, now_ms());
+
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert_eq!(
+            ledger.status("op-1").expect("status").phase,
+            WorkloadOperationPhase::WaitingForGuest
+        );
+    }
+
+    #[test]
+    fn validating_request_is_not_counted_against_exact_fit_cpu_capacity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let calls = Arc::new(Mutex::new(0));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        let request = request();
+        ledger.accept(request.clone(), now_ms()).expect("queue request");
+
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(HostCapacity {
+                // host_reserve(3, 16_384) leaves exactly two guest CPUs for
+                // this Small profile.
+                logical_cpus: 3,
+                memory_mb: 16_384,
+                allocated_vcpu: 0,
+                allocated_memory_mb: 0,
+                storage_gb: 128,
+                allocated_storage_gb: 0,
+            })
             .with_actuator(Box::new(FakeActuator {
                 calls: calls.clone(),
             }));

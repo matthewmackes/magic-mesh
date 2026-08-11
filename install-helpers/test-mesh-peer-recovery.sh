@@ -110,6 +110,9 @@ case "$1" in
             printf '%s\n' "$unit" >>"$state/mutations"
             [ ! -f "$state/fail-start-$unit" ] || exit 1
             : >"$state/active-$unit"
+            if [ "$unit" = etcd.service ] && [ -f "$state/drop-after-etcd-start" ]; then
+                rm -f "$state/drop-after-etcd-start" "$state/online"
+            fi
         elif [ "${2:-}" = mde-shell-egui.service ]; then
             printf '%s\n' "$2" >>"$state/mutations"
             [ ! -f "$state/fail-start-mde-shell-egui.service" ] || exit 1
@@ -324,9 +327,26 @@ grep -Fq 'status=failed-configured-etcd' "$STATE/notifies"
 rm -f "$STATE/fail-start-etcd.service"
 echo 'PASS substrate failure fixture: no downstream mutation after etcd failure'
 
+# The link can disappear after coordination starts but before the file
+# substrate is touched. Recovery must stop at that boundary instead of
+# mutating Syncthing from the stale pre-etcd admission.
+rm -f "$STATE"/active-etcd.service "$STATE"/active-syncthing.service \
+    "$STATE"/active-mackesd-*.service
+: >"$STATE/online"
+: >"$STATE/drop-after-etcd-start"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+printf '%s\n' etcd.service >"$STATE/expected-mutations"
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=offline-after-etcd' "$STATE/notifies"
+rm -f "$STATE/drop-after-etcd-start"
+echo 'PASS substrate boundary fixture: link loss after etcd prevents Syncthing mutation'
+
 # A boot-time event can arrive after Syncthing became active but before the
 # grouped workers.  Recovery must preserve that process instead of racing its
 # initial scan with a bounded restart.
+: >"$STATE/online"
 rm -f "$STATE"/active-etcd.service "$STATE"/active-mackesd-*.service
 : >"$STATE/active-syncthing.service"
 : >"$STATE/mutations"

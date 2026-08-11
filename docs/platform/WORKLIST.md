@@ -96,18 +96,17 @@ behavioral evidence is not completion.
 - Current state: typed contracts, journals, cancellation, Display1, hostile tests, cleanup; adapters, recovery, KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work: **Recovered lease deadline checkpoint (2026-08-10):** expired recovered attachment leases are refused; BigBoy passed the focused gate:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
+- **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
 - **VM resource-efficiency/Dom0 reserve (2026-08-10):** CPU pinning, bounded queues, qcow2 discard, shared non-Dom0 pools, and Dom0 reserve passed focused farm gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **VM/image cleanup:** BigBoy; overlay and virtual-image failure cleanup evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
-- **Workload-pool rollback:** seat `.90` passed the focused storage gate: `docs/platform/evidence/WL-ARCH-010-2026-08-10-workload-pool-mount-rollback-r169.md`.
-- **Start-failure attachment revocation:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-start-failure-attachment-revocation-r172.md`.
-- **Quadlet attachment cleanup:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
-- **Partition geometry refusal:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`.
-- **Mountpoint safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`.
-- **Storage name safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
+- **Attachment cleanup:** BigBoy passed start-failure revocation and Quadlet cleanup:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-start-failure-attachment-revocation-r172.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
+- **Storage safety:** seat `.90` passed partition geometry, mountpoint, and storage-name refusal:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
 - **Backend volume-name admission (2026-08-10):** `.90` passed unsafe Podman identity refusal: `docs/platform/evidence/WL-ARCH-010-2026-08-10-volume-name-admission-r209.md`.
-- **Idle Display1 polling:** seat `.50` passed bounded active/idle backoff coverage: `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-idle-backoff-r178.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
@@ -2047,6 +2046,11 @@ behavioral evidence is not completion.
 - **Stale-session duplicate guard (2026-08-10):** orphaned shell processes block
   duplicate recovery before XDG mutation; `.90` fixtures passed:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-stale-session-guard-r213.md`.
+- **Post-etcd substrate boundary (2026-08-11):** recovery re-attests physical
+  network readiness before Syncthing mutation and emits `offline-after-etcd`
+  when the link disappears at that boundary. `.90` passed all recovery
+  fixtures:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-11-recovery-substrate-boundary-r218.md`.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.

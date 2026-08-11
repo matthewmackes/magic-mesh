@@ -310,6 +310,14 @@ main() {
             publish "failed-configured-etcd"
             return 1
         fi
+        # Starting coordination can take long enough for a
+        # resume/network-return link to disappear. Re-attest before touching
+        # the next configured substrate service so stale admission cannot
+        # cascade into Syncthing mutation.
+        if ! physical_network_online; then
+            publish "offline-after-etcd"
+            return 0
+        fi
     else
         publish "skipped-etcd-client-only"
     fi
