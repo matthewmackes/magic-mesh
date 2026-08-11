@@ -5,6 +5,8 @@
 //! NetworkManager and ModemManager must never put SSIDs, APNs, connection
 //! profiles, passwords, PSKs, or modem credentials on this boundary.
 
+#![allow(clippy::doc_markdown, clippy::derivable_impls)]
+
 use serde::{Deserialize, Serialize};
 
 /// Maximum number of provider observations a status producer may publish.

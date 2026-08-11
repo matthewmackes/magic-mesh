@@ -17,6 +17,12 @@
 //! [`DrmSeatX11State::Unavailable`]; this is important because MCNF's DRM
 //! shell does not grow an X server merely to make an X11 card look launchable.
 
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_const_for_fn,
+    clippy::semicolon_if_nothing_returned
+)]
+
 use crate::resources::SecretReference;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::fmt;

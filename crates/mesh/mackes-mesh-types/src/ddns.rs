@@ -10,6 +10,12 @@
 //! VPN-GW exit-IP changes + runs the WAN check, and the `DnsWriter` (DO) adapter
 //! lives daemon-side; here is the pure, unit-tested core.
 
+#![allow(
+    clippy::if_same_then_else,
+    clippy::match_same_arms,
+    clippy::too_long_first_doc_paragraph
+)]
+
 use serde::{Deserialize, Serialize};
 
 /// What to do with a record when its tunnel goes down (kill-switch policy).
@@ -43,6 +49,7 @@ impl RecordDef {
     /// `{provider}` / `{n}`. An absent `{n}` placeholder is fine (single
     /// instance). Pure + stable. The label is lowercased + non-DNS chars → `-`.
     #[must_use]
+    #[allow(clippy::literal_string_with_formatting_args)]
     pub fn fqdn(&self, node: &str, provider: &str, n: u32, zone: &str) -> String {
         let label = self
             .name
@@ -186,11 +193,10 @@ impl DdnsConfig {
                 return false;
             }
             *existing = rec;
-            true
         } else {
             self.record.push(rec);
-            true
         }
+        true
     }
 
     /// CONNECT-9 — remove a managed record by its name label. Returns `true` when

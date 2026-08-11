@@ -4,6 +4,13 @@
 //! publishes intent. Keeping the wire schema here prevents the two tiers from
 //! maintaining byte-compatible private mirrors.
 
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::match_same_arms,
+    clippy::option_if_let_else,
+    clippy::ptr_arg
+)]
+
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -266,7 +273,7 @@ impl SurfaceVerifyBoard {
         if self.publication.source != SurfaceObservationSource::Kernel {
             return Err(SurfaceContractError::Invalid("board source"));
         }
-        validate_optional_reason(&self.skipped, "skipped")?;
+        validate_optional_reason(self.skipped.as_ref(), "skipped")?;
         if self.skipped.is_some()
             && matches!(self.publication.availability, SurfaceAvailability::Fresh)
         {
@@ -391,7 +398,7 @@ impl SurfaceFirmwareInventory {
         if self.publication.source != SurfaceObservationSource::Fwupd {
             return Err(SurfaceContractError::Invalid("firmware source"));
         }
-        validate_optional_reason(&self.skipped, "skipped")?;
+        validate_optional_reason(self.skipped.as_ref(), "skipped")?;
         if self.skipped.is_some()
             && matches!(self.publication.availability, SurfaceAvailability::Fresh)
         {
@@ -1000,7 +1007,7 @@ impl_action_decode!(
         ) {
             return Err(SurfaceContractError::Invalid("generation"));
         }
-        validate_optional_reason(&value.arm_token, "arm_token")
+        validate_optional_reason(value.arm_token.as_ref(), "arm_token")
     }
 );
 impl_action_decode!(
@@ -1012,7 +1019,7 @@ impl_action_decode!(
         }
         validate_id(&value.release_version, "release_version")?;
         validate_sha256(&value.release_checksum, "release_checksum")?;
-        validate_optional_reason(&value.arm_token, "arm_token")
+        validate_optional_reason(value.arm_token.as_ref(), "arm_token")
     }
 );
 fn decode<T: for<'de> Deserialize<'de>>(
@@ -1031,7 +1038,7 @@ fn decode<T: for<'de> Deserialize<'de>>(
 }
 
 fn validate_optional_reason(
-    value: &Option<String>,
+    value: Option<&String>,
     field: &'static str,
 ) -> Result<(), SurfaceContractError> {
     match value {
