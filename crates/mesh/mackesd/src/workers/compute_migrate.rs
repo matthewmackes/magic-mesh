@@ -632,9 +632,12 @@ fn run_rsync(args: &[String]) -> Result<(), String> {
 }
 
 fn local_nebula_addr(interface: &str) -> String {
-    let Ok(output) = Command::new("ip")
-        .args(["-4", "addr", "show", interface])
-        .output()
+    let mut command = Command::new("ip");
+    command.args(["-4", "addr", "show", interface]);
+    let Ok(output) = super::proc::output_with_timeout(
+        command,
+        super::proc::DEFAULT_CMD_TIMEOUT,
+    )
     else {
         return String::new();
     };
@@ -3138,6 +3141,8 @@ mod tests {
         assert!(!production.contains("Command::new(\"virsh\")"));
         assert!(!production.contains("run_virsh"));
         assert!(!production.contains("SystemWorkloadActuator"));
+        assert!(production.contains("output_with_timeout"));
+        assert!(!production.contains("Command::new(\"ip\")\n        .args([\"-4\", \"addr\", \"show\", interface])\n        .output()"));
     }
 
     #[test]

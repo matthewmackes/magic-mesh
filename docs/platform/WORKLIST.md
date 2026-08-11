@@ -100,10 +100,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Storage probe timeout (2026-08-11):** hanging `df` fails closed; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-storage-probe-timeout-r232.md`.
 - **Bounded mountinfo (2026-08-11):** storage protection/topology refuse over-1 MiB input; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-mountinfo-bound-r233.md`.
-- **VM/image cleanup:** BigBoy passed overlay and virtual-image cleanup:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
-- **Attachment cleanup:** BigBoy passed start-failure revocation and Quadlet cleanup:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-start-failure-attachment-revocation-r172.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
+- **Bounded compute expose probes (2026-08-11):** firewalld/NM/interface probes time out; `.90` passed 1/1: `evidence/WL-ARCH-010-2026-08-11-compute-expose-timeout-r234.md`.
+- **Bounded compute migration probe (2026-08-11):** local `ip` path is timeout-bound; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-compute-migrate-ip-bound-r233.md`.
+- **VM/image cleanup:** `evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
+- **Attachment cleanup:** `evidence/WL-ARCH-010-2026-08-10-start-failure-attachment-revocation-r172.md`, `evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
 - **Storage safety:** seat `.90` passed partition geometry, mountpoint, and storage-name refusal:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
@@ -2385,6 +2385,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-011-2026-08-11-power-supply-bound-r220.md`.
 - **Bounded hardware ID databases (2026-08-11):** `pci.ids`/`usb.ids` reads cap at 16 MiB before parsing; BigBoy passed 1/1:
   `evidence/WL-UX-011-2026-08-11-ids-database-bound-r229.md`.
+- **Bounded hardware probes (2026-08-11):** inventory commands fail closed on hangs; BigBoy passed 1/1: `evidence/WL-UX-011-2026-08-11-hardware-probe-timeout-r233.md`.
 - **Device-control cancellation checkpoint (2026-08-09):** a signed cancellation
   can atomically claim only the exact still-pending request; late/refused
   cancellation cannot replace its eventual execution result, and the shell

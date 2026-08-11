@@ -58,6 +58,7 @@ use mde_bus::persist::Persist;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
+use super::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::{ShutdownToken, Worker};
 
 /// Default poll cadence — control surface (firewalld changes are
@@ -511,7 +512,9 @@ pub fn diff_unexpose(active: &BTreeSet<ActiveRule>, req: &UnexposeRequest) -> Ve
 }
 
 fn binary_present(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
+    let mut command = Command::new(bin);
+    command.arg("--version");
+    output_with_timeout(command, DEFAULT_CMD_TIMEOUT).is_ok()
 }
 
 trait ComputeExposeRuntime: Send + Sync {
@@ -548,10 +551,10 @@ fn compute_bus_root(override_root: Option<PathBuf>, default_root: Option<PathBuf
 }
 
 fn run_firewall_cmd(args: &[String]) -> bool {
-    Command::new("firewall-cmd")
-        .args(args)
-        .status()
-        .map(|s| s.success())
+    let mut command = Command::new("firewall-cmd");
+    command.args(args);
+    status_with_timeout(command, DEFAULT_CMD_TIMEOUT)
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -582,9 +585,9 @@ impl FirewallMutationRunner for SystemFirewallMutationRunner {
 /// Run `firewall-cmd <args>` and capture stdout (empty string on
 /// failure). Used for read-only queries like `--list-rich-rules`.
 fn firewall_cmd_stdout(args: &[String]) -> String {
-    Command::new("firewall-cmd")
-        .args(args)
-        .output()
+    let mut command = Command::new("firewall-cmd");
+    command.args(args);
+    output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -592,9 +595,9 @@ fn firewall_cmd_stdout(args: &[String]) -> String {
 }
 
 fn detect_wan_zone() -> String {
-    let nmcli_out = Command::new("nmcli")
-        .args(["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
-        .output()
+    let mut nmcli = Command::new("nmcli");
+    nmcli.args(["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]);
+    let nmcli_out = output_with_timeout(nmcli, DEFAULT_CMD_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -603,9 +606,9 @@ fn detect_wan_zone() -> String {
         return DEFAULT_WAN_ZONE.to_string();
     };
     let arg = format!("--get-zone-of-interface={dev}");
-    let zone_out = Command::new("firewall-cmd")
-        .arg(&arg)
-        .output()
+    let mut firewall = Command::new("firewall-cmd");
+    firewall.arg(&arg);
+    let zone_out = output_with_timeout(firewall, DEFAULT_CMD_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -614,15 +617,14 @@ fn detect_wan_zone() -> String {
 }
 
 fn local_nebula_addr(interface: &str) -> String {
-    let Ok(output) = Command::new("ip")
-        .args(["-4", "addr", "show", interface])
-        .output()
+    let mut command = Command::new("ip");
+    command.args(["-4", "addr", "show", interface]);
+    let Some(output) = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
+        .ok()
+        .filter(|output| output.status.success())
     else {
         return String::new();
     };
-    if !output.status.success() {
-        return String::new();
-    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -2499,6 +2501,14 @@ mod tests {
     fn parse_zone_of_interface_none_when_no_zone() {
         assert!(parse_zone_of_interface("no zone").is_none());
         assert!(parse_zone_of_interface("").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_fails_closed_when_child_hangs() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        assert!(output_with_timeout(command, Duration::from_millis(50)).is_err());
     }
 
     // ── Required scenario 1: expose mesh-only ──

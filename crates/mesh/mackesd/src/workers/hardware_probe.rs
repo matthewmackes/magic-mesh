@@ -37,11 +37,13 @@ use mackes_mesh_types::peer_probe::{
 /// refresh keeps the directory current without churn.
 pub const TICK: Duration = Duration::from_secs(300);
 
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Run one command, returning trimmed stdout lines (empty on any failure).
 fn cmd_lines(bin: &str, args: &[&str]) -> Vec<String> {
-    std::process::Command::new(bin)
-        .args(args)
-        .output()
+    let mut command = std::process::Command::new(bin);
+    command.args(args);
+    crate::workers::proc::output_with_timeout(command, COMMAND_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -295,5 +297,19 @@ mod tests {
         let json = serde_json::to_string(&probe).expect("serialize");
         let back: PeerProbe = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.peer_id, "peer:test-node");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_probe_times_out_a_hung_child() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        let result = crate::workers::proc::output_with_timeout(
+            command,
+            Duration::from_millis(150),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
