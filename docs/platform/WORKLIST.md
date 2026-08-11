@@ -2407,7 +2407,10 @@ behavioral evidence is not completion.
 - **Taskbar pin identity (2026-08-10):** BigBoy passed stable deduplication: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-pin-dedupe-r156.md`.
 - **Front Door command-input boundary (2026-08-10):** BigBoy passed rejection of control-separated and over-budget `>` command input before terminal activation:
   `docs/platform/evidence/WL-UX-012-2026-08-10-command-input-boundary-r187.md`.
-- **Short Left rail (2026-08-10):** BigBoy `.130` passed short-rail containment: `docs/platform/evidence/WL-UX-012-2026-08-10-short-left-rail-r197.md`.
+- **Short Left-rail geometry (2026-08-10):** `.90` passed bounded admission on a
+  320×160 viewport; fixed controls are shed before any hit target can escape the
+  owned rail or overlap a surviving control:
+  `docs/platform/evidence/WL-UX-012-2026-08-10-short-left-rail-r197.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
