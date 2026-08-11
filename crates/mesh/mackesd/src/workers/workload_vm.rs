@@ -13,6 +13,7 @@ const MANAGED_VM_ROOT: &str = "/var/lib/mde-vms";
 /// into an unbounded host task/FD multiplier. Eight queues are enough to spread
 /// workstation traffic without exceeding the local I/O budget.
 const MAX_VIRTIO_NET_QUEUES: u32 = 8;
+const MAX_VM_IDENTITY_BYTES: usize = 128;
 
 /// The small, reconciler-owned subset of a VM definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub enum VmDomainSpecError {
     NoDom0Reserve,
     /// The disk attachment is outside the reconciler-owned VM pool.
     UnsafeDiskPath,
+    /// A domain or network identity exceeds the bounded XML contract.
+    InvalidIdentity,
 }
 
 impl std::fmt::Display for VmDomainSpecError {
@@ -51,6 +54,7 @@ impl std::fmt::Display for VmDomainSpecError {
             Self::UnsafeDiskPath => {
                 formatter.write_str("VM disk attachment is outside the managed VM pool")
             }
+            Self::InvalidIdentity => formatter.write_str("VM identity exceeds the bounded XML contract"),
         }
     }
 }
@@ -70,6 +74,16 @@ impl VmDomainSpec {
     #[must_use]
     pub fn network_or_default(&self) -> &str {
         self.network.as_deref().unwrap_or(DEFAULT_NETWORK)
+    }
+
+    fn validate_identity(&self) -> Result<(), VmDomainSpecError> {
+        if self.name.is_empty()
+            || self.name.len() > MAX_VM_IDENTITY_BYTES
+            || self.network_or_default().len() > MAX_VM_IDENTITY_BYTES
+        {
+            return Err(VmDomainSpecError::InvalidIdentity);
+        }
+        Ok(())
     }
 }
 
@@ -111,6 +125,7 @@ pub fn build_domain_xml(
     disk_path: &str,
 ) -> Result<String, VmDomainSpecError> {
     spec.validate()?;
+    spec.validate_identity()?;
     let disk = std::path::Path::new(disk_path);
     let managed_root = std::path::Path::new(MANAGED_VM_ROOT);
     if !disk.is_absolute()
@@ -276,6 +291,28 @@ mod tests {
         assert_eq!(
             build_domain_xml(&spec, "/var/lib/mde-vms/overcommitted.qcow2"),
             Err(VmDomainSpecError::NoDom0Reserve)
+        );
+    }
+
+    #[test]
+    fn definition_refuses_unbounded_domain_and_network_identities() {
+        let mut spec = VmDomainSpec {
+            name: "guest".into(),
+            vcpus: 1,
+            ram_mb: 1024,
+            host_threads: 2,
+            network: Some("default".into()),
+        };
+        spec.name = "x".repeat(MAX_VM_IDENTITY_BYTES + 1);
+        assert_eq!(
+            build_domain_xml(&spec, "/var/lib/mde-vms/guest.qcow2"),
+            Err(VmDomainSpecError::InvalidIdentity)
+        );
+        spec.name = "guest".into();
+        spec.network = Some("n".repeat(MAX_VM_IDENTITY_BYTES + 1));
+        assert_eq!(
+            build_domain_xml(&spec, "/var/lib/mde-vms/guest.qcow2"),
+            Err(VmDomainSpecError::InvalidIdentity)
         );
     }
 

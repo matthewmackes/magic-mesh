@@ -1055,7 +1055,7 @@ impl ClockWorker {
             let checkpoint = self.checkpoint();
             advance_clock_cursor(&mut self.action_cursor, &cursor);
             if let Err(error) =
-                self.process_command(transaction, body.as_bytes(), self.clock.now_ms())
+                self.process_command(transaction, body.as_bytes(), now_ms)
             {
                 self.restore_checkpoint(checkpoint);
                 return Err(error);
@@ -1064,8 +1064,8 @@ impl ClockWorker {
         if !self.published_once {
             self.publish(transaction)?;
         }
-        self.publish_peer_convergence(transaction, self.clock.now_ms(), &peer_snapshots)?;
-        self.publish_pending_audio(transaction, self.clock.now_ms())?;
+        self.publish_peer_convergence(transaction, now_ms, &peer_snapshots)?;
+        self.publish_pending_audio(transaction, now_ms)?;
         transaction.verify_current()
     }
 
@@ -2504,6 +2504,18 @@ mod tests {
     impl WallClock for AdjustableClock {
         fn now_ms(&self) -> i64 {
             self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    struct CountingClock {
+        now_ms: i64,
+        reads: AtomicUsize,
+    }
+
+    impl WallClock for CountingClock {
+        fn now_ms(&self) -> i64 {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.now_ms
         }
     }
 
@@ -5115,6 +5127,29 @@ mod tests {
             .list_since(&clock_command_topic("seat-2").unwrap(), None)
             .unwrap();
         assert_eq!(messages.len(), MAX_PEER_COMMANDS_PER_TICK);
+    }
+
+    #[test]
+    fn clock_tick_reuses_one_wall_clock_sample_after_loading() {
+        let mut fixture = Fixture::new();
+        fixture.worker.ensure_loaded().unwrap();
+        let clock = Arc::new(CountingClock {
+            now_ms: NOW,
+            reads: AtomicUsize::new(0),
+        });
+        fixture.worker.clock = clock.clone();
+        let transaction = fixture.worker.open_bus_transaction().unwrap();
+
+        fixture
+            .worker
+            .tick_with_transaction(&transaction)
+            .unwrap();
+
+        assert_eq!(
+            clock.reads.load(Ordering::SeqCst),
+            1,
+            "one Clock tick must validate and publish against one wall-clock sample"
+        );
     }
 
     #[test]

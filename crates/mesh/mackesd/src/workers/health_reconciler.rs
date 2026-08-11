@@ -940,7 +940,10 @@ fn ingest_staged_health_file(
     report: &mut HealthIngressReport,
 ) {
     let bytes = match file {
-        BoundedHealthFile::Missing => return,
+        BoundedHealthFile::Missing => {
+            restore_retained_projection(workgroup_root, publisher, ledger, report);
+            return;
+        }
         BoundedHealthFile::Rejected => {
             report.rejected += 1;
             restore_retained_projection(workgroup_root, publisher, ledger, report);
@@ -962,6 +965,7 @@ fn ingest_staged_health_file(
         return;
     }
     if ledger.retained(publisher) == Some(&candidate) {
+        restore_missing_health_projection(workgroup_root, publisher, &candidate, report);
         return;
     }
     match ledger.admit(candidate, now_ms) {
@@ -1015,6 +1019,7 @@ fn ingest_health_bus_message(
     // twin must advance the cursor without misclassifying it as a replay.
     // Non-identical equal/older generations still fail closed below.
     if ledger.retained(publisher) == Some(&candidate) {
+        restore_missing_health_projection(workgroup_root, publisher, &candidate, report);
         return true;
     }
     if let Err(error) = ledger.validate_candidate(&candidate, now_ms) {
@@ -1051,6 +1056,32 @@ fn ingest_health_bus_message(
                 "health-reconciler: health ledger changed during projection; cursor held",
             );
             false
+        }
+    }
+}
+
+/// Rebuild an exact retained projection when its derived file disappeared.
+/// Equality is otherwise a no-op: a valid canonical/Bus twin must not cause a
+/// write on every tick, but it must also not leave the UI blind after an
+/// operator or cleanup process removes only the derived artifact.
+fn restore_missing_health_projection(
+    workgroup_root: &Path,
+    publisher: &str,
+    state: &NodeHealthState,
+    report: &mut HealthIngressReport,
+) {
+    if health_projection_path(workgroup_root, publisher).exists() {
+        return;
+    }
+    match project_health_state(workgroup_root, state) {
+        Ok(()) => report.restored += 1,
+        Err(error) => {
+            report.projection_failures += 1;
+            tracing::warn!(
+                publisher,
+                error = %error,
+                "health-reconciler: missing exact health projection could not be restored",
+            );
         }
     }
 }
@@ -1571,6 +1602,56 @@ mod tests {
         assert_eq!(
             ingress.bus_cursors.get("node-a").map(String::as_str),
             Some(message.ulid.as_str())
+        );
+    }
+
+    #[test]
+    fn health_ingress_repairs_missing_projection_from_exact_retained_state() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
+        let conn = fresh_store();
+        seed_node(&conn, "node-a");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let first = health_publication("node-a", 1, 100);
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).expect("encode state")),
+            )
+            .expect("publish state");
+        let mut ingress = HealthIngressState::default();
+        ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut ingress,
+            500,
+        )
+        .expect("initial ingress");
+
+        let projection = health_projection_path(workgroup.path(), "node-a");
+        std::fs::remove_file(&projection).expect("remove derived projection");
+        let report = ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut ingress,
+            500,
+        )
+        .expect("repair ingress");
+
+        assert_eq!(report.bus_messages, 0, "the retained state is still current");
+        assert_eq!(report.restored, 1, "exact state repairs the missing artifact");
+        assert_eq!(
+            serde_json::from_slice::<NodeHealthState>(
+                &std::fs::read(&projection).expect("read repaired projection"),
+            )
+            .expect("decode repaired projection"),
+            first
         );
     }
 
