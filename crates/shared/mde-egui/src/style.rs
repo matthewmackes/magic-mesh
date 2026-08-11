@@ -1026,7 +1026,13 @@ impl Style {
         ctx.style_mut(|s| {
             s.visuals = Self::visuals_for(scheme, accent, accent);
         });
-        ctx.data_mut(|d| d.insert_temp(Self::color_scheme_id(), scheme));
+        // The direct-DRM renderer remaps static token-coloured shapes after
+        // `Context::run` returns.  Frame-temporary storage disappears at that
+        // boundary, so a Light/AutoSync3 update would be observed as Dark by
+        // the remapper on the very frame it needs the new palette.  This is a
+        // context configuration value, just like the installer path below;
+        // retain it until the next explicit scheme installation.
+        ctx.data_mut(|d| d.insert_persisted(Self::color_scheme_id(), scheme));
     }
 
     fn color_scheme_id() -> egui::Id {
@@ -2448,6 +2454,32 @@ mod tests {
 
         assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Light);
         assert_eq!(Style::density(&ctx), Density::Touch);
+    }
+
+    #[test]
+    fn accent_scheme_update_survives_the_egui_frame_boundary() {
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            Style::set_color_scheme_and_accent(
+                ctx,
+                StyleColorScheme::Light,
+                Style::ACCENT_WORKLOADS,
+            );
+        });
+
+        // The post-frame DRM remapper must continue resolving tokens through
+        // Light, including the caller-selected accent, rather than falling back
+        // to the default Dark scheme after temporary frame data is discarded.
+        assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Light);
+        assert_eq!(
+            Style::resolve_color(&ctx, Style::ACCENT),
+            Style::QUAZAR_LIGHT_ACCENT
+        );
+        assert_eq!(
+            Style::resolve_color(&ctx, Style::TEXT),
+            Style::QUAZAR_LIGHT_TEXT
+        );
     }
 
     #[test]
