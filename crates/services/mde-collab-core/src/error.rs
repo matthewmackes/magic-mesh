@@ -196,6 +196,15 @@ pub enum CollabError {
         /// The action id.
         action_id: String,
     },
+    /// The alert action id is empty, oversized, or contains a path/control
+    /// character that must not cross the signed action boundary.
+    #[error("alert action id `{action_id}` is invalid (1..={max_bytes} safe ASCII bytes)")]
+    InvalidAlertActionId {
+        /// The rejected action id.
+        action_id: String,
+        /// Maximum accepted UTF-8 byte length.
+        max_bytes: usize,
+    },
     /// The AI request id is not a bounded single-token identifier.
     #[error(
         "AI request id `{request_id}` is invalid (1..={max_bytes} bytes, ASCII alnum/._:- only)"

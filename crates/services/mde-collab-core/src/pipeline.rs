@@ -50,6 +50,11 @@ const MAX_CLEAR_CLIPBOARD_EVENTS: usize = 50;
 /// single token so it never becomes layout, path, or topic material.
 pub const MAX_AI_REQUEST_ID_BYTES: usize = 128;
 
+/// The largest accepted inline alert action id. Action ids are signed into
+/// invocation events and may be consumed by downstream verb/topic adapters;
+/// keep them bounded and token-shaped at the authority boundary.
+pub const MAX_ALERT_ACTION_ID_BYTES: usize = 128;
+
 /// The injected authoring context for [`apply_command`]. Carries the local
 /// actor, the injected wall time, the actor's running HLC (advanced per emitted
 /// event), and the signer + id source. Generic (not `dyn`) so a hot path stays
@@ -577,6 +582,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         } => {
             require_active_space(state, *space)?;
             require_member(state, *space, &ctx.actor)?;
+            require_alert_action_id(action_id)?;
             let entry = state
                 .alerts
                 .get(alert)
@@ -1247,6 +1253,25 @@ fn require_ai_request_id(request_id: &str) -> Result<()> {
         Err(CollabError::InvalidAiRequestId {
             request_id: request_id.to_string(),
             max_bytes: MAX_AI_REQUEST_ID_BYTES,
+        })
+    }
+}
+
+/// Validate the caller-supplied alert action key before it is looked up or
+/// signed into an invocation event. Delimiters that can become path/topic
+/// components are rejected rather than normalized, preserving exact identity.
+fn require_alert_action_id(action_id: &str) -> Result<()> {
+    let valid = !action_id.is_empty()
+        && action_id.len() <= MAX_ALERT_ACTION_ID_BYTES
+        && action_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'));
+    if valid {
+        Ok(())
+    } else {
+        Err(CollabError::InvalidAlertActionId {
+            action_id: action_id.to_string(),
+            max_bytes: MAX_ALERT_ACTION_ID_BYTES,
         })
     }
 }

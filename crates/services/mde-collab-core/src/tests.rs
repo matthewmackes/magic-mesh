@@ -2234,6 +2234,53 @@ fn destructive_alert_action_requires_arming() {
 }
 
 #[test]
+fn alert_action_id_admission_rejects_unbounded_or_path_bearing_ids() {
+    let mut a = engine("alice");
+    let sa = sig(1);
+    let mut ia = SeqIds::new(1);
+    let space = a
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Incident,
+                name: "sev1".into(),
+            },
+            &sa,
+            &mut ia,
+            1000,
+        )
+        .expect("create")[0]
+        .space_id;
+    let alert_env = craft_alert(space, &sa, 1100);
+    let alert = alert_env.event_id;
+    a.merge(vec![alert_env]).expect("merge alert");
+
+    for action_id in [
+        String::new(),
+        "../restart".into(),
+        "restart\\now".into(),
+        "x".repeat(crate::pipeline::MAX_ALERT_ACTION_ID_BYTES + 1),
+    ] {
+        assert!(
+            matches!(
+                a.apply(
+                    &CollabCommand::RunAlertAction {
+                        space,
+                        alert,
+                        action_id: action_id.clone(),
+                        armed: true,
+                    },
+                    &sa,
+                    &mut ia,
+                    1200,
+                ),
+                Err(CollabError::InvalidAlertActionId { .. })
+            ),
+            "unsafe action id was admitted: {action_id:?}"
+        );
+    }
+}
+
+#[test]
 fn alert_ack_is_projected_into_the_inbox() {
     let mut a = engine("alice");
     let sa = sig(1);
