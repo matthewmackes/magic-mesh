@@ -223,6 +223,11 @@ impl<'de> Visitor<'de> for DuplicateKeyVisitor {
 }
 
 /// Reject duplicate object keys recursively before decoding a workload record.
+///
+/// # Errors
+///
+/// Returns an error when the body is malformed or contains duplicate object
+/// keys.
 pub fn reject_duplicate_json_keys(body: &str) -> Result<(), WorkloadContractError> {
     let mut deserializer = serde_json::Deserializer::from_str(body);
     deserializer
@@ -240,6 +245,11 @@ pub struct WorkloadId(String);
 
 impl WorkloadId {
     /// Construct and validate an identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is empty, malformed, or contains a
+    /// forbidden identity character.
     pub fn new(value: impl Into<String>) -> Result<Self, WorkloadContractError> {
         let value = value.into();
         check_identifier(&value, "workload_id")?;
@@ -360,6 +370,7 @@ pub enum WorkloadPressure {
 }
 
 /// Explicit runtime observations exposed in the authoritative projection.
+///
 /// Each dimension is independently replaceable by an adapter; a UI must not
 /// collapse guest-agent, network, service, display, application, health, or
 /// host-pressure state into one optimistic "running" bit.
@@ -380,7 +391,10 @@ impl WorkloadRuntimeSignals {
     /// Derive a conservative baseline from an adapter readiness result.  Real
     /// adapters may replace individual dimensions; unknown remains honest.
     #[must_use]
-    pub fn from_readiness(phase: WorkloadOperationPhase, readiness: WorkloadReadiness) -> Self {
+    pub const fn from_readiness(
+        phase: WorkloadOperationPhase,
+        readiness: WorkloadReadiness,
+    ) -> Self {
         let health = match readiness {
             WorkloadReadiness::Ready => WorkloadHealth::Healthy,
             WorkloadReadiness::Degraded => WorkloadHealth::Degraded,
@@ -393,13 +407,14 @@ impl WorkloadRuntimeSignals {
             WorkloadOperationPhase::Admitting => 20,
             WorkloadOperationPhase::Defining => 35,
             WorkloadOperationPhase::Starting => 50,
-            WorkloadOperationPhase::WaitingForGuest => 60,
+            WorkloadOperationPhase::WaitingForGuest | WorkloadOperationPhase::Stopping => 60,
             WorkloadOperationPhase::WaitingForService => 72,
             WorkloadOperationPhase::PreparingDisplay => 84,
             WorkloadOperationPhase::WaitingForFirstFrame => 92,
-            WorkloadOperationPhase::Ready | WorkloadOperationPhase::Completed => 100,
-            WorkloadOperationPhase::Stopping => 60,
-            WorkloadOperationPhase::Failed | WorkloadOperationPhase::Cancelled => 100,
+            WorkloadOperationPhase::Ready
+            | WorkloadOperationPhase::Completed
+            | WorkloadOperationPhase::Failed
+            | WorkloadOperationPhase::Cancelled => 100,
         };
         let service = if matches!(phase, WorkloadOperationPhase::WaitingForService) {
             WorkloadReadiness::WaitingForService
@@ -505,6 +520,10 @@ pub struct WorkloadResources {
 
 impl WorkloadResources {
     /// Validate basic resource bounds before host-specific admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a resource value is outside its bounded range.
     pub fn validate(&self) -> Result<(), WorkloadContractError> {
         if !(1..=64).contains(&self.vcpu) {
             return Err(WorkloadContractError::InvalidNumber("vcpu"));
@@ -736,6 +755,11 @@ pub struct WorkloadDesiredState {
 
 impl WorkloadDesiredState {
     /// Validate the persisted desired-state record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema, node, resources, generation, or image
+    /// reference is invalid.
     pub fn validate(&self) -> Result<(), WorkloadContractError> {
         check_schema(self.schema_version)?;
         check_identifier(&self.node, "node")?;
@@ -761,7 +785,7 @@ pub struct WorkloadOperationRequest {
     pub backend: WorkloadBackend,
     pub resources: WorkloadResources,
     /// Approved catalog image reference (name:version), never a host path.
-    /// StartAndAttach requires this when the adapter must define a new VM.
+    /// `StartAndAttach` requires this when the adapter must define a new VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
     /// Node-local reconciler target; a worker must ignore operations for peers.
@@ -786,6 +810,11 @@ pub struct WorkloadOperationRequest {
 
 impl WorkloadOperationRequest {
     /// Validate admission-independent request invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request identity, resources, action, deadline,
+    /// or target generation is invalid.
     pub fn validate(&self, now_ms: u64) -> Result<(), WorkloadContractError> {
         check_schema(self.schema_version)?;
         check_identifier(&self.request_id, "request_id")?;
@@ -822,6 +851,11 @@ impl WorkloadOperationRequest {
     }
 
     /// Decode and validate a bounded JSON request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body exceeds the wire bound, contains
+    /// duplicate keys, is malformed, or violates request invariants.
     pub fn from_json(body: &str, now_ms: u64) -> Result<Self, WorkloadContractError> {
         if body.len() > MAX_WORKLOAD_WIRE_BYTES {
             return Err(WorkloadContractError::PayloadTooLarge);
@@ -851,6 +885,11 @@ pub struct WorkloadAttachmentLease {
 
 impl WorkloadAttachmentLease {
     /// Validate a lease before it is published or handed to the shell.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lease identity, generation, or expiry window
+    /// is invalid.
     pub fn validate(&self, now_ms: u64) -> Result<(), WorkloadContractError> {
         check_schema(self.schema_version)?;
         check_identifier(&self.lease_id, "lease_id")?;
@@ -902,6 +941,11 @@ pub struct WorkloadOperationStatus {
 
 impl WorkloadOperationStatus {
     /// Validate bounded status data before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when status fields, readiness authority, retry data, or
+    /// attachment identity violate the Workload contract.
     pub fn validate(&self, now_ms: u64) -> Result<(), WorkloadContractError> {
         check_schema(self.schema_version)?;
         check_identifier(&self.request_id, "request_id")?;
@@ -920,6 +964,15 @@ impl WorkloadOperationStatus {
         }
         if self.phase == WorkloadOperationPhase::Failed && self.reason.is_none() {
             return Err(WorkloadContractError::InvalidField("reason"));
+        }
+        if self.phase == WorkloadOperationPhase::Ready
+            && (self.power != WorkloadPowerState::Running
+                || !matches!(
+                    self.readiness,
+                    WorkloadReadiness::Ready | WorkloadReadiness::Degraded
+                ))
+        {
+            return Err(WorkloadContractError::InvalidField("ready_projection"));
         }
         for (field, value) in [("reason", &self.reason), ("remediation", &self.remediation)] {
             if let Some(value) = value {
@@ -955,9 +1008,11 @@ impl WorkloadOperationStatus {
     }
 }
 
-/// Stable refusal codes for the Workload operation RPC boundary.  Provider
-/// diagnostics remain in an accepted operation's bounded status projection;
-/// malformed or unauthorized requests never echo raw request/provider text.
+/// Stable refusal codes for the Workload operation RPC boundary.
+///
+/// Provider diagnostics remain in an accepted operation's bounded status
+/// projection; malformed or unauthorized requests never echo raw
+/// request/provider text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadOperationErrorCode {
@@ -979,11 +1034,13 @@ pub enum WorkloadOperationErrorCode {
     JournalUnavailable,
 }
 
-/// Typed reply for `action/workload/operation`, correlated by the Bus action
-/// message ULID and written to `reply/<request-ulid>`.  An accepted reply
-/// always carries the authoritative persisted status, including terminal
-/// adapter failure; `accepted` means the operation was journaled, not that a
-/// VM/container was optimistically claimed ready.
+/// Typed reply for `action/workload/operation`.
+///
+/// The reply is correlated by the Bus action message ULID and written to
+/// `reply/<request-ulid>`. An accepted reply always carries the authoritative
+/// persisted status, including terminal adapter failure; `accepted` means the
+/// operation was journaled, not that a VM/container was optimistically claimed
+/// ready.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadOperationReply {
@@ -1011,6 +1068,11 @@ pub struct WorkloadStateSnapshot {
 
 impl WorkloadStateSnapshot {
     /// Validate a projection before publishing it to the mesh bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot identity, size, workload status, or
+    /// workload uniqueness constraints are invalid.
     pub fn validate(&self, now_ms: u64) -> Result<(), WorkloadContractError> {
         check_schema(self.schema_version)?;
         check_identifier(&self.node, "node")?;
@@ -1036,6 +1098,7 @@ pub fn workload_state_topic(node: &str) -> String {
 
 /// Whether a phase transition is legal for a journal replay.
 #[must_use]
+#[allow(clippy::too_many_lines, clippy::unnested_or_patterns)]
 pub fn valid_phase_transition(from: WorkloadOperationPhase, to: WorkloadOperationPhase) -> bool {
     from == to
         || matches!(
@@ -1420,6 +1483,41 @@ mod tests {
             status.validate(1_000),
             Err(WorkloadContractError::InvalidField("terminal_attachment"))
         );
+    }
+
+    #[test]
+    fn ready_projection_requires_running_power_and_non_failed_readiness() {
+        let mut status = WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: "status-ready-boundary-1".into(),
+            workload_id: WorkloadId::new("browser-seat15").expect("valid workload id"),
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadProfile::Standard.resources(),
+            image_ref: None,
+            generation: 1,
+            phase: WorkloadOperationPhase::Ready,
+            power: WorkloadPowerState::Stopped,
+            readiness: WorkloadReadiness::Unknown,
+            signals: WorkloadRuntimeSignals::from_readiness(
+                WorkloadOperationPhase::Ready,
+                WorkloadReadiness::Unknown,
+            ),
+            retryable: false,
+            attempt: 1,
+            next_retry_at_ms: 0,
+            reason: None,
+            remediation: None,
+            attachment: None,
+        };
+
+        assert_eq!(
+            status.validate(1_000),
+            Err(WorkloadContractError::InvalidField("ready_projection"))
+        );
+
+        status.power = WorkloadPowerState::Running;
+        status.readiness = WorkloadReadiness::Ready;
+        assert!(status.validate(1_000).is_ok());
     }
 
     #[test]
