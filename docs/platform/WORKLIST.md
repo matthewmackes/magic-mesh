@@ -1392,6 +1392,9 @@ behavioral evidence is not completion.
 - **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
 - Remaining work:
+- **VDI source identity checkpoint (2026-08-10):** Cuttlefish VDI sources now require current guest-ready state plus
+  matching workload, image provenance, and generation. `.90` passed a hostile mismatched-workload regression:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-10-vdi-source-identity-r187.md`.
 - **Android catalog identity checkpoint (2026-08-10):** higher-revision signed imports cannot switch catalog identity; seat 90 passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-android-identity-continuity-r161.md`.
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
