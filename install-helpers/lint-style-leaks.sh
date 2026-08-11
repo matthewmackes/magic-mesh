@@ -21,6 +21,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The shared icon registry is part of the visual-token boundary. Run its
+# source/asset/license drift gate alongside the raw-style scan so a new glyph
+# cannot bypass the registry simply because it has no colour literal.
+python3 install-helpers/lint-carbon-icon-registry.py
+
 DATA_EXCLUDE='mde-vdi-(rdp|spice|vnc)/|mde-vdi-core/src/pixel\.rs|mde-term-egui/src/(palette|presets)\.rs'
 COLOUR_EXCLUDE="${DATA_EXCLUDE}"
 
