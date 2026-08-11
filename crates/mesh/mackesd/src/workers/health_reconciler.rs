@@ -645,6 +645,15 @@ where
 
     // Every ingress source is now readable and bounded. Only this phase may
     // mutate the candidate ledger/cursors or publish canonical projections.
+    for publisher in &publishers {
+        expire_retained_health_projection(
+            workgroup_root,
+            publisher,
+            &mut candidate_state.ledger,
+            now_ms,
+            &mut report,
+        );
+    }
     for (publisher, file) in staged_files {
         ingest_staged_health_file(
             workgroup_root,
@@ -679,6 +688,27 @@ where
     persist_health_checkpoint(workgroup_root, local_node_id, &candidate_state, &mut report);
     *state = candidate_state;
     Ok(report)
+}
+
+/// Expire a live last-good publication before it can be treated as an exact
+/// duplicate or restored over a missing replacement. Restart recovery already
+/// rejects stale checkpoint rows; this pass closes the equivalent gap for a
+/// daemon that remains running across the publication's validity deadline.
+fn expire_retained_health_projection(
+    workgroup_root: &Path,
+    publisher: &str,
+    ledger: &mut HealthPublicationLedger,
+    now_ms: u64,
+    report: &mut HealthIngressReport,
+) {
+    let expired = ledger
+        .retained(publisher)
+        .is_some_and(|state| state.valid_until_ms < now_ms);
+    if !expired {
+        return;
+    }
+    ledger.retained.remove(publisher);
+    clear_invalid_health_projection(workgroup_root, publisher, report);
 }
 
 fn health_checkpoint_path(workgroup_root: &Path, local_node_id: &str) -> Option<PathBuf> {
@@ -1736,6 +1766,57 @@ mod tests {
         assert!(
             !projection.exists(),
             "expired derived state must not remain visible without a last-good replacement"
+        );
+    }
+
+    #[test]
+    fn live_ingress_expires_retained_state_without_waiting_for_restart() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
+        let conn = fresh_store();
+        seed_node(&conn, "node-a");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let first = health_publication("node-a", 1, 100);
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).expect("encode state")),
+            )
+            .expect("publish state");
+
+        let mut ingress = HealthIngressState::default();
+        ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut ingress,
+            500,
+        )
+        .expect("initial ingress");
+        let projection = health_projection_path(workgroup.path(), "node-a");
+        assert!(projection.is_file(), "initial state is projected");
+
+        // The daemon remains alive, receives no replacement, and sees the
+        // exact same canonical file after its validity deadline. Equality
+        // must not bypass expiry and leave stale health visible.
+        let report = ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut ingress,
+            2_001,
+        )
+        .expect("live expiry ingress");
+
+        assert_eq!(report.bus_messages, 0);
+        assert!(ingress.ledger.retained("node-a").is_none());
+        assert!(
+            !projection.exists(),
+            "live expiry must remove the stale derived projection"
         );
     }
 
