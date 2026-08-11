@@ -114,6 +114,41 @@ fn create_space_makes_the_creator_an_owner() {
 }
 
 #[test]
+fn document_text_is_bounded_before_signing() {
+    let mut a = engine("alice");
+    let signer = sig(1);
+    let mut ids = SeqIds::new(1);
+    let space = a
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "docs".into(),
+            },
+            &signer,
+            &mut ids,
+            1000,
+        )
+        .expect("create space")[0]
+        .space_id;
+    let oversized = "x".repeat(crate::pipeline::MAX_DOCUMENT_TEXT_BYTES + 1);
+    let before_events = a.all_events().len();
+    let before_ids = ids.n;
+    let err = a.apply(
+        &CollabCommand::CreateDocument {
+            space,
+            document: DocumentId::new(),
+            title: oversized,
+        },
+        &signer,
+        &mut ids,
+        1100,
+    );
+    assert!(matches!(err, Err(CollabError::Serde(message)) if message.contains("document title")));
+    assert_eq!(a.all_events().len(), before_events);
+    assert_eq!(ids.n, before_ids);
+}
+
+#[test]
 fn projection_failure_keeps_local_and_replicated_engine_state_atomic() {
     let signer = sig(1);
     let mut ids = SeqIds::new(1);

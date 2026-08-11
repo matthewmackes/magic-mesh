@@ -44,6 +44,10 @@ pub const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
 /// The maximum UTF-8 byte length of a basic channel task title.
 pub const MAX_TASK_TITLE_BYTES: usize = 512;
 
+/// The maximum UTF-8 byte length for document titles, change summaries, and
+/// review comments stored in the collaboration read model.
+pub const MAX_DOCUMENT_TEXT_BYTES: usize = 64 * 1024;
+
 /// The maximum number of tombstones one `ClearClipboard` command may author.
 ///
 /// The mesh clipboard history already retains at most 50 unpinned entries, so
@@ -802,6 +806,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         } => {
             require_active_space(state, *space)?;
             require_member(state, *space, &ctx.actor)?;
+            validate_document_text(title, "document title")?;
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::DocumentCreated {
@@ -819,6 +824,9 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             require_member(state, *space, &ctx.actor)?;
             if state.documents.get(document) != Some(space) {
                 return Err(CollabError::DocumentNotFound(*document));
+            }
+            if let Some(summary) = &change.summary {
+                validate_document_text(summary, "document change summary")?;
             }
             Ok(vec![ctx.emit(
                 *space,
@@ -856,6 +864,9 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             require_member(state, *space, &ctx.actor)?;
             if state.documents.get(document) != Some(space) {
                 return Err(CollabError::DocumentNotFound(*document));
+            }
+            if let Some(comment) = comment {
+                validate_document_text(comment, "review comment")?;
             }
             Ok(vec![ctx.emit(
                 *space,
@@ -1188,6 +1199,17 @@ fn validate_task_title(title: &str) -> Result<()> {
     if trimmed.len() > MAX_TASK_TITLE_BYTES {
         return Err(CollabError::Serde(format!(
             "task title exceeds {MAX_TASK_TITLE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Keep human-authored document metadata representable by the read model
+/// before it consumes an event id, HLC tick, or signature.
+fn validate_document_text(value: &str, field: &str) -> Result<()> {
+    if value.len() > MAX_DOCUMENT_TEXT_BYTES {
+        return Err(CollabError::Serde(format!(
+            "{field} exceeds {MAX_DOCUMENT_TEXT_BYTES} bytes"
         )));
     }
     Ok(())
