@@ -706,7 +706,16 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
         }
 
         let attributes = &tag[name_end..];
-        if attributes.contains("javascript:") || attributes.contains("vbscript:") {
+        // Resource URLs are active content too: a downstream clipboard
+        // renderer may dereference them even when the surrounding markup has
+        // no script tag or event handler.  Keep the guest value inert at this
+        // boundary; in particular, data: can smuggle HTML/SVG and file: can
+        // expose host-local paths when pasted into a capable consumer.
+        if attributes.contains("javascript:")
+            || attributes.contains("vbscript:")
+            || attributes.contains("data:")
+            || attributes.contains("file:")
+        {
             return false;
         }
         let mut attribute = attributes;
@@ -869,6 +878,21 @@ mod tests {
             r#"<div onclick="javascript:alert(1)"><script>alert(1)</script></div>"#
         ));
         assert!(guest_html_fragment_is_safe("<p><strong>safe</strong> guest</p>"));
+    }
+
+    #[test]
+    fn guest_html_resource_urls_are_refused_before_host_publication() {
+        for fragment in [
+            r#"<img src="data:image/svg+xml,<svg onload=alert(1)>" />"#,
+            r#"<a href="file:///etc/passwd">local file</a>"#,
+        ] {
+            let (bridge, mut backend) = ClipboardBridge::pair();
+            backend.on_remote_copy(&[html_format()]);
+            assert_eq!(bridge.take_remote_format_request(), Some(HTML_FORMAT_ID));
+
+            backend.on_format_data_response(FormatDataResponse::new_data(encode_cf_html(fragment)));
+            assert_eq!(bridge.take_remote_html(), None, "active resource URL must not cross the guest boundary");
+        }
     }
 
     #[test]
