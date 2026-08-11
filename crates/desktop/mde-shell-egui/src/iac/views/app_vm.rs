@@ -744,6 +744,8 @@ where
                     || !valid_app_vm_request(&event)
                     || event.app_id != target.app_id
                     || event.guest_profile != target.guest_profile
+                    || event.requested_capabilities != target.requested_capabilities
+                    || event.resume != target.resume
                 {
                     continue;
                 }
@@ -1306,6 +1308,26 @@ mod tests {
             render_model(&target, Some(admitted)).launch,
             LaunchAvailability::Ready
         );
+    }
+
+    #[test]
+    fn session_projection_rejects_open_with_mismatched_capabilities_or_resume() {
+        let target = row(Some(request("catalog-1")));
+        let mut mismatched_capabilities = open("catalog-1");
+        if let SessionRequest::OpenApp {
+            requested_capabilities,
+            ..
+        } = &mut mismatched_capabilities
+        {
+            requested_capabilities.clear();
+        }
+        assert!(project_session([mismatched_capabilities], &target, CLIENT).is_none());
+
+        let mut mismatched_resume = open("catalog-1");
+        if let SessionRequest::OpenApp { resume, .. } = &mut mismatched_resume {
+            *resume = false;
+        }
+        assert!(project_session([mismatched_resume], &target, CLIENT).is_none());
     }
 
     #[test]
