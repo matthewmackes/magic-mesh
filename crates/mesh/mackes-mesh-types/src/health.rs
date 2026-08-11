@@ -1228,10 +1228,10 @@ impl NodeHealthState {
         if self.resolved_conditions.len() > MAX_NODE_HEALTH_CONDITIONS {
             return Err(NodeHealthValidationError::TooMany("resolved_conditions"));
         }
-        let mut active_condition_identities = BTreeSet::new();
+        let mut condition_identities = BTreeSet::new();
         for condition in &self.active_conditions {
             validate_condition(condition, &self.publisher, self.published_at_ms, true)?;
-            if !active_condition_identities.insert((condition.scope.clone(), condition.id.clone())) {
+            if !condition_identities.insert((condition.scope.clone(), condition.id.clone())) {
                 return Err(NodeHealthValidationError::Contradictory(
                     "duplicate active condition identity",
                 ));
@@ -1239,6 +1239,11 @@ impl NodeHealthState {
         }
         for condition in &self.resolved_conditions {
             validate_condition(condition, &self.publisher, self.published_at_ms, false)?;
+            if !condition_identities.insert((condition.scope.clone(), condition.id.clone())) {
+                return Err(NodeHealthValidationError::Contradictory(
+                    "condition identity appears in both lifecycle lanes",
+                ));
+            }
         }
         let evaluated = NodeGrade::evaluate(
             self.publisher.clone(),
@@ -2416,6 +2421,23 @@ mod tests {
             duplicate.validate_at(100),
             Err(NodeHealthValidationError::Contradictory(
                 "duplicate active condition identity"
+            ))
+        );
+    }
+
+    #[test]
+    fn node_health_publication_rejects_condition_identity_split_across_lifecycle_lanes() {
+        let mut ambiguous = state("node", 1, 100);
+        let active = condition("node", HealthSeverity::Warning);
+        let mut resolved = active.clone();
+        resolved.resolved_at_ms = Some(100);
+        ambiguous.active_conditions.push(active);
+        ambiguous.resolved_conditions.push(resolved);
+
+        assert_eq!(
+            ambiguous.validate_at(100),
+            Err(NodeHealthValidationError::Contradictory(
+                "condition identity appears in both lifecycle lanes"
             ))
         );
     }
