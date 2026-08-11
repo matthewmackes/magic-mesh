@@ -1801,7 +1801,19 @@ impl VehicleRoster {
         };
         assignment.latest = None;
         assignment.latest_received_at = None;
-        self.published.remove(source_id);
+        // A manager loss is not a source loss while another manager still has
+        // an accepted snapshot. Preserve the source publication clock so an
+        // unhealthy non-selected manager cannot manufacture a false Changed
+        // publication on the next fold.
+        let has_live_manager = self
+            .assignments
+            .iter()
+            .any(|((candidate, _), assignment)| {
+                candidate == source_id && assignment.latest.is_some()
+            });
+        if !has_live_manager {
+            self.published.remove(source_id);
+        }
         Ok(())
     }
 
@@ -6671,6 +6683,43 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             publications[0].reason,
             VehiclePublicationReason::Heartbeat,
             "manager expiry must not manufacture a source Changed epoch"
+        );
+    }
+
+    #[test]
+    fn marking_non_selected_manager_unavailable_preserves_source_publication_epoch() {
+        let source = roster_source_id();
+        let plan = VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT).unwrap();
+        let t0 = Instant::now();
+        let mut roster = VehicleRoster::new(t0);
+        for manager in ["manager-a", "manager-b"] {
+            roster
+                .register(VehicleRosterSource::remote(source.clone(), manager, plan).unwrap())
+                .unwrap();
+        }
+
+        roster
+            .ingest_at(
+                roster_snapshot(&source, "manager-a", 200, 200, 2),
+                t0,
+            )
+            .unwrap();
+        roster
+            .ingest_at(
+                roster_snapshot(&source, "manager-b", 100, 100, 1),
+                t0,
+            )
+            .unwrap();
+        let initial = roster.take_publications(t0);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].manager_id, "manager-a");
+
+        roster
+            .mark_unavailable(&source, "manager-b")
+            .expect("registered manager can be marked unavailable");
+        assert!(
+            roster.take_publications(t0 + Duration::from_secs(1)).is_empty(),
+            "losing a non-selected manager must not manufacture a source change"
         );
     }
 

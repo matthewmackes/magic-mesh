@@ -885,7 +885,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
-- **MG90 manager failover:** `.90` preserved healthy-source publication: `docs/platform/evidence/WL-FUNC-017-2026-08-10-mg90-partial-manager-expiry-r183.md`.
+- **MG90 failover safety:** source publication epoch preserved across manager loss; `.90`: `docs/platform/evidence/WL-FUNC-017-2026-08-10-mg90-nonselected-loss-r193.md`.
 - **Offline timeline (r160):** impossible access order fails closed; BigBoy passed `docs/platform/evidence/WL-FUNC-017-2026-08-10-offline-timeline-r160.md`.
 - **Offline basemap admission (2026-08-10):** ambiguous or unsafe region/MBTiles candidates fail closed; `.90` passed 6/6; renderer/routing/live proof remain:
   `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
