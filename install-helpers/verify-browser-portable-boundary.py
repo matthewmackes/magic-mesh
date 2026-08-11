@@ -316,6 +316,29 @@ def validate_output_parent_refusal(module: ModuleType, base: Path) -> None:
         raise BoundaryError("symlinked output parent redirected a published bundle")
 
 
+def validate_source_parent_refusal(module: ModuleType, base: Path) -> None:
+    """A symlinked source ancestor must not redirect the migration input."""
+
+    outside = base / "outside-source"
+    (outside / "profile").mkdir(parents=True)
+    (outside / "profile" / "Bookmarks").write_text("{}\n", encoding="utf-8")
+    redirected_parent = base / "redirected-source-parent"
+    try:
+        redirected_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        raise BoundaryError(f"fixture filesystem must support symlinked directories: {exc}") from exc
+    output = base / "source-parent-output"
+    try:
+        module.migrate([(redirected_parent / "profile", "profile")], output)
+    except module.MigrationError as exc:
+        if "source root path" not in str(exc):
+            raise BoundaryError(f"symlinked source parent failed for the wrong reason: {exc}") from exc
+    else:
+        raise BoundaryError("a symlinked source parent must fail closed")
+    if output.exists():
+        raise BoundaryError("a symlinked source parent must not publish a bundle")
+
+
 def validate_source(repo_root: Path) -> None:
     module = load_migration(repo_root)
     require_policy(module)
@@ -342,6 +365,8 @@ def validate_source(repo_root: Path) -> None:
         validate_existing_bundle_integrity(module, Path(raw))
     with tempfile.TemporaryDirectory(prefix="browser-portable-output-parent-") as raw:
         validate_output_parent_refusal(module, Path(raw))
+    with tempfile.TemporaryDirectory(prefix="browser-portable-source-parent-") as raw:
+        validate_source_parent_refusal(module, Path(raw))
 
 
 def self_test() -> None:

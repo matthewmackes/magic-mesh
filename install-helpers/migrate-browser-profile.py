@@ -215,8 +215,23 @@ def validate_roots(roots: list[tuple[Path, str]], output: Path) -> None:
     output_absolute = output.absolute()
     for root, _category in roots:
         root_absolute = root.absolute()
-        if root.is_symlink():
-            raise MigrationError(f"source root must not be a symlink: {root}")
+        current = Path(root_absolute.anchor)
+        relative_parts = root_absolute.relative_to(root_absolute.anchor).parts
+        for part in relative_parts:
+            current /= part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                # A missing suffix is handled by migrate as source-missing;
+                # every existing ancestor has still been checked for
+                # redirection before that decision is made.
+                break
+            except OSError as error:
+                raise MigrationError(f"source root is unreadable: {current}") from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise MigrationError(f"source root path must not contain a symlink: {current}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise MigrationError(f"source root path is not a directory: {current}")
         if root_absolute == output_absolute or root_absolute in output_absolute.parents:
             raise MigrationError("output must not be inside a source root")
 
