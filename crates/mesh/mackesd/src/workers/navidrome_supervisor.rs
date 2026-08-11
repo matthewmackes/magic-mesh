@@ -32,7 +32,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// Keep the first synchronous systemd probe inside the existing cadence while
 /// spreading identical daemon startups across a small, deterministic window.
 const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
-const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The systemd unit `setup-media-navidrome.sh` installs.
 const UNIT: &str = "mcnf-navidrome.service";
@@ -100,7 +100,7 @@ impl NavidromeSupervisor {
                     "navidrome_supervisor: {UNIT} missing — re-provisioning via {SETUP}"
                 );
                 // The setup script is idempotent; default args read CREDS.
-                let _ = Command::new(SETUP).output();
+                let _ = run_bounded(Command::new(SETUP), COMMAND_TIMEOUT);
             }
             Action::NeedsSetup => {
                 tracing::warn!(
@@ -120,7 +120,7 @@ fn sc(args: &[&str]) -> bool {
 fn run(args: &[&str]) -> Option<std::process::Output> {
     let mut command = Command::new("systemctl");
     command.args(args);
-    run_bounded(command, SYSTEMCTL_TIMEOUT)
+    run_bounded(command, COMMAND_TIMEOUT)
 }
 
 fn run_bounded(command: Command, timeout: Duration) -> Option<std::process::Output> {

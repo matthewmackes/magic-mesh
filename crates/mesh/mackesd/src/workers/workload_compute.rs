@@ -4542,9 +4542,13 @@ fn live_capacity<'a>(
 }
 
 fn probe_storage_gb(path: &str) -> u32 {
-    std::process::Command::new("df")
-        .args(["-Pk", path])
-        .output()
+    let mut command = Command::new("df");
+    command.args(["-Pk", path]);
+    probe_storage_gb_command(command, DEFAULT_CMD_TIMEOUT)
+}
+
+fn probe_storage_gb_command(command: Command, timeout: Duration) -> u32 {
+    output_with_timeout(command, timeout)
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -4778,6 +4782,17 @@ mod tests {
             ),
             Some(vec![WorkloadOperationPhase::Starting])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_probe_fails_closed_when_df_hangs() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        let started = std::time::Instant::now();
+
+        assert_eq!(probe_storage_gb_command(command, Duration::from_millis(50)), 0);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

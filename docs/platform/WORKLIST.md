@@ -91,8 +91,7 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
-- Required outcome: One persisted idempotent Workload API controls lifecycle; only the reconciler actuates through libvirt/virtqemud or Quadlet/systemd.
-  The shell consumes bounded typed projections, with tested local Display1/KMS attachment and RDP/SPICE/VNC recovery.
+- Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
 - Current state: typed contracts, journals, cancellation, Display1, hostile tests, cleanup; adapters, recovery, KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work: **Recovered lease deadline checkpoint (2026-08-10):** expired recovered attachment leases are refused; BigBoy passed the focused gate:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
@@ -100,6 +99,7 @@ behavioral evidence is not completion.
 - **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
 - **VM resource-efficiency/Dom0 reserve (2026-08-10):** CPU pinning, bounded queues, qcow2 discard, shared non-Dom0 pools, and Dom0 reserve passed focused farm gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
+- **Storage probe timeout (2026-08-11):** hanging `df` fails closed; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-storage-probe-timeout-r232.md`.
 - **VM/image cleanup:** BigBoy passed overlay and virtual-image cleanup:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
 - **Attachment cleanup:** BigBoy passed start-failure revocation and Quadlet cleanup:
@@ -1530,8 +1530,8 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
 - Required outcome: daemon-owned typed music catalog/queue/playback/cache; real mpv audio/video; local/Jellyfin, discovery, cast, handoff, and live proof.
-- Current state: daemon authority and release 11 run on five seats; Dell named-detail, CPU/NWS, and provider-loss proofs pass.
-  Media-server Bus fold: `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/audio/cast/handoff remain.
+- Current state: release 11/daemon authority run on five seats; Dell/CPU/NWS/provider-loss pass; Bus fold:
+  `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/audio/cast/handoff remain.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
@@ -1541,8 +1541,8 @@ behavioral evidence is not completion.
 - **Navidrome command timeout (2026-08-11):** systemctl/setup calls fail closed at the shared deadline; BigBoy: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-timeout-r226.md`.
 - **Bounded service registration hostname (2026-08-11):** `/etc/hostname` caps at 255 bytes; BigBoy passed 1/1: `evidence/WL-FUNC-021-2026-08-11-service-hostname-bound-r230.md`.
 - **Bounded Navidrome commands (2026-08-11):** systemctl uses shared 15s boundary; BigBoy passed 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-bound-r231.md`.
-- Remaining work: **Shared artwork byte bound (2026-08-11):** cache reads refuse non-regular or over-4-MiB files and writes refuse oversized payloads; `.50` passed:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
+- **Navidrome setup bound (2026-08-11):** re-provision shares 15s timeout; `.90` 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-setup-timeout-r232.md`.
+- Remaining work: **Artwork byte bound (2026-08-11):** non-regular/over-4M reads and oversized writes refuse; `.50`: `evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
 - **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
 - **Cast media URL admission checkpoint (2026-08-10):** unsafe/local/credential-bearing URLs refused; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
@@ -1550,8 +1550,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-021-2026-08-10-direct-media-url-admission-r214.md`.
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
-- **Signed live-radio checkpoint (2026-08-08):** release 8 is live on five seats with encrypted Music credentials; Dell/15 pass retained C-SPAN Play/Stop.
-  Dell capture is non-silent (2,621,440 bytes, 287,035 non-zero, peak 20,092, RMS 1,677.73); T480/Eagle/Surface mutation and speaker judgment remain open.
+- **Signed live-radio (2026-08-08):** release 8 live on five seats; Dell/15 C-SPAN pass and capture non-silent; T480/Eagle/Surface mutation and speaker judgment remain open.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-radio-release8-r1.md`.
 - **Library checkpoint (2026-08-06):** typed collections replace Airsonic rows; UI 44/44 on `.50`, fmt `.90`; `evidence/WL-FUNC-021-2026-08-06-daemon-library-r1.md`.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
