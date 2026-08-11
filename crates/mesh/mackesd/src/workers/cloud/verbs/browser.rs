@@ -35,8 +35,11 @@ pub(super) fn authorization_target(body: &CloudActionBody) -> Result<&str, Strin
 
 /// Build the baseline Browser VM desired-state spec.
 #[must_use]
-pub(super) fn browser_spec(node: &str, name: &str, image_digest: &str) -> WorkloadSpec {
-    let mut spec = BrowserVmProfile::default().workload_spec(node, name);
+pub(super) fn browser_spec(node: &str, _name: &str, image_digest: &str) -> WorkloadSpec {
+    // The Browser surface selects exactly one VM route. Do not let an internal
+    // caller mint an alternate workload identity that can never be selected by
+    // the runtime controller (or shadow the canonical desired-state file).
+    let mut spec = BrowserVmProfile::default().workload_spec(node, BROWSER_VM_WORKLOAD_NAME);
     spec.image_digest = Some(image_digest.to_owned());
     spec
 }
@@ -139,13 +142,22 @@ mod tests {
         let spec = browser_spec("eagle", "browser-eagle", DIGEST);
         assert_eq!(spec.delivery_type, DeliveryType::DesktopVm);
         assert_eq!(spec.node, "eagle");
-        assert_eq!(spec.name, "browser-eagle");
+        assert_eq!(spec.name, BROWSER_VM_WORKLOAD_NAME);
         assert_eq!(spec.vcpu, 4);
         assert_eq!(spec.memory_mb, 8192);
         assert_eq!(spec.disk_gb, 64);
         assert_eq!(spec.image.as_deref(), Some("browser-vm-chromium"));
         assert_eq!(spec.image_digest.as_deref(), Some(DIGEST));
         assert!(!spec.network_isolation);
+    }
+
+    #[test]
+    fn browser_spec_cannot_mint_a_noncanonical_runtime_identity() {
+        let spec = browser_spec("eagle", "browser-shadow", DIGEST);
+
+        assert_eq!(spec.name, BROWSER_VM_WORKLOAD_NAME);
+        assert_eq!(spec.image.as_deref(), Some("browser-vm-chromium"));
+        assert_eq!(spec.node, "eagle");
     }
 
     #[test]
