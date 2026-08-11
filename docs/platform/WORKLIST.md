@@ -106,8 +106,8 @@ behavioral evidence is not completion.
 - **Partition geometry refusal:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`.
 - **Mountpoint safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`.
 - **Storage name safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
-- **Idle Display1 polling:** seat `.50` passed bounded active/idle backoff coverage:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-idle-backoff-r178.md`.
+- **Backend volume-name admission (2026-08-10):** `.90` passed unsafe Podman identity refusal: `docs/platform/evidence/WL-ARCH-010-2026-08-10-volume-name-admission-r209.md`.
+- **Idle Display1 polling:** seat `.50` passed bounded active/idle backoff coverage: `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-idle-backoff-r178.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
@@ -1516,10 +1516,10 @@ behavioral evidence is not completion.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
 - **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-search-replay-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-source-identity-r1.md`.
-- **Cache checkpoints (2026-08-07/09):** Jellyfin truncation is rejected; index and metadata replacement preserve last-good.
-  BigBoy 2/2+1/1; mde-jellyfin 114/114; Media UI 104/104; `.50` cache 16/16; live/package proof remains open.
+- **Cache checkpoints (2026-08-07/09):** truncation rejected; replacements preserve last-good; BigBoy/UI/cache tests pass; live/package proof remains open.
   `evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`,
   `evidence/WL-FUNC-021-2026-08-09-jellyfin-metadata-atomic-r12.md`.
+- **Music cache completeness (2026-08-10):** `.90` passed truncated/replaced-file refusal: `docs/platform/evidence/WL-FUNC-021-2026-08-10-cache-completeness-r208.md`.
 - **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
   Live proof remains: `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`, `evidence/WL-FUNC-021-2026-08-09-mpv-playlist-continuation-r11.md`.
 - **Daemon Album/download/workerless checkpoint (2026-08-06):** Home, Library, and Search open retained albums; detail emits typed play without `LoadAlbum` worker requests.
