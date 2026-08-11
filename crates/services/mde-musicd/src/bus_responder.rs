@@ -4737,9 +4737,35 @@ fn direct_radio_stream_url(content: &ContentRef) -> Option<&str> {
     if content.kind != ContentKind::Radio {
         return None;
     }
+    // A provider owns the station metadata, but it must not be able to smuggle
+    // credentials or request-line control bytes into the native engine/MPRIS
+    // path.  reqwest::Url accepts some whitespace by normalizing it, so reject
+    // the raw locator before parsing as well.
+    if content.remote_id.len() > 4096
+        || content
+            .remote_id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    let _authority = content
+        .remote_id
+        .strip_prefix("http://")
+        .or_else(|| content.remote_id.strip_prefix("https://"))?
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
     let parsed = reqwest::Url::parse(&content.remote_id).ok()?;
-    (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
-        .then_some(content.remote_id.as_str())
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some_and(|port| port == 0)
+    {
+        return None;
+    }
+    Some(content.remote_id.as_str())
 }
 
 fn retained_radio_stream_url<'a>(
@@ -8367,6 +8393,37 @@ mod tests {
                 "malformed retained radio must not fall through to /rest/stream",
             );
         }
+    }
+
+    #[test]
+    fn typed_radio_play_rejects_credentialed_and_control_bearing_urls() {
+        for remote_id in [
+            "https://alice:secret@stream.test/live",
+            "https://stream.test/live path",
+            "https://stream.test/live\r\nX-Injected: yes",
+            "ftp://stream.test/live",
+            "https:///missing-host",
+        ] {
+            let content = ContentRef::new(
+                "airsonic:http://radio.test",
+                remote_id,
+                ContentKind::Radio,
+            )
+            .expect("test content identity");
+            assert_eq!(
+                direct_radio_stream_url(&content),
+                None,
+                "unsafe provider radio locator must be refused: {remote_id:?}"
+            );
+        }
+
+        let safe = ContentRef::new(
+            "airsonic:http://radio.test",
+            "https://stream.test/live?token=abc",
+            ContentKind::Radio,
+        )
+        .expect("test content identity");
+        assert_eq!(direct_radio_stream_url(&safe), Some(safe.remote_id.as_str()));
     }
 
     #[test]
