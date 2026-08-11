@@ -837,6 +837,14 @@ pub enum VopInvalid {
     /// The named volume already exists.
     #[error("volume {0} already exists")]
     VolumeExists(String),
+    /// A volume name is outside the backend's safe resource-name grammar.
+    #[error("unsafe volume name {name}: {reason}")]
+    UnsafeVolumeName {
+        /// The untrusted volume name.
+        name: String,
+        /// Why the name was refused.
+        reason: String,
+    },
 }
 
 /// Validate one virtual op against `topo` (advisory at stage, authoritative at
@@ -890,6 +898,7 @@ pub fn validate_vop(op: &VirtualStorageOp, topo: &VirtualTopology) -> Result<(),
         }
         VirtualStorageOp::ImageDelete { path } => require_image(topo, path).map(|_| ()),
         VirtualStorageOp::VolumeCreate { name } => {
+            validate_volume_name(name)?;
             if topo.volume(name).is_some() {
                 Err(VopInvalid::VolumeExists(name.clone()))
             } else {
@@ -897,6 +906,7 @@ pub fn validate_vop(op: &VirtualStorageOp, topo: &VirtualTopology) -> Result<(),
             }
         }
         VirtualStorageOp::VolumeRemove { name, .. } => {
+            validate_volume_name(name)?;
             if topo.volume(name).is_some() {
                 Ok(())
             } else {
@@ -905,6 +915,42 @@ pub fn validate_vop(op: &VirtualStorageOp, topo: &VirtualTopology) -> Result<(),
         }
         VirtualStorageOp::VolumePrune => Ok(()),
     }
+}
+
+/// Refuse a Podman volume name unless it is a bounded resource identifier.
+///
+/// The name is passed as a separate argv element, so shell metacharacters are
+/// not the concern here. The boundary must still reject option-like names,
+/// path-shaped identities, control/non-ASCII bytes, and unbounded input before
+/// a signed request can create or remove a backend resource.
+fn validate_volume_name(name: &str) -> Result<(), VopInvalid> {
+    let reject = |reason: &str| {
+        Err(VopInvalid::UnsafeVolumeName {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        })
+    };
+
+    if name.is_empty() {
+        return reject("name is empty");
+    }
+    if name.len() > 255 {
+        return reject("name exceeds 255 bytes");
+    }
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+    {
+        return reject("name must start with an ASCII letter or digit");
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-'))
+    {
+        return reject("name contains a character outside [A-Za-z0-9_.-]");
+    }
+    Ok(())
 }
 
 fn disp(p: &Path) -> String {
@@ -2418,6 +2464,49 @@ mod tests {
             ),
             Err(VopInvalid::UnknownVolume(_))
         ));
+    }
+
+    #[test]
+    fn volume_name_admission_rejects_backend_unsafe_identities_before_topology() {
+        let t = topo();
+        let oversized = "a".repeat(256);
+        for name in [
+            "",
+            "-f",
+            "../escape",
+            "nested/volume",
+            "volume name",
+            "ümlaut",
+        ]
+        .into_iter()
+        .chain(std::iter::once(oversized.as_str()))
+        {
+            for op in [
+                VirtualStorageOp::VolumeCreate {
+                    name: name.to_string(),
+                },
+                VirtualStorageOp::VolumeRemove {
+                    name: name.to_string(),
+                    force: false,
+                },
+            ] {
+                assert!(
+                    matches!(
+                        validate_vop(&op, &t),
+                        Err(VopInvalid::UnsafeVolumeName { .. })
+                    ),
+                    "unsafe volume name must be rejected before topology lookup: {name:?}"
+                );
+            }
+        }
+
+        assert!(validate_vop(
+            &VirtualStorageOp::VolumeCreate {
+                name: "workload_data-01".into(),
+            },
+            &t
+        )
+        .is_ok());
     }
 
     // ── walls ──
