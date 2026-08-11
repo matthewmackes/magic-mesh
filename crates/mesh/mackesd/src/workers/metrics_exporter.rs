@@ -189,7 +189,13 @@ impl Worker for MetricsExporterWorker {
 /// that turns a delayed SQLite/filesystem pass into immediate repeated work
 /// and can amplify CPU and I/O pressure during recovery.
 fn export_interval(tick: Duration) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(tick);
+    // Do not perform an immediate startup export: a daemon restart after a
+    // slow scrape should wait for the next normal cadence, not join a burst
+    // with the collector's just-written snapshot.
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + tick,
+        tick,
+    );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval
 }

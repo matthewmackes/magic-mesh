@@ -106,6 +106,9 @@ const MAX_SHARE_CONFIG_BYTES: usize = 64 * 1024;
 /// library fold into unbounded memory or an authoritative partial roster.
 const MAX_MANIFEST_HOSTS: usize = 4_096;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+/// Cover/artwork responses are intentionally small.  A malformed image must
+/// not turn the media responder into an unbounded file reader.
+const MAX_ARTWORK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The SSDP multicast group + port a LAN UPnP control point listens on.
 const SSDP_MULTICAST: &str = "239.255.255.250:1900";
@@ -895,7 +898,13 @@ fn route_request(state: &ServeState, path: &str) -> (u16, String, Vec<u8>) {
         p if p.starts_with("/media/") => {
             let id = &p["/media/".len()..];
             match state.abs.get(id) {
-                Some(abs) => match std::fs::read(abs) {
+                Some(abs) => match std::fs::metadata(abs) {
+                    Ok(meta) if !meta.is_file() || meta.len() > MAX_ARTWORK_BYTES &&
+                        state.manifest.items.iter().find(|i| i.id == id)
+                            .is_some_and(|i| i.kind == MediaItemKind::Image) => {
+                        (413, "text/plain".to_string(), b"media item exceeds bounded artwork policy".to_vec())
+                    }
+                    Ok(_) => match std::fs::read(abs) {
                     Ok(bytes) => {
                         let item = state.manifest.items.iter().find(|i| i.id == id);
                         let ext = Path::new(abs)
@@ -908,6 +917,8 @@ fn route_request(state: &ServeState, path: &str) -> (u16, String, Vec<u8>) {
                         );
                         (200, mime, bytes)
                     }
+                    Err(_) => (404, "text/plain".to_string(), b"not found".to_vec()),
+                    },
                     Err(_) => (404, "text/plain".to_string(), b"not found".to_vec()),
                 },
                 None => (404, "text/plain".to_string(), b"not found".to_vec()),
