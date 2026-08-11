@@ -290,6 +290,13 @@ main() {
         publish "failed-grouped-mackesd"
         return 1
     fi
+    # Group readiness can take long enough for the physical link to disappear
+    # after the substrate gate above. Do not let that stale recovery continue
+    # into the final desktop mutation or claim a complete peer return.
+    if ! physical_network_online; then
+        publish "offline-before-desktop"
+        return 0
+    fi
     # Desktop bind repair is the final local mutation.  Keep it behind the
     # grouped readiness gate so a failed daemon/session recovery cannot report
     # or partially apply a healthy desktop state.

@@ -74,6 +74,9 @@ case "$1" in
                             : >"$state/active-mackesd-$group.service"
                         done
                         rm -f "$state/pending-groups"
+                        if [ -f "$state/drop-after-groups-ready" ]; then
+                            rm -f "$state/drop-after-groups-ready" "$state/online"
+                        fi
                     fi
                 fi
                 ;;
@@ -324,6 +327,31 @@ grep -Fq 'status=recovered' "$STATE/notifies"
 rm -f "$STATE/target-activating"
 echo 'PASS grouped boot fixture: delayed child readiness is awaited'
 
+# The physical link can disappear while grouped workers settle. The final
+# desktop mutation must remain behind a fresh physical-network attestation.
+rm -f "$STATE"/active-mackesd-*.service "$STATE/group-ready-checks" \
+    "$STATE/target-active"
+: >"$STATE/delay-groups"
+: >"$STATE/drop-after-groups-ready"
+: >"$STATE/online"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+cat >"$STATE/expected-mutations" <<'EOF'
+mackesd.target
+mackesd-control.service
+mackesd-observation.service
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+if grep -Fqx xdg-binds "$STATE/mutations"; then
+    echo 'late network loss allowed desktop mutation' >&2
+    exit 1
+fi
+grep -Fq 'status=offline-before-desktop' "$STATE/notifies"
+rm -f "$STATE/delay-groups" "$STATE/drop-after-groups-ready"
+echo 'PASS late-network fixture: desktop mutation waits for final link attestation'
+
+: >"$STATE/online"
 : >"$STATE/mutations"
 : >"$STATE/notifies"
 : >"$STATE/sleeps"
