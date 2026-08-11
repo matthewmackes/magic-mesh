@@ -418,6 +418,7 @@ behavioral evidence is not completion.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
+- **Bounded job input (2026-08-11):** signed playbooks cap at 1 MiB before digest/apply; BigBoy: `evidence/WL-ARCH-009-2026-08-11-job-playbook-bound-r226.md`.
 - Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip rather than burst after a blocking snapshot; evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
 - **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
@@ -428,8 +429,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
 - **Symlink-safe group leases:** seat `.90` passed kernel-enforced lock-leaf refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-group-lease-symlink-r179.md`.
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that `Requires=` edges cascaded one integrations crash through all six groups.
-  Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects
-  regressions in the process-boundary validator, and restarts an already-active
+  Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects regressions in the process-boundary validator, and restarts an already-active
   target during RPM upgrade. Seat 15 proved isolated integrations and control
   crashes while every unaffected PID and restart counter remained unchanged;
   target, mesh-health, and RPM verification stayed healthy. Dell was offline
@@ -1535,6 +1535,8 @@ behavioral evidence is not completion.
 - **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
   `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
 - **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
+- **Bounded media config (2026-08-11):** shared-folder JSON caps at 64 KiB and rejects symlinks; BigBoy: `evidence/WL-FUNC-021-2026-08-11-media-config-bound-r226.md`.
+- **Navidrome command timeout (2026-08-11):** systemctl/setup calls fail closed at the shared deadline; BigBoy: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-timeout-r226.md`.
 - Remaining work: **Shared artwork byte bound (2026-08-11):** cache reads refuse non-regular or over-4-MiB files and writes refuse oversized payloads; `.50` passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
 - **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
@@ -1566,8 +1568,7 @@ behavioral evidence is not completion.
 - **Live provider-loss checkpoint (2026-08-08):** release 11 on seat 15 passed a controlled healthy → provider loss → healthy transition with cached catalog/state available.
   The daemon stayed active with zero restarts and the seat-local firewall rule was removed; two-catalog outage and audible stream continuity remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.
-- **Provider-loss reconnect checkpoint (2026-08-06):** the native engine now
-  retries a failed Subsonic stream from the audible playhead using bounded
+- **Provider-loss reconnect checkpoint (2026-08-06):** the native engine now retries a failed Subsonic stream from the audible playhead using bounded
   `timeOffset` resumes, clears buffered-ahead samples before retry, preserves
   the complete-track cache, and refuses arbitrary direct/radio URLs. BigBoy
   passed the full mde-musicd suite at 176/176, focused engine lane at 21/21,

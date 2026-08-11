@@ -96,6 +96,11 @@ const MAX_SCAN_DEPTH: usize = 8;
 /// past a size the plane + Bus can carry.
 const MAX_ITEMS_PER_MANIFEST: usize = 20_000;
 
+/// Bound the local shared-folder configuration before handing it to the JSON
+/// parser. A malformed or oversized config is rejected and falls through to
+/// the standard media directories.
+const MAX_SHARE_CONFIG_BYTES: usize = 64 * 1024;
+
 /// Replicated manifests are untrusted peer input. Bound both the directory
 /// census and each file before allocation so a hostile/sick peer cannot turn a
 /// library fold into unbounded memory or an authoritative partial roster.
@@ -350,12 +355,34 @@ pub fn share_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("mde").join("media").join("shared-folders.json"))
 }
 
+fn read_share_config_bounded(path: &Path) -> io::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_SHARE_CONFIG_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared-folder configuration is not a bounded regular file",
+        ));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let mut body = String::new();
+    file.take((MAX_SHARE_CONFIG_BYTES + 1) as u64)
+        .read_to_string(&mut body)?;
+    if body.len() > MAX_SHARE_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared-folder configuration exceeds its byte limit",
+        ));
+    }
+    Ok(body)
+}
+
 /// Load the chosen shared folders from the env + config file (the production
 /// wrapper around [`resolve_share_dirs`]).
 #[must_use]
 pub fn load_share_dirs() -> Vec<PathBuf> {
     let env_val = std::env::var(SHARE_DIRS_ENV).ok();
-    let config_body = share_config_path().and_then(|p| std::fs::read_to_string(p).ok());
+    let config_body = share_config_path().and_then(|p| read_share_config_bounded(&p).ok());
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/root"), PathBuf::from);
     resolve_share_dirs(env_val.as_deref(), config_body.as_deref(), &home)
 }
@@ -1426,6 +1453,16 @@ mod tests {
         // An empty env string falls through to the config/default, not [].
         let fell = resolve_share_dirs(Some("  "), None, Path::new("/home/u"));
         assert_eq!(fell.len(), 3);
+    }
+
+    #[test]
+    fn oversized_shared_folder_config_is_rejected_before_json_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shared-folders.json");
+        std::fs::write(&path, vec![b'{'; MAX_SHARE_CONFIG_BYTES + 1]).unwrap();
+
+        let error = read_share_config_bounded(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     // ── the manifest scan ──

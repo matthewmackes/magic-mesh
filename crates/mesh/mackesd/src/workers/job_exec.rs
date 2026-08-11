@@ -15,6 +15,8 @@
 
 #![cfg(feature = "async-services")]
 
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,26 @@ use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Run poll cadence.
 pub const POLL: Duration = Duration::from_secs(5);
+
+/// A signed playbook is configuration, not an unbounded payload. Keep the
+/// executor's memory and apply latency bounded before hashing or parsing it.
+const MAX_PLAYBOOK_BYTES: u64 = 1024 * 1024;
+
+fn read_bounded_playbook(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_PLAYBOOK_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PLAYBOOK_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "playbook exceeds the maximum size",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+    })
+}
 
 /// The local job executor.
 pub struct JobExecWorker {
@@ -154,7 +176,7 @@ impl JobExecWorker {
         if !canonical_path.starts_with(&canonical_root) {
             return self.refused("playbook resolves outside the replicated playbooks directory");
         }
-        let yaml = match std::fs::read_to_string(&playbook_path) {
+        let yaml = match read_bounded_playbook(&playbook_path) {
             Ok(y) => y,
             Err(e) => {
                 return self.failed(&format!("playbook {} unreadable: {e}", playbook));
@@ -293,5 +315,14 @@ mod tests {
             magic_fleet::jobs::normalize_playbook_ref("repair.yml").unwrap(),
             "playbooks/repair.yml"
         );
+    }
+
+    #[test]
+    fn oversized_playbook_is_rejected_before_digest_or_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oversized.yml");
+        std::fs::write(&path, vec![b'x'; MAX_PLAYBOOK_BYTES as usize + 1]).unwrap();
+        let error = read_bounded_playbook(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

@@ -7,9 +7,11 @@
 //! them via the helper when absent, then keeps both enabled and active.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use super::{ShutdownToken, Worker};
+use super::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 /// The rclone-backed music-library mount unit.
 pub const STORE_UNIT: &str = "mcnf-music-store.service";
@@ -106,9 +108,9 @@ pub struct SystemOps;
 
 impl SystemOps {
     fn systemctl_status(args: &[&str]) -> bool {
-        std::process::Command::new("systemctl")
-            .args(args)
-            .status()
+        let mut command = Command::new("systemctl");
+        command.args(args);
+        status_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             .map(|status| status.success())
             .unwrap_or(false)
     }
@@ -130,8 +132,8 @@ impl MediaNavidromeOps for SystemOps {
     }
 
     fn run_setup(&mut self, helper: &Path) -> Result<(), String> {
-        let out = std::process::Command::new(helper)
-            .output()
+        let command = Command::new(helper);
+        let out = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             .map_err(|e| format!("run {}: {e}", helper.display()))?;
         if out.status.success() {
             Ok(())
@@ -146,9 +148,9 @@ impl MediaNavidromeOps for SystemOps {
     }
 
     fn enable_now(&mut self, unit: &str) -> Result<(), String> {
-        let out = std::process::Command::new("systemctl")
-            .args(["enable", "--now", unit])
-            .output()
+        let mut command = Command::new("systemctl");
+        command.args(["enable", "--now", unit]);
+        let out = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             .map_err(|e| format!("systemctl enable --now {unit}: {e}"))?;
         if out.status.success() {
             Ok(())
@@ -311,5 +313,15 @@ mod tests {
             worker.ops.calls,
             vec![format!("setup:{}", helper.display())]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_timeout_fails_closed_and_reaps_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let error = status_with_timeout(command, Duration::from_millis(50))
+            .expect_err("sleep must exceed the bounded command deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }
