@@ -414,8 +414,8 @@ behavioral evidence is not completion.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
-- Remaining work: **HTTPS policy (r159):** bounded policy fallback rejects malformed or unsafe configuration;
-  BigBoy passed `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
+- Remaining work: **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
+- **HTTPS policy source-parent integrity (2026-08-10):** `.90` passed symlinked-ancestor refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-parent-r214.md`.
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
@@ -1511,11 +1511,11 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
 - **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
   `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
-- Remaining work: **Music Bus replacement checkpoint (2026-08-10):** Bus index inode replacement converges; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
-- **Cast media URL admission checkpoint (2026-08-10):** refuses local, alternate-scheme, malformed-authority,
-  credential-bearing, whitespace-bearing, and non-network locators before renderer admission; BigBoy passed:
+- Remaining work: **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
+- **Cast media URL admission checkpoint (2026-08-10):** unsafe/local/credential-bearing URLs refused; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
+- **Direct media URL admission (2026-08-10):** `.90` passed malformed/credential-bearing/unsafe URL refusal:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-10-direct-media-url-admission-r214.md`.
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
 - **Signed live-radio checkpoint (2026-08-08):** release 8 is live on five seats with encrypted Music credentials; Dell/15 pass retained C-SPAN Play/Stop.
