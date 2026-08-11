@@ -249,6 +249,7 @@ impl BrowserVmLifecycleIntent {
 #[derive(Debug, Clone)]
 struct BrowserVmLifecyclePending {
     intent: BrowserVmLifecycleIntent,
+    request_id: String,
     bus_root: PathBuf,
     published_at: Instant,
 }
@@ -590,6 +591,7 @@ impl WebState {
             .map_err(|error| format!("Workload operation rejected by the local Bus: {error}"))?;
         Ok(BrowserVmLifecyclePending {
             intent: intent.clone(),
+            request_id: request.request_id,
             bus_root: root.to_path_buf(),
             published_at: now,
         })
@@ -599,13 +601,14 @@ impl WebState {
         let Some(snapshot) = self.lifecycle_pending.as_ref().map(|pending| {
             (
                 pending.intent.clone(),
+                pending.request_id.clone(),
                 pending.bus_root.clone(),
                 pending.published_at,
             )
         }) else {
             return;
         };
-        let (intent, bus_root, published_at) = snapshot;
+        let (intent, request_id, bus_root, published_at) = snapshot;
         let elapsed = now.saturating_duration_since(published_at);
         if let Ok(persist) = Persist::open(bus_root.clone()) {
             if let Some(status) = crate::workload_api::read_status(
@@ -613,7 +616,11 @@ impl WebState {
                 &intent.serving_peer,
                 &intent.workload,
             ) {
-                if status.phase.is_terminal() {
+                // The state projection is keyed by workload, not operation.
+                // Ignore a terminal row from an older or foreign operation;
+                // otherwise a stale completion could make this one-shot
+                // Browser start/resume appear to have succeeded.
+                if status.request_id == request_id && status.phase.is_terminal() {
                     self.lifecycle_pending = None;
                     self.projection_refresh_not_before = None;
                     if status.phase == WorkloadOperationPhase::Completed {

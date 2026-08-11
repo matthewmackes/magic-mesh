@@ -337,6 +337,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-008-2026-08-11-session-restart-readiness-r265.md`.
 - **Browser reconnect identity (2026-08-11):** exact replay preserves the live route/transport while retargeting fails closed; BigBoy passed 1/1:
   `docs/platform/evidence/WL-ARCH-008-2026-08-11-browser-reconnect-identity-r245.md`.
+- **Lifecycle request correlation (2026-08-11):** Browser start/resume terminal
+  rows now require the exact published request ID; BigBoy passed 14/14:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-11-browser-request-correlation-r476.md`.
 - **Early file-count admission (2026-08-11):** Browser migration carries the
   remaining `MAX_FILES` budget into traversal and refuses the next source entry
   before retaining more candidates; `.50` passed the self-test:
