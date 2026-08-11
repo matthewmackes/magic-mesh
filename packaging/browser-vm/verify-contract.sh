@@ -68,6 +68,28 @@ grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
 grep -Fq 'mcnf-browser-vm-media-probe' "$RUNTIME" || fail "guest runtime omits Chromium media probe"
+verify_runtime_unit() {
+    local unit=$1
+    for directive in \
+        'User=mcnf-browser' \
+        'RuntimeDirectory=mcnf-browser' \
+        'RuntimeDirectoryMode=0700' \
+        'Environment=XDG_RUNTIME_DIR=/run/mcnf-browser' \
+        'ExecStart=/usr/local/libexec/mcnf-browser-vm-runtime'; do
+        grep -Fxq "$directive" "$unit" \
+            || return 1
+    done
+    if grep -Eq '^[[:space:]]*EnvironmentFile=' "$unit"; then
+        return 1
+    fi
+    if grep -E '^[[:space:]]*Environment=XDG_RUNTIME_DIR=' "$unit" \
+        | grep -Fvqx 'Environment=XDG_RUNTIME_DIR=/run/mcnf-browser'; then
+        return 1
+    fi
+    ! grep -Eq '^[[:space:]]*ExecStart=.*/(sh|bash)[[:space:]]' "$unit"
+}
+verify_runtime_unit "$RUNTIME_UNIT" \
+    || fail "Browser runtime unit permits an unowned runtime or executable boundary"
 for runtime_path in "$VALIDATOR" "$RUNTIME" "$MEDIA_PROBE"; do
     grep -Fq '/etc/mcnf-browser-vm' "$runtime_path" \
         || fail "Browser runtime component omits the dedicated readable input root: $runtime_path"
@@ -143,6 +165,16 @@ grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce th
 "$DEPLOY_IMAGE" --self-test >/dev/null
 "$PROFILE_VERIFY" --source "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null
+
+unit_fixture=$(mktemp)
+trap 'rm -rf "$fixture" "$profile_fixture" "$unit_fixture"' EXIT
+cp "$RUNTIME_UNIT" "$unit_fixture"
+sed -i 's#^Environment=XDG_RUNTIME_DIR=/run/mcnf-browser$#Environment=XDG_RUNTIME_DIR=/run/user/1000#' \
+    "$unit_fixture"
+if verify_runtime_unit "$unit_fixture"; then
+    fail "accepted a user-directed Browser runtime directory fixture"
+fi
+rm -f "$unit_fixture"
 
 profile_fixture=$(mktemp)
 trap 'rm -rf "$fixture" "$profile_fixture"' EXIT
