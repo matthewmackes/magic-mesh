@@ -145,19 +145,13 @@ pub fn augment_from_production(
         );
     adapt_peers(&peers, directory_current, now_ms, &mut adapted);
 
-    let mut approved_nodes = peers
-        .iter()
-        .map(|peer| peer.hostname.clone())
-        .collect::<BTreeSet<_>>();
-    approved_nodes.insert(catalog.publisher.clone());
-    if approved_nodes.len() > MAX_APPROVED_NODES
-        || approved_nodes.iter().any(|node| !is_safe_id(node))
-    {
-        refuse_invalid_approved_nodes(&mut adapted);
-    } else {
-        adapt_workloads(bus_root, &approved_nodes, now_ms, &mut adapted);
-        adapt_app_vm_catalogs(bus_root, &approved_nodes, now_ms, &mut adapted);
-        adapt_android_catalogs(bus_root, &approved_nodes, now_ms, &mut adapted);
+    match approved_nodes_for_resources(&peers, &catalog.publisher) {
+        Some(approved_nodes) => {
+            adapt_workloads(bus_root, &approved_nodes, now_ms, &mut adapted);
+            adapt_app_vm_catalogs(bus_root, &approved_nodes, now_ms, &mut adapted);
+            adapt_android_catalogs(bus_root, &approved_nodes, now_ms, &mut adapted);
+        }
+        None => refuse_invalid_approved_nodes(&mut adapted),
     }
     adapt_media(bus_root, &catalog.publisher, now_ms, &mut adapted);
 
@@ -177,6 +171,46 @@ fn refuse_invalid_approved_nodes(adapted: &mut AdaptedSources) {
             0,
         ));
     }
+}
+
+/// Return the node identities that are safe to use as downstream source
+/// authorities. A peer directory is a set of self-owned rows, but a stale or
+/// malicious replicated view can contain two non-identical rows claiming one
+/// hostname. That hostname may still be rendered as a visible conflict card;
+/// it must not authorize Workload/App/Android reads until its identity is
+/// unambiguous. Exact duplicate rows are harmless and collapse here.
+fn approved_nodes_for_resources(
+    peers: &[PeerRecord],
+    publisher: &str,
+) -> Option<BTreeSet<String>> {
+    if peers.len() > MAX_PEER_ROWS || !is_safe_id(publisher) {
+        return None;
+    }
+
+    let mut rows = BTreeMap::<String, PeerRecord>::new();
+    let mut ambiguous = BTreeSet::new();
+    for peer in peers {
+        if !is_safe_id(&peer.hostname) {
+            return None;
+        }
+        match rows.entry(peer.hostname.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(peer.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != peer {
+                    ambiguous.insert(peer.hostname.clone());
+                }
+            }
+        }
+    }
+
+    let mut approved = rows
+        .into_keys()
+        .filter(|hostname| !ambiguous.contains(hostname))
+        .collect::<BTreeSet<_>>();
+    approved.insert(publisher.to_owned());
+    (approved.len() <= MAX_APPROVED_NODES).then_some(approved)
 }
 
 fn adapt_peers(
@@ -1527,6 +1561,26 @@ mod tests {
             remediation: None,
             attachment: None,
         }
+    }
+
+    #[test]
+    fn ambiguous_peer_identity_cannot_authorize_downstream_resource_reads() {
+        let first = peer("alpha");
+        let mut conflicting = first.clone();
+        conflicting.last_seen_ms += 1;
+        conflicting.health = "degraded".into();
+
+        let approved = approved_nodes_for_resources(
+            &[first.clone(), conflicting],
+            "seat193",
+        )
+        .expect("safe peer rows remain a valid directory input");
+        assert!(!approved.contains("alpha"));
+        assert!(approved.contains("seat193"));
+
+        let exact_duplicates = approved_nodes_for_resources(&[first.clone(), first], "seat193")
+            .expect("exact duplicate rows are safe to collapse");
+        assert!(exact_duplicates.contains("alpha"));
     }
 
     fn app_projection(name: &str) -> AdmittedFlatpakCatalogProjection {
