@@ -35,6 +35,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -357,7 +358,12 @@ impl FirmwareStage {
             action: "inspect downloaded firmware cabinet".into(),
             detail: error.to_string(),
         })?;
+        // A regular file is not enough: a downloader-controlled hard link can
+        // make the staging name alias an inode owned outside this private
+        // directory.  Require the staged inode to have no other link before
+        // it can become the install input.
         if !metadata.file_type().is_file()
+            || metadata.nlink() != 1
             || metadata.len() == 0
             || metadata.len() > MAX_FWUPD_CAB_BYTES
             || metadata.len() != expected_size
@@ -365,7 +371,7 @@ impl FirmwareStage {
             return Err(FwError::Failed {
                 action: "inspect downloaded firmware cabinet".into(),
                 detail: format!(
-                    "download is not a regular file with the bound {expected_size}-byte size (maximum {MAX_FWUPD_CAB_BYTES})"
+                    "download is not a private regular file with the bound {expected_size}-byte size (maximum {MAX_FWUPD_CAB_BYTES})"
                 ),
             });
         }
@@ -3246,6 +3252,23 @@ mod tests {
         assert!(stage.single_cabinet(4).is_err(), "size mismatch admitted");
         fs::write(stage.path().join("unexpected"), b"x").expect("second file");
         assert!(stage.single_cabinet(3).is_err(), "multiple files admitted");
+    }
+
+    #[test]
+    fn private_stage_rejects_hard_linked_external_cabinet() {
+        let stage = FirmwareStage::create().expect("private stage");
+        // Keep the fixture on the same filesystem as /var/tmp: hard links
+        // cannot cross devices, while the production threat is an alias to a
+        // different path on the staging filesystem.
+        let source = stage.path().with_extension("outside.cab");
+        fs::write(&source, b"abc").expect("write outside cabinet");
+        fs::hard_link(&source, stage.path().join("surface.cab")).expect("hard-link fixture");
+
+        assert!(
+            stage.single_cabinet(3).is_err(),
+            "a hard-linked external inode must not become an install input"
+        );
+        fs::remove_file(source).expect("remove outside cabinet");
     }
 
     #[test]
