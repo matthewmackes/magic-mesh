@@ -2513,6 +2513,9 @@ behavioral evidence is not completion.
   oversized availability TTLs. Expected-state publishers, transition
   evaluation, history/detail, recovery/export, and three-seat proof remain.
 - Remaining work:
+- **Decommissioned health projection cleanup (2026-08-11):** retired publishers are evicted from ledger, cursor, projection, and restart checkpoint after staged roster reads;
+  `.90` passed:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-health-decommissioned-projection-r217.md`.
 - **Future health freshness:** `.50` passed refusal of zero/future-dated snapshots:
   `docs/platform/evidence/WL-UX-013-2026-08-10-future-health-freshness-r181.md`.
 - **Duplicate active-condition admission:** `.90` passed refusal of repeated active

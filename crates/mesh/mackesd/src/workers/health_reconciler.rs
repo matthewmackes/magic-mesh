@@ -595,25 +595,33 @@ where
         ..HealthIngressReport::default()
     };
 
-    // Prepare against a clone. Checkpoint restoration and publisher pruning are
-    // candidate state until every bounded file and every required exact Bus
+    // Prepare against a clone. Checkpoint restoration and roster contraction
+    // are candidate state until every bounded file and every required exact Bus
     // lane has been read successfully.
     let mut candidate_state = state.clone();
     restore_health_checkpoint(
         workgroup_root,
         local_node_id,
-        &publishers,
         &mut candidate_state,
         now_ms,
         &mut report,
     );
-    candidate_state
+    let retired_publishers = candidate_state
         .ledger
         .retained
-        .retain(|publisher, _| publishers.contains(publisher));
-    candidate_state
-        .bus_cursors
-        .retain(|publisher, _| publishers.contains(publisher));
+        .keys()
+        .chain(candidate_state.bus_cursors.keys())
+        .filter(|publisher| !publishers.contains(*publisher))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    // Do not drop a decommissioned publisher's projection until every current
+    // publisher source has staged successfully. A failed registry-adjacent Bus
+    // lane must leave the complete last-good ingress state untouched.
+    for publisher in &retired_publishers {
+        candidate_state.ledger.retained.remove(publisher);
+        candidate_state.bus_cursors.remove(publisher);
+    }
 
     let staged_files = publishers
         .iter()
@@ -645,6 +653,9 @@ where
 
     // Every ingress source is now readable and bounded. Only this phase may
     // mutate the candidate ledger/cursors or publish canonical projections.
+    for publisher in &retired_publishers {
+        clear_invalid_health_projection(workgroup_root, publisher, &mut report);
+    }
     for publisher in &publishers {
         expire_retained_health_projection(
             workgroup_root,
@@ -755,7 +766,6 @@ fn is_valid_bus_cursor(cursor: &str) -> bool {
 fn restore_health_checkpoint(
     workgroup_root: &Path,
     local_node_id: &str,
-    publishers: &BTreeSet<String>,
     state: &mut HealthIngressState,
     now_ms: u64,
     report: &mut HealthIngressReport,
@@ -802,16 +812,12 @@ fn restore_health_checkpoint(
         return;
     }
 
-    state.bus_cursors = checkpoint
-        .bus_cursors
-        .into_iter()
-        .filter(|(publisher, _)| publishers.contains(publisher))
-        .collect();
-    state.ledger.retained = checkpoint
-        .retained
-        .into_iter()
-        .filter(|(publisher, _)| publishers.contains(publisher))
-        .collect();
+    // Keep validated former publishers until the current roster's sources
+    // have staged. The caller then evicts their exact regular projections and
+    // rewrites the checkpoint, so a daemon restart cannot retain a departed
+    // identity merely because it was restored before roster contraction.
+    state.bus_cursors = checkpoint.bus_cursors;
+    state.ledger.retained = checkpoint.retained;
     report.checkpoint_restored = true;
 }
 
@@ -1716,6 +1722,77 @@ mod tests {
             after_restart.bus_cursors.get("node-a").map(String::as_str),
             Some(message.ulid.as_str())
         );
+    }
+
+    #[test]
+    fn health_ingress_evicts_decommissioned_projection_and_checkpoint_on_restart() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
+        let conn = fresh_store();
+        seed_node(&conn, "node-a");
+        seed_node(&conn, "node-b");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let first = health_publication("node-a", 1, 100);
+        let departed = health_publication("node-b", 1, 100);
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).expect("encode first")),
+            )
+            .expect("publish first");
+        persist
+            .write(
+                &node_health_topic("node-b"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&departed).expect("encode departed")),
+            )
+            .expect("publish departed");
+        let mut before_decommission = HealthIngressState::default();
+        ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "observer",
+            bus.path(),
+            &mut before_decommission,
+            500,
+        )
+        .expect("initial ingress");
+        let departed_projection = health_projection_path(workgroup.path(), "node-b");
+        assert!(departed_projection.is_file(), "admitted projection exists");
+
+        crate::store::set_node_role(&conn, "node-b", "decommissioned")
+            .expect("decommission node-b");
+        let mut after_restart = HealthIngressState::default();
+        let report = ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "observer",
+            bus.path(),
+            &mut after_restart,
+            500,
+        )
+        .expect("roster contraction ingress");
+
+        assert!(report.checkpoint_restored, "restart restores tracked state first");
+        assert!(after_restart.ledger.retained("node-a").is_some());
+        assert!(after_restart.ledger.retained("node-b").is_none());
+        assert!(after_restart.bus_cursors.get("node-b").is_none());
+        assert!(
+            !departed_projection.exists(),
+            "decommissioned publisher cannot retain a visible health projection"
+        );
+        let checkpoint: HealthIngressCheckpoint = serde_json::from_slice(
+            &std::fs::read(
+                health_checkpoint_path(workgroup.path(), "observer").expect("checkpoint path"),
+            )
+            .expect("read contracted checkpoint"),
+        )
+        .expect("decode contracted checkpoint");
+        assert!(!checkpoint.retained.contains_key("node-b"));
+        assert!(!checkpoint.bus_cursors.contains_key("node-b"));
     }
 
     #[test]
