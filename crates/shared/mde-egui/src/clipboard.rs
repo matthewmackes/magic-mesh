@@ -365,7 +365,11 @@ impl LocalClipboardAuthority {
 }
 
 fn validate_owner(owner: &str) -> Result<(), LocalClipboardError> {
-    if owner.is_empty() || owner.len() > MAX_CLIPBOARD_OWNER_BYTES {
+    if owner.is_empty()
+        || owner.len() > MAX_CLIPBOARD_OWNER_BYTES
+        || owner.trim() != owner
+        || owner.chars().any(char::is_control)
+    {
         Err(LocalClipboardError::InvalidOwner)
     } else {
         Ok(())
@@ -545,6 +549,19 @@ mod tests {
             .replace(vec![text_offer("browser text").expect("text offer")])
             .expect("browser offer");
         assert!(authority.current().expect("current").generation() > first_generation);
+    }
+
+    #[test]
+    fn hostile_owner_identity_is_rejected_before_clipboard_admission() {
+        let mut authority = LocalClipboardAuthority::new();
+        for owner in [" files", "files ", "files\nstatus", "files\u{7f}status"] {
+            assert_eq!(
+                authority.focus(owner),
+                Err(LocalClipboardError::InvalidOwner),
+                "malformed owner must not enter the native clipboard authority"
+            );
+        }
+        assert!(authority.current().is_none());
     }
 
     #[test]
