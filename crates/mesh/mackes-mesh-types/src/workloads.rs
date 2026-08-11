@@ -892,6 +892,11 @@ impl WorkloadAttachmentLease {
     /// is invalid.
     pub fn validate(&self, now_ms: u64) -> Result<(), WorkloadContractError> {
         check_schema(self.schema_version)?;
+        // Keep the lease self-contained at every publication boundary.  The
+        // reconciler also compares this identity with its owning operation,
+        // but a lease must not be considered valid merely because a caller
+        // supplied a previously constructed WorkloadId.
+        WorkloadId::new(self.workload_id.as_str())?;
         check_identifier(&self.lease_id, "lease_id")?;
         check_identifier(&self.nonce, "nonce")?;
         if self.generation == 0
