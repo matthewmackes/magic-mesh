@@ -414,7 +414,9 @@ behavioral evidence is not completion.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
-- Remaining work: **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
+- Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip rather than burst after a blocking snapshot; evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
+- **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
 - **HTTPS policy source-parent integrity (2026-08-10):** `.90` passed symlinked-ancestor refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-parent-r214.md`.
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
@@ -449,10 +451,8 @@ behavioral evidence is not completion.
 - **Nebula dispatcher ownership checkpoint (2026-08-09):** Control and Observation own distinct registered adapters; the other groups fail closed. Machine 196 passed 4/4
   admission guards; complete worker-role rerun remains: `docs/platform/evidence/WL-ARCH-009-2026-08-09-nebula-dispatcher-ownership-r95.md`.
 - **Metrics collector recovery checkpoint (2026-08-09):** missing textfile directory is recreated; symlink substitution fails closed; temporary files are cleaned on failure.
-  Machine 194 passed 3/3; Dell deployment proof remains:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
-- **Metrics bucket ownership checkpoint (2026-08-10):** provider schedules discard non-finite bounds, sort, and deduplicate before publication; `.90` passed the hostile regression:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-10-metrics-bucket-normalization-r184.md`.
+  Machine 194 passed 3/3; Dell deployment proof remains: `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
+- **Metrics bucket ownership:** non-finite bounds are discarded, sorted, and deduplicated; `.90` passed: `evidence/WL-ARCH-009-2026-08-10-metrics-bucket-normalization-r184.md`.
 - **Metrics observation ownership checkpoint (2026-08-10):** shared histogram admission discards non-finite observations before they poison `_sum`, `_count`, or bucket publication;
   `.90` passed the hostile regression:
   `docs/platform/evidence/WL-ARCH-009-2026-08-10-metrics-observation-finiteness-r194.md`.
@@ -1527,7 +1527,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
 - **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
   `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
-- Remaining work: **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
+- **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
+- Remaining work: **Shared artwork byte bound (2026-08-11):** cache reads refuse non-regular or over-4-MiB files and writes refuse oversized payloads; `.50` passed:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
 - **Cast media URL admission checkpoint (2026-08-10):** unsafe/local/credential-bearing URLs refused; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
 - **Direct media URL admission (2026-08-10):** `.90` passed malformed/credential-bearing/unsafe URL refusal:
@@ -1539,11 +1541,9 @@ behavioral evidence is not completion.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-radio-release8-r1.md`.
 - **Library checkpoint (2026-08-06):** typed collections replace Airsonic rows; UI 44/44 on `.50`, fmt `.90`; `evidence/WL-FUNC-021-2026-08-06-daemon-library-r1.md`.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
-- **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass. Evidence:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-06-search-replay-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-source-identity-r1.md`.
+- **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass.
 - **Cache checkpoints (2026-08-07/09):** truncation rejected; replacements preserve last-good; BigBoy/UI/cache tests pass; live/package proof remains open.
-  `evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`,
-  `evidence/WL-FUNC-021-2026-08-09-jellyfin-metadata-atomic-r12.md`.
+  Evidence: `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`.
 - **Music cache completeness (2026-08-10):** `.90` passed truncated/replaced-file refusal: `docs/platform/evidence/WL-FUNC-021-2026-08-10-cache-completeness-r208.md`.
 - **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
   Live proof remains: `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`, `evidence/WL-FUNC-021-2026-08-09-mpv-playlist-continuation-r11.md`.
@@ -1944,6 +1944,10 @@ behavioral evidence is not completion.
   rejected in bounded release commands while safe parameter expansion remains
   allowed; `.50` passed 18 hostile fixtures:
   `docs/platform/evidence/WL-CRIT-006-2026-08-11-command-control-boundary-r219.md`.
+- **Command-substitution boundary (2026-08-11):** corrected the command
+  validator's `$(` gap while retaining safe `${MCNF_*}` expansion; `.50`
+  passed 19 hostile fixtures:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-command-substitution-boundary-r222.md`.
 - **Release-32 native-F44 three-seat checkpoint (2026-08-10):** an F42 candidate was rejected before install; the corrected signed F44 artifact then passed integrity,
   transaction, package, grouped-runtime, and Dell Browser-VM preservation on exactly Dell, seat 15, and Surface:
   `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.

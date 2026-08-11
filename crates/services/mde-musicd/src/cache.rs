@@ -16,7 +16,7 @@
 //! maintenance entry point that exercises the index end-to-end.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,9 @@ pub const CACHE_SCHEMA_VERSION: u16 = 1;
 const ARTWORK_DIR_ENV: &str = "MDE_MESH_ARTWORK_DIR";
 const DEFAULT_ARTWORK_DIR: &str = "/mnt/mesh-storage/music/artwork";
 const METADATA_DIR_ENV: &str = "MDE_MUSIC_METADATA_CACHE_DIR";
+/// Keep a shared cover-art read bounded even when a peer replaces the file
+/// with an unexpectedly large object.
+pub const MAX_SHARED_ARTWORK_BYTES: usize = 4 * 1024 * 1024;
 
 /// The communal artwork dir IF it currently exists (the mount is up + mackesd
 /// provisioned it). `None` → fall back to a direct Airsonic fetch (no sharing).
@@ -73,7 +76,17 @@ pub fn artwork_filename(cover_id: &str) -> String {
 #[must_use]
 pub fn read_shared_artwork(cover_id: &str) -> Option<Vec<u8>> {
     let path = artwork_dir()?.join(artwork_filename(cover_id));
-    let bytes = std::fs::read(path).ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_SHARED_ARTWORK_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_SHARED_ARTWORK_BYTES {
+        return None;
+    }
     (!bytes.is_empty()).then_some(bytes)
 }
 
@@ -82,7 +95,7 @@ pub fn read_shared_artwork(cover_id: &str) -> Option<Vec<u8>> {
 /// Writes to a temp sibling + renames so a concurrent reader never sees a
 /// half-written image.
 pub fn write_shared_artwork(cover_id: &str, bytes: &[u8]) {
-    if bytes.is_empty() {
+    if bytes.is_empty() || bytes.len() > MAX_SHARED_ARTWORK_BYTES {
         return;
     }
     let Some(dir) = artwork_dir() else { return };
@@ -519,6 +532,19 @@ mod tests {
         assert_eq!(read_shared_artwork("al-missing"), None);
         write_shared_artwork("al-empty", &[]);
         assert_eq!(read_shared_artwork("al-empty"), None);
+        std::env::remove_var(super::ARTWORK_DIR_ENV);
+    }
+
+    #[test]
+    fn oversized_shared_artwork_is_refused_without_an_unbounded_read() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(super::ARTWORK_DIR_ENV, dir.path());
+        let path = dir.path().join(artwork_filename("oversized"));
+        std::fs::write(&path, vec![b'x'; MAX_SHARED_ARTWORK_BYTES + 1]).unwrap();
+
+        assert_eq!(read_shared_artwork("oversized"), None);
+        write_shared_artwork("too-large", &vec![b'y'; MAX_SHARED_ARTWORK_BYTES + 1]);
+        assert!(!dir.path().join(artwork_filename("too-large")).exists());
         std::env::remove_var(super::ARTWORK_DIR_ENV);
     }
 

@@ -156,7 +156,7 @@ impl Worker for MetricsExporterWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let mut interval = tokio::time::interval(self.tick);
+        let mut interval = export_interval(self.tick);
         loop {
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
@@ -182,6 +182,16 @@ impl Worker for MetricsExporterWorker {
             }
         }
     }
+}
+
+/// Build the exporter cadence with bounded recovery after a slow blocking
+/// snapshot. The default Tokio behaviour bursts through every missed tick;
+/// that turns a delayed SQLite/filesystem pass into immediate repeated work
+/// and can amplify CPU and I/O pressure during recovery.
+fn export_interval(tick: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(tick);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
 }
 
 /// Owned per-tick inputs (built from the worker, moved into the
@@ -581,6 +591,24 @@ mod tests {
         let w =
             MetricsExporterWorker::new(PathBuf::from("/tmp/db"), PathBuf::from("/tmp/tf"), None);
         assert_eq!(w.name(), "metrics_exporter");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exporter_interval_skips_slow_tick_backlog() {
+        let mut interval = export_interval(Duration::from_secs(1));
+        interval.tick().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        interval.tick().await;
+
+        // A slow export must not cause the four missed periods to fire as a
+        // burst; the next pass is scheduled one full cadence later.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(tokio::time::timeout(Duration::from_millis(1), interval.tick())
+            .await
+            .is_err());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        interval.tick().await;
     }
 
     #[test]

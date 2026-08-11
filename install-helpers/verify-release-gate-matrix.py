@@ -22,7 +22,7 @@ EVIDENCE_RE = re.compile(r"docs/platform/release-evidence/[0-9a-f]{40}/[a-z0-9][
 # parameter expansion (the canonical matrix uses ${MCNF_*}), but they must not
 # carry shell control syntax that could turn an evidence claim into a second
 # command when a downstream runner evaluates the field.
-COMMAND_CONTROL_RE = re.compile(r"[;&|<>`]|$\(")
+COMMAND_CONTROL_RE = re.compile(r"[;&|<>`]|[$][(]")
 
 TOP_KEYS = {
     "schema_version", "kind", "source_revision", "required_gate_ids",
@@ -310,6 +310,12 @@ def self_test() -> None:
         "shell control command",
         lambda value: value["gates"][0].__setitem__(
             "command", "self-test --gate github-required; touch /tmp/forged"
+        ),
+    )
+    case(
+        "command substitution",
+        lambda value: value["gates"][0].__setitem__(
+            "command", "self-test --gate github-required $(touch /tmp/forged)"
         ),
     )
     case("missing evidence", lambda value: value["gates"][0].__setitem__("evidence_filename", ""))
