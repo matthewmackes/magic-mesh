@@ -1388,6 +1388,14 @@ fn validate_condition(
             return Err(NodeHealthValidationError::InvalidTimestamp(field));
         }
     }
+    if condition
+        .resolved_at_ms
+        .is_some_and(|resolved_at_ms| resolved_at_ms < condition.last_observed_ms)
+    {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "condition.resolved_at_ms",
+        ));
+    }
     if !expected_active
         && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
             published_at_ms.saturating_sub(resolved_at_ms) > MAX_HEALTH_HISTORY_RETENTION_MS
@@ -2585,6 +2593,24 @@ mod tests {
                 "condition.resolved_at_ms"
             )),
             "a fresh envelope cannot restore condition history older than the privacy epoch"
+        );
+    }
+
+    #[test]
+    fn hostile_resolved_history_cannot_end_before_its_final_observation() {
+        let mut publication = state("node", 1, 200);
+        let mut contradictory_history = condition("node", HealthSeverity::Warning);
+        contradictory_history.last_observed_ms = 180;
+        contradictory_history.evidence.observed_at_ms = 180;
+        contradictory_history.resolved_at_ms = Some(150);
+        publication.resolved_conditions.push(contradictory_history);
+
+        assert_eq!(
+            publication.validate_at(200),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "condition.resolved_at_ms"
+            )),
+            "a hostile publisher cannot move resolution before the condition's final observation"
         );
     }
 

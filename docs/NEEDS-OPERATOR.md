@@ -2,7 +2,7 @@
 
 > **NOT AN ACTIVE TRACKER — see [`docs/platform/WORKLIST.md`](platform/WORKLIST.md).**
 > The single authoritative active worklist is `docs/platform/WORKLIST.md` (the
-> 43 reconciled **WL-\*** epics). This file is **only** the drain loop's
+> 18 active **WL-\*** epics). This file is **only** the drain loop's
 > operator-blocker *sink*: `install-helpers/park-blocker.sh` and
 > `automation/drain/park-worklist-item.sh` append parked units here under
 > "Parked by the drain loop" so the loop never stalls. Every blocker is *worked*

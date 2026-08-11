@@ -12,7 +12,7 @@ valid_revision() {
 }
 
 resolve_receipt() {
-  local repo="$1" revision epoch status
+  local repo="$1" revision final_revision epoch status
   revision="$(git -C "$repo" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
     || die "cannot resolve HEAD to an immutable commit"
   valid_revision "$revision" || die "HEAD is not an exact lowercase Git object ID"
@@ -24,6 +24,11 @@ resolve_receipt() {
   epoch="$(git -C "$repo" show -s --format=%ct "$revision" 2>/dev/null)" \
     || die "cannot resolve the commit timestamp"
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "commit timestamp is not a non-negative Unix epoch"
+
+  final_revision="$(git -C "$repo" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
+    || die "cannot revalidate HEAD after inspecting the checkout"
+  [ "$final_revision" = "$revision" ] \
+    || die "HEAD changed while the source receipt was being resolved"
   printf '%s\t%s\n' "$revision" "$epoch"
 }
 
@@ -34,7 +39,7 @@ verify_receipt() {
 }
 
 self_test() {
-  local root clean dirty revision epoch output
+  local root clean dirty revision epoch output hostile marker first_revision second_revision
   root="$(mktemp -d)"
   trap 'rm -rf -- "$root"' EXIT
   git -C "$root" init -q
@@ -56,9 +61,33 @@ self_test() {
   [[ "$dirty" == *"checkout is dirty"* ]] || die "self-test accepted a dirty checkout"
   clean="$("$0" --verify bad 1700000000 2>&1 || true)"
   [[ "$clean" == *"revision must be an exact"* ]] || die "self-test accepted a malformed revision"
+
+  first_revision="$(printf '1%.0s' {1..40})"
+  second_revision="$(printf '2%.0s' {1..40})"
+  marker="$root/revision-read"
+  hostile="$({
+    git() {
+      case "$*" in
+        *"rev-parse --verify HEAD^{commit}"*)
+          if [ -e "$marker" ]; then
+            printf '%s\n' "$second_revision"
+          else
+            : >"$marker"
+            printf '%s\n' "$first_revision"
+          fi
+          ;;
+        *"status --porcelain=v1 --untracked-files=normal"*) ;;
+        *"show -s --format=%ct $first_revision"*) printf '1700000000\n' ;;
+        *) return 1 ;;
+      esac
+    }
+    resolve_receipt "$root"
+  } 2>&1 || true)"
+  [[ "$hostile" == *"HEAD changed while the source receipt was being resolved"* ]] \
+    || die "self-test accepted a revision that changed during receipt resolution"
   rm -rf -- "$root"
   trap - EXIT
-  printf 'source-revision-receipt: self-test passed (clean exact receipt; dirty and malformed fail closed)\n'
+  printf 'source-revision-receipt: self-test passed (clean exact receipt; dirty, malformed, and moving revisions fail closed)\n'
 }
 
 case "${1:-}" in

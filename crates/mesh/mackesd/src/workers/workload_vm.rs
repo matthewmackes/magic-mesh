@@ -42,6 +42,8 @@ pub enum VmDomainSpecError {
     NoDom0Reserve,
     /// The disk attachment is outside the reconciler-owned VM pool.
     UnsafeDiskPath,
+    /// The disk attachment belongs to a different Workload domain identity.
+    MismatchedDiskIdentity,
     /// A domain or network identity exceeds the bounded XML contract.
     InvalidIdentity,
 }
@@ -53,6 +55,9 @@ impl std::fmt::Display for VmDomainSpecError {
             Self::NoDom0Reserve => formatter.write_str("VM requires one host CPU reserved for Dom0"),
             Self::UnsafeDiskPath => {
                 formatter.write_str("VM disk attachment is outside the managed VM pool")
+            }
+            Self::MismatchedDiskIdentity => {
+                formatter.write_str("VM disk attachment does not match the Workload domain")
             }
             Self::InvalidIdentity => formatter.write_str("VM identity exceeds the bounded XML contract"),
         }
@@ -141,6 +146,10 @@ pub fn build_domain_xml(
     {
         return Err(VmDomainSpecError::UnsafeDiskPath);
     }
+    let expected_disk_name = format!("{}.qcow2", spec.name);
+    if disk.file_name().and_then(|name| name.to_str()) != Some(expected_disk_name.as_str()) {
+        return Err(VmDomainSpecError::MismatchedDiskIdentity);
+    }
     let guest_cpuset = format!("1-{}", spec.host_threads - 1);
     let cpu_tune = {
         format!(
@@ -213,7 +222,7 @@ mod tests {
                 host_threads: 4,
                 network: None,
             },
-            "/var/lib/mde-vms/a'&.qcow2",
+            "/var/lib/mde-vms/guest<&.qcow2",
         )
         .expect("valid VM domain spec");
         assert!(xml.contains("<graphics type='dbus' p2p='yes'>"));
@@ -221,7 +230,7 @@ mod tests {
         assert_eq!(xml.matches("<graphics type=").count(), 1);
         assert!(!xml.contains("type='spice'"));
         assert!(xml.contains("guest&lt;&amp;"));
-        assert!(xml.contains("a&apos;&amp;.qcow2"));
+        assert!(xml.contains("guest&lt;&amp;.qcow2"));
         assert!(xml.contains("<audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'>"));
         assert!(xml.contains("<input streamName='vm-guest&lt;&amp;-capture'/>"));
         assert!(xml.contains("<output streamName='vm-guest&lt;&amp;-playback'/>"));
@@ -339,6 +348,26 @@ mod tests {
                 "unsafe disk path must be rejected: {path}"
             );
         }
+    }
+
+    #[test]
+    fn restarted_reconciler_cannot_attach_foreign_workload_overlay() {
+        let spec = VmDomainSpec {
+            name: "mde-vm-local-generation".into(),
+            vcpus: 1,
+            ram_mb: 1024,
+            host_threads: 2,
+            network: None,
+        };
+
+        assert_eq!(
+            build_domain_xml(
+                &spec,
+                "/var/lib/mde-vms/mde-vm-foreign-generation.qcow2"
+            ),
+            Err(VmDomainSpecError::MismatchedDiskIdentity),
+            "a managed-pool path must not transfer disk authority between Workloads"
+        );
     }
 
     #[test]

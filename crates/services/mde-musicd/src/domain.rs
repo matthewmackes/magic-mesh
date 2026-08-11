@@ -584,6 +584,14 @@ impl MusicWorkspaceSnapshotV1 {
         {
             return Err("collection_too_large");
         }
+        if self
+            .playback
+            .current
+            .as_ref()
+            .is_some_and(|content| !valid_content_ref(content))
+        {
+            return Err("invalid_playback_identity");
+        }
         let mut queue_ids = BTreeSet::new();
         if self.queue.iter().any(|entry| {
             entry.id.trim().is_empty()
@@ -992,6 +1000,44 @@ mod tests {
             })
             .collect();
         assert_eq!(snapshot.validate(), Err("collection_too_large"));
+    }
+
+    #[test]
+    fn restarted_snapshot_cannot_adopt_malformed_current_provider_identity() {
+        let snapshot = MusicWorkspaceSnapshotV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            revision: 1,
+            shelves: Vec::new(),
+            bookmarks: Vec::new(),
+            collections: Vec::new(),
+            search: None,
+            playback: PlaybackSnapshot {
+                current: Some(ContentRef {
+                    source_id: "provider-a".into(),
+                    remote_id: " \t".into(),
+                    kind: ContentKind::Music,
+                }),
+                playing: true,
+                position_ms: 42,
+                duration_ms: Some(1_000),
+                volume_milli: 1_000,
+                shuffle: false,
+                repeat: "off".into(),
+                queue_revision: 7,
+                seekable: true,
+            },
+            queue: Vec::new(),
+            downloads: Vec::new(),
+            storage: MusicStorageSnapshot {
+                used_bytes: 0,
+                cap_bytes: 1,
+            },
+            targets: Vec::new(),
+            sources: Vec::new(),
+            any_source_reachable: true,
+        };
+
+        assert_eq!(snapshot.validate(), Err("invalid_playback_identity"));
     }
 
     #[test]

@@ -22,10 +22,12 @@
 #![cfg(feature = "async-services")]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 
 use super::{ShutdownToken, Worker};
@@ -40,6 +42,9 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bus topic for live cap-utilization updates.
 pub const CAP_TOPIC: &str = "mesh/peer-cap/updated";
+
+/// Process-local uniqueness for crash-safe cache replacement siblings.
+static CACHE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the current cap utilization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,25 +149,60 @@ async fn tick_once(store: Arc<Mutex<rusqlite::Connection>>, cache_path: &PathBuf
         }
     };
     let snapshot = PeerCapSnapshot::from_count(cap_used);
-    write_cache(cache_path, &snapshot).await;
+    if let Err(error) = write_cache(cache_path, &snapshot).await {
+        tracing::warn!(
+            %error,
+            path = %cache_path.display(),
+            "peer-cap: cache commit failed; live publication withheld for corrected-forward retry"
+        );
+        return;
+    }
     publish_cap(&snapshot);
 }
 
-async fn write_cache(path: &PathBuf, snapshot: &PeerCapSnapshot) {
-    match serde_json::to_string(snapshot) {
-        Ok(json) => {
-            if let Err(e) = tokio::fs::write(path, json.as_bytes()).await {
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "peer-cap: cache write failed"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "peer-cap: snapshot serialization failed");
-        }
+/// Commit one corrected-forward snapshot before it becomes live Bus truth.
+///
+/// A unique sibling plus atomic rename means a retained symlink or hard link at
+/// the cache leaf is replaced, never followed. Syncing both the bytes and parent
+/// directory keeps the cache as the restart authority: callers may publish only
+/// after this function succeeds.
+async fn write_cache(path: &PathBuf, snapshot: &PeerCapSnapshot) -> std::io::Result<()> {
+    let json = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "peer-cap cache path has no parent directory",
+        )
+    })?;
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "peer-cap cache path has no file name",
+        )
+    })?;
+    let sequence = CACHE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{}.peer-cap-{}-{sequence}.tmp",
+        leaf.to_string_lossy(),
+        std::process::id(),
+    ));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await?;
+    let commit = async {
+        file.write_all(&json).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, path).await?;
+        tokio::fs::File::open(parent).await?.sync_all().await
     }
+    .await;
+    if commit.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    commit
 }
 
 /// Publish the peer-cap snapshot to [`CAP_TOPIC`] in-process (perf-10 / arch-6)
@@ -312,5 +352,36 @@ mod tests {
             std::env::temp_dir().join("peer-cap-name-test.json"),
         );
         assert_eq!(w.name(), "peer-cap");
+    }
+
+    #[tokio::test]
+    async fn retained_hard_link_cannot_redirect_returned_peer_snapshot_commit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let protected = root.path().join("retained-before-return.json");
+        let cache = root.path().join("peer-cap.json");
+        std::fs::write(&protected, b"retained pre-return authority").expect("seed authority");
+        std::fs::hard_link(&protected, &cache).expect("install hostile cache alias");
+
+        let returned = PeerCapSnapshot {
+            checked_at: 42,
+            cap_used: 4,
+            cap_limit: PEER_CAP,
+            cap_full: false,
+        };
+        write_cache(&cache, &returned)
+            .await
+            .expect("commit corrected-forward snapshot");
+
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected authority"),
+            b"retained pre-return authority"
+        );
+        assert_eq!(
+            serde_json::from_slice::<PeerCapSnapshot>(
+                &std::fs::read(&cache).expect("read committed snapshot")
+            )
+            .expect("decode committed snapshot"),
+            returned
+        );
     }
 }
