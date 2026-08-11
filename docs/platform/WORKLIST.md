@@ -641,6 +641,9 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Conflicting duplicate checkpoint (2026-08-10):** signed event-ID conflicts fail closed in log and batch; exact duplicates remain idempotent. `.90` passed 1/1:
   `docs/platform/evidence/WL-FUNC-011-2026-08-10-conflicting-event-duplicates-r157.md`.
+- **Alert action ID admission (2026-08-10):** unsafe IDs are rejected before
+  lookup/signing; `.90` passed with `.50` format proof:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-10-alert-action-id-admission-r210.md`.
 - **Files name-operation checkpoint (2026-08-10):** New Folder and Rename are reachable through the existing `FileOps` authority, with bounded validation and atomic
   no-replace rename; machines 193/9 passed seven focused tests: `docs/platform/evidence/WL-FUNC-011-2026-08-10-files-name-operations-r23.md`.
 - **Alert delivery restart checkpoint (2026-08-09):** successful Bus/fallback
@@ -1429,6 +1432,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-android-identity-continuity-r161.md`.
 - **Android catalog state-parent checkpoint (2026-08-10):** cache replay and replacement refuse symlinked or non-directory parent components; seat 90 passed the hostile regression:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-catalog-state-parent-nofollow-r196.md`.
+- **Stale Android generation admission (2026-08-10):** non-ready or stale
+  Cuttlefish operations stop before backend contact; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-10-stale-generation-admission-r210.md`.
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
     libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
   - **Signed release-artifact admission (2026-08-09):** schema v3 requires one bounded detached signature from the pinned installed MCNF key before provisioning; missing,
