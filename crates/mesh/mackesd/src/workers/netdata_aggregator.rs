@@ -61,6 +61,8 @@ pub const DEFAULT_OVERLAY_IP_SOURCE: &str = "/var/lib/mackesd/nebula/overlay-ip"
 /// promote/demote action lifts both subsystems.
 pub const DEFAULT_ROLE_HOST_MARKER: &str = "/var/lib/mackesd/nebula/role.host";
 
+const MAX_OVERLAY_IP_FILE_BYTES: usize = 256;
+
 /// Published-pointer schema. Mesh-replicated under
 /// `<workgroup_root>/<self>/mackesd/netdata-aggregator.json`. The
 /// `epoch_s` field carries the publish timestamp so the
@@ -361,7 +363,22 @@ impl Worker for NetdataAggregator {
 /// read failure, or `"empty"` when the file contains only
 /// whitespace.
 pub fn read_overlay_ip(path: &Path) -> Result<String, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("read {} metadata: {e}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_OVERLAY_IP_FILE_BYTES as u64 {
+        return Err(format!("{} is not a bounded regular file", path.display()));
+    }
+    let mut raw = String::new();
+    std::fs::File::open(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .take((MAX_OVERLAY_IP_FILE_BYTES + 1) as u64)
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if raw.len() > MAX_OVERLAY_IP_FILE_BYTES {
+        return Err(format!("{} exceeds its byte bound", path.display()));
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("{} is empty", path.display()));
@@ -716,6 +733,15 @@ mod tests {
     #[test]
     fn latest_aggregator_empty_input_returns_none() {
         assert!(latest_aggregator(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn oversized_overlay_ip_file_fails_closed_before_trim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("overlay-ip");
+        std::fs::write(&path, vec![b'9'; MAX_OVERLAY_IP_FILE_BYTES + 1]).unwrap();
+        let error = read_overlay_ip(&path).expect_err("oversized overlay IP must fail closed");
+        assert!(error.contains("bounded"));
     }
 
     #[test]

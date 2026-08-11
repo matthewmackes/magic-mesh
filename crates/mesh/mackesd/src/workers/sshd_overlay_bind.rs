@@ -32,6 +32,7 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use super::{ShutdownToken, Worker};
@@ -164,6 +165,14 @@ impl SshdOverlayBindWorker {
             tracing::warn!(
                 target: "mackesd::sshd_overlay_bind",
                 "overlay-ip publish file empty; deferring"
+            );
+            return TickOutcome::Idle;
+        }
+        if overlay_ip.parse::<IpAddr>().is_err() {
+            tracing::warn!(
+                target: "mackesd::sshd_overlay_bind",
+                overlay_ip = %overlay_ip,
+                "overlay-ip publish file is not a valid IP address; deferring"
             );
             return TickOutcome::Idle;
         }
@@ -406,5 +415,20 @@ mod tests {
             .with_dropin_path(tmp.path().join("mackes-mesh.conf"))
             .with_sshd_unit("");
         assert_eq!(w.tick_once(), TickOutcome::Idle);
+    }
+
+    #[test]
+    fn invalid_overlay_publish_value_defers_without_writing_dropin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay-ip");
+        let dropin = tmp.path().join("mackes-mesh.conf");
+        std::fs::write(&overlay, "not-an-ip\n").expect("seed invalid overlay");
+        let mut w = SshdOverlayBindWorker::new()
+            .with_overlay_ip_path(overlay)
+            .with_dropin_path(dropin.clone())
+            .with_sshd_unit("");
+
+        assert_eq!(w.tick_once(), TickOutcome::Idle);
+        assert!(!dropin.exists());
     }
 }

@@ -410,8 +410,7 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
-- Required outcome: six independently supervised mackesd groups publish bounded typed runtime snapshots; one Surface::Workers owns worker tree, graph, inspector, Network
-  Operations, and staged Action Console; old surfaces and health duplication are removed.
+- Required outcome: six supervised groups publish bounded snapshots; Surface::Workers owns worker tree/graph/inspector/Network Operations/Action Console; remove duplicate surfaces.
 - Current state: all 152 registered starts have bounded runtime contracts; six grouped services ship, but complete ownership, UI cutover, and fleet proof remain.
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console evidence (2026-08-08/09):** generation/digest gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
@@ -420,6 +419,7 @@ behavioral evidence is not completion.
 - **Bounded job input (2026-08-11):** signed playbooks cap at 1 MiB before digest/apply; BigBoy: `evidence/WL-ARCH-009-2026-08-11-job-playbook-bound-r226.md`.
 - **Bounded mesh-DNS directory (2026-08-11):** over-12-peer directories fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-mesh-dns-directory-bound-r229.md`.
 - **Bounded Nebula systemctl (2026-08-11):** hung commands die at 2 seconds with 8 KiB caps; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-nebula-systemctl-bound-r230.md`.
+- **Bounded Netdata overlay IP (2026-08-11):** source files cap at 256 bytes before trim; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-netdata-overlay-bound-r231.md`.
 - Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip bursts; evidence: `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
 - **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
 - **HTTPS policy source-parent integrity (2026-08-10):** `.90` passed symlinked-ancestor refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-parent-r214.md`.
@@ -1529,8 +1529,7 @@ behavioral evidence is not completion.
 - Priority: P1
 - Complexity: Epic
 - Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
-- Required outcome: a near-Spotify workspace uses daemon-owned typed catalog, queue, playback, bookmarks, cache, and source authority; mde-media-core provides real mpv
-  frame/audio playback; Media UI covers local/Jellyfin/library flows; discovery, DLNA/cast, peer handoff, and live visual/audio proof pass.
+- Required outcome: daemon-owned typed music catalog/queue/playback/cache; real mpv audio/video; local/Jellyfin, discovery, cast, handoff, and live proof.
 - Current state: daemon authority and release 11 run on five seats; Dell named-detail, CPU/NWS, and provider-loss proofs pass.
   Media-server Bus fold: `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/audio/cast/handoff remain.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
@@ -1541,6 +1540,7 @@ behavioral evidence is not completion.
 - **Bounded media config (2026-08-11):** shared-folder JSON caps at 64 KiB and rejects symlinks; BigBoy: `evidence/WL-FUNC-021-2026-08-11-media-config-bound-r226.md`.
 - **Navidrome command timeout (2026-08-11):** systemctl/setup calls fail closed at the shared deadline; BigBoy: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-timeout-r226.md`.
 - **Bounded service registration hostname (2026-08-11):** `/etc/hostname` caps at 255 bytes; BigBoy passed 1/1: `evidence/WL-FUNC-021-2026-08-11-service-hostname-bound-r230.md`.
+- **Bounded Navidrome commands (2026-08-11):** systemctl uses shared 15s boundary; BigBoy passed 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-bound-r231.md`.
 - Remaining work: **Shared artwork byte bound (2026-08-11):** cache reads refuse non-regular or over-4-MiB files and writes refuse oversized payloads; `.50` passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
 - **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
@@ -2089,6 +2089,9 @@ behavioral evidence is not completion.
   when the link disappears at that boundary. `.90` passed all recovery
   fixtures:
   `docs/platform/evidence/WL-CRIT-007-2026-08-11-recovery-substrate-boundary-r218.md`.
+- **SSH overlay-IP admission (2026-08-11):** invalid values defer before drop-in
+  or reload; BigBoy passed 1/1:
+  `evidence/WL-CRIT-007-2026-08-11-sshd-overlay-admission-r231.md`.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.

@@ -32,6 +32,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// Keep the first synchronous systemd probe inside the existing cadence while
 /// spreading identical daemon startups across a small, deterministic window.
 const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The systemd unit `setup-media-navidrome.sh` installs.
 const UNIT: &str = "mcnf-navidrome.service";
@@ -117,7 +118,13 @@ fn sc(args: &[&str]) -> bool {
 }
 
 fn run(args: &[&str]) -> Option<std::process::Output> {
-    Command::new("systemctl").args(args).output().ok()
+    let mut command = Command::new("systemctl");
+    command.args(args);
+    run_bounded(command, SYSTEMCTL_TIMEOUT)
+}
+
+fn run_bounded(command: Command, timeout: Duration) -> Option<std::process::Output> {
+    crate::workers::proc::output_with_timeout(command, timeout).ok()
 }
 
 #[async_trait::async_trait]
@@ -206,5 +213,12 @@ mod tests {
         assert!(
             initial_phase_for("seat15", Duration::from_millis(100)) <= Duration::from_millis(100)
         );
+    }
+
+    #[test]
+    fn systemctl_wrapper_times_out_a_hung_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        assert!(run_bounded(command, Duration::from_millis(25)).is_none());
     }
 }
