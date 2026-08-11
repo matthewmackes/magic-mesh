@@ -134,6 +134,11 @@ SH
 cat >"$BIN/ip" <<'SH'
 #!/bin/sh
 state=${MCNF_TEST_STATE:?}
+if [ "${1:-}" = -4 ] && [ "${2:-}" = route ]; then
+    test ! -f "$state/no-default-route" \
+        && printf '%s\n' 'default via 192.0.2.1 dev eth0'
+    exit 0
+fi
 if test -f "$state/active-nebula.service"; then
     printf '%s\n' '7: nebula1 inet 10.42.0.7/17 scope global'
     if test -f "$state/drop-after-nebula-ready"; then
@@ -178,6 +183,19 @@ run_helper
 [ ! -s "$STATE/mutations" ]
 grep -Fq 'offline-no-mutation' "$STATE/notifies"
 echo 'PASS offline fixture: no service mutation'
+
+# NetworkManager can retain a positive global result after the usable
+# substrate route disappears. A cached online signal must not authorize even
+# the first recovery mutation.
+: >"$STATE/online"
+: >"$STATE/no-default-route"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+[ ! -s "$STATE/mutations" ]
+grep -Fq 'offline-no-mutation' "$STATE/notifies"
+rm -f "$STATE/no-default-route"
+echo 'PASS default-route fixture: cached manager-online state fails closed'
 
 # The event can be admitted while online and lose its link before the
 # single-flight lease is acquired. The post-lock attestation must fail closed

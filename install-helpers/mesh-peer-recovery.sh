@@ -50,15 +50,20 @@ admitted_role() {
 physical_network_online() {
     if [ -x "$NM_ONLINE" ] \
         && bounded_systemctl is-active --quiet NetworkManager.service >/dev/null 2>&1; then
-        /usr/bin/timeout 3 "$NM_ONLINE" -x -q --timeout=1 >/dev/null 2>&1
+        /usr/bin/timeout 3 "$NM_ONLINE" -x -q --timeout=1 >/dev/null 2>&1 || return 1
     elif [ -x "$NETWORKCTL" ] \
         && bounded_systemctl is-active --quiet systemd-networkd.service >/dev/null 2>&1; then
-        /usr/bin/timeout 3 "$NETWORKCTL" is-online --quiet >/dev/null 2>&1
+        /usr/bin/timeout 3 "$NETWORKCTL" is-online --quiet >/dev/null 2>&1 || return 1
     else
         # No approved network manager can attest readiness. A default route can
         # remain cached across link loss, so fail closed instead of mutating.
         return 1
     fi
+    # A manager's global online state can outlive loss of the usable substrate
+    # route. Nebula readiness must never authorize recovery from a cached
+    # positive manager result, so require an actual IPv4 default route too.
+    /usr/bin/timeout 3 "$IP" -4 route show default 2>/dev/null \
+        | /usr/bin/grep -qE '^[[:space:]]*default([[:space:]]|$)'
 }
 
 nebula_ready() {
