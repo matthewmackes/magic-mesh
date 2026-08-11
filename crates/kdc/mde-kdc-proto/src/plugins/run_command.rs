@@ -1,4 +1,4 @@
-//! KDC2-2.19 run_command plugin — `kdeconnect.runcommand` body.
+//! KDC2-2.19 `run_command` plugin — `kdeconnect.runcommand` body.
 //!
 //! Remote command execution. **Deny-by-default** per the v2.1
 //! KDC2 security-review lock — the system policy.toml ships
@@ -45,6 +45,10 @@ pub struct RunCommandBody {
 /// Build a `kdeconnect.runcommand` packet. Used by tests + the
 /// future operator-facing `mde-kdc run-on-peer <peer> <key>`
 /// CLI.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable body cannot be encoded.
 #[must_use]
 pub fn run_command_packet(id_ms: i64, key: String, name: String, command: String) -> Packet {
     Packet {

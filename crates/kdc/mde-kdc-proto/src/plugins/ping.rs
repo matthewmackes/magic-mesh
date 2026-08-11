@@ -25,6 +25,10 @@ pub struct PingBody {
 }
 
 /// Build a `kdeconnect.ping` packet.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable ping body cannot be encoded.
 #[must_use]
 pub fn ping_packet(id_ms: i64, message: String) -> Packet {
     Packet {
@@ -90,7 +94,7 @@ mod tests {
 
     // KDC2-2.16 — PingPlugin Plugin trait impl
 
-    use crate::plugins::{Plugin, PluginContext, PluginKind};
+    use crate::plugins::{Plugin, PluginContext};
 
     #[test]
     fn ping_plugin_queues_received_message() {
@@ -103,7 +107,7 @@ mod tests {
     }
 }
 
-/// KDC2-2.16 — PingPlugin (adapter pattern). Inbound pings get
+/// KDC2-2.16 — `PingPlugin` (adapter pattern). Inbound pings get
 /// queued for host-side notification surfacing.
 #[derive(Debug, Default)]
 pub struct PingPlugin {
@@ -114,7 +118,7 @@ pub struct PingPlugin {
 impl PingPlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             handles: ["kdeconnect.ping"],
@@ -127,7 +131,7 @@ impl PingPlugin {
     }
     /// Items currently queued.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }

@@ -58,7 +58,7 @@ mod tests {
     }
 
     // KDC2-2.16 — FindMyPhonePlugin Plugin trait impl
-    use crate::plugins::{Plugin, PluginContext, PluginKind};
+    use crate::plugins::{Plugin, PluginContext};
 
     #[test]
     fn findmyphone_plugin_records_trigger() {
@@ -72,7 +72,7 @@ mod tests {
     }
 }
 
-/// KDC2-2.16 — FindMyPhonePlugin. Body is empty; we record
+/// KDC2-2.16 — `FindMyPhonePlugin`. Body is empty; we record
 /// trigger COUNT rather than queuing bodies, since each trigger
 /// is interchangeable.
 #[derive(Debug, Default)]
@@ -84,7 +84,7 @@ pub struct FindMyPhonePlugin {
 impl FindMyPhonePlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             triggers: 0,
             handles: ["kdeconnect.findmyphone.request"],
@@ -92,12 +92,12 @@ impl FindMyPhonePlugin {
     }
     /// Return the pending trigger count + reset to zero.
     #[must_use]
-    pub fn take_triggers(&mut self) -> u32 {
+    pub const fn take_triggers(&mut self) -> u32 {
         std::mem::replace(&mut self.triggers, 0)
     }
     /// Triggers currently queued.
     #[must_use]
-    pub fn trigger_count(&self) -> u32 {
+    pub const fn trigger_count(&self) -> u32 {
         self.triggers
     }
 }

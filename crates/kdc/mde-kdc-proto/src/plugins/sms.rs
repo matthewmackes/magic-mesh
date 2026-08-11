@@ -74,6 +74,10 @@ impl SmsMessagesBody {
 
 /// Build a `kdeconnect.sms.messages` packet from a list of
 /// messages.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable SMS body cannot be encoded.
 #[must_use]
 pub fn sms_messages_packet(id_ms: i64, messages: Vec<SmsMessage>) -> Packet {
     Packet {
@@ -169,7 +173,7 @@ mod tests {
     }
 
     // KDC2-2.18 — SmsPlugin Plugin trait impl
-    use crate::plugins::{Plugin, PluginContext, PluginKind};
+    use crate::plugins::{Plugin, PluginContext};
 
     #[test]
     fn sms_plugin_queues_inbound_message_list() {
@@ -183,7 +187,7 @@ mod tests {
     }
 }
 
-/// KDC2-2.18 — SmsPlugin. Queues inbound SmsMessagesBody packets;
+/// KDC2-2.18 — `SmsPlugin`. Queues inbound `SmsMessagesBody` packets;
 /// host's SMS view groups + renders by thread.
 #[derive(Debug, Default)]
 pub struct SmsPlugin {
@@ -194,7 +198,7 @@ pub struct SmsPlugin {
 impl SmsPlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             handles: ["kdeconnect.sms.messages"],
@@ -207,7 +211,7 @@ impl SmsPlugin {
     }
     /// Items currently queued.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }

@@ -30,7 +30,7 @@ pub struct NotificationBody {
     pub title: String,
     /// Body text.
     pub text: String,
-    /// Combined preview line ("AppName: title — body"). Upstream
+    /// Combined preview line ("`AppName`: title — body"). Upstream
     /// emits this as a convenience for tray-style renderings; KDC2
     /// keeps the field so older Android clients that read only
     /// `ticker` still get the full content.
@@ -50,6 +50,11 @@ pub struct NotificationBody {
 /// `id_ms` is the wire-level millisecond timestamp the receiver
 /// uses for envelope-level deduplication (separate from the body
 /// `id` field, which is the per-notification dedup key).
+///
+/// # Panics
+///
+/// Panics only if the statically serializable notification body cannot be
+/// encoded.
 #[must_use]
 pub fn notification_packet(id_ms: i64, body: NotificationBody) -> Packet {
     Packet {
@@ -71,9 +76,9 @@ pub fn notification_packet(id_ms: i64, body: NotificationBody) -> Packet {
 /// Adapter pattern: the protocol crate stays pure (no I/O,
 /// no notification-daemon calls). Received packets are decoded
 /// + pushed into an internal queue; the host crate
-/// (`mde-kdc`) polls `take_received()` from its event loop and
-/// forwards each `NotificationBody` to the OS notification
-/// daemon (mako on Wayland).
+///   (`mde-kdc`) polls `take_received()` from its event loop and
+///   forwards each `NotificationBody` to the OS notification
+///   daemon (mako on Wayland).
 ///
 /// Outgoing notification packets (e.g. dismiss-request relay)
 /// are constructed via the existing `notification_packet()`
@@ -89,7 +94,7 @@ pub struct NotificationPlugin {
 impl NotificationPlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             handles: ["kdeconnect.notification"],
@@ -108,7 +113,7 @@ impl NotificationPlugin {
     /// How many notifications are currently queued. Used by
     /// tests + the host's `mded healthz` instrumentation.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }

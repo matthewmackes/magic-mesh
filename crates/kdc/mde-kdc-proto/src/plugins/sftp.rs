@@ -69,7 +69,7 @@ impl SftpMountInfo {
     /// address, a port, and credentials. A reply missing any of these is an
     /// honest no-mount (the phone declined / SFTP is off), not a faked mount.
     #[must_use]
-    pub fn is_mountable(&self) -> bool {
+    pub const fn is_mountable(&self) -> bool {
         !self.ip.is_empty() && self.port != 0 && !self.user.is_empty() && !self.password.is_empty()
     }
 
@@ -90,6 +90,10 @@ impl SftpMountInfo {
 }
 
 /// Build a `kdeconnect.sftp.request` packet asking the phone to start browsing.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable body cannot be encoded.
 #[must_use]
 pub fn sftp_request_packet(id_ms: i64, start_browsing: bool) -> Packet {
     Packet {
@@ -105,6 +109,11 @@ pub fn sftp_request_packet(id_ms: i64, start_browsing: bool) -> Packet {
 
 /// Build a `kdeconnect.sftp` mount-info packet (the phone's reply shape — used by
 /// tests + any host-side SFTP responder).
+///
+/// # Panics
+///
+/// Panics only if the statically serializable mount information cannot be
+/// encoded.
 #[must_use]
 pub fn sftp_mount_packet(id_ms: i64, info: SftpMountInfo) -> Packet {
     Packet {

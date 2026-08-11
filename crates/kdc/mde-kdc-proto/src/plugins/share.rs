@@ -66,7 +66,7 @@ impl ShareBody {
     /// dispatch saves every consumer from reimplementing the
     /// "which fields are set" probe.
     #[must_use]
-    pub fn kind(&self) -> ShareKind {
+    pub const fn kind(&self) -> ShareKind {
         if !self.url.is_empty() {
             ShareKind::Url
         } else if !self.filename.is_empty() && self.payload_size > 0 {
@@ -77,12 +77,17 @@ impl ShareBody {
     }
 }
 
-fn is_zero(n: &u64) -> bool {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
 /// Build a URL-share packet (e.g. operator paste-shares a URL to
 /// their phone).
+///
+/// # Panics
+///
+/// Panics only if the statically serializable share body cannot be encoded.
 #[must_use]
 pub fn url_share_packet(id_ms: i64, url: String, open: bool) -> Packet {
     Packet {
@@ -103,6 +108,10 @@ pub fn url_share_packet(id_ms: i64, url: String, open: bool) -> Packet {
 /// Build a file-share request packet. Caller is responsible for
 /// streaming the actual binary payload through the KDC file-
 /// transfer port — this packet only announces the intent.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable share body cannot be encoded.
 #[must_use]
 pub fn file_share_packet(
     id_ms: i64,
@@ -205,7 +214,7 @@ mod tests {
     }
 
     // KDC2-2.15 — SharePlugin Plugin trait impl
-    use crate::plugins::{Plugin, PluginContext, PluginKind};
+    use crate::plugins::{Plugin, PluginContext};
 
     #[test]
     fn share_plugin_queues_inbound_url() {
@@ -235,7 +244,8 @@ mod tests {
     }
 }
 
-/// KDC2-2.15 — SharePlugin. Queues both URL + file-announce
+/// KDC2-2.15 — `SharePlugin`. Queues both URL + file-announce
+///
 /// bodies; the actual binary payload streaming over the KDC
 /// file-transfer port is a separate KDC2-3.x mechanism the host
 /// drives off the file-share announcement.
@@ -248,7 +258,7 @@ pub struct SharePlugin {
 impl SharePlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             handles: ["kdeconnect.share.request"],
@@ -261,7 +271,7 @@ impl SharePlugin {
     }
     /// Items currently queued.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }

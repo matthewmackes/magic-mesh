@@ -95,7 +95,8 @@ pub struct MprisBody {
     pub support_album_art_payload: Option<bool>,
 }
 
-fn is_zero(n: &i64) -> bool {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(n: &i64) -> bool {
     *n == 0
 }
 
@@ -115,7 +116,7 @@ pub enum MprisKind {
 impl MprisBody {
     /// Classify which direction this body represents.
     #[must_use]
-    pub fn kind(&self) -> MprisKind {
+    pub const fn kind(&self) -> MprisKind {
         if !self.action.is_empty() {
             MprisKind::Command
         } else if !self.player_list.is_empty() || self.support_album_art_payload.is_some() {
@@ -151,6 +152,10 @@ pub struct MprisRequestBody {
 }
 
 /// Build a remote MPRIS command packet (peer→player).
+///
+/// # Panics
+///
+/// Panics only if the statically serializable MPRIS body cannot be encoded.
 #[must_use]
 pub fn mpris_command_packet(id_ms: i64, action: String) -> Packet {
     Packet {
@@ -314,7 +319,7 @@ pub struct MprisPlugin {
 impl MprisPlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             handles: ["kdeconnect.mpris"],
@@ -329,7 +334,7 @@ impl MprisPlugin {
 
     /// Items currently queued.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }

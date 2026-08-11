@@ -51,6 +51,10 @@ pub struct TelephonyBody {
 }
 
 /// Build a telephony event packet.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable telephony body cannot be encoded.
 #[must_use]
 pub fn telephony_packet(id_ms: i64, body: TelephonyBody) -> Packet {
     Packet {
@@ -146,7 +150,7 @@ mod tests {
     }
 
     // KDC2-2.18 — TelephonyPlugin Plugin trait impl
-    use crate::plugins::{Plugin, PluginContext, PluginKind};
+    use crate::plugins::{Plugin, PluginContext};
 
     #[test]
     fn telephony_plugin_queues_inbound_event() {
@@ -163,7 +167,7 @@ mod tests {
     }
 }
 
-/// KDC2-2.18a — TelephonyPlugin (Plugin trait impl)
+/// KDC2-2.18a — `TelephonyPlugin` (Plugin trait impl)
 #[derive(Debug, Default)]
 pub struct TelephonyPlugin {
     received: Vec<TelephonyBody>,
@@ -173,7 +177,7 @@ pub struct TelephonyPlugin {
 impl TelephonyPlugin {
     /// New empty plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             handles: ["kdeconnect.telephony"],
@@ -186,7 +190,7 @@ impl TelephonyPlugin {
     }
     /// Items currently queued.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }

@@ -152,10 +152,14 @@ pub fn validate_clipboard_text(content: &str) -> Result<(), ClipboardRejection> 
     Ok(())
 }
 
-/// Validate a local seat identifier before it becomes a materialization
-/// destination. Seat names are opaque to the protocol, but rejecting control
-/// characters, separators, and empty values prevents a peer- or config-derived
-/// value from being interpreted as a path or command fragment downstream.
+/// Validate a local seat identifier before materialization.
+///
+/// Seat names are opaque to the protocol, but rejecting control characters,
+/// separators, and empty values prevents path or command interpretation.
+///
+/// # Errors
+///
+/// Returns the reason the seat is empty, too long, or contains invalid bytes.
 pub fn validate_clipboard_seat(seat: &str) -> Result<(), ClipboardSeatError> {
     if seat.is_empty() {
         return Err(ClipboardSeatError::Empty);
@@ -915,6 +919,11 @@ impl ClipboardPlugin {
     ///
     /// Passing `None` explicitly disables seat delivery while retaining remote
     /// history. The destination is validated before it is stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested seat is not a valid local seat
+    /// identifier.
     pub fn set_active_seat(&mut self, seat: Option<String>) -> Result<(), ClipboardSeatError> {
         if let Some(ref seat) = seat {
             validate_clipboard_seat(seat)?;
@@ -1106,12 +1115,9 @@ impl crate::plugins::Plugin for ClipboardPlugin {
             );
             return Vec::new();
         }
-        let body_bytes = match serde_json::to_vec(&packet.body) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.record_rejection(ClipboardRejection::MalformedBody, metadata);
-                return Vec::new();
-            }
+        let Ok(body_bytes) = serde_json::to_vec(&packet.body) else {
+            self.record_rejection(ClipboardRejection::MalformedBody, metadata);
+            return Vec::new();
         };
         if body_bytes.len() > MAX_CLIPBOARD_BODY_BYTES {
             self.record_rejection(

@@ -15,6 +15,7 @@ const MAX_KEY_CHARS: usize = 16;
 /// `kdeconnect.mousepad.request` body.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MousepadBody {
     /// Relative x movement.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
@@ -57,7 +58,8 @@ pub struct MousepadBody {
     pub super_key: bool,
 }
 
-fn is_zero_f64(n: &f64) -> bool {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_f64(n: &f64) -> bool {
     *n == 0.0
 }
 
@@ -87,6 +89,7 @@ impl MouseButton {
 
 /// Keyboard modifiers attached to a key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MouseModifiers {
     /// Shift modifier.
     pub shift: bool,
@@ -225,6 +228,10 @@ fn bounded_key(value: &str) -> Option<String> {
 }
 
 /// Build a remote-input packet.
+///
+/// # Panics
+///
+/// Panics only if the statically serializable mousepad body cannot be encoded.
 #[must_use]
 pub fn mousepad_packet(id_ms: i64, body: MousepadBody) -> Packet {
     Packet {
