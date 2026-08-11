@@ -1191,11 +1191,15 @@ impl ClockWorker {
                 let Some(peer) = peer_snapshots.get(target) else {
                     continue;
                 };
-                let delivered = peer.schedules.iter().any(|candidate| {
-                    candidate.schedule_id == schedule.schedule_id
-                        && candidate.origin_node_id == schedule.origin_node_id
-                        && candidate.revision >= schedule.revision
-                });
+                // Revision alone is not proof of convergence. A peer can
+                // retain a conflicting payload under the same (or a newer)
+                // revision after a torn/replayed command. Treat that state as
+                // divergent so it remains visible to the admission boundary
+                // instead of silently declaring the alarm delivered.
+                let delivered = peer
+                    .schedules
+                    .iter()
+                    .any(|candidate| peer_schedule_is_converged(candidate, schedule));
                 if !delivered {
                     if remaining_commands == 0 {
                         return Ok(());
@@ -1526,6 +1530,13 @@ fn due_now_or_before(schedule: &ClockScheduleV1, now_ms: i64) -> anyhow::Result<
             .map_or(Ok(None), |deadline| Ok(Some(deadline))),
         _ => Ok(None),
     }
+}
+
+fn peer_schedule_is_converged(
+    candidate: &ClockScheduleV1,
+    desired: &ClockScheduleV1,
+) -> bool {
+    candidate == desired
 }
 
 fn weekday_due_now_or_before(
@@ -4964,6 +4975,27 @@ mod tests {
             .list_since(&clock_command_topic("seat-2").unwrap(), None)
             .unwrap();
         assert_eq!(messages.len(), MAX_PEER_COMMANDS_PER_TICK);
+    }
+
+    #[test]
+    fn peer_schedule_convergence_rejects_revision_only_matches() {
+        let desired = weekday_alarm_schedule("mesh-alarm", 7, 30, ClockFoldPolicy::Earlier);
+
+        assert!(peer_schedule_is_converged(&desired, &desired));
+
+        let mut same_revision_conflict = desired.clone();
+        same_revision_conflict.label = "tampered label".into();
+        assert!(!peer_schedule_is_converged(
+            &same_revision_conflict,
+            &desired
+        ));
+
+        let mut newer_revision_conflict = desired.clone();
+        newer_revision_conflict.revision += 1;
+        assert!(!peer_schedule_is_converged(
+            &newer_revision_conflict,
+            &desired
+        ));
     }
 
     #[test]
