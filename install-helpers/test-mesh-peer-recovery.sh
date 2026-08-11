@@ -168,6 +168,12 @@ cat >"$BIN/notify" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >>"${MCNF_TEST_STATE:?}/notifies"
 SH
+cat >"$BIN/pgrep" <<'SH'
+#!/bin/sh
+state=${MCNF_TEST_STATE:?}
+[ "${1:-}" = -x ] && [ "${2:-}" = mde-shell-egui ] || exit 2
+test -f "$state/stale-mde-shell-egui"
+SH
 cat >"$BIN/sleep" <<'SH'
 #!/bin/sh
 printf '%s\n' "$1" >>"${MCNF_TEST_STATE:?}/sleeps"
@@ -178,6 +184,7 @@ run_helper() {
     NOTIFY_SOCKET="$ROOT/notify.sock" MCNF_TEST_STATE="$STATE" \
     MCNF_RECOVERY_SYSTEMCTL="$BIN/systemctl" MCNF_RECOVERY_IP="$BIN/ip" \
     MCNF_RECOVERY_NOTIFY="$BIN/notify" MCNF_RECOVERY_SLEEP="$BIN/sleep" \
+    MCNF_RECOVERY_PGREP="$BIN/pgrep" \
     MCNF_RECOVERY_NM_ONLINE="$BIN/nm-online" MCNF_RECOVERY_NETWORKCTL="$ROOT/missing-networkctl" \
     MCNF_RECOVERY_LOCK="$ROOT/recovery.lock" MCNF_NEBULA_DIR="$ROOT/nebula" \
     MCNF_ROLE_FILE="$ROOT/role.toml" MCNF_ETCD_MEMBER_FILE="$ROOT/etcd.env" \
@@ -398,9 +405,26 @@ mde-shell-egui.service
 EOF
 cmp "$STATE/expected-mutations" "$STATE/mutations"
 grep -Fq 'status=restoring-workstation-session' "$STATE/notifies"
-grep -Fq 'status=recovered' "$STATE/notifies"
+grep -Fq 'status=already-recovered' "$STATE/notifies"
 : >"$STATE/active-mde-shell-egui.service"
 echo 'PASS missing-session fixture: healthy substrate restores only the Workstation shell'
+
+# An inactive unit can still leave an orphaned shell process behind after a
+# crash or interrupted stop. Recovery must refuse to start a second session
+# until that stale process is removed.
+rm -f "$STATE/active-mde-shell-egui.service"
+: >"$STATE/stale-mde-shell-egui"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+if run_helper; then
+    echo 'stale shell process unexpectedly allowed a second session' >&2
+    exit 1
+fi
+[ ! -s "$STATE/mutations" ]
+grep -Fq 'status=refused-stale-workstation-session' "$STATE/notifies"
+rm -f "$STATE/stale-mde-shell-egui"
+echo 'PASS stale-session fixture: orphaned shell refuses duplicate recovery'
+: >"$STATE/active-mde-shell-egui.service"
 
 # A network-return event can find the target active while one grouped daemon is
 # missing. Recovery must start only that group. Restarting the target creates a

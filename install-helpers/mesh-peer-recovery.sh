@@ -8,6 +8,7 @@ SYSTEMCTL="${MCNF_RECOVERY_SYSTEMCTL:-/usr/bin/systemctl}"
 IP="${MCNF_RECOVERY_IP:-/usr/sbin/ip}"
 NOTIFY="${MCNF_RECOVERY_NOTIFY:-/usr/bin/systemd-notify}"
 SLEEP="${MCNF_RECOVERY_SLEEP:-/usr/bin/sleep}"
+PGREP="${MCNF_RECOVERY_PGREP:-/usr/bin/pgrep}"
 NM_ONLINE="${MCNF_RECOVERY_NM_ONLINE:-/usr/bin/nm-online}"
 NETWORKCTL="${MCNF_RECOVERY_NETWORKCTL:-/usr/bin/networkctl}"
 FLOCK="${MCNF_RECOVERY_FLOCK:-/usr/bin/flock}"
@@ -137,6 +138,11 @@ restore_xdg_binds() {
     bounded_systemctl start mcnf-xdg-bind-recovery.service >/dev/null 2>&1
 }
 
+stale_workstation_session_present() {
+    bounded_systemctl is-active --quiet mde-shell-egui.service >/dev/null 2>&1 && return 1
+    [ -x "$PGREP" ] && "$PGREP" -x mde-shell-egui >/dev/null 2>&1
+}
+
 restore_workstation_session() {
     # The grouped daemon set can be healthy while the DRM seat has crashed or
     # was not started during a boot race.  Treat the packaged shell as part of
@@ -145,6 +151,15 @@ restore_workstation_session() {
     if bounded_systemctl is-active --quiet mde-shell-egui.service >/dev/null 2>&1; then
         publish "workstation-session-already-ready"
         return 0
+    fi
+    # An inactive unit does not prove that its old process exited.  Starting
+    # another shell while an orphan still owns the DRM/session authority can
+    # create two desktop authorities after a crash or interrupted stop.  Treat
+    # any exact-name survivor as stale and fail closed; systemd must clean it
+    # up before a later recovery attempt can start a fresh session.
+    if stale_workstation_session_present; then
+        publish "refused-stale-workstation-session"
+        return 1
     fi
     publish "restoring-workstation-session"
     if ! bounded_systemctl start mde-shell-egui.service >/dev/null 2>&1 \
@@ -159,6 +174,12 @@ restore_role_desktop_state() {
     if [ "$role" = lighthouse ]; then
         publish "skipped-workstation-xdg-lighthouse"
         return 0
+    fi
+    # XDG repair is itself a desktop mutation. Refuse the whole Workstation
+    # desktop path before it runs when an inactive shell left an orphan behind.
+    if stale_workstation_session_present; then
+        publish "refused-stale-workstation-session"
+        return 1
     fi
     publish "restoring-workstation-xdg-binds"
     if ! restore_xdg_binds; then
