@@ -599,6 +599,14 @@ impl ClockWorker {
         issued_at_ms: i64,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
+        // A locally authored command is the only point at which this node
+        // chooses remote executors. Do not persist a target that cannot take
+        // part in the signed convergence protocol: it would make a schedule
+        // or mirror look durable even though no admitted peer can receive it.
+        // Peer-originated commands deliberately retain their full target set;
+        // this node only admits those when it is one of the selected targets.
+        let local_node_id = self.node_id.clone();
+        let approved_peer_ids = self.approved_peer_ids.clone();
         let snapshot = self.snapshot.as_mut().expect("Clock snapshot loaded");
         let changed = match command {
             ClockCommandKindV1::UpsertSchedule { mut schedule } => {
@@ -606,6 +614,16 @@ impl ClockWorker {
                     schedule.origin_node_id == command_origin,
                     "Clock schedule origin mismatch"
                 );
+                if !peer_origin {
+                    anyhow::ensure!(
+                        clock_targets_are_admitted(
+                            &schedule.selected_target_ids,
+                            &local_node_id,
+                            &approved_peer_ids,
+                        ),
+                        "Clock schedule target is not an approved peer"
+                    );
+                }
                 if peer_origin {
                     anyhow::ensure!(
                         schedule
@@ -811,6 +829,16 @@ impl ClockWorker {
                     stopwatch.origin_node_id == command_origin,
                     "Clock stopwatch origin mismatch"
                 );
+                if !peer_origin {
+                    anyhow::ensure!(
+                        clock_targets_are_admitted(
+                            &stopwatch.mirror_target_ids,
+                            &local_node_id,
+                            &approved_peer_ids,
+                        ),
+                        "Clock stopwatch mirror is not an approved peer"
+                    );
+                }
                 if peer_origin {
                     anyhow::ensure!(
                         stopwatch
@@ -2012,6 +2040,16 @@ fn upsert_stopwatch(stopwatches: &mut Vec<ClockStopwatchV1>, stopwatch: ClockSto
     } else {
         stopwatches.push(stopwatch);
     }
+}
+
+fn clock_targets_are_admitted(
+    targets: &[String],
+    local_node_id: &str,
+    approved_peer_ids: &BTreeSet<String>,
+) -> bool {
+    targets
+        .iter()
+        .all(|target| target == local_node_id || approved_peer_ids.contains(target))
 }
 
 fn validate_stopwatch_deadlines(
@@ -4602,6 +4640,98 @@ mod tests {
                 .origin_node_id,
             "seat-1"
         );
+    }
+
+    #[test]
+    fn local_clock_targets_must_be_self_or_approved_peers() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+
+        let mut unapproved_schedule = fixture.timer_command(
+            "unapproved-schedule-target",
+            1,
+            NOW + 60_000,
+        );
+        let ClockCommandKindV1::UpsertSchedule { schedule } = &mut unapproved_schedule.body
+        else {
+            unreachable!();
+        };
+        schedule.selected_target_ids = vec!["seat-9".into()];
+        unapproved_schedule.signature.clear();
+        unapproved_schedule.signer_id.clear();
+        let unapproved_schedule = unapproved_schedule
+            .sign(
+                "seat-1-key",
+                &fixture.signing_key,
+                &ClockValidationContext {
+                    wall_utc_ms: NOW,
+                    monotonic_ms: 1,
+                    zone_exists: &zone_exists,
+                },
+            )
+            .unwrap();
+        fixture.publish(&unapproved_schedule);
+
+        let unapproved_stopwatch = signed_stopwatch_for(
+            &fixture.signing_key,
+            "seat-1-key",
+            "seat-1",
+            "seat-1",
+            "unapproved-stopwatch-mirror",
+            1,
+            "unapproved-stopwatch",
+            1,
+            &["seat-9"],
+            0,
+        );
+        fixture.publish(&unapproved_stopwatch);
+        fixture.worker.tick_once().unwrap();
+
+        let rejected = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(rejected.revision, 1);
+        assert!(rejected.schedules.is_empty());
+        assert!(rejected.stopwatches.is_empty());
+
+        fixture.worker.approved_peer_ids.insert("seat-2".into());
+        let mut approved_schedule =
+            fixture.timer_command("approved-schedule-target", 1, NOW + 60_000);
+        let ClockCommandKindV1::UpsertSchedule { schedule } = &mut approved_schedule.body else {
+            unreachable!();
+        };
+        schedule.selected_target_ids = vec!["seat-2".into()];
+        approved_schedule.signature.clear();
+        approved_schedule.signer_id.clear();
+        let approved_schedule = approved_schedule
+            .sign(
+                "seat-1-key",
+                &fixture.signing_key,
+                &ClockValidationContext {
+                    wall_utc_ms: NOW,
+                    monotonic_ms: 1,
+                    zone_exists: &zone_exists,
+                },
+            )
+            .unwrap();
+        fixture.publish(&approved_schedule);
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&signed_stopwatch_for(
+            &fixture.signing_key,
+            "seat-1-key",
+            "seat-1",
+            "seat-1",
+            "approved-stopwatch-mirror",
+            2,
+            "approved-stopwatch",
+            1,
+            &["seat-2"],
+            0,
+        ));
+        fixture.worker.tick_once().unwrap();
+
+        let admitted = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(admitted.revision, 3);
+        assert_eq!(admitted.schedules[0].selected_target_ids, ["seat-2"]);
+        assert_eq!(admitted.stopwatches[0].mirror_target_ids, ["seat-2"]);
     }
 
     #[test]

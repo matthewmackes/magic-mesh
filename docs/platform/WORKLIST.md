@@ -1744,6 +1744,8 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Clock local-target admission (2026-08-11):** locally authored schedules and stopwatch mirrors reject unapproved peers while approved peers persist; `.50` passed:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-11-clock-target-admission-r217.md`.
 - **Replay cursor recovery checkpoint (2026-08-10):** duplicate Clock request
   replays cannot regress or clear the durable Bus action cursor; `.50` passed
   the hostile stale/`NULL` cursor regression:
@@ -2319,6 +2321,9 @@ behavioral evidence is not completion.
   contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
 - **Unavailable provider control (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-UX-011-2026-08-10-unavailable-control-r207.md`.
 - Remaining work:
+- **Unavailable control all-verbs admission (2026-08-11):** unresolved provider state blocks Enable, Disable, Reload Module, and Rescan Bus without sysfs mutation;
+  BigBoy passed:
+  `docs/platform/evidence/WL-UX-011-2026-08-11-unavailable-control-all-verbs-r217.md`.
 - **Device-control cancellation checkpoint (2026-08-09):** a signed cancellation
   can atomically claim only the exact still-pending request; late/refused
   cancellation cannot replace its eventual execution result, and the shell

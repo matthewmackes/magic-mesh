@@ -364,15 +364,17 @@ impl DeviceControlExecWorker {
     }
 
     /// A provider-owned record with no resolved state or explanatory evidence is
-    /// not safe to mutate. Keep known operational states (for example a network
-    /// link explicitly reported `down`) actionable, while refusing an absent
-    /// driver/unknown device whose provider could not establish availability.
+    /// not safe to mutate. This applies to every control verb: a module reload
+    /// and a bus rescan are mutations too, even though they do not look like a
+    /// simple enable/disable toggle. Keep known operational states (for example
+    /// a network link explicitly reported `down`) actionable, while refusing an
+    /// absent driver/unknown device whose provider could not establish
+    /// availability.
     fn admit_control_state(
         op: DeviceControlOp,
         device: &device_inventory::DeviceRecord,
     ) -> Result<(), String> {
-        if matches!(op, DeviceControlOp::Enable | DeviceControlOp::Disable)
-            && device.status == device_inventory::DeviceStatus::Unknown
+        if device.status == device_inventory::DeviceStatus::Unknown
             && device.problem.is_none()
         {
             return Err(format!(
@@ -1052,7 +1054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_provider_state_cannot_reach_the_mutation_seam() {
+    async fn unavailable_provider_state_cannot_reach_any_control_seam() {
         let tmp = tempfile::tempdir().unwrap();
         let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
         std::fs::create_dir_all(&dev_dir).unwrap();
@@ -1074,28 +1076,39 @@ mod tests {
             "peer:edge-2".into(),
         )
         .with_authorizer(test_authorizer(tmp.path()));
-        let request = authorize_request(
-            &DeviceControlRequest {
-                schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
-                armed_token: None,
-                id: "01UNAVAILABLE".into(),
-                op: DeviceControlOp::Disable,
-                target: DeviceTarget {
-                    name: "Unavailable USB device".into(),
-                    category: category::NETWORK_ADAPTERS.into(),
-                    sysfs_path: Some(sysfs_path),
-                    driver: None,
-                },
-                target_host: "edge-2".into(),
-                expected_inventory_published_at_ms: 1,
-                from: "peer:laptop-mm".into(),
+        let request = DeviceControlRequest {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: "01UNAVAILABLE".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget {
+                name: "Unavailable USB device".into(),
+                category: category::NETWORK_ADAPTERS.into(),
+                sysfs_path: Some(sysfs_path),
+                driver: None,
             },
-            "unavailable-provider-state",
-        );
+            target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1,
+            from: "peer:laptop-mm".into(),
+        };
 
-        let result = worker.handle_request(&request).await;
-        assert!(!result.ok, "unavailable provider state must refuse mutation");
-        assert!(result.error.contains("provider state"), "{}", result.error);
+        for op in DeviceControlOp::ALL {
+            let mut request = request.clone();
+            request.id = format!("01UNAVAILABLE-{}", op.as_str());
+            request.op = op;
+            let result = worker.handle_request(&request).await;
+            assert!(
+                !result.ok,
+                "unavailable provider state must refuse {}",
+                op.as_str()
+            );
+            assert!(
+                result.error.contains("provider state"),
+                "{} unexpectedly escaped provider admission: {}",
+                op.as_str(),
+                result.error
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
             "1",
