@@ -2886,6 +2886,9 @@ fn peer_app_provision_wire_with(
             "Flatpak App VM launch is blocked by current admission state: {reason}"
         ));
     }
+    if !target.source.trim().eq_ignore_ascii_case("flatpak") {
+        return Err("Flatpak App VM provisioning requires a Flatpak catalog target.".to_owned());
+    }
     let node = target.node.trim();
     if node.is_empty()
         || node.len() > 255
@@ -7241,6 +7244,30 @@ mod tests {
 
         assert!(error.contains("not admitted"), "{error}");
         assert!(error.contains("capability"), "{error}");
+        assert!(!authorization_called.get());
+    }
+
+    #[test]
+    fn non_flatpak_target_cannot_reach_app_vm_authorization() {
+        let target = FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.example.Editor".to_owned(),
+            name: "Editor".to_owned(),
+            source: "xdg".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: Vec::new(),
+            launch_blocked_reason: None,
+        };
+        let authorization_called = std::cell::Cell::new(false);
+
+        let error = peer_app_provision_wire_with(&target, "seat-a", |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("host XDG target must fail before App VM authorization");
+
+        assert!(error.contains("Flatpak catalog target"), "{error}");
         assert!(!authorization_called.get());
     }
 
