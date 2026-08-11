@@ -1384,6 +1384,18 @@ mod tests {
     fn shared_health_contract_maps_into_toast_host_without_regrading() {
         use mackes_mesh_types::health::GradeLetter;
 
+        let grade_a = decode(&health_kiron_body(GradeLetter::A)).expect("grade A admitted");
+        assert_eq!(grade_a.tier, Tier::Alert(Severity::Info));
+        assert_eq!(grade_a.dwell, mde_egui::Dwell::For(std::time::Duration::from_secs(3)));
+
+        let grade_b = decode(&health_kiron_body(GradeLetter::B)).expect("grade B admitted");
+        assert_eq!(grade_b.tier, Tier::Alert(Severity::Info));
+        assert_eq!(grade_b.dwell, mde_egui::Dwell::For(std::time::Duration::from_secs(5)));
+
+        let grade_c = decode(&health_kiron_body(GradeLetter::C)).expect("grade C admitted");
+        assert_eq!(grade_c.tier, Tier::Alert(Severity::Warning));
+        assert_eq!(grade_c.dwell, mde_egui::Dwell::For(std::time::Duration::from_secs(6)));
+
         let grade_d = decode(&health_kiron_body(GradeLetter::D)).expect("grade D admitted");
         assert_eq!(grade_d.tier, Tier::Alert(Severity::Warning));
         assert_eq!(
