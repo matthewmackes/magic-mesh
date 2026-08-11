@@ -51,6 +51,7 @@ pub mod device_inventory;
 pub mod airspace;
 pub mod device_control;
 /// WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake latest-wins snapshot
+///
 /// shared by the workstation-side adapter and the Maps & Location surface.
 pub mod earthquake;
 pub mod exposure;
@@ -105,6 +106,7 @@ pub mod peer_probe;
 // (reader) use one path; docs/design/v2.7-peer-data-convergence.md.
 pub mod peers;
 /// WL-FUNC-019 — versioned universal resource identity, capability, transport,
+///
 /// provenance, auth/health, catalog, and bounded-action contracts.
 pub mod resources;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
@@ -154,6 +156,7 @@ pub mod vehicle;
 /// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
 pub mod vpn;
 /// VPN-GW-3 — selective egress: fwmark/ip-rule policy routing + nftables
+///
 /// masquerade + a leak-proof kill-switch, with the Nebula overlay carved out so
 /// mesh traffic never tunnels. Pure argv builders applied by the `vpn_gw`
 /// responder on tunnel up/down. Also holds VPN-GW-4 — the mesh egress *routing*
