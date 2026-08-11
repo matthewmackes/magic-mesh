@@ -641,6 +641,9 @@ fn validated_request(
         body.resume,
     )
     .map_err(|error| format!("invalid App VM declaration: {error}"))?;
+    request
+        .validate_admitted()
+        .map_err(|error| format!("App VM declaration failed admission: {error}"))?;
     Ok((node, name, client_peer, request))
 }
 
@@ -736,6 +739,26 @@ mod tests {
             reconcile::read_desired_slice(tmp.path(), "eagle"),
             vec![spec]
         );
+    }
+
+    #[test]
+    fn app_provision_rejects_capability_outside_guest_policy_before_persisting() {
+        let tmp = tempdir().unwrap();
+        admit_app_image(tmp.path());
+        let mut request = body("eagle", "writer");
+        request.requested_capabilities = vec!["host_socket".to_owned()];
+
+        let reply = build_reply(tmp.path(), "app-provision", &request);
+
+        assert!(!reply.ok, "unsupported capability was admitted: {reply:?}");
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed admission")),
+            "unexpected rejection: {reply:?}"
+        );
+        assert!(reconcile::read_desired_slice(tmp.path(), "eagle").is_empty());
     }
 
     #[test]
