@@ -1784,13 +1784,39 @@ pub struct RemoveSourceRequest {
 pub fn parse_add_source(body: &str) -> Result<ManualSource, String> {
     let req: ManualSource =
         serde_json::from_str(body).map_err(|e| format!("malformed add-source request: {e}"))?;
-    if req.host.trim().is_empty() {
-        return Err("add-source: host must not be empty".to_string());
-    }
-    if req.port == 0 {
-        return Err("add-source: port must be non-zero".to_string());
-    }
+    validate_manual_source(&req).map_err(|reason| format!("add-source: {reason}"))?;
     Ok(req)
+}
+
+/// Apply the closed manual-source grammar at every trust boundary, including
+/// records restored from the node-local JSON store.  Store contents are
+/// operator-controlled data, but they are still untrusted input to the
+/// resource browser and must not bypass the request parser.
+fn validate_manual_source(source: &ManualSource) -> Result<(), &'static str> {
+    if source.host.trim().is_empty() {
+        return Err("host must not be empty");
+    }
+    if !source.host.is_ascii()
+        || source.host.chars().any(|character| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | ':' | '[' | ']' | '%'))
+        })
+    {
+        return Err("host must be a bounded literal or DNS-style name");
+    }
+    if source.port == 0 {
+        return Err("port must be non-zero");
+    }
+    if let Some(name) = source.name.as_deref() {
+        if name.is_empty()
+            || name.len() > MAX_DESKTOP_ADAPTER_NAME_BYTES
+            || name.trim() != name
+            || name.chars().any(char::is_control)
+        {
+            return Err("name must be a bounded, trimmed, non-control string");
+        }
+    }
+    Ok(())
 }
 
 /// Parse + validate a remove-source body.
@@ -1910,8 +1936,17 @@ pub fn load_manual_sources(store_root: &Path) -> Vec<ManualSource> {
 fn load_manual_sources_strict(store_root: &Path) -> std::io::Result<Vec<ManualSource>> {
     let _store_dir = open_manual_store_root(store_root)?;
     let data = read_bounded_manual_store(&manual_store_path(store_root))?;
-    serde_json::from_str(&data)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    let sources: Vec<ManualSource> = serde_json::from_str(&data)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    for source in &sources {
+        validate_manual_source(source).map_err(|reason| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid manual source in store: {reason}"),
+            )
+        })?;
+    }
+    Ok(sources)
 }
 
 /// Persist the manual-source store atomically (temp + rename, the peers-plane
@@ -4485,6 +4520,14 @@ mod tests {
         assert!(parse_add_source(r#"{"host":"","port":1,"protocol":"vnc"}"#).is_err());
         assert!(parse_add_source(r#"{"host":"h","port":0,"protocol":"vnc"}"#).is_err());
         assert!(parse_add_source(r#"{"host":"h","port":1,"protocol":"telnet"}"#).is_err());
+        assert!(parse_add_source(
+            r#"{"host":"https://evil.example/$(id)","port":3389,"protocol":"rdp"}"#
+        )
+        .is_err());
+        assert!(parse_add_source(
+            r#"{"name":" bad","host":"h","port":3389,"protocol":"rdp"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -4510,6 +4553,26 @@ mod tests {
         // Corrupt store → empty, never fatal.
         std::fs::write(dir.path().join(MANUAL_STORE_FILE), "{ not json").unwrap();
         assert!(load_manual_sources(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn manual_store_rejects_records_that_bypass_request_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANUAL_STORE_FILE);
+        std::fs::write(
+            &path,
+            r#"[{"name":"ok","host":"192.168.1.50","port":3389,"protocol":"rdp"},{"name":" bad","host":"h","port":5900,"protocol":"vnc"}]"#,
+        )
+        .unwrap();
+
+        assert!(
+            load_manual_sources_strict(dir.path()).is_err(),
+            "one invalid persisted record must not be admitted into the roster"
+        );
+        assert!(
+            load_manual_sources(dir.path()).is_empty(),
+            "invalid persisted records fail closed rather than partially publishing"
+        );
     }
 
     #[test]

@@ -1211,6 +1211,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-peer-record-nofollow-r180.md`.
 - **Manual-store root nofollow:** `.50` passed refusal of a symlinked manual-source store directory:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-manual-store-root-nofollow-r185.md`.
+- **Persisted manual-source admission:** `.90` passed refusal of invalid
+  host/name records restored from the JSON store, so persisted data cannot
+  bypass request validation:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-manual-store-admission-r193e.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
 - **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card
