@@ -59,6 +59,13 @@ pub enum ClipboardEnvelopeV2ValidationError {
     ZeroSequence,
     /// A timestamp is zero.
     InvalidTimestamp,
+    /// The envelope claims creation after the admission clock.
+    FutureTimestamp {
+        /// Admission time in Unix epoch milliseconds.
+        now_ms: u64,
+        /// Envelope creation time in Unix epoch milliseconds.
+        timestamp_ms: u64,
+    },
     /// Expiry is not after the timestamp or exceeds the bounded TTL.
     InvalidExpiry,
     /// A collection or string field exceeded its contract bound.
@@ -139,6 +146,13 @@ impl fmt::Display for ClipboardEnvelopeV2ValidationError {
             }
             Self::ZeroSequence => formatter.write_str("clipboard envelope sequence is zero"),
             Self::InvalidTimestamp => formatter.write_str("clipboard envelope timestamp is zero"),
+            Self::FutureTimestamp {
+                now_ms,
+                timestamp_ms,
+            } => write!(
+                formatter,
+                "clipboard envelope timestamp is {timestamp_ms}; admission time is {now_ms}"
+            ),
             Self::InvalidExpiry => formatter.write_str("clipboard envelope expiry is invalid"),
             Self::CapacityExceeded { field, max } => {
                 write!(formatter, "clipboard envelope {field} exceeds {max}")
@@ -505,6 +519,12 @@ impl ClipboardEnvelopeV2 {
     /// Validate the expiry against an admission clock.
     pub fn validate_at(&self, now_ms: u64) -> Result<(), ClipboardEnvelopeV2ValidationError> {
         self.validate()?;
+        if now_ms < self.timestamp_ms {
+            return Err(ClipboardEnvelopeV2ValidationError::FutureTimestamp {
+                now_ms,
+                timestamp_ms: self.timestamp_ms,
+            });
+        }
         if now_ms >= self.expires_at_ms {
             return Err(ClipboardEnvelopeV2ValidationError::Expired {
                 now_ms,
@@ -2217,6 +2237,25 @@ mod tests {
         assert_eq!(
             VdiClipboardMessageV2::from_json_bytes(&oversized),
             Err(VdiClipboardTransportV2Error::BodyTooLarge)
+        );
+    }
+
+    #[test]
+    fn vdi_transport_rejects_future_dated_envelopes_before_replay_admission() {
+        let now_ms = 1_700_000_000_000;
+        let lease = transport_lease(now_ms);
+        let mut message = transport_message(now_ms, 1);
+        message.envelope.timestamp_ms = now_ms + 1;
+        message.envelope.expires_at_ms = now_ms + 30_001;
+
+        assert_eq!(
+            message.admit(&lease, None, now_ms),
+            Err(VdiClipboardTransportV2Error::InvalidEnvelope(
+                ClipboardEnvelopeV2ValidationError::FutureTimestamp {
+                    now_ms,
+                    timestamp_ms: now_ms + 1,
+                }
+            ))
         );
     }
 
