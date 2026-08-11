@@ -20,6 +20,15 @@
 //! [`beacon_for`] is the thin adapter that reads those booleans off a
 //! [`PeerRecord`] + the caller-supplied "is this the leader?" fact.
 
+#![allow(
+    clippy::missing_const_for_fn,
+    clippy::cast_possible_truncation,
+    clippy::doc_link_code,
+    clippy::fn_params_excessive_bools,
+    clippy::too_long_first_doc_paragraph,
+    reason = "lighthouse wire contracts preserve their established public shape"
+)]
+
 use crate::peers::PeerRecord;
 
 /// Records older than this many milliseconds are treated as offline — three

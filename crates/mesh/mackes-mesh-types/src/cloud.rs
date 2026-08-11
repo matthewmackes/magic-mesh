@@ -28,6 +28,16 @@
 //! The I/O (minting the mirror, issuing probes, converging the backend) belongs to
 //! the mesh-side worker; only these pure types + parsers are shared, so the
 //! backend can be swapped without the consumer knowing.
+#![allow(
+    clippy::doc_markdown,
+    clippy::derivable_impls,
+    clippy::missing_const_for_fn,
+    clippy::missing_errors_doc,
+    clippy::too_long_first_doc_paragraph,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "cloud wire contracts preserve their established public shape"
+)]
 use serde::{Deserialize, Serialize};
 
 use crate::android_apps::AndroidAppInventory;

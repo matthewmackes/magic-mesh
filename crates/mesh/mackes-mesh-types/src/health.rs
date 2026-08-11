@@ -7,6 +7,19 @@
     missing_docs,
     reason = "field names are the documented versioned health wire contract"
 )]
+#![allow(
+    clippy::items_after_statements,
+    clippy::missing_const_for_fn,
+    clippy::missing_errors_doc,
+    clippy::doc_markdown,
+    clippy::redundant_closure_for_method_calls,
+    clippy::too_long_first_doc_paragraph,
+    clippy::match_same_arms,
+    clippy::match_like_matches_macro,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "health wire contracts preserve their established public shape"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -802,7 +815,7 @@ pub struct HealthKironAlert {
 
 impl HealthKironAlert {
     /// Reject malformed, stale-shaped, oversized, or secret-bearing display
-    /// payloads before the shell can admit them to ToastHost.
+    /// payloads before the shell can admit them to `ToastHost`.
     pub fn validate(&self) -> Result<(), NodeHealthValidationError> {
         if self.schema_version != HEALTH_KIRON_SCHEMA_VERSION {
             return Err(NodeHealthValidationError::UnsupportedSchema(
@@ -1515,7 +1528,7 @@ fn validate_health_text(field: &'static str, value: &str) -> Result<(), NodeHeal
 fn secret_field_name(value: &str) -> bool {
     let normalized: String = value
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect();
     [

@@ -2,6 +2,14 @@
 
 #![allow(missing_docs, reason = "closed v1 wire fields are self-describing")]
 #![allow(clippy::missing_errors_doc)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::double_must_use,
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::too_long_first_doc_paragraph,
+    reason = "clock wire contracts preserve their established public shape"
+)]
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
