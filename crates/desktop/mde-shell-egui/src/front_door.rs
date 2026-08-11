@@ -2873,6 +2873,9 @@ fn peer_app_provision_wire_with(
         true,
     )
     .map_err(|error| format!("Flatpak App VM declaration is invalid: {error}"))?;
+    request
+        .validate_admitted()
+        .map_err(|error| format!("Flatpak App VM declaration is not admitted: {error}"))?;
     let capability_target = format!(
         "app-vm:{node}:{name}:{}:{}",
         request.app_id, request.catalog_revision
@@ -7054,6 +7057,31 @@ mod tests {
         })
         .expect_err("an empty blocked marker must remain fail closed");
         assert!(error.contains("unspecified admission refusal"), "{error}");
+        assert!(!authorization_called.get());
+    }
+
+    #[test]
+    fn unsupported_flatpak_capability_cannot_reach_app_vm_authorization() {
+        let target = FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.example.Editor".to_owned(),
+            name: "Editor".to_owned(),
+            source: "flatpak".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: vec!["host_socket".to_owned()],
+            launch_blocked_reason: None,
+        };
+        let authorization_called = std::cell::Cell::new(false);
+
+        let error = peer_app_provision_wire_with(&target, |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("unsupported guest capability must fail closed before authorization");
+
+        assert!(error.contains("not admitted"), "{error}");
+        assert!(error.contains("capability"), "{error}");
         assert!(!authorization_called.get());
     }
 

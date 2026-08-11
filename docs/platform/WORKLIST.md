@@ -1115,6 +1115,11 @@ behavioral evidence is not completion.
   path-like serving/client peer or VM identities are refused before session
   roster mutation; `.50` passed the hostile regression:
   `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-target-admission-r186.md`.
+- **App VM capability admission (2026-08-10):** catalog-backed Front Door
+  requests now apply the closed App VM capability policy before root
+  authorization; unsupported host capabilities cannot reach the authorizer.
+  `.90` passed the hostile regression:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-capability-admission-r192.md`.
 - **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
   only after governed projection/status effects succeed, and expiry retains
   authority until its retraction publishes. Machine 194 passed the exact
