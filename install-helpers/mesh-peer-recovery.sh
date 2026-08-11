@@ -326,6 +326,13 @@ main() {
             publish "failed-configured-syncthing"
             return 1
         fi
+        # Syncthing startup/activation can outlive the physical link that
+        # admitted this recovery.  Do not let a stale post-Syncthing result
+        # authorize grouped daemon or desktop mutation.
+        if ! physical_network_online; then
+            publish "offline-after-syncthing"
+            return 0
+        fi
     else
         publish "skipped-syncthing-unconfigured"
     fi

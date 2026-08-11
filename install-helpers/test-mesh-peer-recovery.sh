@@ -112,6 +112,8 @@ case "$1" in
             : >"$state/active-$unit"
             if [ "$unit" = etcd.service ] && [ -f "$state/drop-after-etcd-start" ]; then
                 rm -f "$state/drop-after-etcd-start" "$state/online"
+            elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-after-syncthing-start" ]; then
+                rm -f "$state/drop-after-syncthing-start" "$state/online"
             fi
         elif [ "${2:-}" = mde-shell-egui.service ]; then
             printf '%s\n' "$2" >>"$state/mutations"
@@ -362,7 +364,27 @@ grep -Fq 'status=syncthing-already-ready' "$STATE/notifies"
 grep -Fq 'status=recovered' "$STATE/notifies"
 echo 'PASS boot race fixture: active Syncthing is preserved'
 
+# The link can disappear after Syncthing starts but before grouped workers.
+# Recovery must re-attest at that boundary rather than allowing stale network
+# admission to mutate the daemon set.
+rm -f "$STATE"/active-etcd.service "$STATE"/active-mackesd-*.service
+rm -f "$STATE/active-syncthing.service"
+: >"$STATE/online"
+: >"$STATE/drop-after-syncthing-start"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+cat >"$STATE/expected-mutations" <<'EOF'
+etcd.service
+syncthing.service
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=offline-after-syncthing' "$STATE/notifies"
+echo 'PASS Syncthing boundary fixture: link loss prevents grouped mutation'
+rm -f "$STATE/drop-after-syncthing-start"
+
 rm -f "$STATE"/active-mackesd-*.service "$STATE/group-ready-checks"
+: >"$STATE/online"
 : >"$STATE/target-activating"
 : >"$STATE/pending-groups"
 : >"$STATE/mutations"
