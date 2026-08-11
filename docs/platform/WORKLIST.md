@@ -1227,6 +1227,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-manual-store-admission-r193e.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
+- **Ambiguous peer identity isolation (2026-08-10):** divergent hostname claims
+  cannot authorize downstream resource reads; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-peer-identity-isolation-r207.md`.
 - **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card
   plus matching discovery revision, and now retains provenance for the full bounded probe lease; `.90` passed the exact lifetime regression. Authenticated login/render
   remains: `docs/platform/evidence/WL-FUNC-019-2026-08-10-seat15-rdp-resource-provenance-r129.md`.
@@ -2289,6 +2292,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-generation-r2.md`.
 - **Device-control authorization checkpoint (2026-08-09):** exact-body, short-lived, single-use root-shell capabilities now gate the fixed executor; machine 9 passed
   contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
+- **Unavailable provider control (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-UX-011-2026-08-10-unavailable-control-r207.md`.
 - Remaining work:
 - **Device-control cancellation checkpoint (2026-08-09):** a signed cancellation
   can atomically claim only the exact still-pending request; late/refused
