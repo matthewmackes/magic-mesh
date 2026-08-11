@@ -775,6 +775,8 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **Future VDI envelope admission (2026-08-11):** future-dated clipboard envelopes are rejected before replay admission; `.90` passed the exact regression:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-vdi-future-envelope-r216.md`.
 - **VDI replay expiry:** `.90` passed bounded expired-session cleanup before fresh clipboard admission:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-expiry-r182.md`.
 - **VDI replay retention:** `.90` passed refusal of an older replay after a newer
@@ -1121,6 +1123,8 @@ behavioral evidence is not completion.
 - **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
   machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
+- **Durable App-catalog restart cursor (2026-08-11):** committed rows are checkpointed and skipped after restart without emitting an idempotent replay; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-11-app-catalog-restart-cursor-r216.md`.
 - **Launch-action admission checkpoint (2026-08-10):** installed Flatpak rows without exact `launch` authority are withheld before App-VM projection; seat 90 passed:
   `docs/platform/evidence/WL-FUNC-018-2026-08-10-launch-action-admission-r162.md`.
 - **Blocked App-VM authorization checkpoint (2026-08-10):** stale, unavailable, or malformed blocked Flatpak rows now fail before root authorization or Bus payload;

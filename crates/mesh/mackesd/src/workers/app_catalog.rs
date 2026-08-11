@@ -24,6 +24,7 @@ const POLL: Duration = Duration::from_secs(1);
 const SYSTEM_BUS_ROOT: &str = mde_bus::SYSTEM_BUS_ROOT;
 const MAX_TRUST_KEY_BYTES: u64 = 256;
 const MAX_CATALOG_WIRE_BYTES: u64 = 512 * 1024;
+const MAX_CURSOR_BYTES: u64 = 128;
 const MAX_IMPORTS_PER_POLL: usize = 32;
 const PROJECTION_SCHEMA_VERSION: u16 = 1;
 const STATUS_SCHEMA_VERSION: u16 = 1;
@@ -32,6 +33,7 @@ const PRODUCTION_OWNER_UID: u32 = 0;
 const SIGNER_ID_ENV: &str = "MDE_FLATPAK_CATALOG_SIGNER_ID";
 const TRUST_KEY_ENV: &str = "MDE_FLATPAK_CATALOG_TRUST_KEY_FILE";
 const LAST_GOOD_ENV: &str = "MDE_FLATPAK_CATALOG_LAST_GOOD_FILE";
+const CURSOR_ENV: &str = "MDE_FLATPAK_CATALOG_CURSOR_FILE";
 
 /// Bus projection containing only signed, admitted, installed application rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +124,7 @@ struct CatalogConfig {
     signer_id: String,
     verifying_key: VerifyingKey,
     last_good_file: PathBuf,
+    cursor_file: PathBuf,
     required_owner_uid: u32,
 }
 
@@ -311,7 +314,7 @@ impl AppCatalogWorker {
                     ),
                     last_status,
                 )?;
-                *cursor = Some(row_ulid);
+                advance_cursor(config, cursor, row_ulid)?;
                 continue;
             };
 
@@ -337,7 +340,7 @@ impl AppCatalogWorker {
                         ),
                         last_status,
                     )?;
-                    *cursor = Some(row_ulid);
+                    advance_cursor(config, cursor, row_ulid)?;
                     continue;
                 }
             };
@@ -358,7 +361,7 @@ impl AppCatalogWorker {
                         ),
                         last_status,
                     )?;
-                    *cursor = Some(row_ulid);
+                    advance_cursor(config, cursor, row_ulid)?;
                     continue;
                 }
                 if candidate.payload.revision < existing.revision {
@@ -375,7 +378,7 @@ impl AppCatalogWorker {
                         ),
                         last_status,
                     )?;
-                    *cursor = Some(row_ulid);
+                    advance_cursor(config, cursor, row_ulid)?;
                     continue;
                 }
                 if candidate.payload.revision == existing.revision {
@@ -408,7 +411,7 @@ impl AppCatalogWorker {
                             last_status,
                         )?;
                     }
-                    *cursor = Some(row_ulid);
+                    advance_cursor(config, cursor, row_ulid)?;
                     continue;
                 }
             }
@@ -428,7 +431,7 @@ impl AppCatalogWorker {
                     ),
                     last_status,
                 )?;
-                *cursor = Some(row_ulid);
+                advance_cursor(config, cursor, row_ulid)?;
                 continue;
             }
 
@@ -448,7 +451,7 @@ impl AppCatalogWorker {
                 ),
                 last_status,
             )?;
-            *cursor = Some(row_ulid);
+            advance_cursor(config, cursor, row_ulid)?;
             tally.admitted += 1;
         }
         Ok(tally)
@@ -626,7 +629,19 @@ impl Worker for AppCatalogWorker {
             shutdown.wait().await;
             return Ok(());
         }
-        let mut state = ImportState::default();
+        let mut state = ImportState {
+            cursor: self
+                .config
+                .as_ref()
+                .and_then(|config| match load_cursor(config) {
+                    Ok(cursor) => cursor,
+                    Err(error) => {
+                        tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog cursor recovery refused; replaying from the topic head");
+                        None
+                    }
+                }),
+            ..ImportState::default()
+        };
         loop {
             let root = self.resolved_bus_root();
             match Persist::open(root.clone()) {
@@ -664,10 +679,14 @@ fn load_environment_config(host: &str) -> io::Result<CatalogConfig> {
         .unwrap_or_else(|| {
             PathBuf::from("/var/lib/mackesd/flatpak-catalog").join(format!("{host}.json"))
         });
+    let cursor_file = std::env::var_os(CURSOR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| last_good_file.with_extension("cursor"));
     Ok(CatalogConfig {
         signer_id,
         verifying_key,
         last_good_file,
+        cursor_file,
         required_owner_uid: PRODUCTION_OWNER_UID,
     })
 }
@@ -765,6 +784,89 @@ fn store_last_good(config: &CatalogConfig, catalog: &SignedFlatpakAppCatalog) ->
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn load_cursor(config: &CatalogConfig) -> io::Result<Option<String>> {
+    match open_secure_regular_nofollow(
+        &config.cursor_file,
+        MAX_CURSOR_BYTES,
+        config.required_owner_uid,
+    ) {
+        Ok(mut file) => {
+            let mut body = String::new();
+            file.read_to_string(&mut body)?;
+            let cursor = body.trim();
+            if cursor.is_empty()
+                || cursor.len() > usize::try_from(MAX_CURSOR_BYTES).unwrap_or(usize::MAX)
+                || cursor.bytes().any(|byte| !byte.is_ascii_graphic())
+            {
+                return Err(io::Error::other("Flatpak catalog cursor is malformed"));
+            }
+            Ok(Some(cursor.to_owned()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn store_cursor(config: &CatalogConfig, cursor: &str) -> io::Result<()> {
+    if cursor.is_empty()
+        || cursor.len() > usize::try_from(MAX_CURSOR_BYTES).unwrap_or(usize::MAX)
+        || cursor.bytes().any(|byte| !byte.is_ascii_graphic())
+    {
+        return Err(io::Error::other("Flatpak catalog cursor is malformed"));
+    }
+    let path = &config.cursor_file;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Flatpak catalog cursor path has no parent"))?;
+    reject_symlink_parent(path)?;
+    fs::create_dir_all(parent)?;
+    validate_directory_owner(parent, config.required_owner_uid)?;
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::other("Flatpak catalog cursor path is a symlink"));
+    }
+    let temp = parent.join(format!(
+        ".flatpak-catalog-cursor-{}-{}.tmp",
+        std::process::id(),
+        now_unix_ms()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(0o400000); // Linux O_NOFOLLOW
+    }
+    let mut file = options.open(&temp)?;
+    let result = (|| {
+        file.write_all(cursor.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        validate_open_metadata(&file, MAX_CURSOR_BYTES, config.required_owner_uid)?;
+        fs::rename(&temp, path)?;
+        let persisted =
+            open_secure_regular_nofollow(path, MAX_CURSOR_BYTES, config.required_owner_uid)?;
+        persisted.sync_all()?;
+        File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn advance_cursor(
+    config: &CatalogConfig,
+    cursor: &mut Option<String>,
+    row_ulid: String,
+) -> io::Result<()> {
+    // The durable checkpoint is the acknowledgment boundary: only publish
+    // effects that succeeded may move it, and a failed checkpoint leaves the
+    // row eligible for a safe replay on the next pass.
+    store_cursor(config, &row_ulid)?;
+    *cursor = Some(row_ulid);
+    Ok(())
 }
 
 fn open_secure_regular_nofollow(
@@ -1167,6 +1269,7 @@ mod tests {
                 signer_id: "flatpak-release-v1".into(),
                 verifying_key: key.verifying_key(),
                 last_good_file: state_dir.join("catalog.json"),
+                cursor_file: state_dir.join("catalog.cursor"),
                 required_owner_uid: owner_uid(),
             }),
             poll: POLL,
@@ -1446,6 +1549,74 @@ mod tests {
     }
 
     #[test]
+    fn durable_cursor_skips_committed_rows_after_restart() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let initial_worker = worker(&temp, &key);
+        let bus_root = temp.path().join("bus");
+        let mut persist = Persist::open(bus_root.clone()).unwrap();
+        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        let mut cursor = None;
+        let mut current = None;
+        let mut watermark = None;
+        let mut last_status = None;
+        initial_worker
+            .process_once(
+                &mut persist,
+                &mut cursor,
+                &mut current,
+                &mut watermark,
+                &mut last_status,
+                NOW,
+            )
+            .unwrap();
+        let first_cursor = cursor.clone().unwrap();
+        assert_eq!(
+            load_cursor(initial_worker.config.as_ref().unwrap()).unwrap(),
+            cursor
+        );
+
+        // This row is intentionally malformed. After a restart it must be the
+        // first row examined; replaying the already-committed catalog would
+        // emit an unnecessary IdempotentReplay status before this refusal.
+        persist
+            .write(
+                &app_catalog_import_topic("node-01").unwrap(),
+                Priority::Default,
+                None,
+                Some("{\"not-a-catalog\":true}"),
+            )
+            .unwrap();
+        let restarted = AppCatalogWorker {
+            host: initial_worker.host.clone(),
+            bus_root: Some(bus_root.clone()),
+            config: initial_worker.config.clone(),
+            poll: POLL,
+        };
+        let mut state = ImportState {
+            cursor: load_cursor(restarted.config.as_ref().unwrap()).unwrap(),
+            ..ImportState::default()
+        };
+        restarted
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
+            .unwrap();
+        assert_ne!(state.cursor.as_deref(), Some(first_cursor.as_str()));
+        let statuses = persist
+            .list_since(&app_catalog_status_topic("node-01").unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            statuses.len(),
+            3,
+            "original admission, recovery, and the new refusal only"
+        );
+        assert!(!statuses.iter().any(|row| {
+            row.body
+                .as_deref()
+                .is_some_and(|body| body.contains("idempotent_replay"))
+        }));
+    }
+
+    #[test]
     fn hostile_imports_publish_payload_free_status_and_preserve_last_good() {
         let temp = TempDir::new().unwrap();
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -1547,6 +1718,7 @@ mod tests {
             signer_id: "flatpak-release-v1".into(),
             verifying_key: key.verifying_key(),
             last_good_file: linked_parent.join("catalog.json"),
+            cursor_file: linked_parent.join("catalog.cursor"),
             required_owner_uid: owner_uid(),
         };
         assert!(store_last_good(
