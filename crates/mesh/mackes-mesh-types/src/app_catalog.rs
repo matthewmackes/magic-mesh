@@ -117,6 +117,11 @@ pub enum FlatpakCatalogError {
 
 impl FlatpakAppCatalog {
     /// Validate the complete catalog before it crosses a provider boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema, bounded fields, entry count, entry
+    /// contents, or app-ID uniqueness constraint is invalid.
     pub fn validate(&self) -> Result<(), FlatpakCatalogError> {
         if self.schema_version != FLATPAK_CATALOG_SCHEMA_VERSION {
             return Err(FlatpakCatalogError::UnsupportedSchema(self.schema_version));
@@ -136,6 +141,10 @@ impl FlatpakAppCatalog {
     }
 
     /// Return a deterministic, validated catalog from untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation error produced by [`Self::validate`].
     pub fn admitted(self) -> Result<Self, FlatpakCatalogError> {
         self.validate()?;
         Ok(self)
@@ -352,6 +361,11 @@ pub enum SignedFlatpakCatalogError {
 
 impl SignedFlatpakCatalogPayload {
     /// Validate intrinsic bounds and canonical ordering before signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema, validity window, bounded fields,
+    /// entry contents, or canonical ordering is invalid.
     pub fn validate(&self) -> Result<(), SignedFlatpakCatalogError> {
         if self.schema_version != SIGNED_FLATPAK_CATALOG_SCHEMA_VERSION {
             return Err(SignedFlatpakCatalogError::UnsupportedSchema(
@@ -404,6 +418,11 @@ impl SignedFlatpakCatalogPayload {
     }
 
     /// Stable lowercase SHA-256 address of the canonical signed payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload fails validation or cannot be
+    /// serialized into its canonical signing representation.
     pub fn content_digest(&self) -> Result<String, SignedFlatpakCatalogError> {
         Ok(format!(
             "sha256:{}",
@@ -413,6 +432,11 @@ impl SignedFlatpakCatalogPayload {
 
     /// Search validated rows using only signed deterministic ranking inputs.
     /// Match class sorts before provider weight; stable app identity breaks ties.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog is invalid or the query is blank,
+    /// malformed, or exceeds its bounded search-input form.
     pub fn search(
         &self,
         query: &str,
@@ -440,10 +464,8 @@ impl SignedFlatpakCatalogPayload {
                 3
             } else if query_terms.iter().all(|term| searchable_term(term)) {
                 2
-            } else if searchable_term(&query) {
-                1
             } else {
-                0
+                u32::from(searchable_term(&query))
             };
             if match_class != 0 {
                 matches.push(FlatpakSearchMatch {
@@ -515,6 +537,10 @@ impl SignedFlatpakCatalogEntry {
 
 impl SignedFlatpakAppCatalog {
     /// Sign an intrinsically valid payload with an offline/provider key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signer identity or payload is invalid.
     pub fn sign(
         signer_id: impl Into<String>,
         payload: SignedFlatpakCatalogPayload,
@@ -531,6 +557,11 @@ impl SignedFlatpakAppCatalog {
     }
 
     /// Verify exact signer trust, freshness, signature, bounds, and canonicality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when trust, freshness, signature, bounds, or
+    /// canonicality verification fails.
     pub fn admit(
         self,
         trusted_signer_id: &str,
@@ -560,6 +591,11 @@ impl SignedFlatpakAppCatalog {
     }
 
     /// Bound untrusted input before parsing, then perform complete admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body exceeds the wire limit, is malformed, or
+    /// fails catalog admission.
     pub fn decode_and_admit_json(
         body: &[u8],
         trusted_signer_id: &str,
@@ -695,7 +731,7 @@ fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
     Some(output)
 }
 
-fn decode_nibble(value: u8) -> Option<u8> {
+const fn decode_nibble(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),

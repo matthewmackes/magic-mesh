@@ -476,6 +476,7 @@ impl ServiceConfigurationField {
 }
 
 /// Registry-owned service interface projected onto one resource card.
+///
 /// `service_kind` is open and adapter-defined, so a future service receives the
 /// same card without a shell code change. `provider_id` is attribution only;
 /// cards remain one-per-service even when a provider supplies several services.
@@ -2957,13 +2958,13 @@ pub struct AuthenticatedResourceCatalog {
 impl AuthenticatedResourceCatalog {
     /// Borrow the catalog covered by the verified detached proof.
     #[must_use]
-    pub fn catalog(&self) -> &ResourceCatalog {
+    pub const fn catalog(&self) -> &ResourceCatalog {
         &self.catalog
     }
 
     /// Borrow the detached proof that authenticated the catalog.
     #[must_use]
-    pub fn publisher_attestation(&self) -> &ResourcePublisherAttestation {
+    pub const fn publisher_attestation(&self) -> &ResourcePublisherAttestation {
         &self.publisher_attestation
     }
 
@@ -3397,7 +3398,7 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
     Some(decoded)
 }
 
-fn hex_nibble(byte: u8) -> Option<u8> {
+const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
