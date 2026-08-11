@@ -438,6 +438,14 @@ verify_resource_publisher_attestation() {
     || die "resource publisher attestation descriptor does not match its file: $path"
 }
 
+verify_production_gate_manifest() {
+  local gate_manifest="$1" source_commit="$2"
+  [ -x "$SCRIPT_DIR/verify-release-gate-matrix.py" ] \
+    || return 1
+  "$SCRIPT_DIR/verify-release-gate-matrix.py" "$gate_manifest" \
+    --expected-revision "$source_commit" >/dev/null
+}
+
 validate_file() {
   local file="$1"
   local -a topology_verify_args=()
@@ -600,6 +608,12 @@ validate_file() {
   done < <(jq -c '.artifacts[]' "$file")
   verify_descriptor "SBOM" "$(jq -c '.provenance.sbom_manifest' "$file")"
   verify_descriptor "gate" "$(jq -c '.provenance.gate_manifest' "$file")"
+  if [ "$(jq -r '.verdict.production' "$file")" = "pass" ]; then
+    verify_production_gate_manifest \
+      "$(jq -r '.provenance.gate_manifest.path' "$file")" \
+      "$(jq -r '.source_commit' "$file")" \
+      || die "production gate manifest is not the complete canonical matrix for the source revision: $(jq -r '.provenance.gate_manifest.path' "$file")"
+  fi
   if [ "$(jq -r '.provenance.resource_publisher_attestation // empty' "$file")" ]; then
     verify_resource_publisher_attestation \
       "$(jq -c '.provenance.resource_publisher_attestation' "$file")"
@@ -878,7 +892,19 @@ self_test() {
   printf 'alpha release artifact\n' >"$work/a.rpm"
   printf 'browser release artifact with a second line\n' >"$work/browser.rpm"
   printf '{"packages":["magic-mesh"]}\n' >"$work/sbom.json"
-  printf '{"required":["github-policy","fedora-44"]}\n' >"$work/gates.json"
+  jq --arg revision 0123456789abcdef0123456789abcdef01234567 \
+    --arg canonical_revision "$(jq -r '.source_revision' "$SCRIPT_DIR/release-gate-matrix.json")" \
+    '.source_revision = $revision |
+     .gates |= map(.evidence_filename |= gsub($canonical_revision; $revision))' \
+    "$SCRIPT_DIR/release-gate-matrix.json" >"$work/gates.json"
+  gate_revision="$(jq -r '.source_revision' "$SCRIPT_DIR/release-gate-matrix.json")"
+  verify_production_gate_manifest "$SCRIPT_DIR/release-gate-matrix.json" "$gate_revision"
+  set +e
+  verify_production_gate_manifest "$SCRIPT_DIR/release-gate-matrix.json" \
+    0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || die "self-test: gate manifest accepted a mismatched production revision"
   vdi_evidence="$work/vdi-evidence.json"
   cat >"$vdi_evidence" <<'EOF'
 {"frame":{"fnv1a64":"0x0123456789abcdef","height":768,"width":1024},"image_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_observation":"echoed","probe":{"log_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","returncode":0,"source":"mde-shell-egui ignored live worker test"},"protocol":"vnc","recorded_at":"2026-08-01T00:00:00Z","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","status":"observed","target":{"host":"127.0.0.1","port":15903}}

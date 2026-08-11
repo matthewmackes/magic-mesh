@@ -1893,6 +1893,11 @@ behavioral evidence is not completion.
   rejects missing or replaced artifact bytes even after an outer binding is
   refreshed and CI provenance is removed; `.90` passed the focused hostile
   self-test: `docs/platform/evidence/WL-CRIT-006-2026-08-10-artifact-revalidation-r186.md`.
+- **Production matrix identity gate (2026-08-10):** a production `pass` now
+  invokes the canonical release-matrix verifier and refuses an incomplete,
+  reordered, or source-revision-mismatched gate manifest; the helper self-test
+  covers both the canonical matrix and a hostile revision. Farm proof:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-10-production-matrix-identity-r190.md`.
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
      - Inputs: governance, current CI, all active P0/P1 epics.
