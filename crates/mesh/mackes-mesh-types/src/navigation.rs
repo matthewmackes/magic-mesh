@@ -169,6 +169,10 @@ pub enum NavigationUnavailableReason {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the v1 wire shape keeps the active route and progress together"
+)]
 pub enum NavigationPhase {
     Idle,
     Calculating {
@@ -200,12 +204,18 @@ pub struct NavigationSnapshot {
 }
 
 impl RouteRequest {
+    /// # Errors
+    ///
+    /// Returns an error when the JSON payload or request fields are invalid.
     pub fn from_json_at(bytes: &[u8], now_ms: i64) -> Result<Self, WeatherContractError> {
         let value: Self = decode_json(bytes, MAX_ROUTE_REQUEST_BYTES)?;
         value.validate_at(now_ms)?;
         Ok(value)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the request violates the navigation contract.
     pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
         validate_version(self.schema_version)?;
         validate_id(&self.request_id, "request_id")?;
@@ -216,7 +226,7 @@ impl RouteRequest {
         match (self.kind, &self.replaces_route_id) {
             (RouteRequestKind::Route, None) => {}
             (RouteRequestKind::Reroute, Some(route_id)) => {
-                validate_id(route_id, "replaces_route_id")?
+                validate_id(route_id, "replaces_route_id")?;
             }
             _ => return Err(WeatherContractError::InvalidField("replaces_route_id")),
         }
@@ -225,12 +235,18 @@ impl RouteRequest {
 }
 
 impl CancelNavigationRequest {
+    /// # Errors
+    ///
+    /// Returns an error when the JSON payload or request fields are invalid.
     pub fn from_json_at(bytes: &[u8], now_ms: i64) -> Result<Self, WeatherContractError> {
         let value: Self = decode_json(bytes, MAX_ROUTE_REQUEST_BYTES)?;
         value.validate_at(now_ms)?;
         Ok(value)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the request violates the navigation contract.
     pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
         validate_version(self.schema_version)?;
         validate_id(&self.request_id, "request_id")?;
@@ -240,6 +256,9 @@ impl CancelNavigationRequest {
 }
 
 impl NavigationProgressRequest {
+    /// # Errors
+    ///
+    /// Returns an error when the JSON payload or request fields are invalid.
     pub fn from_json_at(bytes: &[u8], now_ms: i64) -> Result<Self, WeatherContractError> {
         let value: Self = decode_json(bytes, MAX_ROUTE_REQUEST_BYTES)?;
         validate_version(value.schema_version)?;
@@ -257,6 +276,10 @@ impl NavigationProgressRequest {
 }
 
 impl RouteResult {
+    /// # Errors
+    ///
+    /// Returns an error when route geometry, maneuvers, attribution, or timing
+    /// violates the navigation contract.
     pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
         validate_id(&self.route_id, "route_id")?;
         validate_id(&self.request_id, "request_id")?;
@@ -309,6 +332,10 @@ impl RouteResult {
 }
 
 impl NavigationProgress {
+    /// # Errors
+    ///
+    /// Returns an error when progress does not belong to the route or violates
+    /// the route's bounds and timing.
     pub fn validate_for(
         &self,
         route: &RouteResult,
@@ -322,6 +349,11 @@ impl NavigationProgress {
         }
         validate_point(&self.position)?;
         validate_not_future(self.observed_at_ms, now_ms, "progress.observed_at_ms")?;
+        if self.observed_at_ms < route.calculated_at_ms {
+            return Err(WeatherContractError::InvalidRelationship(
+                "progress.observed_at_ms",
+            ));
+        }
         if self.distance_remaining_metres > route.distance_metres
             || self.duration_remaining_seconds > route.duration_seconds
         {
@@ -332,6 +364,9 @@ impl NavigationProgress {
 }
 
 impl NavigationSnapshot {
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot or its active phase is invalid.
     pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
         validate_version(self.schema_version)?;
         validate_id(&self.host, "host")?;
@@ -339,7 +374,7 @@ impl NavigationSnapshot {
         match &self.phase {
             NavigationPhase::Idle => {}
             NavigationPhase::Calculating { request_id, .. } => {
-                validate_id(request_id, "request_id")?
+                validate_id(request_id, "request_id")?;
             }
             NavigationPhase::Cancelled {
                 request_id,
@@ -362,7 +397,7 @@ impl NavigationSnapshot {
     }
 }
 
-fn validate_version(version: u16) -> Result<(), WeatherContractError> {
+const fn validate_version(version: u16) -> Result<(), WeatherContractError> {
     if version == NAVIGATION_SCHEMA_VERSION {
         Ok(())
     } else {
@@ -431,5 +466,62 @@ mod tests {
         let mut oversized = serde_json::to_vec(&request()).unwrap();
         oversized.resize(MAX_ROUTE_REQUEST_BYTES + 1, b' ');
         assert!(RouteRequest::from_json_at(&oversized, 100).is_err());
+    }
+
+    #[test]
+    fn progress_rejects_observation_before_route_calculation() {
+        let route = RouteResult {
+            route_id: "route-1".into(),
+            request_id: "req-1".into(),
+            calculated_at_ms: 200,
+            distance_metres: 1_000,
+            duration_seconds: 100,
+            geometry: vec![
+                GeoPoint {
+                    latitude: 40.0,
+                    longitude: -75.0,
+                },
+                GeoPoint {
+                    latitude: 40.1,
+                    longitude: -75.1,
+                },
+            ],
+            maneuvers: vec![RouteManeuver {
+                sequence: 0,
+                kind: ManeuverKind::Depart,
+                instruction: "Depart".into(),
+                point: GeoPoint {
+                    latitude: 40.0,
+                    longitude: -75.0,
+                },
+                distance_metres: 100,
+                duration_seconds: 10,
+            }],
+            attribution: RouteAttribution {
+                provider_id: "provider-1".into(),
+                label: "Provider".into(),
+                data_revision: "revision-1".into(),
+                offline: true,
+            },
+        };
+        let progress = NavigationProgress {
+            route_id: route.route_id.clone(),
+            position: GeoPoint {
+                latitude: 40.0,
+                longitude: -75.0,
+            },
+            observed_at_ms: 199,
+            maneuver_index: 0,
+            distance_remaining_metres: 900,
+            duration_remaining_seconds: 90,
+            off_route: false,
+        };
+
+        assert_eq!(
+            progress.validate_for(&route, 200),
+            Err(WeatherContractError::InvalidRelationship(
+                "progress.observed_at_ms"
+            ))
+        );
     }
 }
