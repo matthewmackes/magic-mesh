@@ -324,12 +324,20 @@ impl ClipboardMeshReplayLedger {
                 expires_unix_ms: envelope.expires_unix_ms,
                 cas_digests: cas_digests(&envelope),
             };
-            if self
-                .latest
-                .get(&key)
-                .is_none_or(|current| current.generation < marker.generation)
-            {
-                self.latest.insert(key, marker);
+            match self.latest.get_mut(&key) {
+                Some(current) => {
+                    // A newer generation is not allowed to shorten the
+                    // replay authority retained for an older offer.  A
+                    // restart may see a later, shorter-lived row before the
+                    // earlier row in the retained tail; preserve both the
+                    // highest sequence and the longest expiry.
+                    current.generation = current.generation.max(marker.generation);
+                    current.expires_unix_ms = current.expires_unix_ms.max(marker.expires_unix_ms);
+                    current.cas_digests.extend(marker.cas_digests);
+                }
+                None => {
+                    self.latest.insert(key, marker);
+                }
             }
         }
         Ok(())
@@ -360,14 +368,21 @@ impl ClipboardMeshReplayLedger {
         if !self.latest.contains_key(&key) && self.latest.len() >= MAX_MESH_REPLAY_LANES {
             return Err(ClipboardMeshRefusal::FloodLimited);
         }
-        self.latest.insert(
-            key,
-            ReplayMarker {
-                generation: frame.envelope.sequence,
-                expires_unix_ms: frame.envelope.expires_unix_ms,
-                cas_digests: cas_digests(&frame.envelope),
-            },
-        );
+        let marker = ReplayMarker {
+            generation: frame.envelope.sequence,
+            expires_unix_ms: frame.envelope.expires_unix_ms,
+            cas_digests: cas_digests(&frame.envelope),
+        };
+        match self.latest.get_mut(&key) {
+            Some(current) => {
+                current.generation = current.generation.max(marker.generation);
+                current.expires_unix_ms = current.expires_unix_ms.max(marker.expires_unix_ms);
+                current.cas_digests.extend(marker.cas_digests);
+            }
+            None => {
+                self.latest.insert(key, marker);
+            }
+        }
         Ok(())
     }
 }
@@ -1545,6 +1560,68 @@ mod tests {
                 1_002,
             ),
             Err(ClipboardMeshRefusal::Replayed)
+        );
+    }
+
+    #[test]
+    fn restart_seed_retains_longest_expiry_across_newer_shorter_generation() {
+        let (root, persist, directory, source, first) = fixture();
+        let mut newer = first.clone();
+        newer.sequence = 2;
+        newer.expires_unix_ms = 2_000;
+        newer.sign(&source);
+
+        // The newer row is retained after the older row, as it would be in a
+        // restart tail.  Its shorter expiry must not erase the older offer's
+        // still-live replay authority.
+        for envelope in [&first, &newer] {
+            persist
+                .write(
+                    COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(envelope).unwrap()),
+                )
+                .unwrap();
+        }
+
+        let mut ledger = ClipboardMeshReplayLedger::default();
+        ledger.seed_from_retained(&persist, 1_500).unwrap();
+        let marker = ledger.latest.values().next().unwrap();
+        assert_eq!(marker.generation, 2);
+        assert_eq!(marker.expires_unix_ms, first.expires_unix_ms);
+
+        let replay = ClipboardMeshFrameV1::new(first.clone()).unwrap();
+        assert_eq!(
+            receive_frame(
+                &persist,
+                &directory,
+                root.path(),
+                "target",
+                &serde_json::to_vec(&replay).unwrap(),
+                &mut ledger,
+                3_000,
+            ),
+            Err(ClipboardMeshRefusal::Replayed)
+        );
+
+        let mut live_ledger = ClipboardMeshReplayLedger::default();
+        for (envelope, now_ms) in [(&first, 1_500), (&newer, 1_600)] {
+            let frame = ClipboardMeshFrameV1::new(envelope.clone()).unwrap();
+            receive_frame(
+                &persist,
+                &directory,
+                root.path(),
+                "target",
+                &serde_json::to_vec(&frame).unwrap(),
+                &mut live_ledger,
+                now_ms,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            live_ledger.latest.values().next().unwrap().expires_unix_ms,
+            first.expires_unix_ms
         );
     }
 }
