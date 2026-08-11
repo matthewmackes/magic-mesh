@@ -1319,9 +1319,11 @@ fn compute_health_for_peer(
     now_ms: i64,
 ) -> HealthState {
     let path = heartbeat_path(workgroup_root, node_id);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return HealthState::Unreachable,
+    let bytes = match read_bounded_health_file(&path) {
+        BoundedHealthFile::Bytes(bytes) => bytes,
+        BoundedHealthFile::Missing | BoundedHealthFile::Rejected => {
+            return HealthState::Unreachable;
+        }
     };
     let hb: Heartbeat = match serde_json::from_slice(&bytes) {
         Ok(h) => h,
@@ -2550,6 +2552,20 @@ mod tests {
             compute_health_for_peer(root.path(), "peer:remote", now),
             HealthState::Unreachable,
             "future-dated evidence must fail closed instead of becoming healthy"
+        );
+    }
+
+    #[test]
+    fn oversized_heartbeat_is_rejected_before_json_parse() {
+        let root = tempfile::tempdir().expect("temporary health root");
+        let path = heartbeat_path(root.path(), "peer:remote");
+        std::fs::create_dir_all(path.parent().expect("heartbeat parent")).expect("heartbeat dir");
+        std::fs::write(&path, vec![b'x'; MAX_HEALTH_PUBLICATION_BYTES + 1])
+            .expect("oversized heartbeat");
+
+        assert_eq!(
+            compute_health_for_peer(root.path(), "peer:remote", 1_700_000_000_000),
+            HealthState::Unreachable
         );
     }
 

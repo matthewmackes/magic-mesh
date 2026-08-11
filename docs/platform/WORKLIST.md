@@ -1129,6 +1129,9 @@ behavioral evidence is not completion.
 - **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
   machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
+- **Bounded persistence recovery (2026-08-11):** retained App-catalog and
+  durable-cursor reads refuse data beyond declared limits; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-11-bounded-persistence-read-r224.md`.
 - **Durable App-catalog restart cursor (2026-08-11):** committed rows are checkpointed and skipped after restart without emitting an idempotent replay; `.90` passed:
   `docs/platform/evidence/WL-FUNC-018-2026-08-11-app-catalog-restart-cursor-r216.md`.
 - **Launch-action admission checkpoint (2026-08-10):** installed Flatpak rows without exact `launch` authority are withheld before App-VM projection; seat 90 passed:
@@ -2356,6 +2359,9 @@ behavioral evidence is not completion.
   contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
 - **Unavailable provider control (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-UX-011-2026-08-10-unavailable-control-r207.md`.
 - Remaining work:
+- **Device command timeout (2026-08-11):** fixed device helpers now have a
+  30-second deadline with child termination on drop; `.90` passed:
+  `docs/platform/evidence/WL-UX-011-2026-08-11-command-timeout-r224.md`.
 - **Unavailable control all-verbs admission (2026-08-11):** unresolved provider state blocks Enable, Disable, Reload Module, and Rescan Bus without sysfs mutation;
   BigBoy passed:
   `docs/platform/evidence/WL-UX-011-2026-08-11-unavailable-control-all-verbs-r217.md`.
@@ -2549,6 +2555,9 @@ behavioral evidence is not completion.
   oversized availability TTLs. Expected-state publishers, transition
   evaluation, history/detail, recovery/export, and three-seat proof remain.
 - Remaining work:
+- **Bounded heartbeat fallback (2026-08-11):** peer heartbeat recovery uses
+  the existing regular-file byte bound before JSON parsing; `.90` passed:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-heartbeat-byte-bound-r224.md`.
 - **Decommissioned health projection cleanup (2026-08-11):** retired publishers are evicted from ledger, cursor, projection, and restart checkpoint after staged roster reads;
   `.90` passed:
   `docs/platform/evidence/WL-UX-013-2026-08-11-health-decommissioned-projection-r217.md`.

@@ -54,6 +54,11 @@ use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 /// Request poll cadence — an op lands within ~3 s of replication (as `lifecycle_exec`).
 pub const POLL: Duration = Duration::from_secs(3);
 
+/// A fixed device-control helper must not be able to wedge this worker forever.
+/// In particular, a stuck `rmmod`/`modprobe` would otherwise prevent later
+/// cancellations and recovery actions from being observed.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The Bus lane a device-op FAILURE alert rides.
 ///
 /// Folded by the `chat` worker ([`super::chat::ALERT_LANE_PREFIXES`] carries
@@ -622,6 +627,16 @@ impl DeviceControlExecWorker {
 /// Execute a plan step-by-step, capturing the first failure's honest reason.
 /// Returns a compact success note (the seams that ran) or the typed error.
 async fn execute_plan(steps: &[ExecStep]) -> Result<String, String> {
+    execute_plan_with_timeout(steps, COMMAND_TIMEOUT).await
+}
+
+/// Execute a plan with an explicit command deadline. The parameter is kept in
+/// this small seam so the timeout behavior can be tested without waiting for
+/// the production 30-second deadline.
+async fn execute_plan_with_timeout(
+    steps: &[ExecStep],
+    command_timeout: Duration,
+) -> Result<String, String> {
     let mut notes = Vec::new();
     for step in steps {
         match step {
@@ -636,11 +651,22 @@ async fn execute_plan(steps: &[ExecStep]) -> Result<String, String> {
                 notes.push(format!("wrote `{contents}` → {}", path.display()));
             }
             ExecStep::Command { bin, args } => {
-                let out = tokio::process::Command::new(*bin)
-                    .args(args)
-                    .output()
-                    .await
-                    .map_err(|e| format!("`{bin}` unavailable: {e}"))?;
+                let out = tokio::time::timeout(
+                    command_timeout,
+                    tokio::process::Command::new(*bin)
+                        .args(args)
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "`{bin} {}` timed out after {}s",
+                        args.join(" "),
+                        command_timeout.as_secs()
+                    )
+                })?
+                .map_err(|e| format!("`{bin}` unavailable: {e}"))?;
                 if !out.status.success() {
                     return Err(format!(
                         "`{bin} {}` failed: {}",
@@ -915,6 +941,22 @@ mod tests {
 
         assert!(result.is_err(), "a final symlink must not be a control target");
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+    }
+
+    #[tokio::test]
+    async fn command_control_step_times_out_instead_of_wedging_the_worker() {
+        let result = execute_plan_with_timeout(
+            &[ExecStep::Command {
+                bin: "sleep",
+                args: vec!["1".into()],
+            }],
+            Duration::from_millis(25),
+        )
+        .await;
+
+        let error = result.expect_err("a command beyond its deadline must fail");
+        assert!(error.contains("sleep 1"), "{error}");
+        assert!(error.contains("timed out"), "{error}");
     }
 
     // ── the offered gate + audit fire, without touching real hardware ──────────

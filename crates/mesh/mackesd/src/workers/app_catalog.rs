@@ -708,8 +708,7 @@ fn recover_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<R
         config.required_owner_uid,
     ) {
         Ok(mut file) => {
-            let mut body = Vec::new();
-            file.read_to_end(&mut body)?;
+            let body = read_bounded(&mut file, MAX_CATALOG_WIRE_BYTES)?;
             let parsed: SignedFlatpakAppCatalog =
                 serde_json::from_slice(&body).map_err(io_other)?;
             let signature_check_time = parsed.payload.issued_at_unix_ms;
@@ -793,8 +792,8 @@ fn load_cursor(config: &CatalogConfig) -> io::Result<Option<String>> {
         config.required_owner_uid,
     ) {
         Ok(mut file) => {
-            let mut body = String::new();
-            file.read_to_string(&mut body)?;
+            let body = String::from_utf8(read_bounded(&mut file, MAX_CURSOR_BYTES)?)
+                .map_err(io_other)?;
             let cursor = body.trim();
             if cursor.is_empty()
                 || cursor.len() > usize::try_from(MAX_CURSOR_BYTES).unwrap_or(usize::MAX)
@@ -807,6 +806,19 @@ fn load_cursor(config: &CatalogConfig) -> io::Result<Option<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn read_bounded(reader: &mut impl Read, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let limit = usize::try_from(max_bytes)
+        .map_err(|_| io::Error::other("bounded read limit does not fit in usize"))?;
+    let mut body = Vec::with_capacity(limit.min(8 * 1024));
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut body)?;
+    if body.len() > limit {
+        return Err(io::Error::other("bounded read exceeded persistence limit"));
+    }
+    Ok(body)
 }
 
 fn store_cursor(config: &CatalogConfig, cursor: &str) -> io::Result<()> {
@@ -1546,6 +1558,16 @@ mod tests {
         );
         assert!(state.recovery_attempted);
         assert!(state.bus_identity.is_some());
+    }
+
+    #[test]
+    fn bounded_persistence_reads_reject_data_beyond_declared_limit() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; 129]);
+
+        let error = read_bounded(&mut reader, MAX_CURSOR_BYTES).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("bounded read exceeded"));
     }
 
     #[test]
