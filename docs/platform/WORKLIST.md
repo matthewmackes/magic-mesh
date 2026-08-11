@@ -417,19 +417,16 @@ behavioral evidence is not completion.
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
   `docs/platform/evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
-- **Symlink-safe group leases:** seat `.90` passed kernel-enforced lock-leaf refusal:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-10-group-lease-symlink-r179.md`.
-- **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
-  `Requires=` edges cascaded one integrations crash through all six groups.
+- **Symlink-safe group leases:** seat `.90` passed kernel-enforced lock-leaf refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-group-lease-symlink-r179.md`.
+- **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that `Requires=` edges cascaded one integrations crash through all six groups.
   Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects
   regressions in the process-boundary validator, and restarts an already-active
   target during RPM upgrade. Seat 15 proved isolated integrations and control
   crashes while every unaffected PID and restart counter remained unchanged;
   target, mesh-health, and RPM verification stayed healthy. Dell was offline
   for corrected-package deployment. Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`.
-- **Live cgroup-enforcement checkpoint (2026-08-08):** Release 23 on seat 15
-  placed all six active groups in distinct cgroup-v2 paths whose effective
-  memory, CPU, task, and I/O values matched the package. A bounded transient
+- **Live cgroup-enforcement checkpoint (2026-08-08):** Release 23 on seat 15 placed six groups in distinct cgroup-v2 paths with package-matched CPU, memory, task, and I/O limits.
+  A bounded transient
   128 MiB allocation under a 16 MiB/no-swap boundary was OOM-killed exactly at
   16 MiB; cleanup left the target and every group active. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-live-cgroup-enforcement-r3.md`.
@@ -453,6 +450,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
 - **Metrics bucket ownership checkpoint (2026-08-10):** provider schedules discard non-finite bounds, sort, and deduplicate before publication; `.90` passed the hostile regression:
   `docs/platform/evidence/WL-ARCH-009-2026-08-10-metrics-bucket-normalization-r184.md`.
+- **Metrics observation ownership checkpoint (2026-08-10):** shared histogram admission discards non-finite observations before they poison `_sum`, `_count`, or bucket publication;
+  `.90` passed the hostile regression:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-10-metrics-observation-finiteness-r194.md`.
 - **Compute Bus recovery (2026-08-09):** complete reads and durable pending output preserve Cloud/storage/workload/migration/scheduler truth across late/replaced Bus:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`,

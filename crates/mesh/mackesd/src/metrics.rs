@@ -89,6 +89,14 @@ impl Histogram {
     /// bucket whose `le` ≥ the observed value, plus the implicit
     /// `+Inf` bucket via `self.count`.
     pub fn observe(&mut self, value: f64) {
+        // Prometheus samples must be finite.  A provider-controlled NaN or
+        // infinity would otherwise poison `_sum` or create an unbounded
+        // observation that cannot be represented by the finite bucket
+        // schedule.  Refuse it at the shared metrics ownership boundary so
+        // one malformed worker cannot corrupt the process-wide snapshot.
+        if !value.is_finite() {
+            return;
+        }
         for b in &mut self.buckets {
             if value <= b.le {
                 b.count += 1;
@@ -485,6 +493,23 @@ mod tests {
         assert_eq!(h.buckets[0].count, 0);
         assert_eq!(h.buckets[1].count, 1);
         assert_eq!(h.percentile_estimate(0.5), Some(3.0));
+    }
+
+    #[test]
+    fn histogram_discards_non_finite_provider_observations() {
+        let mut h = Histogram::new("x", "x", &[1.0, 5.0]);
+        h.observe(f64::NAN);
+        h.observe(f64::INFINITY);
+        h.observe(f64::NEG_INFINITY);
+        assert_eq!(h.count, 0);
+        assert_eq!(h.sum, 0.0);
+        assert!(h.buckets.iter().all(|bucket| bucket.count == 0));
+
+        h.observe(2.0);
+        assert_eq!(h.count, 1);
+        assert_eq!(h.sum, 2.0);
+        assert_eq!(h.buckets[0].count, 0);
+        assert_eq!(h.buckets[1].count, 1);
     }
 
     #[test]
