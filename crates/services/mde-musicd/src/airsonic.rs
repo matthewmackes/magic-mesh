@@ -42,6 +42,8 @@ pub const API_VERSION: &str = "1.16.1";
 pub const MAX_FINITE_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 /// Maximum bookmark rows admitted from one provider response.
 pub const MAX_BOOKMARKS: usize = 512;
+/// Maximum raw URL length admitted for a direct radio/media stream.
+const MAX_DIRECT_STREAM_URL_BYTES: usize = 4096;
 
 /// Subsonic error code returned when the client's requested `v=` is newer than
 /// the server supports ("incompatible REST protocol version, server must upgrade").
@@ -604,8 +606,10 @@ impl Client {
     pub fn stream_url(&self, song_id: &str) -> String {
         // SVC-3 — radio stations enqueue their raw upstream URL as the
         // "song id"; pass URLs through untouched so the engine streams
-        // the station directly instead of asking Subsonic for it.
-        if song_id.starts_with("http://") || song_id.starts_with("https://") {
+        // the station directly instead of asking Subsonic for it. Only an
+        // admitted URL may cross this seam; malformed or credential-bearing
+        // values remain opaque provider IDs and are URL-encoded below.
+        if admitted_direct_stream_url(song_id) {
             return song_id.to_string();
         }
         self.endpoint_url("stream", &[("id", song_id)])
@@ -1365,6 +1369,40 @@ impl Client {
         let inner = self.get("getLyricsBySongId", &[("id", id)]).await?;
         Ok(parse_lyrics(&inner))
     }
+}
+
+/// Admit a provider-supplied direct media URL before it reaches reqwest/the
+/// native engine. Provider metadata is untrusted: accepting URL-shaped text by
+/// prefix alone would allow credentials, malformed authorities, unsupported
+/// schemes, or control/whitespace bytes to become an engine request target.
+fn admitted_direct_stream_url(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > MAX_DIRECT_STREAM_URL_BYTES
+        || value.trim() != value
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return false;
+    }
+    let Some(rest) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if rest.split(['/', '?', '#']).next().is_none_or(str::is_empty) {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some_and(|host| !host.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none_or(|port| port != 0)
+        && parsed.fragment().is_none()
 }
 
 // ───────────────────────── pure parse helpers ─────────────────────────
@@ -2360,6 +2398,29 @@ mod tests {
         assert!(c.stream_url("song-7").contains("id=song-7"));
         assert!(c.cover_art_url("al-3").contains("/rest/getCoverArt?"));
         assert!(c.cover_art_url("al-3").contains("id=al-3"));
+    }
+
+    #[test]
+    fn direct_media_url_admission_rejects_credentials_malformed_authority_and_scheme() {
+        let c = Client::with_salt("http://h:4040", "alice", "pw", "abc");
+        let accepted = "https://radio.example/live.mp3?station=7";
+        assert_eq!(c.stream_url(accepted), accepted);
+
+        for rejected in [
+            "https://alice:secret@radio.example/live.mp3",
+            "https:///missing-authority/live.mp3",
+            "https://radio.example:0/live.mp3",
+            "ftp://radio.example/live.mp3",
+            "https://radio.example/live.mp3#fragment",
+            "https://radio.example/live mp3",
+        ] {
+            let admitted = c.stream_url(rejected);
+            assert!(
+                admitted.starts_with("http://h:4040/rest/stream?"),
+                "unadmitted media URL crossed direct stream seam: {rejected}"
+            );
+            assert_ne!(admitted, rejected);
+        }
     }
 
     #[test]
