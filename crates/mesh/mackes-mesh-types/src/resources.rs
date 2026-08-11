@@ -420,9 +420,11 @@ pub enum ServiceConfigurationFieldKind {
     Choice,
 }
 
-/// One field in a service adapter's configuration schema. Values never ride
-/// the resource catalog: secret values are sealed by the action responder and
-/// non-secret values are submitted through typed service actions.
+/// One field in a service adapter's configuration schema.
+///
+/// Values never ride the resource catalog: secret values are sealed by the
+/// action responder and non-secret values are submitted through typed service
+/// actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfigurationField {
@@ -2070,7 +2072,9 @@ impl ResourceAction {
             | ResourceActionVerb::Test
             | ResourceActionVerb::Enable
             | ResourceActionVerb::Disable
-            | ResourceActionVerb::Remove => {
+            | ResourceActionVerb::Remove
+            | ResourceActionVerb::Start
+            | ResourceActionVerb::Resume => {
                 matches!(self.target, ResourceActionTarget::Resource)
             }
             ResourceActionVerb::Pair | ResourceActionVerb::Retry => {
@@ -2083,9 +2087,6 @@ impl ResourceAction {
                 self.target,
                 ResourceActionTarget::Resource | ResourceActionTarget::TransportClient { .. }
             ),
-            ResourceActionVerb::Start | ResourceActionVerb::Resume => {
-                matches!(self.target, ResourceActionTarget::Resource)
-            }
             ResourceActionVerb::Transfer => {
                 matches!(self.target, ResourceActionTarget::TransportClient { .. })
             }
@@ -2518,6 +2519,11 @@ impl ResourceDiscoveryEntry {
     }
 
     /// Validate a decoded discovery entry before it is rendered or acted on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity, metadata, ordering, or bounded
+    /// collection contents violate the resource contract.
     pub fn validate(&self) -> Result<(), ResourceValidationError> {
         validate_version("resource_discovery_entry", self.schema_version)?;
         validate_fingerprint_field(
@@ -2619,6 +2625,11 @@ pub struct ResourceDiscoveryProjection {
 
 impl ResourceDiscoveryProjection {
     /// Validate the projection's bounded entries and source metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projection metadata or any entry violates the
+    /// resource contract.
     pub fn validate(&self) -> Result<(), ResourceValidationError> {
         validate_version("resource_discovery_projection", self.schema_version)?;
         validate_identifier("resource_discovery_projection.revision", &self.revision)?;
@@ -2665,6 +2676,10 @@ impl ResourceDiscoveryProjection {
     }
 
     /// Consume and return only a fully validated discovery projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation error from [`Self::validate`].
     pub fn admitted(self) -> Result<Self, ResourceValidationError> {
         self.validate()?;
         Ok(self)
@@ -2819,6 +2834,11 @@ impl ResourceCatalog {
     /// This is not a cryptographic signature; use
     /// [`ResourcePublisherAttestation`] when publisher authentication is
     /// required.
+    ///
+    /// # Panics
+    ///
+    /// This function cannot panic for a `ResourceCard` serialized by its
+    /// derived serializer.
     #[must_use]
     pub fn computed_content_digest(&self) -> String {
         let mut cards: Vec<_> = self.cards.iter().collect();
@@ -2847,6 +2867,10 @@ impl ResourceCatalog {
     /// A missing digest is filled for a new publication. An existing digest is
     /// validated before it can be retained, so this helper cannot silently
     /// repair a forged or stale attestation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog or its existing digest is invalid.
     pub fn with_content_digest(mut self) -> Result<Self, ResourceValidationError> {
         self.validate()?;
         self.content_digest = Some(self.computed_content_digest());
@@ -2859,6 +2883,11 @@ impl ResourceCatalog {
     ///
     /// The source catalog is validated first, so the projection cannot carry
     /// a forged identity, stale cross-reference, or unadmitted action summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source catalog or resulting projection is
+    /// invalid.
     pub fn discovery_projection(
         &self,
     ) -> Result<ResourceDiscoveryProjection, ResourceValidationError> {

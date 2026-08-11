@@ -195,9 +195,11 @@ impl DeviceProbeStatus {
     }
 }
 
-/// Vehicle power + OBD/CAN telemetry (mirrors the cockpit `VehicleTelemetry`, plus the
-/// MCU-sourced board temp). Power fields (`battery_v`/`internal_temp_c`/`ignition_on`)
-/// come from the gateway MCU; the rest from OBD-II when `obd_present` and the
+/// Vehicle power + OBD/CAN telemetry (mirrors the cockpit `VehicleTelemetry`,
+/// plus the MCU-sourced board temp).
+///
+/// Power fields (`battery_v`/`internal_temp_c`/`ignition_on`) come from the
+/// gateway MCU; the rest from OBD-II when `obd_present` and the
 /// [`DeviceProbeStatus`] is [`DeviceProbeStatus::Supported`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VehicleTelem {
@@ -792,6 +794,11 @@ impl ManagerSet {
     /// IDs are retained exactly as supplied and in stable order. Blank IDs,
     /// duplicates, and sets larger than [`VEHICLE_STATE_V2_MAX_MANAGERS`] are
     /// rejected before they can enter the wire model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an ID is blank, duplicated, or the collection is
+    /// over capacity.
     pub fn approved(ids: Vec<String>) -> Result<Self, ManagerSetValidationError> {
         Self::validate_ids(&ids)?;
         Ok(Self {
@@ -801,6 +808,10 @@ impl ManagerSet {
     }
 
     /// Construct an authoritative manager set; equivalent to [`Self::approved`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation error from [`Self::approved`].
     pub fn new(ids: Vec<String>) -> Result<Self, ManagerSetValidationError> {
         Self::approved(ids)
     }
@@ -1249,7 +1260,9 @@ fn freshness_from_v1(legacy: &VehicleState, _published_at_ms: i64) -> VehicleDom
             .as_millis();
         Some(
             now.saturating_sub(u128::from(observed))
-                .min(u128::from(u64::MAX)) as u64,
+                .min(u128::from(u64::MAX))
+                .try_into()
+                .unwrap_or(u64::MAX),
         )
     };
     let unknown = |reason: &str| DomainFreshness {

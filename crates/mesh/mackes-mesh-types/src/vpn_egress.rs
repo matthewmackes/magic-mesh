@@ -362,20 +362,23 @@ impl EgressPlan {
 // ─────────────────────────────────────────────────────────────────────────────
 // VPN-GW-4 — mesh egress *routing* (per-node / group / ANY) + failover chain.
 //
-// Where the rest of this module is the per-tunnel *mechanism* (an `EgressPlan`'s
-// fwmark/ip-rule/NAT/kill-switch argv), this is the *policy*: which node — or
+// Where the rest of this module is the per-tunnel *mechanism* (an
+// `EgressPlan`'s fwmark/ip-rule/NAT/kill-switch argv), this is the *policy*:
+// which node — or
 // node-group, or the whole mesh (ANY/all-mesh) — exits through which gateway +
 // primary tunnel, with an ordered **failover chain** so a tunnel drop walks down
 // to the next tunnel instead of dropping egress (the kill-switch is the floor).
 //
-// The model is pure + durable (TOML on the shared substrate, the same shape as
-// `vpn::VpnConfig`). The `vpn_gw` responder serves `action/vpn/{set-route,
-// clear-route, list-routes, route-status}` over it; the assigned node sends its
+// The model is pure + durable (TOML on the shared substrate, the same shape
+// as `vpn::VpnConfig`). The `vpn_gw` responder serves
+// `action/vpn/{set-route, clear-route, list-routes, route-status}` over it; the
+// assigned node sends its
 // selected egress over the Nebula overlay to the gateway's overlay IP, where the
 // gateway marks + NATs it out the chain's currently-active tunnel.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Who a route assigns egress for — the three scopes the survey locked (Q6):
+///
 /// a single node, a named node-group, or ANY/all-mesh (the default route every
 /// node falls back to when no more-specific route matches it).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +429,7 @@ impl RouteTarget {
 }
 
 /// One egress-routing assignment: a [`RouteTarget`] exits through `gateway`'s
+///
 /// tunnel chain. The chain is `[primary, …failover]` — the gateway NATs the
 /// assigned traffic out the first tunnel that is up; on a drop it walks down the
 /// chain, and only when the whole chain is down does the kill-switch (if set)
