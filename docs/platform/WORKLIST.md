@@ -94,6 +94,9 @@ behavioral evidence is not completion.
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
 - Current state: typed authority exists; KMS/EGL and live proof remain. Evidence: `evidence/WL-ARCH-010-2026-08-11-running-reservation-restart-r458.md`.
+- **Native DRM/PRIME seam (2026-08-11):** `mde-egui` DRM feature and bounded
+  DMA-BUF/PRIME cleanup gates passed 3/3 on `.90`; live KMS/EGL scanout remains:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-11-native-drm-prime-boundary-r474.md`.
 - Remaining work: **Recovered lease deadline (2026-08-10):** expired attachment leases refused; BigBoy: `evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
 - **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
