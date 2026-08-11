@@ -36,6 +36,11 @@ pub(crate) const DEFAULT_AUTH_ROOT: &str = "/var/lib/mackesd/cloud-auth";
 /// malformed or replaced inputs from becoming an unbounded allocation.
 const MAX_CLOUD_ARM_CREDENTIAL_BYTES: usize = 4 * 1024;
 
+/// An expired replay row contains only a signed decimal `i64` expiry, with a
+/// small allowance for surrounding whitespace. Keep cleanup from allocating or
+/// parsing attacker-controlled data beyond this bound.
+const MAX_EXPIRED_NONCE_ROW_BYTES: usize = 128;
+
 // ─────────────────────────── the signing seam ───────────────────────────
 
 /// The token signing/verification seam.
@@ -251,6 +256,51 @@ pub(crate) fn claim_nonce(
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
+    fn read_expired_nonce_row(path: &std::path::Path) -> Result<Vec<u8>, String> {
+        use rustix::fs::{Mode, OFlags};
+        use std::io::Read as _;
+
+        let file: std::fs::File = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("read expired armed-token nonce {}: {error}", path.display()))?
+        .into();
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "metadata expired armed-token nonce {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "read expired armed-token nonce {}: not a regular file",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_EXPIRED_NONCE_ROW_BYTES as u64 {
+            return Err(format!(
+                "read expired armed-token nonce {} exceeds {MAX_EXPIRED_NONCE_ROW_BYTES}-byte limit",
+                path.display()
+            ));
+        }
+
+        let mut raw = Vec::with_capacity(MAX_EXPIRED_NONCE_ROW_BYTES + 1);
+        file.take((MAX_EXPIRED_NONCE_ROW_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut raw)
+            .map_err(|error| {
+                format!("read expired armed-token nonce {}: {error}", path.display())
+            })?;
+        if raw.len() > MAX_EXPIRED_NONCE_ROW_BYTES {
+            return Err(format!(
+                "read expired armed-token nonce {} exceeds {MAX_EXPIRED_NONCE_ROW_BYTES}-byte limit",
+                path.display()
+            ));
+        }
+        Ok(raw)
+    }
+
     let dir = ensure_replay_dir(root)?;
 
     // Tokens are rejected as expired before reaching this seam, so deleting an
@@ -266,13 +316,30 @@ pub(crate) fn claim_nonce(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !is_nonce_row(&name) || !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+        if !is_nonce_row(&name) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "inspect expired armed-token nonce {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "read expired armed-token nonce {}: symlink is not allowed",
+                entry.path().display()
+            ));
+        }
+        if !file_type.is_file() {
             continue;
         }
         let path = entry.path();
-        let expired = std::fs::read_to_string(&path)
+        let raw = read_expired_nonce_row(&path)?;
+        let expired = std::str::from_utf8(&raw)
             .ok()
-            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .map(str::trim)
+            .and_then(|raw| raw.parse::<i64>().ok())
             .is_some_and(|expiry| expiry < now_ms);
         if !expired {
             continue;
@@ -836,6 +903,36 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(outside.read_dir().unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_nonce_rejects_oversized_or_symlinked_expired_nonce_rows() {
+        use std::os::unix::fs::symlink;
+
+        let oversized_directory = tempfile::tempdir().unwrap();
+        let oversized_root = oversized_directory.path().join("auth");
+        let oversized_rows = oversized_root.join("spent-nonces");
+        std::fs::create_dir_all(&oversized_rows).unwrap();
+        let oversized_row = oversized_rows.join("a".repeat(64));
+        std::fs::write(&oversized_row, vec![b'9'; MAX_EXPIRED_NONCE_ROW_BYTES + 1]).unwrap();
+        let error = claim_nonce(&oversized_root, "oversized-row-nonce", 10_000, 1)
+            .expect_err("an oversized expired row must fail closed before parsing");
+        assert!(error.contains("exceeds"), "unexpected error: {error}");
+
+        let symlinked_directory = tempfile::tempdir().unwrap();
+        let symlinked_root = symlinked_directory.path().join("auth");
+        let symlinked_rows = symlinked_root.join("spent-nonces");
+        let outside = symlinked_directory.path().join("outside-row");
+        std::fs::create_dir_all(&symlinked_rows).unwrap();
+        std::fs::write(&outside, b"1").unwrap();
+        symlink(&outside, symlinked_rows.join("b".repeat(64))).unwrap();
+        let error = claim_nonce(&symlinked_root, "symlinked-row-nonce", 10_000, 1)
+            .expect_err("a symlinked expired row must fail closed before parsing");
+        assert!(
+            error.contains("expired armed-token nonce"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

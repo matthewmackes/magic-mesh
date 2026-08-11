@@ -1451,6 +1451,10 @@ behavioral evidence is not completion.
 - **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
 - Remaining work:
+- **Bounded Android host probes (2026-08-11):** `/proc` and nested-KVM sysfs reads reject oversized host text before parsing; BigBoy passed 1/1:
+  `evidence/WL-FUNC-020-2026-08-11-android-host-probe-bound-r227.md`.
+- **Bounded cloud replay cleanup (2026-08-11):** expired nonce rows reject symlinks and payloads over 128 bytes before parsing; BigBoy passed 1/1:
+  `evidence/WL-FUNC-020-2026-08-11-cloud-gate-nonce-bound-r227.md`.
 - **VDI source identity checkpoint (2026-08-10):** Cuttlefish VDI sources now require current guest-ready state plus
   matching workload, image provenance, and generation. `.90` passed a hostile mismatched-workload regression:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-vdi-source-identity-r187.md`.
@@ -1945,6 +1949,8 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- **Farm orchestrator timeout boundary (2026-08-11):** etcd curl range/get calls kill hung children and fail closed; BigBoy passed 1/1:
+  `evidence/WL-CRIT-006-2026-08-11-farm-orchestrator-timeout-r227.md`.
 - **Evidence identity binding (2026-08-10):** the release verifier rejects
   cross-wired seat evidence filenames; `.90` passed 1 valid and 16 hostile
   fixtures: `docs/platform/evidence/WL-CRIT-006-2026-08-10-evidence-identity-r177.md`.

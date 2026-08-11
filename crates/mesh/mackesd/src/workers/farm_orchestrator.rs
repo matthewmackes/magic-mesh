@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::{ShutdownToken, Worker};
+use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 /// Sweep cadence — 10 s (farm jobs are coarse vs the 5 s firewall sweeps).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);
@@ -205,6 +206,10 @@ impl FarmOrchestratorWorker {
     }
 
     fn etcd_range_keys(prefix: &str) -> Vec<String> {
+        Self::etcd_range_keys_with_timeout(prefix, DEFAULT_CMD_TIMEOUT)
+    }
+
+    fn etcd_range_keys_with_timeout(prefix: &str, timeout: Duration) -> Vec<String> {
         let base = etcd_base();
         // range_end = prefix with last byte +1 (etcd "prefix" convention).
         let mut end = prefix.as_bytes().to_vec();
@@ -216,16 +221,16 @@ impl FarmOrchestratorWorker {
             b64(prefix.as_bytes()),
             b64(&end)
         );
-        let out = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-X",
-                "POST",
-                &format!("{base}/v3/kv/range"),
-                "-d",
-                &body,
-            ])
-            .output();
+        let mut command = std::process::Command::new("curl");
+        command.args([
+            "-s",
+            "-X",
+            "POST",
+            &format!("{base}/v3/kv/range"),
+            "-d",
+            &body,
+        ]);
+        let out = output_with_timeout(command, timeout);
         match out {
             Ok(o) if o.status.success() => {
                 parse_jobids(&String::from_utf8_lossy(&o.stdout), prefix)
@@ -235,19 +240,25 @@ impl FarmOrchestratorWorker {
     }
 
     fn etcd_get(key: &str) -> Option<String> {
+        Self::etcd_get_with_timeout(key, DEFAULT_CMD_TIMEOUT)
+    }
+
+    fn etcd_get_with_timeout(key: &str, timeout: Duration) -> Option<String> {
         let base = etcd_base();
         let body = format!(r#"{{"key":"{}"}}"#, b64(key.as_bytes()));
-        let o = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-X",
-                "POST",
-                &format!("{base}/v3/kv/range"),
-                "-d",
-                &body,
-            ])
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("curl");
+        command.args([
+            "-s",
+            "-X",
+            "POST",
+            &format!("{base}/v3/kv/range"),
+            "-d",
+            &body,
+        ]);
+        let o = output_with_timeout(command, timeout).ok()?;
+        if !o.status.success() {
+            return None;
+        }
         let v: serde_json::Value = serde_json::from_slice(&o.stdout).ok()?;
         let val64 = v.get("kvs")?.as_array()?.first()?.get("value")?.as_str()?;
         String::from_utf8(base64_decode(val64).ok()?).ok()
@@ -409,5 +420,43 @@ mod tests {
         for s in ["", "f", "fo", "foo", "/farm/queue/x", "hello world!"] {
             assert_eq!(base64_decode(&b64(s.as_bytes())).unwrap(), s.as_bytes());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_curl_returns_no_jobs_or_value() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Mutex, OnceLock};
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let shim_dir = tempfile::tempdir().expect("temporary curl shim directory");
+        let shim = shim_dir.path().join("curl");
+        std::fs::write(&shim, "#!/bin/sh\nexec sleep 60\n").expect("write curl shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("make curl shim executable");
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", shim_dir.path());
+        let start = std::time::Instant::now();
+        let jobs = FarmOrchestratorWorker::etcd_range_keys_with_timeout(
+            "/farm/queue/",
+            Duration::from_millis(150),
+        );
+        let value = FarmOrchestratorWorker::etcd_get_with_timeout(
+            "/farm/result/hung",
+            Duration::from_millis(150),
+        );
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(jobs.is_empty(), "a timed-out range must fail closed");
+        assert!(value.is_none(), "a timed-out get must fail closed");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hung curl must be killed promptly"
+        );
     }
 }

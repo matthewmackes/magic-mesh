@@ -18,6 +18,7 @@ const MIN_VCPUS: u16 = 4;
 const MIN_MEMORY_MIB: u64 = 8 * 1024;
 const MIN_DISK_MIB: u64 = 80 * 1024;
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+const MAX_HOST_PROBE_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AndroidHostFacts {
@@ -243,13 +244,13 @@ fn nested_virtualization_enabled() -> bool {
         "/sys/module/kvm_amd/parameters/nested",
     ]
     .iter()
-    .filter_map(|path| fs::read_to_string(path).ok())
+    .filter_map(|path| read_bounded_host_text(path).ok())
     .map(|value| value.trim().to_ascii_lowercase())
     .any(|value| matches!(value.as_str(), "1" | "y" | "yes"))
 }
 
 fn available_memory_mib() -> Option<u64> {
-    fs::read_to_string("/proc/meminfo")
+    read_bounded_host_text("/proc/meminfo")
         .ok()?
         .lines()
         .find_map(|line| {
@@ -257,6 +258,28 @@ fn available_memory_mib() -> Option<u64> {
             value.split_whitespace().next()?.parse::<u64>().ok()
         })
         .map(|kib| kib / 1024)
+}
+
+fn read_bounded_host_text(path: impl AsRef<Path>) -> io::Result<String> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_HOST_PROBE_TEXT_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "host probe text is not a bounded regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    let mut body = String::new();
+    file.take((MAX_HOST_PROBE_TEXT_BYTES + 1) as u64)
+        .read_to_string(&mut body)?;
+    if body.len() > MAX_HOST_PROBE_TEXT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "host probe text exceeds its byte limit",
+        ));
+    }
+    Ok(body)
 }
 
 fn digest_regular_file(path: &Path) -> io::Result<String> {
@@ -507,6 +530,17 @@ mod tests {
             Some(AndroidProviderRefusal::CatalogUnavailable)
         );
         assert_eq!(admission.readiness, AndroidProviderReadiness::Unavailable);
+    }
+
+    #[test]
+    fn oversized_host_probe_text_is_rejected_before_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("probe");
+        std::fs::write(&path, vec![b'x'; MAX_HOST_PROBE_TEXT_BYTES + 1]).unwrap();
+        assert_eq!(
+            read_bounded_host_text(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
