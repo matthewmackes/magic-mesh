@@ -1131,6 +1131,9 @@ behavioral evidence is not completion.
   authorization; unsupported host capabilities cannot reach the authorizer.
   `.90` passed the hostile regression:
   `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-capability-admission-r192.md`.
+- **Admitted capability projection (2026-08-10):** App-VM sessions reject
+  unsupported host capabilities at projection; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-10-admitted-capability-projection-r206.md`.
 - **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
   only after governed projection/status effects succeed, and expiry retains
   authority until its retraction publishes. Machine 194 passed the exact
@@ -2480,6 +2483,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-2026-08-10-duplicate-active-condition-r185.md`.
 - **Health expiry projection checkpoint (2026-08-10):** expired checkpoint state and stale invalid projections fail closed without touching symlinks; BigBoy passed:
   `docs/platform/evidence/WL-UX-013-2026-08-10-health-expiry-projection-r160.md`.
+- **Live health expiry (2026-08-10):** expired retained projections are evicted
+  without daemon restart; `.90` passed:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-live-expiry-r206.md`.
 - **Availability duplicate-precedence checkpoint (2026-08-10):** duplicate evidence is classified before at-capacity overflow in forward and reversed order, while a
   distinct extra node remains `CapacityExceeded`; machine 194 passed the exact regression: `docs/platform/evidence/WL-UX-013-2026-08-10-availability-duplicate-precedence-r13.md`.
 - **Expected-state boundary checkpoint (2026-08-06):** the health contract
