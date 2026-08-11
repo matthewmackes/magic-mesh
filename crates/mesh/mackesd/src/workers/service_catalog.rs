@@ -39,6 +39,7 @@ const PROBED_RDP_MAX_AGE_MS: u64 = 300_000;
 const DESKTOP_ROSTER_MAX_AGE_MS: u64 = 300_000;
 const SERVICE_CONFIG_VERSION: u16 = 1;
 const MAX_CONFIGURATION_BYTES: u64 = 64 * 1024;
+const MAX_HOSTNAME_BYTES: usize = 255;
 
 /// Local, stdin-only submission consumed by `mackesd service-card save`.
 /// Values are never published to the Bus or resource catalog. Secret fields
@@ -1200,13 +1201,30 @@ pub fn remove_configuration(
 }
 
 fn local_hostname() -> Result<String, String> {
-    let hostname = std::fs::read_to_string("/etc/hostname")
-        .map_err(|error| format!("read local hostname: {error}"))?;
+    let hostname = read_bounded_hostname(Path::new("/etc/hostname"))?;
     let hostname = hostname.trim();
     if hostname.is_empty() || hostname.chars().any(char::is_whitespace) {
         return Err("local hostname is invalid for a media gateway registration".into());
     }
     Ok(hostname.to_owned())
+}
+
+fn read_bounded_hostname(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("read local hostname metadata: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_HOSTNAME_BYTES as u64 {
+        return Err("local hostname is not a bounded regular file".into());
+    }
+    let mut body = String::new();
+    std::fs::File::open(path)
+        .map_err(|error| format!("read local hostname: {error}"))?
+        .take((MAX_HOSTNAME_BYTES + 1) as u64)
+        .read_to_string(&mut body)
+        .map_err(|error| format!("read local hostname: {error}"))?;
+    if body.len() > MAX_HOSTNAME_BYTES {
+        return Err("local hostname exceeds its byte bound".into());
+    }
+    Ok(body)
 }
 
 fn media_registration_dir(workgroup_root: &Path, hostname: &str) -> PathBuf {
@@ -1824,6 +1842,15 @@ SERVER: MCNF/1.0\r\n\r\n";
             card.service.as_ref().expect("service interface").lifecycle,
             ServiceLifecycleStatus::Offline
         );
+    }
+
+    #[test]
+    fn oversized_hostname_input_fails_closed_before_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hostname");
+        std::fs::write(&path, vec![b'h'; MAX_HOSTNAME_BYTES + 1]).unwrap();
+        let error = read_bounded_hostname(&path).expect_err("oversized hostname must fail closed");
+        assert!(error.contains("bound"));
     }
 
     #[test]

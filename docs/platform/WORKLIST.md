@@ -415,11 +415,11 @@ behavioral evidence is not completion.
 - Current state: all 152 registered starts have bounded runtime contracts; six grouped services ship, but complete ownership, UI cutover, and fleet proof remain.
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console evidence (2026-08-08/09):** generation/digest gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
-- **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
+- **Runtime census/aggregate (2026-08-09):** 160 starts fail closed without stable rows; live proof: `evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
 - **Bounded job input (2026-08-11):** signed playbooks cap at 1 MiB before digest/apply; BigBoy: `evidence/WL-ARCH-009-2026-08-11-job-playbook-bound-r226.md`.
 - **Bounded mesh-DNS directory (2026-08-11):** over-12-peer directories fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-mesh-dns-directory-bound-r229.md`.
+- **Bounded Nebula systemctl (2026-08-11):** hung commands die at 2 seconds with 8 KiB caps; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-nebula-systemctl-bound-r230.md`.
 - Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip bursts; evidence: `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
 - **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
 - **HTTPS policy source-parent integrity (2026-08-10):** `.90` passed symlinked-ancestor refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-parent-r214.md`.
@@ -1536,11 +1536,11 @@ behavioral evidence is not completion.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
-- **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
-  `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
+- **Provider consistency (2026-08-09):** restart selection and stale fallback invalidation passed `.90`; evidence: `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`.
 - **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
 - **Bounded media config (2026-08-11):** shared-folder JSON caps at 64 KiB and rejects symlinks; BigBoy: `evidence/WL-FUNC-021-2026-08-11-media-config-bound-r226.md`.
 - **Navidrome command timeout (2026-08-11):** systemctl/setup calls fail closed at the shared deadline; BigBoy: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-timeout-r226.md`.
+- **Bounded service registration hostname (2026-08-11):** `/etc/hostname` caps at 255 bytes; BigBoy passed 1/1: `evidence/WL-FUNC-021-2026-08-11-service-hostname-bound-r230.md`.
 - Remaining work: **Shared artwork byte bound (2026-08-11):** cache reads refuse non-regular or over-4-MiB files and writes refuse oversized payloads; `.50` passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
 - **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
@@ -2580,6 +2580,9 @@ behavioral evidence is not completion.
 - **Bounded firewall history (2026-08-11):** retention refuses non-regular or
   over-4-MiB JSONL before rewrite; BigBoy passed 1/1:
   `evidence/WL-UX-013-2026-08-11-firewall-history-bound-r228.md`.
+- **Bounded firewall journal (2026-08-11):** oversized `journalctl` output is
+  rejected before cursor advancement; BigBoy passed 1/1:
+  `evidence/WL-UX-013-2026-08-11-firewall-journal-bound-r230.md`.
 - **Bounded alert relay input (2026-08-11):** alert JSON refuses symlinks and
   over-64-KiB payloads before parsing; BigBoy passed 1/1:
   `evidence/WL-UX-013-2026-08-11-alert-relay-bound-r228.md`.

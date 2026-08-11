@@ -25,6 +25,7 @@
 
 #![cfg(feature = "async-services")]
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,6 +47,10 @@ const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
 /// config repair. Leadership reconciliation is advisory for this worker's
 /// config-refresh path, so fail closed quickly and retry on the next tick.
 const DEFAULT_LEADERSHIP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Keep a broken systemctl invocation from stalling the supervisor forever.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(2);
+const SYSTEMCTL_MAX_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// Default marker file path that systemd's
 /// `ConditionPathExists=` checks for lighthouse/tunnel
@@ -1685,30 +1690,75 @@ pub(crate) fn read_role_marker(path: &Path) -> Option<String> {
     Some(node_id.to_owned())
 }
 
-/// Lightweight `systemctl <verb> <unit>` invocation. Returns
-/// Ok(()) on success or Err(stderr) on failure. Missing
-/// systemctl is reported as an error; promotion/demotion may
-/// tolerate it, while config refresh keeps its watch pending
-/// so a later sweep can retry the reconnect.
+/// Lightweight bounded `systemctl <verb> <unit>` invocation. Returns Ok(())
+/// on success or Err(stderr) on failure. Missing systemctl is reported as an
+/// error; promotion/demotion may tolerate it, while config refresh keeps its
+/// watch pending so a later sweep can retry the reconnect.
 fn systemctl(path: &Path, verb: &str, unit: &str) -> Result<(), String> {
-    let out = std::process::Command::new(path)
+    let mut child = std::process::Command::new(path)
         .args([verb, unit])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("{} {verb} {unit}: {e}", path.display()))?;
-    if out.status.success() {
+
+    let stdout = child.stdout.take().expect("piped systemctl stdout");
+    let stderr = child.stderr.take().expect("piped systemctl stderr");
+    let stdout_reader = std::thread::spawn(move || read_systemctl_output(stdout));
+    let stderr_reader = std::thread::spawn(move || read_systemctl_output(stderr));
+    let deadline = std::time::Instant::now() + SYSTEMCTL_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("{} {verb} {unit}: {e}", path.display()))?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{} {verb} {unit} timed out after {} ms",
+                path.display(),
+                SYSTEMCTL_TIMEOUT.as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _ = stdout_reader.join();
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| format!("{} {verb} {unit}: output reader panicked", path.display()))?
+        .map_err(|e| format!("{} {verb} {unit}: {e}", path.display()))?;
+
+    if status.success() {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
         if stderr.is_empty() {
             Err(format!(
                 "{} {verb} {unit} exited with {}",
                 path.display(),
-                out.status
+                status
             ))
         } else {
             Err(stderr)
         }
     }
+}
+
+fn read_systemctl_output<R: std::io::Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    (&mut reader)
+        .take((SYSTEMCTL_MAX_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut output)?;
+    if output.len() > SYSTEMCTL_MAX_OUTPUT_BYTES {
+        output.truncate(SYSTEMCTL_MAX_OUTPUT_BYTES);
+        let mut discarded = [0_u8; 4096];
+        while reader.read(&mut discarded)? != 0 {}
+    }
+    output.truncate(SYSTEMCTL_MAX_OUTPUT_BYTES);
+    Ok(output)
 }
 
 fn systemctl_start(path: &Path, unit: &str) -> Result<(), String> {
@@ -2730,6 +2780,35 @@ exit 0
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("make fake systemctl executable");
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemctl_timeout_kills_a_hung_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("systemctl");
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\ntrap 'exit 124' TERM\nwhile :; do :; done\n",
+        )
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake systemctl executable");
+
+        let started = std::time::Instant::now();
+        let result = systemctl(&path, "reload-or-restart", "nebula.service");
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "{} reload-or-restart nebula.service timed out after {} ms",
+                path.display(),
+                SYSTEMCTL_TIMEOUT.as_millis()
+            ))
+        );
+        assert!(started.elapsed() < SYSTEMCTL_TIMEOUT + Duration::from_secs(1));
     }
 
     #[cfg(unix)]

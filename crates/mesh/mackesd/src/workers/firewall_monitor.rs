@@ -74,6 +74,10 @@ pub const RETENTION_SWEEP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 /// well below this cap under normal operation.
 const MAX_FIREWALL_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Reject journal output at the shared subprocess capture boundary rather
+/// than parsing a truncated batch and advancing the cursor past unseen lines.
+const MAX_JOURNAL_OUTPUT_BYTES: usize = 64 * 1024;
+
 /// One denied-packet record.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeniedEvent {
@@ -313,19 +317,23 @@ impl FirewallMonitorWorker {
         let since_sec = since_ms / 1_000;
         let since_arg = format!("@{since_sec}");
 
-        let output = Command::new("journalctl")
+        let mut command = Command::new("journalctl");
+        command
             .args(["-k", "--no-pager", "-o", "cat"])
-            .arg(format!("--since={since_arg}"))
-            .output();
+            .arg(format!("--since={since_arg}"));
+        let output = crate::workers::proc::output_with_timeout(
+            command,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        );
 
-        let _ = std::fs::write(&self.cursor_path, now_ms.to_string());
-
-        output.ok().filter(|o| o.status.success()).map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(String::from)
-                .collect()
-        })
+        let lines = output
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_bounded_journal_output(&o.stdout));
+        if lines.is_some() {
+            let _ = std::fs::write(&self.cursor_path, now_ms.to_string());
+        }
+        lines
     }
 
     /// Run one synchronous observation pass. Returns whether a new accepted
@@ -396,6 +404,18 @@ impl FirewallMonitorWorker {
 
         !events.is_empty()
     }
+}
+
+fn parse_bounded_journal_output(stdout: &[u8]) -> Option<Vec<String>> {
+    if stdout.len() >= MAX_JOURNAL_OUTPUT_BYTES {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .map(String::from)
+            .collect(),
+    )
 }
 
 fn next_tick_interval(current: Duration, had_events: bool) -> Duration {
@@ -635,6 +655,12 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             (MAX_FIREWALL_HISTORY_BYTES + 1) as u64
         );
+    }
+
+    #[test]
+    fn oversized_journal_output_is_rejected_before_cursor_progress() {
+        let output = vec![b'\n'; MAX_JOURNAL_OUTPUT_BYTES];
+        assert!(parse_bounded_journal_output(&output).is_none());
     }
 
     // --- threshold_tripped ---
