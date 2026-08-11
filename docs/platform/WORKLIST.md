@@ -904,10 +904,10 @@ behavioral evidence is not completion.
 - Remaining work:
 - **MG90 failover safety:** source publication epoch preserved across manager loss; `.90`: `docs/platform/evidence/WL-FUNC-017-2026-08-10-mg90-nonselected-loss-r193.md`.
 - **Offline timeline (r160):** impossible access order fails closed; BigBoy passed `docs/platform/evidence/WL-FUNC-017-2026-08-10-offline-timeline-r160.md`.
-- **Offline basemap admission (2026-08-10):** ambiguous or unsafe region/MBTiles candidates fail closed; `.90` passed 6/6; renderer/routing/live proof remain:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
+- **Offline basemap admission:** unsafe candidates fail closed; `.90` 6/6; live proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
 - **Offline index corruption recovery (2026-08-09):** malformed metadata is replaced atomically; future schemas and non-regular paths fail closed. Machine 193 passed:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
+- **Basemap cache reload:** `.90` passed atomic replacement: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-cache-revalidation-r215.md`.
 - **Weather cache identity checkpoint (2026-08-09):** restart recovery now
   binds nested current/forecast snapshots to exact host, location generation,
   point, and timezone; mismatches publish typed unavailable state. Machine 194 passed the exact hostile-cache test:
@@ -2506,6 +2506,9 @@ behavioral evidence is not completion.
 - **Duplicate active-condition admission:** `.90` passed refusal of repeated active
   `(scope, id)` identities while preserving repeated resolved records for recurrence:
   `docs/platform/evidence/WL-UX-013-2026-08-10-duplicate-active-condition-r185.md`.
+- **Condition lifecycle identity admission (2026-08-10):** active/resolved
+  identity splits are rejected; `.90` passed:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-condition-lifecycle-identity-r215.md`.
 - **Health expiry projection checkpoint (2026-08-10):** expired checkpoint state and stale invalid projections fail closed without touching symlinks; BigBoy passed:
   `docs/platform/evidence/WL-UX-013-2026-08-10-health-expiry-projection-r160.md`.
 - **Live health expiry (2026-08-10):** expired retained projections are evicted
