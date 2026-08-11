@@ -216,6 +216,54 @@ fn local_file_stream_path(url: &str) -> Option<std::path::PathBuf> {
         .flatten()
 }
 
+/// Open a daemon-admitted local audio file without following a peer-controlled
+/// replacement symlink between URL admission and decoder access.
+fn open_admitted_local_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect admitted local audio {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "admitted local audio is not a regular file: {}",
+            path.display()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            // Linux's O_NOFOLLOW is stable and avoids adding a direct libc
+            // dependency to this service for one open flag.
+            .custom_flags(0o400000)
+            .open(path)
+    };
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let file = std::fs::File::open(path);
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path);
+
+    let file = file.map_err(|error| {
+        format!(
+            "open admitted local Clock audio {}: {error}",
+            path.display()
+        )
+    })?;
+    let opened = file.metadata().map_err(|error| {
+        format!(
+            "inspect opened local Clock audio {}: {error}",
+            path.display()
+        )
+    })?;
+    if !opened.is_file() || opened.len() != metadata.len() {
+        return Err(format!(
+            "admitted local audio changed before decode: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
 /// Should the queue driver begin pre-buffering the next track? True once
 /// the current track is within [`GAPLESS_LEAD_MS`] of its end (and its
 /// duration is known).
@@ -1211,12 +1259,7 @@ fn decode_track_at(
     let source: Box<dyn symphonia::core::io::MediaSource> =
         if let Some(path) = local_file_stream_path(url) {
             shared.seekable.store(true, Ordering::Relaxed);
-            Box::new(std::fs::File::open(&path).map_err(|error| {
-                format!(
-                    "open admitted local Clock audio {}: {error}",
-                    path.display()
-                )
-            })?)
+            Box::new(open_admitted_local_file(&path)?)
         } else if is_cached_stream_url(url) {
             Box::new(Cursor::new(cached_track_source(
                 cache_identity.as_ref(),
@@ -1696,6 +1739,25 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_local_audio_refuses_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.wav");
+        std::fs::write(&target, b"not daemon-admitted audio").unwrap();
+        let link = dir.path().join("alarm.wav");
+        symlink(&target, &link).unwrap();
+
+        let error = open_admitted_local_file(&link).unwrap_err();
+        assert!(
+            error.contains("not a regular file") || error.contains("Too many levels"),
+            "unexpected symlink refusal: {error}"
+        );
     }
 
     #[test]
