@@ -618,6 +618,12 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
         }
         Ok(inventory)
     }
+
+    fn generation_is_guest_ready(&self, generation: u64) -> bool {
+        self.observation.lock().is_ok_and(|observation| {
+            observation.generation == generation && observation.is_guest_ready()
+        })
+    }
 }
 
 impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAdapter<C> {
@@ -675,7 +681,10 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
         request: &AndroidGuestInventoryRequest,
         generation: u64,
     ) -> AndroidAppInventory {
-        if request.workload_id != self.workload_id || generation == 0 {
+        if request.workload_id != self.workload_id
+            || generation == 0
+            || !self.generation_is_guest_ready(generation)
+        {
             return AndroidAppInventory::pending(request.workload_id.clone());
         }
         self.client
@@ -689,9 +698,14 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
         request: &AndroidGuestLaunchRequest,
         generation: u64,
     ) -> AndroidGuestLaunchOutcome {
-        if request.workload_id != self.workload_id || request.validate().is_err() || generation == 0
+        if request.workload_id != self.workload_id
+            || request.validate().is_err()
+            || generation == 0
         {
             return AndroidGuestLaunchOutcome::Rejected;
+        }
+        if !self.generation_is_guest_ready(generation) {
+            return AndroidGuestLaunchOutcome::Unavailable;
         }
         match self.client.launch_at(&self.target, request, generation) {
             Ok(outcome) => outcome,
@@ -821,6 +835,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeClient {
         observe_calls: Arc<AtomicUsize>,
+        inventory_calls: Arc<AtomicUsize>,
         launch_calls: Arc<AtomicUsize>,
         observe_result:
             Arc<Mutex<Option<Result<CuttlefishVmObservation, CuttlefishProviderError>>>>,
@@ -833,6 +848,7 @@ mod tests {
         fn new(observe_result: Result<CuttlefishVmObservation, CuttlefishProviderError>) -> Self {
             Self {
                 observe_calls: Arc::new(AtomicUsize::new(0)),
+                inventory_calls: Arc::new(AtomicUsize::new(0)),
                 launch_calls: Arc::new(AtomicUsize::new(0)),
                 observe_result: Arc::new(Mutex::new(Some(observe_result))),
                 launch_result: Arc::new(Mutex::new(Some(Ok(AndroidGuestLaunchOutcome::Started)))),
@@ -865,6 +881,16 @@ mod tests {
                 .expect("launch result lock")
                 .take()
                 .expect("one launch call")
+        }
+
+        fn inventory_at(
+            &self,
+            _target: &CuttlefishVmTarget,
+            _package_manifest: &AndroidImagePackageManifest,
+            _generation: u64,
+        ) -> Result<AndroidAppInventory, CuttlefishProviderError> {
+            self.inventory_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(AndroidAppInventory::pending("android-t480"))
         }
 
         fn vdi_source(&self, _generation: u64) -> Option<AndroidVdiSource> {
@@ -1074,6 +1100,42 @@ mod tests {
 
         assert_eq!(adapter.launch(&request), AndroidGuestLaunchOutcome::Started);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stale_generation_operations_stop_before_backend_contact() {
+        let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
+        let client = FakeClient::new(Ok(initial.clone()));
+        let inventory_calls = client.inventory_calls.clone();
+        let launch_calls = client.launch_calls.clone();
+        let adapter = CuttlefishProviderAdapter::new(
+            "android-t480",
+            target(),
+            package_manifest(),
+            initial,
+            client,
+        )
+        .expect("adapter");
+        let inventory_request = AndroidGuestInventoryRequest::new(
+            "inventory-stale-generation",
+            "android-t480",
+        )
+        .expect("inventory request");
+        let launch_request = AndroidGuestLaunchRequest::for_app(
+            "launch-stale-generation",
+            "android-t480",
+            AospStarterApp::Browser,
+        )
+        .expect("launch request");
+
+        let inventory = adapter.inventory_at(&inventory_request, 6);
+        assert_eq!(inventory.guest_boot_state, AndroidGuestBootState::Pending);
+        assert_eq!(
+            adapter.launch_at(&launch_request, 6),
+            AndroidGuestLaunchOutcome::Unavailable
+        );
+        assert_eq!(inventory_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(launch_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
