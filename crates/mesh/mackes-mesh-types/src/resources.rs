@@ -2571,6 +2571,19 @@ impl ResourceDiscoveryEntry {
             &self.ready_actions,
             MAX_DISCOVERY_ACTIONS,
         )?;
+        if self.service_category.is_some()
+            && !matches!(
+                self.class,
+                ResourceClass::MediaServer
+                    | ResourceClass::FileShare
+                    | ResourceClass::CloudWorkload
+                    | ResourceClass::Service
+            )
+        {
+            return Err(ResourceValidationError::InvalidRelationship(
+                "resource_discovery_entry.service_class",
+            ));
+        }
         Ok(())
     }
 }
@@ -3911,6 +3924,23 @@ mod tests {
             unsorted.validate(),
             Err(ResourceValidationError::InvalidRelationship(
                 "resource_discovery_projection.entry_order"
+            ))
+        );
+    }
+
+    #[test]
+    fn discovery_entry_rejects_service_grouping_on_non_service_class() {
+        let projection = valid_catalog()
+            .discovery_projection()
+            .expect("valid discovery projection");
+        let mut entry = projection.entries[0].clone();
+        entry.class = ResourceClass::Desktop;
+        entry.service_category = Some(ServiceCategory::Communications);
+
+        assert_eq!(
+            entry.validate(),
+            Err(ResourceValidationError::InvalidRelationship(
+                "resource_discovery_entry.service_class"
             ))
         );
     }
