@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -93,6 +94,7 @@ const MAX_MIGRATION_COMMAND_RECORD_BYTES: u64 = (MAX_MIGRATION_DOMAIN_XML_BYTES 
 const REPLY_OUTBOX_DIR: &str = "reply-outbox";
 const MAX_REPLY_OUTBOX_RECORDS: usize = 128;
 const MAX_REPLY_OUTBOX_RECORD_BYTES: u64 = 128 * 1024;
+const MAX_HOST_MEMINFO_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BusIdentity {
@@ -4477,7 +4479,7 @@ fn live_capacity<'a>(
         // so admission rejects the request instead of allocating against a
         // made-up capacity sample.
         .unwrap_or(0);
-    let memory_mb = std::fs::read_to_string("/proc/meminfo")
+    let memory_mb = read_bounded_text(Path::new("/proc/meminfo"), MAX_HOST_MEMINFO_BYTES)
         .ok()
         .and_then(|body| {
             body.lines()
@@ -4554,6 +4556,20 @@ fn probe_storage_gb(path: &str) -> u32 {
         .and_then(|value| value.parse::<u64>().ok())
         .map(|kib| u32::try_from(kib / 1_048_576).unwrap_or(u32::MAX))
         .unwrap_or(0)
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let mut body = String::new();
+    fs::File::open(path)?
+        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_string(&mut body)?;
+    if body.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "host text input exceeded its bound",
+        ));
+    }
+    Ok(body)
 }
 
 fn admission_message(admission: WorkloadAdmission) -> (&'static str, &'static str) {
@@ -5883,6 +5899,17 @@ mod tests {
             normalize_qemu_display1_address("tcp:host=127.0.0.1,port=1234"),
             Err(WorkloadActuatorError::Permanent(_))
         ));
+    }
+
+    #[test]
+    fn oversized_host_text_input_is_rejected_before_capacity_parse() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("meminfo");
+        fs::write(&path, "x".repeat(MAX_HOST_MEMINFO_BYTES + 1)).expect("seed host input");
+
+        let error = read_bounded_text(&path, MAX_HOST_MEMINFO_BYTES)
+            .expect_err("oversized host input must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -34,7 +34,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -59,6 +59,11 @@ const DELIVERY_RECEIPTS_DIR: &str = ".relay-delivered-v1";
 /// MON-3 currently emits ULIDs. Leave room for a future namespaced identifier,
 /// but keep the receipt filename bounded and traversal-proof.
 const MAX_ALERT_ID_BYTES: usize = 128;
+
+/// Alert JSON is small by design. Keep peer-controlled input bounded before
+/// serde materializes it, and read only regular files through a no-follow
+/// descriptor.
+const MAX_ALERT_BYTES: usize = 64 * 1024;
 
 /// Subset of the MON-3 `AlertEvent` schema the relay needs
 /// to render an FDO notification. The full schema lives in
@@ -181,7 +186,7 @@ impl AlertRelayWorker {
             if ext != "json" {
                 continue;
             }
-            let Ok(body) = std::fs::read_to_string(&path) else {
+            let Some(body) = read_bounded_alert(&path) else {
                 continue;
             };
             let Ok(event) = serde_json::from_str::<AlertEventPartial>(&body) else {
@@ -371,6 +376,52 @@ impl AlertRelayWorker {
             }
         }
     }
+}
+
+/// Read one alert through the descriptor that will be consumed. Reject final
+/// symlinks, blocking special files, oversized input, and invalid UTF-8 before
+/// the JSON parser sees peer-controlled bytes.
+fn read_bounded_alert(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_ALERT_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_ALERT_BYTES)
+        .min(MAX_ALERT_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_ALERT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_ALERT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn valid_receipt_id(id: &str) -> bool {
@@ -684,6 +735,33 @@ mod tests {
             .with_bus_binary("/bin/true");
         // Bad file is skipped (logged at warn); good file fires.
         assert_eq!(w.tick_once(), 1);
+    }
+
+    #[test]
+    fn tick_once_skips_oversized_and_symlinked_alert_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("oversized.json"),
+            vec![b'x'; MAX_ALERT_BYTES + 1],
+        )
+        .unwrap();
+
+        let outside = tmp.path().join("outside");
+        write_event(tmp.path(), "01H8XYZABC0000000000000004", "CRITICAL");
+        std::fs::rename(
+            tmp.path().join("01H8XYZABC0000000000000004.json"),
+            &outside,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join("linked.json"))
+            .expect("symlink fixture");
+
+        let w = AlertRelayWorker::new()
+            .with_alerts_dir(tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
+        assert_eq!(w.tick_once(), 0);
+        assert!(outside.is_file());
     }
 
     #[test]

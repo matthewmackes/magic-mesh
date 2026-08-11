@@ -109,6 +109,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
 - **Label bound (2026-08-11):** 255-byte/control refusal before filesystem commands; BigBoy: `evidence/WL-ARCH-010-2026-08-11-storage-label-admission-r225.md`.
 - **Virtual output bound (2026-08-11):** qemu-img drains both streams, retaining 64 KiB each; BigBoy: `evidence/WL-ARCH-010-2026-08-11-virtual-storage-output-bound-r225.md`.
+- **Bounded workload capacity probe (2026-08-11):** `/proc/meminfo` input is capped at 64 KiB; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-workload-meminfo-bound-r228.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
@@ -303,8 +304,7 @@ behavioral evidence is not completion.
   4. The shell only sends typed intent and renders bounded state.
 - Verification method: run lint-workload-authority first; use @farm:{cargo test -p mackes-mesh-types}
   @farm:{cargo test -p mackesd workload_compute}
-  @farm:{cargo test -p mde-shell-egui --features live-vdi}
-  and BigBoy release/package gates with explicit host and slot; capture live evidence on required seats.
+  @farm:{cargo test -p mde-shell-egui --features live-vdi}; BigBoy release/package gates use explicit host/slot and capture live evidence.
 - Origin or merged source IDs: Job One 2026-08-05; archived ARCH-006/007, CRIT-001; VDI zero-copy design; current Dell/seat-15 incidents.
 ### WL-ARCH-008 - Extract the host Browser stack and replace it with a VM Browser
 
@@ -2573,6 +2573,12 @@ behavioral evidence is not completion.
   restores a deleted derived projection without a new Bus message; `.90`
   passed:
   `docs/platform/evidence/WL-UX-013-2026-08-11-missing-projection-repair-r221.md`.
+- **Bounded firewall history (2026-08-11):** retention refuses non-regular or
+  over-4-MiB JSONL before rewrite; BigBoy passed 1/1:
+  `evidence/WL-UX-013-2026-08-11-firewall-history-bound-r228.md`.
+- **Bounded alert relay input (2026-08-11):** alert JSON refuses symlinks and
+  over-64-KiB payloads before parsing; BigBoy passed 1/1:
+  `evidence/WL-UX-013-2026-08-11-alert-relay-bound-r228.md`.
 - **Future health freshness:** `.50` passed refusal of zero/future-dated snapshots:
   `docs/platform/evidence/WL-UX-013-2026-08-10-future-health-freshness-r181.md`.
 - **Duplicate active-condition admission:** `.90` passed refusal of repeated active

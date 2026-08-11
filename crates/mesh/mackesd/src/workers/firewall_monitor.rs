@@ -27,7 +27,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -68,6 +68,11 @@ pub const ALERT_WINDOW_MS: u64 = 60 * 60 * 1_000;
 /// Retention rewrites are maintenance, not per-packet work. Rewriting the
 /// complete JSONL file once per hour is sufficient for the seven-day view.
 pub const RETENTION_SWEEP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
+
+/// Keep retention work bounded even if a damaged or hostile history file is
+/// presented to the monitor. A seven-day local denial history should remain
+/// well below this cap under normal operation.
+const MAX_FIREWALL_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 
 /// One denied-packet record.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -167,10 +172,33 @@ pub fn is_overlay_or_established(event: &DeniedEvent) -> bool {
 /// from `path`. Rewrites the file in-place.  No-ops when the file
 /// doesn't exist.
 pub fn trim_older_than(path: &Path, cutoff_ms: i64) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "firewall history is not a regular file",
+        ));
     }
-    let content = std::fs::read_to_string(path)?;
+    if metadata.len() > MAX_FIREWALL_HISTORY_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "firewall history exceeds its size bound",
+        ));
+    }
+    let mut content = String::new();
+    let file = std::fs::File::open(path)?;
+    file.take((MAX_FIREWALL_HISTORY_BYTES + 1) as u64)
+        .read_to_string(&mut content)?;
+    if content.len() > MAX_FIREWALL_HISTORY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "firewall history exceeds its size bound",
+        ));
+    }
     let kept: Vec<&str> = content
         .lines()
         .filter(|line| {
@@ -594,6 +622,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nonexistent.jsonl");
         trim_older_than(&path, 0).unwrap();
+    }
+
+    #[test]
+    fn trim_rejects_oversized_history_before_reading_or_rewriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fw.jsonl");
+        std::fs::write(&path, vec![b'x'; MAX_FIREWALL_HISTORY_BYTES + 1]).unwrap();
+        let error = trim_older_than(&path, 0).expect_err("oversized history must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (MAX_FIREWALL_HISTORY_BYTES + 1) as u64
+        );
     }
 
     // --- threshold_tripped ---
