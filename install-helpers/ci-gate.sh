@@ -572,9 +572,11 @@ verify_status() {
     # hexadecimal token. Accept the repository SHA-1 and SHA-256 forms only.
     (.sha | type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")) and
     (.short_sha | type == "string" and length >= 7 and startswith($sha_prefix)) and
-    (.job_id | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
-    (.build_host | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
-    (.build_slot | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
+    # Farm identities are copied into authenticated release evidence and must
+    # remain bounded before they reach that publisher-facing seam.
+    (.job_id | type == "string" and length <= 255 and test("^[^[:space:][:cntrl:]]+$")) and
+    (.build_host | type == "string" and length <= 255 and test("^[^[:space:][:cntrl:]]+$")) and
+    (.build_slot | type == "string" and length <= 255 and test("^[^[:space:][:cntrl:]]+$")) and
     (.stages | type == "object" and (keys == ["clippy", "coverage", "fmt", "policy", "test"]) and all(.[]; . == "pass")) and
     (.tests_passed | type == "number" and floor == . and . > 0) and
     (.tests_failed == 0) and
@@ -854,6 +856,23 @@ EOF
   set -e
   [ "$rc" -ne 0 ] || {
     echo "ci-gate.sh: SELF-TEST FAILED — duplicated producer identity was accepted" >&2
+    return 1
+  }
+  local oversized_identity oversized_identity_digest oversized_job
+  oversized_identity="$work/oversized-identity"
+  mkdir -p -- "$oversized_identity"
+  oversized_job="$(printf 'j%.0s' {1..256})"
+  sed "s/job_id=self-test-job/job_id=$oversized_job/" "$log" >"$oversized_identity/ci-gate.log"
+  oversized_identity_digest="$(file_sha256 "$oversized_identity/ci-gate.log")"
+  jq --arg job_id "$oversized_job" --arg digest "$oversized_identity_digest" \
+    '.job_id = $job_id | .evidence.gate_log.sha256 = $digest' \
+    "$status" >"$oversized_identity/status.json"
+  set +e
+  verify_status "$oversized_identity/status.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — oversized farm identity was accepted" >&2
     return 1
   }
 
