@@ -182,6 +182,7 @@ pub fn command_plan(op: DeviceControlOp, target: &DeviceTarget) -> Result<Vec<Ex
             let module = non_empty(target.driver.as_deref()).ok_or_else(|| {
                 "reload-module: the device has no bound driver/module to reload".to_string()
             })?;
+            validate_driver_name(module)?;
             // rmmod then modprobe — the honest module bounce. If the module is
             // in-use rmmod fails and the executor surfaces its stderr (§7).
             Ok(vec![
@@ -256,6 +257,7 @@ pub fn command_plan(op: DeviceControlOp, target: &DeviceTarget) -> Result<Vec<Ex
                                 op.as_str()
                             )
                         })?;
+                        validate_driver_name(driver)?;
                         let node = if up { "bind" } else { "unbind" };
                         let bind_path = prefix
                             .join("bus")
@@ -278,6 +280,27 @@ pub fn command_plan(op: DeviceControlOp, target: &DeviceTarget) -> Result<Vec<Ex
 /// as absent — an honest missing anchor, not a blank one).
 fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Admit only one bounded Linux module identifier before using provider data as
+/// either a fixed-command argument or a sysfs path component. In particular,
+/// leading option markers and path separators must never let a hostile provider
+/// reinterpret a privileged helper invocation or escape the driver directory.
+fn validate_driver_name(driver: &str) -> Result<(), String> {
+    let bytes = driver.as_bytes();
+    if bytes.len() > 63
+        || !bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!(
+            "driver `{driver}` is not a bounded kernel module identifier — refused before mutation"
+        ));
+    }
+    Ok(())
 }
 
 /// The device-control executor worker.
@@ -890,6 +913,24 @@ mod tests {
         let target = DeviceTarget::new("A thermal zone", category::SENSORS);
         let err = command_plan(DeviceControlOp::ReloadModule, &target).expect_err("no module");
         assert!(err.contains("no bound driver/module"), "{err}");
+    }
+
+    #[test]
+    fn hostile_provider_driver_cannot_escape_or_reinterpret_the_control_seam() {
+        let mut target = DeviceTarget {
+            name: "Hostile PCI function".into(),
+            category: category::PCI_DEVICES.into(),
+            sysfs_path: Some("/sys/bus/pci/devices/0000:02:00.0".into()),
+            driver: Some("../../tmp/forged-driver".into()),
+        };
+        let path_escape = command_plan(DeviceControlOp::Disable, &target)
+            .expect_err("a driver path escape must not produce a sysfs write");
+        assert!(path_escape.contains("bounded kernel module identifier"));
+
+        target.driver = Some("--force".into());
+        let option_injection = command_plan(DeviceControlOp::ReloadModule, &target)
+            .expect_err("a helper option must not be accepted as a module name");
+        assert!(option_injection.contains("bounded kernel module identifier"));
     }
 
     #[test]

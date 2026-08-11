@@ -17,9 +17,15 @@
 //! Save/load is [`serde`] (JSON) — [`Playlist::save`] / [`Playlist::load`] persist
 //! the queue to a path, and the type round-trips through any serde format.
 
-use std::path::Path;
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
+
+static PLAYLIST_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A `SplitMix64` step — a tiny, dependency-free PRNG for the seeded shuffle.
 ///
@@ -350,8 +356,22 @@ impl Playlist {
     /// of a [`Playlist`] cannot itself fail, but is mapped into an I/O error for a
     /// single return type).
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        let (mut staging, staging_path) = create_staging_file(path)?;
+        let result = (|| {
+            staging.write_all(json.as_bytes())?;
+            staging.sync_all()?;
+            drop(staging);
+            std::fs::rename(&staging_path, path)?;
+            #[cfg(unix)]
+            std::fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(staging_path);
+        }
+        result
     }
 
     /// Load a queue from a JSON `path` written by [`save`](Self::save) (load
@@ -361,9 +381,61 @@ impl Playlist {
     /// Returns the [`std::io::Error`] if the file cannot be read, or a mapped error
     /// if its contents are not a valid serialized [`Playlist`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let json = std::fs::read_to_string(path)?;
+        let path = path.as_ref();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+        }
+        let mut file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "playlist path is not a regular file",
+            ));
+        }
+        let mut json = String::new();
+        file.read_to_string(&mut json)?;
         serde_json::from_str(&json).map_err(std::io::Error::other)
     }
+}
+
+/// Create a unique same-directory staging inode for an atomic playlist save.
+fn create_staging_file(path: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "playlist path has no file name",
+        )
+    })?;
+    for _ in 0..128 {
+        let sequence = PLAYLIST_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staging_path = parent.join(format!(
+            ".{}.{}.{sequence}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+        {
+            Ok(file) => return Ok((file, staging_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate playlist staging file",
+    ))
 }
 
 /// Remap an index when the item at `from` is moved to `to` (used to keep the
@@ -668,5 +740,41 @@ mod tests {
         // The deterministic shuffle order survives the round-trip.
         let (mut a, mut b) = (pl, back);
         assert_eq!(play_order(&mut a), play_order(&mut b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cannot_substitute_or_redirect_playlist_persistence() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("playlist scratch directory");
+        let victim_path = dir.path().join("another-playlist.json");
+        let playlist_path = dir.path().join("playlist.json");
+        let victim = Playlist::from_items(items(&["victim-audio"]));
+        victim.save(&victim_path).expect("save victim playlist");
+        symlink(&victim_path, &playlist_path).expect("forge playlist symlink");
+
+        assert!(
+            Playlist::load(&playlist_path).is_err(),
+            "a forged path must not silently substitute another playlist"
+        );
+
+        let replacement = Playlist::from_items(items(&["authorized-audio"]));
+        replacement
+            .save(&playlist_path)
+            .expect("atomically replace forged path");
+
+        assert_eq!(Playlist::load(&victim_path).expect("victim intact"), victim);
+        assert_eq!(
+            Playlist::load(&playlist_path).expect("replacement playlist"),
+            replacement
+        );
+        assert!(
+            std::fs::symlink_metadata(&playlist_path)
+                .expect("replacement metadata")
+                .file_type()
+                .is_file(),
+            "save must replace the symlink inode, not write through its target"
+        );
     }
 }

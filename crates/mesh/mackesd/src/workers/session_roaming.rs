@@ -1263,6 +1263,26 @@ pub trait LiveNodes {
     fn live(&self) -> BTreeSet<NodeId>;
 }
 
+/// Admit one unambiguous snapshot of the persisted session plane.
+///
+/// A restarted worker must not choose between two rows carrying the same session
+/// id: iteration order is not recovery authority, and a last-wins fold could let
+/// a substituted row change the VM or client peer that roaming reconnects.  The
+/// caller defers the whole convergence tick until the store returns one row per
+/// id, preserving the previously published plane instead of adopting ambiguity.
+fn admit_session_roster(
+    rows: Vec<VdiSession>,
+) -> Result<BTreeMap<SessionId, VdiSession>, SessionId> {
+    let mut admitted = BTreeMap::new();
+    for session in rows {
+        let id = session.id.clone();
+        if admitted.insert(id.clone(), session).is_some() {
+            return Err(id);
+        }
+    }
+    Ok(admitted)
+}
+
 /// Production [`LiveNodes`]: the canonical etcd-first peer directory
 /// ([`crate::substrate::peers::read_directory`]), where liveness is the etcd
 /// keepalive lease (fs-union fallback under `workgroup_root`).
@@ -1734,7 +1754,16 @@ impl SessionRoamingWorker {
             return;
         }
         let observed: BTreeMap<SessionId, VdiSession> = match self.store.list() {
-            Ok(rows) => rows.into_iter().map(|s| (s.id.clone(), s)).collect(),
+            Ok(rows) => match admit_session_roster(rows) {
+                Ok(observed) => observed,
+                Err(session_id) => {
+                    tracing::warn!(
+                        %session_id,
+                        "session_roaming: duplicate persisted session identity; deferring"
+                    );
+                    return;
+                }
+            },
             Err(e @ SessionStoreError::IntegrationGated { .. }) => {
                 tracing::info!(error = %e, "session_roaming: session store integration-gated; deferring");
                 return;
@@ -1950,6 +1979,27 @@ mod tests {
 
     fn roster_of(sessions: &[VdiSession]) -> BTreeMap<SessionId, VdiSession> {
         sessions.iter().map(|s| (s.id.clone(), s.clone())).collect()
+    }
+
+    #[test]
+    fn restarted_roaming_cannot_adopt_a_substituted_duplicate_session_identity() {
+        let retained = sess(
+            "session-1",
+            "peer:workstation-a",
+            "peer:vm-host-a",
+            SessionState::Disconnected,
+        );
+        let mut substituted = retained.clone();
+        substituted.client_peer = "peer:hostile-workstation".into();
+        substituted.serving_peer = "peer:hostile-vm-host".into();
+        substituted.vm_id = "uuid-hostile-replacement".into();
+        substituted.updated_at_ms = retained.updated_at_ms.saturating_add(1);
+
+        assert_eq!(
+            admit_session_roster(vec![retained, substituted]),
+            Err("session-1".into()),
+            "restart recovery must defer instead of choosing a conflicting row by iteration order"
+        );
     }
 
     /// A live-node set of (bare) hostnames — the node-loss `live` argument.

@@ -30,7 +30,8 @@
 // (nursery) is over-eager on the small overlay mutators.
 #![allow(clippy::module_name_repetitions, clippy::missing_const_for_fn)]
 
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -166,14 +167,107 @@ pub(crate) fn apply_edits_to_text(text: &str, edits: &[TextEdit]) -> String {
 }
 
 /// Apply `edits` to a file that isn't open in the editor (the closed-buffer leg
-/// of a rename [`WorkspaceEdit`]): read, splice, write back.
+/// of a rename [`WorkspaceEdit`]): bind the read and write to one unaliased
+/// regular-file descriptor, splice, then synchronize that same inode. The path
+/// must still name the descriptor before and after mutation, so an LSP reply or
+/// concurrent replacement cannot redirect a native Editor rename into another
+/// file.
 ///
 /// # Errors
 /// Any [`io::Error`] from reading or writing `path`.
 pub(crate) fn apply_edits_on_disk(path: &Path, edits: &[TextEdit]) -> io::Result<()> {
-    let text = std::fs::read_to_string(path)?;
+    let mut file = open_closed_workspace_file(path)?;
+    validate_closed_workspace_file(&file, path)?;
+
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    validate_closed_workspace_file(&file, path)?;
     let updated = apply_edits_to_text(&text, edits);
-    std::fs::write(path, updated)
+
+    // Revalidate immediately before the destructive step. A replacement after
+    // this point still cannot receive bytes: all writes remain descriptor-bound.
+    validate_closed_workspace_file(&file, path)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(updated.as_bytes())?;
+    file.sync_data()?;
+    validate_closed_workspace_file(&file, path)
+}
+
+/// Open an existing closed workspace file without following a substituted final
+/// symlink. Rename edits never create a path: only a file the language server
+/// observed may be mutated.
+#[cfg(target_os = "linux")]
+fn open_closed_workspace_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const O_NOFOLLOW: i32 = 0o400000;
+    const O_CLOEXEC: i32 = 0o2000000;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+        .open(path)
+}
+
+/// Development fallback for non-Linux targets. Production Linux uses the
+/// race-resistant no-follow open above.
+#[cfg(not(target_os = "linux"))]
+fn open_closed_workspace_file(path: &Path) -> io::Result<File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing symlinked closed Editor document {}",
+                path.display()
+            ),
+        ));
+    }
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
+/// Prove that `path` still names the exact single-link regular file opened for
+/// the closed-buffer workspace edit.
+fn validate_closed_workspace_file(file: &File, path: &Path) -> io::Result<()> {
+    let descriptor = file.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    if !descriptor.is_file() || !current.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "closed Editor document is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if descriptor.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "closed Editor document has external aliases: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if descriptor.dev() != current.dev() || descriptor.ino() != current.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "closed Editor document changed during workspace edit: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +737,46 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file).expect("read back"),
             "let bar = 1;\n"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_closed_workspace_path_cannot_redirect_lsp_rename() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "mde-editor-lspnav-hostile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).expect("temp dir");
+        let closed = base.join("closed.rs");
+        let displaced = base.join("displaced.rs");
+        let outside = base.join("outside.rs");
+        std::fs::write(&closed, "let foo = 1;\n").expect("seed workspace file");
+        std::fs::write(&outside, "let secret = foo;\n").expect("seed outside file");
+
+        std::fs::rename(&closed, &displaced).expect("replace workspace inode");
+        symlink(&outside, &closed).expect("redirect workspace path");
+
+        assert!(
+            apply_edits_on_disk(&closed, &[edit(0, 4, 7, "bar")]).is_err(),
+            "a replaced workspace path must lose rename authority"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside file"),
+            "let secret = foo;\n",
+            "the replacement target must not receive Editor bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&displaced).expect("read displaced file"),
+            "let foo = 1;\n",
+            "the displaced workspace inode must also remain untouched"
         );
         std::fs::remove_dir_all(&base).ok();
     }

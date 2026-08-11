@@ -235,17 +235,40 @@ fn probe_one(
 }
 
 /// Read peers from the etcd substrate when provisioned, else the replicated fs
-/// directory (`<workgroup>/peers/*.json`) — the same etcd-or-fs precedence the
-/// health reconciler uses, so the probe sees the canonical directory.
+/// directory (`<workgroup>/peers/*.json`). Once etcd is configured, an outage
+/// fails closed instead of reviving a stale filesystem roster: a peer returning
+/// after boot/resume must be observed by the current coordination authority
+/// before it can regain lighthouse-health or uptime authority.
 #[must_use]
 fn read_directory_peers(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
     let eps = crate::substrate::etcd::default_endpoints();
-    if !eps.is_empty() {
-        if let Some(rows) = crate::substrate::peers::read_peers_blocking(&eps) {
-            return rows;
-        }
+    if eps.is_empty() {
+        return select_directory_peers(DirectoryPeerSource::Filesystem, || {
+            peers::read_peers(&peers::peers_dir(workgroup_root))
+        });
     }
-    peers::read_peers(&peers::peers_dir(workgroup_root))
+    select_directory_peers(
+        DirectoryPeerSource::Etcd(crate::substrate::peers::read_peers_blocking(&eps)),
+        || peers::read_peers(&peers::peers_dir(workgroup_root)),
+    )
+}
+
+enum DirectoryPeerSource {
+    Filesystem,
+    Etcd(Option<Vec<PeerRecord>>),
+}
+
+/// Resolve the configured directory authority without allowing an unavailable
+/// etcd source to fall through to retained filesystem rows. The closure keeps
+/// the fallback lazy, so configured nodes do not even read stale rows.
+fn select_directory_peers(
+    source: DirectoryPeerSource,
+    read_filesystem: impl FnOnce() -> Vec<PeerRecord>,
+) -> Vec<PeerRecord> {
+    match source {
+        DirectoryPeerSource::Filesystem => read_filesystem(),
+        DirectoryPeerSource::Etcd(rows) => rows.unwrap_or_default(),
+    }
 }
 
 /// Publish one probe to `compute/lighthouse-probe/<name>` in-process (perf-10 /
@@ -418,6 +441,17 @@ mod tests {
         assert!(!seen.contains_key("relic"));
         // No nebula-cert in the test env ⇒ cert expiry degrades to None.
         assert!(probes.iter().all(|p| p.cert_expiry_days.is_none()));
+    }
+
+    #[test]
+    fn returned_peer_cannot_regain_lighthouse_authority_from_stale_fs_during_etcd_outage() {
+        let stale = lighthouse("retired-lighthouse", now_ms());
+        let peers = select_directory_peers(DirectoryPeerSource::Etcd(None), || vec![stale]);
+
+        assert!(
+            peers.is_empty(),
+            "configured etcd outage must fail closed instead of adopting stale filesystem peers"
+        );
     }
 
     #[tokio::test]

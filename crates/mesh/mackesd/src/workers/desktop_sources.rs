@@ -1312,6 +1312,17 @@ pub fn peer_reachability(health: &str, stale: bool) -> (Reachability, Option<Str
     }
 }
 
+/// Reject peer heartbeat evidence that is absent, from the future, or outside
+/// the bounded roster window. `PeerRecord::is_stale` deliberately uses
+/// saturating age arithmetic, which is useful to callers tolerating clock
+/// skew but would otherwise make a future-dated record look freshly observed
+/// at this resource-authority boundary.
+fn peer_record_is_stale_at(rec: &PeerRecord, observed_now_ms: u64) -> bool {
+    rec.last_seen_ms == 0
+        || rec.last_seen_ms > observed_now_ms
+        || observed_now_ms.saturating_sub(rec.last_seen_ms) > PEER_STALE_MS
+}
+
 /// Lift the advertised desktops out of one peer's published record.
 ///
 /// Yields the seat when its RDP/VNC listeners are advertised. VM desktops are
@@ -1329,7 +1340,8 @@ pub fn advertised_from_peer(rec: &PeerRecord, self_node: &str) -> Vec<Advertised
         .overlay_ip
         .clone()
         .unwrap_or_else(|| format!("{}.{}", rec.hostname, super::mesh_dns::MESH_SUFFIX));
-    let (reachability, reason) = peer_reachability(&rec.health, rec.is_stale(PEER_STALE_MS));
+    let (reachability, reason) =
+        peer_reachability(&rec.health, peer_record_is_stale_at(rec, now_ms()));
 
     let mut out = Vec::new();
     let mut seat = Vec::new();
@@ -1377,7 +1389,8 @@ pub fn advertised_workloads_from_peer(
         .overlay_ip
         .clone()
         .unwrap_or_else(|| format!("{}.{}", rec.hostname, super::mesh_dns::MESH_SUFFIX));
-    let (reachability, reason) = peer_reachability(&rec.health, rec.is_stale(PEER_STALE_MS));
+    let (reachability, reason) =
+        peer_reachability(&rec.health, peer_record_is_stale_at(rec, now_ms()));
     instances_from_snapshot(snapshot)
         .into_iter()
         .map(|vm| {
@@ -2016,10 +2029,10 @@ pub fn resolve_store_root() -> PathBuf {
 ///
 /// 1. Peer-advertised desktops seed the list (the roster is the reachability
 ///    authority for mesh nodes).
-/// 2. An mDNS endpoint that resolves to a known peer **seat** (same address,
-///    or its instance name matches the node) folds its protocol into that
-///    card instead of duplicating it; an unknown LAN endpoint becomes its own
-///    card.
+/// 2. An mDNS endpoint that resolves to a known peer **seat** at the same
+///    address folds its protocol into that card instead of duplicating it; an
+///    instance-name match alone is not identity authority, and an unknown LAN
+///    endpoint becomes its own card.
 /// 3. Local VM sources append as-is (unique per `(node, name)` by
 ///    construction).
 /// 4. A manual source whose `(host, port, protocol)` is already offered is
@@ -2037,10 +2050,12 @@ pub fn merge_sources(
     let mut out: Vec<DesktopSource> = advertised.iter().map(source_from_advertised).collect();
 
     for ep in mdns {
-        let seat = out.iter().position(|s| {
-            s.id.starts_with("peer:")
-                && (s.host == ep.host || s.node.eq_ignore_ascii_case(&ep.instance))
-        });
+        // mDNS instance names are unauthenticated display metadata. Letting a
+        // name collision enrich an authenticated mesh card would allow an
+        // unrelated LAN endpoint to fabricate a transport for that peer.
+        let seat = out
+            .iter()
+            .position(|s| s.id.starts_with("peer:") && s.host == ep.host);
         match seat {
             Some(i) => {
                 if !out[i].protocols.iter().any(|p| p.protocol == ep.protocol) {
@@ -3035,8 +3050,9 @@ impl DesktopSourcesWorker {
         Err(last_error.unwrap_or_else(|| "desktop Bus root unresolved".to_string()))
     }
 
-    /// Add a manual source (idempotent on the id). Returns whether the durable
-    /// set changed; the in-memory projection commits only after persistence.
+    /// Add or replace a manual source by stable endpoint identity. Exact replay
+    /// is idempotent, while changed display metadata replaces the durable row;
+    /// the in-memory projection commits only after persistence.
     fn handle_add(&mut self, req: ManualSource) -> bool {
         self.handle_add_with(req, save_manual_sources)
     }
@@ -3046,11 +3062,15 @@ impl DesktopSourcesWorker {
         req: ManualSource,
         persist: impl FnOnce(&Path, &[ManualSource]) -> std::io::Result<()>,
     ) -> bool {
-        if self.manual.iter().any(|m| m.id() == req.id()) {
-            return false;
-        }
         let mut candidate = self.manual.clone();
-        candidate.push(req);
+        if let Some(index) = candidate.iter().position(|source| source.id() == req.id()) {
+            if candidate[index] == req {
+                return false;
+            }
+            candidate[index] = req;
+        } else {
+            candidate.push(req);
+        }
         self.commit_manual(candidate, persist)
     }
 
@@ -3854,6 +3874,30 @@ mod tests {
         let ads = advertised_from_peer(&rec, "elm");
         assert_eq!(ads[0].reachability, Reachability::Unreachable);
         assert_eq!(ads[0].reason.as_deref(), Some("peer heartbeat stale"));
+    }
+
+    #[test]
+    fn future_peer_heartbeat_cannot_authorize_seat_or_workload_resources() {
+        let mut rec = peer("oak", "healthy", Some("10.42.0.7"), true, false);
+        rec.last_seen_ms = now_ms().saturating_add(60_000);
+
+        let seat = advertised_from_peer(&rec, "elm")
+            .into_iter()
+            .next()
+            .expect("advertised seat remains visible for recovery context");
+        assert_eq!(seat.reachability, Reachability::Unreachable);
+        assert_eq!(seat.reason.as_deref(), Some("peer heartbeat stale"));
+
+        let workload = advertised_workloads_from_peer(
+            &rec,
+            &workload_snapshot("oak", &[("win11", "running")]),
+            "elm",
+        )
+        .into_iter()
+        .next()
+        .expect("advertised workload remains visible for recovery context");
+        assert_eq!(workload.reachability, Reachability::Unreachable);
+        assert_eq!(workload.reason.as_deref(), Some("peer heartbeat stale"));
     }
 
     // ── lane 2: the mDNS fold ──
@@ -4685,15 +4729,52 @@ mod tests {
                 ProtocolOffer::new(DesktopProtocol::Vnc, Some(5901)),
             ]
         );
-        // A protocol the card already offers isn't duplicated.
+        // A protocol the same endpoint already offers isn't duplicated.
         let merged = merge_sources(
             &[ad_seat("oak", "10.42.0.7")],
-            &[ep("OAK", "192.168.1.9", 3390, DesktopProtocol::Rdp)],
+            &[ep("Oak desktop", "10.42.0.7", 3390, DesktopProtocol::Rdp)],
             &[],
             &[],
         );
-        assert_eq!(merged.len(), 1, "instance-name match (case-insensitive)");
+        assert_eq!(merged.len(), 1, "endpoint-address match");
         assert_eq!(merged[0].protocols.len(), 1);
+    }
+
+    #[test]
+    fn mdns_instance_collision_cannot_fabricate_a_mesh_peer_transport() {
+        let merged = merge_sources(
+            &[ad_seat("oak", "10.42.0.7")],
+            &[ep("OAK", "192.168.1.9", 5901, DesktopProtocol::Vnc)],
+            &[],
+            &[],
+        );
+
+        let mesh = merged
+            .iter()
+            .find(|source| source.id == "peer:oak")
+            .expect("authenticated mesh source remains present");
+        assert_eq!(
+            mesh.protocols,
+            vec![ProtocolOffer::new(DesktopProtocol::Rdp, Some(3389))],
+            "an mDNS display-name collision must not add attacker transport authority",
+        );
+
+        let lan = merged
+            .iter()
+            .find(|source| source.origin == SourceOrigin::Mdns)
+            .expect("colliding LAN observation remains separately attributable");
+        assert_eq!(lan.host, "192.168.1.9");
+        let card = resource_card_from_desktop_source(lan, RESOURCE_NOW)
+            .expect("separate LAN evidence remains a valid resource");
+        let connect = card
+            .actions
+            .iter()
+            .find(|action| action.verb == ResourceActionVerb::Connect)
+            .expect("LAN resource exposes its own typed action");
+        assert_eq!(
+            connect.availability.status,
+            ActionAvailabilityStatus::RequiresApproval,
+        );
     }
 
     #[test]
@@ -5526,6 +5607,42 @@ mod tests {
         let (changed, _) = w.drain_actions(&persist);
         assert!(!changed);
         assert_eq!(w.manual.len(), 1);
+    }
+
+    #[test]
+    fn add_source_verb_replaces_metadata_for_the_same_stable_identity() {
+        let (_bus, persist) = temp_persist();
+        let wg = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut worker = worker_at(wg.path(), store.path());
+
+        for (name, nonce) in [("Old label", "replace-old"), ("Current label", "replace-new")] {
+            let request = format!(
+                r#"{{"name":"{name}","host":"192.168.1.50","port":3389,"protocol":"rdp","schema_version":1}}"#
+            );
+            persist
+                .write(
+                    ADD_SOURCE_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&authorized_add_body(&request, nonce)),
+                )
+                .unwrap();
+            let (changed, refresh) = worker.drain_actions(&persist);
+            assert!(changed, "new metadata must replace the existing identity");
+            assert!(!refresh);
+        }
+
+        assert_eq!(worker.manual.len(), 1, "replacement must not duplicate identity");
+        assert_eq!(worker.manual[0].name.as_deref(), Some("Current label"));
+        assert_eq!(load_manual_sources(store.path()), worker.manual);
+
+        let sources = worker.collect_sources(None, &[]);
+        assert!(worker.publish(&persist, sources, false));
+        let state = latest_state(&persist);
+        assert_eq!(state.sources.len(), 1);
+        assert_eq!(state.sources[0].id, "manual:192.168.1.50:3389:rdp");
+        assert_eq!(state.sources[0].name, "Current label");
     }
 
     #[test]

@@ -74,9 +74,10 @@ use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
     parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, ApprovalState, CellLink,
-    DeviceProbeStatus, GpsFix, ImuSample, ManagerSet, ManagerSetState, SnapshotProvenance,
-    SnapshotSource, VehicleReply, VehicleState, VehicleStateV2, VehicleTelem, WanStatus,
-    VEHICLE_ACTION_PREFIX, VEHICLE_STATE_V2_SCHEMA_VERSION,
+    DeviceProbeStatus, FreshnessState, GpsFix, ImuSample, ManagerSet, ManagerSetState, RadioId,
+    RadioInventory, RadioOperation, SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState,
+    VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
+    VEHICLE_STATE_V2_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -386,15 +387,19 @@ impl SshHttpProbe {
     /// Run `curl` with `args`, returning stdout. An empty `Ok("")` is a legitimate
     /// (empty-page) result; only a spawn failure / non-zero exit is an `Err`.
     fn curl(args: &[&str]) -> io::Result<String> {
-        let out = Command::new("curl")
+        let mut command = Command::new("curl");
+        command
             .args([
                 "--connect-timeout",
                 CURL_CONNECT_TIMEOUT_SECONDS,
                 "--max-time",
                 CURL_MAX_TIME_SECONDS,
             ])
-            .args(args)
-            .output()?;
+            .args(args);
+        let out = crate::workers::proc::output_with_timeout(
+            command,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        )?;
         if !out.status.success() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -2116,6 +2121,49 @@ fn vehicle_state_content_eq(left: &VehicleState, right: &VehicleState) -> bool {
     left == right
 }
 
+/// Retained WAN metrics are useful diagnostics during a transient MG90 probe
+/// outage, but they are not a live radio-health observation. The v1 mirror has
+/// no per-domain stale representation, so make the additive v2 projection
+/// explicitly stale and revoke every retained active-path claim.
+fn mark_retained_radio_state_stale(state: &VehicleState, snapshot: &mut VehicleStateV2) {
+    if !state
+        .gaps
+        .iter()
+        .any(|gap| gap.contains("wan status unavailable"))
+    {
+        return;
+    }
+
+    let mut radios = snapshot.radios.as_slice().to_vec();
+    let mut retained_radio = false;
+    for radio in &mut radios {
+        if !matches!(
+            &radio.id,
+            RadioId::CellularA | RadioId::CellularB | RadioId::WifiA | RadioId::WifiB
+        ) {
+            continue;
+        }
+        if radio.age_ms.is_some()
+            || radio.operation != RadioOperation::Unknown
+            || radio.active_path
+        {
+            radio.operation = RadioOperation::Stale;
+            radio.active_path = false;
+            // The legacy WAN plane has no source timestamp. Zero would falsely
+            // claim this retained sample was observed by the failed refresh.
+            radio.age_ms = None;
+            retained_radio = true;
+        }
+    }
+    if retained_radio {
+        snapshot.radios = RadioInventory::new(radios)
+            .expect("the admitted native radio inventory remains bounded and unique");
+        snapshot.freshness.radios.state = FreshnessState::Stale;
+        snapshot.freshness.radios.age_ms = None;
+        snapshot.freshness.radios.reason = Some("wan-probe-unavailable-retained".to_string());
+    }
+}
+
 fn no_source_reason_from_roster_error(error: VehicleRosterError) -> VehicleNoSourceReason {
     match error {
         VehicleRosterError::IdentityMismatch { reported, .. } => {
@@ -2141,6 +2189,8 @@ struct VehicleCurrentStatusObservation {
 
 #[derive(Debug)]
 struct VehicleEnrichmentObservation {
+    source_before: Option<String>,
+    source_after: Option<String>,
     gps: Option<GpsFix>,
     imu: Option<ImuSample>,
     gps_gaps: Vec<String>,
@@ -2148,6 +2198,15 @@ struct VehicleEnrichmentObservation {
     wan_gaps: Vec<String>,
     obd_probe_status: DeviceProbeStatus,
     obd_gaps: Vec<String>,
+}
+
+fn probe_enrichment_source(probe: &dyn VehicleProbe) -> Option<String> {
+    probe
+        .read_lci_general()
+        .ok()
+        .map(|general| strip_html(&general))
+        .and_then(|general| find_token_after(&general, "ESN"))
+        .filter(|source| !source.trim().is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -2245,6 +2304,20 @@ impl VehicleRuntimeSnapshot {
     }
 
     fn apply_enrichment(&mut self, enrichment: VehicleEnrichmentObservation) {
+        let source_matches = self.esn.as_deref().is_some_and(|expected| {
+            enrichment.source_before.as_deref() == Some(expected)
+                && enrichment.source_after.as_deref() == Some(expected)
+        });
+        if !source_matches {
+            // Slow GNSS/WAN/application reads are a separate task from the
+            // current-status generation. Revalidate the authoritative LCI ESN
+            // on both sides of that batch so an endpoint replacement cannot
+            // fold another MG90's telemetry into the retained source.
+            self.mark_enrichment_unavailable(
+                "MG90 source identity changed or was unavailable during enrichment",
+            );
+            return;
+        }
         if let Some(gps) = enrichment.gps {
             self.enrichment_gps = Some(gps);
         }
@@ -3119,6 +3192,7 @@ impl VehicleWorker {
     }
 
     fn probe_enrichment(probe: &dyn VehicleProbe) -> VehicleEnrichmentObservation {
+        let source_before = probe_enrichment_source(probe);
         let mut gps_gaps = Vec::new();
         let (gps, imu) = match probe.read_gps_nmea() {
             Ok(nmea) => {
@@ -3187,7 +3261,10 @@ impl VehicleWorker {
             }
         };
 
+        let source_after = probe_enrichment_source(probe);
         VehicleEnrichmentObservation {
+            source_before,
+            source_after,
             gps,
             imu,
             gps_gaps,
@@ -3413,7 +3490,7 @@ impl VehicleWorker {
         sequence: u64,
     ) -> VehicleStateV2 {
         let published_at_ms = now_ms();
-        VehicleStateV2::from_v1(
+        let mut snapshot = VehicleStateV2::from_v1(
             state,
             self.host.clone(),
             sequence,
@@ -3424,7 +3501,9 @@ impl VehicleWorker {
                 source_id: Some(self.host.clone()),
                 relay: None,
             },
-        )
+        );
+        mark_retained_radio_state_stale(state, &mut snapshot);
+        snapshot
     }
 
     fn snapshot_v2(&self, state: &VehicleState) -> VehicleStateV2 {
@@ -5573,6 +5652,44 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     #[test]
+    fn replaced_mg90_source_cannot_merge_enrichment_into_retained_generation() {
+        let current = VehicleWorker::probe_current_status("rig-1", &FakeProbe::real());
+        let mut runtime = VehicleRuntimeSnapshot::from_current("rig-1", current);
+        runtime.apply_enrichment(VehicleWorker::probe_enrichment(&FakeProbe::real()));
+        let retained_gps = runtime.enrichment_gps.clone();
+        let retained_wan = runtime.wan.clone();
+
+        // The configured endpoint now resolves to a different physical MG90.
+        // Its GNSS and WAN payloads are individually valid and would otherwise
+        // be folded beneath the first gateway's retained ESN.
+        let mut replacement = FakeProbe::real();
+        replacement.general = replacement
+            .general
+            .map(|html| html.replace("ND84720078011035", "ND84720078011999"));
+        replacement.nmea = replacement
+            .nmea
+            .map(|nmea| nmea.replace("3210.07993", "4010.07993"));
+        replacement.wan = replacement
+            .wan
+            .map(|wan| wan.replace("CellularA", "WiFi"));
+
+        runtime.apply_enrichment(VehicleWorker::probe_enrichment(&replacement));
+        let refused = runtime.render();
+
+        assert_eq!(
+            replacement.general_calls(),
+            2,
+            "the slow batch is identity-bracketed"
+        );
+        assert_eq!(runtime.enrichment_gps, retained_gps);
+        assert_eq!(runtime.wan, retained_wan);
+        assert_eq!(refused.esn, "ND84720078011035");
+        assert!(refused.gaps.iter().any(|gap| {
+            gap.contains("MG90 source identity changed or was unavailable during enrichment")
+        }));
+    }
+
+    #[test]
     fn failed_enrichment_retains_last_sourced_domains_with_explicit_gaps() {
         let current_probe = FakeProbe::real();
         let current = VehicleWorker::probe_current_status("rig-1", &current_probe);
@@ -5612,6 +5729,88 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             .iter()
             .any(|gap| gap.contains("OBD application unavailable")
                 && gap.contains("application timeout")));
+    }
+
+    #[test]
+    fn failed_radio_refresh_cannot_republish_retained_link_as_live() {
+        let worker = worker();
+        let current = VehicleWorker::probe_current_status("rig-1", &FakeProbe::real());
+        let mut runtime = VehicleRuntimeSnapshot::from_current("rig-1", current);
+        runtime.apply_enrichment(VehicleWorker::probe_enrichment(&FakeProbe::real()));
+
+        let fresh = worker.snapshot_v2(&runtime.render());
+        let fresh_cellular = fresh
+            .radios
+            .by_id(&RadioId::CellularA)
+            .expect("native cellular row");
+        assert_eq!(fresh_cellular.operation, RadioOperation::Active);
+        assert!(fresh_cellular.active_path);
+        assert_eq!(fresh.freshness.radios.state, FreshnessState::Fresh);
+
+        // The gateway anchor remains reachable, but the authoritative WAN
+        // refresh fails. Retained diagnostics must not be stamped as a new live
+        // radio observation by the next v2 publication.
+        let failed = FakeProbe {
+            wan: Err("hostile replay after radio timeout".to_string()),
+            ..FakeProbe::real()
+        };
+        runtime.apply_enrichment(VehicleWorker::probe_enrichment(&failed));
+        let stale = worker.snapshot_v2(&runtime.render());
+        let stale_cellular = stale
+            .radios
+            .by_id(&RadioId::CellularA)
+            .expect("retained cellular row");
+
+        assert_eq!(stale_cellular.operation, RadioOperation::Stale);
+        assert!(!stale_cellular.active_path);
+        assert_eq!(stale_cellular.age_ms, None);
+        assert_eq!(stale.freshness.radios.state, FreshnessState::Stale);
+        assert_eq!(
+            stale.freshness.radios.reason.as_deref(),
+            Some("wan-probe-unavailable-retained")
+        );
+        assert_eq!(
+            stale_cellular.metrics, fresh_cellular.metrics,
+            "retained diagnostics remain visible without claiming fresh health"
+        );
+
+        // The compatibility mapper projects the single legacy Wi-Fi WAN label
+        // onto both native Wi-Fi slots, including an otherwise unknown B row.
+        // A failed refresh must revoke that active-path bit too; operation/age
+        // alone are insufficient evidence that a row carries retained truth.
+        let wifi_probe = FakeProbe {
+            wan: Ok(FakeProbe::real()
+                .wan
+                .expect("real WAN fixture")
+                .replace("CellularA", "WiFi")
+                .replace("Disabled", "Active")),
+            ..FakeProbe::real()
+        };
+        let current = VehicleWorker::probe_current_status("rig-1", &wifi_probe);
+        let mut wifi_runtime = VehicleRuntimeSnapshot::from_current("rig-1", current);
+        wifi_runtime.apply_enrichment(VehicleWorker::probe_enrichment(&wifi_probe));
+        let fresh_wifi = worker.snapshot_v2(&wifi_runtime.render());
+        assert!(
+            fresh_wifi
+                .radios
+                .by_id(&RadioId::WifiB)
+                .expect("native Wi-Fi B row")
+                .active_path,
+            "hostile compatibility row must exercise active-path-only retention"
+        );
+
+        wifi_runtime.apply_enrichment(VehicleWorker::probe_enrichment(&failed));
+        let stale_wifi = worker.snapshot_v2(&wifi_runtime.render());
+        for id in [RadioId::WifiA, RadioId::WifiB] {
+            let radio = stale_wifi.radios.by_id(&id).expect("native Wi-Fi row");
+            assert_eq!(radio.operation, RadioOperation::Stale);
+            assert!(
+                !radio.active_path,
+                "{} retained an active-path claim",
+                id.as_str()
+            );
+            assert_eq!(radio.age_ms, None);
+        }
     }
 
     #[test]
@@ -6041,6 +6240,17 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             read_root_password_bytes(file).is_none(),
             "password bytes beyond the bounded read must be rejected"
         );
+    }
+
+    #[test]
+    fn vehicle_curl_uses_bounded_subprocess_capture() {
+        let production = include_str!("vehicle.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(production.contains("output_with_timeout"));
+        assert!(production.contains("DEFAULT_CMD_TIMEOUT"));
+        assert!(!production.contains(".args(args)\n            .output()?"));
     }
 
     #[cfg(target_os = "linux")]

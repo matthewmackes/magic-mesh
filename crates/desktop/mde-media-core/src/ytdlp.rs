@@ -78,6 +78,9 @@ pub enum YtDlpError {
     /// `yt-dlp` ran and parsed, but exposed no playable media URL.
     #[error("yt-dlp resolved no playable media URL")]
     NoMedia,
+    /// A page or resolved-media URL has an ambiguous or unsupported authority.
+    #[error("yt-dlp URL is not an unambiguous credential-free HTTP(S) URL")]
+    InvalidUrl,
 }
 
 /// The injectable `yt-dlp` seam (MEDIA-12).
@@ -114,6 +117,9 @@ pub trait YtDlpResolver {
 /// [`YtDlpError::Parse`] when `body` is not JSON; [`YtDlpError::NoMedia`] when no
 /// direct URL is present.
 pub fn parse_dump_json(source_url: &str, body: &str) -> Result<ResolvedMedia, YtDlpError> {
+    if !is_safe_http_url(source_url) {
+        return Err(YtDlpError::InvalidUrl);
+    }
     let root: Value = serde_json::from_str(body).map_err(|e| YtDlpError::Parse(e.to_string()))?;
     let title = root.get("title").and_then(Value::as_str).map(str::to_owned);
 
@@ -144,10 +150,29 @@ pub fn parse_dump_json(source_url: &str, body: &str) -> Result<ResolvedMedia, Yt
 fn push_url(urls: &mut Vec<String>, value: Option<&Value>) {
     if let Some(url) = value.and_then(Value::as_str) {
         let url = url.trim();
-        if !url.is_empty() && !urls.iter().any(|seen| seen == url) {
+        if is_safe_http_url(url) && !urls.iter().any(|seen| seen == url) {
             urls.push(url.to_owned());
         }
     }
+}
+
+/// Admit only an unambiguous, credential-free HTTP(S) authority. Both page URLs
+/// entering `yt-dlp` and provider-controlled direct URLs leaving it cross this
+/// boundary before any subprocess or player can contact them.
+fn is_safe_http_url(url: &str) -> bool {
+    if url.is_empty() || url.trim() != url || url.chars().any(|character| character.is_control()) {
+        return false;
+    }
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains(['@', '\\', '%'])
+        && !authority.chars().any(char::is_whitespace)
 }
 
 /// The real `yt-dlp` resolver — shells out to the bundled tool (MEDIA-12).
@@ -183,6 +208,9 @@ impl YtDlpResolver for YtDlpCli {
     }
 
     fn resolve(&self, page_url: &str) -> Result<ResolvedMedia, YtDlpError> {
+        if !is_safe_http_url(page_url) {
+            return Err(YtDlpError::InvalidUrl);
+        }
         // `--dump-single-json` resolves + prints the metadata without downloading;
         // `-f best/bestvideo+bestaudio` prefers a single progressive stream, falling
         // back to the separate video+audio streams `parse_dump_json` also gathers.
@@ -353,5 +381,27 @@ mod tests {
         let empty = ResolvedMedia::default();
         assert!(empty.is_empty());
         assert_eq!(empty.primary(), None);
+    }
+
+    #[test]
+    fn ambiguous_authority_cannot_cross_the_ytdlp_boundary() {
+        assert_eq!(
+            YtDlpCli.resolve("https://trusted.mesh@attacker.example/watch"),
+            Err(YtDlpError::InvalidUrl)
+        );
+
+        let body = r#"{
+          "title": "Hostile projection",
+          "url": "file:///etc/shadow",
+          "requested_formats": [
+            { "url": "https://trusted.mesh@attacker.example/video" },
+            { "url": "https://cdn.mesh/video.mp4?token=a%2Fb" }
+          ]
+        }"#;
+        let resolved = parse_dump_json("https://video.mesh/watch", body).expect("safe result");
+        assert_eq!(
+            resolved.urls,
+            vec!["https://cdn.mesh/video.mp4?token=a%2Fb"]
+        );
     }
 }

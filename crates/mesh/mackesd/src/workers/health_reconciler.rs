@@ -45,13 +45,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mackes_mesh_types::health::{
-    node_health_topic, NodeHealthState, NodeHealthValidationError, MAX_HEALTH_ID_BYTES,
+    node_health_topic, HealthCondition, NodeAvailabilityAssessment, NodeAvailabilityIntent,
+    NodeAvailabilityPolicy, NodeHealthState, NodeHealthValidationError, MAX_HEALTH_ID_BYTES,
 };
 use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
 use crate::ipc::nebula::{NebulaSignal, SignalSenderSlot};
 use crate::telemetry::{health_state_from_age, heartbeat_path, HealthState, Heartbeat};
+use crate::workers::node_availability::{
+    runtime_availability_path, MAX_LIFECYCLE_INTENT_RECORD_BYTES,
+};
 
 /// Default tick cadence. 5 s gives a healthy→degraded transition
 /// of ≤ 15 s after a peer's mackesd goes silent (10 s heartbeat
@@ -106,6 +110,12 @@ pub enum HealthPublicationRejection {
         /// Publication timestamp carried by the rejected candidate.
         candidate: u64,
     },
+    /// A forward publication dropped an active condition or substituted its
+    /// stable provenance instead of carrying it forward or resolving it.
+    ConditionLifecycleDiscontinuity {
+        /// Stable condition id whose history was broken.
+        condition_id: String,
+    },
 }
 
 impl fmt::Display for HealthPublicationRejection {
@@ -125,6 +135,10 @@ impl fmt::Display for HealthPublicationRejection {
             } => write!(
                 formatter,
                 "node-health publication time rolled back: retained {retained}, candidate {candidate}"
+            ),
+            Self::ConditionLifecycleDiscontinuity { condition_id } => write!(
+                formatter,
+                "node-health condition lifecycle was discontinuous: {condition_id}"
             ),
         }
     }
@@ -195,9 +209,54 @@ impl HealthPublicationLedger {
                     candidate: candidate.published_at_ms,
                 });
             }
+            validate_active_condition_continuity(previous, candidate)?;
         }
         Ok(())
     }
+}
+
+/// A generation boundary must not erase an outage by omission. Every active
+/// condition in the retained publication has a stable lifecycle identity and
+/// must either remain active or appear in resolved history. Its producer,
+/// component, requirement class, and original start time are provenance, not
+/// fields a newer generation may silently substitute.
+fn validate_active_condition_continuity(
+    previous: &NodeHealthState,
+    candidate: &NodeHealthState,
+) -> Result<(), HealthPublicationRejection> {
+    for retained in &previous.active_conditions {
+        let successor = candidate
+            .active_conditions
+            .iter()
+            .chain(candidate.resolved_conditions.iter())
+            .find(|condition| {
+                condition.id == retained.id && condition.scope == retained.scope
+            });
+        let continuous = successor.is_some_and(|condition| {
+            same_condition_provenance(retained, condition)
+                && condition.last_observed_ms >= retained.last_observed_ms
+                && condition.evidence.observed_at_ms >= retained.evidence.observed_at_ms
+                && condition
+                    .resolved_at_ms
+                    .is_none_or(|resolved_at_ms| resolved_at_ms >= retained.last_observed_ms)
+        });
+        if !continuous {
+            return Err(
+                HealthPublicationRejection::ConditionLifecycleDiscontinuity {
+                    condition_id: retained.id.clone(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn same_condition_provenance(previous: &HealthCondition, candidate: &HealthCondition) -> bool {
+    candidate.component == previous.component
+        && candidate.source == previous.source
+        && candidate.requirement == previous.requirement
+        && candidate.evidence.provider == previous.evidence.provider
+        && candidate.active_since_ms == previous.active_since_ms
 }
 
 /// Stateful persisted-ingress cursor and last-good publication authority.
@@ -803,9 +862,7 @@ fn restore_health_checkpoint(
         || checkpoint.retained.iter().any(|(publisher, publication)| {
             publisher != &publication.publisher
                 || !is_safe_health_publisher(publisher)
-                || publication
-                    .validate_at(now_ms)
-                    .is_err()
+                || publication.validate_at(now_ms).is_err()
         })
     {
         report.checkpoint_failures += 1;
@@ -1202,23 +1259,33 @@ pub fn reconcile_with_conn(
     // unreachable. No `last_seen_ms` heartbeat-age staleness guess. Empty
     // endpoints (pre-cutover) ⇒ the fs heartbeat path, unchanged. The reconciler
     // tick runs under spawn_blocking, so the blocking etcd read is safe.
-    let etcd_live: Option<std::collections::HashMap<String, String>> = {
+    let health_authority = {
         let eps = crate::substrate::etcd::default_endpoints();
         if eps.is_empty() {
-            None
+            PeerHealthAuthority::Filesystem
         } else {
             crate::substrate::peers::read_peers_blocking(&eps)
-                .map(|peers| peers.into_iter().map(|p| (p.hostname, p.health)).collect())
+                .map(|peers| {
+                    PeerHealthAuthority::Etcd(
+                        peers
+                            .into_iter()
+                            .map(|peer| (peer.hostname, peer.health))
+                            .collect(),
+                    )
+                })
+                .unwrap_or(PeerHealthAuthority::EtcdUnavailable)
         }
     };
     for node in nodes {
         if node.node_id == local_node_id {
             continue;
         }
-        let next = match &etcd_live {
-            Some(live) => health_from_etcd(strip_peer(&node.node_id), live),
-            None => compute_health_for_peer(workgroup_root, &node.node_id, now_ms),
-        };
+        let next = health_for_peer(
+            &health_authority,
+            workgroup_root,
+            &node.node_id,
+            now_ms,
+        );
         let next_str = match next {
             HealthState::Healthy => "healthy",
             HealthState::Degraded => "degraded",
@@ -1258,6 +1325,32 @@ pub fn reconcile_with_conn(
     // view) see them. The installer tools read the files directly; this
     // is the nodes-table cache. See docs/design/v2.7-peer-data-convergence.md.
     mirror_peer_versions(conn, workgroup_root);
+}
+
+/// The configured coordination source is an authority boundary, not a
+/// preference order. Once etcd is configured, a failed lease-directory read
+/// must not silently substitute filesystem heartbeat data left by an earlier
+/// daemon generation.
+enum PeerHealthAuthority {
+    Filesystem,
+    Etcd(std::collections::HashMap<String, String>),
+    EtcdUnavailable,
+}
+
+fn health_for_peer(
+    authority: &PeerHealthAuthority,
+    workgroup_root: &Path,
+    node_id: &str,
+    now_ms: i64,
+) -> HealthState {
+    match authority {
+        PeerHealthAuthority::Etcd(live) => health_from_etcd(strip_peer(node_id), live),
+        PeerHealthAuthority::EtcdUnavailable => HealthState::Unreachable,
+        PeerHealthAuthority::Filesystem => {
+            expected_state_health_override(workgroup_root, node_id, now_ms)
+                .unwrap_or_else(|| compute_health_for_peer(workgroup_root, node_id, now_ms))
+        }
+    }
 }
 
 /// PEERVER-4 mirror: union the GFS `<workgroup_root>/peers/*.json` and write
@@ -1318,16 +1411,8 @@ fn compute_health_for_peer(
     node_id: &str,
     now_ms: i64,
 ) -> HealthState {
-    let path = heartbeat_path(workgroup_root, node_id);
-    let bytes = match read_bounded_health_file(&path) {
-        BoundedHealthFile::Bytes(bytes) => bytes,
-        BoundedHealthFile::Missing | BoundedHealthFile::Rejected => {
-            return HealthState::Unreachable;
-        }
-    };
-    let hb: Heartbeat = match serde_json::from_slice(&bytes) {
-        Ok(h) => h,
-        Err(_) => return HealthState::Unreachable,
+    let Some(hb) = read_heartbeat_for_peer(workgroup_root, node_id) else {
+        return HealthState::Unreachable;
     };
     // A future-dated heartbeat is not fresh evidence: accepting it as age zero
     // would let clock-skewed or forged input keep a peer green indefinitely.
@@ -1336,6 +1421,73 @@ fn compute_health_for_peer(
     }
     let age_ms = (now_ms - hb.at_ms).max(0);
     health_state_from_age(age_ms as u64)
+}
+
+fn read_heartbeat_for_peer(workgroup_root: &std::path::Path, node_id: &str) -> Option<Heartbeat> {
+    let path = heartbeat_path(workgroup_root, node_id);
+    let BoundedHealthFile::Bytes(bytes) = read_bounded_health_file(&path) else {
+        return None;
+    };
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Fold the node-owned lifecycle intent into the legacy peer-health projection.
+///
+/// The availability worker publishes a durable intent before a planned sleep,
+/// shutdown, or maintenance window. Without this fold, a missing heartbeat is
+/// indistinguishable from an outage to the older `nodes.health` projection.
+/// Only the shared policy's explicit `ExpectedAbsence` assessment suppresses an
+/// outage; an expired intent or a missed return falls back to escalation.
+fn expected_state_health_override(
+    workgroup_root: &std::path::Path,
+    node_id: &str,
+    now_ms: i64,
+) -> Option<HealthState> {
+    let now_ms = u64::try_from(now_ms).ok()?;
+    let publisher = strip_peer(node_id);
+    if !is_safe_health_publisher(publisher) {
+        return None;
+    }
+    let path = runtime_availability_path(workgroup_root, publisher);
+    let BoundedHealthFile::Bytes(bytes) =
+        read_bounded_regular_file(&path, MAX_LIFECYCLE_INTENT_RECORD_BYTES)
+    else {
+        return None;
+    };
+    let intent: NodeAvailabilityIntent = serde_json::from_slice(&bytes).ok()?;
+    if intent.node_id != publisher || intent.validate().is_err() {
+        return None;
+    }
+    let heartbeat_at_ms = read_heartbeat_for_peer(workgroup_root, node_id)
+        .and_then(|heartbeat| u64::try_from(heartbeat.at_ms).ok())
+        .filter(|observed_at_ms| *observed_at_ms <= now_ms);
+    // A heartbeat strictly newer than an expected-absence intent is
+    // corrected-forward evidence that the node returned after publishing the
+    // intent.  The runtime publisher normally follows that heartbeat with a
+    // `Returned` generation, but the durable intent can outlive a crash or be
+    // replaced by an older valid snapshot.  Letting that stale absence keep
+    // winning would hide a later, real outage until the old return deadline.
+    // Fall back to heartbeat/etcd liveness until a newer lifecycle generation
+    // is durably published.
+    if intent.expects_return()
+        && heartbeat_at_ms.is_some_and(|heartbeat_at_ms| heartbeat_at_ms > intent.observed_at_ms)
+    {
+        return None;
+    }
+    let assessment = NodeAvailabilityPolicy::for_device_class(intent.device_class).assess(
+        Some(&intent),
+        now_ms,
+        heartbeat_at_ms,
+    );
+    match assessment {
+        NodeAvailabilityAssessment::ExpectedAbsence => Some(HealthState::Healthy),
+        NodeAvailabilityAssessment::WarningMissedReturn => Some(HealthState::Degraded),
+        NodeAvailabilityAssessment::CriticalMissedReturn => Some(HealthState::Unreachable),
+        NodeAvailabilityAssessment::Available
+        | NodeAvailabilityAssessment::WarningUnannounced
+        | NodeAvailabilityAssessment::CriticalUnannounced
+        | NodeAvailabilityAssessment::Unknown => None,
+    }
 }
 
 /// Map a [`HealthState`] to the wire string the
@@ -1384,7 +1536,12 @@ mod tests {
     use crate::ipc::nebula::{new_signal_sender_slot, spawn_signal_dispatcher};
     use crate::store::{open_in_memory, upsert_node};
     use crate::telemetry::{write_heartbeat, HEARTBEAT_INTERVAL_S};
-    use mackes_mesh_types::health::{GradeFactors, NodeGrade, HEALTH_SCHEMA_VERSION};
+    use mackes_mesh_types::health::{
+        ExpectedReturn, GradeFactors, HealthComponent, HealthEvidence, HealthScope,
+        HealthSeverity, NodeAvailabilityIntent, NodeAvailabilityState, NodeConnectionType,
+        NodeDeviceClass, NodeGrade, RequirementClass, HEALTH_SCHEMA_VERSION,
+        NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+    };
     use mde_bus::hooks::config::Priority;
 
     fn fresh_store() -> rusqlite::Connection {
@@ -1416,6 +1573,30 @@ mod tests {
             ),
             active_conditions: Vec::new(),
             resolved_conditions: Vec::new(),
+        }
+    }
+
+    fn sleeping_intent(
+        node_id: &str,
+        observed_at_ms: u64,
+        expected_at_ms: u64,
+    ) -> NodeAvailabilityIntent {
+        NodeAvailabilityIntent {
+            schema_version: NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+            node_id: node_id.into(),
+            device_id: format!("{node_id}-device"),
+            device_class: NodeDeviceClass::Desktop,
+            connection_type: NodeConnectionType::Ethernet,
+            state: NodeAvailabilityState::Sleeping,
+            reason: "operator-directed sleep".into(),
+            source: "health-reconciler-test".into(),
+            event_id: format!("sleep-{observed_at_ms}"),
+            generation: 1,
+            observed_at_ms,
+            expires_at_ms: expected_at_ms + 120_000,
+            expected_return: Some(ExpectedReturn::new(expected_at_ms)),
+            old_connectivity: None,
+            new_connectivity: None,
         }
     }
 
@@ -1496,6 +1677,59 @@ mod tests {
             Some(1)
         );
         assert!(ledger.retained("missing").is_none());
+    }
+
+    #[test]
+    fn forward_generation_cannot_silently_erase_active_condition_history() {
+        let mut first = health_publication("node-a", 7, 100);
+        first.active_conditions.push(HealthCondition {
+            id: "node-a:disk-outage".into(),
+            scope: HealthScope::Node {
+                node: "node-a".into(),
+            },
+            component: HealthComponent::System,
+            source: "disk-provider".into(),
+            severity: HealthSeverity::Critical,
+            requirement: RequirementClass::Required,
+            evidence: HealthEvidence {
+                provider: "disk-provider".into(),
+                summary: "Disk is unavailable.".into(),
+                facts: BTreeMap::new(),
+                observed_at_ms: 90,
+            },
+            active_since_ms: 80,
+            last_observed_ms: 90,
+            resolved_at_ms: None,
+            acknowledged_at_ms: None,
+            snoozed_until_ms: None,
+            remediation: Vec::new(),
+        });
+        first.grade = NodeGrade::evaluate(
+            "node-a",
+            first.grade.capability_score,
+            first.grade.factors,
+            &first.active_conditions,
+            first.published_at_ms,
+        );
+        let mut ledger = HealthPublicationLedger::default();
+        ledger
+            .admit(first.clone(), 500)
+            .expect("admit active outage");
+
+        let erased = health_publication("node-a", 8, 200);
+        assert_eq!(
+            ledger.admit(erased, 500),
+            Err(
+                HealthPublicationRejection::ConditionLifecycleDiscontinuity {
+                    condition_id: "node-a:disk-outage".into(),
+                }
+            )
+        );
+        assert_eq!(
+            ledger.retained("node-a"),
+            Some(&first),
+            "the truthful active outage and its history remain authoritative"
+        );
     }
 
     #[test]
@@ -1646,8 +1880,14 @@ mod tests {
         )
         .expect("repair ingress");
 
-        assert_eq!(report.bus_messages, 0, "the retained state is still current");
-        assert_eq!(report.restored, 1, "exact state repairs the missing artifact");
+        assert_eq!(
+            report.bus_messages, 0,
+            "the retained state is still current"
+        );
+        assert_eq!(
+            report.restored, 1,
+            "exact state repairs the missing artifact"
+        );
         assert_eq!(
             serde_json::from_slice::<NodeHealthState>(
                 &std::fs::read(&projection).expect("read repaired projection"),
@@ -1859,7 +2099,10 @@ mod tests {
         )
         .expect("roster contraction ingress");
 
-        assert!(report.checkpoint_restored, "restart restores tracked state first");
+        assert!(
+            report.checkpoint_restored,
+            "restart restores tracked state first"
+        );
         assert!(after_restart.ledger.retained("node-a").is_some());
         assert!(after_restart.ledger.retained("node-b").is_none());
         assert!(after_restart.bus_cursors.get("node-b").is_none());
@@ -2448,6 +2691,80 @@ mod tests {
     }
 
     #[test]
+    fn expected_absence_prevents_missing_heartbeat_from_becoming_outage() {
+        let qnm = tempfile::tempdir().expect("tmp");
+        let intent_path = runtime_availability_path(qnm.path(), "remote");
+        let intent = sleeping_intent("remote", 1_000, 5_000);
+        std::fs::create_dir_all(intent_path.parent().expect("intent parent")).expect("intent dir");
+        std::fs::write(
+            &intent_path,
+            serde_json::to_vec(&intent).expect("encode intent"),
+        )
+        .expect("write intent");
+
+        assert_eq!(
+            expected_state_health_override(qnm.path(), "peer:remote", 2_000),
+            Some(HealthState::Healthy),
+            "a valid planned absence is not an outage before its return deadline"
+        );
+    }
+
+    #[test]
+    fn missed_expected_return_escalates_instead_of_suppressing_outage() {
+        let qnm = tempfile::tempdir().expect("tmp");
+        let intent_path = runtime_availability_path(qnm.path(), "remote");
+        let intent = sleeping_intent("remote", 1_000, 5_000);
+        std::fs::create_dir_all(intent_path.parent().expect("intent parent")).expect("intent dir");
+        std::fs::write(
+            &intent_path,
+            serde_json::to_vec(&intent).expect("encode intent"),
+        )
+        .expect("write intent");
+
+        assert_eq!(
+            expected_state_health_override(qnm.path(), "peer:remote", 35_000),
+            Some(HealthState::Degraded),
+            "a missed desktop return reaches warning after the governed 30s grace"
+        );
+    }
+
+    #[test]
+    fn post_intent_heartbeat_prevents_stale_sleep_replay_from_masking_outage() {
+        let qnm = tempfile::tempdir().expect("tmp");
+        let intent_path = runtime_availability_path(qnm.path(), "remote");
+        let intent = sleeping_intent("remote", 1_000, 100_000);
+        std::fs::create_dir_all(intent_path.parent().expect("intent parent")).expect("intent dir");
+        std::fs::write(
+            &intent_path,
+            serde_json::to_vec(&intent).expect("encode intent"),
+        )
+        .expect("write intent");
+
+        // The node returned after publishing generation 1, then disappeared
+        // again. Replaying the old Sleeping record must not keep that second
+        // outage green merely because its original return deadline is future.
+        let heartbeat = Heartbeat {
+            node_id: "peer:remote".into(),
+            at_ms: 2_000,
+            agent_version: "test".into(),
+            applied_revision: None,
+            health: HealthState::Healthy,
+        };
+        write_heartbeat(qnm.path(), &heartbeat).expect("write post-intent heartbeat");
+
+        assert_eq!(
+            expected_state_health_override(qnm.path(), "peer:remote", 70_000),
+            None,
+            "post-intent return evidence supersedes the stale absence generation"
+        );
+        assert_eq!(
+            compute_health_for_peer(qnm.path(), "peer:remote", 70_000),
+            HealthState::Unreachable,
+            "the later outage remains visible after stale intent replay"
+        );
+    }
+
+    #[test]
     fn local_peer_is_skipped() {
         let qnm = tempfile::tempdir().expect("tmp");
         let conn = fresh_store();
@@ -2552,6 +2869,30 @@ mod tests {
             compute_health_for_peer(root.path(), "peer:remote", now),
             HealthState::Unreachable,
             "future-dated evidence must fail closed instead of becoming healthy"
+        );
+    }
+
+    #[test]
+    fn configured_etcd_restart_failure_cannot_substitute_fresh_filesystem_health() {
+        let qnm = tempfile::tempdir().expect("tmp");
+        let heartbeat = Heartbeat {
+            node_id: "peer:remote".into(),
+            at_ms: 10_000,
+            agent_version: "stale-daemon-generation".into(),
+            applied_revision: None,
+            health: HealthState::Healthy,
+        };
+        write_heartbeat(qnm.path(), &heartbeat).expect("seed fallback heartbeat");
+
+        assert_eq!(
+            health_for_peer(
+                &PeerHealthAuthority::EtcdUnavailable,
+                qnm.path(),
+                "peer:remote",
+                10_001,
+            ),
+            HealthState::Unreachable,
+            "configured lease authority failure must not fall through to fresh-looking fallback evidence"
         );
     }
 

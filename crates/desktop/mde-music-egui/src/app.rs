@@ -620,6 +620,18 @@ impl MusicApp {
     /// the explicit detail-page action. Catalog-row activation merely opens the
     /// station detail; it never mutates playback on its own.
     fn play_radio_station(&mut self, station: &CatalogItem) {
+        if self
+            .state
+            .workspace
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot_retains_exact_catalog_item(snapshot, station))
+        {
+            self.state.error = Some(format!(
+                "{} changed or was withdrawn; reopen the station from the latest Music catalog",
+                station.title
+            ));
+            return;
+        }
         let Some(variant) = admitted_radio_stream_variant(station) else {
             self.state.error = Some(format!(
                 "{} is unavailable: no admitted direct HTTP stream target",
@@ -688,6 +700,18 @@ impl MusicApp {
     }
 
     fn transfer_playback_to_target(&mut self, target: &PlaybackTarget) {
+        if self
+            .state
+            .workspace
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot_retains_exact_playback_target(snapshot, target))
+        {
+            self.state.error = Some(format!(
+                "{} changed or was withdrawn; choose a target from the latest Music projection",
+                target.name
+            ));
+            return;
+        }
         if !target.available {
             self.state.error = Some(format!(
                 "{} is unavailable: {}",
@@ -2343,6 +2367,64 @@ fn admitted_radio_stream_variant(station: &CatalogItem) -> Option<&SourceVariant
                 && !variant.content.source_id.trim().is_empty()
                 && is_well_formed_direct_stream(&variant.content.remote_id)
         })
+}
+
+/// Confirm that a retained detail row is still the exact daemon-admitted item.
+/// Exact duplicates across Home/Search/Library are harmless, while any
+/// conflicting binding for the same UI identity fails closed.
+fn snapshot_retains_exact_catalog_item(
+    snapshot: &MusicWorkspaceSnapshotV1,
+    selected: &CatalogItem,
+) -> bool {
+    let mut retained = false;
+    let candidates = snapshot
+        .shelves
+        .iter()
+        .flat_map(|shelf| shelf.items.iter())
+        .chain(
+            snapshot
+                .collections
+                .iter()
+                .flat_map(|collection| collection.items.iter()),
+        )
+        .chain(
+            snapshot
+                .search
+                .iter()
+                .flat_map(|page| page.groups.values())
+                .flat_map(|items| items.iter()),
+        );
+    for candidate in candidates {
+        if candidate.id == selected.id && candidate.kind == selected.kind {
+            if candidate != selected {
+                return false;
+            }
+            retained = true;
+        }
+    }
+    retained
+}
+
+/// Bind a handoff action to the exact target generation rendered by the
+/// current daemon projection. A restarted daemon may reuse a peer id while
+/// changing its kind, readiness, or display identity; retained UI state must
+/// not turn that replacement into authority for an old transfer action.
+fn snapshot_retains_exact_playback_target(
+    snapshot: &MusicWorkspaceSnapshotV1,
+    selected: &PlaybackTarget,
+) -> bool {
+    let mut retained = false;
+    for candidate in snapshot
+        .targets
+        .iter()
+        .filter(|candidate| candidate.id == selected.id)
+    {
+        if candidate != selected {
+            return false;
+        }
+        retained = true;
+    }
+    retained
 }
 
 fn is_downloadable_catalog_item(item: &CatalogItem) -> bool {
@@ -4364,6 +4446,65 @@ mod tests {
     }
 
     #[test]
+    fn withdrawn_radio_detail_cannot_publish_its_stale_stream_identity() {
+        let station = CatalogItem {
+            id: "radio-stale".to_owned(),
+            kind: ContentKind::Radio,
+            title: "Withdrawn station".to_owned(),
+            creator: "Internet radio".to_owned(),
+            parent_title: String::new(),
+            duration_ms: None,
+            artwork_ref: None,
+            starred: false,
+            cached: false,
+            variants: vec![SourceVariant {
+                content: ContentRef::new(
+                    "airsonic:http://radio.test",
+                    "https://stream.test/withdrawn",
+                    ContentKind::Radio,
+                )
+                .unwrap(),
+                cached: false,
+                reachable: true,
+                operator_priority: 0,
+                latency_ms: None,
+            }],
+        };
+        let mut retained = empty_workspace_snapshot(40);
+        retained.collections.push(LibraryCollection {
+            key: "radio".to_owned(),
+            title: "Radio".to_owned(),
+            kind: ContentKind::Radio,
+            items: vec![station.clone()],
+            mutable: false,
+            offset: 0,
+            page_size: 1,
+            has_more: false,
+        });
+        let mut state = MusicState::new();
+        state.workspace = Some(retained);
+        let mut app = app_with(state, None);
+        let (published_tx, published_rx) = mpsc::sync_channel(1);
+        app.set_workspace_action_publisher(move |body| {
+            published_tx
+                .send(body.to_owned())
+                .map_err(|error| error.to_string())
+        });
+        app.activate_catalog_item(&station);
+
+        app.state.workspace = Some(empty_workspace_snapshot(41));
+        app.play_radio_station(&station);
+
+        assert!(published_rx.try_recv().is_err());
+        assert_eq!(
+            app.state.error.as_deref(),
+            Some(
+                "Withdrawn station changed or was withdrawn; reopen the station from the latest Music catalog"
+            )
+        );
+    }
+
+    #[test]
     fn empty_and_malformed_radio_streams_render_unavailable_and_publish_nothing() {
         let station = CatalogItem {
             id: "radio-unavailable".to_owned(),
@@ -4509,6 +4650,47 @@ mod tests {
                 .unwrap();
         assert_eq!(request.action, "transfer");
         assert_eq!(request.target_peer.as_deref(), Some("peer:seat-15"));
+    }
+
+    #[test]
+    fn restarted_daemon_target_cannot_authorize_retained_handoff_identity() {
+        let retained_target = PlaybackTarget {
+            id: "peer:seat-15".to_owned(),
+            name: "Seat 15".to_owned(),
+            kind: "mesh_seat".to_owned(),
+            available: true,
+            unavailable_reason: None,
+        };
+        let mut initial = empty_workspace_snapshot(7);
+        initial.targets = vec![retained_target.clone()];
+        let mut state = MusicState::new();
+        state.workspace = Some(initial);
+        let mut app = app_with(state, None);
+        let (published_tx, published_rx) = mpsc::sync_channel(1);
+        app.set_workspace_action_publisher(move |body| {
+            published_tx
+                .send(body.to_owned())
+                .map_err(|error| error.to_string())
+        });
+
+        let mut replacement = empty_workspace_snapshot(8);
+        replacement.targets = vec![PlaybackTarget {
+            id: retained_target.id.clone(),
+            name: "Recycled seat identity".to_owned(),
+            kind: "mesh_seat".to_owned(),
+            available: false,
+            unavailable_reason: Some("replacement daemon has not proved ownership".to_owned()),
+        }];
+        app.state.workspace = Some(replacement);
+        app.transfer_playback_to_target(&retained_target);
+
+        assert!(published_rx.try_recv().is_err());
+        assert_eq!(
+            app.state.error.as_deref(),
+            Some(
+                "Seat 15 changed or was withdrawn; choose a target from the latest Music projection"
+            )
+        );
     }
 
     #[test]

@@ -78,6 +78,14 @@ const SKIP_SECS: f64 = 10.0;
 pub enum Picked {
     /// A core transport intent, dispatched through [`MediaController::dispatch`].
     Transport(TransportAction),
+    /// Select an enumerated track, bound to the media identity that minted the menu
+    /// item. Track ids are only unique within one file, so [`apply`] revalidates this
+    /// identity before dispatching the selection.
+    SelectTrack {
+        media: String,
+        kind: TrackKind,
+        id: i64,
+    },
     /// Switch the active sub-view ([`UiState::tab`](crate::model::UiState::tab)).
     GoTab(MediaTab),
     /// Toggle immersive fullscreen ([`UiState::fullscreen`](crate::model::UiState::fullscreen)).
@@ -98,6 +106,19 @@ pub enum Picked {
 pub fn apply<E: MediaEngine>(picked: Picked, controller: &mut MediaController<E>) {
     match picked {
         Picked::Transport(action) => controller.dispatch(action),
+        Picked::SelectTrack { media, kind, id } => {
+            let same_media = controller.player().media() == Some(media.as_str());
+            let still_enumerated = controller
+                .tracks()
+                .iter()
+                .any(|track| track.kind == kind && track.id == id);
+            if same_media && still_enumerated {
+                controller.dispatch(TransportAction::SelectTrack(kind, id));
+            } else {
+                controller.ui_mut().status =
+                    Some("That track is no longer available for this media.".to_owned());
+            }
+        }
         Picked::GoTab(tab) => controller.ui_mut().tab = tab,
         Picked::ToggleFullscreen => {
             let now = controller.ui().fullscreen;
@@ -294,6 +315,7 @@ fn playback_menu(cx: &PlaybackCtx) -> Menu<Picked> {
 /// item). The `empty` note names why: the surface has no tracks until media loads.
 fn track_entries(
     tracks: &[Track],
+    media: &str,
     kind: TrackKind,
     selection: TrackSelect,
     empty: &str,
@@ -308,7 +330,11 @@ fn track_entries(
             let checked = selection == TrackSelect::Id(track.id);
             Entry::Item(
                 BarItem::new(
-                    Picked::Transport(TransportAction::SelectTrack(kind, track.id)),
+                    Picked::SelectTrack {
+                        media: media.to_owned(),
+                        kind,
+                        id: track.id,
+                    },
                     track_label(track),
                 )
                 .checked(checked),
@@ -370,6 +396,7 @@ fn replaygain_entries(replaygain: ReplayGainMode) -> Vec<Entry<Picked>> {
 /// slider); the menu surfaces the discrete modes + the flatten seam.
 fn audio_menu(
     tracks: &[Track],
+    media: &str,
     audio_selection: TrackSelect,
     loudness: LoudnessNorm,
     replaygain: ReplayGainMode,
@@ -383,6 +410,7 @@ fn audio_menu(
                 mnemonic: None,
                 entries: track_entries(
                     tracks,
+                    media,
                     TrackKind::Audio,
                     audio_selection,
                     "No audio tracks (load media)",
@@ -414,11 +442,12 @@ fn audio_menu(
 
 /// The Subtitles menu — the enumerated subtitle tracks, checkmarked to the live
 /// selection (or an honest caption when none).
-fn subtitles_menu(tracks: &[Track], subtitle_selection: TrackSelect) -> Menu<Picked> {
+fn subtitles_menu(tracks: &[Track], media: &str, subtitle_selection: TrackSelect) -> Menu<Picked> {
     Menu::new(
         "Subtitles",
         track_entries(
             tracks,
+            media,
             TrackKind::Subtitle,
             subtitle_selection,
             "No subtitle tracks",
@@ -480,6 +509,7 @@ fn build_menus<E: MediaEngine>(controller: &MediaController<E>) -> Vec<Menu<Pick
     let audio_selection = selection.audio;
     let subtitle_selection = selection.subtitle;
     let tracks = controller.tracks();
+    let media = player.media().unwrap_or_default();
     let audio = controller.audio_config();
 
     vec![
@@ -492,12 +522,13 @@ fn build_menus<E: MediaEngine>(controller: &MediaController<E>) -> Vec<Menu<Pick
         playback_menu(&transport),
         audio_menu(
             tracks,
+            media,
             audio_selection,
             audio.loudness,
             audio.replaygain,
             audio.gapless,
         ),
-        subtitles_menu(tracks, subtitle_selection),
+        subtitles_menu(tracks, media, subtitle_selection),
         cast_menu(controller, loaded),
     ]
 }
@@ -819,16 +850,54 @@ mod tests {
         let menus = build_menus(&c);
         let sel = by_id(
             &menu(&menus, "Audio").entries,
-            &Picked::Transport(TransportAction::SelectTrack(TrackKind::Audio, 2)),
+            &Picked::SelectTrack {
+                media: "clip.mkv".to_owned(),
+                kind: TrackKind::Audio,
+                id: 2,
+            },
         )
         .unwrap();
         assert_eq!(sel.checked, Some(true));
         // The Subtitles menu lists the one enumerated subtitle track.
         let sub = by_id(
             &menu(&menus, "Subtitles").entries,
-            &Picked::Transport(TransportAction::SelectTrack(TrackKind::Subtitle, 1)),
+            &Picked::SelectTrack {
+                media: "clip.mkv".to_owned(),
+                kind: TrackKind::Subtitle,
+                id: 1,
+            },
         );
         assert!(sub.is_some(), "the enumerated subtitle track is offered");
+    }
+
+    #[test]
+    fn stale_track_menu_action_cannot_select_same_numeric_id_on_replacement_media() {
+        let mut c = playing();
+        let stale = Picked::SelectTrack {
+            media: "clip.mkv".to_owned(),
+            kind: TrackKind::Audio,
+            id: 2,
+        };
+        assert!(
+            by_id(&menu(&build_menus(&c), "Audio").entries, &stale).is_some(),
+            "the first media minted the action"
+        );
+
+        c.dispatch(TransportAction::PlayPath("replacement.mkv".to_owned()));
+        c.pump();
+        assert_eq!(c.player().track_selection().audio, TrackSelect::Auto);
+
+        apply(stale, &mut c);
+
+        assert_eq!(
+            c.player().track_selection().audio,
+            TrackSelect::Auto,
+            "the stale per-file id must not select a track on the replacement media"
+        );
+        assert_eq!(
+            c.ui().status.as_deref(),
+            Some("That track is no longer available for this media.")
+        );
     }
 
     #[test]

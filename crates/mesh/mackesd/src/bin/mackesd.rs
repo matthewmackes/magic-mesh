@@ -2591,6 +2591,15 @@ fn run_serve(
         tracing::info!("mackesd serve: starting supervisor + workers");
         let shutdown = Arc::new(AtomicBool::new(false));
         install_signal_handlers(Arc::clone(&shutdown)).context("installing signal handlers")?;
+        // WL-ARCH-009 — claim this installed process group before opening the
+        // control writer, publishing startup manifests, or constructing any
+        // worker. Previously the lease was acquired much later, after those
+        // side effects, so a duplicate group process could briefly mutate
+        // production state before the supervisor rejected its ownership.
+        let bus_root = mackesd_core::bus_publish::default_bus_root()
+            .context("resolving Bus root for worker process-group ownership")?;
+        let mut sup = Supervisor::claim_process_group(worker_group, &bus_root)
+            .context("claiming worker process group before activation")?;
         let sqlite_writer = if worker_group
             == mackesd_core::worker_role::WorkerGroup::Control
         {
@@ -2658,9 +2667,7 @@ fn run_serve(
         // ReconcileWorker: its blocking sync rusqlite tick still runs on
         // a dedicated OS thread inside the worker (so it can't stall the
         // tokio scheduler), but the supervisor owns its restart/breaker.
-        let mut sup = Supervisor::new();
         tracing::info!(group = %worker_group, "WL-ARCH-009: enforcing one worker process group");
-        sup.set_worker_group(worker_group);
         // EFF-24 — the live per-worker status registry: the supervisor
         // records alive/restarts/breaker transitions; the Bus healthz
         // folds them into the readiness verdict and the exporter emits

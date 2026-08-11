@@ -77,6 +77,18 @@ validate_absolute_path() {
     esac
 }
 
+validate_non_symlink_ancestors() {
+    local path=$1
+    local label=$2
+    local ancestor
+    ancestor=$(dirname -- "$path")
+    while [[ "$ancestor" != / ]]; do
+        [[ -d "$ancestor" ]] || fail "$label ancestor is not a directory: $ancestor"
+        [[ ! -L "$ancestor" ]] || fail "$label ancestor must not be a symlink: $ancestor"
+        ancestor=$(dirname -- "$ancestor")
+    done
+}
+
 write_seed_files() {
     local dir=$1
     local image_digest=$2
@@ -203,10 +215,9 @@ seed() {
     require_command sha256sum
 
     [[ ! -e "$out" && ! -L "$out" ]] || fail "refusing to overwrite existing seed path: $out"
+    validate_non_symlink_ancestors "$out" "seed output"
     local parent
     parent=$(dirname -- "$out")
-    [[ -d "$parent" ]] || fail "seed parent directory does not exist: $parent"
-    [[ ! -L "$parent" ]] || fail "seed parent directory must not be a symlink: $parent"
 
     SEED_TMP=$(mktemp -d "$parent/.mcnf-browser-vm-seed.XXXXXX")
     write_seed_files \
@@ -266,6 +277,8 @@ preflight() {
     [[ -n "$image" ]] || fail "preflight requires --image"
     validate_absolute_path "$image"
     validate_absolute_path "$run_dir"
+    validate_non_symlink_ancestors "$image" "image"
+    validate_non_symlink_ancestors "$run_dir" "run directory"
     [[ -f "$image" && ! -L "$image" ]] || fail "image must be a regular non-symlink file: $image"
 
     local command_name
@@ -372,6 +385,14 @@ self_test() {
         fail "self-test qualified seed manifest omitted connected transport health"
     [[ "$(stat -c '%a' "$fixture/qualified-seed")" == 755 ]] ||
         fail "self-test qualified seed directory is not qemu-traversable"
+
+    mkdir -p "$fixture/redirect-target/nested"
+    ln -s "$fixture/redirect-target" "$fixture/redirect-parent"
+    if "$0" seed --out "$fixture/redirect-parent/nested/hostile-seed" \
+        --image-digest "$digest" --session-id "$session" --transport rdp \
+        >/dev/null 2>&1; then
+        fail "self-test allowed a symlinked ancestor to redirect seed authority"
+    fi
 
     mkdir "$fixture/existing"
     if "$0" seed --out "$fixture/existing" --image-digest "$digest" --session-id "$session" --transport spice >/dev/null 2>&1; then

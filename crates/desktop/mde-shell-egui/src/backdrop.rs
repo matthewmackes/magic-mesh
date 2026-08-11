@@ -31,8 +31,8 @@
 )]
 
 use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,11 @@ const PREFS_SUBDIR: &str = "wallpaper-prefs";
 
 /// How often [`wallpaper_texture`] re-reads the Bing cache off disk.
 const PREF_REFRESH: Duration = Duration::from_secs(3);
+
+/// Maximum encoded Bing payload admitted by the Home renderer. The downloader
+/// may replace the canonical cache atomically, but the renderer must never turn
+/// a substituted device or an unbounded local file into a decode allocation.
+const MAX_WALLPAPER_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The dim Carbon scrim faded in as a surface/window covers the desktop, so
 /// foreground content (a populated Chooser grid, a session) stays legible over the
@@ -476,11 +481,36 @@ fn wallpaper_texture(ctx: &egui::Context) -> Option<TextureHandle> {
 /// fails soft to the Carbon field until Bing has supplied an image.
 fn decode_wallpaper(ctx: &egui::Context) -> Option<TextureHandle> {
     let path = crate::system::bing_wallpaper_path()?;
-    let image = fs::read(path)
-        .ok()
-        .as_deref()
-        .and_then(decode_wallpaper_rgba)?;
+    let bytes = read_wallpaper_payload(&path)?;
+    let image = decode_wallpaper_rgba(&bytes)?;
     Some(ctx.load_texture("bing-wallpaper-of-the-day", image, TextureOptions::LINEAR))
+}
+
+/// Read the canonical cache through one bounded regular-file descriptor. On the
+/// production Linux seat `O_NOFOLLOW` makes a path replacement fail closed;
+/// checking the opened descriptor (rather than path metadata) also prevents a
+/// FIFO/device substitution and keeps an atomic rename after `open` from changing
+/// which generation is decoded.
+fn read_wallpaper_payload(path: &Path) -> Option<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_WALLPAPER_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    file.take(MAX_WALLPAPER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (u64::try_from(bytes.len()).ok()? <= MAX_WALLPAPER_BYTES).then_some(bytes)
 }
 
 /// Decode the downloaded Bing payload regardless of its transport image
@@ -498,7 +528,9 @@ fn decode_wallpaper_rgba(bytes: &[u8]) -> Option<egui::ColorImage> {
 
 #[cfg(test)]
 mod wallpaper_decode_tests {
-    use super::decode_wallpaper_rgba;
+    use std::fs;
+
+    use super::{decode_wallpaper_rgba, read_wallpaper_payload};
 
     #[test]
     fn bing_jpeg_cache_payload_decodes_for_desktop_render() {
@@ -516,6 +548,30 @@ mod wallpaper_decode_tests {
         let decoded = decode_wallpaper_rgba(&bytes).expect("decode Bing JPEG");
         assert_eq!(decoded.size, [2, 1]);
         assert_eq!(decoded.pixels.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_home_wallpaper_path_cannot_redirect_decode() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("mde-wallpaper-replacement-{nonce}"));
+        fs::create_dir_all(&root).expect("create hostile wallpaper fixture");
+        let foreign = root.join("foreign.jpg");
+        fs::write(&foreign, b"foreign local file").expect("write foreign file");
+        let cache = root.join("bing-image-of-the-day.jpg");
+        symlink(&foreign, &cache).expect("replace cache with symlink");
+
+        assert!(
+            read_wallpaper_payload(&cache).is_none(),
+            "Home must not follow a replaced Bing cache path to unrelated local data"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
 

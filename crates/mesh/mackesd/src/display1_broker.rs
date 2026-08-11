@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, OwnedFd as StdOwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use fs2::FileExt as _;
 use mackes_mesh_types::workloads::WorkloadAttachmentLease;
 use rustix::net::{
     accept_with, bind_unix, connect_unix, listen, recvmsg, send, sendmsg, socket_with,
@@ -54,6 +56,59 @@ const DISPLAY1_PRESENT_ACK: u8 = 0xA5;
 // Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 preserves unknown receive
 // flags but does not expose a named constant for this result-only flag.
 const DISPLAY1_MSG_CTRUNC: u32 = 0x08;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Display1PresentationPoll {
+    Pending,
+    Acknowledged,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Display1SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl Display1SocketIdentity {
+    fn from_path(path: &Path) -> Result<Self, Display1Error> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| Display1Error::Attachment(format!("stat broker socket: {error}")))?;
+        if !metadata.file_type().is_socket() {
+            return Err(Display1Error::Attachment(
+                "broker endpoint is not a Unix socket".into(),
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn remove_if_owned(self, path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            return fs::remove_file(path).is_ok();
+        }
+        false
+    }
+}
+
+fn lock_display1_root(socket_path: &Path) -> Result<fs::File, Display1Error> {
+    let root = socket_path.parent().ok_or_else(|| {
+        Display1Error::Attachment("Display1 broker socket has no root directory".into())
+    })?;
+    let lock = fs::File::open(root)
+        .map_err(|error| Display1Error::Attachment(format!("open broker root: {error}")))?;
+    lock.lock_exclusive()
+        .map_err(|error| Display1Error::Attachment(format!("lock broker root: {error}")))?;
+    Ok(lock)
+}
 
 fn require_seqpacket(stream: &UnixStream) -> Result<(), Display1Error> {
     let socket_type = rustix::net::sockopt::get_socket_type(stream)
@@ -628,7 +683,7 @@ impl Display1ScmRightsRelay {
     /// Poll the one-byte shell acknowledgement emitted only after a
     /// successful KMS modeset/page-flip. An idle socket is not readiness, and
     /// EOF is a disconnect rather than an acknowledgement.
-    fn presentation_acknowledged(&self) -> Result<bool, Display1Error> {
+    fn poll_presentation(&self) -> Result<Display1PresentationPoll, Display1Error> {
         if peer_credentials(&self.stream)
             .map_err(|error| Display1Error::Attachment(error.to_string()))?
             != self.peer
@@ -641,7 +696,7 @@ impl Display1ScmRightsRelay {
         let mut ancillary = RecvAncillaryBuffer::new(&mut control);
         let received = match recvmsg(&self.stream, &mut iov, &mut ancillary, RecvFlags::DONTWAIT) {
             Ok(received) => received,
-            Err(rustix::io::Errno::AGAIN) => return Ok(false),
+            Err(rustix::io::Errno::AGAIN) => return Ok(Display1PresentationPoll::Pending),
             Err(error) => {
                 return Err(Display1Error::Attachment(format!(
                     "read Display1 presentation acknowledgement: {error}"
@@ -650,14 +705,46 @@ impl Display1ScmRightsRelay {
         };
         reject_truncated_packet(received.flags, "presentation acknowledgement")?;
         if received.bytes == 0 {
-            return Ok(false);
+            return Ok(Display1PresentationPoll::Disconnected);
         }
         if received.bytes == 1 && ack[0] == DISPLAY1_PRESENT_ACK {
-            Ok(true)
+            Ok(Display1PresentationPoll::Acknowledged)
         } else {
             Err(Display1Error::Attachment(
                 "invalid Display1 presentation acknowledgement".into(),
             ))
+        }
+    }
+
+    /// Revalidate an already-acknowledged presentation without consuming a
+    /// queued input packet. A successful page flip is not durable authority:
+    /// the shell endpoint must remain connected and the lease must remain live.
+    fn presentation_connected(&self, now_ms: u64) -> Result<bool, Display1Error> {
+        if peer_credentials(&self.stream)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?
+            != self.peer
+        {
+            return Err(Display1Error::Attachment("peer credential mismatch".into()));
+        }
+        self.lease
+            .validate(now_ms)
+            .map_err(|error| Display1Error::Attachment(error.to_string()))?;
+
+        let mut byte = [0_u8; 1];
+        let mut iov = [IoSliceMut::new(&mut byte)];
+        let mut control = [];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+        match recvmsg(
+            &self.stream,
+            &mut iov,
+            &mut ancillary,
+            RecvFlags::DONTWAIT | RecvFlags::PEEK,
+        ) {
+            Ok(received) => Ok(received.bytes != 0),
+            Err(rustix::io::Errno::AGAIN) => Ok(true),
+            Err(error) => Err(Display1Error::Attachment(format!(
+                "probe Display1 presentation relay: {error}"
+            ))),
         }
     }
 
@@ -803,26 +890,55 @@ impl Display1AttachmentSink {
     #[must_use]
     pub fn first_frame_seen(&self) -> bool {
         if self.first_frame.load(Ordering::Acquire) {
-            return true;
+            let mut relay = match self.relay.lock() {
+                Ok(relay) => relay,
+                Err(_) => return false,
+            };
+            if relay
+                .as_ref()
+                .is_some_and(|relay| {
+                    relay
+                        .presentation_connected(display1_now_ms())
+                        .unwrap_or(false)
+                })
+            {
+                return true;
+            }
+            relay.take();
+            self.frame_delivered.store(false, Ordering::Release);
+            self.first_frame.store(false, Ordering::Release);
+            self.input_epoch.fetch_add(1, Ordering::AcqRel);
+            return false;
         }
         if !self.frame_delivered.load(Ordering::Acquire) {
             return false;
         }
-        let acknowledged = self
-            .relay
-            .lock()
-            .ok()
-            .and_then(|relay| {
-                relay
-                    .as_ref()
-                    .map(Display1ScmRightsRelay::presentation_acknowledged)
-            })
-            .and_then(Result::ok)
-            .unwrap_or(false);
-        if acknowledged {
-            self.first_frame.store(true, Ordering::Release);
+        let mut relay = match self.relay.lock() {
+            Ok(relay) => relay,
+            Err(_) => return false,
+        };
+        let presentation = relay
+            .as_ref()
+            .map(Display1ScmRightsRelay::poll_presentation);
+        match presentation {
+            Some(Ok(Display1PresentationPoll::Acknowledged)) => {
+                self.first_frame.store(true, Ordering::Release);
+                true
+            }
+            Some(Ok(Display1PresentationPoll::Pending)) | None => false,
+            Some(Ok(Display1PresentationPoll::Disconnected)) | Some(Err(_)) => {
+                // Before presentation acknowledgement, poll_input deliberately
+                // admits nothing. Therefore this is the only production path
+                // that can observe a shell which received the DMA-BUF and then
+                // vanished. Retaining that relay would keep sending QEMU frames
+                // and descriptors into a dead attachment until lease expiry.
+                relay.take();
+                self.frame_delivered.store(false, Ordering::Release);
+                self.first_frame.store(false, Ordering::Release);
+                self.input_epoch.fetch_add(1, Ordering::AcqRel);
+                false
+            }
         }
-        acknowledged
     }
 }
 
@@ -873,6 +989,7 @@ impl Display1FrameSink for Display1AttachmentSink {
 pub struct Display1AttachmentServer {
     lease: WorkloadAttachmentLease,
     socket_path: PathBuf,
+    socket_identity: Display1SocketIdentity,
     sink: Arc<Display1AttachmentSink>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -898,9 +1015,14 @@ impl Display1AttachmentServer {
                 Display1Error::Attachment(format!("create broker root: {error}"))
             })?;
         }
+        // Serialize bind/probe/stale cleanup across daemon instances. The
+        // endpoint inode check below then cannot race another cooperative
+        // broker replacing the stable lease pathname between stat and unlink.
+        let _root_lock = lock_display1_root(&socket_path)?;
         let listener = match seqpacket_listener(&socket_path) {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                let existing_identity = Display1SocketIdentity::from_path(&socket_path)?;
                 match seqpacket_connect(&socket_path) {
                     Ok(_) => {
                         return Err(Display1Error::Attachment(
@@ -908,11 +1030,11 @@ impl Display1AttachmentServer {
                         ));
                     }
                     Err(probe) if probe.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        fs::remove_file(&socket_path).map_err(|error| {
-                            Display1Error::Attachment(format!(
-                                "remove stale broker socket: {error}"
-                            ))
-                        })?;
+                        if !existing_identity.remove_if_owned(&socket_path) {
+                            return Err(Display1Error::Attachment(
+                                "stale broker socket changed during restart cleanup".into(),
+                            ));
+                        }
                         seqpacket_listener(&socket_path).map_err(|error| {
                             Display1Error::Attachment(format!("bind broker socket: {error}"))
                         })?
@@ -940,6 +1062,7 @@ impl Display1AttachmentServer {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660));
         }
+        let socket_identity = Display1SocketIdentity::from_path(&socket_path)?;
         let sink = Arc::new(Display1AttachmentSink::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
@@ -955,6 +1078,7 @@ impl Display1AttachmentServer {
                     thread_sink,
                     thread_shutdown,
                     thread_socket_path,
+                    socket_identity,
                 );
             })
             .map_err(|error| {
@@ -963,6 +1087,7 @@ impl Display1AttachmentServer {
         Ok(Self {
             lease,
             socket_path,
+            socket_identity,
             sink,
             shutdown,
             thread: Some(thread),
@@ -1012,7 +1137,9 @@ impl Drop for Display1AttachmentServer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = fs::remove_file(&self.socket_path);
+        if let Ok(_root_lock) = lock_display1_root(&self.socket_path) {
+            self.socket_identity.remove_if_owned(&self.socket_path);
+        }
     }
 }
 
@@ -1022,6 +1149,7 @@ fn serve_attachment_socket(
     sink: Arc<Display1AttachmentSink>,
     shutdown: Arc<AtomicBool>,
     socket_path: PathBuf,
+    socket_identity: Display1SocketIdentity,
 ) {
     let broker = Display1ScmRightsBroker::new();
     while !shutdown.load(Ordering::Acquire) && display1_now_ms() < lease.expires_at_ms {
@@ -1060,9 +1188,13 @@ fn serve_attachment_socket(
     }
     // Expiry is a revocation boundary, not merely an admission-loop stop. A
     // runtime can outlive its operation poll, so clear the relay/readiness
-    // state and unlink the endpoint here instead of waiting for Arc teardown.
+    // state and unlink the exact endpoint this server created instead of
+    // waiting for Arc teardown. A stale generation must never unlink a newer
+    // server that has already reclaimed the same lease pathname.
     let _ = sink.disable();
-    let _ = fs::remove_file(socket_path);
+    if let Ok(_root_lock) = lock_display1_root(&socket_path) {
+        socket_identity.remove_if_owned(&socket_path);
+    }
 }
 
 fn read_display1_hello(
@@ -2150,6 +2282,121 @@ mod tests {
     }
 
     #[test]
+    fn pre_presentation_disconnect_revokes_dead_relay_and_frame_authority() {
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-pre-presentation-disconnect".into(),
+            nonce: "nonce-pre-presentation-disconnect".into(),
+            workload_id: WorkloadId::new("browser-pre-presentation").expect("workload id"),
+            generation: 8,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: display1_now_ms().saturating_add(5_000),
+        };
+        let sink = Display1AttachmentSink::new();
+        let (daemon, shell) = seqpacket_pair();
+        let daemon_peer = peer_credentials(&daemon).expect("daemon peer");
+        let shell_peer = peer_credentials(&shell).expect("shell peer");
+        sink.install(
+            Display1ScmRightsRelay::attach(
+                daemon,
+                daemon_peer,
+                lease.clone(),
+                &lease.nonce,
+                &lease.nonce,
+                display1_now_ms(),
+            )
+            .expect("relay"),
+        )
+        .expect("install relay");
+
+        sink.accept(Display1DmaBufFrame {
+            dmabuf: std::fs::File::open("/dev/null").expect("dev null").into(),
+            width: 64,
+            height: 32,
+            stride: 256,
+            fourcc: 0x3432_5258,
+            modifier: 0,
+            y0_top: true,
+        })
+        .expect("send frame");
+        receive_display1_frame(&shell, shell_peer, &lease, display1_now_ms())
+            .expect("shell receives DMA-BUF before crashing");
+        drop(shell);
+
+        assert!(!sink.first_frame_seen());
+        assert!(sink.relay.lock().expect("relay store").is_none());
+        assert!(!sink.frame_delivered.load(Ordering::Acquire));
+        assert_eq!(sink.input_epoch.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            sink.accept(Display1DmaBufFrame {
+                dmabuf: std::fs::File::open("/dev/null").expect("dev null").into(),
+                width: 64,
+                height: 32,
+                stride: 256,
+                fourcc: 0x3432_5258,
+                modifier: 0,
+                y0_top: true,
+            }),
+            Err(Display1Error::Attachment(message))
+                if message.contains("no authenticated shell relay")
+        ));
+    }
+
+    #[test]
+    fn post_presentation_disconnect_revokes_retained_frame_authority() {
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-post-presentation-disconnect".into(),
+            nonce: "nonce-post-presentation-disconnect".into(),
+            workload_id: WorkloadId::new("browser-post-presentation").expect("workload id"),
+            generation: 9,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: display1_now_ms().saturating_add(5_000),
+        };
+        let sink = Display1AttachmentSink::new();
+        let (daemon, shell) = seqpacket_pair();
+        let daemon_peer = peer_credentials(&daemon).expect("daemon peer");
+        let shell_peer = peer_credentials(&shell).expect("shell peer");
+        sink.install(
+            Display1ScmRightsRelay::attach(
+                daemon,
+                daemon_peer,
+                lease.clone(),
+                &lease.nonce,
+                &lease.nonce,
+                display1_now_ms(),
+            )
+            .expect("relay"),
+        )
+        .expect("install relay");
+
+        sink.accept(Display1DmaBufFrame {
+            dmabuf: std::fs::File::open("/dev/null").expect("dev null").into(),
+            width: 64,
+            height: 32,
+            stride: 256,
+            fourcc: 0x3432_5258,
+            modifier: 0,
+            y0_top: true,
+        })
+        .expect("send frame");
+        receive_display1_frame(&shell, shell_peer, &lease, display1_now_ms())
+            .expect("shell receives DMA-BUF");
+        assert_eq!(
+            send(&shell, &[DISPLAY1_PRESENT_ACK], SendFlags::empty()).expect("presentation ack"),
+            1
+        );
+        assert!(sink.first_frame_seen());
+
+        drop(shell);
+
+        assert!(!sink.first_frame_seen());
+        assert!(sink.relay.lock().expect("relay store").is_none());
+        assert!(!sink.frame_delivered.load(Ordering::Acquire));
+        assert_eq!(sink.input_epoch.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn duplicate_server_cannot_replace_an_active_lease_socket() {
         let temp = tempfile::tempdir().expect("temp");
         let lease = WorkloadAttachmentLease {
@@ -2197,6 +2444,91 @@ mod tests {
         let replacement = Display1AttachmentServer::start_at(temp.path(), lease)
             .expect("replace connection-refused stale socket");
         seqpacket_connect(replacement.socket_path()).expect("replacement broker is reachable");
+    }
+
+    #[test]
+    fn stale_generation_drop_cannot_unlink_newer_live_broker_socket() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = display1_now_ms();
+        let stale_lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-restart-generation".into(),
+            nonce: "nonce-restart-generation-1".into(),
+            workload_id: WorkloadId::new("browser-seat15").expect("workload id"),
+            generation: 1,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: now.saturating_add(200),
+        };
+        let stale = Display1AttachmentServer::start_at(temp.path(), stale_lease.clone())
+            .expect("start stale-generation broker");
+        let socket_path = stale.socket_path().to_path_buf();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while socket_path.exists() {
+            if Instant::now() >= deadline {
+                panic!("stale-generation broker did not retire its endpoint");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let current_lease = WorkloadAttachmentLease {
+            generation: 2,
+            nonce: "nonce-restart-generation-2".into(),
+            expires_at_ms: display1_now_ms().saturating_add(5_000),
+            ..stale_lease
+        };
+        let current = Display1AttachmentServer::start_at(temp.path(), current_lease)
+            .expect("start current-generation broker");
+        seqpacket_connect(current.socket_path()).expect("current broker is initially reachable");
+
+        // The stale owner still has a completed listener thread and reaches
+        // its Drop cleanup only now, after the current generation reclaimed
+        // the stable pathname.
+        drop(stale);
+
+        assert!(
+            current.socket_path().exists(),
+            "stale-generation cleanup removed the current broker endpoint"
+        );
+        seqpacket_connect(current.socket_path())
+            .expect("current broker remains reachable after stale cleanup");
+    }
+
+    #[test]
+    fn restart_cleanup_cannot_unlink_a_concurrent_newer_broker_socket() {
+        let temp = tempfile::tempdir().expect("temp");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-restart-cleanup-race".into(),
+            nonce: "nonce-restart-cleanup-race".into(),
+            workload_id: WorkloadId::new("browser-restart-cleanup").expect("workload id"),
+            generation: 17,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: display1_now_ms().saturating_add(5_000),
+        };
+        let socket_path = display1_socket_path_at(temp.path(), &lease.lease_id)
+            .expect("restart broker socket path");
+        let stale_listener = seqpacket_listener(&socket_path).expect("stale listener");
+        let stale_identity =
+            Display1SocketIdentity::from_path(&socket_path).expect("stale socket identity");
+
+        drop(stale_listener);
+        {
+            let _current_lock = lock_display1_root(&socket_path).expect("current startup lock");
+            fs::remove_file(&socket_path).expect("retire stale pathname");
+        }
+        let current =
+            Display1AttachmentServer::start_at(temp.path(), lease).expect("current broker");
+
+        {
+            let _stale_cleanup_lock =
+                lock_display1_root(&socket_path).expect("stale cleanup lock");
+            assert!(
+                !stale_identity.remove_if_owned(&socket_path),
+                "restart cleanup accepted a substituted socket inode"
+            );
+        }
+        seqpacket_connect(current.socket_path())
+            .expect("concurrent newer broker remains reachable after stale cleanup");
     }
 
     #[test]

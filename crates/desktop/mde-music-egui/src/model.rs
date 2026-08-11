@@ -259,11 +259,17 @@ impl MusicState {
         }
         match snapshot.validate() {
             Ok(()) => {
-                let now_playing = snapshot
-                    .playback
-                    .current
-                    .as_ref()
-                    .and_then(|content| Self::workspace_song(&snapshot, content));
+                let now_playing = match snapshot.playback.current.as_ref() {
+                    Some(content) => match Self::workspace_song(&snapshot, content) {
+                        Ok(song) => Some(song),
+                        Err(reason) => {
+                            self.error =
+                                Some(format!("Music daemon projection rejected: {reason}"));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 if let Some(open) = self.open_album.as_mut() {
                     if let Some(item) = snapshot
                         .collections
@@ -291,8 +297,11 @@ impl MusicState {
     /// `Song` render model. The embedded shell does not run the compatibility
     /// worker, so without this bridge a valid daemon playback projection would
     /// leave the Music player's Now Playing strip permanently empty.
-    fn workspace_song(snapshot: &MusicWorkspaceSnapshotV1, current: &ContentRef) -> Option<Song> {
-        let catalog_item = snapshot
+    fn workspace_song(
+        snapshot: &MusicWorkspaceSnapshotV1,
+        current: &ContentRef,
+    ) -> Result<Song, &'static str> {
+        let mut catalog_items = snapshot
             .shelves
             .iter()
             .flat_map(|shelf| shelf.items.iter())
@@ -302,11 +311,15 @@ impl MusicState {
                     .iter()
                     .flat_map(|collection| collection.items.iter()),
             )
-            .find(|item| {
+            .filter(|item| {
                 item.variants
                     .iter()
                     .any(|variant| variant.content == *current)
             });
+        let catalog_item = catalog_items.next();
+        if catalog_item.is_some_and(|accepted| catalog_items.any(|item| item != accepted)) {
+            return Err("equivocated_current_catalog_identity");
+        }
         let queue_entry = snapshot
             .queue
             .iter()
@@ -340,7 +353,7 @@ impl MusicState {
             .unwrap_or_default()
             .min(u64::from(u32::MAX)) as u32;
 
-        Some(Song {
+        Ok(Song {
             id: current.remote_id.clone(),
             title,
             album: catalog_item
@@ -764,6 +777,99 @@ mod tests {
         assert_eq!(now_playing.album, "A podcast");
         assert_eq!(now_playing.duration, 300);
         assert_eq!(now_playing.cover_art, "episode-art");
+    }
+
+    #[test]
+    fn equivocated_current_catalog_identity_cannot_replace_last_good_playback_projection() {
+        use mde_musicd::domain::{
+            CatalogItem, ContentKind, ContentRef, LibraryCollection, MusicStorageSnapshot,
+            MusicWorkspaceSnapshotV1, PlaybackSnapshot, SourceVariant,
+        };
+
+        let content = ContentRef::new("source-one", "song-1", ContentKind::Music).unwrap();
+        let trusted_item = CatalogItem {
+            id: "trusted-row".to_owned(),
+            kind: ContentKind::Music,
+            title: "Trusted title".to_owned(),
+            creator: "Trusted artist".to_owned(),
+            parent_title: "Trusted album".to_owned(),
+            duration_ms: Some(180_000),
+            artwork_ref: Some("trusted-art".to_owned()),
+            starred: false,
+            cached: true,
+            variants: vec![SourceVariant {
+                content: content.clone(),
+                cached: true,
+                reachable: true,
+                operator_priority: 1,
+                latency_ms: Some(4),
+            }],
+        };
+        let mut state = MusicState::new();
+        state.apply_workspace_snapshot(MusicWorkspaceSnapshotV1 {
+            schema_version: 1,
+            revision: 9,
+            shelves: Vec::new(),
+            bookmarks: Vec::new(),
+            collections: vec![LibraryCollection {
+                key: "songs".to_owned(),
+                title: "Songs".to_owned(),
+                kind: ContentKind::Music,
+                items: vec![trusted_item],
+                mutable: false,
+                offset: 0,
+                page_size: 0,
+                has_more: false,
+            }],
+            search: None,
+            playback: PlaybackSnapshot {
+                current: Some(content),
+                playing: true,
+                position_ms: 42_000,
+                duration_ms: Some(180_000),
+                volume_milli: 750,
+                shuffle: false,
+                repeat: "off".to_owned(),
+                queue_revision: 1,
+                seekable: true,
+            },
+            queue: Vec::new(),
+            downloads: Vec::new(),
+            storage: MusicStorageSnapshot {
+                used_bytes: 0,
+                cap_bytes: 1,
+            },
+            targets: Vec::new(),
+            sources: Vec::new(),
+            any_source_reachable: true,
+        });
+        assert_eq!(
+            state.now_playing.as_ref().expect("trusted playback").title,
+            "Trusted title"
+        );
+
+        let mut equivocated = state.workspace.clone().expect("trusted projection");
+        equivocated.revision = 10;
+        let mut hostile_item = equivocated.collections[0].items[0].clone();
+        hostile_item.id = "hostile-row".to_owned();
+        hostile_item.title = "Source-order substitution".to_owned();
+        hostile_item.artwork_ref = Some("hostile-art".to_owned());
+        equivocated.collections[0].items.insert(0, hostile_item);
+        state.apply_workspace_snapshot(equivocated);
+
+        assert_eq!(state.workspace_revision, 9);
+        assert_eq!(
+            state
+                .now_playing
+                .as_ref()
+                .expect("last-good playback")
+                .title,
+            "Trusted title"
+        );
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Music daemon projection rejected: equivocated_current_catalog_identity")
+        );
     }
 
     #[test]

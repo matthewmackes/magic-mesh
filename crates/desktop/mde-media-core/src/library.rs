@@ -428,7 +428,18 @@ impl Library {
     /// if its contents are not a valid serialized [`Library`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json).map_err(std::io::Error::other)
+        let library: Self = serde_json::from_str(&json).map_err(std::io::Error::other)?;
+        if library
+            .items
+            .iter()
+            .any(|(indexed_path, item)| indexed_path != &item.path)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "library item path does not match its indexed identity",
+            ));
+        }
+        Ok(library)
     }
 }
 
@@ -742,5 +753,23 @@ mod tests {
             titles(&lib.browse(&BrowseQuery::new())),
             titles(&back.browse(&BrowseQuery::new()))
         );
+    }
+
+    #[test]
+    fn persisted_item_cannot_substitute_a_different_playback_path_after_restart() {
+        let path = temp_dir("substituted-item").with_extension("json");
+        let mut persisted = serde_json::to_value(sample()).expect("serialize library");
+        persisted["items"]["/m/alpha.mp3"]["path"] =
+            serde_json::Value::String("/attacker/substitute.mp3".to_owned());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&persisted).expect("encode hostile library"),
+        )
+        .expect("write hostile library");
+
+        let error = Library::load(&path).expect_err("mismatched item identity must fail closed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

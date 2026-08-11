@@ -91,6 +91,7 @@ const BOOT_STATUS_FILE: &str = "/run/mde/boot-status.tsv";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BootService {
+    unit: String,
     label: String,
     active: String,
     sub: String,
@@ -109,6 +110,7 @@ fn boot_services() -> Vec<BootService> {
                 return None;
             }
             Some(BootService {
+                unit: unit.to_owned(),
                 label: fields.next()?.to_owned(),
                 active: fields.next()?.to_owned(),
                 sub: fields.next()?.to_owned(),
@@ -330,13 +332,19 @@ impl Splash {
         self.done.iter().all(|d| *d)
     }
 
-    /// The systemd feed is allowed to settle only when every discovered node
-    /// service is active, intentionally skipped, inactive/oneshot-complete, or
-    /// failed and therefore visible as a terminal red result. An absent feed
-    /// is treated as settled so recovery and minimal images never deadlock the
-    /// graphical shell on an optional status helper.
+    /// The systemd feed is allowed to settle only when every boot-relevant
+    /// discovered node service is active, intentionally skipped,
+    /// inactive/oneshot-complete, or failed and therefore visible as a
+    /// terminal red result. Periodic timer jobs are deliberately excluded:
+    /// their short `activating` window must never hold the desktop splash open
+    /// after the initial boot graph has completed. An absent feed is treated as
+    /// settled so recovery and minimal images never deadlock the graphical
+    /// shell on an optional status helper.
     pub(crate) fn services_settled(&self) -> bool {
         boot_services().iter().all(|service| {
+            if matches!(service.unit.as_str(), "mesh-health.service" | "mesh-status.service") {
+                return true;
+            }
             matches!(
                 service.active.as_str(),
                 "active" | "skipped" | "inactive" | "failed"

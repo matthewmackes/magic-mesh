@@ -15,8 +15,8 @@
 //! ## Shape (mirrors `vm_lifecycle`)
 //!
 //! - The **pure core** is fully unit-tested with no bus: [`fold_capacity`]
-//!   (latest-wins-by-host fold of `event/kvm/services`, exactly like the other
-//!   capacity folders), [`choose_node`] (the placement decision), and
+//!   (newest-publication-by-host fold of `event/kvm/services` with replay and
+//!   equivocation quarantine), [`choose_node`] (the placement decision), and
 //!   [`plan_placement`] (what to publish) never touch the bus or a clock
 //!   (`now_ms` is passed in).
 //! - The sole outward seam is an injectable [`Publisher`] (production
@@ -42,7 +42,7 @@
 //!   a [`DesiredPlacement`] (`{kind, spec, chosen_host, request_id}`) to the
 //!   [`DESIRED_TOPIC`] on the same bus [`Persist`] MV-5a already reads/writes, so
 //!   the intent outlives a restart or a leader change. Read back latest-wins-by-key
-//!   ([`fold_desired`]), exactly like the capacity fold.
+//!   ([`fold_desired`]).
 //! - **Pure re-placement:** [`replace_decisions`] re-picks a live host (via
 //!   [`choose_node`] over the surviving capacity) for any persisted placement whose
 //!   node has left the mesh — never the dead node, skipped when nothing is live.
@@ -204,15 +204,39 @@ impl DesiredPlacement {
 
 // ─────────────────────────── pure: decision ───────────────────────────
 
-/// Fold a stream of `event/kvm/services` bodies into a latest-wins-by-host
-/// capacity map (later messages for the same `host` overwrite earlier ones —
-/// exactly like the other capacity folders). Unparseable bodies are skipped.
+/// Fold a stream of `event/kvm/services` bodies into a newest-publication-by-host
+/// capacity map. Bus delivery order is not health-history authority: an older
+/// replicated row cannot roll a host back, and conflicting bodies at the same
+/// publication time quarantine that host until a strictly newer observation
+/// arrives. Exact duplicate delivery remains idempotent. Unparseable bodies are
+/// skipped.
 #[must_use]
 pub fn fold_capacity<'a>(bodies: impl IntoIterator<Item = &'a str>) -> BTreeMap<NodeId, KvmHealth> {
-    let mut map = BTreeMap::new();
+    let mut map = BTreeMap::<NodeId, KvmHealth>::new();
+    let mut equivocated_at = BTreeMap::<NodeId, u64>::new();
     for body in bodies {
         if let Ok(h) = serde_json::from_str::<KvmHealth>(body) {
-            map.insert(h.host.clone(), h);
+            let host = h.host.clone();
+            if equivocated_at
+                .get(&host)
+                .is_some_and(|watermark| h.published_at_ms <= *watermark)
+            {
+                continue;
+            }
+
+            match map.get(&host) {
+                Some(current) if h.published_at_ms < current.published_at_ms => {}
+                Some(current) if h.published_at_ms == current.published_at_ms => {
+                    if current != &h {
+                        map.remove(&host);
+                        equivocated_at.insert(host, h.published_at_ms);
+                    }
+                }
+                _ => {
+                    equivocated_at.remove(&host);
+                    map.insert(host, h);
+                }
+            }
         }
     }
     map
@@ -1404,19 +1428,58 @@ mod tests {
         assert_eq!(chosen.as_deref(), Some("node-b"));
     }
 
-    // ── fold_capacity (latest-wins by host) ──
+    // ── fold_capacity (newest authoritative publication by host) ──
 
     #[test]
     fn fold_capacity_is_latest_wins_by_host() {
-        let older = serde_json::to_string(&health("node-a", 1, false)).unwrap();
-        let newer = serde_json::to_string(&health("node-a", 6, true)).unwrap();
+        let mut older_health = health("node-a", 1, false);
+        older_health.published_at_ms = 1;
+        let older = serde_json::to_string(&older_health).unwrap();
+        let mut newer_health = health("node-a", 6, true);
+        newer_health.published_at_ms = 2;
+        let newer = serde_json::to_string(&newer_health).unwrap();
         let other = serde_json::to_string(&health("node-b", 3, true)).unwrap();
         let map = fold_capacity([older.as_str(), other.as_str(), newer.as_str(), "garbage"]);
         assert_eq!(map.len(), 2);
-        // node-a's later message wins.
+        // node-a's newer publication wins.
         assert_eq!(map["node-a"].active, 6);
         assert!(map["node-a"].all_healthy);
         assert_eq!(map["node-b"].active, 3);
+    }
+
+    #[test]
+    fn replayed_or_equivocated_health_history_cannot_authorize_capacity_after_restart() {
+        let body = |active, healthy, published_at_ms| {
+            let mut summary = health("node-a", active, healthy);
+            summary.published_at_ms = published_at_ms;
+            serde_json::to_string(&summary).expect("encode health fixture")
+        };
+        let current = body(5, true, 20);
+        let replay = body(1, false, 10);
+        let conflict = body(4, true, 20);
+        let replayed_current = body(5, true, 20);
+        let recovered = body(6, true, 21);
+
+        let quarantined = fold_capacity([
+            current.as_str(),
+            replay.as_str(),
+            conflict.as_str(),
+            replayed_current.as_str(),
+        ]);
+        assert!(
+            !quarantined.contains_key("node-a"),
+            "equal-time equivocation must fail closed and replay cannot restore capacity"
+        );
+
+        let corrected = fold_capacity([
+            current.as_str(),
+            replay.as_str(),
+            conflict.as_str(),
+            replayed_current.as_str(),
+            recovered.as_str(),
+        ]);
+        assert_eq!(corrected["node-a"].published_at_ms, 21);
+        assert_eq!(corrected["node-a"].active, 6);
     }
 
     // ── plan_placement (the non-executing proposal) ──

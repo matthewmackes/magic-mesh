@@ -72,20 +72,35 @@ pub enum CaptureNodeKind {
 }
 
 impl CaptureNodeKind {
-    /// Classify a device-node path by its basename prefix (the trailing index
-    /// digits are stripped), e.g. `/dev/video0` → [`Video`](Self::Video).
+    /// Classify a canonical, direct `/dev` device-node path by its prefix and
+    /// decimal index, e.g. `/dev/video0` → [`Video`](Self::Video).
+    ///
+    /// Paths containing traversal, nested components, or non-canonical indexes
+    /// are not capture authority even when their basename resembles `videoN`.
     #[must_use]
     pub fn from_path(path: &str) -> Self {
-        let base = path.rsplit('/').next().unwrap_or(path);
-        let prefix = base.trim_end_matches(|c: char| c.is_ascii_digit());
-        match prefix {
-            "video" => Self::Video,
-            "vbi" => Self::Vbi,
-            "radio" => Self::Radio,
-            "media" => Self::Media,
-            "v4l-subdev" => Self::SubDevice,
-            _ => Self::Other,
+        let Some(base) = path.strip_prefix("/dev/") else {
+            return Self::Other;
+        };
+        if base.contains('/') {
+            return Self::Other;
         }
+
+        for (prefix, kind) in [
+            ("video", Self::Video),
+            ("vbi", Self::Vbi),
+            ("radio", Self::Radio),
+            ("media", Self::Media),
+            ("v4l-subdev", Self::SubDevice),
+        ] {
+            if base
+                .strip_prefix(prefix)
+                .is_some_and(is_canonical_node_index)
+            {
+                return kind;
+            }
+        }
+        Self::Other
     }
 
     /// A short human label for the node kind (for the Sources detail line / tests).
@@ -106,6 +121,12 @@ impl CaptureNodeKind {
     pub const fn is_capture(self) -> bool {
         matches!(self, Self::Video)
     }
+}
+
+fn is_canonical_node_index(index: &str) -> bool {
+    index
+        .parse::<u32>()
+        .is_ok_and(|parsed| parsed.to_string() == index)
 }
 
 /// One device node of a v4l2 capture device — a `/dev/...` path and its classified
@@ -468,6 +489,25 @@ mod tests {
         );
         assert!(CaptureNodeKind::Video.is_capture());
         assert!(!CaptureNodeKind::Media.is_capture());
+    }
+
+    #[test]
+    fn path_aliases_cannot_manufacture_capture_authority() {
+        let devices = parse_v4l2_listing(
+            "Hostile Camera (usb-attacker):\n\
+             \t/dev/attacker/../video0\n\
+             \t/dev/video00\n\
+             \t/dev/video0/../video1\n",
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].nodes.iter().all(|node| !node.is_capture()));
+        assert!(!devices[0].is_playable());
+        assert_eq!(devices[0].play_url(), None);
+        assert_eq!(
+            CaptureNode::new("/dev/attacker/../video0").kind,
+            CaptureNodeKind::Other
+        );
     }
 
     #[test]

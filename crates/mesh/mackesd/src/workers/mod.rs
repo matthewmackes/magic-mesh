@@ -186,7 +186,9 @@ pub mod worker_runtime_status;
 // 30 s cadence; the renderer (metrics::write_textfile) existed with
 // no production caller until this worker.
 pub mod metrics_exporter;
-// MEDIA-3 — exact-role-gated Navidrome supervisor for Lighthouse_Media.
+// MEDIA-3 / MEDIA-pkg-2 — exact-role-gated, two-unit Navidrome supervisor for
+// Lighthouse_Media. This is the sole authority for backing-store recovery and
+// Navidrome activation.
 pub mod media_navidrome;
 // EFF-20 — timeout-bounded subprocess execution shared by the workers
 // that shell out on a tick, so a hung child can't pin a runtime thread.
@@ -311,10 +313,6 @@ pub mod router_action;
 // `<host>/media-registry.json` (same registry plane the other published
 // services use) — with a per-instance health field.
 pub mod media_registry;
-// MEDIA-pkg-2 — the navidrome_supervisor worker: on a Lighthouse_Media node only,
-// adopt + self-heal the mcnf-navidrome.service systemd unit (restart-if-down,
-// re-provision-if-missing via the RPM-shipped setup-media-navidrome).
-pub mod navidrome_supervisor;
 // MEDIA-8 — the Workstation half of the media birthright: read the published
 // shared account off the registry plane and idempotently write the desktop
 // user's airsonic-creds.json so mde-music auto-browses (no first-run connect).
@@ -1225,6 +1223,24 @@ impl Supervisor {
         }
     }
 
+    /// Claim one installed ARCH-009 process group before any group-owned
+    /// service activation occurs.
+    ///
+    /// The six `mackesd-*.service` entrypoints must use this constructor at
+    /// the top of `serve --group`: it acquires the kernel-backed group lease
+    /// before returning a supervisor, so a duplicate process cannot open the
+    /// SQLite writer, publish startup state, or construct workers before its
+    /// ownership conflict is detected.
+    pub fn claim_process_group(
+        group: crate::worker_role::WorkerGroup,
+        bus_root: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        let mut supervisor = Self::new();
+        supervisor.worker_owner_root = Some(bus_root.join(".mackesd-worker-owners"));
+        supervisor.try_set_worker_group(group)?;
+        Ok(supervisor)
+    }
+
     /// EFF-24 — attach the shared per-worker status registry. Call
     /// before the first `spawn` so every worker is tracked.
     pub fn set_status_map(&mut self, map: WorkerStatusMap) {
@@ -2048,6 +2064,21 @@ mod tests {
 
         drop(supervisor);
         run_group_lease_child(owner_root.path(), false);
+    }
+
+    #[test]
+    fn process_group_claim_rejects_duplicate_before_runtime_activation() {
+        let bus_root = tempfile::tempdir().expect("bus root");
+        let supervisor = Supervisor::claim_process_group(
+            crate::worker_role::WorkerGroup::Control,
+            bus_root.path(),
+        )
+        .expect("first process claims control before activation");
+        let owner_root = bus_root.path().join(".mackesd-worker-owners");
+
+        run_group_lease_child(&owner_root, true);
+        drop(supervisor);
+        run_group_lease_child(&owner_root, false);
     }
 
     // ── mackesd-05: half-open recovery — behavioral (paused-time) ───

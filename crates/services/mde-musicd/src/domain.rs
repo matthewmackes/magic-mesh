@@ -19,6 +19,8 @@ pub const MAX_SEARCH_ITEMS: usize = 96;
 pub const MAX_SHELVES: usize = 32;
 /// Maximum queue entries retained in one workspace snapshot.
 pub const MAX_QUEUE_ITEMS: usize = 512;
+/// Maximum bytes in one queue-stable entry identity.
+pub const MAX_QUEUE_ENTRY_ID_BYTES: usize = 256;
 /// Maximum library items retained in one collection.
 pub const MAX_COLLECTION_ITEMS: usize = 512;
 /// Maximum number of items admitted in one provider-backed library page.
@@ -582,12 +584,18 @@ impl MusicWorkspaceSnapshotV1 {
         {
             return Err("collection_too_large");
         }
+        let mut queue_ids = BTreeSet::new();
+        if self.queue.iter().any(|entry| {
+            entry.id.trim().is_empty()
+                || entry.id.len() > MAX_QUEUE_ENTRY_ID_BYTES
+                || entry.id.chars().any(char::is_control)
+                || !valid_content_ref(&entry.content)
+                || !queue_ids.insert(entry.id.as_str())
+        }) {
+            return Err("invalid_queue_identity");
+        }
         if self
-            .queue
-            .iter()
-            .any(|entry| !valid_content_ref(&entry.content))
-            || self
-                .downloads
+            .downloads
                 .iter()
                 .any(|entry| !valid_content_ref(&entry.content))
             || self
@@ -984,5 +992,52 @@ mod tests {
             })
             .collect();
         assert_eq!(snapshot.validate(), Err("collection_too_large"));
+    }
+
+    #[test]
+    fn equivocated_queue_entry_identity_cannot_select_track_by_order() {
+        let first = ContentRef::new("source", "song-a", ContentKind::Music).unwrap();
+        let second = ContentRef::new("source", "song-b", ContentKind::Music).unwrap();
+        let snapshot = MusicWorkspaceSnapshotV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            revision: 1,
+            shelves: Vec::new(),
+            bookmarks: Vec::new(),
+            collections: Vec::new(),
+            search: None,
+            playback: PlaybackSnapshot {
+                current: Some(first.clone()),
+                playing: false,
+                position_ms: 0,
+                duration_ms: None,
+                volume_milli: 1000,
+                shuffle: false,
+                repeat: "off".into(),
+                queue_revision: 1,
+                seekable: false,
+            },
+            queue: vec![
+                QueueEntry {
+                    id: "shared-entry".into(),
+                    content: first,
+                    title: "First".into(),
+                },
+                QueueEntry {
+                    id: "shared-entry".into(),
+                    content: second,
+                    title: "Substituted".into(),
+                },
+            ],
+            downloads: Vec::new(),
+            storage: MusicStorageSnapshot {
+                used_bytes: 0,
+                cap_bytes: 1,
+            },
+            targets: Vec::new(),
+            sources: Vec::new(),
+            any_source_reachable: false,
+        };
+
+        assert_eq!(snapshot.validate(), Err("invalid_queue_identity"));
     }
 }

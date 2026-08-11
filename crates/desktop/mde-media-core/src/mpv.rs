@@ -35,6 +35,72 @@ use crate::video::VideoConfig;
 /// replacement for this whole path).
 const FRAME_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Admission state for frame captures from the current mpv load generation.
+///
+/// mpv retains the last decoded frame while a replacement `loadfile` is in
+/// flight.  Treating that frame as output from the replacement media would let
+/// stale pixels stand in for successful playback, so capture stays revoked
+/// until mpv confirms the current generation with `FileLoaded`.
+#[derive(Debug, Default)]
+struct FrameAuthority {
+    generation: u64,
+    state: FrameAuthorityState,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum FrameAuthorityState {
+    #[default]
+    Idle,
+    AwaitingStart(u64),
+    AwaitingLoaded(u64),
+    Ready(u64),
+}
+
+impl FrameAuthority {
+    fn begin_load(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.state = FrameAuthorityState::AwaitingStart(self.generation);
+    }
+
+    fn start_file(&mut self) {
+        self.state = match self.state {
+            FrameAuthorityState::AwaitingStart(generation) => {
+                FrameAuthorityState::AwaitingLoaded(generation)
+            }
+            // An uncommanded start is not proof for the requested media.
+            _ => FrameAuthorityState::Idle,
+        };
+    }
+
+    fn file_loaded(&mut self) {
+        self.state = match self.state {
+            FrameAuthorityState::AwaitingLoaded(generation) if generation == self.generation => {
+                FrameAuthorityState::Ready(generation)
+            }
+            // In particular, reject a queued FileLoaded from the superseded
+            // generation when no current-generation StartFile preceded it.
+            _ => FrameAuthorityState::Idle,
+        };
+    }
+
+    fn end_file(&mut self) {
+        // Replacing a file emits EndFile for the incumbent before StartFile for
+        // the requested replacement. Preserve that pending request; every
+        // other terminal event revokes frame authority.
+        if !matches!(self.state, FrameAuthorityState::AwaitingStart(_)) {
+            self.state = FrameAuthorityState::Idle;
+        }
+    }
+
+    fn revoke(&mut self) {
+        self.state = FrameAuthorityState::Idle;
+    }
+
+    const fn can_capture(&self) -> bool {
+        matches!(self.state, FrameAuthorityState::Ready(ready) if ready == self.generation)
+    }
+}
+
 /// The real mpv-backed engine.
 ///
 /// Owns one [`libmpv2::Mpv`] instance. Construct with [`MpvEngine::new`], then
@@ -51,6 +117,8 @@ pub struct MpvEngine {
     /// self-throttles to [`FRAME_CAPTURE_MIN_INTERVAL`] instead of hitting disk
     /// every call.
     last_capture: Option<Instant>,
+    /// Whether mpv has confirmed decoded-media authority for this load.
+    frame_authority: FrameAuthority,
 }
 
 impl std::fmt::Debug for MpvEngine {
@@ -107,6 +175,7 @@ impl MpvEngine {
             mpv,
             frame_seq: 0,
             last_capture: None,
+            frame_authority: FrameAuthority::default(),
         })
     }
 
@@ -184,7 +253,9 @@ const fn end_reason(reason: libmpv2::EndFileReason) -> EndReason {
 
 impl MediaEngine for MpvEngine {
     fn load_file(&mut self, url: &str) -> Result<(), EngineError> {
-        self.mpv.command("loadfile", &[url]).map_err(backend)
+        self.mpv.command("loadfile", &[url]).map_err(backend)?;
+        self.frame_authority.begin_load();
+        Ok(())
     }
 
     fn set_paused(&mut self, paused: bool) -> Result<(), EngineError> {
@@ -198,7 +269,9 @@ impl MediaEngine for MpvEngine {
     }
 
     fn stop(&mut self) -> Result<(), EngineError> {
-        self.mpv.command("stop", &[]).map_err(backend)
+        self.mpv.command("stop", &[]).map_err(backend)?;
+        self.frame_authority.revoke();
+        Ok(())
     }
 
     fn position(&self) -> Option<f64> {
@@ -225,11 +298,17 @@ impl MediaEngine for MpvEngine {
         // Non-blocking drain of the event queue (timeout 0.0 = don't wait).
         while let Some(ev) = self.mpv.wait_event(0.0) {
             match ev {
-                Ok(Event::FileLoaded) => out.push(EngineSignal::FileLoaded),
+                Ok(Event::StartFile) => self.frame_authority.start_file(),
+                Ok(Event::FileLoaded) => {
+                    self.frame_authority.file_loaded();
+                    out.push(EngineSignal::FileLoaded);
+                }
                 Ok(Event::EndFile(reason)) => {
+                    self.frame_authority.end_file();
                     out.push(EngineSignal::EndFile(end_reason(reason)));
                 }
                 Ok(Event::Shutdown) => {
+                    self.frame_authority.revoke();
                     out.push(EngineSignal::EndFile(EndReason::Stopped));
                     break;
                 }
@@ -340,6 +419,10 @@ impl MediaEngine for MpvEngine {
     }
 
     fn latest_frame(&mut self) -> Option<VideoFrame> {
+        if !self.frame_authority.can_capture() {
+            return None;
+        }
+
         // Self-throttle: a "first proof" cadence, not the perf-tuned path (see
         // FRAME_CAPTURE_MIN_INTERVAL). Update the clock regardless of the
         // outcome below so a "nothing loaded" caller doesn't retry every call.
@@ -377,6 +460,55 @@ impl MediaEngine for MpvEngine {
         let bytes = std::fs::read(&path).ok();
         let _ = std::fs::remove_file(&path);
         decode_png_rgba(&bytes?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameAuthority;
+
+    #[test]
+    fn replacement_load_cannot_reuse_prior_generation_frame_as_playback_proof() {
+        let mut authority = FrameAuthority::default();
+
+        authority.begin_load();
+        authority.start_file();
+        authority.file_loaded();
+        assert!(
+            authority.can_capture(),
+            "confirmed first load owns its frame"
+        );
+
+        authority.begin_load();
+        assert!(
+            !authority.can_capture(),
+            "replacement load must revoke the retained prior-media frame"
+        );
+
+        authority.file_loaded();
+        assert!(
+            !authority.can_capture(),
+            "queued FileLoaded without a current StartFile must stay stale"
+        );
+
+        authority.begin_load();
+        authority.end_file();
+        assert!(
+            !authority.can_capture(),
+            "the incumbent EndFile must not authorize replacement frames"
+        );
+        authority.start_file();
+        authority.file_loaded();
+        assert!(
+            authority.can_capture(),
+            "only current-generation FileLoaded restores frame authority"
+        );
+
+        authority.revoke();
+        assert!(
+            !authority.can_capture(),
+            "terminal events must revoke the final retained frame"
+        );
     }
 }
 

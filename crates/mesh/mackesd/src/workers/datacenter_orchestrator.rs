@@ -31,12 +31,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use super::{ShutdownToken, Worker};
 
 /// Sweep cadence — 15 s (datacenter state is coarse; doctl/XAPI calls aren't free).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Keep every substrate probe below one worker tick. The shared process runner
+/// also caps each captured stream, so a wedged or noisy provider cannot pin the
+/// datacenter process group or grow its snapshot heap without bound.
+const PROVIDER_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+
+fn provider_command_output(command: Command, timeout: Duration) -> std::io::Result<Output> {
+    super::proc::output_with_timeout(command, timeout)
+}
+
+fn run_provider_command(command: Command) -> std::io::Result<Output> {
+    provider_command_output(command, PROVIDER_COMMAND_TIMEOUT)
+}
 
 /// DATACENTER-12 — SR capacity **warning** line. An SR whose physical utilisation
 /// is at or above this percentage of its capacity emits a `warn` onto the health
@@ -222,17 +236,17 @@ pub fn parse_droplets(json: &str) -> Vec<DcResource> {
 /// Sample the DigitalOcean zone via `doctl` (best-effort: a missing/failed doctl
 /// yields no resources, never an error).
 fn gather_do() -> Vec<DcResource> {
-    let out = std::process::Command::new("doctl")
-        .args([
-            "compute",
-            "droplet",
-            "list",
-            "--context",
-            &doctl_context(),
-            "-o",
-            "json",
-        ])
-        .output();
+    let mut command = Command::new("doctl");
+    command.args([
+        "compute",
+        "droplet",
+        "list",
+        "--context",
+        &doctl_context(),
+        "-o",
+        "json",
+    ]);
+    let out = run_provider_command(command);
     match out {
         Ok(o) if o.status.success() => parse_droplets(&String::from_utf8_lossy(&o.stdout)),
         _ => Vec::new(),
@@ -383,10 +397,9 @@ fn node_on_lan() -> bool {
             return false;
         }
     }
-    match std::process::Command::new("ip")
-        .args(["-j", "addr"])
-        .output()
-    {
+    let mut command = Command::new("ip");
+    command.args(["-j", "addr"]);
+    match run_provider_command(command) {
         Ok(o) if o.status.success() => node_on_lan_for(&local_ipv4s_from_ip_json(
             &String::from_utf8_lossy(&o.stdout),
         )),
@@ -703,10 +716,9 @@ pub fn ssh_xe_argv(key: &str, dom0: &str, route: &SshRoute, remote: &str) -> Vec
 /// (best-effort). The argv (incl. any `-J root@<relay>` ProxyJump) comes from
 /// [`ssh_xe_argv`], so this is the only spot that actually spawns ssh.
 fn ssh_xe(key: &str, dom0: &str, route: &SshRoute, remote: &str) -> Option<String> {
-    let o = std::process::Command::new("ssh")
-        .args(ssh_xe_argv(key, dom0, route, remote))
-        .output()
-        .ok()?;
+    let mut command = Command::new("ssh");
+    command.args(ssh_xe_argv(key, dom0, route, remote));
+    let o = run_provider_command(command).ok()?;
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -916,10 +928,9 @@ pub fn parse_unifi_cred(raw: &str) -> (String, String) {
 /// repo root (the worker's current dir). `None` on any failure (helper missing,
 /// secret absent, non-zero exit) so the gateway source degrades to a no-op.
 fn unifi_cred() -> Option<(String, String)> {
-    let o = std::process::Command::new("bash")
-        .args(["-lc", "automation/secrets/mcnf-secret.sh get unifi-cred"])
-        .output()
-        .ok()?;
+    let mut command = Command::new("bash");
+    command.args(["-lc", "automation/secrets/mcnf-secret.sh get unifi-cred"]);
+    let o = run_provider_command(command).ok()?;
     if !o.status.success() {
         return None;
     }
@@ -934,20 +945,19 @@ fn unifi_cred() -> Option<(String, String)> {
 /// Run a remote command on the UniFi gateway over `sshpass` (password auth — the
 /// router has no mesh key). Best-effort: `None` on any failure.
 fn ssh_unifi(pw: &str, user: &str, host: &str, remote: &str) -> Option<String> {
-    let o = std::process::Command::new("sshpass")
-        .args([
-            "-p",
-            pw,
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=8",
-            &format!("{user}@{host}"),
-            remote,
-        ])
-        .output()
-        .ok()?;
+    let mut command = Command::new("sshpass");
+    command.args([
+        "-p",
+        pw,
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=8",
+        &format!("{user}@{host}"),
+        remote,
+    ]);
+    let o = run_provider_command(command).ok()?;
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -1312,6 +1322,22 @@ impl Worker for DatacenterOrchestratorWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_provider_process_cannot_pin_the_datacenter_worker_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = std::time::Instant::now();
+
+        let error = provider_command_output(command, Duration::from_millis(75))
+            .expect_err("a provider that outlives its deadline must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the provider must be killed and reaped instead of pinning the group"
+        );
+    }
 
     #[test]
     fn reconcile_emits_on_new_and_change_only() {

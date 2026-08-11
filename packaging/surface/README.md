@@ -58,22 +58,23 @@ published SRPMs, output directory, or networked dependency phase. Final RPMs
 additionally require the project release signing key. Neither secret belongs in
 this repository or the finalization process.
 
-## Finalizing a release candidate
+## Preparing and publishing a release candidate
 
-Finalization never signs. An operator must first copy **every** RPM from all
-five new producer output directories into one otherwise empty staging
-directory, then explicitly invoke the existing operator-only signing flow on
-that exact set:
+RPM-header signing and release publication are separate operator-only stages.
+First copy **every** RPM from all five new producer output directories into one
+otherwise empty staging directory, then prepare that exact set:
 
 ```sh
-install-helpers/sign-release.sh /new/signed-rpms/*.rpm
+install-helpers/sign-release.sh --prepare-rpms /new/prepared-rpms/*.rpm
 ```
 
-This mutates the staged RPM headers and creates `SHA256SUMS` plus
-`SHA256SUMS.asc`; it must run only on the authorized release-signing machine.
-Do not pass private material to the finalizer. With the signed directory
-containing exactly those RPMs and the two checksum-envelope files, emit a new
-candidate directory:
+This is the only mutating stage: it parses the complete RPM set before changing
+the first file, embeds the project RPM signature, verifies each result, and
+emits no `SHA256SUMS`, detached release signature, or provenance. It accepts
+only non-symlink regular RPMs from one directory and
+must run on the authorized release-signing machine. Do not pass private
+material to the finalizer. With the prepared directory containing exactly
+those RPMs and no release outputs, emit a new candidate directory:
 
 ```sh
 install-helpers/finalize-surface-stack.py \
@@ -83,7 +84,7 @@ install-helpers/finalize-surface-stack.py \
   --surface-control-output /new/surface-control/path \
   --surface-secureboot-output /new/surface-secureboot/path \
   --source-bundle /verified/input/path \
-  --signed-dir /new/signed-rpms \
+  --signed-dir /new/prepared-rpms \
   --release-key /public/RPM-GPG-KEY-magic-mesh \
   --certificate /verified/input/path/surface.cer \
   --bootc-base quay.io/fedora/fedora-bootc:44@sha256:EXACT_64_HEX_DIGEST \
@@ -91,14 +92,54 @@ install-helpers/finalize-surface-stack.py \
 ```
 
 The helper rejects extra, missing, unsigned, renamed, or payload-changed RPMs;
-checks every producer and source checksum; verifies the signed checksum
-envelope and the exact primary/signing-subkey fingerprints admitted by the
-public key; inspects every kernel module signer; matches the module key, kernel
-build certificate, and certificate packaged by
+checks every producer and source checksum; verifies each RPM against the exact
+primary/signing-subkey fingerprints admitted by the public key; inspects every
+kernel module signer; matches the module key, kernel build certificate, and
+certificate packaged by
 `surface-secureboot`; and runs `verify-surface-stack.sh` before atomically
 publishing `surface-stack.f44.json`, `surface-stack.install.lock`, and the exact
 ready artifact set. It does not update the tracked contract automatically.
 Review and promotion of that candidate remain operator actions.
+
+Next place the exact candidate artifacts being released, the SBOM, gate
+manifest, CI/farm status, and any required live/topology inputs in one new
+publication directory. Generate schema-5 evidence over the already prepared,
+immutable artifact bytes; the full command must name every governed gate input:
+
+```sh
+install-helpers/release-evidence.sh write \
+  --out /new/publication/release-evidence.json \
+  --source-commit FULL_GIT_COMMIT \
+  --artifact /new/publication/ARTIFACT.rpm \
+  --check github-required=pass \
+  --farm-job FARM_JOB_ID --farm-slot FARM_HOST/FARM_SLOT \
+  --sbom rpm=pass \
+  --sbom-manifest /new/publication/sbom.json \
+  --gate-manifest /new/publication/release-gate-matrix.json \
+  --ci-gate-status /new/publication/ci-gate-status.json \
+  --resource-publisher-attestation /new/publication/resource-attestation.json \
+  --topology-evidence /new/publication/six-node-topology.json \
+  --vdi-evidence /new/publication/vdi-live-proof.json \
+  --fedora-target fedora-44=pass \
+  --live-gate six-node-acceptance=pass \
+  --preview-verdict pass --production-verdict pass
+```
+
+Finally publish the evidence-bound bundle. Before creating any output or
+invoking GPG, this stage requires every `.rpm` artifact to have a verifiable
+embedded signature. It never rewrites an RPM; it validates the exact
+post-preparation bytes and emits the only
+`PROVENANCE.json`, `SHA256SUMS`, and `SHA256SUMS.asc` release outputs:
+
+```sh
+install-helpers/sign-release.sh \
+  --evidence /new/publication/release-evidence.json \
+  /new/publication/ARTIFACT.rpm
+```
+
+Supplying artifacts to `sign-release.sh` without either `--prepare-rpms` or
+`--evidence` is refused. Production-pass publication also requires the governed
+resource-publisher credential described by `sign-release.sh --help`.
 
 Run the focused refusal fixtures with:
 

@@ -528,6 +528,25 @@ fn write_manifest_complete(mount: &Path, host: &str, manifest: &ShareManifest) -
     Ok(())
 }
 
+fn validate_manifest_items(manifest: &ShareManifest, path: &Path) -> io::Result<()> {
+    let mut item_ids = BTreeSet::new();
+    for item in &manifest.items {
+        if item.id.is_empty()
+            || item.id != item_id(&item.title, item.size_bytes)
+            || !item_ids.insert(item.id.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "non-canonical or duplicate media item identity in {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Read every peer's share manifest off the replicated plane
 /// (`<mount>/<host>/media-library.json`). Malformed/unreadable files are
 /// skipped (a half-written file from a concurrent writer must not break a
@@ -619,6 +638,7 @@ fn read_manifests_complete(mount: &Path) -> io::Result<Vec<ShareManifest>> {
                 format!("invalid media manifest identity/bounds {}", path.display()),
             ));
         }
+        validate_manifest_items(&manifest, &path)?;
         out.push(manifest);
     }
     out.sort_by(|a, b| a.host.cmp(&b.host));
@@ -2099,6 +2119,32 @@ mod tests {
             symlink(&outside, &path).unwrap();
             assert!(read_manifests_complete(mount.path()).is_err());
         }
+    }
+
+    #[test]
+    fn forged_or_duplicate_item_identity_cannot_enter_the_complete_fold() {
+        let mount = tempfile::tempdir().unwrap();
+        let peer = mount.path().join("oak");
+        std::fs::create_dir_all(&peer).unwrap();
+        let path = peer.join(MESH_LIBRARY_MANIFEST_FILE);
+        let mut manifest = manifest_with("oak", &[("Trusted", 128, MediaItemKind::Video)]);
+
+        manifest.items[0].title = "Forged".to_string();
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            read_manifests_complete(mount.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "an item declaration must remain bound to its deterministic identity"
+        );
+
+        manifest.items[0].title = "Trusted".to_string();
+        manifest.items.push(manifest.items[0].clone());
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            read_manifests_complete(mount.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a complete manifest must not carry duplicate item identities"
+        );
     }
 
     #[test]

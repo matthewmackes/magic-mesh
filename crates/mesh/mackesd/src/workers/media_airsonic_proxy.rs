@@ -69,6 +69,27 @@ struct GatewayCredential {
     password: String,
 }
 
+#[derive(Debug)]
+enum ProxyFailure {
+    BeforeResponse { status: u16, message: String },
+    AfterResponse { message: String },
+}
+
+impl ProxyFailure {
+    fn before_response(status: u16, message: impl Into<String>) -> Self {
+        Self::BeforeResponse {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn after_response(message: impl Into<String>) -> Self {
+        Self::AfterResponse {
+            message: message.into(),
+        }
+    }
+}
+
 /// Test seam over the encrypted mesh secret store.
 pub trait CredentialProvider: Send + Sync {
     /// Resolve one sealed credential reference into its decrypted body.
@@ -262,10 +283,32 @@ async fn handle_conn(
         }
     };
 
-    if let Err((status, message)) =
-        proxy_request(&mut stream, &http, request, route, credential).await
-    {
-        let _ = write_text_response(&mut stream, status, &message).await;
+    let _ = proxy_request_to_client(&mut stream, &http, request, route, credential).await;
+}
+
+async fn proxy_request_to_client(
+    stream: &mut TcpStream,
+    http: &reqwest::Client,
+    request: ParsedRequest,
+    route: GatewayRoute,
+    credential: GatewayCredential,
+) -> bool {
+    let source_id = route.source_id.clone();
+    match proxy_request(stream, http, request, route, credential).await {
+        Ok(()) => false,
+        Err(ProxyFailure::BeforeResponse { status, message }) => {
+            let _ = write_text_response(stream, status, &message).await;
+            false
+        }
+        Err(ProxyFailure::AfterResponse { message }) => {
+            tracing::warn!(
+                target: "mackesd::media_airsonic_proxy",
+                source = %source_id,
+                error = %message,
+                "AirSonic upstream failed after the client response was committed",
+            );
+            true
+        }
     }
 }
 
@@ -355,13 +398,20 @@ async fn proxy_request(
     request: ParsedRequest,
     route: GatewayRoute,
     credential: GatewayCredential,
-) -> Result<(), (u16, String)> {
+) -> Result<(), ProxyFailure> {
     let upstream_url = inject_subsonic_auth_query_params(&route.upstream_url, &credential)
-        .ok_or_else(|| (400, "invalid airsonic gateway upstream query".to_string()))?;
+        .ok_or_else(|| {
+            ProxyFailure::before_response(400, "invalid airsonic gateway upstream query")
+        })?;
     let method = match request.method.as_str() {
         "GET" => reqwest::Method::GET,
         "HEAD" => reqwest::Method::HEAD,
-        _ => return Err((405, "airsonic gateway method is not allowed".to_string())),
+        _ => {
+            return Err(ProxyFailure::before_response(
+                405,
+                "airsonic gateway method is not allowed",
+            ));
+        }
     };
     let headers = forwarded_headers(&request.headers);
     let mut response = http
@@ -369,29 +419,26 @@ async fn proxy_request(
         .headers(headers)
         .send()
         .await
-        .map_err(|e| (502, format!("airsonic upstream request failed: {e}")))?;
+        .map_err(|e| {
+            ProxyFailure::before_response(502, format!("airsonic upstream request failed: {e}"))
+        })?;
     let status = response.status();
     let response_headers = response.headers().clone();
     let content_length = response.content_length();
     let header = render_response_head(status, &response_headers, content_length);
-    stream
-        .write_all(header.as_bytes())
-        .await
-        .map_err(|e| (502, format!("airsonic gateway response write failed: {e}")))?;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| (502, format!("airsonic upstream response read failed: {e}")))?
-    {
-        stream
-            .write_all(&chunk)
-            .await
-            .map_err(|e| (502, format!("airsonic gateway response stream failed: {e}")))?;
+    stream.write_all(header.as_bytes()).await.map_err(|e| {
+        ProxyFailure::after_response(format!("airsonic gateway response write failed: {e}"))
+    })?;
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        ProxyFailure::after_response(format!("airsonic upstream response read failed: {e}"))
+    })? {
+        stream.write_all(&chunk).await.map_err(|e| {
+            ProxyFailure::after_response(format!("airsonic gateway response stream failed: {e}"))
+        })?;
     }
-    stream
-        .flush()
-        .await
-        .map_err(|e| (502, format!("airsonic gateway response flush failed: {e}")))?;
+    stream.flush().await.map_err(|e| {
+        ProxyFailure::after_response(format!("airsonic gateway response flush failed: {e}"))
+    })?;
     Ok(())
 }
 
@@ -979,6 +1026,79 @@ mod tests {
         assert_eq!(header_value(&head, "Accept-Ranges"), Some("bytes"));
         assert_eq!(header_value(&head, "ETag"), Some("\"song-etag\""));
         assert_eq!(&response[head_end + 4..], b"EFGHIJ");
+    }
+
+    #[tokio::test]
+    async fn truncated_provider_response_cannot_append_a_second_http_reply() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _request = read_http_request_bytes(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: audio/mpeg\r\n\
+                      Content-Length: 12\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      short",
+                )
+                .await
+                .unwrap();
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (mut gateway_stream, _) = listener.accept().await.unwrap();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let committed_failure = proxy_request_to_client(
+            &mut gateway_stream,
+            &http,
+            ParsedRequest {
+                method: "GET".to_string(),
+                target: "/mde/airsonic/source/rest/stream?id=song-7".to_string(),
+                headers: Vec::new(),
+            },
+            GatewayRoute {
+                source_id: "source".to_string(),
+                upstream_url: format!("http://{upstream_addr}/rest/stream?id=song-7"),
+                credential_ref: "media/airsonic/shared-readonly".to_string(),
+            },
+            GatewayCredential {
+                username: "mesh-readonly".to_string(),
+                password: "sesame".to_string(),
+            },
+        )
+        .await;
+        drop(gateway_stream);
+        upstream_task.await.unwrap();
+        let response = client.await.unwrap();
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(committed_failure, "truncated body must be detected");
+        assert!(
+            response_text.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{response_text}"
+        );
+        assert_eq!(
+            response_text.matches("HTTP/1.1 ").count(),
+            1,
+            "{response_text}"
+        );
+        assert!(
+            !response_text.contains("502 Bad Gateway"),
+            "{response_text}"
+        );
     }
 
     #[test]

@@ -342,6 +342,23 @@ fn position_target_ms(position_us: i64) -> Option<u64> {
     (!position_us.is_negative()).then_some(position_us as u64 / 1_000)
 }
 
+/// Resolve the queue identity that the engine is actually rendering.  The
+/// durable queue cursor can move before a replacement load reaches the engine,
+/// so it must not authorize a track-scoped MPRIS command by itself.
+#[must_use]
+fn audible_song_id(
+    songs: &[String],
+    engine_active: bool,
+    play_base: usize,
+    track_index: usize,
+) -> Option<&str> {
+    engine_active
+        .then(|| play_base.checked_add(track_index))
+        .flatten()
+        .and_then(|index| songs.get(index))
+        .map(String::as_str)
+}
+
 // ───────────────────────── root interface ─────────────────────────
 
 /// `org.mpris.MediaPlayer2` — the root media-player object.
@@ -664,11 +681,15 @@ impl Player {
         let Some(position_ms) = position_target_ms(position) else {
             return;
         };
-        let current = queue::read_from(&self.queue_path)
-            .current()
-            .map(ToOwned::to_owned)
-            .unwrap_or_default();
-        if current.is_empty() || track_id.as_str() != track_path(&current) {
+        let q = queue::read_from(&self.queue_path);
+        let current = audible_song_id(
+            &q.songs,
+            self.engine.is_active(),
+            self.engine.play_base(),
+            self.engine.current_track_index(),
+        )
+        .unwrap_or_default();
+        if current.is_empty() || track_id.as_str() != track_path(current) {
             return;
         }
         if self.engine.is_seekable() {
@@ -995,6 +1016,24 @@ mod tests {
         assert_eq!(seek_target_ms(u64::MAX - 1, i64::MAX), u64::MAX);
         assert_eq!(position_target_ms(42_500), Some(42));
         assert_eq!(position_target_ms(-1), None);
+    }
+
+    #[test]
+    fn stale_queue_cursor_cannot_authorize_seek_on_a_different_audible_track() {
+        let songs = vec!["still-audible".to_string(), "new-cursor".to_string()];
+
+        // Another control surface has moved the durable cursor to `new-cursor`,
+        // but the engine generation still starts at queue index zero.  A
+        // SetPosition carrying the new cursor's track path must not acquire
+        // authority over the still-audible track.
+        let persisted_cursor = 1;
+        let audible = audible_song_id(&songs, true, 0, 0).unwrap();
+        assert_eq!(audible, "still-audible");
+        assert_ne!(track_path(&songs[persisted_cursor]), track_path(audible));
+
+        // Stopped and impossible/overflowed engine generations fail closed.
+        assert_eq!(audible_song_id(&songs, false, 0, 0), None);
+        assert_eq!(audible_song_id(&songs, true, usize::MAX, 1), None);
     }
 
     #[tokio::test(flavor = "current_thread")]

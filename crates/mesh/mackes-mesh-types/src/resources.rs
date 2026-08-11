@@ -3077,6 +3077,11 @@ impl ResourcePublisherAttestation {
                 "resource_publisher_attestation.catalog_content_digest",
             ));
         }
+        if catalog.generated_at_ms > now_ms {
+            return Err(ResourceValidationError::InvalidTimestamp(
+                "resource_publisher_attestation.catalog_generation",
+            ));
+        }
         if now_ms < self.issued_at_ms || now_ms >= self.expires_at_ms {
             return Err(ResourceValidationError::InvalidTimestamp(
                 "resource_publisher_attestation.window",
@@ -3720,6 +3725,49 @@ mod tests {
             catalog.validate_publisher_attestation(&attestation, KEY, NOW + FRESH),
             Err(ResourceValidationError::InvalidTimestamp(
                 "resource_publisher_attestation.window"
+            ))
+        );
+    }
+
+    #[test]
+    fn restarted_browser_cannot_admit_future_catalog_under_current_attestation() {
+        const KEY: &[u8] = b"publisher-attestation-test-key";
+        let mut future = valid_catalog();
+        future.generated_at_ms = NOW + 1_000;
+        future.cards[0].first_seen_at_ms = NOW + 1_000;
+        future.cards[0].last_seen_at_ms = NOW + 1_000;
+        future.cards[0].expires_at_ms = NOW + FRESH;
+        future.cards[0].health.observed_at_ms = NOW + 1_000;
+        future.cards[0].health.expires_at_ms = NOW + FRESH;
+        future.cards[0].auth.updated_at_ms = NOW + 1_000;
+        for provenance in &mut future.cards[0].provenance {
+            provenance.observed_at_ms = NOW + 1_000;
+            provenance.expires_at_ms = NOW + FRESH;
+        }
+        for transport in &mut future.cards[0].transports {
+            transport.last_seen_at_ms = NOW + 1_000;
+            transport.expires_at_ms = NOW + FRESH;
+            transport.health.observed_at_ms = NOW + 1_000;
+            transport.health.expires_at_ms = NOW + FRESH;
+        }
+        for action in &mut future.cards[0].actions {
+            action.issued_at_ms = NOW + 1_000;
+            action.expires_at_ms = NOW + FRESH;
+        }
+        let future = future.with_content_digest().expect("future catalog shape");
+        let attestation = ResourcePublisherAttestation::mint(
+            &future,
+            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
+            KEY,
+            NOW,
+            NOW + FRESH,
+        )
+        .expect("current proof over future catalog");
+
+        assert_eq!(
+            future.admit_authenticated(attestation, KEY, NOW),
+            Err(ResourceValidationError::InvalidTimestamp(
+                "resource_publisher_attestation.catalog_generation"
             ))
         );
     }

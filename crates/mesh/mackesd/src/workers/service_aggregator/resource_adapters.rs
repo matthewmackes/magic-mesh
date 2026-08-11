@@ -83,7 +83,7 @@ pub enum ResourceAdapterAvailability {
     Unavailable,
     /// Source body or typed fields failed admission.
     Malformed,
-    /// Multiple non-identical cards claimed one stable resource ID.
+    /// Multiple non-identical source observations claimed one stable resource ID.
     Conflict,
 }
 
@@ -145,7 +145,12 @@ pub fn augment_from_production(
         );
     adapt_peers(&peers, directory_current, now_ms, &mut adapted);
 
-    match approved_nodes_for_resources(&peers, &catalog.publisher) {
+    match approved_nodes_for_resources(
+        &peers,
+        &catalog.publisher,
+        directory_current,
+        now_ms,
+    ) {
         Some(approved_nodes) => {
             adapt_workloads(bus_root, &approved_nodes, now_ms, &mut adapted);
             adapt_app_vm_catalogs(bus_root, &approved_nodes, now_ms, &mut adapted);
@@ -178,10 +183,14 @@ fn refuse_invalid_approved_nodes(adapted: &mut AdaptedSources) {
 /// malicious replicated view can contain two non-identical rows claiming one
 /// hostname. That hostname may still be rendered as a visible conflict card;
 /// it must not authorize Workload/App/Android reads until its identity is
-/// unambiguous. Exact duplicate rows are harmless and collapse here.
+/// unambiguous and its directory observation must still be current. Exact
+/// duplicate rows are harmless and collapse here. The local publisher remains
+/// an approved authority independently of remote-directory availability.
 fn approved_nodes_for_resources(
     peers: &[PeerRecord],
     publisher: &str,
+    directory_current: bool,
+    now_ms: u64,
 ) -> Option<BTreeSet<String>> {
     if peers.len() > MAX_PEER_ROWS || !is_safe_id(publisher) {
         return None;
@@ -206,8 +215,16 @@ fn approved_nodes_for_resources(
     }
 
     let mut approved = rows
-        .into_keys()
-        .filter(|hostname| !ambiguous.contains(hostname))
+        .into_iter()
+        .filter(|(hostname, peer)| {
+            directory_current
+                && !ambiguous.contains(hostname)
+                && peer.last_seen_ms > 0
+                && peer.last_seen_ms <= now_ms
+                && now_ms.saturating_sub(peer.last_seen_ms) < SOURCE_TTL_MS
+                && peer_card(peer, true, now_ms).is_ok()
+        })
+        .map(|(hostname, _)| hostname)
         .collect::<BTreeSet<_>>();
     approved.insert(publisher.to_owned());
     (approved.len() <= MAX_APPROVED_NODES).then_some(approved)
@@ -701,7 +718,7 @@ struct RetainedMediaState {
     published_at_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetainedMediaSource {
     id: String,
@@ -795,9 +812,13 @@ fn adapt_media_body(
     }
     let stale = now_ms.saturating_sub(state.published_at_ms) >= SOURCE_TTL_MS;
     let expires = state.published_at_ms.saturating_add(SOURCE_TTL_MS);
+    let conflicts = conflicting_media_keys(&state.sources);
     let mut media_cards = Vec::new();
     let mut share_cards = Vec::new();
     for source in &state.sources {
+        if conflicts.contains(&media_resource_key(source)) {
+            continue;
+        }
         let (health, reason) = media_health(source.reachability, stale);
         let class = if source.kind == MediaKind::FileShare {
             ResourceClass::FileShare
@@ -836,7 +857,7 @@ fn adapt_media_body(
             }
         }
     }
-    let availability = if stale {
+    let current_availability = if stale {
         ResourceAdapterAvailability::Stale
     } else {
         ResourceAdapterAvailability::Available
@@ -844,17 +865,63 @@ fn adapt_media_body(
     admit_source_cards(
         ResourceAdapterKind::Media,
         "media-roster",
-        availability,
+        if conflicts
+            .iter()
+            .any(|(kind, _)| *kind == ResourceAdapterKind::Media)
+        {
+            ResourceAdapterAvailability::Conflict
+        } else {
+            current_availability
+        },
         Ok(media_cards),
         adapted,
     );
     admit_source_cards(
         ResourceAdapterKind::FileShare,
         "media-roster/file-shares",
-        availability,
+        if conflicts
+            .iter()
+            .any(|(kind, _)| *kind == ResourceAdapterKind::FileShare)
+        {
+            ResourceAdapterAvailability::Conflict
+        } else {
+            current_availability
+        },
         Ok(share_cards),
         adapted,
     );
+}
+
+fn media_resource_key(source: &RetainedMediaSource) -> (ResourceAdapterKind, String) {
+    let kind = if source.kind == MediaKind::FileShare {
+        ResourceAdapterKind::FileShare
+    } else {
+        ResourceAdapterKind::Media
+    };
+    (kind, source.id.clone())
+}
+
+/// Detect equivocation before redaction can make conflicting raw rows look
+/// like one identical catalog card. Exact duplicate observations are harmless;
+/// non-identical rows claiming one stable projected identity are not.
+fn conflicting_media_keys(
+    sources: &[RetainedMediaSource],
+) -> BTreeSet<(ResourceAdapterKind, String)> {
+    let mut first = BTreeMap::<(ResourceAdapterKind, String), &RetainedMediaSource>::new();
+    let mut conflicts = BTreeSet::new();
+    for source in sources {
+        let key = media_resource_key(source);
+        match first.entry(key.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(source);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != source => {
+                conflicts.insert(key);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    conflicts
 }
 
 fn valid_media_source(source: &RetainedMediaSource) -> bool {
@@ -1073,12 +1140,21 @@ fn peer_card(peer: &PeerRecord, directory_current: bool, now_ms: u64) -> Result<
     }
     let observed = peer.last_seen_ms;
     let expires = observed.saturating_add(SOURCE_TTL_MS);
+    let stale = now_ms.saturating_sub(observed) >= SOURCE_TTL_MS;
     let (health, failure) = if !directory_current {
         (
             HealthStatus::Unavailable,
             Some(failure(
                 FailureCode::Unreachable,
                 "peer membership authority is unavailable",
+            )),
+        )
+    } else if stale {
+        (
+            HealthStatus::Stale,
+            Some(failure(
+                FailureCode::Stale,
+                "peer membership observation is stale",
             )),
         )
     } else {
@@ -1580,14 +1656,77 @@ mod tests {
         let approved = approved_nodes_for_resources(
             &[first.clone(), conflicting],
             "seat193",
+            true,
+            NOW,
         )
         .expect("safe peer rows remain a valid directory input");
         assert!(!approved.contains("alpha"));
         assert!(approved.contains("seat193"));
 
-        let exact_duplicates = approved_nodes_for_resources(&[first.clone(), first], "seat193")
-            .expect("exact duplicate rows are safe to collapse");
+        let exact_duplicates =
+            approved_nodes_for_resources(&[first.clone(), first], "seat193", true, NOW)
+                .expect("exact duplicate rows are safe to collapse");
         assert!(exact_duplicates.contains("alpha"));
+    }
+
+    #[test]
+    fn stale_or_unavailable_peer_directory_cannot_authorize_downstream_resource_reads() {
+        let current = peer("current");
+        let mut stale = peer("stale");
+        stale.last_seen_ms = NOW - SOURCE_TTL_MS;
+        let mut future = peer("future");
+        future.last_seen_ms = NOW + 1;
+
+        let approved = approved_nodes_for_resources(
+            &[current.clone(), stale, future],
+            "seat193",
+            true,
+            NOW,
+        )
+        .expect("bounded directory");
+        assert_eq!(
+            approved,
+            BTreeSet::from(["current".to_owned(), "seat193".to_owned()])
+        );
+
+        let unavailable =
+            approved_nodes_for_resources(&[current], "seat193", false, NOW)
+                .expect("bounded fallback directory");
+        assert_eq!(unavailable, BTreeSet::from(["seat193".to_owned()]));
+    }
+
+    #[test]
+    fn malformed_peer_projection_cannot_authorize_downstream_resource_reads() {
+        let mut malformed = peer("hostile");
+        malformed.role = Some("workstation\nforged-authority".into());
+
+        let approved = approved_nodes_for_resources(
+            &[malformed],
+            "seat193",
+            true,
+            NOW,
+        )
+        .expect("bounded directory");
+
+        assert_eq!(approved, BTreeSet::from(["seat193".to_owned()]));
+    }
+
+    #[test]
+    fn stale_peer_heartbeat_cannot_fabricate_current_resource_health() {
+        let mut stale = peer("stale");
+        stale.last_seen_ms = NOW - SOURCE_TTL_MS;
+        stale.health = "healthy".into();
+
+        let card = peer_card(&stale, true, NOW).expect("bounded stale peer card");
+
+        assert_eq!(card.health.status, HealthStatus::Stale);
+        assert_eq!(
+            card.health.failure,
+            Some(FailureReason {
+                code: FailureCode::Stale,
+                message: "peer membership observation is stale".into(),
+            })
+        );
     }
 
     fn app_projection(name: &str) -> AdmittedFlatpakCatalogProjection {
@@ -2087,6 +2226,40 @@ mod tests {
         assert!(!wire.contains("secret-path"));
         assert!(!wire.contains("secret/media-token"));
         assert!(!wire.contains("Do not copy"));
+    }
+
+    #[test]
+    fn media_raw_stable_id_equivocation_is_visible_before_redacted_card_deduplication() {
+        let mut state = media_state(MediaKind::Jellyfin);
+        let mut conflicting = state.sources[0].clone();
+        conflicting.endpoint = "http://hostile.mesh:8096/other-secret".into();
+        let mut independent = state.sources[0].clone();
+        independent.id = "jellyfin:birch:8096".into();
+        independent.node = "birch".into();
+        state.sources.extend([conflicting, independent]);
+
+        let mut adapted = AdaptedSources::default();
+        let body = serde_json::to_string(&state).unwrap();
+        adapt_media_body("seat193", Some(&body), NOW, &mut adapted);
+
+        let media_status = adapted
+            .statuses
+            .iter()
+            .find(|row| row.source == ResourceAdapterKind::Media)
+            .expect("media status");
+        assert_eq!(
+            media_status.availability,
+            ResourceAdapterAvailability::Conflict
+        );
+        assert_eq!(media_status.admitted_cards, 1);
+        assert_eq!(adapted.cards.len(), 1);
+        assert_eq!(
+            adapted.cards[0].resource_id(),
+            "media/jellyfin:birch:8096"
+        );
+        let wire = serde_json::to_string(&adapted.cards).unwrap();
+        assert!(!wire.contains("jellyfin:oak:8096"));
+        assert!(!wire.contains("other-secret"));
     }
 
     #[test]

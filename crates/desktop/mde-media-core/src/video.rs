@@ -252,15 +252,17 @@ pub struct VideoConfig {
     /// container's aspect).
     pub aspect: AspectRatio,
     /// Zoom as a log2 factor (mpv `video-zoom`: `0` = none, `1` = 2×, `-1` = ½×);
-    /// emitted only when non-zero.
+    /// A neutral `0` is emitted explicitly so a replacement config revokes the
+    /// preceding media generation's zoom.
     pub zoom: f64,
-    /// Horizontal pan as a fraction of the frame (mpv `video-pan-x`); emitted only
-    /// when non-zero.
+    /// Horizontal pan as a fraction of the frame (mpv `video-pan-x`); a neutral
+    /// `0` is emitted so a replacement config revokes retained pan.
     pub pan_x: f64,
-    /// Vertical pan as a fraction of the frame (mpv `video-pan-y`); emitted only
-    /// when non-zero.
+    /// Vertical pan as a fraction of the frame (mpv `video-pan-y`); a neutral `0`
+    /// is emitted so a replacement config revokes retained pan.
     pub pan_y: f64,
-    /// An optional rectangular crop (mpv `video-crop`); emitted only when set.
+    /// An optional rectangular crop (mpv `video-crop`); an empty value disables
+    /// cropping and revokes a preceding media generation's crop.
     pub crop: Option<Crop>,
     /// Quarter-turn rotation (mpv `video-rotate`).
     pub rotate: Rotation,
@@ -306,32 +308,27 @@ impl VideoConfig {
     }
 
     /// Compile the non-`vf` mpv properties this config sets, in a stable order:
-    /// `hwdec`, `video-aspect-override`, optional `video-zoom`/`video-pan-x`/
-    /// `video-pan-y`, optional `video-crop`, `video-rotate`, and `deinterlace`.
+    /// `hwdec`, `video-aspect-override`, `video-zoom`/`video-pan-x`/
+    /// `video-pan-y`, `video-crop`, `video-rotate`, and `deinterlace`.
     ///
     /// `hwdec`, `video-aspect-override`, `video-rotate`, and `deinterlace` are
-    /// always emitted (each carries a neutral value — `auto-safe`, `-1`, `0`,
-    /// `no`), so applying a config re-establishes those primary controls; the
-    /// finer zoom/pan/crop adjustments are emitted only when non-neutral, matching
-    /// [`AudioConfig`](crate::AudioConfig)'s conditional properties.
+    /// always emitted with neutral values where applicable. mpv properties are
+    /// global and survive media replacement, so omitting neutral zoom, pan, or
+    /// crop would let a previous media generation retain control of the next
+    /// frame's presentation.
     #[must_use]
     pub fn properties(&self) -> Vec<(String, String)> {
         let mut props = vec![
             ("hwdec".to_owned(), self.hwdec.as_mpv().to_owned()),
             ("video-aspect-override".to_owned(), self.aspect.as_mpv()),
+            ("video-zoom".to_owned(), fmt_num(self.zoom)),
+            ("video-pan-x".to_owned(), fmt_num(self.pan_x)),
+            ("video-pan-y".to_owned(), fmt_num(self.pan_y)),
+            (
+                "video-crop".to_owned(),
+                self.crop.map(Crop::to_mpv).unwrap_or_default(),
+            ),
         ];
-        if self.zoom.abs() > f64::EPSILON {
-            props.push(("video-zoom".to_owned(), fmt_num(self.zoom)));
-        }
-        if self.pan_x.abs() > f64::EPSILON {
-            props.push(("video-pan-x".to_owned(), fmt_num(self.pan_x)));
-        }
-        if self.pan_y.abs() > f64::EPSILON {
-            props.push(("video-pan-y".to_owned(), fmt_num(self.pan_y)));
-        }
-        if let Some(crop) = self.crop {
-            props.push(("video-crop".to_owned(), crop.to_mpv()));
-        }
         props.push(("video-rotate".to_owned(), self.rotate.degrees().to_string()));
         props.push((
             "deinterlace".to_owned(),
@@ -363,6 +360,10 @@ mod tests {
             vec![
                 ("hwdec".to_owned(), "auto-safe".to_owned()),
                 ("video-aspect-override".to_owned(), "-1".to_owned()),
+                ("video-zoom".to_owned(), "0".to_owned()),
+                ("video-pan-x".to_owned(), "0".to_owned()),
+                ("video-pan-y".to_owned(), "0".to_owned()),
+                ("video-crop".to_owned(), "".to_owned()),
                 ("video-rotate".to_owned(), "0".to_owned()),
                 ("deinterlace".to_owned(), "no".to_owned()),
             ]
@@ -465,10 +466,12 @@ mod tests {
     }
 
     #[test]
-    fn crop_folds_to_geometry_and_only_when_set() {
-        // No crop → no video-crop property at all.
+    fn crop_folds_to_geometry_and_empty_disables_it() {
+        // No crop explicitly clears a crop retained by mpv.
         let none = VideoConfig::new();
-        assert!(!none.properties().iter().any(|(k, _)| k == "video-crop"));
+        assert!(none
+            .properties()
+            .contains(&("video-crop".to_owned(), "".to_owned())));
 
         // A crop window folds to <w>x<h>+<x>+<y>.
         let cropped = VideoConfig {
@@ -481,13 +484,13 @@ mod tests {
     }
 
     #[test]
-    fn zoom_and_pan_emitted_only_when_non_zero() {
-        // Neutral zoom/pan → none of the three fine properties present.
+    fn zoom_and_pan_always_reestablish_their_values() {
+        // Neutral zoom/pan explicitly revoke values retained by mpv.
         let flat = VideoConfig::new();
-        let flat_keys: Vec<String> = flat.properties().into_iter().map(|(k, _)| k).collect();
-        assert!(!flat_keys.iter().any(|k| k == "video-zoom"));
-        assert!(!flat_keys.iter().any(|k| k == "video-pan-x"));
-        assert!(!flat_keys.iter().any(|k| k == "video-pan-y"));
+        let flat = flat.properties();
+        assert!(flat.contains(&("video-zoom".to_owned(), "0".to_owned())));
+        assert!(flat.contains(&("video-pan-x".to_owned(), "0".to_owned())));
+        assert!(flat.contains(&("video-pan-y".to_owned(), "0".to_owned())));
 
         // Non-zero zoom + pan → all three present, formatted (no stray `-0`).
         let tuned = VideoConfig {
@@ -499,8 +502,33 @@ mod tests {
         let props = tuned.properties();
         assert!(props.contains(&("video-zoom".to_owned(), "0.5".to_owned())));
         assert!(props.contains(&("video-pan-x".to_owned(), "-0.25".to_owned())));
-        // pan_y is exactly zero → still omitted.
-        assert!(!props.iter().any(|(k, _)| k == "video-pan-y"));
+        assert!(props.contains(&("video-pan-y".to_owned(), "0".to_owned())));
+    }
+
+    #[test]
+    fn replacement_config_revokes_retained_frame_adjustments() {
+        let retained = VideoConfig {
+            zoom: 2.0,
+            pan_x: 0.75,
+            pan_y: -0.5,
+            crop: Some(Crop::new(640, 360, 80, 45)),
+            ..VideoConfig::new()
+        }
+        .properties();
+        assert!(retained.contains(&("video-crop".to_owned(), "640x360+80+45".to_owned())));
+
+        // mpv retains global properties across media loads. Every neutral value
+        // therefore has to be sent by the replacement generation; omission
+        // would let the old frame authority survive the replacement.
+        let replacement = VideoConfig::new().properties();
+        for (key, neutral) in [
+            ("video-zoom", "0"),
+            ("video-pan-x", "0"),
+            ("video-pan-y", "0"),
+            ("video-crop", ""),
+        ] {
+            assert!(replacement.contains(&(key.to_owned(), neutral.to_owned())));
+        }
     }
 
     #[test]

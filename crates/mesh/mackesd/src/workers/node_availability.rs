@@ -727,9 +727,12 @@ impl RuntimeAvailabilityPublisher {
         intent
             .validate()
             .map_err(RuntimeAvailabilityError::Contract)?;
-        if intent.node_id != self.node_id || intent.device_id != self.device_id {
+        if intent.node_id != self.node_id
+            || intent.device_id != self.device_id
+            || intent.device_class != self.device_class
+        {
             return Err(RuntimeAvailabilityError::DurableRecord(
-                "durable lifecycle identity does not match this node".to_string(),
+                "durable lifecycle identity or device class does not match this node".to_string(),
             ));
         }
         Ok(Some(intent))
@@ -833,6 +836,33 @@ pub fn runtime_availability_path(workgroup_root: &Path, node_id: &str) -> PathBu
         .join("availability")
         .join(node_id)
         .join("current.json")
+}
+
+/// Read one node's canonical runtime intent through the publication path's
+/// no-symlink, bounded-file boundary.
+///
+/// Consumers that do not own the device identity may use this node-bound read
+/// to evaluate health policy. Malformed, stale-shaped, or identity-switched
+/// records fail closed and must not explain a missing health publisher.
+pub fn read_runtime_availability_intent(
+    workgroup_root: &Path,
+    node_id: &str,
+) -> Result<Option<NodeAvailabilityIntent>, RuntimeAvailabilityError> {
+    let path = runtime_availability_path(workgroup_root, node_id);
+    let Some(body) = read_lifecycle_intent_record(&path)? else {
+        return Ok(None);
+    };
+    let intent: NodeAvailabilityIntent = serde_json::from_slice(&body)
+        .map_err(|error| RuntimeAvailabilityError::DurableRecord(error.to_string()))?;
+    intent
+        .validate()
+        .map_err(RuntimeAvailabilityError::Contract)?;
+    if intent.node_id != node_id {
+        return Err(RuntimeAvailabilityError::DurableRecord(
+            "durable lifecycle node identity does not match its path".to_string(),
+        ));
+    }
+    Ok(Some(intent))
 }
 
 fn runtime_request_matches(
@@ -959,11 +989,14 @@ fn retry_durable_publication(
     intent: &NodeAvailabilityIntent,
     now_ms: u64,
 ) -> Result<(), RuntimeAvailabilityError> {
-    match intent.validate_at(now_ms) {
-        Ok(()) => {}
-        Err(NodeAvailabilityValidationError::Stale) => return Ok(()),
+    // Expiry suppresses replay, but cannot suppress reconciliation: a
+    // replacement Bus may already carry a higher generation that must stop a
+    // restarted producer from minting equivocal forward state.
+    let intent_is_stale = match intent.validate_at(now_ms) {
+        Ok(()) => false,
+        Err(NodeAvailabilityValidationError::Stale) => true,
         Err(error) => return Err(RuntimeAvailabilityError::Contract(error)),
-    }
+    };
     let body = serde_json::to_string(intent)
         .map_err(|error| RuntimeAvailabilityError::DurableRecord(error.to_string()))?;
     if body.len() > MAX_LIFECYCLE_INTENT_RECORD_BYTES {
@@ -1002,9 +1035,13 @@ fn retry_durable_publication(
             retained
                 .validate()
                 .map_err(|error| RuntimeAvailabilityError::BusProjection(error.to_string()))?;
-            if retained.node_id != intent.node_id || retained.device_id != intent.device_id {
+            if retained.node_id != intent.node_id
+                || retained.device_id != intent.device_id
+                || retained.device_class != intent.device_class
+            {
                 return Err(RuntimeAvailabilityError::BusProjection(
-                    "latest Bus availability row carries another identity".to_string(),
+                    "latest Bus availability row carries another identity or device class"
+                        .to_string(),
                 ));
             }
             if retained.generation >= intent.generation {
@@ -1015,7 +1052,7 @@ fn retry_durable_publication(
             false
         }
     };
-    if !already_published {
+    if !intent_is_stale && !already_published {
         persist
             .write(&topic, Priority::Default, None, Some(&body))
             .map_err(RuntimeAvailabilityError::Bus)?;
@@ -2259,6 +2296,104 @@ mod tests {
     }
 
     #[test]
+    fn older_bus_device_class_substitution_cannot_join_corrected_forward_chain() {
+        let bus = tempfile::tempdir().expect("bus");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(bus.path(), &durable);
+        let mut substituted = intent(
+            "node-a",
+            NodeAvailabilityState::Returned,
+            1,
+            "substituted-server-generation",
+            10_000,
+        );
+        substituted.device_class = NodeDeviceClass::Server;
+        let retained = intent(
+            "node-a",
+            NodeAvailabilityState::Sleeping,
+            2,
+            "retained-laptop-generation",
+            20_000,
+        );
+        write_lifecycle_intent_record(
+            &durable,
+            serde_json::to_string(&retained)
+                .expect("encode retained generation")
+                .as_bytes(),
+        )
+        .expect("stage retained generation");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&substituted).expect("encode substitution")),
+            )
+            .expect("publish substituted class");
+
+        assert!(matches!(
+            publisher.correct_forward_at(21_000),
+            Err(RuntimeAvailabilityError::BusProjection(_))
+        ));
+        let rows = persist
+            .list_since(&node_health_topic("node-a"), None)
+            .expect("read unchanged Bus");
+        assert_eq!(rows.len(), 1, "correction must not join the false class chain");
+        assert_eq!(
+            serde_json::from_str::<NodeAvailabilityIntent>(
+                rows[0].body.as_deref().expect("substituted body")
+            )
+            .expect("typed substituted row"),
+            substituted
+        );
+        assert_eq!(
+            publisher.current_intent().expect("read retained truth"),
+            Some(retained),
+            "failed reconciliation must preserve the durable laptop generation"
+        );
+    }
+
+    #[test]
+    fn restart_cannot_retain_device_class_substitution_as_node_availability() {
+        let bus = tempfile::tempdir().expect("bus");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(bus.path(), &durable);
+        let substituted = build_runtime_intent(
+            "node-a",
+            "node-a-device",
+            NodeDeviceClass::Server,
+            None,
+            runtime_returned_request(),
+            20_000,
+        )
+        .expect("build same-identity substituted device class");
+        let substituted_body = serde_json::to_vec(&substituted).expect("encode substitution");
+        write_lifecycle_intent_record(&durable, &substituted_body)
+            .expect("stage substituted restart record");
+
+        assert!(matches!(
+            publisher.correct_forward_at(21_000),
+            Err(RuntimeAvailabilityError::DurableRecord(_))
+        ));
+        assert_eq!(
+            std::fs::read(&durable).expect("read rejected durable record"),
+            substituted_body,
+            "recovery must fail closed without rewriting the conflicting identity"
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        assert!(
+            persist
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("read availability projection")
+                .is_empty(),
+            "a restarted laptop publisher must not project server-class availability"
+        );
+    }
+
+    #[test]
     fn runtime_publisher_does_not_republish_expired_durable_expected_absence() {
         let bus = tempfile::tempdir().expect("bus");
         let state = tempfile::tempdir().expect("state");
@@ -2301,6 +2436,68 @@ mod tests {
             serde_json::from_str(rows[0].body.as_deref().expect("projection body"))
                 .expect("typed returned projection");
         assert_eq!(projected, returned);
+    }
+
+    #[test]
+    fn expired_durable_truth_cannot_ignore_newer_replacement_generation() {
+        let bus = tempfile::tempdir().expect("bus");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(bus.path(), &durable);
+        let sleeping = build_runtime_intent(
+            "node-a",
+            "node-a-device",
+            NodeDeviceClass::Laptop,
+            None,
+            runtime_sleep_request(),
+            10_000,
+        )
+        .expect("build durable expected absence");
+        write_lifecycle_intent_record(
+            &durable,
+            serde_json::to_string(&sleeping)
+                .expect("encode durable expected absence")
+                .as_bytes(),
+        )
+        .expect("stage stale durable generation");
+
+        let replacement_truth = build_runtime_intent(
+            "node-a",
+            "node-a-device",
+            NodeDeviceClass::Laptop,
+            Some(&sleeping),
+            runtime_returned_request(),
+            20_000,
+        )
+        .expect("build replacement Bus truth");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open replacement Bus");
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&replacement_truth).expect("encode Bus truth")),
+            )
+            .expect("publish replacement truth");
+
+        let stale_now = sleeping.expires_at_ms.saturating_add(1);
+        assert!(matches!(
+            publisher.publish_at(runtime_returned_request(), stale_now),
+            Err(RuntimeAvailabilityError::BusProjection(_))
+        ));
+        assert_eq!(
+            publisher.current_intent().expect("read unchanged durable truth"),
+            Some(sleeping),
+            "a restart must not overwrite its durable generation before reconciling the Bus floor"
+        );
+        assert_eq!(
+            persist
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("read replacement Bus")
+                .len(),
+            1,
+            "recovery must not append an equivocal duplicate generation"
+        );
     }
 
     #[test]

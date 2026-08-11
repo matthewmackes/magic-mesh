@@ -158,6 +158,9 @@ impl NotificationRing {
 
     /// Refresh only actionability.  Display rows and action identity remain
     /// retained until the existing per-group/clear-all semantics remove them.
+    /// The complete daemon-admitted action payload must still match: the
+    /// display identity alone does not authorize a replacement snapshot to
+    /// reactivate buttons retained from an earlier shell generation.
     pub(crate) fn refresh_clock_actionability(
         &mut self,
         live: &[ClockBannerProjection],
@@ -169,6 +172,7 @@ impl NotificationRing {
             };
             retained.actionable = live.iter().any(|banner| {
                 banner.identity == retained.identity
+                    && banner.actions == retained.actions
                     && retained
                         .actions
                         .iter()
@@ -710,6 +714,31 @@ mod tests {
             .expect("stale metadata remains visible");
         assert!(!retained.actionable);
         assert_eq!(retained.actions[0].label, "Snooze");
+    }
+
+    #[test]
+    fn restarted_notification_center_cannot_reauthorize_replaced_clock_action_payload() {
+        let original = clock_banner(10_000);
+        let mut ring = NotificationRing::default();
+        ring.record_clock(&original, 1);
+
+        let mut replacement = original.clone();
+        replacement.actions[0].admitted_snapshot_revision += 1;
+        replacement.actions[1].admitted_snapshot_revision += 1;
+        ring.refresh_clock_actionability(std::slice::from_ref(&replacement), 9_000);
+
+        let retained = ring.entries[0]
+            .clock_actions
+            .as_ref()
+            .expect("original Clock metadata remains visible");
+        assert!(
+            !retained.actionable,
+            "same display identity cannot reauthorize a replacement daemon payload"
+        );
+        assert_eq!(
+            retained.actions, original.actions,
+            "retained controls stay bound to the originally admitted snapshot"
+        );
     }
 
     #[test]

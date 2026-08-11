@@ -397,6 +397,7 @@ impl AtmosphereCache {
             && self.snapshot.location_generation == location_generation
             && self.snapshot.location_point == *point
             && self.snapshot.viewport == *viewport
+            && self.snapshot.attributions.as_slice() == [attribution()]
     }
 }
 
@@ -564,7 +565,7 @@ fn blocking_refresh(
     now_ms: i64,
     cache_path: &Path,
 ) -> BlockingResult {
-    let (cache, cache_error) = match load_cache(cache_path) {
+    let (cache, cache_error) = match load_cache_for_refresh(cache_path) {
         Ok(cache) => (cache, None),
         Err(error) => (None, Some(error.to_string())),
     };
@@ -585,6 +586,55 @@ fn blocking_refresh(
         fresh,
         cache,
         cache_error,
+    }
+}
+
+/// A malformed regular cache is disposable acceleration state. Quarantine it
+/// before an outage fallback so the next retry does not repeatedly parse the
+/// same corrupt bytes. Symlinks and other non-regular paths are left in place
+/// and remain fail-closed for the later cache write.
+fn load_cache_for_refresh(path: &Path) -> io::Result<Option<AtmosphereCache>> {
+    match load_cache(path) {
+        Ok(cache) => Ok(cache),
+        Err(error) if quarantine_regular_cache(path)? => {
+            tracing::warn!(
+                target: "mackesd::weather_atmosphere",
+                %error,
+                path = %path.display(),
+                "quarantined unusable atmospheric cache; continuing without cache"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn quarantine_regular_cache(path: &Path) -> io::Result<bool> {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let quarantine = parent.join(format!(
+        ".corrupt-weather-atmosphere-cache-{}-{}",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    match fs::rename(path, &quarantine) {
+        Ok(()) => {
+            File::open(parent)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Ok(false),
     }
 }
 
@@ -652,7 +702,18 @@ fn resolve_viewport(
         .map_err(io_other)?
         .and_then(|message| message.body)
         .and_then(|body| WeatherMapViewportState::from_json_at(body.as_bytes(), now_ms).ok())
-        .filter(|state| state.host == host && state.location_generation == location.generation);
+        .filter(|state| {
+            state.host == host
+                && state.location_generation == location.generation
+                && match state.source {
+                    WeatherMapViewportSource::EffectiveLocationFallback => {
+                        state.viewport == fallback.viewport
+                    }
+                    WeatherMapViewportSource::MapsAction => {
+                        state.viewport.generation > fallback.viewport.generation
+                    }
+                }
+        });
     let action = persist
         .read_latest(&weather_set_map_viewport_topic(host))
         .map_err(io_other)?
@@ -699,13 +760,10 @@ fn same_authority(
 ) -> bool {
     expected.host == latest.host
         && expected.generation == latest.generation
+        && expected.mode == latest.mode
         && effective_location(expected)
             .zip(effective_location(latest))
-            .is_some_and(|(expected, latest)| {
-                expected.point == latest.point
-                    && expected.coverage == latest.coverage
-                    && expected.time_zone == latest.time_zone
-            })
+            .is_some_and(|(expected, latest)| expected == latest)
 }
 
 fn same_atmospheric_authority(
@@ -1150,6 +1208,18 @@ mod tests {
             .expect("publish viewport action");
     }
 
+    fn write_viewport_state(root: &Path, state: &WeatherMapViewportState) {
+        let persist = Persist::open(root.to_path_buf()).expect("open Bus");
+        persist
+            .write(
+                &weather_map_viewport_state_topic("workstation-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(state).expect("encode")),
+            )
+            .expect("publish viewport state");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn publishes_three_exact_fields_with_provider_work_off_runtime() {
         let temp = TempDir::new().expect("temp");
@@ -1295,6 +1365,43 @@ mod tests {
     }
 
     #[test]
+    fn malformed_regular_cache_is_quarantined_before_provider_outage_fallback() {
+        let temp = TempDir::new().expect("temp");
+        let cache_path = temp.path().join("atmosphere-cache.json");
+        fs::write(&cache_path, b"not-json").expect("corrupt cache");
+        let location = location(7, -71.0589);
+        let point = location_point(&location);
+        let viewport = fallback_viewport(7, &point).expect("fallback viewport");
+        let probe = fixture_probe();
+        probe.fail.store(true, Ordering::SeqCst);
+
+        let result = blocking_refresh(
+            Some(probe),
+            "workstation-1",
+            7,
+            &point,
+            &viewport,
+            NOW,
+            &cache_path,
+        );
+
+        assert!(result.fresh.is_err(), "provider outage must remain explicit");
+        assert!(result.cache.is_none(), "corrupt cache must not be admitted");
+        assert!(result.cache_error.is_none(), "quarantine should recover the read");
+        assert!(!cache_path.exists(), "corrupt cache must leave the authority path");
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("cache directory")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".corrupt-weather-atmosphere-cache-")),
+            "corrupt cache must remain recoverable as quarantined evidence"
+        );
+    }
+
+    #[test]
     fn official_wms_products_url_png_and_dimensions_are_strict() {
         let viewport =
             fallback_viewport(7, &location_point(&location(7, -71.0589))).expect("viewport");
@@ -1366,6 +1473,58 @@ mod tests {
         assert_eq!(authority(&worker).viewport, admitted.viewport);
     }
 
+    #[test]
+    fn restart_rejects_retained_viewport_without_source_identity() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        let location = location(7, -71.0589);
+        write_location(&root, &location);
+        let expected = fallback_viewport(7, &location_point(&location)).expect("fallback");
+
+        let mut forged_fallback = expected.clone();
+        forged_fallback.x = (forged_fallback.x + 1) % (1_u32 << forged_fallback.zoom);
+        write_viewport_state(
+            &root,
+            &WeatherMapViewportState {
+                schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+                host: "workstation-1".into(),
+                location_generation: 7,
+                viewport: forged_fallback,
+                source: WeatherMapViewportSource::EffectiveLocationFallback,
+                admitted_at_ms: NOW - 1,
+            },
+        );
+
+        let worker = worker_at(&temp, fixture_probe(), NOW);
+        let recovered = authority(&worker).viewport;
+        assert_eq!(
+            recovered.source,
+            WeatherMapViewportSource::EffectiveLocationFallback
+        );
+        assert_eq!(recovered.viewport, expected);
+
+        let mut impossible_action = expected.clone();
+        impossible_action.x = (impossible_action.x + 1) % (1_u32 << impossible_action.zoom);
+        write_viewport_state(
+            &root,
+            &WeatherMapViewportState {
+                schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+                host: "workstation-1".into(),
+                location_generation: 7,
+                viewport: impossible_action,
+                source: WeatherMapViewportSource::MapsAction,
+                admitted_at_ms: NOW - 1,
+            },
+        );
+
+        let recovered = authority(&worker).viewport;
+        assert_eq!(
+            recovered.source,
+            WeatherMapViewportSource::EffectiveLocationFallback
+        );
+        assert_eq!(recovered.viewport, expected);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn viewport_change_during_fetch_is_admitted_and_stale_result_is_discarded() {
         let temp = TempDir::new().expect("temp");
@@ -1412,6 +1571,38 @@ mod tests {
         let worker = worker_at(&temp, Arc::new(probe), NOW);
         let expected = authority(&worker);
         assert!(!worker.refresh_once(expected).await.expect("discard"));
+        let persist = Persist::open(root).expect("open Bus");
+        assert!(persist
+            .read_latest(&weather_map_state_topic("workstation-1"))
+            .expect("read")
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_generation_location_provenance_substitution_discards_snapshot() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        write_location(&root, &location(7, -71.0589));
+        let changed_root = root.clone();
+        let mut probe = Arc::try_unwrap(fixture_probe())
+            .unwrap_or_else(|_| panic!("fixture unexpectedly shared"));
+        probe.on_cloud = Some(Box::new(move || {
+            let mut substituted = location(7, -71.0589);
+            let EffectiveLocationState::Available { location } = &mut substituted.state else {
+                panic!("fixture location must be available");
+            };
+            location.provenance = EffectiveLocationProvenance::ManualVerifiedPlace {
+                place_id: "substituted-place".into(),
+            };
+            write_location(&changed_root, &substituted);
+        }));
+        let worker = worker_at(&temp, Arc::new(probe), NOW);
+        let expected = authority(&worker);
+
+        assert!(!worker
+            .refresh_once(expected)
+            .await
+            .expect("discard substituted location authority"));
         let persist = Persist::open(root).expect("open Bus");
         assert!(persist
             .read_latest(&weather_map_state_topic("workstation-1"))
@@ -1504,6 +1695,49 @@ mod tests {
         assert!(load_cache(&recovery.cache_path)
             .expect("load recovered")
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_cache_cannot_relabel_atmospheric_source_identity() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        write_location(&root, &location(7, -71.0589));
+        let initial = worker_at(&temp, fixture_probe(), NOW);
+        let initial_authority = authority(&initial);
+        assert!(initial
+            .refresh_once(initial_authority)
+            .await
+            .expect("seed canonical cache"));
+
+        let mut substituted = load_cache(&initial.cache_path)
+            .expect("read cache")
+            .expect("seeded cache");
+        substituted.snapshot.attributions = vec![WeatherAttribution {
+            provider: WeatherProvider::NationalWeatherService,
+            source_id: "substituted-source".into(),
+            label: "Substituted atmospheric source".into(),
+        }];
+        store_cache(&initial.cache_path, &substituted).expect("replace cache source identity");
+
+        let failed_probe = fixture_probe();
+        failed_probe.fail.store(true, Ordering::SeqCst);
+        let restarted = worker_at(
+            &temp,
+            failed_probe,
+            NOW + MAX_ATMOSPHERIC_FRESH_AGE_MS + 1,
+        );
+        let restarted_authority = authority(&restarted);
+        assert!(!restarted
+            .refresh_once(restarted_authority)
+            .await
+            .expect("reject relabeled restart cache"));
+
+        let published = latest(&root);
+        assert!(matches!(
+            published.availability,
+            WeatherAvailability::Unavailable { .. }
+        ));
+        assert_eq!(published.attributions, vec![attribution()]);
     }
 
     #[test]

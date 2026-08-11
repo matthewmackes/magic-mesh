@@ -164,6 +164,26 @@ fn body_bytes(map: serde_json::Map<String, serde_json::Value>) -> Vec<u8> {
     serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_default()
 }
 
+/// Encode one opaque Jellyfin identity as exactly one URL path segment.
+///
+/// IDs arrive from a remote server and must not be allowed to introduce a path
+/// separator, query, fragment, or pre-encoded escape into a later mutation.
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 /// Build the `POST /Sessions/Playing` report — playback has opened.
 #[must_use]
 pub fn build_report_start_request(
@@ -232,8 +252,8 @@ pub fn build_mark_played_request(
         format!(
             "{}/Users/{}/PlayedItems/{}",
             trim_base(base_url),
-            user_id,
-            item_id
+            encode_path_segment(user_id),
+            encode_path_segment(item_id)
         ),
         json_headers(device, token, true),
         Vec::new(),
@@ -253,8 +273,8 @@ pub fn build_mark_unplayed_request(
         format!(
             "{}/Users/{}/PlayedItems/{}",
             trim_base(base_url),
-            user_id,
-            item_id
+            encode_path_segment(user_id),
+            encode_path_segment(item_id)
         ),
         json_headers(device, token, false),
     )
@@ -356,6 +376,31 @@ mod tests {
             unplayed.url,
             "https://j.mesh/Users/user-1/PlayedItems/movie-1"
         );
+    }
+
+    #[test]
+    fn played_state_identity_cannot_escape_or_alias_path_segments() {
+        let played = build_mark_played_request(
+            "https://j.mesh",
+            "user/other?admin=true",
+            "movie%2Fother#fragment",
+            &device(),
+            None,
+        );
+        assert_eq!(
+            played.url,
+            "https://j.mesh/Users/user%2Fother%3Fadmin%3Dtrue/PlayedItems/\
+             movie%252Fother%23fragment"
+        );
+
+        let unplayed = build_mark_unplayed_request(
+            "https://j.mesh",
+            "user/other?admin=true",
+            "movie%2Fother#fragment",
+            &device(),
+            None,
+        );
+        assert_eq!(unplayed.url, played.url);
     }
 
     #[test]

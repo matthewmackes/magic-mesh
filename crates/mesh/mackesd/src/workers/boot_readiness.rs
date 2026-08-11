@@ -16,10 +16,12 @@
 #![cfg(feature = "async-services")]
 
 use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::peers::PeerRecord;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use serde_json::json;
@@ -48,6 +50,11 @@ pub const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// recheck avoids repeatedly spawning `systemctl`, TCP, directory, and `ping`
 /// work on every node when readiness is stable.
 pub const HEALTHY_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Allow ordinary timer jitter without treating it as a wake event. A larger
+/// overrun is safety-significant: cached readiness was not observed on the
+/// cadence under which it was admitted.
+pub const SCHEDULING_GAP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Default)]
 struct FailureBackoff {
@@ -349,10 +356,9 @@ impl BootReadinessWorker {
 
     /// Gather a fresh probe (impure: systemctl, fs, the directory).
     fn probe(&self) -> BootProbe {
-        let nebula_up = systemctl_active("nebula");
-        let overlay_ip = std::fs::read_to_string(super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let overlay_path = std::path::Path::new(super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH);
+        let nebula_before = systemctl_active("nebula");
+        let overlay_before = read_overlay_generation(overlay_path);
         // SUBSTRATE-10 — shared-state liveness by substrate: when on the etcd
         // coordination plane (endpoints file present) it's "is etcd reachable"
         // (a cheap TCP connect to the client port — no async runtime needed in
@@ -364,16 +370,31 @@ impl BootReadinessWorker {
         } else {
             crate::shared_root_writable(&self.workgroup_root)
         };
-        let now = now_ms();
-        let peer_count = crate::ipc::directory::DirectoryService::new(
-            &self.workgroup_root,
-            Some(self.db_path.clone()),
-        )
-        .mesh_health_counts(&self.node_id, now)
-        .0;
+        let directory = if on_etcd {
+            // Configuring etcd makes its lease-backed directory authoritative.
+            // DirectoryService intentionally falls back to the filesystem for
+            // display availability, but boot admission must not let retained
+            // filesystem rows substitute for a failed current etcd read.
+            DirectoryPeerObservation::Etcd(crate::substrate::peers::read_peers_blocking(
+                &etcd_endpoints,
+            ))
+        } else {
+            DirectoryPeerObservation::Filesystem(mackes_mesh_types::peers::read_peers(
+                &mackes_mesh_types::peers::peers_dir(&self.workgroup_root),
+            ))
+        };
+        let overlay_after = read_overlay_generation(overlay_path);
+        let overlay_ip =
+            stable_overlay_ip(overlay_before.as_ref(), overlay_after.as_ref()).unwrap_or_default();
+        let nebula_up = nebula_before && systemctl_active("nebula");
+        let peer_count = if nebula_up {
+            authoritative_peer_count(directory, &self.node_id, &overlay_ip)
+        } else {
+            0
+        };
         BootProbe {
             nebula_up,
-            overlay_ip,
+            overlay_ip: overlay_ip.to_owned(),
             bus_ok: true, // set false on a publish failure below
             qnm_mounted,
             on_etcd,
@@ -430,6 +451,94 @@ impl BootReadinessWorker {
         out.sort_by(|a, b| a.peer.cmp(&b.peer));
         out
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OverlayGeneration {
+    overlay_ip: String,
+    device: u64,
+    inode: u64,
+}
+
+const MAX_OVERLAY_MARKER_BYTES: u64 = 64;
+
+/// Read the supervisor's readiness marker as one bounded descriptor identity.
+/// The supervisor atomically replaces this file after it has verified Nebula;
+/// a symlink or a replacement between the two observations must therefore be
+/// treated as a different overlay generation, even when the text is unchanged.
+fn read_overlay_generation(path: &std::path::Path) -> Option<OverlayGeneration> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    let mut file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_OVERLAY_MARKER_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_OVERLAY_MARKER_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_OVERLAY_MARKER_BYTES {
+        return None;
+    }
+    let overlay_ip = std::str::from_utf8(&bytes).ok()?.trim();
+    let address = overlay_ip.parse::<std::net::Ipv4Addr>().ok()?;
+    let octets = address.octets();
+    if address.to_string() != overlay_ip || octets[0] != 10 || octets[1] != 42 || octets[2] > 127 {
+        return None;
+    }
+    Some(OverlayGeneration {
+        overlay_ip: overlay_ip.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn stable_overlay_ip<'a>(
+    before: Option<&'a OverlayGeneration>,
+    after: Option<&OverlayGeneration>,
+) -> Option<&'a str> {
+    let before = before?;
+    (Some(before) == after).then_some(before.overlay_ip.as_str())
+}
+
+enum DirectoryPeerObservation {
+    Etcd(Option<Vec<PeerRecord>>),
+    Filesystem(Vec<PeerRecord>),
+}
+
+/// Admit a directory only when it carries exactly one row for this daemon's
+/// hostname and that row exclusively owns the stable local overlay address.
+/// A retained row from the pre-restart identity (or another peer claiming the
+/// same address) must not make an otherwise populated directory look ready.
+fn authoritative_peer_count(
+    observation: DirectoryPeerObservation,
+    node_id: &str,
+    overlay_ip: &str,
+) -> u32 {
+    let records = match observation {
+        DirectoryPeerObservation::Etcd(Some(records))
+        | DirectoryPeerObservation::Filesystem(records) => records,
+        DirectoryPeerObservation::Etcd(None) => return 0,
+    };
+    let hostname = node_id.strip_prefix("peer:").unwrap_or(node_id);
+    if hostname.is_empty() || overlay_ip.is_empty() {
+        return 0;
+    }
+    let local_rows: Vec<&PeerRecord> = records
+        .iter()
+        .filter(|record| record.hostname == hostname)
+        .collect();
+    if local_rows.len() != 1
+        || local_rows[0].overlay_ip.as_deref() != Some(overlay_ip)
+        || records.iter().any(|record| {
+            record.hostname != hostname && record.overlay_ip.as_deref() == Some(overlay_ip)
+        })
+    {
+        return 0;
+    }
+    u32::try_from(records.len()).unwrap_or(u32::MAX)
 }
 
 /// BOOT-STATUS-2 — cap on per-tick ping fan-out so a large mesh can't stall the
@@ -497,10 +606,7 @@ fn services_probe_failed(services: &[ServiceProbe]) -> bool {
 fn systemctl_active(unit: &str) -> bool {
     let mut command = std::process::Command::new("systemctl");
     command.args(["is-active", unit]);
-    bounded_command_stdout(
-        &mut command,
-        MAX_SYSTEMCTL_STDOUT_BYTES,
-    )
+    bounded_command_stdout(&mut command, MAX_SYSTEMCTL_STDOUT_BYTES)
         .map(|stdout| stdout.starts_with(b"active"))
         .unwrap_or(false)
 }
@@ -587,6 +693,22 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Linux boot time includes time spent suspended, unlike the monotonic clock
+/// used by Tokio timers. Reading it only around the existing publication sleep
+/// lets the worker distinguish a resume from ordinary active runtime without
+/// adding another timer or periodic task.
+fn boot_elapsed() -> Option<Duration> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let seconds = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+fn sleep_was_discontinuous(monotonic_elapsed: Duration, boot_elapsed: Option<Duration>) -> bool {
+    monotonic_elapsed > INTERVAL.saturating_add(SCHEDULING_GAP_GRACE)
+        || boot_elapsed
+            .is_some_and(|elapsed| elapsed > monotonic_elapsed.saturating_add(SCHEDULING_GAP_GRACE))
+}
+
 /// Resolve the daemon's Bus spool even when it starts without a user home.
 ///
 /// `mde_bus::default_data_dir` intentionally returns `None` in that service
@@ -599,6 +721,80 @@ fn default_bus_root() -> PathBuf {
 
 fn bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+/// Replace any readiness record left by an earlier daemon generation before
+/// this worker enters its deliberately phased first-probe delay. Without this
+/// barrier, a consumer can observe the previous process's `ready: true` for up
+/// to one full publication interval after a restart and admit work before the
+/// restarted daemon has revalidated any dependency.
+fn publish_startup_barrier(bus_root: PathBuf, observed_at_ms: u64) -> Result<(), String> {
+    let persist = Persist::open(bus_root).map_err(|error| error.to_string())?;
+    let mut snapshot = build_readiness(&BootProbe::default(), &[], &[], observed_at_ms);
+    snapshot["phase"] = json!("probing");
+    persist
+        .write(TOPIC, Priority::Default, None, Some(&snapshot.to_string()))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn publish_gap_barrier_if_needed(
+    bus_root: PathBuf,
+    observed_at_ms: u64,
+    monotonic_elapsed: Duration,
+    boot_elapsed: Option<Duration>,
+) -> Result<bool, String> {
+    if !sleep_was_discontinuous(monotonic_elapsed, boot_elapsed) {
+        return Ok(false);
+    }
+    publish_startup_barrier(bus_root, observed_at_ms)?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_published_probe_batch(
+    publication: Result<(), String>,
+    observed_at: Instant,
+    probe_due: bool,
+    pings_due: bool,
+    services_due: bool,
+    probe: BootProbe,
+    pings: Vec<PingResult>,
+    services: Vec<ServiceProbe>,
+    probe_backoff: &mut FailureBackoff,
+    ping_backoff: &mut FailureBackoff,
+    service_backoff: &mut FailureBackoff,
+    cached_probe: &mut Option<BootProbe>,
+    cached_pings: &mut Option<Vec<PingResult>>,
+    cached_services: &mut Option<Vec<ServiceProbe>>,
+) -> Result<(), String> {
+    if let Err(error) = publication {
+        // A healthy observation is authoritative only if the generation that
+        // observed it also published it. Retaining this batch would allow a
+        // recovered/replaced Bus to receive cached `ready: true` without any
+        // dependency being revalidated after the publication gap.
+        *probe_backoff = FailureBackoff::default();
+        *ping_backoff = FailureBackoff::default();
+        *service_backoff = FailureBackoff::default();
+        *cached_probe = None;
+        *cached_pings = None;
+        *cached_services = None;
+        return Err(error);
+    }
+
+    if probe_due {
+        probe_backoff.record(fabric_probe_failed(&probe), observed_at);
+        *cached_probe = Some(probe);
+    }
+    if pings_due {
+        ping_backoff.record(ping_probe_failed(&pings), observed_at);
+        *cached_pings = Some(pings);
+    }
+    if services_due {
+        service_backoff.record(services_probe_failed(&services), observed_at);
+        *cached_services = Some(services);
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -615,6 +811,12 @@ impl Worker for BootReadinessWorker {
         let mut cached_probe: Option<BootProbe> = None;
         let mut cached_pings: Option<Vec<PingResult>> = None;
         let mut cached_services: Option<Vec<ServiceProbe>> = None;
+
+        // A Bus topic survives a daemon process restart. Invalidate an old
+        // generation's optimistic state synchronously before waiting for the
+        // node-specific first-probe phase; the first real probe below replaces
+        // this fail-safe barrier with current observations.
+        publish_startup_barrier(bus_root.clone(), now_ms()).map_err(anyhow::Error::msg)?;
 
         // Keep the first full probe batch within the old two-second freshness
         // deadline, but anchor it to a stable node-specific phase so seats do
@@ -633,7 +835,7 @@ impl Worker for BootReadinessWorker {
             let workgroup_root = self.workgroup_root.clone();
             let node_id = self.node_id.clone();
             let db_path = self.db_path.clone();
-            let bus_root = bus_root.clone();
+            let publish_bus_root = bus_root.clone();
             let previous_probe = cached_probe.clone();
             let previous_pings = cached_pings.clone();
             let previous_services = cached_services.clone();
@@ -659,27 +861,38 @@ impl Worker for BootReadinessWorker {
                 } else {
                     previous_services.unwrap_or_default()
                 };
-                if let Ok(persist) = Persist::open(bus_root) {
-                    let snap = build_readiness(&probe, &services, &pings, now_ms());
-                    let _ = persist.write(TOPIC, Priority::Default, None, Some(&snap.to_string()));
-                }
-                (probe, pings, services)
+                let publication = Persist::open(publish_bus_root)
+                    .map_err(|error| error.to_string())
+                    .and_then(|persist| {
+                        let snap = build_readiness(&probe, &services, &pings, now_ms());
+                        persist
+                            .write(TOPIC, Priority::Default, None, Some(&snap.to_string()))
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    });
+                (probe, pings, services, publication)
             })
             .await;
 
             match result {
-                Ok((probe, pings, services)) => {
-                    if probe_due {
-                        probe_backoff.record(fabric_probe_failed(&probe), now);
-                        cached_probe = Some(probe);
-                    }
-                    if pings_due {
-                        ping_backoff.record(ping_probe_failed(&pings), now);
-                        cached_pings = Some(pings);
-                    }
-                    if services_due {
-                        service_backoff.record(services_probe_failed(&services), now);
-                        cached_services = Some(services);
+                Ok((probe, pings, services, publication)) => {
+                    if let Err(error) = record_published_probe_batch(
+                        publication,
+                        now,
+                        probe_due,
+                        pings_due,
+                        services_due,
+                        probe,
+                        pings,
+                        services,
+                        &mut probe_backoff,
+                        &mut ping_backoff,
+                        &mut service_backoff,
+                        &mut cached_probe,
+                        &mut cached_pings,
+                        &mut cached_services,
+                    ) {
+                        tracing::debug!(%error, "boot_readiness: snapshot publication failed");
                     }
                 }
                 Err(error) => {
@@ -695,9 +908,34 @@ impl Worker for BootReadinessWorker {
                     }
                 }
             }
+            let sleep_started = Instant::now();
+            let boot_before_sleep = boot_elapsed();
             tokio::select! {
                 _ = shutdown.wait() => break,
                 () = tokio::time::sleep(INTERVAL) => {}
+            }
+            let monotonic_elapsed = sleep_started.elapsed();
+            let boot_sleep_elapsed = boot_before_sleep
+                .zip(boot_elapsed())
+                .and_then(|(before, after)| after.checked_sub(before));
+            if publish_gap_barrier_if_needed(
+                bus_root.clone(),
+                now_ms(),
+                monotonic_elapsed,
+                boot_sleep_elapsed,
+            )
+            .map_err(anyhow::Error::msg)?
+            {
+                // The barrier must remain authoritative until every source has
+                // been freshly observed. Resetting both schedules and caches
+                // makes the next loop perform all real probes rather than
+                // republishing a pre-suspend healthy result.
+                probe_backoff = FailureBackoff::default();
+                ping_backoff = FailureBackoff::default();
+                service_backoff = FailureBackoff::default();
+                cached_probe = None;
+                cached_pings = None;
+                cached_services = None;
             }
         }
         Ok(())
@@ -708,16 +946,254 @@ impl Worker for BootReadinessWorker {
 mod tests {
     use super::*;
 
+    fn peer(hostname: &str, overlay_ip: &str) -> PeerRecord {
+        PeerRecord {
+            hostname: hostname.to_owned(),
+            mde_version: None,
+            last_seen_ms: 1,
+            health: "healthy".into(),
+            descriptors: None,
+            overlay_ip: Some(overlay_ip.to_owned()),
+            role: Some("workstation".into()),
+            external_addr: None,
+            media: false,
+        }
+    }
+
     #[test]
     fn bus_root_has_the_documented_system_fallback() {
-        assert_eq!(
-            bus_root_or_system(None),
-            PathBuf::from("/run/mde-bus")
-        );
+        assert_eq!(bus_root_or_system(None), PathBuf::from("/run/mde-bus"));
         assert_eq!(
             bus_root_or_system(Some(PathBuf::from("/tmp/explicit-bus"))),
             PathBuf::from("/tmp/explicit-bus")
         );
+    }
+
+    #[test]
+    fn configured_etcd_read_failure_cannot_substitute_stale_filesystem_peers() {
+        let filesystem_rows = vec![peer("node-a", "10.42.0.5")];
+
+        assert_eq!(
+            authoritative_peer_count(DirectoryPeerObservation::Etcd(None), "node-a", "10.42.0.5",),
+            0,
+            "an unavailable configured authority must leave boot pending"
+        );
+        assert_eq!(
+            authoritative_peer_count(
+                DirectoryPeerObservation::Filesystem(filesystem_rows),
+                "node-a",
+                "10.42.0.5",
+            ),
+            1,
+            "filesystem rows remain authoritative only in filesystem mode"
+        );
+    }
+
+    #[test]
+    fn replaced_overlay_generation_cannot_join_retained_directory_identity() {
+        let tmp = tempfile::tempdir().expect("temporary overlay root");
+        let marker = tmp.path().join("overlay-ip");
+        std::fs::write(&marker, b"10.42.0.5\n").expect("seed old overlay generation");
+        let before = read_overlay_generation(&marker).expect("read old generation");
+
+        let replacement = tmp.path().join("overlay-ip.next");
+        std::fs::write(&replacement, b"10.42.0.9\n").expect("stage replacement generation");
+        std::fs::rename(&replacement, &marker).expect("replace overlay generation");
+        let after = read_overlay_generation(&marker).expect("read replacement generation");
+
+        let admitted_overlay = stable_overlay_ip(Some(&before), Some(&after)).unwrap_or_default();
+        assert_eq!(
+            authoritative_peer_count(
+                DirectoryPeerObservation::Etcd(Some(vec![
+                    peer("node-a", "10.42.0.5"),
+                    peer("node-b", "10.42.0.6"),
+                ])),
+                "node-a",
+                admitted_overlay,
+            ),
+            0,
+            "a retained self row must not bridge an in-flight overlay replacement"
+        );
+
+        let corrected = read_overlay_generation(&marker).expect("read corrected generation");
+        assert_eq!(
+            authoritative_peer_count(
+                DirectoryPeerObservation::Etcd(Some(vec![
+                    peer("node-a", "10.42.0.9"),
+                    peer("node-b", "10.42.0.6"),
+                ])),
+                "node-a",
+                stable_overlay_ip(Some(&corrected), Some(&corrected)).unwrap_or_default(),
+            ),
+            2,
+            "only the corrected-forward marker and self row may restore readiness"
+        );
+    }
+
+    #[test]
+    fn startup_barrier_supersedes_persisted_ready_snapshot() {
+        let tmp = tempfile::tempdir().expect("temporary Bus root");
+        let root = tmp.path().to_path_buf();
+        let persist = Persist::open(root.clone()).expect("open Bus");
+        let healthy = BootProbe {
+            nebula_up: true,
+            overlay_ip: "10.42.0.5".into(),
+            bus_ok: true,
+            qnm_mounted: true,
+            on_etcd: true,
+            peer_count: 3,
+        };
+        let old = build_readiness(&healthy, &[], &[], 41);
+        assert_eq!(old["ready"], true);
+        persist
+            .write(TOPIC, Priority::Default, None, Some(&old.to_string()))
+            .expect("persist previous daemon generation");
+
+        publish_startup_barrier(root.clone(), 42).expect("publish restart barrier");
+
+        let rows = Persist::open(root)
+            .expect("reopen Bus")
+            .list_since(TOPIC, None)
+            .expect("read readiness history");
+        assert_eq!(rows.len(), 2);
+        let current: serde_json::Value = serde_json::from_str(
+            rows.last()
+                .and_then(|row| row.body.as_deref())
+                .expect("current readiness body"),
+        )
+        .expect("parse current readiness");
+        assert_eq!(current["ts_ms"], 42);
+        assert_eq!(current["phase"], "probing");
+        assert_eq!(current["ready"], false);
+        assert_eq!(current["steps"][0]["status"], "pending");
+
+        let blocked_root = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"occupied").expect("create invalid Bus root");
+        assert!(publish_startup_barrier(blocked_root, 43).is_err());
+    }
+
+    #[test]
+    fn wake_or_scheduling_gap_invalidates_cached_readiness_before_reuse() {
+        let tmp = tempfile::tempdir().expect("temporary Bus root");
+        let root = tmp.path().to_path_buf();
+        let persist = Persist::open(root.clone()).expect("open Bus");
+        let healthy = BootProbe {
+            nebula_up: true,
+            overlay_ip: "10.42.0.5".into(),
+            bus_ok: true,
+            qnm_mounted: true,
+            on_etcd: true,
+            peer_count: 3,
+        };
+        persist
+            .write(
+                TOPIC,
+                Priority::Default,
+                None,
+                Some(&build_readiness(&healthy, &[], &[], 50).to_string()),
+            )
+            .expect("persist healthy snapshot");
+
+        assert!(
+            !publish_gap_barrier_if_needed(root.clone(), 51, INTERVAL, Some(INTERVAL),)
+                .expect("normal cadence remains valid")
+        );
+        assert!(publish_gap_barrier_if_needed(
+            root.clone(),
+            52,
+            INTERVAL + SCHEDULING_GAP_GRACE + Duration::from_millis(1),
+            Some(INTERVAL),
+        )
+        .expect("scheduling gap publishes barrier"));
+        persist
+            .write(
+                TOPIC,
+                Priority::Default,
+                None,
+                Some(&build_readiness(&healthy, &[], &[], 53).to_string()),
+            )
+            .expect("persist healthy snapshot after scheduling gap");
+        assert!(publish_gap_barrier_if_needed(
+            root.clone(),
+            54,
+            INTERVAL,
+            Some(INTERVAL + SCHEDULING_GAP_GRACE + Duration::from_millis(1)),
+        )
+        .expect("resume gap publishes barrier"));
+
+        let rows = Persist::open(root)
+            .expect("reopen Bus")
+            .list_since(TOPIC, None)
+            .expect("read readiness history");
+        assert_eq!(rows.len(), 4);
+        let current: serde_json::Value = serde_json::from_str(
+            rows.last()
+                .and_then(|row| row.body.as_deref())
+                .expect("current readiness body"),
+        )
+        .expect("parse current readiness");
+        assert_eq!(current["ts_ms"], 54);
+        assert_eq!(current["phase"], "probing");
+        assert_eq!(current["ready"], false);
+    }
+
+    #[test]
+    fn failed_publication_discards_healthy_caches_before_bus_recovery() {
+        let now = Instant::now();
+        let healthy = BootProbe {
+            nebula_up: true,
+            overlay_ip: "10.42.0.5".into(),
+            bus_ok: true,
+            qnm_mounted: true,
+            on_etcd: true,
+            peer_count: 3,
+        };
+        let pings = vec![PingResult {
+            peer: "peer-a".into(),
+            overlay_ip: "10.42.0.6".into(),
+            role: "peer".into(),
+            rtt_ms: Some(1.0),
+        }];
+        let services = vec![ServiceProbe {
+            id: "musicd",
+            label: "Music daemon",
+            active: true,
+            reachable: None,
+        }];
+        let mut probe_backoff = FailureBackoff::default();
+        let mut ping_backoff = FailureBackoff::default();
+        let mut service_backoff = FailureBackoff::default();
+        probe_backoff.record(false, now);
+        ping_backoff.record(false, now);
+        service_backoff.record(false, now);
+        let mut cached_probe = Some(healthy.clone());
+        let mut cached_pings = Some(pings.clone());
+        let mut cached_services = Some(services.clone());
+
+        let result = record_published_probe_batch(
+            Err("replacement Bus rejected the write".into()),
+            now,
+            true,
+            true,
+            true,
+            healthy,
+            pings,
+            services,
+            &mut probe_backoff,
+            &mut ping_backoff,
+            &mut service_backoff,
+            &mut cached_probe,
+            &mut cached_pings,
+            &mut cached_services,
+        );
+
+        assert!(result.is_err());
+        assert!(cached_probe.is_none());
+        assert!(cached_pings.is_none());
+        assert!(cached_services.is_none());
+        assert!(probe_backoff.due(now));
+        assert!(ping_backoff.due(now));
+        assert!(service_backoff.due(now));
     }
 
     fn val(v: &serde_json::Value, i: usize, k: &str) -> String {

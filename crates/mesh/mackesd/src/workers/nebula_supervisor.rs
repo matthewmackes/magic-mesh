@@ -81,6 +81,11 @@ pub struct NebulaSupervisor {
     tick_interval: Duration,
     /// Cached bundle mtime so a change triggers a re-write.
     last_bundle_mtime: Option<SystemTime>,
+    /// A retained overlay-IP publication is not proof that the Nebula service
+    /// survived this supervisor restart. Invalidate it once before the first
+    /// phased sweep; a successful config reload and active-service probe
+    /// republish the current value.
+    startup_overlay_invalidated: bool,
     /// ENT-3 — the replicated root carrying ca/blocklist.
     workgroup_root: PathBuf,
     /// ENT-3 — last-applied blocklist union (change triggers reload).
@@ -125,6 +130,7 @@ impl NebulaSupervisor {
             overlay_ip_path: PathBuf::from(DEFAULT_OVERLAY_IP_PATH),
             tick_interval: DEFAULT_TICK_INTERVAL,
             last_bundle_mtime: None,
+            startup_overlay_invalidated: false,
             last_is_leader: false,
             workgroup_root,
             last_blocklist: Vec::new(),
@@ -198,6 +204,10 @@ impl NebulaSupervisor {
     /// success; logs + swallows individual step failures so
     /// a single bad tick doesn't kill the worker.
     async fn tick(&mut self) {
+        if !self.invalidate_startup_overlay() {
+            return;
+        }
+
         // Local config repair is deliberately first. A stale/unreachable
         // coordination plane must not keep an already-enrolled peer from
         // sanitizing a legacy bundle, materializing `/etc/nebula`, or retrying a
@@ -282,6 +292,29 @@ impl NebulaSupervisor {
             }
         }
         true
+    }
+
+    /// Replace any retained readiness publication with an empty, sealed value
+    /// before this process claims that the local overlay is usable. Using the
+    /// same atomic writer as publication preserves its no-symlink boundary.
+    fn invalidate_startup_overlay(&mut self) -> bool {
+        if self.startup_overlay_invalidated {
+            return true;
+        }
+        match write_atomic(&self.overlay_ip_path, b"") {
+            Ok(()) => {
+                self.startup_overlay_invalidated = true;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %self.overlay_ip_path.display(),
+                    "nebula-supervisor: failed to invalidate retained overlay readiness; will retry"
+                );
+                false
+            }
+        }
     }
 
     /// Leader-promotion: mint CA if missing, write
@@ -378,25 +411,18 @@ impl NebulaSupervisor {
             // the live Nebula key and make the service fail to reload.
             None,
         )?;
-        // GF-1.3.a — publish the overlay IP so downstream
-        // services (notably mackes-glusterd-nebula-bind in
-        // GF-1.3.b) can rewrite their bind config without
-        // re-parsing the full NebulaBundle JSON. Best-effort —
-        // a publish failure is logged but doesn't abort the
-        // Nebula-config refresh (the daemon itself still has
-        // a valid /etc/nebula tree).
-        if let Err(e) = publish_overlay_ip(&self.overlay_ip_path, &bundle.overlay_ip) {
-            tracing::warn!(
-                error = %e,
-                path = %self.overlay_ip_path.display(),
-                "nebula-supervisor: publishing overlay-ip failed",
-            );
-        }
         // The on-disk render is not effective until Nebula accepts it.  Keep
         // the bundle watch unacknowledged when the reload/reconnect fails so
         // the next sweep retries the same rotated or revoked state.
         systemctl_reload(&self.systemctl_path, "nebula.service")
             .map_err(|e| format!("reload nebula.service: {e}"))?;
+        systemctl_is_active(&self.systemctl_path, "nebula.service")
+            .map_err(|e| format!("verify nebula.service active after reload: {e}"))?;
+        // GF-1.3.a — this file is consumed as overlay readiness by downstream
+        // bind workers. Publish it only after this process has made the current
+        // config effective and observed the actual service active.
+        publish_overlay_ip(&self.overlay_ip_path, &bundle.overlay_ip)
+            .map_err(|e| format!("publish verified overlay-ip: {e}"))?;
         if self.last_is_leader {
             // The base Nebula service is the transport dependency for every
             // node.  A role-specific lighthouse unit may be absent on a
@@ -565,6 +591,9 @@ impl Worker for NebulaSupervisor {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // Do this before the bounded startup phase: a retained publication
+        // must not remain visible while the first service verification waits.
+        let _ = self.invalidate_startup_overlay();
         // Spread the first full supervisor sweep across a bounded window. The
         // tick body remains intact and ordered: config repair still precedes
         // leadership/roster reconciliation, while the first pass is delayed
@@ -1773,6 +1802,10 @@ fn systemctl_reload(path: &Path, unit: &str) -> Result<(), String> {
     systemctl(path, "reload-or-restart", unit)
 }
 
+fn systemctl_is_active(path: &Path, unit: &str) -> Result<(), String> {
+    systemctl(path, "is-active", unit)
+}
+
 /// Observe a bundle only when its final path component is a regular, non-link
 /// file. `read_bundle` consumes through a no-follow descriptor, but using
 /// `metadata` here would follow a hostile final symlink and make the watcher
@@ -2783,6 +2816,27 @@ exit 0
     }
 
     #[cfg(unix)]
+    fn fake_systemctl_with_inactive_nebula(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("systemctl");
+        std::fs::write(
+            &path,
+            br####"#!/bin/sh
+if [ "$1" = "is-active" ] && [ "$2" = "nebula.service" ] && [ ! -e "${0}.active" ]; then
+    echo "inactive" >&2
+    exit 3
+fi
+exit 0
+"####,
+        )
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake systemctl executable");
+        path
+    }
+
+    #[cfg(unix)]
     #[test]
     fn systemctl_timeout_kills_a_hung_command() {
         use std::os::unix::fs::PermissionsExt;
@@ -2884,6 +2938,71 @@ exit 0
         assert!(
             systemctl_path.with_file_name("systemctl.failed").exists(),
             "the fixture must exercise the failed-reload branch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_invalidates_retained_overlay_until_nebula_is_verified_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let bundle_path = root.join("nebula-bundle.json");
+        let bundle = sample_bundle();
+        crate::ca::bundle::write_bundle(&bundle_path, &bundle).expect("seed bundle");
+        let config_dir = root.join("nebula");
+        materialize_config(
+            &config_dir,
+            &bundle,
+            ConfigRole::Peer,
+            &[],
+            root,
+            Some(b"local-key"),
+        )
+        .expect("seed local identity");
+
+        let overlay_ip_path = root.join("overlay-ip");
+        publish_overlay_ip(&overlay_ip_path, "10.42.0.99").expect("seed stale readiness");
+        let systemctl_path = fake_systemctl_with_inactive_nebula(root);
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path,
+        )
+        .with_workgroup_root(root.to_path_buf())
+        .with_role_marker(root.join("role.host"))
+        .with_config_dir(config_dir)
+        .with_overlay_ip_path(overlay_ip_path.clone())
+        .with_leadership_endpoints(Vec::new())
+        .with_systemctl_path(systemctl_path.clone());
+
+        supervisor.tick().await;
+
+        assert_eq!(
+            std::fs::read(&overlay_ip_path).expect("read invalidated readiness"),
+            b"",
+            "restart must retract retained readiness before service verification"
+        );
+        assert!(
+            supervisor.last_bundle_mtime.is_none(),
+            "an inactive service must leave the bundle pending"
+        );
+
+        std::fs::write(
+            systemctl_path.with_file_name("systemctl.active"),
+            b"active\n",
+        )
+        .expect("activate fixture");
+        supervisor.tick().await;
+
+        assert_eq!(
+            std::fs::read_to_string(&overlay_ip_path).expect("read verified readiness"),
+            format!("{}\n", bundle.overlay_ip)
+        );
+        assert!(
+            supervisor.last_bundle_mtime.is_some(),
+            "only verified active service state may acknowledge the bundle"
         );
     }
 

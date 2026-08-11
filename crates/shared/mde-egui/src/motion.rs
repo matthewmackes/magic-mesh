@@ -336,6 +336,11 @@ pub trait MotionValue: Copy + PartialEq + Send + Sync + 'static {
     /// Whether every component is finite.
     #[must_use]
     fn is_finite(self) -> bool;
+
+    /// Neutral finite value used when a restarted renderer restores a poisoned
+    /// carrier before any trustworthy visual value is available.
+    #[must_use]
+    fn fail_closed_value() -> Self;
 }
 
 impl MotionValue for f32 {
@@ -351,6 +356,10 @@ impl MotionValue for f32 {
 
     fn is_finite(self) -> bool {
         f32::is_finite(self)
+    }
+
+    fn fail_closed_value() -> Self {
+        0.0
     }
 }
 
@@ -369,6 +378,10 @@ impl MotionValue for Vec2 {
     fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite()
     }
+
+    fn fail_closed_value() -> Self {
+        Self::ZERO
+    }
 }
 
 impl MotionValue for Pos2 {
@@ -385,6 +398,10 @@ impl MotionValue for Pos2 {
 
     fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite()
+    }
+
+    fn fail_closed_value() -> Self {
+        Self::ZERO
     }
 }
 
@@ -409,6 +426,10 @@ impl MotionValue for Rect {
             && self.min.y.is_finite()
             && self.max.x.is_finite()
             && self.max.y.is_finite()
+    }
+
+    fn fail_closed_value() -> Self {
+        Self::from_min_max(Pos2::ZERO, Pos2::ZERO)
     }
 }
 
@@ -439,6 +460,10 @@ impl MotionValue for Color32 {
 
     fn is_finite(self) -> bool {
         true
+    }
+
+    fn fail_closed_value() -> Self {
+        Self::TRANSPARENT
     }
 }
 
@@ -486,6 +511,10 @@ impl MotionValue for MotionOpacity {
     fn is_finite(self) -> bool {
         self.0.is_finite()
     }
+
+    fn fail_closed_value() -> Self {
+        Self(0.0)
+    }
 }
 
 /// A non-negative scale value for typed scale animation.
@@ -519,6 +548,10 @@ impl MotionValue for MotionScale {
 
     fn is_finite(self) -> bool {
         self.0.is_finite()
+    }
+
+    fn fail_closed_value() -> Self {
+        Self(1.0)
     }
 }
 
@@ -555,6 +588,11 @@ impl<T: MotionValue> Animated<T> {
     /// Create a carrier already settled at `value`.
     #[must_use]
     pub fn settled(value: T) -> Self {
+        let value = if value.is_finite() {
+            value
+        } else {
+            T::fail_closed_value()
+        };
         Self {
             from: value,
             value,
@@ -574,6 +612,25 @@ impl<T: MotionValue> Animated<T> {
     /// delayed page flip.
     pub fn advance(&mut self, target: T, spec: MotionSpec, mode: MotionMode, dt: f32) {
         if !target.is_finite() {
+            *self = Self::settled(self.value);
+            return;
+        }
+
+        // A DRM/EGL restart can leave temporary egui memory carrying an old or
+        // partially-written timeline. Never feed that state (or an invalid
+        // frame delta) back into interpolation: NaN would otherwise keep
+        // `is_settled` false and force the direct-DRM runner to repaint forever.
+        let timeline_is_valid = self.from.is_finite()
+            && self.value.is_finite()
+            && self.target.is_finite()
+            && self.elapsed.is_finite()
+            && self.elapsed >= 0.0
+            && self.duration.is_finite()
+            && self.duration >= 0.0
+            && self.progress.is_finite()
+            && (0.0..=1.0).contains(&self.progress);
+        if !timeline_is_valid || !dt.is_finite() || dt < 0.0 {
+            *self = Self::settled(target);
             return;
         }
 
@@ -1432,6 +1489,30 @@ mod tests {
             "non-finite targets are ignored rather than poisoning the carrier"
         );
         assert!(value.value().is_finite());
+    }
+
+    #[test]
+    fn restarted_or_non_finite_timeline_cannot_keep_drm_repainting() {
+        let spec = Motion::spec(MotionPreset::Panel);
+        let mut restarted = AnimatedScalar {
+            from: f32::NAN,
+            value: f32::INFINITY,
+            target: f32::NEG_INFINITY,
+            elapsed: f32::NAN,
+            duration: f32::INFINITY,
+            progress: f32::NAN,
+            phase: Phase::Entering,
+        };
+
+        restarted.advance(42.0, spec, MotionMode::Normal, f32::NAN);
+        assert_eq!(restarted.value(), 42.0);
+        assert_eq!(restarted.target(), 42.0);
+        assert!(restarted.is_settled());
+
+        let mut fresh_bad_target = AnimatedScalar::settled(f32::NAN);
+        fresh_bad_target.advance(f32::INFINITY, spec, MotionMode::Normal, 1.0 / 60.0);
+        assert_eq!(fresh_bad_target.value(), 0.0);
+        assert!(fresh_bad_target.is_settled());
     }
 
     #[test]

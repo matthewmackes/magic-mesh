@@ -68,7 +68,20 @@ base image before invoking Podman, bounds a registry probe with
 `MCNF_PULL_TIMEOUT`, and exits with `3` when the farm cannot reach the registry;
 an image is never claimed or passed to disk conversion in that state. The
 successful path runs `verify-image.sh` before any disk output. The repo lane
-requires the configured signed package channel; the local lane accepts a
-staged `magic-mesh-*.rpm` and is useful for an air-gapped farm build. The
-Containerfile uses `context.containerignore` so only the packaging inputs enter
-the build context.
+pins that channel to the committed Magic Mesh RPM key, then requires both
+installed production binaries to carry compile-time BuildInfo matching the
+requested source revision and the installed RPM version. The local lane accepts
+exactly one regular, bounded, non-group/other-writable `magic-mesh-*.rpm`,
+verifies that its package name is exactly `magic-mesh`, and checks its signature
+against the same governed key before and after staging. The Containerfile
+repeats the signature gate on the actual build-context bytes and enables DNF's
+local-package signature check. The candidate manifest is deliberately treated
+only as a consistency record: its revision, NEVRA, and payload digest do not
+authenticate themselves. Revision authority comes from the exact compile-time
+BuildInfo carried by both signed RPM binaries. The verifier streams only those
+two ELF members, without filesystem extraction or execution, and requires each
+to carry the requested source revision before staging, after staging, and at
+the Containerfile boundary. Thus a forged current-revision manifest cannot make
+an older correctly signed RPM eligible. This lane remains useful for an
+air-gapped farm build. The Containerfile uses `context.containerignore` so only
+the packaging inputs enter the build context.

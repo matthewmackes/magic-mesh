@@ -537,15 +537,30 @@ fn valid_discovery_field(value: &str) -> bool {
 }
 
 /// Fold several discovery sources into one de-duplicated target list (by `id`).
+///
+/// An id is authority, not merely display metadata: if two observations bind it to
+/// different renderer kinds or endpoints, suppress every observation for that id.
+/// Source ordering must never decide which physical renderer receives a cast.
 #[must_use]
 pub fn discover_all(sources: &[&dyn RendererDiscovery]) -> Vec<CastTarget> {
     let mut out: Vec<CastTarget> = Vec::new();
+    let mut equivocated_ids: Vec<String> = Vec::new();
     for source in sources {
         for target in source.discover() {
-            if out.len() == MAX_CAST_TARGETS {
-                return out;
+            if equivocated_ids.iter().any(|id| id == &target.id) {
+                continue;
             }
-            if !out.iter().any(|t| t.id == target.id) {
+            if let Some(index) = out.iter().position(|existing| existing.id == target.id) {
+                let existing = &out[index];
+                if existing.kind == target.kind && existing.location == target.location {
+                    continue;
+                }
+                let id = target.id;
+                out.remove(index);
+                equivocated_ids.push(id);
+                continue;
+            }
+            if out.len() < MAX_CAST_TARGETS {
                 out.push(target);
             }
         }
@@ -1345,7 +1360,7 @@ id=bad\nhost=192.0.2.22\nport=not-a-port\n";
                 kind: CastKind::MeshNode,
                 id: "dup".to_owned(),
                 name: "B".to_owned(),
-                location: "y".to_owned(),
+                location: "x".to_owned(),
             },
             CastTarget {
                 kind: CastKind::DlnaUpnp,
@@ -1357,6 +1372,47 @@ id=bad\nhost=192.0.2.22\nport=not-a-port\n";
         let all = discover_all(&[&a, &b]);
         assert_eq!(all.len(), 2, "the duplicate id is folded once");
         assert_eq!(all[0].name, "A", "first source wins the id");
+    }
+
+    #[test]
+    fn equivocated_discovery_identity_cannot_select_a_renderer_by_source_order() {
+        struct Canned(Vec<CastTarget>);
+        impl RendererDiscovery for Canned {
+            fn discover(&self) -> Vec<CastTarget> {
+                self.0.clone()
+            }
+        }
+
+        let first = Canned(vec![
+            CastTarget {
+                kind: CastKind::DlnaUpnp,
+                id: "living-room".to_owned(),
+                name: "Expected TV".to_owned(),
+                location: "http://192.0.2.20:8200/desc.xml".to_owned(),
+            },
+            CastTarget {
+                kind: CastKind::Chromecast,
+                id: "unrelated".to_owned(),
+                name: "Kitchen".to_owned(),
+                location: "192.0.2.30:8009".to_owned(),
+            },
+        ]);
+        let conflicting = Canned(vec![CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "living-room".to_owned(),
+            name: "Substitute TV".to_owned(),
+            location: "http://192.0.2.99:8200/desc.xml".to_owned(),
+        }]);
+        let replay = Canned(vec![first.0[0].clone()]);
+
+        for sources in [
+            [&first as &dyn RendererDiscovery, &conflicting, &replay],
+            [&conflicting as &dyn RendererDiscovery, &first, &replay],
+        ] {
+            let all = discover_all(&sources);
+            assert_eq!(all.len(), 1, "only unrelated authority survives");
+            assert_eq!(all[0].id, "unrelated");
+        }
     }
 
     // ── endpoint + control-url parsing ──────────────────────────────────────────

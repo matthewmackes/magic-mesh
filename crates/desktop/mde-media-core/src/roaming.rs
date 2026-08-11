@@ -530,8 +530,9 @@ pub enum LoginOutcome {
     /// No resumable session existed; this seat took a fresh lease so a later seat
     /// can roam from here.
     FreshLease,
-    /// The replicated lease-generation space is exhausted, so this seat did not
-    /// claim a lease or resume playback.
+    /// The replicated lease-generation space is exhausted or the exact lease
+    /// claim could not be durably published and confirmed, so this seat did not
+    /// resume playback.
     LeaseUnavailable,
     /// The prior owner's media could not be opened here, so the existing owner
     /// keeps the lease and this seat does not claim or alter it.
@@ -662,16 +663,23 @@ impl RoamingSession {
                         self.released = true;
                         return LoginOutcome::ResumeUnavailable;
                     }
-                    player.set_playlist(owning.queue.clone());
-                    // The pending seek lands once the file opens.
-                    self.pending = Some(PendingResume {
-                        media: media.clone(),
-                        position,
-                        was_paused,
-                    });
                 }
-                // Take the lease immediately (carry the roamed playback payload).
-                let _ = self.store.publish(&owning);
+                // Take and confirm the exact lease before arming any playback
+                // payload. A failed rename or a concurrent higher claim leaves
+                // the source as owner; reporting a resume here would let this
+                // target play without authority until the next poll.
+                if self.store.publish(&owning).is_err() || !self.holds_current_lease() {
+                    self.held_gen = 0;
+                    self.release_local(player);
+                    return LoginOutcome::LeaseUnavailable;
+                }
+                player.set_playlist(owning.queue.clone());
+                // The pending seek lands once the file opens.
+                self.pending = owning.media.map(|media| PendingResume {
+                    media,
+                    position,
+                    was_paused,
+                });
                 return LoginOutcome::Resumed {
                     title,
                     position_secs: position,
@@ -681,7 +689,11 @@ impl RoamingSession {
         // Nothing to resume — still claim a lease so a later seat roams from here.
         let idle =
             SessionRecord::capture(player, &self.identity, &self.seat, self.held_gen, now_ms);
-        let _ = self.store.publish(&idle);
+        if self.store.publish(&idle).is_err() || !self.holds_current_lease() {
+            self.held_gen = 0;
+            self.release_local(player);
+            return LoginOutcome::LeaseUnavailable;
+        }
         LoginOutcome::FreshLease
     }
 
@@ -1209,10 +1221,7 @@ mod tests {
 
         let mut session = RoamingSession::new(store.clone(), "matthew", "seat-b");
         let mut p = player();
-        assert_eq!(
-            session.login(&mut p, 2_000),
-            LoginOutcome::LeaseUnavailable
-        );
+        assert_eq!(session.login(&mut p, 2_000), LoginOutcome::LeaseUnavailable);
         assert_eq!(session.held_gen(), 0);
         assert_eq!(store.owner_seat("matthew").as_deref(), Some("seat-a"));
         assert_eq!(store.records("matthew").len(), 1);
@@ -1232,7 +1241,10 @@ mod tests {
 
         store.release("matthew", "seat-a").expect("remove lease");
         session.publish(&p, 2_000);
-        assert!(store.records("matthew").is_empty(), "yielded seat cannot reassert");
+        assert!(
+            store.records("matthew").is_empty(),
+            "yielded seat cannot reassert"
+        );
         assert_eq!(session.poll(&mut p, 3_000), PollOutcome::Released);
         assert_eq!(p.state(), PlayerState::Paused);
         assert_eq!(session.poll(&mut p, 4_000), PollOutcome::Released);
@@ -1288,7 +1300,11 @@ mod tests {
         assert!(sb.pending.is_none(), "yielded resume must be discarded");
         pb.pump();
         assert_eq!(pb.state(), PlayerState::Paused);
-        assert_eq!(pb.position(), 0.0, "yielded seat must not seek into resumed media");
+        assert_eq!(
+            pb.position(),
+            0.0,
+            "yielded seat must not seek into resumed media"
+        );
     }
 
     #[test]
@@ -1339,10 +1355,7 @@ mod tests {
 
         let mut pb = Player::new(FakeMpv::new().with_duration(120.0).failing_load());
         let mut sb = RoamingSession::new(RoamingStore::new(root), "matthew", "seat-b");
-        assert_eq!(
-            sb.login(&mut pb, 3_000),
-            LoginOutcome::ResumeUnavailable
-        );
+        assert_eq!(sb.login(&mut pb, 3_000), LoginOutcome::ResumeUnavailable);
         assert!(sb.pending.is_none(), "a rejected load cannot arm a resume");
         assert_eq!(sb.held_gen(), 0, "failed target must not claim a lease");
         assert_eq!(
@@ -1350,10 +1363,56 @@ mod tests {
             Some("seat-a"),
             "the source keeps ownership when the target cannot open media"
         );
-        assert_eq!(pb.media(), None, "rejected load leaves the target untouched");
+        assert_eq!(
+            pb.media(),
+            None,
+            "rejected load leaves the target untouched"
+        );
         assert!(
             pb.playlist().items().is_empty(),
             "rejected load must not copy the source queue into the target"
+        );
+    }
+
+    #[test]
+    fn failed_lease_publication_cannot_resume_on_non_owner_after_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let store = RoamingStore::new(root.clone());
+        let mut source = record("seat-a", 7, 2_000);
+        source.position_secs = 45.0;
+        source
+            .queue
+            .push(PlaylistItem::titled("movie.mkv", "Source queue"));
+        store
+            .publish(&source)
+            .expect("persist source before restart");
+
+        // A durable obstruction at the arriving seat's final pathname makes
+        // the atomic rename fail. The old implementation ignored that failure,
+        // returned Resumed, and left the non-owner target armed to play.
+        std::fs::create_dir(store.seat_path("matthew", "seat-b"))
+            .expect("obstruct target lease pathname");
+        let mut target = player();
+        let mut restarted = RoamingSession::new(store.clone(), "matthew", "seat-b");
+
+        assert_eq!(
+            restarted.login(&mut target, 3_000),
+            LoginOutcome::LeaseUnavailable
+        );
+        assert_eq!(restarted.held_gen(), 0);
+        assert!(restarted.pending.is_none());
+        assert_eq!(store.owner_seat("matthew").as_deref(), Some("seat-a"));
+        assert!(
+            target.playlist().items().is_empty(),
+            "a target without the lease must not adopt the source queue"
+        );
+
+        target.pump();
+        assert_eq!(
+            target.state(),
+            PlayerState::Paused,
+            "a target without the lease must remain unable to play"
         );
     }
 

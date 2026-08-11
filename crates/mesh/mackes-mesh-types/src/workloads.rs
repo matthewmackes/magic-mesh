@@ -927,6 +927,18 @@ impl WorkloadOperationStatus {
             }
         }
         if let Some(attachment) = &self.attachment {
+            // Failed and cancelled operations have no remaining presentation
+            // authority. A retained, otherwise-valid lease in a restarted or
+            // substituted projection must not let a shell reconnect after the
+            // reconciler has declared the operation terminal.
+            if matches!(
+                self.phase,
+                WorkloadOperationPhase::Failed | WorkloadOperationPhase::Cancelled
+            ) {
+                return Err(WorkloadContractError::InvalidField(
+                    "terminal_attachment",
+                ));
+            }
             attachment.validate(now_ms)?;
             if attachment.workload_id != self.workload_id {
                 return Err(WorkloadContractError::InvalidField(
@@ -1361,6 +1373,52 @@ mod tests {
             Err(WorkloadContractError::InvalidNumber(
                 "attachment_generation"
             ))
+        );
+    }
+
+    #[test]
+    fn terminal_projection_cannot_retain_attachment_authority_after_restart() {
+        let workload_id = WorkloadId::new("browser-seat15").expect("valid workload id");
+        let mut status = WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: "status-terminal-attachment-1".into(),
+            workload_id: workload_id.clone(),
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadProfile::Standard.resources(),
+            image_ref: None,
+            generation: 7,
+            phase: WorkloadOperationPhase::Failed,
+            power: WorkloadPowerState::Stopped,
+            readiness: WorkloadReadiness::Failed,
+            signals: WorkloadRuntimeSignals::from_readiness(
+                WorkloadOperationPhase::Failed,
+                WorkloadReadiness::Failed,
+            ),
+            retryable: false,
+            attempt: 2,
+            next_retry_at_ms: 0,
+            reason: Some("presentation failed".into()),
+            remediation: None,
+            attachment: Some(WorkloadAttachmentLease {
+                schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+                lease_id: "lease-retained-after-failure".into(),
+                nonce: "nonce-retained-after-failure".into(),
+                workload_id,
+                generation: 7,
+                protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+                expires_at_ms: 5_000,
+            }),
+        };
+
+        assert_eq!(
+            status.validate(1_000),
+            Err(WorkloadContractError::InvalidField("terminal_attachment"))
+        );
+        status.phase = WorkloadOperationPhase::Cancelled;
+        status.reason = None;
+        assert_eq!(
+            status.validate(1_000),
+            Err(WorkloadContractError::InvalidField("terminal_attachment"))
         );
     }
 

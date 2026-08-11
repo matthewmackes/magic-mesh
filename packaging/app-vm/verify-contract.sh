@@ -10,6 +10,9 @@ LAUNCHER="$APP_VM/mcnf-app-vm-launch.sh"
 PROBE="$APP_VM/mcnf-app-vm-runtime-probe.sh"
 IMAGE_VERIFY="$APP_VM/verify-image.sh"
 BUILD="$APP_VM/build-image.sh"
+RPM_SUPPLY_VERIFY="$APP_VM/verify-rpm-supply.sh"
+RPM_BUILD_IDENTITY_VERIFY="$APP_VM/verify-rpm-build-identity.py"
+INSTALLED_RPM_IDENTITY_VERIFY="$APP_VM/verify-installed-rpm-identity.sh"
 
 require() {
     local needle=$1 file=$2
@@ -19,15 +22,100 @@ require() {
     }
 }
 
+require_unique_container_arg() {
+    local name=$1 expected=$2 file=$3 count
+
+    count=$(awk -v name="$name" '
+        $1 == "ARG" {
+            split($2, declaration, "=")
+            if (declaration[1] == name) count++
+        }
+        END { print count + 0 }
+    ' "$file")
+    if [ "$count" -ne 1 ] || ! grep -Fxq -- "$expected" "$file"; then
+        echo "FATAL: expected exactly one governed $name declaration in $file" >&2
+        return 1
+    fi
+}
+
+require_governed_container_base() {
+    local file=$1 count
+
+    count=$(awk '$1 == "FROM" { count++ } END { print count + 0 }' "$file")
+    if [ "$count" -ne 1 ] || ! grep -Fxq -- "FROM \${APP_VM_BASE}" "$file"; then
+        echo "FATAL: App VM image must consume exactly one governed base declaration in $file" >&2
+        return 1
+    fi
+}
+
+require_unique_unit_directive() {
+    local name=$1 expected=$2 file=$3
+
+    awk -v name="$name" -v expected="$expected" '
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            if (line ~ /^#/) next
+            split(line, directive, "=")
+            if (directive[1] == name) {
+                count++
+                if (line == name "=" expected) exact++
+            }
+        }
+        END { exit !(count == 1 && exact == 1) }
+    ' "$file" || {
+        echo "FATAL: expected exactly one governed $name=$expected directive in $file" >&2
+        return 1
+    }
+}
+
 [ -x "$VALIDATOR" ] || { echo "FATAL: validator is not executable" >&2; exit 1; }
 [ -x "$LAUNCHER" ] || { echo "FATAL: launcher is not executable" >&2; exit 1; }
 [ -x "$PROBE" ] || { echo "FATAL: runtime probe is not executable" >&2; exit 1; }
-bash -n "$BUILD" "$IMAGE_VERIFY" "$0"
+[ -x "$RPM_SUPPLY_VERIFY" ] || { echo "FATAL: RPM supply verifier is not executable" >&2; exit 1; }
+[ -x "$RPM_BUILD_IDENTITY_VERIFY" ] || { echo "FATAL: RPM build-identity verifier is not executable" >&2; exit 1; }
+[ -x "$INSTALLED_RPM_IDENTITY_VERIFY" ] || { echo "FATAL: installed RPM identity verifier is not executable" >&2; exit 1; }
+bash -n "$BUILD" "$IMAGE_VERIFY" "$RPM_SUPPLY_VERIFY" "$INSTALLED_RPM_IDENTITY_VERIFY" "$0"
 sh -n "$VALIDATOR" "$LAUNCHER" "$PROBE"
 "$IMAGE_VERIFY" --self-test
+python3 "$RPM_BUILD_IDENTITY_VERIFY" --self-test
+"$RPM_SUPPLY_VERIFY" --self-test
+"$INSTALLED_RPM_IDENTITY_VERIFY" --self-test
 
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
+printf '%s\n' \
+    '[Service]' \
+    '# ExecStart=/usr/local/libexec/mcnf-app-vm-runtime' \
+    'ExecStart=/usr/local/libexec/substituted-runtime' \
+    > "$fixture/substituted-runtime.service"
+if require_unique_unit_directive ExecStart \
+   '/usr/local/libexec/mcnf-app-vm-runtime' \
+   "$fixture/substituted-runtime.service" >/dev/null 2>&1; then
+    echo "FATAL: verifier accepted a commented runtime decoy and substituted ExecStart" >&2
+    exit 1
+fi
+printf '%s\n' \
+    'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' \
+    'ARG APP_VM_BASE=registry.example.invalid/mutable:latest' \
+    "FROM \${APP_VM_BASE}" \
+    > "$fixture/conflicting-base.Containerfile"
+if require_unique_container_arg APP_VM_BASE \
+   'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' \
+   "$fixture/conflicting-base.Containerfile" >/dev/null 2>&1; then
+    echo "FATAL: verifier accepted conflicting App VM base declarations" >&2
+    exit 1
+fi
+printf '%s\n' \
+    'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' \
+    'FROM registry.example.invalid/substituted:latest' \
+    > "$fixture/substituted-base.Containerfile"
+if require_governed_container_base \
+   "$fixture/substituted-base.Containerfile" >/dev/null 2>&1; then
+    echo "FATAL: verifier accepted an image that bypassed the governed App VM base" >&2
+    exit 1
+fi
+
 mkdir -p "$fixture/app-vm"
 printf '%s\n' '"org.example.App"' > "$fixture/app-vm/app-id"
 printf '%s\n' '"catalog-2026.07"' > "$fixture/app-vm/catalog-revision"
@@ -291,12 +379,19 @@ grep -Fq '"state":"unavailable"' "$probe_run/runtime-preflight.json" || {
 }
 
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck "$VALIDATOR" "$PROBE" "$APP_VM/build-image.sh" "$0"
+    shellcheck "$VALIDATOR" "$PROBE" "$APP_VM/build-image.sh" "$RPM_SUPPLY_VERIFY" \
+        "$INSTALLED_RPM_IDENTITY_VERIFY" "$0"
 fi
 
 require 'COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate' "$APP_VM/Containerfile"
 require 'COPY packaging/app-vm/mcnf-app-vm-runtime-probe.sh /tmp/mcnf-app-vm-runtime-probe' "$APP_VM/Containerfile"
-require 'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' "$APP_VM/Containerfile"
+require 'COPY packaging/app-vm/verify-rpm-supply.sh /tmp/mcnf-app-vm-verify-rpm-supply' "$APP_VM/Containerfile"
+require 'COPY packaging/app-vm/verify-rpm-build-identity.py /tmp/verify-rpm-build-identity.py' "$APP_VM/Containerfile"
+require 'COPY packaging/app-vm/verify-installed-rpm-identity.sh /tmp/verify-installed-rpm-identity.sh' "$APP_VM/Containerfile"
+require 'COPY packaging/repo/RPM-GPG-KEY-magic-mesh /tmp/RPM-GPG-KEY-magic-mesh' "$APP_VM/Containerfile"
+require_unique_container_arg APP_VM_BASE \
+    'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' "$APP_VM/Containerfile"
+require_governed_container_base "$APP_VM/Containerfile"
 require 'ARG MCNF_APP_VM_SOURCE_COMMIT' "$APP_VM/Containerfile"
 require 'ARG MCNF_APP_VM_BASE_IMAGE_ID' "$APP_VM/Containerfile"
 require 'source-commit' "$APP_VM/Containerfile"
@@ -312,6 +407,24 @@ require 'resolve_image' "$BUILD"
 require 'MCNF_PULL_TIMEOUT' "$BUILD"
 require '--ignorefile' "$BUILD"
 require 'context.containerignore' "$BUILD"
+require 'RPM_SUPPLY_VERIFY' "$BUILD"
+require 'exactly one local magic-mesh RPM is required' "$RPM_SUPPLY_VERIFY"
+require 'RPM signature is missing, invalid, or not made by the governed key' "$RPM_SUPPLY_VERIFY"
+require 'local lane requires --candidate-manifest' "$BUILD"
+require 'RPM NEVRA does not match the source-revision candidate manifest' "$RPM_SUPPLY_VERIFY"
+require 'RPM payload digest does not match the source-revision candidate manifest' "$RPM_SUPPLY_VERIFY"
+require 'candidate manifest revision does not match the requested App VM source revision' "$RPM_SUPPLY_VERIFY"
+require 'signed RPM payload does not carry the requested source revision' "$RPM_SUPPLY_VERIFY"
+require 'verify-rpm-build-identity.py' "$RPM_SUPPLY_VERIFY"
+require 'installed repo RPM does not carry the requested source revision and package version' "$INSTALLED_RPM_IDENTITY_VERIFY"
+require 'installed build-identity carrier differs from the governed RPM payload' "$INSTALLED_RPM_IDENTITY_VERIFY"
+require 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh' "$APP_VM/Containerfile"
+require '/tmp/mcnf-app-vm-verify-rpm-supply' "$APP_VM/Containerfile"
+require "--source-commit \"\${MCNF_APP_VM_SOURCE_COMMIT}\"" "$APP_VM/Containerfile"
+require '--candidate-manifest /tmp/mcnf-rpms/candidate-manifest.json' "$APP_VM/Containerfile"
+require '/tmp/mcnf-rpms/magic-mesh-local.rpm' "$APP_VM/Containerfile"
+require 'localpkg_gpgcheck=1' "$APP_VM/Containerfile"
+require '/tmp/verify-installed-rpm-identity.sh' "$APP_VM/Containerfile"
 require 'GATED[WL-FUNC-018/base-image]' "$BUILD"
 require 'org.mcnf.app-vm.profile' "$BUILD"
 require 'base-image-id' "$BUILD"
@@ -353,7 +466,8 @@ require "kill -TERM \"\$app_pid\"" "$APP_VM/mcnf-app-vm-launch.sh"
 require 'application stopped by guest supervisor' "$APP_VM/mcnf-app-vm-launch.sh"
 require 'swaymsg exit' "$APP_VM/mcnf-app-vm-launch.sh"
 require 'Type=simple' "$TEMPLATE"
-require 'ExecStart=/usr/local/libexec/mcnf-app-vm-runtime' "$TEMPLATE"
+require_unique_unit_directive ExecStart \
+    '/usr/local/libexec/mcnf-app-vm-runtime' "$TEMPLATE"
 if grep -Fq 'flatpak remote-add' "$APP_VM/Containerfile"; then
     echo "FATAL: image must not add an unsigned Flatpak remote" >&2
     exit 1

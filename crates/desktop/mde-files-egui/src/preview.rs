@@ -22,6 +22,7 @@
 //!   "load on demand" affordance instead of auto-reading over sshfs.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
@@ -666,22 +667,66 @@ fn build_preview(path: &Path) -> Result<PreviewData, String> {
     }
 }
 
+/// Open one preview source without allowing a resource card's path to redirect
+/// read authority to a symlink, non-regular inode, or multiply-linked alias.
+/// The caller retains this descriptor for the entire decode/probe and validates
+/// it again afterwards so path replacement cannot populate a cache entry under
+/// an identity that now names different bytes.
+fn open_preview_source(path: &Path, max_bytes: u64) -> Result<File, String> {
+    let before = std::fs::symlink_metadata(path).map_err(|e| format!("unreadable: {e}"))?;
+    if !before.is_file() {
+        return Err("untrusted preview source: not a regular file".to_string());
+    }
+    if before.len() > max_bytes {
+        return Err(format!("too large to preview ({} MB cap)", max_bytes / (1024 * 1024)));
+    }
+
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    }
+    let file = options.open(path).map_err(|e| format!("unreadable: {e}"))?;
+    validate_preview_source(&file, path, max_bytes)?;
+    Ok(file)
+}
+
+fn validate_preview_source(file: &File, path: &Path, max_bytes: u64) -> Result<(), String> {
+    let descriptor = file.metadata().map_err(|e| format!("unreadable: {e}"))?;
+    let current = std::fs::symlink_metadata(path).map_err(|e| format!("unreadable: {e}"))?;
+    if !descriptor.is_file() || !current.is_file() || descriptor.len() > max_bytes {
+        return Err("untrusted preview source: invalid or replaced file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if descriptor.nlink() != 1 {
+            return Err("untrusted preview source: file has external aliases".to_string());
+        }
+        if descriptor.dev() != current.dev() || descriptor.ino() != current.ino() {
+            return Err("untrusted preview source: file was replaced".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Read + decode + downscale an image file. Refuses over-cap files honestly.
 ///
 /// # Errors
 /// A human-readable reason: unreadable, over the size cap, or undecodable.
 fn decode_image_file(path: &Path, max_px: u32) -> Result<(Pixels, [u32; 2]), String> {
-    let len = std::fs::metadata(path)
-        .map_err(|e| format!("unreadable: {e}"))?
-        .len();
-    if len > MAX_DECODE_BYTES {
-        return Err(format!(
-            "too large to decode ({} MB > {} MB cap)",
-            len / (1024 * 1024),
-            MAX_DECODE_BYTES / (1024 * 1024)
-        ));
+    let mut file = open_preview_source(path, MAX_DECODE_BYTES)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_DECODE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("unreadable: {e}"))?;
+    if bytes.len() as u64 > MAX_DECODE_BYTES {
+        return Err("too large to decode".to_string());
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("unreadable: {e}"))?;
+    validate_preview_source(&file, path, MAX_DECODE_BYTES)?;
     decode_image_bytes(&bytes, max_px)
 }
 
@@ -722,7 +767,7 @@ pub(crate) fn decode_image_bytes(bytes: &[u8], max_px: u32) -> Result<(Pixels, [
 /// # Errors
 /// A human-readable reason: unreadable, or a binary file.
 pub(crate) fn read_text_file(path: &Path) -> Result<(String, bool), String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("unreadable: {e}"))?;
+    let mut file = open_preview_source(path, MAX_DECODE_BYTES)?;
     let mut buf = vec![0_u8; TEXT_CAP_BYTES + 1];
     let mut read = 0;
     loop {
@@ -742,6 +787,7 @@ pub(crate) fn read_text_file(path: &Path) -> Result<(String, bool), String> {
     if slice.contains(&0) {
         return Err("binary file \u{2014} no text preview".to_string());
     }
+    validate_preview_source(&file, path, MAX_DECODE_BYTES)?;
     Ok((String::from_utf8_lossy(slice).into_owned(), truncated))
 }
 
@@ -757,7 +803,10 @@ pub(crate) fn probe_media_file(path: &Path) -> Result<MediaMeta, String> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let file = std::fs::File::open(path).map_err(|e| format!("unreadable: {e}"))?;
+    let file = open_preview_source(path, MAX_DECODE_BYTES)?;
+    let verifier = file
+        .try_clone()
+        .map_err(|e| format!("unreadable: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -793,6 +842,7 @@ pub(crate) fn probe_media_file(path: &Path) -> Result<MediaMeta, String> {
                 .map(|d| d.short_name.to_string());
         }
     }
+    validate_preview_source(&verifier, path, MAX_DECODE_BYTES)?;
     Ok(meta)
 }
 
@@ -1074,6 +1124,17 @@ mod tests {
         let bin = scratch_file("blob.bin", &[0x7f, b'E', b'L', b'F', 0, 1, 2]);
         let err = read_text_file(&bin).expect_err("binary must refuse");
         assert!(err.contains("binary"), "honest reason, got: {err}");
+    }
+
+    #[test]
+    fn hard_linked_resource_preview_cannot_read_ambiguous_file_authority() {
+        let source = scratch_file("governed-resource.txt", b"foreign resource bytes\n");
+        let alias = source.with_file_name("hostile-resource-alias.txt");
+        let _ = std::fs::remove_file(&alias);
+        std::fs::hard_link(&source, &alias).expect("create hostile alias");
+
+        let error = read_text_file(&alias).expect_err("multiply-linked resource must fail closed");
+        assert!(error.contains("external aliases"), "unexpected refusal: {error}");
     }
 
     // ── tokenizer folds ──────────────────────────────────────────────────────

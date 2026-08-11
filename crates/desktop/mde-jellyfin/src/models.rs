@@ -6,9 +6,9 @@
 //! or an `Option` so a trimmed / evolving server payload deserializes softly
 //! rather than failing the whole browse.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 /// The universal Jellyfin item — one row of any `/Items`-shaped response.
 ///
@@ -307,7 +307,7 @@ pub struct UserData {
 #[serde(rename_all = "PascalCase")]
 pub struct ItemsResponse {
     /// The page of items.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_items")]
     pub items: Vec<BaseItemDto>,
     /// The total match count across all pages (for paging).
     #[serde(default)]
@@ -315,6 +315,28 @@ pub struct ItemsResponse {
     /// The start offset this page represents.
     #[serde(default)]
     pub start_index: i64,
+}
+
+fn deserialize_unique_items<'de, D>(deserializer: D) -> Result<Vec<BaseItemDto>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let items = Vec::<BaseItemDto>::deserialize(deserializer)?;
+    let mut ids = BTreeSet::new();
+
+    for item in &items {
+        if item.id.is_empty() {
+            return Err(D::Error::custom("Jellyfin item identity must not be empty"));
+        }
+        if !ids.insert(item.id.as_str()) {
+            return Err(D::Error::custom(format!(
+                "duplicate Jellyfin item identity: {}",
+                item.id
+            )));
+        }
+    }
+
+    Ok(items)
 }
 
 /// The public user identity carried by an [`AuthenticationResult`].
@@ -420,6 +442,25 @@ mod tests {
         assert_eq!(resp.items.len(), 2);
         assert_eq!(resp.total_record_count, 57);
         assert_eq!(resp.start_index, 10);
+    }
+
+    #[test]
+    fn duplicate_or_blank_item_identity_fails_closed_during_response_admission() {
+        let equivocated = r#"{
+            "Items": [
+                {"Id":"movie-1","Name":"Expected","Type":"Movie"},
+                {"Id":"movie-1","Name":"Substituted","Type":"Audio"}
+            ]
+        }"#;
+        let duplicate = serde_json::from_str::<ItemsResponse>(equivocated)
+            .expect_err("conflicting rows must not select one item by provider order");
+        assert!(duplicate
+            .to_string()
+            .contains("duplicate Jellyfin item identity"));
+
+        let blank = serde_json::from_str::<ItemsResponse>(r#"{"Items":[{"Id":""}]}"#)
+            .expect_err("blank item identity must not enter browse state");
+        assert!(blank.to_string().contains("identity must not be empty"));
     }
 
     #[test]

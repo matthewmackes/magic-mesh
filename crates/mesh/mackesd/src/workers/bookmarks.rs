@@ -70,6 +70,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use uuid::Uuid;
 
+use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::{ShutdownToken, Worker};
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
@@ -703,11 +704,53 @@ fn load_snapshot(path: &Path) -> Collection {
         .unwrap_or_default()
 }
 
-/// Load a persisted [`HlcClock`], if present + parseable.
+/// Load this node's persisted [`HlcClock`], if present + parseable. A clock
+/// transplanted from a retired Browser VM is not local generation authority.
 #[must_use]
-fn load_clock(path: &Path) -> Option<HlcClock> {
+fn load_clock(path: &Path, expected_node: &str) -> Option<HlcClock> {
     let s = read_bookmark_text(path, MAX_BOOKMARK_CLOCK_BYTES, "bookmark clock").ok()?;
-    serde_json::from_str(&s).ok()
+    let value = serde_json::from_str::<serde_json::Value>(&s).ok()?;
+    if value.get("node").and_then(serde_json::Value::as_str) != Some(expected_node) {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// Recover the greatest generation retained inside a folded collection. The
+/// CRDT intentionally keeps register metadata private, while its durable JSON
+/// is the restart contract; walk that representation so a missing or rolled
+/// back clock can never mint below snapshot-only history.
+#[must_use]
+fn collection_generation_floor(collection: &Collection) -> Option<Hlc> {
+    fn visit(value: &serde_json::Value, floor: &mut Option<Hlc>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(hlc) = fields
+                    .get("hlc")
+                    .and_then(|value| serde_json::from_value::<Hlc>(value.clone()).ok())
+                {
+                    if floor.as_ref().is_none_or(|current| hlc > *current) {
+                        *floor = Some(hlc);
+                    }
+                }
+                for value in fields.values() {
+                    visit(value, floor);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, floor);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut floor = None;
+    if let Ok(value) = serde_json::to_value(collection) {
+        visit(&value, &mut floor);
+    }
+    floor
 }
 
 /// Read one node's on-disk contribution as a converged [`Collection`]
@@ -776,21 +819,21 @@ fn probe_link_with_curl(url: &str) -> LinkProbeOutcome {
             "only http:// and https:// bookmark URLs are checked",
         );
     }
-    let output = Command::new("curl")
-        .args([
-            "-L",
-            "-sS",
-            "--max-time",
-            "5",
-            "--range",
-            "0-0",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            url,
-        ])
-        .output();
+    let mut command = Command::new("curl");
+    command.args([
+        "-L",
+        "-sS",
+        "--max-time",
+        "5",
+        "--range",
+        "0-0",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        url,
+    ]);
+    let output = run_link_probe_command(command, DEFAULT_CMD_TIMEOUT);
     match output {
         Ok(out) => {
             let code = String::from_utf8_lossy(&out.stdout)
@@ -818,6 +861,13 @@ fn probe_link_with_curl(url: &str) -> LinkProbeOutcome {
         }
         Err(e) => LinkProbeOutcome::new(LinkHealth::Error, None, format!("curl spawn failed: {e}")),
     }
+}
+
+fn run_link_probe_command(
+    command: Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    output_with_timeout(command, timeout)
 }
 
 fn classify_http_status(status: u16) -> LinkHealth {
@@ -1056,18 +1106,23 @@ impl BookmarksWorker {
             )
             .unwrap_or_default(),
         );
-        // A persisted clock already dominates every op it ever minted; on a fresh
-        // store, seed from the tail's max stamp so the first new op still sorts
-        // after the reloaded history.
-        if let Some(clock) = load_clock(&clock_path(&self.local_root, &self.node)) {
-            self.clock = clock;
-        } else {
-            let mut clock = HlcClock::new(self.node.clone());
-            if let Some(max) = self.own_tail.iter().map(|o| o.hlc.clone()).max() {
-                let _ = clock.observe(&max, self.now_ms());
-            }
-            self.clock = clock;
+        // Never trust the clock file as the sole generation authority: it can
+        // lag a successfully-pruned snapshot or belong to a replaced Browser
+        // VM. Bind it to this node and then advance beyond every durable local
+        // register/tail stamp before accepting a new mutation.
+        let mut clock = load_clock(
+            &clock_path(&self.local_root, &self.node),
+            &self.node,
+        )
+        .unwrap_or_else(|| HlcClock::new(self.node.clone()));
+        let history_floor = collection_generation_floor(&self.own_snapshot)
+            .into_iter()
+            .chain(self.own_tail.iter().map(|op| op.hlc.clone()))
+            .max();
+        if let Some(floor) = history_floor {
+            let _ = clock.observe(&floor, self.now_ms());
         }
+        self.clock = clock;
         self.rebuild_index();
     }
 
@@ -1791,6 +1846,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn link_probe_command_times_out_a_hung_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        assert!(run_link_probe_command(command, Duration::from_millis(50)).is_err());
+    }
+
     #[test]
     fn bus_read_failure_leaves_the_complete_command_sweep_untouched() {
         let (_clock, now) = fake_clock(1000);
@@ -2443,7 +2506,7 @@ mod tests {
         let clock = node.join(CLOCK_FILE);
         std::fs::write(&clock, [0xff, 0xfe]).unwrap();
         assert!(
-            load_clock(&clock).is_none(),
+            load_clock(&clock, "node").is_none(),
             "invalid UTF-8 clocks fail soft before JSON parsing"
         );
 
@@ -2546,6 +2609,47 @@ mod tests {
             .join("bookmarks/n1")
             .join(SEGMENT_FILE)
             .exists());
+    }
+
+    #[test]
+    fn transplanted_clock_cannot_rollback_snapshot_generation_after_browser_vm_restart() {
+        let (wall, now) = fake_clock(9_000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let gate = Arc::new(AtomicBool::new(false));
+        let mut original = worker("browser-vm", "alice", local.path(), share.path(), now.clone())
+            .with_share_gate(gate.clone());
+        let add = original.apply_action(add("https://authority.test", "Before restart"));
+        let id = find_by_title(original.collection(), "Before restart").unwrap();
+        original.snapshot_prune();
+        assert!(original.own_tail.is_empty(), "history is snapshot-only");
+
+        let retired_clock = HlcClock::new("retired-browser-vm".to_string());
+        std::fs::write(
+            clock_path(local.path(), "browser-vm"),
+            serde_json::to_string(&retired_clock).unwrap(),
+        )
+        .unwrap();
+        wall.store(100, Ordering::SeqCst);
+
+        let mut restarted = worker("browser-vm", "alice", local.path(), share.path(), now)
+            .with_share_gate(gate);
+        restarted.load();
+        let edit = restarted.apply_action(BookmarkAction::Edit {
+            id,
+            url: None,
+            title: Some("After restart".into()),
+            tags: None,
+            notes: None,
+        });
+
+        assert_eq!(edit.hlc.node, "browser-vm");
+        assert!(edit.hlc > add.hlc, "restored generation must dominate its snapshot");
+        assert_eq!(
+            title_of(restarted.collection(), id).as_deref(),
+            Some("After restart"),
+            "the accepted post-restart edit must not be silently discarded"
+        );
     }
 
     // ── the crux: two-node convergence via replay-merge ─────────────────────

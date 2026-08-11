@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -128,13 +128,9 @@ impl UnixCuttlefishGuestTransport {
     fn exchange(&self, request: GuestRequest) -> Result<GuestResponse, CuttlefishProviderError> {
         validate_request(&request)?;
         let socket = socket_path(&self.socket_root, request.target.vm_id.as_str())?;
-        let metadata = fs::symlink_metadata(&socket)
-            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
-        if !metadata.file_type().is_socket() {
-            return Err(CuttlefishProviderError::ProviderUnavailable);
-        }
         let mut stream = UnixStream::connect(&socket)
             .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        validate_connected_socket(&self.socket_root, &socket, &stream)?;
         stream
             .set_read_timeout(Some(GUEST_IO_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(GUEST_IO_TIMEOUT)))
@@ -144,6 +140,12 @@ impl UnixCuttlefishGuestTransport {
         if body.is_empty() || body.len() > MAX_GUEST_FRAME_BYTES {
             return Err(CuttlefishProviderError::ProviderRejected);
         }
+        // Observe is a current-runtime proof, not permission to replay a
+        // previously valid guest snapshot under the same outer-VM generation.
+        // Capture the admission floor immediately before the request leaves
+        // this process so both returned observations must belong to this
+        // exchange (and therefore survive guest-relay restart honestly).
+        let observation_not_before_unix_ms = now_unix_ms();
         let length = u32::try_from(body.len())
             .map_err(|_| CuttlefishProviderError::ProviderRejected)?
             .to_be_bytes();
@@ -168,7 +170,7 @@ impl UnixCuttlefishGuestTransport {
             .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
         let response: GuestResponse = serde_json::from_slice(&response)
             .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
-        validate_response(&request, response)
+        validate_response(&request, response, observation_not_before_unix_ms)
     }
 
     fn request(
@@ -189,6 +191,45 @@ impl UnixCuttlefishGuestTransport {
             operation,
         }
     }
+}
+
+/// Bind a connected relay to the protected runtime directory and the kernel's
+/// peer credentials before sending catalog, package, or lifecycle data.
+///
+/// Checking only `is_socket()` leaves the guest-readiness authority open to a
+/// socket planted in a writable or symlink-substituted runtime directory.  The
+/// post-connect checks also close the cross-uid path replacement race: the
+/// server process must own both the protected directory and the socket inode.
+fn validate_connected_socket(
+    root: &Path,
+    socket: &Path,
+    stream: &UnixStream,
+) -> Result<(), CuttlefishProviderError> {
+    let canonical_root =
+        fs::canonicalize(root).map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+    if canonical_root != root {
+        return Err(CuttlefishProviderError::ProviderUnavailable);
+    }
+    let root_metadata =
+        fs::symlink_metadata(root).map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+    if !root_metadata.file_type().is_dir() || root_metadata.permissions().mode() & 0o022 != 0 {
+        return Err(CuttlefishProviderError::ProviderUnavailable);
+    }
+
+    let socket_metadata =
+        fs::symlink_metadata(socket).map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+    if !socket_metadata.file_type().is_socket()
+        || socket_metadata.permissions().mode() & 0o022 != 0
+        || socket_metadata.uid() != root_metadata.uid()
+    {
+        return Err(CuttlefishProviderError::ProviderUnavailable);
+    }
+    let peer = rustix::net::sockopt::get_socket_peercred(stream)
+        .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+    if peer.uid.as_raw() != socket_metadata.uid() {
+        return Err(CuttlefishProviderError::ProviderUnavailable);
+    }
+    Ok(())
 }
 
 impl CuttlefishGuestTransport for UnixCuttlefishGuestTransport {
@@ -312,6 +353,7 @@ fn validate_request(request: &GuestRequest) -> Result<(), CuttlefishProviderErro
 fn validate_response(
     request: &GuestRequest,
     response: GuestResponse,
+    observation_not_before_unix_ms: u64,
 ) -> Result<GuestResponse, CuttlefishProviderError> {
     if response.schema_version != GUEST_PROTOCOL_SCHEMA_VERSION
         || response.request_id != request.request_id
@@ -327,14 +369,19 @@ fn validate_response(
                 .inventory
                 .as_ref()
                 .ok_or(CuttlefishProviderError::ProviderRejected)?;
+            let now = now_unix_ms();
             inventory
-                .validate()
+                .validate_at(now)
                 .map_err(CuttlefishProviderError::InventoryContract)?;
+            let inventory_observed_at_unix_ms = inventory
+                .observed_at_unix_ms
+                .ok_or(CuttlefishProviderError::ProviderRejected)?;
             if inventory.workload_id != request.target.vm_id.as_str()
                 || inventory.image_provenance.as_ref()
                     != Some(&request.package_manifest.image_provenance)
                 || inventory.guest_boot_state
                     != mackes_mesh_types::android_apps::AndroidGuestBootState::Ready
+                || inventory_observed_at_unix_ms < observation_not_before_unix_ms
             {
                 return Err(CuttlefishProviderError::ProviderRejected);
             }
@@ -344,8 +391,10 @@ fn validate_response(
                 .ok_or(CuttlefishProviderError::ProviderRejected)?
                 .admitted_against(&request.target, &request.catalog_digest, request.generation)
                 .map_err(CuttlefishProviderError::Contract)?;
-            let now = now_unix_ms();
-            if source.observed_at_unix_ms > now || source.expires_at_unix_ms <= now {
+            if source.observed_at_unix_ms < observation_not_before_unix_ms
+                || source.observed_at_unix_ms > now
+                || source.expires_at_unix_ms <= now
+            {
                 return Err(CuttlefishProviderError::ProviderRejected);
             }
             if response.launch_outcome.is_some() || response.cleanup_complete {
@@ -590,6 +639,100 @@ mod tests {
         assert_eq!(
             validate_request(&hostile),
             Err(CuttlefishProviderError::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn future_inventory_observation_cannot_invent_guest_readiness() {
+        let request = GuestRequest {
+            schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+            request_id: "observe-7".to_owned(),
+            target: target(),
+            catalog_digest: CATALOG_DIGEST.to_owned(),
+            package_manifest: manifest(),
+            generation: 7,
+            operation: GuestOperation::Observe,
+        };
+        let mut inventory = ready_inventory();
+        inventory.observed_at_unix_ms = Some(now_unix_ms().saturating_add(60_000));
+        inventory.observation_age_ms = Some(0);
+        let response = GuestResponse {
+            schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            target: request.target.clone(),
+            catalog_digest: request.catalog_digest.clone(),
+            generation: request.generation,
+            inventory: Some(inventory),
+            launch_outcome: None,
+            vdi_source: Some(vdi_source()),
+            cleanup_complete: false,
+        };
+
+        assert!(matches!(
+            validate_response(&request, response, now_unix_ms()),
+            Err(CuttlefishProviderError::InventoryContract(_))
+        ));
+    }
+
+    #[test]
+    fn pre_restart_inventory_cannot_authorize_the_current_guest_exchange() {
+        let temporary = tempfile::tempdir().expect("socket root");
+        let socket = temporary.path().join("android-one.sock");
+        let listener = UnixListener::bind(&socket).expect("guest listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("guest connection");
+            let request = read_request(&mut stream);
+            let mut stale_inventory = ready_inventory();
+            stale_inventory.observed_at_unix_ms =
+                Some(now_unix_ms().saturating_sub(60_000).max(1));
+            stale_inventory.observation_age_ms = Some(0);
+            write_response(
+                &mut stream,
+                &GuestResponse {
+                    schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    target: request.target,
+                    catalog_digest: request.catalog_digest,
+                    generation: request.generation,
+                    inventory: Some(stale_inventory),
+                    launch_outcome: None,
+                    vdi_source: Some(vdi_source()),
+                    cleanup_complete: false,
+                },
+            );
+        });
+
+        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
+        assert_eq!(
+            transport.observe("observe-7", &target(), CATALOG_DIGEST, &manifest(), 7),
+            Err(CuttlefishProviderError::ProviderRejected),
+            "a fresh envelope must not relabel pre-restart package readiness"
+        );
+        server.join().expect("guest server");
+    }
+
+    #[test]
+    fn transport_rejects_writable_guest_relay_before_sending_authority_data() {
+        let temporary = tempfile::tempdir().expect("socket root");
+        let socket = temporary.path().join("android-one.sock");
+        let listener = UnixListener::bind(&socket).expect("guest listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o777))
+            .expect("make hostile relay writable");
+
+        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
+        assert_eq!(
+            transport.observe("observe-7", &target(), CATALOG_DIGEST, &manifest(), 7),
+            Err(CuttlefishProviderError::ProviderUnavailable)
+        );
+
+        let (mut intercepted, _) = listener.accept().expect("intercepted connection");
+        let mut first_byte = [0_u8; 1];
+        assert_eq!(
+            intercepted
+                .read(&mut first_byte)
+                .expect("client closes without a request"),
+            0,
+            "an unauthenticated relay must receive no governed request bytes"
         );
     }
 

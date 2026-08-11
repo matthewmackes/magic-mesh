@@ -459,6 +459,10 @@ impl ResourceBrowserState {
                     current_unix_millis(),
                 )?)
             });
+        self.apply_refresh_result(result);
+    }
+
+    fn apply_refresh_result(&mut self, result: Result<AdmittedResourceSnapshot, String>) {
         match result {
             Ok(snapshot) => {
                 self.catalog = Some(snapshot.catalog);
@@ -484,8 +488,15 @@ impl ResourceBrowserState {
                     self.cancel_vdi_handoff();
                 }
             }
-            Err(error) if self.catalog.is_none() => self.error = Some(error),
-            Err(_) => {}
+            Err(error) => {
+                // A retained card may remain useful for inspection, but a failed
+                // newer read can represent an equivocated catalog/projection pair.
+                // Never let the last authenticated generation continue to arm
+                // actions or a prepared VDI handoff across that ambiguity.
+                self.authenticated_catalog = None;
+                self.cancel_vdi_handoff();
+                self.error = Some(error);
+            }
         }
     }
 
@@ -2185,6 +2196,51 @@ mod tests {
         let state = ResourceBrowserState::new(None);
         assert!(state.publisher_key.is_none());
         assert!(state.authenticated_catalog.is_none());
+    }
+
+    #[test]
+    fn mismatched_newer_snapshot_cannot_retain_prior_launch_authority() {
+        let (catalog_body, discovery_body) = snapshot_bodies();
+        let catalog = catalog();
+        let proof = ResourcePublisherAttestation::mint(
+            &catalog,
+            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
+            KEY,
+            NOW,
+            NOW + 60_000,
+        )
+        .expect("publisher proof");
+        let proof_body = serde_json::to_string(&proof).expect("proof JSON");
+        let admitted = admit_resource_snapshot(
+            &catalog_body,
+            &discovery_body,
+            Some(&proof_body),
+            Some(KEY),
+            NOW + 1,
+        )
+        .expect("authenticated snapshot");
+
+        let mut state = ResourceBrowserState::with_publisher_key(None, Some(KEY.to_vec()));
+        state.apply_refresh_result(Ok(admitted.clone()));
+        assert!(state.authenticated_catalog.is_some());
+        state.vdi_handoff = Some(ApprovedCatalogDesktop {
+            resource_id: "resource:prior-generation".into(),
+            display_name: "Prior desktop".into(),
+            host: "172.20.146.54".into(),
+            port: 3_389,
+        });
+
+        state.apply_refresh_result(Err(
+            "resource discovery projection does not match the retained catalog".into(),
+        ));
+        assert_eq!(state.catalog.as_ref(), Some(&admitted.catalog));
+        assert!(state.authenticated_catalog.is_none());
+        assert!(state.take_vdi_handoff().is_none());
+        assert!(state.error.as_deref().is_some_and(|error| error.contains("does not match")));
+
+        state.apply_refresh_result(Ok(admitted));
+        assert!(state.authenticated_catalog.is_some());
+        assert!(state.error.is_none());
     }
 
     #[test]

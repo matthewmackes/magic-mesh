@@ -661,6 +661,26 @@ impl PhonesHubState {
             });
     }
 
+    /// Render a single Phones leaf when mounted by Workers. The hub keeps its
+    /// provider state and feature renderers, but does not expose its legacy tab
+    /// strip inside the parent catalog.
+    pub(crate) fn show_catalog(&mut self, ui: &mut egui::Ui, label: &str) {
+        self.header(ui);
+        if let Some((msg, is_err)) = &self.note {
+            ui.colored_label(if *is_err { Style::DANGER } else { Style::OK }, msg);
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(("phones-catalog-body", label))
+            .auto_shrink([false, false])
+            .show(ui, |ui| match label {
+                "Files" => self.files_tab(ui),
+                "Services" => self.services_tab(ui),
+                "Commands" => self.commands_tab(ui),
+                "Pair" => self.pair_tab(ui),
+                _ => self.phones_tab(ui),
+            });
+    }
+
     /// The shared header: the mesh KDC identity + the paired/online counts.
     fn header(&self, ui: &mut egui::Ui) {
         let name = self.endpoint_name();
@@ -1477,8 +1497,31 @@ const fn provenance_color(source: ServiceProvenance) -> egui::Color32 {
 
 /// Fold an `action/connect/devices` reply body into the roster (mirrors the worker's
 /// sorted `WireDevice` array). A malformed reply yields an empty roster (§7).
+/// Exact duplicate rows collapse, while conflicting claims for one physical phone
+/// identity suppress that identity instead of rendering contradictory controls that
+/// all target the same `device_id`.
 fn fold_devices(body: &str) -> Vec<WireDevice> {
-    serde_json::from_str::<Vec<WireDevice>>(body).unwrap_or_default()
+    let Ok(devices) = serde_json::from_str::<Vec<WireDevice>>(body) else {
+        return Vec::new();
+    };
+
+    let mut by_id: BTreeMap<String, Option<WireDevice>> = BTreeMap::new();
+    for device in devices {
+        if device.id.is_empty() {
+            continue;
+        }
+        match by_id.entry(device.id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(device));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&device) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    by_id.into_values().flatten().collect()
 }
 
 /// Fold an `action/connect/browse` reply into the live-browse view.
@@ -1989,6 +2032,30 @@ mod tests {
         assert!(got[1].battery.is_none());
         // A malformed body is an honest empty roster, never a panic.
         assert!(fold_devices("not json").is_empty());
+    }
+
+    #[test]
+    fn fold_devices_suppresses_equivocating_physical_identity() {
+        let got = fold_devices(
+            r#"[
+                {"id":"same-phone","name":"Pixel","online":true,"battery":82},
+                {"id":"safe-phone","name":"Moto","online":false,"battery":null},
+                {"id":"same-phone","name":"Pixel","online":false,"battery":82},
+                {"id":"safe-phone","name":"Moto","online":false,"battery":null},
+                {"id":"","name":"Missing identity","online":true,"battery":100}
+            ]"#,
+        );
+
+        assert_eq!(
+            got,
+            vec![WireDevice {
+                id: "safe-phone".to_string(),
+                name: "Moto".to_string(),
+                online: false,
+                battery: None,
+            }],
+            "a conflicted or absent physical identity must not retain an actionable card"
+        );
     }
 
     #[test]

@@ -27,12 +27,15 @@
 //! The [`TransfersClient`] seam is injectable so the model is unit-tested headless
 //! (a fake) while production talks the file store ([`FileTransfers`]).
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+const MAX_LEDGER_RECORD_BYTES: u64 = 256 * 1024;
 
 // ── the protocol lane (mirror of the worker's `job::Method`) ────────────────────
 
@@ -399,10 +402,8 @@ fn load_ledger(store_root: &Path) -> Vec<TransferJob> {
         {
             continue;
         }
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(job) = serde_json::from_str::<TransferJob>(&data) {
-                out.push(job);
-            }
+        if let Some(job) = load_ledger_record(&path) {
+            out.push(job);
         }
     }
     out.sort_by(|a, b| {
@@ -411,6 +412,63 @@ fn load_ledger(store_root: &Path) -> Vec<TransferJob> {
             .then_with(|| a.id.cmp(&b.id))
     });
     out
+}
+
+/// Admit one worker-published ledger inode. The filename is part of the transfer
+/// authority: lifecycle actions address `job.id`, so a record may not claim a
+/// different ID than the inode selected by the directory scan. Read through one
+/// bounded, no-follow descriptor and reject multiply linked or replaced inodes;
+/// otherwise a hostile local publisher could alias mutable bytes into the
+/// resource surface after discovery.
+fn load_ledger_record(path: &Path) -> Option<TransferJob> {
+    let expected_id = path.file_stem()?.to_str()?;
+    let before = std::fs::symlink_metadata(path).ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_LEDGER_RECORD_BYTES {
+        return None;
+    }
+
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    }
+    let mut file = options.open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.len() > MAX_LEDGER_RECORD_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.nlink() != 1
+            || opened.dev() != before.dev()
+            || opened.ino() != before.ino()
+        {
+            return None;
+        }
+    }
+
+    let mut data = String::new();
+    file.by_ref()
+        .take(MAX_LEDGER_RECORD_BYTES + 1)
+        .read_to_string(&mut data)
+        .ok()?;
+    if data.len() as u64 > MAX_LEDGER_RECORD_BYTES {
+        return None;
+    }
+    let after = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.dev() != after.dev() || opened.ino() != after.ino() {
+            return None;
+        }
+    }
+
+    let job = serde_json::from_str::<TransferJob>(&data).ok()?;
+    (job.id == expected_id).then_some(job)
 }
 
 // ── the client seam ─────────────────────────────────────────────────────────────
@@ -989,6 +1047,24 @@ mod tests {
         assert_eq!(jobs.len(), 2, "two records, junk skipped");
         // Ledger order is by created_ms: `a` (100) before `b` (200).
         assert_eq!(jobs[0].id, a.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_ledger_record_cannot_inject_transfer_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = FileTransfers::with_root(tmp.path().to_path_buf());
+        let dir = ledger_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = job_in(TransferState::Running, Method::Node, 100);
+        let record = dir.join(format!("{}.json", job.id));
+        std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
+        std::fs::hard_link(&record, dir.join("hostile-alias.json")).unwrap();
+
+        assert!(
+            client.jobs().is_empty(),
+            "a multiply linked worker record must not become visible or actionable"
+        );
     }
 
     // ── the destination registry (Q10) ───────────────────────────────────────────

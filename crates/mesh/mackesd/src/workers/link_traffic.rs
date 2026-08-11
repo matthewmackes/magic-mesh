@@ -72,8 +72,10 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::Write as _;
+use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -87,6 +89,12 @@ use crate::nebula_roster::export_roster;
 /// the wallpaper's ~3 s flow tick sees fresh-ish numbers, long enough that
 /// a single `nft list table` read per tick is negligible.
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Hard ceiling for the privileged nftables reconciliation process.
+const NFT_APPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll cadence for the blocking nftables apply boundary.
+const NFT_APPLY_POLL: Duration = Duration::from_millis(10);
 
 /// The dedicated nftables table name (family `inet`). Isolated from
 /// firewalld's tables so reconcile never touches enforcement rules.
@@ -347,27 +355,63 @@ fn nft_present() -> bool {
 /// Apply the rendered ruleset via `nft -f -` (stdin). Returns `false` on
 /// any failure (non-root, parse error, no nft) — the caller then reads
 /// nothing and the consumer keeps the proxy.
-fn apply_ruleset(ruleset: &str) -> bool {
-    use std::io::Write;
-    use std::process::Stdio;
-    let Ok(mut child) = Command::new("nft")
+fn terminate_nft_apply(child: &mut Child) {
+    if let Some(process_group) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::Kill);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn apply_ruleset_with(binary: &Path, ruleset: &str, timeout: Duration) -> bool {
+    let mut command = Command::new(binary);
+    command
         .arg("-f")
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    // Keep the privileged helper and every process it creates inside one
+    // invocation-owned process group. A hostile replacement cannot outlive the
+    // worker's deadline and retain the group's nftables authority.
+    command.process_group(0);
+    let Ok(mut child) = command.spawn() else {
         return false;
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(ruleset.as_bytes()).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_nft_apply(&mut child);
+        return false;
+    };
+    let input = ruleset.as_bytes().to_vec();
+    let Ok(writer) = std::thread::Builder::new()
+        .name("link-traffic-nft-input".into())
+        .spawn(move || stdin.write_all(&input))
+    else {
+        terminate_nft_apply(&mut child);
+        return false;
+    };
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                terminate_nft_apply(&mut child);
+                break None;
+            }
+            Ok(None) => std::thread::sleep(NFT_APPLY_POLL),
+            Err(_) => {
+                terminate_nft_apply(&mut child);
+                break None;
+            }
         }
-    }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+    };
+    let input_written = writer.join().is_ok_and(|result| result.is_ok());
+    status.is_some_and(|status| status.success()) && input_written
+}
+
+fn apply_ruleset(ruleset: &str) -> bool {
+    apply_ruleset_with(Path::new("nft"), ruleset, NFT_APPLY_TIMEOUT)
 }
 
 /// Read the accounting table as JSON. `None` on any failure (table absent
@@ -771,5 +815,37 @@ mod tests {
             .await
             .expect("worker must exit on shutdown");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hostile_nft_descendant_cannot_outlive_link_traffic_worker_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let helper = tmp.path().join("nft");
+        let escaped_marker = tmp.path().join("escaped");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\n(sleep 0.25; : > '{}') &\nwait\n",
+                escaped_marker.display()
+            ),
+        )
+        .expect("write hostile nft helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("make hostile nft helper executable");
+
+        let started = Instant::now();
+        assert!(!apply_ruleset_with(
+            &helper,
+            "add table inet mde_linkacct\n",
+            Duration::from_millis(25),
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(
+            !escaped_marker.exists(),
+            "a descendant retained nft apply authority after the deadline"
+        );
     }
 }

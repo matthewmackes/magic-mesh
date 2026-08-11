@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::workloads::{
@@ -27,6 +28,8 @@ pub const WORKLOAD_LEDGER_FILENAME: &str = "workload-operations.json";
 /// workload, older terminal records may be evicted in deterministic order;
 /// idempotent replay is therefore guaranteed for retained records only.
 pub const MAX_WORKLOAD_OPERATION_RECORDS: usize = 1024;
+/// Maximum serialized journal size admitted during restart replay.
+const MAX_WORKLOAD_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Errors returned while opening or advancing the durable workload journal.
 #[derive(Debug, Error)]
@@ -92,14 +95,17 @@ impl WorkloadOperationLedger {
     pub fn open(state_root: impl AsRef<Path>) -> Result<Self, WorkloadLedgerError> {
         fs::create_dir_all(state_root.as_ref())?;
         let path = state_root.as_ref().join(WORKLOAD_LEDGER_FILENAME);
-        if !path.exists() {
-            return Ok(Self {
-                path,
-                operations: BTreeMap::new(),
-            });
+        let Some(mut file) = open_restart_ledger(&path)? else {
+            return Ok(Self { path, operations: BTreeMap::new() });
+        };
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_WORKLOAD_LEDGER_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        validate_restart_ledger(&file)?;
+        if bytes.len() as u64 > MAX_WORKLOAD_LEDGER_BYTES {
+            return Err(WorkloadLedgerError::Malformed);
         }
-
-        let bytes = fs::read(&path)?;
         let body = std::str::from_utf8(&bytes).map_err(|_| WorkloadLedgerError::Malformed)?;
         reject_duplicate_json_keys(body).map_err(|_| WorkloadLedgerError::Malformed)?;
         let document: LedgerFile =
@@ -378,6 +384,35 @@ impl WorkloadOperationLedger {
     }
 }
 
+/// Open the restart journal without allowing another filesystem name to share
+/// or redirect the reconciler's lifecycle authority. Reading and validating
+/// through this one descriptor also keeps a concurrent path replacement from
+/// changing the bytes halfway through replay.
+fn open_restart_ledger(path: &Path) -> Result<Option<File>, WorkloadLedgerError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(0o400000 | 0o4000 | 0o2000000); // Linux O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    validate_restart_ledger(&file)?;
+    Ok(Some(file))
+}
+
+fn validate_restart_ledger(file: &File) -> Result<(), WorkloadLedgerError> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_WORKLOAD_LEDGER_BYTES
+    {
+        return Err(WorkloadLedgerError::Malformed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +674,23 @@ mod tests {
             1,
         );
         std::fs::write(temp.path().join(WORKLOAD_LEDGER_FILENAME), hostile).expect("write hostile");
+
+        assert!(matches!(
+            WorkloadOperationLedger::open(temp.path()),
+            Err(WorkloadLedgerError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn restarted_reconciler_cannot_adopt_hardlinked_workload_journal_authority() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("open");
+        ledger.accept(request("req-1"), 1_000).expect("accept");
+        drop(ledger);
+
+        let journal = temp.path().join(WORKLOAD_LEDGER_FILENAME);
+        std::fs::hard_link(&journal, temp.path().join("external-ledger-alias.json"))
+            .expect("create hostile journal alias");
 
         assert!(matches!(
             WorkloadOperationLedger::open(temp.path()),

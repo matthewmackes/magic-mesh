@@ -763,6 +763,29 @@ fn rdp_png_expands_only_into_a_bounded_top_down_dibv5() {
     assert!(super::bounded_rgba_len(u32::MAX, u32::MAX).is_err());
 }
 
+#[cfg(feature = "live-vdi")]
+#[test]
+fn rdp_guest_image_without_files_ingress_has_an_explicit_typed_refusal() {
+    let refusal = super::RdpGuestImageRefusal::files_provider_unavailable(
+        mde_vdi_rdp::clipboard::RemoteClipboardImageFormat::DibV5,
+        128,
+    );
+
+    assert_eq!(
+        refusal.reason,
+        mde_collab_types::ClipboardUnavailableReason::FilesProviderUnavailable
+    );
+    assert_eq!(
+        refusal.wire_format,
+        mde_vdi_rdp::clipboard::RemoteClipboardImageFormat::DibV5
+    );
+    assert_eq!(refusal.byte_count, 128);
+    assert_eq!(
+        refusal.to_string(),
+        "RDP guest CF_DIBV5 image (128 bytes) refused: governed Files/CAS descriptor ingestion is unavailable"
+    );
+}
+
 #[test]
 fn a_connect_request_carries_the_three_display_choices() {
     // The request-construction fold: the picked target + the three choices

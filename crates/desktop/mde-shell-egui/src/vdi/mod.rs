@@ -55,8 +55,11 @@ use {
         VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
     },
     mde_bus::hooks::config::Priority,
-    mde_collab_types::ClipboardClipBody,
-    mde_vdi_rdp::{ConnectError, PumpOutcome, RdpConfig, RdpConnection},
+    mde_collab_types::{ClipboardClipBody, ClipboardUnavailableReason},
+    mde_vdi_rdp::{
+        clipboard::{RemoteClipboardImage, RemoteClipboardImageFormat},
+        ConnectError, PumpOutcome, RdpConfig, RdpConnection,
+    },
     mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
     mde_vdi_vnc::{PumpOutcome as VncPumpOutcome, VncConfig, VncConnection},
     std::thread,
@@ -430,6 +433,7 @@ const fn request_focus_surface(_request: &ConnectRequest) -> SessionFocusSurface
 enum LiveRdpEvent {
     Connected(String),
     ClipboardPublished,
+    ClipboardRefused(RdpGuestImageRefusal),
     /// The host's TLS certificate changed since it was pinned (vdi-vm-6) — a
     /// non-fatal MITM warning; the session stays live (the Nebula link is the
     /// trust floor). Strict mode instead surfaces as [`LiveRdpEvent::Error`].
@@ -1131,6 +1135,59 @@ enum RdpClipboardPayload {
     Text(String),
     Html(String),
     Image,
+}
+
+/// Typed, non-fatal refusal for a validated guest image that cannot yet enter
+/// Files. Raw DIB bytes are deliberately absent: the transport value is dropped
+/// unless a daemon-owned descriptor-ingest authority can mint its CAS identity.
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RdpGuestImageRefusal {
+    wire_format: RemoteClipboardImageFormat,
+    byte_count: u64,
+    reason: ClipboardUnavailableReason,
+}
+
+#[cfg(feature = "live-vdi")]
+impl RdpGuestImageRefusal {
+    fn files_provider_unavailable(
+        wire_format: RemoteClipboardImageFormat,
+        byte_count: u64,
+    ) -> Self {
+        Self {
+            wire_format,
+            byte_count,
+            reason: ClipboardUnavailableReason::FilesProviderUnavailable,
+        }
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+impl core::fmt::Display for RdpGuestImageRefusal {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let format = match self.wire_format {
+            RemoteClipboardImageFormat::Dib => "CF_DIB",
+            RemoteClipboardImageFormat::DibV5 => "CF_DIBV5",
+        };
+        write!(
+            formatter,
+            "RDP guest {format} image ({} bytes) refused: governed Files/CAS descriptor ingestion is unavailable",
+            self.byte_count
+        )
+    }
+}
+
+/// Fail closed until the daemon exposes an inverse of its descriptor-only
+/// Files materializer. This consumes the admitted transport value, retains only
+/// bounded metadata, and never fabricates a Files reference or writes a path.
+#[cfg(feature = "live-vdi")]
+fn refuse_rdp_guest_image_without_files_ingress(
+    image: RemoteClipboardImage,
+) -> RdpGuestImageRefusal {
+    RdpGuestImageRefusal::files_provider_unavailable(
+        image.format(),
+        u64::try_from(image.data().len()).unwrap_or(u64::MAX),
+    )
 }
 
 // Linux's stable MSG_CTRUNC ABI bit. rustix 0.38 retains this receive-result
@@ -1961,6 +2018,9 @@ fn run_live_rdp(
                         pending_guest_clipboard = Some((Some(clip), rich));
                     }
                 }
+            } else if let Some(image) = conn.take_guest_image_clipboard() {
+                let refusal = refuse_rdp_guest_image_without_files_ingress(image);
+                let _ = event_tx.send(LiveRdpEvent::ClipboardRefused(refusal));
             }
         }
     }
@@ -2980,6 +3040,11 @@ pub(crate) struct VdiState {
     /// parallel slot so the existing `incoming` writers/tests that don't carry damage
     /// still compile and safely fall back to a full upload.
     incoming_damage: Option<FrameDamage>,
+    /// Input may enter the guest only after the currently attached transport has
+    /// produced a frame. A reconnect or resize re-dial may deliberately keep the
+    /// prior texture visible, but that stale presentation must never authorize
+    /// control of the replacement transport.
+    presentation_input_authorized: bool,
     /// Local frame/texture/reconnect/repaint measurements. Guest hardware
     /// capability evidence remains a separate live-proof concern.
     metrics: VdiMetrics,
@@ -3089,6 +3154,20 @@ impl VdiState {
         self.metrics.note_frame();
         self.incoming = Some(img);
         self.incoming_damage = Some(damage);
+        self.presentation_input_authorized = true;
+    }
+
+    /// Revoke all presentation state owned by a superseded attachment. The
+    /// retained request is only reconnect metadata; it does not carry frame or
+    /// input authority into the next transport generation.
+    fn revoke_presentation_authority(&mut self, clear_frame: bool) {
+        self.presentation_input_authorized = false;
+        self.session = None;
+        self.incoming = None;
+        self.incoming_damage = None;
+        if clear_frame {
+            self.texture = None;
+        }
     }
 
     /// Take (and clear) the "return to chrome" request raised by the Esc chord.
@@ -3176,6 +3255,7 @@ impl VdiState {
             self.transport_install_attempted = true;
         }
         self.route_status = None;
+        self.revoke_presentation_authority(true);
         #[cfg(feature = "live-vdi")]
         {
             self.live_status = None;
@@ -3199,9 +3279,6 @@ impl VdiState {
             if let Some(live) = self.live_spice.take() {
                 live.stop();
             }
-            self.texture = None;
-            self.incoming = None;
-            self.incoming_damage = None;
             // A broker-session request without an endpoint belonged to the retired
             // raw console relay. Native presentation now requires an authenticated
             // lease from the typed Workload projection; fail closed here.
@@ -3230,6 +3307,8 @@ impl VdiState {
             return;
         };
 
+        self.revoke_presentation_authority(true);
+
         #[cfg(feature = "live-vdi")]
         {
             self.publish_broker_disconnect_if_active();
@@ -3248,9 +3327,6 @@ impl VdiState {
             self.reconnect_at = None;
             self.pending_resize = None;
             self.negotiated_size = None;
-            self.texture = None;
-            self.incoming = None;
-            self.incoming_damage = None;
         }
 
         if let Some(id) = request
@@ -3453,6 +3529,7 @@ impl VdiState {
         // identity whether or not a transport reached Active so an unavailable
         // Sunshine attempt cannot leak when the operator chooses explicit RDP.
         self.publish_broker_close_current();
+        self.revoke_presentation_authority(true);
         #[cfg(feature = "live-vdi")]
         {
             if let Some(live) = self.live_rdp.take() {
@@ -3474,9 +3551,6 @@ impl VdiState {
             // vdi-vm-8 — backing out cancels any pending resize re-dial too.
             self.pending_resize = None;
             self.negotiated_size = None;
-            self.texture = None;
-            self.incoming = None;
-            self.incoming_damage = None;
         }
         self.requested = None;
         self.route_status = None;
@@ -3489,6 +3563,9 @@ impl VdiState {
     /// and stops retrying. The caller has already taken the dead handle.
     #[cfg(feature = "live-vdi")]
     fn on_transport_drop(&mut self, reason: String) {
+        // The frozen texture remains useful context, but no longer proves that
+        // the replacement transport is the session shown on screen.
+        self.presentation_input_authorized = false;
         self.metrics.note_reconnect();
         let next = next_phase_on_drop(&self.session_phase, reason, MAX_RECONNECT_ATTEMPTS);
         match &next {
@@ -3512,6 +3589,7 @@ impl VdiState {
     /// again, so walk the phase back to `Live` and cancel any pending re-dial.
     #[cfg(feature = "live-vdi")]
     fn note_live_frame(&mut self) {
+        self.presentation_input_authorized = true;
         if self.session_phase != SessionPhase::Live {
             self.session_phase = SessionPhase::Live;
         }
@@ -3627,6 +3705,7 @@ impl VdiState {
         };
         // Stop the current transport and re-dial at the new geometry; KEEP texture /
         // incoming so the last frame bridges the gap (the upscale fallback covers it).
+        self.presentation_input_authorized = false;
         if let Some(live) = self.live_rdp.take() {
             live.stop();
         }
@@ -3657,6 +3736,7 @@ impl VdiState {
             }
             SessionPhase::Live => String::new(),
         };
+        self.presentation_input_authorized = false;
         if let Some(live) = self.live_rdp.take() {
             live.stop();
         }
@@ -3713,6 +3793,11 @@ impl VdiState {
                     self.live_status = Some(message);
                 }
                 LiveRdpEvent::ClipboardPublished => {}
+                LiveRdpEvent::ClipboardRefused(refusal) => {
+                    // Non-fatal and explicit: the live desktop remains usable,
+                    // while status never claims the image reached Files.
+                    self.live_status = Some(refusal.to_string());
+                }
                 LiveRdpEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
                     drop_reason = Some(reason);
@@ -4102,16 +4187,18 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 // never a placeholder render (§7).
                 Some(req) => {
                     let title = req.android_source.as_ref().map_or_else(
-                        || req.app_id.as_ref().map_or_else(
-                            || {
-                            format!(
-                                "Connecting to {} via {}",
-                                req.target.name,
-                                req.protocol.label()
+                        || {
+                            req.app_id.as_ref().map_or_else(
+                                || {
+                                    format!(
+                                        "Connecting to {} via {}",
+                                        req.target.name,
+                                        req.protocol.label()
+                                    )
+                                },
+                                |app_id| format!("Opening {app_id} via {}", req.protocol.label()),
                             )
-                            },
-                            |app_id| format!("Opening {app_id} via {}", req.protocol.label()),
-                        ),
+                        },
                         |source| {
                             format!(
                                 "Android {} · generation {} · session {}",
@@ -4131,18 +4218,19 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         if let Some(status) = &state.route_status {
                             status.clone()
                         } else {
-                        #[cfg(feature = "live-vdi")]
-                        {
-                            state
-                                .live_status
-                                .as_deref()
-                                .unwrap_or("Waiting for the live transport")
-                                .to_string()
-                        }
-                        #[cfg(not(feature = "live-vdi"))]
-                        {
-                            "the live transport is not compiled into this shell build".to_string()
-                        }
+                            #[cfg(feature = "live-vdi")]
+                            {
+                                state
+                                    .live_status
+                                    .as_deref()
+                                    .unwrap_or("Waiting for the live transport")
+                                    .to_string()
+                            }
+                            #[cfg(not(feature = "live-vdi"))]
+                            {
+                                "the live transport is not compiled into this shell build"
+                                    .to_string()
+                            }
                         }
                     };
                     let detail = format!(
@@ -4326,6 +4414,12 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState, rect: egui::Rect, desktop_
             state.return_to_chrome = true;
             continue;
         }
+        // A retained texture from a disconnected or resizing generation is
+        // display-only. Wait for the current transport's first frame before any
+        // pointer/key event can control it.
+        if !state.presentation_input_authorized {
+            continue;
+        }
         // Transform pointer coordinates into guest desktop pixels BEFORE handing the
         // event to any transport, so every transport applies the same mapping and
         // clicks land on the pixel under the cursor (vdi-vm-2).
@@ -4420,6 +4514,48 @@ pub(crate) fn mock_frame() -> egui::ColorImage {
         }
     }
     egui::ColorImage::from_rgba_unmultiplied([W, H], &rgba)
+}
+
+#[cfg(test)]
+mod presentation_authority_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_request_revokes_stale_frame_input_authority_until_new_frame() {
+        let mut state = VdiState::default();
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("node-old", "desktop-old"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("seat-a"),
+        ));
+        state.queue_frame(mock_frame(), FrameDamage::Full);
+        assert!(state.presentation_input_authorized);
+        assert!(state.incoming.is_some());
+
+        // A hostile ordering replaces the attachment before the old decoded
+        // frame is uploaded. Neither that frame nor its input authority may be
+        // inherited by the newly selected desktop.
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("node-new", "desktop-new"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("seat-a"),
+        ));
+        assert_eq!(
+            state.requested_target().map(|target| target.name.as_str()),
+            Some("desktop-new")
+        );
+        assert!(!state.presentation_input_authorized);
+        assert!(state.incoming.is_none());
+        assert!(state.incoming_damage.is_none());
+        assert!(state.session.is_none());
+
+        state.queue_frame(mock_frame(), FrameDamage::Full);
+        assert!(state.presentation_input_authorized);
+    }
 }
 
 mod pointer;

@@ -174,15 +174,9 @@ pub fn probe_path(workgroup_root: &Path, node_id: &str) -> PathBuf {
 fn publish(workgroup_root: &Path, node_id: &str) {
     let probe = gather(node_id);
     let path = probe_path(workgroup_root, node_id);
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!(target: "mackesd::hardware_probe", error = %e, "mkdir failed");
-            return;
-        }
-    }
     match serde_json::to_vec_pretty(&probe) {
         Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, &bytes) {
+            if let Err(e) = write_probe(&path, &bytes) {
                 tracing::warn!(target: "mackesd::hardware_probe", error = %e, path = %path.display(), "probe write failed");
             } else {
                 tracing::debug!(target: "mackesd::hardware_probe", path = %path.display(), "published hardware probe");
@@ -192,6 +186,56 @@ fn publish(workgroup_root: &Path, node_id: &str) {
             tracing::warn!(target: "mackesd::hardware_probe", error = %e, "probe serialize failed");
         }
     }
+}
+
+/// Atomically publish one probe without following a substituted staging row.
+///
+/// The replicated directory is writable substrate state, so the fixed staging
+/// name must never be opened through a symlink or hard-link alias. A private
+/// regular residue from an interrupted prior write may be reclaimed; every
+/// other occupant fails closed and leaves the prior `probe.json` untouched.
+fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use rustix::fs::{Mode, OFlags};
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hardware probe path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(".probe.json.tmp");
+
+    match std::fs::symlink_metadata(&temporary) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 => {
+            std::fs::remove_file(&temporary)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hardware probe staging row is not a private regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let fd = rustix::fs::open(
+        &temporary,
+        OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::WRONLY
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(temporary, path)
 }
 
 /// The default Bus root (persisted message tree), matching every other worker.
@@ -311,5 +355,26 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_probe_staging_row_cannot_redirect_hardware_publication() {
+        use std::os::unix::fs::symlink;
+
+        let store = tempfile::tempdir().unwrap();
+        let path = probe_path(store.path(), "peer:node-a");
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let outside = store.path().join("outside-authority");
+        std::fs::write(&outside, b"operator-owned\n").unwrap();
+        symlink(&outside, parent.join(".probe.json.tmp")).unwrap();
+
+        let error = write_probe(&path, br#"{"peer_id":"peer:node-a"}"#)
+            .expect_err("a substituted staging row must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"operator-owned\n");
+        assert!(!path.exists());
     }
 }

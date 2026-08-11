@@ -168,11 +168,16 @@ impl FlatpakCatalogEntry {
         Ok(())
     }
 
-    /// Only installed, signed rows can be handed to the launch/session layer.
+    /// Only installed, signed rows that explicitly grant the typed launch
+    /// action can be handed to the App VM launch layer.
     #[must_use]
     pub fn is_launchable(&self) -> bool {
         self.validate().is_ok()
             && self.state == FlatpakInstallState::Installed
+            && self
+                .supported_actions
+                .iter()
+                .any(|action| action.eq_ignore_ascii_case("launch"))
             && self
                 .provenance
                 .signature
@@ -847,6 +852,18 @@ mod tests {
         row.provenance.signature = Some("sig-42".into());
         row.state = FlatpakInstallState::Stale;
         assert!(!row.is_launchable());
+    }
+
+    #[test]
+    fn hostile_catalog_row_without_launch_action_cannot_authorize_app_vm_launch() {
+        let mut row = entry("org.example.Editor");
+        row.supported_actions = vec!["resume".into()];
+
+        assert!(row.validate().is_ok(), "the row remains discoverable");
+        assert!(
+            !row.is_launchable(),
+            "installed and signed metadata is not implicit launch authority"
+        );
     }
 
     #[test]

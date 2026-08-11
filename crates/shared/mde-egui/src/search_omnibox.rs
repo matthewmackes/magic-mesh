@@ -6,6 +6,8 @@
 //! any one widget. Existing surfaces can adopt it incrementally while keeping
 //! their own action dispatch paths.
 
+use std::collections::HashMap;
+
 /// The health of the node/source that produced a search candidate.
 ///
 /// This is an **explicit ranking weight**, not a searchable text term: within a
@@ -43,7 +45,7 @@ impl SourceHealth {
 }
 
 /// The origin bucket of one unified omnibox candidate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SearchDomain {
     /// A shell application or surface.
     App,
@@ -170,6 +172,9 @@ const MAX_RANKED_HITS: usize = 256;
 const MAX_QUERY_CHARS: usize = 256;
 const MAX_SEARCH_FIELD_CHARS: usize = 4096;
 const MAX_SEARCH_TERMS: usize = 32;
+const MAX_SEARCH_AUTHORITIES: usize = 16_384;
+
+type ScoredItem<T> = (MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>);
 
 /// Rank `items` for `query`, best first, capped at `cap`.
 ///
@@ -180,7 +185,7 @@ const MAX_SEARCH_TERMS: usize = 32;
 /// source order. Neither health nor model score is a license to bury a stronger
 /// typed match: both only break ties inside the same tier.
 #[must_use]
-pub fn ranked_hits<T: Clone>(
+pub fn ranked_hits<T: Clone + Eq>(
     query: &str,
     items: impl IntoIterator<Item = SearchItem<T>>,
     cap: usize,
@@ -196,28 +201,68 @@ pub fn ranked_hits<T: Clone>(
         return Vec::new();
     }
 
-    // Keep the working set bounded as well as the returned result. A caller can
-    // hand this shared core a large live inventory; collecting every matching
-    // candidate before applying `cap` would turn the result cap into a false
-    // memory-safety boundary.
-    let mut scored = Vec::with_capacity(cap.min(64));
+    // Bind one activation payload to one domain/target authority. During a
+    // provider restart, an old row and its replacement can briefly coexist.
+    // Repeated labels for the same payload are harmless and idempotent, but two
+    // different payloads for one activation target are equivocation: neither is
+    // safe to activate.
+    // Keep the first-seen vector so equal-ranked results retain source order;
+    // the map only locates an authority's slot.
+    let mut authority_slots: HashMap<(SearchDomain, String), usize> = HashMap::new();
+    let mut authorities: Vec<Option<(T, Option<ScoredItem<T>>)>> =
+        Vec::with_capacity(cap.min(64));
     for item in items {
-        let Some((tier, cost)) = score_item(&q, &item) else {
+        let authority = (
+            item.domain,
+            item.target
+                .chars()
+                .take(MAX_SEARCH_FIELD_CHARS)
+                .collect::<String>(),
+        );
+        let payload = item.payload.clone();
+        let candidate = score_item(&q, &item).map(|(tier, cost)| {
+            (
+                tier,
+                cost,
+                item.source_health.penalty(),
+                item.model_score.unwrap_or(0),
+                item.source_rank,
+                item,
+            )
+        });
+        if let Some(&slot) = authority_slots.get(&authority) {
+            let conflicts = authorities[slot]
+                .as_ref()
+                .map_or(false, |(admitted_payload, _)| admitted_payload != &payload);
+            if conflicts {
+                authorities[slot] = None;
+            } else if let (Some((_, best)), Some(candidate)) =
+                (&mut authorities[slot], candidate)
+            {
+                let improves_rank = match best.as_ref() {
+                    Some(existing) => compare_scored(&candidate, existing).is_lt(),
+                    None => true,
+                };
+                if improves_rank {
+                    *best = Some(candidate);
+                }
+            }
             continue;
-        };
-        scored.push((
-            tier,
-            cost,
-            item.source_health.penalty(),
-            item.model_score.unwrap_or(0),
-            item.source_rank,
-            item,
-        ));
-        if scored.len() > cap {
-            scored.sort_by(compare_scored);
-            scored.pop();
         }
+        if authority_slots.len() == MAX_SEARCH_AUTHORITIES {
+            // A source that exceeds the bounded authority set cannot choose
+            // which rows survive by publication order.
+            return Vec::new();
+        }
+        let slot = authorities.len();
+        authority_slots.insert(authority, slot);
+        authorities.push(Some((payload, candidate)));
     }
+    let mut scored: Vec<_> = authorities
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, candidate)| candidate)
+        .collect();
     scored.sort_by(compare_scored);
     scored
         .into_iter()
@@ -258,10 +303,7 @@ fn lowercase_bounded(value: &str) -> String {
         .collect()
 }
 
-fn compare_scored<T>(
-    a: &(MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>),
-    b: &(MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>),
-) -> std::cmp::Ordering {
+fn compare_scored<T>(a: &ScoredItem<T>, b: &ScoredItem<T>) -> std::cmp::Ordering {
     a.0.cmp(&b.0)
         .then(a.1.cmp(&b.1))
         .then(a.2.cmp(&b.2))
@@ -610,5 +652,41 @@ mod tests {
         assert_eq!(hits.len(), MAX_RANKED_HITS);
         assert_eq!(hits[0].item.payload, 0);
         assert_eq!(hits[MAX_RANKED_HITS - 1].item.payload, MAX_RANKED_HITS - 1);
+    }
+
+    #[test]
+    fn restarted_search_cannot_activate_equivocated_target_authority() {
+        let retained = item(
+            SearchDomain::App,
+            "Home settings",
+            "surface:system/home",
+            "retained-route",
+        );
+        let replacement = item(
+            SearchDomain::App,
+            "Replacement policy",
+            "surface:system/home",
+            "replacement-route",
+        );
+        let corrected = item(
+            SearchDomain::App,
+            "Settings wallpaper",
+            "surface:system/home-wallpaper",
+            "corrected-route",
+        );
+
+        let hits = ranked_hits(
+            "settings",
+            [retained.clone(), retained, replacement, corrected],
+            8,
+        );
+
+        assert_eq!(
+            hits.into_iter()
+                .map(|hit| hit.item.payload)
+                .collect::<Vec<_>>(),
+            ["corrected-route"],
+            "a replacement payload must quarantine the shared target while exact duplicates remain idempotent"
+        );
     }
 }

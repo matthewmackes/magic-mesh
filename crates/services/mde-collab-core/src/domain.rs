@@ -194,8 +194,17 @@ impl DomainState {
             }
             CollabEventKind::SpaceArchived => {}
             CollabEventKind::SpaceDeleted => {
-                if let Some(s) = self.spaces.get_mut(&space_id) {
-                    s.deleted = true;
+                // Command authoring owner-gates deletion. Enforce the same
+                // boundary while rebuilding from signed replicated events: a
+                // member's valid key authenticates that member, but does not
+                // grant authority to tombstone the whole space. Without this
+                // check a hostile member could make every later local command
+                // fail with `SpaceDeleted` after restart even though the
+                // read-side projection correctly ignored its forged deletion.
+                if self.is_owner(space_id, &env.actor) {
+                    if let Some(s) = self.spaces.get_mut(&space_id) {
+                        s.deleted = true;
+                    }
                 }
             }
             CollabEventKind::MemberJoined { actor, role } => {
@@ -523,7 +532,9 @@ mod tests {
     use mde_collab_types::event::CollabEventKind;
     use mde_collab_types::ids::{CallId, EventId, SpaceId};
     use mde_collab_types::value::{CallKind, CallParticipantState};
-    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope};
+    use mde_collab_types::{
+        ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole,
+    };
     use uuid::Uuid;
 
     fn event_id(value: u128) -> EventId {
@@ -539,14 +550,66 @@ mod tests {
     }
 
     fn event(id: u128, space: SpaceId, wall: u64, kind: CollabEventKind) -> CollabEventEnvelope {
+        event_as(id, space, "alice", wall, kind)
+    }
+
+    fn event_as(
+        id: u128,
+        space: SpaceId,
+        actor: &str,
+        wall: u64,
+        kind: CollabEventKind,
+    ) -> CollabEventEnvelope {
         CollabEventEnvelope::new(
             event_id(id),
             space,
-            ActorId::new("alice"),
+            ActorId::new(actor),
             ActorClock::at(wall, 0),
             i64::try_from(wall).expect("test clock fits"),
             kind,
         )
+    }
+
+    #[test]
+    fn hostile_member_deletion_cannot_revoke_space_authority_after_restart() {
+        let space = space_id(20);
+        let events = vec![
+            event(
+                21,
+                space,
+                1,
+                CollabEventKind::SpaceCreated {
+                    kind: SpaceKind::Team,
+                    name: "operations".into(),
+                },
+            ),
+            event(
+                22,
+                space,
+                2,
+                CollabEventKind::MemberJoined {
+                    actor: ActorId::new("alice"),
+                    role: SpaceRole::Owner,
+                },
+            ),
+            event(
+                23,
+                space,
+                3,
+                CollabEventKind::MemberJoined {
+                    actor: ActorId::new("mallory"),
+                    role: SpaceRole::Member,
+                },
+            ),
+            event_as(24, space, "mallory", 4, CollabEventKind::SpaceDeleted),
+        ];
+
+        let restarted = DomainState::from_events(&events);
+        let recovered_space = restarted.space(space).expect("space survives replay");
+
+        assert!(!recovered_space.deleted);
+        assert!(restarted.is_owner(space, &ActorId::new("alice")));
+        assert!(restarted.is_member(space, &ActorId::new("mallory")));
     }
 
     #[test]

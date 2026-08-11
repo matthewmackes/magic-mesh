@@ -157,30 +157,74 @@ farm_pairs_json() {
 }
 
 artifact_json() {
-  local path="$1" resolved size digest
+  local path="$1" resolved size digest artifact_fd artifact_input
+  local opened_identity current_identity opened_metadata current_metadata
   [ -f "$path" ] && [ ! -L "$path" ] || die "artifact is not a regular, non-symlink file: $path"
   resolved="$(realpath -e -- "$path")" || die "could not resolve artifact: $path"
-  size="$(stat -c '%s' -- "$resolved")" || die "could not stat artifact: $resolved"
-  digest="$(sha256sum -- "$resolved" | awk '{print $1}')"
+  [ -f "$resolved" ] && [ ! -L "$resolved" ] \
+    || die "resolved artifact is not a regular, non-symlink file: $resolved"
+  exec {artifact_fd}<"$resolved" \
+    || die "could not open artifact for stable descriptor capture: $resolved"
+  artifact_input="/proc/self/fd/$artifact_fd"
+  [ -f "$artifact_input" ] \
+    || die "opened artifact is not a regular file: $resolved"
+  opened_identity="$(stat -Lc '%d:%i' -- "$artifact_input")" \
+    || die "could not identify opened artifact: $resolved"
+  current_identity="$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)"
+  [ ! -L "$resolved" ] && [ "$current_identity" = "$opened_identity" ] \
+    || die "artifact changed while it was opened for descriptor capture: $resolved"
+  opened_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$artifact_input")" \
+    || die "could not capture opened artifact metadata: $resolved"
+  size="$(stat -Lc '%s' -- "$artifact_input")" \
+    || die "could not stat opened artifact: $resolved"
+  digest="$(sha256sum -- "$artifact_input" | awk '{print $1}')"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "could not hash artifact: $resolved"
+  current_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$artifact_input")" \
+    || die "could not recheck opened artifact metadata: $resolved"
+  current_identity="$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)"
+  [ ! -L "$resolved" ] && [ "$current_identity" = "$opened_identity" ] \
+    && [ "$current_metadata" = "$opened_metadata" ] \
+    || die "artifact was replaced or changed during descriptor capture: $resolved"
+  exec {artifact_fd}<&-
   jq -cn --arg path "$resolved" --arg sha256 "$digest" --argjson size "$size" \
     '{path: $path, size_bytes: $size, sha256: $sha256}'
 }
 
 verify_artifact_descriptor() {
   local descriptor="$1" path expected_size expected_sha256 actual_size actual_sha256
+  local artifact_fd artifact_input opened_identity current_identity
+  local opened_metadata current_metadata
   path="$(jq -r '.path' <<<"$descriptor")"
   expected_size="$(jq -r '.size_bytes' <<<"$descriptor")"
   expected_sha256="$(jq -r '.sha256' <<<"$descriptor")"
   [ -f "$path" ] && [ ! -L "$path" ] \
     || die "release artifact is not a regular, non-symlink file: $path"
-  actual_size="$(stat -c '%s' -- "$path")" \
+  exec {artifact_fd}<"$path" \
+    || die "could not open release artifact for stable validation: $path"
+  artifact_input="/proc/self/fd/$artifact_fd"
+  [ -f "$artifact_input" ] \
+    || die "opened release artifact is not a regular file: $path"
+  opened_identity="$(stat -Lc '%d:%i' -- "$artifact_input")" \
+    || die "could not identify opened release artifact: $path"
+  current_identity="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  [ ! -L "$path" ] && [ "$current_identity" = "$opened_identity" ] \
+    || die "release artifact changed while it was opened for validation: $path"
+  opened_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$artifact_input")" \
+    || die "could not capture opened release artifact metadata: $path"
+  actual_size="$(stat -Lc '%s' -- "$artifact_input")" \
     || die "could not stat release artifact: $path"
-  actual_sha256="$(sha256sum -- "$path" | awk '{print $1}')"
+  actual_sha256="$(sha256sum -- "$artifact_input" | awk '{print $1}')"
   [ "$actual_size" = "$expected_size" ] \
     || die "release artifact changed size since evidence was written: $path"
   [ "$actual_sha256" = "$expected_sha256" ] \
     || die "release artifact digest does not match evidence: $path"
+  current_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$artifact_input")" \
+    || die "could not recheck opened release artifact metadata: $path"
+  current_identity="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  [ ! -L "$path" ] && [ "$current_identity" = "$opened_identity" ] \
+    && [ "$current_metadata" = "$opened_metadata" ] \
+    || die "release artifact was replaced or changed during validation: $path"
+  exec {artifact_fd}<&-
 }
 
 manifest_json() {
@@ -424,18 +468,160 @@ verify_descriptor() {
     || die "$kind manifest digest does not match evidence: $path"
 }
 
+open_stable_descriptor() {
+  local descriptor_kind="$1" descriptor_json="$2"
+  local path_output_name="$3" input_output_name="$4"
+  local identity_output_name="$5" metadata_output_name="$6"
+  local digest_output_name="$7" fd_output_name="$8"
+  local descriptor_path descriptor_size descriptor_sha256 opened_size opened_sha256
+  local opened_identity opened_metadata current_identity opened_fd opened_input
+  local snapshot_dir snapshot_input snapshot_size snapshot_sha256
+  local reopened_metadata reopened_sha256
+  local -n path_output="$path_output_name" input_output="$input_output_name"
+  local -n identity_output="$identity_output_name" metadata_output="$metadata_output_name"
+  local -n digest_output="$digest_output_name" fd_output="$fd_output_name"
+
+  descriptor_path="$(jq -r '.path' <<<"$descriptor_json")"
+  descriptor_size="$(jq -r '.size_bytes' <<<"$descriptor_json")"
+  descriptor_sha256="$(jq -r '.sha256' <<<"$descriptor_json")"
+  [ -s "$descriptor_path" ] \
+    || die "$descriptor_kind manifest is missing or empty: $descriptor_path"
+  [ -f "$descriptor_path" ] && [ ! -L "$descriptor_path" ] \
+    || die "$descriptor_kind manifest is not a regular, non-symlink file: $descriptor_path"
+  exec {opened_fd}<"$descriptor_path" \
+    || die "could not open $descriptor_kind manifest for stable validation: $descriptor_path"
+  opened_input="/proc/self/fd/$opened_fd"
+  [ -s "$opened_input" ] && [ -f "$opened_input" ] \
+    || die "opened $descriptor_kind manifest is not a non-empty regular file: $descriptor_path"
+  opened_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$opened_input")" \
+    || die "could not capture opened $descriptor_kind manifest metadata: $descriptor_path"
+  opened_size="$(stat -Lc '%s' -- "$opened_input")" \
+    || die "could not stat opened $descriptor_kind manifest: $descriptor_path"
+  opened_sha256="$(sha256sum -- "$opened_input" | awk '{print $1}')"
+  [ "$opened_size" = "$descriptor_size" ] \
+    || die "$descriptor_kind manifest changed size since evidence was written: $descriptor_path"
+  [ "$opened_sha256" = "$descriptor_sha256" ] \
+    || die "$descriptor_kind manifest digest does not match evidence: $descriptor_path"
+  opened_identity="$(stat -Lc '%d:%i' -- "$opened_input")" \
+    || die "could not identify opened $descriptor_kind manifest: $descriptor_path"
+  current_identity="$(stat -Lc '%d:%i' -- "$descriptor_path" 2>/dev/null || true)"
+  [ ! -L "$descriptor_path" ] && [ "$current_identity" = "$opened_identity" ] \
+    || die "$descriptor_kind manifest changed while it was opened for validation: $descriptor_path"
+
+  snapshot_dir="$(mktemp -d)" \
+    || die "could not create private $descriptor_kind validation snapshot directory"
+  if ! chmod 0700 -- "$snapshot_dir"; then
+    rmdir -- "$snapshot_dir" || true
+    exec {opened_fd}<&-
+    die "could not protect private $descriptor_kind validation snapshot directory"
+  fi
+  snapshot_input="$snapshot_dir/input"
+  if ! cp -- "$opened_input" "$snapshot_input"; then
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir"
+    exec {opened_fd}<&-
+    die "could not snapshot opened $descriptor_kind manifest: $descriptor_path"
+  fi
+  if ! chmod 0400 -- "$snapshot_input"; then
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    exec {opened_fd}<&-
+    die "could not protect private $descriptor_kind validation snapshot: $descriptor_path"
+  fi
+  if ! snapshot_size="$(stat -Lc '%s' -- "$snapshot_input")" \
+    || ! snapshot_sha256="$(sha256sum -- "$snapshot_input" | awk '{print $1}')"; then
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    exec {opened_fd}<&-
+    die "could not verify private $descriptor_kind validation snapshot: $descriptor_path"
+  fi
+  if [ "$snapshot_size" != "$descriptor_size" ] \
+    || [ "$snapshot_sha256" != "$descriptor_sha256" ]; then
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    exec {opened_fd}<&-
+    die "$descriptor_kind manifest changed while its validation snapshot was copied: $descriptor_path"
+  fi
+  if ! reopened_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$opened_input")" \
+    || ! reopened_sha256="$(sha256sum -- "$opened_input" | awk '{print $1}')"; then
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    exec {opened_fd}<&-
+    die "could not reverify opened $descriptor_kind manifest: $descriptor_path"
+  fi
+  if [ "$reopened_metadata" != "$opened_metadata" ] \
+    || [ "$reopened_sha256" != "$opened_sha256" ] \
+    || [ "$reopened_sha256" != "$descriptor_sha256" ]; then
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    exec {opened_fd}<&-
+    die "$descriptor_kind manifest changed while its validation snapshot was prepared: $descriptor_path"
+  fi
+
+  path_output="$descriptor_path"
+  input_output="$snapshot_input"
+  identity_output="$opened_identity"
+  metadata_output="$opened_metadata"
+  digest_output="$opened_sha256"
+  fd_output="$opened_fd"
+}
+
+close_stable_descriptor() {
+  local descriptor_kind="$1" descriptor_path="$2" opened_identity="$3" descriptor_fd="$4"
+  local snapshot_input="$5" expected_metadata="$6" expected_sha256="$7" snapshot_dir
+  local current_identity opened_input current_metadata current_sha256 snapshot_size snapshot_sha256 expected_size
+  snapshot_dir="$(dirname -- "$snapshot_input")"
+  opened_input="/proc/self/fd/$descriptor_fd"
+  expected_size="${expected_metadata#*:}"
+  expected_size="${expected_size#*:}"
+  expected_size="${expected_size%%:*}"
+  current_identity="$(stat -Lc '%d:%i' -- "$descriptor_path" 2>/dev/null || true)"
+  if [ ! -f "$descriptor_path" ] || [ -L "$descriptor_path" ] \
+    || [ "$current_identity" != "$opened_identity" ]; then
+    exec {descriptor_fd}<&-
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    die "$descriptor_kind manifest was replaced while validation was in progress: $descriptor_path"
+  fi
+  if ! current_metadata="$(stat -Lc '%d:%i:%s:%y:%z' -- "$opened_input")" \
+    || ! current_sha256="$(sha256sum -- "$opened_input" | awk '{print $1}')" \
+    || ! snapshot_size="$(stat -Lc '%s' -- "$snapshot_input")" \
+    || ! snapshot_sha256="$(sha256sum -- "$snapshot_input" | awk '{print $1}')"; then
+    exec {descriptor_fd}<&-
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    die "could not complete stable $descriptor_kind manifest validation: $descriptor_path"
+  fi
+  if [ "$current_metadata" != "$expected_metadata" ] \
+    || [ "$current_sha256" != "$expected_sha256" ] \
+    || [ "$snapshot_size" != "$expected_size" ] \
+    || [ "$snapshot_sha256" != "$expected_sha256" ]; then
+    exec {descriptor_fd}<&-
+    rm -f -- "$snapshot_input"
+    rmdir -- "$snapshot_dir" || true
+    die "$descriptor_kind manifest or its private snapshot changed while validation was in progress: $descriptor_path"
+  fi
+  exec {descriptor_fd}<&-
+  rm -f -- "$snapshot_input"
+  rmdir -- "$snapshot_dir" \
+    || die "could not remove private $descriptor_kind validation snapshot directory"
+}
+
 verify_resource_publisher_attestation() {
-  local descriptor="$1" path expected_attestation actual_attestation
-  path="$(jq -r '.path' <<<"$descriptor")"
-  verify_descriptor "resource publisher attestation" \
-    "$(jq -c '{path, sha256, size_bytes}' <<<"$descriptor")"
-  resource_publisher_attestation_shape "$path" \
+  local descriptor="$1" path input identity metadata digest fd
+  local expected_attestation actual_attestation
+  open_stable_descriptor "resource publisher attestation" \
+    "$(jq -c '{path, sha256, size_bytes}' <<<"$descriptor")" \
+    path input identity metadata digest fd
+  resource_publisher_attestation_shape "$input" \
     || die "resource publisher attestation is not a valid HMAC publisher-attestation:v1 envelope: $path"
   expected_attestation="$(jq -cS 'del(.path, .sha256, .size_bytes)' <<<"$descriptor")"
-  actual_attestation="$(jq -cS . "$path")" \
+  actual_attestation="$(jq -cS . "$input")" \
     || die "resource publisher attestation is not valid JSON: $path"
   [ "$actual_attestation" = "$expected_attestation" ] \
     || die "resource publisher attestation descriptor does not match its file: $path"
+  close_stable_descriptor "resource publisher attestation" "$path" "$identity" "$fd" \
+    "$input" "$metadata" "$digest"
 }
 
 verify_production_gate_manifest() {
@@ -446,10 +632,33 @@ verify_production_gate_manifest() {
     --expected-revision "$source_commit" >/dev/null
 }
 
+verify_production_topology_roster() {
+  local gate_manifest="$1" topology_evidence="$2"
+  jq -e --slurpfile gate_manifest "$gate_manifest" '
+    def node_ids($role):
+      [.nodes[] | select(.role == $role) | .id] | sort;
+    (node_ids("workstation") == ($gate_manifest[0].rosters.seats | sort)) and
+    (node_ids("lighthouse") == ($gate_manifest[0].rosters.lighthouses | sort))
+  ' "$topology_evidence" >/dev/null \
+    || die "production topology node identities do not match the gate manifest's exact three-seat and three-lighthouse rosters: $topology_evidence"
+}
+
 validate_file() {
-  local file="$1"
+  local display_file="$1" file evidence_fd evidence_identity current_identity
+  local gate_path gate_input gate_identity gate_metadata gate_digest gate_fd
   local -a topology_verify_args=()
-  [ -f "$file" ] && [ ! -L "$file" ] || die "evidence file is not a regular, non-symlink file: $file"
+  [ -f "$display_file" ] && [ ! -L "$display_file" ] \
+    || die "evidence file is not a regular, non-symlink file: $display_file"
+  exec {evidence_fd}<"$display_file" \
+    || die "could not open evidence file for stable validation: $display_file"
+  file="/proc/self/fd/$evidence_fd"
+  [ -f "$file" ] \
+    || die "opened evidence input is not a regular file: $display_file"
+  evidence_identity="$(stat -Lc '%d:%i' -- "$file")" \
+    || die "could not identify opened evidence file: $display_file"
+  current_identity="$(stat -Lc '%d:%i' -- "$display_file" 2>/dev/null || true)"
+  [ ! -L "$display_file" ] && [ "$current_identity" = "$evidence_identity" ] \
+    || die "evidence file changed while it was opened for validation: $display_file"
   jq -e \
     --arg source_commit "$(jq -r '.source_commit' "$file")" \
     --argjson schema_version "$SCHEMA_VERSION" \
@@ -601,18 +810,20 @@ validate_file() {
     (.verdict | type == "object" and (keys == ["preview", "production"]) and
       (.preview | verdict_ok) and (.production | verdict_ok))
     and production_verdict_ok
-  ' "$file" >/dev/null || die "invalid or incomplete evidence schema: $file"
+  ' "$file" >/dev/null || die "invalid or incomplete evidence schema: $display_file"
   local artifact_descriptor
   while IFS= read -r artifact_descriptor; do
     verify_artifact_descriptor "$artifact_descriptor"
   done < <(jq -c '.artifacts[]' "$file")
   verify_descriptor "SBOM" "$(jq -c '.provenance.sbom_manifest' "$file")"
-  verify_descriptor "gate" "$(jq -c '.provenance.gate_manifest' "$file")"
+  open_stable_descriptor "gate" \
+    "$(jq -c '.provenance.gate_manifest' "$file")" \
+    gate_path gate_input gate_identity gate_metadata gate_digest gate_fd
   if [ "$(jq -r '.verdict.production' "$file")" = "pass" ]; then
     verify_production_gate_manifest \
-      "$(jq -r '.provenance.gate_manifest.path' "$file")" \
+      "$gate_input" \
       "$(jq -r '.source_commit' "$file")" \
-      || die "production gate manifest is not the complete canonical matrix for the source revision: $(jq -r '.provenance.gate_manifest.path' "$file")"
+      || die "production gate manifest is not the complete canonical matrix for the source revision: $gate_path"
   fi
   if [ "$(jq -r '.provenance.resource_publisher_attestation // empty' "$file")" ]; then
     verify_resource_publisher_attestation \
@@ -631,6 +842,11 @@ validate_file() {
     fi
     "$SCRIPT_DIR/verify-six-node-topology.py" --evidence "$topology_path" "${topology_verify_args[@]}" >/dev/null \
       || die "topology evidence is not a verified live six-node result: $topology_path"
+    if [ "$(jq -r '.verdict.production' "$file")" = "pass" ]; then
+      verify_production_topology_roster \
+        "$gate_input" \
+        "$topology_path"
+    fi
   fi
   if [ "$(jq -r '.provenance.ci_gate_status // empty' "$file")" ]; then
     local ci_gate
@@ -675,12 +891,19 @@ validate_file() {
   elif [ "$(jq -r '.verdict.production' "$file")" = "pass" ]; then
     die "production pass requires --vdi-evidence with observed guest framebuffer proof"
   fi
+  close_stable_descriptor "gate" "$gate_path" "$gate_identity" "$gate_fd" \
+    "$gate_input" "$gate_metadata" "$gate_digest"
   local actual_binding expected_binding
   actual_binding="$(binding_payload "$file" | sha256sum | awk '{print $1}')"
   expected_binding="$(jq -r '.provenance.binding_sha256' "$file")"
   [ "$actual_binding" = "$expected_binding" ] \
-    || die "provenance binding digest does not match evidence: $file"
-  echo "release-evidence: valid $file"
+    || die "provenance binding digest does not match evidence: $display_file"
+  current_identity="$(stat -Lc '%d:%i' -- "$display_file" 2>/dev/null || true)"
+  [ -f "$display_file" ] && [ ! -L "$display_file" ] \
+    && [ "$current_identity" = "$evidence_identity" ] \
+    || die "evidence file was replaced while validation was in progress: $display_file"
+  exec {evidence_fd}<&-
+  echo "release-evidence: valid $display_file"
 }
 
 write_evidence() {
@@ -692,28 +915,75 @@ write_evidence() {
   shift
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --out) [ "$#" -ge 2 ] || die "--out needs a file"; out="$2"; shift 2 ;;
-      --source-commit) [ "$#" -ge 2 ] || die "--source-commit needs a SHA"; source_commit="$2"; shift 2 ;;
+      --out)
+        [ "$#" -ge 2 ] || die "--out needs a file"
+        [ -z "$out" ] || die "--out may be supplied only once"
+        out="$2"
+        shift 2
+        ;;
+      --source-commit)
+        [ "$#" -ge 2 ] || die "--source-commit needs a SHA"
+        [ -z "$source_commit" ] || die "--source-commit may be supplied only once"
+        source_commit="$2"
+        shift 2
+        ;;
       --artifact) [ "$#" -ge 2 ] || die "--artifact needs a path"; artifacts+=("$2"); shift 2 ;;
       --check) [ "$#" -ge 2 ] || die "--check needs NAME=STATUS"; checks+=("$2"); shift 2 ;;
       --farm-job) [ "$#" -ge 2 ] || die "--farm-job needs an ID"; farm_jobs+=("$2"); shift 2 ;;
       --farm-slot) [ "$#" -ge 2 ] || die "--farm-slot needs an ID"; farm_slots+=("$2"); shift 2 ;;
       --sbom) [ "$#" -ge 2 ] || die "--sbom needs NAME=STATUS"; sbom+=("$2"); shift 2 ;;
-      --sbom-manifest) [ "$#" -ge 2 ] || die "--sbom-manifest needs a file"; sbom_manifest="$2"; shift 2 ;;
-      --gate-manifest) [ "$#" -ge 2 ] || die "--gate-manifest needs a file"; gate_manifest="$2"; shift 2 ;;
-      --ci-gate-status) [ "$#" -ge 2 ] || die "--ci-gate-status needs a file"; ci_gate_status="$2"; shift 2 ;;
+      --sbom-manifest)
+        [ "$#" -ge 2 ] || die "--sbom-manifest needs a file"
+        [ -z "$sbom_manifest" ] || die "--sbom-manifest may be supplied only once"
+        sbom_manifest="$2"
+        shift 2
+        ;;
+      --gate-manifest)
+        [ "$#" -ge 2 ] || die "--gate-manifest needs a file"
+        [ -z "$gate_manifest" ] || die "--gate-manifest may be supplied only once"
+        gate_manifest="$2"
+        shift 2
+        ;;
+      --ci-gate-status)
+        [ "$#" -ge 2 ] || die "--ci-gate-status needs a file"
+        [ -z "$ci_gate_status" ] || die "--ci-gate-status may be supplied only once"
+        ci_gate_status="$2"
+        shift 2
+        ;;
       --resource-publisher-attestation|--resource-publication-attestation)
         [ "$#" -ge 2 ] || die "$1 needs a file"
+        [ -z "$resource_publisher_attestation" ] \
+          || die "resource publisher attestation may be supplied only once"
         resource_publisher_attestation="$2"
         shift 2
         ;;
-      --topology-evidence) [ "$#" -ge 2 ] || die "--topology-evidence needs a file"; topology_evidence="$2"; shift 2 ;;
-      --vdi-evidence) [ "$#" -ge 2 ] || die "--vdi-evidence needs a file"; vdi_evidence="$2"; shift 2 ;;
+      --topology-evidence)
+        [ "$#" -ge 2 ] || die "--topology-evidence needs a file"
+        [ -z "$topology_evidence" ] || die "--topology-evidence may be supplied only once"
+        topology_evidence="$2"
+        shift 2
+        ;;
+      --vdi-evidence)
+        [ "$#" -ge 2 ] || die "--vdi-evidence needs a file"
+        [ -z "$vdi_evidence" ] || die "--vdi-evidence may be supplied only once"
+        vdi_evidence="$2"
+        shift 2
+        ;;
       --fedora-target) [ "$#" -ge 2 ] || die "--fedora-target needs TARGET=STATUS"; fedora+=("$2"); shift 2 ;;
       --live-gate) [ "$#" -ge 2 ] || die "--live-gate needs NAME=STATUS"; live_gates+=("$2"); shift 2 ;;
       --unavailable) [ "$#" -ge 2 ] || die "--unavailable needs text"; unavailable+=("$2"); shift 2 ;;
-      --preview-verdict) [ "$#" -ge 2 ] || die "--preview-verdict needs a status"; preview="$2"; shift 2 ;;
-      --production-verdict) [ "$#" -ge 2 ] || die "--production-verdict needs a status"; production="$2"; shift 2 ;;
+      --preview-verdict)
+        [ "$#" -ge 2 ] || die "--preview-verdict needs a status"
+        [ -z "$preview" ] || die "--preview-verdict may be supplied only once"
+        preview="$2"
+        shift 2
+        ;;
+      --production-verdict)
+        [ "$#" -ge 2 ] || die "--production-verdict needs a status"
+        [ -z "$production" ] || die "--production-verdict may be supplied only once"
+        production="$2"
+        shift 2
+        ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown write argument: $1" ;;
     esac
@@ -881,12 +1151,19 @@ self_test_ci_status() {
 }
 
 self_test() {
-  local work evidence_a evidence_b broken broken_farm short_source invalid_farm_slot ci_pair_mismatch production_pass topology farm_topology preview_farm topology_revision_mismatch topology_revision_mismatch_raw missing_ci_gate missing_github_check failed_gate unavailable_pass missing_source changed_sbom changed_gate legacy_preview legacy_production missing_resource_attestation invalid_resource_attestation descriptor_mismatch artifact_missing artifact_changed expected_a_sha expected_binding symlink_artifact reused_ci_artifact replacement_descriptor rc
+  local work evidence_a evidence_b broken broken_farm short_source invalid_farm_slot ci_pair_mismatch production_pass topology wrong_roster_topology farm_topology preview_farm topology_revision_mismatch topology_revision_mismatch_raw missing_ci_gate missing_github_check failed_gate unavailable_pass missing_source changed_sbom changed_gate legacy_preview legacy_production missing_resource_attestation invalid_resource_attestation descriptor_mismatch artifact_missing artifact_changed expected_a_sha expected_binding symlink_artifact reused_ci_artifact replacement_descriptor rc
   local ci_status ci_status_single vdi_evidence resource_attestation attestation_issued_ms attestation_expires_ms two_artifacts single_artifact
   local roundtrip_status roundtrip_binding roundtrip_binding_reordered roundtrip_evidence
   local hostile_status hostile_status_changed hostile_output duplicate_status duplicate_binding
   local hostile_descriptor_status hostile_descriptor_binding hostile_descriptor_evidence
   local missing_binding symlink_binding_artifact malformed_status
+  local binding_swap_source binding_swap_original binding_swap_marker binding_swap_output
+  local replacement_race replacement_race_original replacement_race_marker real_jq
+  local artifact_replacement artifact_replacement_original artifact_replacement_marker
+  local gate_replacement gate_replacement_marker gate_original_identity real_sha256sum
+  local gate_mutation_source gate_mutation_original gate_mutation_marker gate_mutation_tmp
+  local attestation_replacement attestation_replacement_marker attestation_original_identity
+  local duplicate_claim_output duplicate_gate_claim
   work="$(mktemp -d)"
   trap 'rm -rf -- "$work"' RETURN
   printf 'alpha release artifact\n' >"$work/a.rpm"
@@ -1004,6 +1281,53 @@ EOF
   [ "$rc" -ne 0 ] && [ ! -e "$work/symlink-binding.json" ] \
     || die "self-test: symlinked release binding artifact was accepted or published"
 
+  # write-binding has no later evidence-validation pass, so descriptor capture
+  # itself must stay bound to one opened artifact inode. Replace the pathname
+  # immediately after its bytes are hashed and require fail-closed publication.
+  binding_swap_source="$work/binding-artifact-replacement.rpm"
+  binding_swap_original="$work/binding-artifact-original.rpm"
+  binding_swap_marker="$work/binding-artifact-replacement.marker"
+  binding_swap_output="$work/binding-artifact-replacement.json"
+  cp -- "$work/a.rpm" "$binding_swap_original"
+  printf 'omega release artifact\n' >"$binding_swap_source"
+  [ "$(stat -c '%s' -- "$binding_swap_source")" = "$(stat -c '%s' -- "$work/a.rpm")" ] \
+    || die "self-test: binding artifact replacement fixture is not size preserving"
+  printf '%s\n' 'preserve-existing-binding-output' >"$binding_swap_output"
+  real_sha256sum="$(command -v sha256sum)"
+  mkdir -- "$work/hostile-binding-sha256sum"
+  cat >"$work/hostile-binding-sha256sum/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_sha256sum="${RELEASE_EVIDENCE_REAL_SHA256SUM:?}"
+candidate="${@: -1}"
+"$real_sha256sum" "$@"
+status=$?
+if [ "$status" -eq 0 ] \
+  && [ ! -e "${RELEASE_EVIDENCE_BINDING_SWAP_MARKER:?}" ] \
+  && cmp -s -- "$candidate" "${RELEASE_EVIDENCE_BINDING_SWAP_TARGET:?}"; then
+  mv -- "${RELEASE_EVIDENCE_BINDING_SWAP_SOURCE:?}" \
+    "${RELEASE_EVIDENCE_BINDING_SWAP_TARGET:?}"
+  : >"$RELEASE_EVIDENCE_BINDING_SWAP_MARKER"
+fi
+exit "$status"
+EOF
+  chmod 0755 -- "$work/hostile-binding-sha256sum/sha256sum"
+  set +e
+  PATH="$work/hostile-binding-sha256sum:$PATH" \
+    RELEASE_EVIDENCE_REAL_SHA256SUM="$real_sha256sum" \
+    RELEASE_EVIDENCE_BINDING_SWAP_MARKER="$binding_swap_marker" \
+    RELEASE_EVIDENCE_BINDING_SWAP_SOURCE="$binding_swap_source" \
+    RELEASE_EVIDENCE_BINDING_SWAP_TARGET="$work/a.rpm" \
+    "$0" write-binding --out "$binding_swap_output" \
+      --source-commit 0123456789abcdef0123456789abcdef01234567 \
+      --ci-gate-status "$duplicate_status" --artifact "$work/a.rpm" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$binding_swap_marker" ] \
+    && [ "$(<"$binding_swap_output")" = preserve-existing-binding-output ] \
+    || die "self-test: write-binding accepted an artifact pathname replacement or changed existing output"
+  cp -- "$binding_swap_original" "$work/a.rpm"
+
   # A malformed or authenticated-status identity change must leave an existing
   # output byte-for-byte untouched.
   hostile_status="$(self_test_ci_status "$work/ci-binding-hostile-status" "$single_artifact" \
@@ -1073,6 +1397,204 @@ EOF
     --live-gate dell-install=unavailable --unavailable 'live Dell visual signoff unavailable' \
     --preview-verdict pass --production-verdict not-promoted >/dev/null
   "$0" validate "$evidence_a" >/dev/null
+
+  # A release invocation is itself an evidence declaration. Accepting two
+  # singleton claims and silently choosing the last one makes the resulting
+  # bundle depend on argument order instead of an unambiguous caller intent.
+  # Prove a conflicting duplicate gate claim fails before publication and
+  # leaves an existing caller-owned output byte-for-byte untouched.
+  duplicate_claim_output="$work/duplicate-singleton-claim.json"
+  duplicate_gate_claim="$work/duplicate-gate-claim.json"
+  printf '%s\n' 'preserve-existing-evidence-output' >"$duplicate_claim_output"
+  printf '%s\n' '{"required":["hostile-duplicate-claim"]}' >"$duplicate_gate_claim"
+  set +e
+  "$0" write --out "$duplicate_claim_output" \
+    --source-commit 0123456789abcdef0123456789abcdef01234567 \
+    --artifact "$work/a.rpm" --check github-required=pass \
+    --farm-job farm-job-duplicate --farm-slot 172.20.0.90/duplicate-slot \
+    --sbom rpm=pass --sbom-manifest "$work/sbom.json" \
+    --gate-manifest "$duplicate_gate_claim" --gate-manifest "$work/gates.json" \
+    --fedora-target fedora-44=pass --live-gate dell-install=unavailable \
+    --unavailable 'live gate unavailable' \
+    --preview-verdict pass --production-verdict not-promoted >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] \
+    && [ "$(<"$duplicate_claim_output")" = preserve-existing-evidence-output ] \
+    || die "self-test: conflicting duplicate singleton claim was accepted or changed existing output"
+
+  # Artifact validation must remain bound to one opened inode. Replace the
+  # declared pathname with same-sized hostile bytes immediately after hashing
+  # the admitted inode; validation must reject the stale digest/path splice.
+  artifact_replacement="$work/a-same-sized-replacement.rpm"
+  artifact_replacement_original="$work/a-before-inode-replacement.rpm"
+  artifact_replacement_marker="$work/a-inode-replacement.marker"
+  cp -- "$work/a.rpm" "$artifact_replacement_original"
+  printf 'omega release artifact\n' >"$artifact_replacement"
+  [ "$(stat -c '%s' -- "$artifact_replacement")" = "$(stat -c '%s' -- "$work/a.rpm")" ] \
+    || die "self-test: artifact inode-replacement fixture is not size preserving"
+  real_sha256sum="$(command -v sha256sum)"
+  mkdir -- "$work/hostile-artifact-sha256sum"
+  cat >"$work/hostile-artifact-sha256sum/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_sha256sum="${RELEASE_EVIDENCE_REAL_SHA256SUM:?}"
+candidate="${@: -1}"
+"$real_sha256sum" "$@"
+status=$?
+if [ "$status" -eq 0 ] \
+  && [ ! -e "${RELEASE_EVIDENCE_ARTIFACT_SWAP_MARKER:?}" ] \
+  && cmp -s -- "$candidate" "${RELEASE_EVIDENCE_ARTIFACT_SWAP_TARGET:?}"; then
+  mv -- "${RELEASE_EVIDENCE_ARTIFACT_SWAP_SOURCE:?}" \
+    "${RELEASE_EVIDENCE_ARTIFACT_SWAP_TARGET:?}"
+  : >"$RELEASE_EVIDENCE_ARTIFACT_SWAP_MARKER"
+fi
+exit "$status"
+EOF
+  chmod 0755 -- "$work/hostile-artifact-sha256sum/sha256sum"
+  set +e
+  PATH="$work/hostile-artifact-sha256sum:$PATH" \
+    RELEASE_EVIDENCE_REAL_SHA256SUM="$real_sha256sum" \
+    RELEASE_EVIDENCE_ARTIFACT_SWAP_MARKER="$artifact_replacement_marker" \
+    RELEASE_EVIDENCE_ARTIFACT_SWAP_SOURCE="$artifact_replacement" \
+    RELEASE_EVIDENCE_ARTIFACT_SWAP_TARGET="$work/a.rpm" \
+    "$0" validate "$evidence_a" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$artifact_replacement_marker" ] \
+    && ! cmp -s -- "$work/a.rpm" "$artifact_replacement_original" \
+    || die "self-test: same-sized release artifact inode replacement was accepted"
+  cp -- "$artifact_replacement_original" "$work/a.rpm"
+
+  # Descriptor hashing alone does not bind later recursive consumers to the
+  # directory member that was hashed. Replace the gate-manifest pathname with
+  # a byte-identical inode immediately after its opened bytes are hashed: the
+  # matrix would still parse and validate, but the pathname membership changed
+  # and the release envelope must therefore fail closed.
+  gate_replacement="$work/gates-identical-replacement.json"
+  gate_replacement_marker="$work/gates-identical-replacement.marker"
+  gate_original_identity="$(stat -Lc '%d:%i' -- "$work/gates.json")"
+  cp -- "$work/gates.json" "$gate_replacement"
+  real_sha256sum="$(command -v sha256sum)"
+  mkdir -- "$work/hostile-sha256sum"
+  cat >"$work/hostile-sha256sum/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_sha256sum="${RELEASE_EVIDENCE_REAL_SHA256SUM:?}"
+candidate="${@: -1}"
+"$real_sha256sum" "$@"
+status=$?
+if [ "$status" -eq 0 ] \
+  && [ ! -e "${RELEASE_EVIDENCE_GATE_SWAP_MARKER:?}" ] \
+  && cmp -s -- "$candidate" "${RELEASE_EVIDENCE_GATE_SWAP_TARGET:?}"; then
+  mv -- "${RELEASE_EVIDENCE_GATE_SWAP_SOURCE:?}" "$RELEASE_EVIDENCE_GATE_SWAP_TARGET"
+  : >"$RELEASE_EVIDENCE_GATE_SWAP_MARKER"
+fi
+exit "$status"
+EOF
+  chmod 0755 -- "$work/hostile-sha256sum/sha256sum"
+  set +e
+  PATH="$work/hostile-sha256sum:$PATH" \
+    RELEASE_EVIDENCE_REAL_SHA256SUM="$real_sha256sum" \
+    RELEASE_EVIDENCE_GATE_SWAP_MARKER="$gate_replacement_marker" \
+    RELEASE_EVIDENCE_GATE_SWAP_SOURCE="$gate_replacement" \
+    RELEASE_EVIDENCE_GATE_SWAP_TARGET="$work/gates.json" \
+    "$0" validate "$evidence_a" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$gate_replacement_marker" ] \
+    && [ "$(stat -Lc '%d:%i' -- "$work/gates.json")" != "$gate_original_identity" ] \
+    || die "self-test: byte-identical gate-manifest pathname replacement was accepted"
+
+  # A writer can also retain directory membership and mutate the already-open
+  # inode after its first digest pass. Force that sequence before the snapshot
+  # copy and require both fail-closed validation and complete private-snapshot
+  # cleanup.
+  gate_mutation_source="$work/gates-in-place-mutation.json"
+  gate_mutation_original="$work/gates-before-in-place-mutation.json"
+  gate_mutation_marker="$work/gates-in-place-mutation.marker"
+  gate_mutation_tmp="$work/gate-snapshot-tmp"
+  cp -- "$work/gates.json" "$gate_mutation_original"
+  jq '.source_revision = ("f" * 40)' "$work/gates.json" >"$gate_mutation_source"
+  gate_original_identity="$(stat -Lc '%d:%i' -- "$work/gates.json")"
+  mkdir -- "$work/hostile-in-place-sha256sum" "$gate_mutation_tmp"
+  cat >"$work/hostile-in-place-sha256sum/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_sha256sum="${RELEASE_EVIDENCE_REAL_SHA256SUM:?}"
+candidate="${@: -1}"
+"$real_sha256sum" "$@"
+status=$?
+if [ "$status" -eq 0 ] \
+  && [ ! -e "${RELEASE_EVIDENCE_GATE_MUTATION_MARKER:?}" ] \
+  && cmp -s -- "$candidate" "${RELEASE_EVIDENCE_GATE_MUTATION_TARGET:?}"; then
+  cp -- "${RELEASE_EVIDENCE_GATE_MUTATION_SOURCE:?}" "$RELEASE_EVIDENCE_GATE_MUTATION_TARGET"
+  : >"$RELEASE_EVIDENCE_GATE_MUTATION_MARKER"
+fi
+exit "$status"
+EOF
+  chmod 0755 -- "$work/hostile-in-place-sha256sum/sha256sum"
+  set +e
+  PATH="$work/hostile-in-place-sha256sum:$PATH" \
+    TMPDIR="$gate_mutation_tmp" \
+    RELEASE_EVIDENCE_REAL_SHA256SUM="$real_sha256sum" \
+    RELEASE_EVIDENCE_GATE_MUTATION_MARKER="$gate_mutation_marker" \
+    RELEASE_EVIDENCE_GATE_MUTATION_SOURCE="$gate_mutation_source" \
+    RELEASE_EVIDENCE_GATE_MUTATION_TARGET="$work/gates.json" \
+    "$0" validate "$evidence_a" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$gate_mutation_marker" ] \
+    && [ "$(stat -Lc '%d:%i' -- "$work/gates.json")" = "$gate_original_identity" ] \
+    && [ -z "$(find "$gate_mutation_tmp" -mindepth 1 -print -quit)" ] \
+    || die "self-test: same-inode gate-manifest mutation was accepted or leaked its private snapshot"
+  cp -- "$gate_mutation_original" "$work/gates.json"
+
+  # Every validation read must come from one opened inode.  A schema-correct,
+  # freshly rebound evidence file atomically replacing the pathname after the
+  # first jq read must not splice two valid envelopes into one successful
+  # validation or leave a caller believing the original pathname was checked.
+  replacement_race="$work/evidence-replacement-race.json"
+  replacement_race_original="$work/evidence-replacement-race-original.json"
+  replacement_race_marker="$work/evidence-replacement-race.marker"
+  cp -- "$evidence_a" "$replacement_race_original"
+  jq '.verdict.preview = "fail"' "$evidence_a" >"$replacement_race"
+  binding="$(binding_payload "$replacement_race" | sha256sum | awk '{print $1}')"
+  jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' \
+    "$replacement_race" >"$replacement_race.bound"
+  mv -- "$replacement_race.bound" "$replacement_race"
+  real_jq="$(command -v jq)"
+  mkdir -- "$work/hostile-jq"
+  cat >"$work/hostile-jq/jq" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_jq="${RELEASE_EVIDENCE_REAL_JQ:?}"
+if [ ! -e "${RELEASE_EVIDENCE_SWAP_MARKER:?}" ]; then
+  "$real_jq" "$@"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    mv -- "${RELEASE_EVIDENCE_SWAP_SOURCE:?}" "${RELEASE_EVIDENCE_SWAP_TARGET:?}"
+    : >"$RELEASE_EVIDENCE_SWAP_MARKER"
+  fi
+  exit "$status"
+fi
+exec "$real_jq" "$@"
+EOF
+  chmod 0755 -- "$work/hostile-jq/jq"
+  set +e
+  PATH="$work/hostile-jq:$PATH" \
+    RELEASE_EVIDENCE_REAL_JQ="$real_jq" \
+    RELEASE_EVIDENCE_SWAP_MARKER="$replacement_race_marker" \
+    RELEASE_EVIDENCE_SWAP_SOURCE="$replacement_race" \
+    RELEASE_EVIDENCE_SWAP_TARGET="$evidence_a" \
+    "$0" validate "$evidence_a" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$replacement_race_marker" ] \
+    && [ "$(jq -r '.verdict.preview' "$evidence_a")" = fail ] \
+    || die "self-test: atomically replaced evidence pathname was accepted"
+  cp -- "$replacement_race_original" "$evidence_a"
+
   "$0" write --out "$evidence_b" --source-commit 0123456789abcdef0123456789abcdef01234567 \
     --artifact "$work/a.rpm" --artifact "$work/browser.rpm" \
     --check github-cargo-test=not-run --check github-policy=pass --check github-required=pass \
@@ -1254,21 +1776,47 @@ EOF
 
   production_pass="$work/production-pass.json"
   topology="$work/topology.json"
-  python3 - "$SCRIPT_DIR/verify-six-node-topology.py" "$work" "$topology" <<'PY'
+  wrong_roster_topology="$work/wrong-roster-topology.json"
+  python3 - "$SCRIPT_DIR/verify-six-node-topology.py" "$work" "$topology" "$wrong_roster_topology" "$work/gates.json" <<'PY'
 import importlib.util
 import json
 import sys
 import time
 from pathlib import Path
 
-module_path, root_name, output_name = sys.argv[1:]
+module_path, root_name, output_name, wrong_output_name, gate_manifest_name = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("six_node_verifier", module_path)
 module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(module)
 root = Path(root_name)
-bundle = module._fixture(source="live", now_ms=time.time_ns() // 1_000_000)
-bundle["revision"] = "0123456789abcdef0123456789abcdef01234567"
+revision = "0123456789abcdef0123456789abcdef01234567"
+now_ms = time.time_ns() // 1_000_000
+
+wrong_bundle = module._fixture(source="live", now_ms=now_ms)
+wrong_bundle["revision"] = revision
+module._materialize_fixture(wrong_bundle, root)
+Path(wrong_output_name).write_text(json.dumps(wrong_bundle), encoding="utf-8")
+
+rosters = json.loads(Path(gate_manifest_name).read_text(encoding="utf-8"))["rosters"]
+replacements = dict(zip(
+    ["lh-1", "lh-2", "lh-3", "ws-1", "ws-2", "ws-3"],
+    rosters["lighthouses"] + rosters["seats"],
+))
+assert len(replacements) == 6
+
+def remap(value):
+    if isinstance(value, dict):
+        return {key: remap(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [remap(item) for item in value]
+    if isinstance(value, str):
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+    return value
+
+bundle = remap(module._fixture(source="live", now_ms=now_ms))
+bundle["revision"] = revision
 module._materialize_fixture(bundle, root)
 Path(output_name).write_text(json.dumps(bundle), encoding="utf-8")
 PY
@@ -1302,6 +1850,20 @@ PY
   set -e
   [ "$rc" -ne 0 ] || die "self-test: malformed resource publisher attestation was accepted"
 
+  set +e
+  "$0" write --out "$work/production-wrong-node-roster.json" --source-commit 0123456789abcdef0123456789abcdef01234567 \
+    --artifact "$work/a.rpm" --check github-required=pass --check github-policy=pass --check github-cargo-test=pass \
+    --farm-job farm-job-1 --farm-slot 172.20.0.90/1 \
+    --sbom rpm=pass --sbom-manifest "$work/sbom.json" --gate-manifest "$work/gates.json" \
+    --ci-gate-status "$ci_status" --fedora-target fedora-44=pass \
+    --live-gate dell-install=pass --topology-evidence "$wrong_roster_topology" --vdi-evidence "$vdi_evidence" \
+    --resource-publisher-attestation "$resource_attestation" \
+    --preview-verdict pass --production-verdict pass >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ ! -e "$work/production-wrong-node-roster.json" ] \
+    || die "self-test: production pass accepted six nodes outside the gate manifest rosters"
+
   "$0" write --out "$production_pass" --source-commit 0123456789abcdef0123456789abcdef01234567 \
     --artifact "$work/a.rpm" --check github-required=pass --check github-policy=pass --check github-cargo-test=pass \
     --farm-job farm-job-1 --farm-slot 172.20.0.90/1 \
@@ -1319,6 +1881,25 @@ PY
      (.provenance.resource_publisher_attestation.signature | startswith("publisher-attestation:v1:"))' \
     "$production_pass" >/dev/null \
     || die "self-test: resource publisher attestation descriptor was not recorded"
+
+  # Keep attestation parsing bound to the directory member admitted by its
+  # digest, even when an atomic replacement carries byte-identical content.
+  attestation_replacement="$work/resource-publisher-attestation-identical.json"
+  attestation_replacement_marker="$work/resource-publisher-attestation-replacement.marker"
+  attestation_original_identity="$(stat -Lc '%d:%i' -- "$resource_attestation")"
+  cp -- "$resource_attestation" "$attestation_replacement"
+  set +e
+  PATH="$work/hostile-sha256sum:$PATH" \
+    RELEASE_EVIDENCE_REAL_SHA256SUM="$real_sha256sum" \
+    RELEASE_EVIDENCE_GATE_SWAP_MARKER="$attestation_replacement_marker" \
+    RELEASE_EVIDENCE_GATE_SWAP_SOURCE="$attestation_replacement" \
+    RELEASE_EVIDENCE_GATE_SWAP_TARGET="$resource_attestation" \
+    "$0" validate "$production_pass" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$attestation_replacement_marker" ] \
+    && [ "$(stat -Lc '%d:%i' -- "$resource_attestation")" != "$attestation_original_identity" ] \
+    || die "self-test: byte-identical resource-attestation pathname replacement was accepted"
 
   missing_resource_attestation="$work/production-missing-resource-attestation-evidence.json"
   jq '.provenance.resource_publisher_attestation = null' "$production_pass" \

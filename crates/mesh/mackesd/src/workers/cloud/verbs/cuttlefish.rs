@@ -26,7 +26,9 @@ use super::cuttlefish_guest::{
 };
 use super::AndroidGuestProvider;
 use mackes_mesh_types::android_provider::AndroidVdiSource;
-use mackes_mesh_types::workloads::{WorkloadOperationStatus, WorkloadPowerState};
+use mackes_mesh_types::workloads::{
+    WorkloadOperationPhase, WorkloadOperationStatus, WorkloadPowerState,
+};
 
 /// Closed failures returned by the Cuttlefish adapter or its backend client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +129,20 @@ impl CuttlefishOuterWorkloadObservation {
         status: &WorkloadOperationStatus,
     ) -> Result<Self, CuttlefishProviderError> {
         if !status.backend.is_vm() {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
+        // A failed/cancelled retry may honestly retain `Running` power from
+        // the preceding no-effect generation. That retained power is not proof
+        // that the terminal operation's generation ever owned the outer VM;
+        // binding guest readiness to it would let the old VM answer as the new
+        // generation. With no prior-generation row in this projection, fail
+        // closed until Workloads publishes a non-terminal/current generation.
+        if status.power == WorkloadPowerState::Running
+            && matches!(
+                status.phase,
+                WorkloadOperationPhase::Failed | WorkloadOperationPhase::Cancelled
+            )
+        {
             return Err(CuttlefishProviderError::ProviderRejected);
         }
         let lifecycle_state = match status.power {
@@ -520,8 +536,20 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
             .observation
             .lock()
             .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
-        let observed = self.client.observe(&self.target)?;
-        commit_observation(&self.target, &mut current, observed)
+        let observed = match self.client.observe(&self.target) {
+            Ok(observed) => observed,
+            Err(error) => {
+                revoke_guest_readiness(&mut current);
+                return Err(error);
+            }
+        };
+        match commit_observation(&self.target, &mut current, observed) {
+            Ok(observed) => Ok(observed),
+            Err(error) => {
+                revoke_guest_readiness(&mut current);
+                Err(error)
+            }
+        }
     }
 
     fn inventory_from_observation(
@@ -633,22 +661,30 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
             // adapter defensive makes direct trait use fail closed too.
             return AndroidAppInventory::pending(request.workload_id.clone());
         }
-        match self
+        let inventory = self
             .observe_readiness()
-            .and_then(|observation| self.inventory_from_observation(&observation))
-        {
+            .and_then(|observation| self.inventory_from_observation(&observation));
+        match inventory {
             Ok(inventory) => inventory,
-            Err(_) => self
-                .current_observation()
-                .ok()
-                .and_then(|observation| {
-                    self.unavailable_inventory(
-                        &observation,
-                        AndroidUnavailableReason::ProviderUnavailable,
-                    )
-                    .ok()
-                })
-                .unwrap_or_else(|| AndroidAppInventory::pending(self.workload_id.clone())),
+            Err(_) => {
+                let observation = self.observation.lock().ok().map(|mut observation| {
+                    // A failed readiness/inventory transaction must revoke the
+                    // launch and display authority retained by an earlier
+                    // successful poll. Keeping the old ready row would let a
+                    // later action cross the provider failure with stale proof.
+                    revoke_guest_readiness(&mut observation);
+                    observation.clone()
+                });
+                observation
+                    .and_then(|observation| {
+                        self.unavailable_inventory(
+                            &observation,
+                            AndroidUnavailableReason::ProviderUnavailable,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(|| AndroidAppInventory::pending(self.workload_id.clone()))
+            }
         }
     }
 
@@ -698,9 +734,7 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
         request: &AndroidGuestLaunchRequest,
         generation: u64,
     ) -> AndroidGuestLaunchOutcome {
-        if request.workload_id != self.workload_id
-            || request.validate().is_err()
-            || generation == 0
+        if request.workload_id != self.workload_id || request.validate().is_err() || generation == 0
         {
             return AndroidGuestLaunchOutcome::Rejected;
         }
@@ -770,6 +804,29 @@ fn commit_observation(
     }
     *current = observed.clone();
     Ok(observed)
+}
+
+fn revoke_guest_readiness(current: &mut CuttlefishVmObservation) {
+    if !current.is_guest_ready() || current.generation == 0 {
+        return;
+    }
+    let Ok(guest) = CuttlefishGuestReadinessEvidence::new(
+        CuttlefishGuestBootState::Unavailable,
+        CuttlefishGuestReadiness::Unavailable,
+        Some(CuttlefishUnavailableReason::ProviderUnavailable),
+    ) else {
+        return;
+    };
+    let observed_at_unix_ms = now_unix_ms().max(current.observed_at_unix_ms);
+    if let Ok(revoked) = CuttlefishVmObservation::new(
+        current.target.clone(),
+        CuttlefishVmLifecycleState::Unavailable,
+        guest,
+        current.generation,
+        observed_at_unix_ms,
+    ) {
+        *current = revoked;
+    }
 }
 
 fn android_image_provenance(
@@ -1103,6 +1160,60 @@ mod tests {
     }
 
     #[test]
+    fn failed_readiness_refresh_revokes_retained_launch_authority() {
+        let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
+        let client = FakeClient::new(Err(CuttlefishProviderError::ProviderUnavailable));
+        let launch_calls = client.launch_calls.clone();
+        let observe_result = client.observe_result.clone();
+        let adapter = CuttlefishProviderAdapter::new(
+            "android-t480",
+            target(),
+            package_manifest(),
+            initial,
+            client,
+        )
+        .expect("adapter");
+        let inventory_request =
+            AndroidGuestInventoryRequest::new("inventory-provider-loss", "android-t480")
+                .expect("inventory request");
+        let launch_request = AndroidGuestLaunchRequest::for_app(
+            "launch-after-provider-loss",
+            "android-t480",
+            AospStarterApp::Browser,
+        )
+        .expect("launch request");
+
+        let inventory = adapter.inventory(&inventory_request);
+        assert_eq!(
+            inventory.unavailable_reason,
+            Some(AndroidUnavailableReason::ProviderUnavailable)
+        );
+        assert!(!adapter
+            .current_observation()
+            .expect("retained observation")
+            .is_guest_ready());
+        assert_eq!(
+            adapter.launch(&launch_request),
+            AndroidGuestLaunchOutcome::Unavailable
+        );
+        assert_eq!(launch_calls.load(Ordering::Relaxed), 0);
+
+        *observe_result.lock().expect("observe result lock") = Some(Ok(observation(
+            CuttlefishVmLifecycleState::Running,
+            7,
+            now_unix_ms().saturating_add(1_000),
+        )));
+        adapter
+            .observe_readiness()
+            .expect("corrected-forward readiness");
+        assert_eq!(
+            adapter.launch(&launch_request),
+            AndroidGuestLaunchOutcome::Started
+        );
+        assert_eq!(launch_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn stale_generation_operations_stop_before_backend_contact() {
         let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
         let client = FakeClient::new(Ok(initial.clone()));
@@ -1116,11 +1227,9 @@ mod tests {
             client,
         )
         .expect("adapter");
-        let inventory_request = AndroidGuestInventoryRequest::new(
-            "inventory-stale-generation",
-            "android-t480",
-        )
-        .expect("inventory request");
+        let inventory_request =
+            AndroidGuestInventoryRequest::new("inventory-stale-generation", "android-t480")
+                .expect("inventory request");
         let launch_request = AndroidGuestLaunchRequest::for_app(
             "launch-stale-generation",
             "android-t480",
@@ -1142,21 +1251,19 @@ mod tests {
     fn adapter_refuses_vdi_source_with_mismatched_workload_identity() {
         let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
         let client = FakeClient::new(Ok(initial.clone()));
-        *client.vdi_source_result.lock().expect("VDI source lock") = Some(
-            AndroidVdiSource {
-                schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
-                workload_id: "android-other".to_owned(),
-                image_provenance: target().image_provenance,
-                catalog_digest: DIGEST.to_owned(),
-                generation: 7,
-                protocol: AndroidVdiProtocol::WebRtc,
-                mesh_host: "android-t480.mesh".to_owned(),
-                port: 8_443,
-                session_id: "session-7".to_owned(),
-                observed_at_unix_ms: now_unix_ms(),
-                expires_at_unix_ms: now_unix_ms().saturating_add(60_000),
-            },
-        );
+        *client.vdi_source_result.lock().expect("VDI source lock") = Some(AndroidVdiSource {
+            schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+            workload_id: "android-other".to_owned(),
+            image_provenance: target().image_provenance,
+            catalog_digest: DIGEST.to_owned(),
+            generation: 7,
+            protocol: AndroidVdiProtocol::WebRtc,
+            mesh_host: "android-t480.mesh".to_owned(),
+            port: 8_443,
+            session_id: "session-7".to_owned(),
+            observed_at_unix_ms: now_unix_ms(),
+            expires_at_unix_ms: now_unix_ms().saturating_add(60_000),
+        });
         let adapter = CuttlefishProviderAdapter::new(
             "android-t480",
             target(),
@@ -1251,6 +1358,47 @@ mod tests {
         assert_eq!(
             client.observe(&target()),
             Err(CuttlefishProviderError::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn failed_retry_cannot_rebind_running_outer_vm_to_new_generation() {
+        use mackes_mesh_types::workloads::{
+            WorkloadBackend, WorkloadId, WorkloadReadiness, WorkloadResources,
+            WorkloadRuntimeSignals, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        };
+
+        let status = WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: "android-retry-8".to_owned(),
+            workload_id: WorkloadId::new("android-t480").expect("workload id"),
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadResources {
+                vcpu: 4,
+                memory_mb: 8_192,
+                disk_gb: 64,
+            },
+            image_ref: None,
+            generation: 8,
+            phase: WorkloadOperationPhase::Failed,
+            power: WorkloadPowerState::Running,
+            readiness: WorkloadReadiness::Ready,
+            signals: WorkloadRuntimeSignals::default(),
+            retryable: true,
+            attempt: 2,
+            next_retry_at_ms: 0,
+            reason: Some("retry made no lifecycle change".to_owned()),
+            remediation: None,
+            attachment: None,
+        };
+        status
+            .validate(now_unix_ms())
+            .expect("hostile status is contract-valid");
+
+        assert_eq!(
+            CuttlefishOuterWorkloadObservation::from_status(&status),
+            Err(CuttlefishProviderError::ProviderRejected),
+            "retained prior power must not become outer-VM authority for a failed retry"
         );
     }
 }

@@ -338,23 +338,28 @@ pub fn revision(queue: &Queue) -> u64 {
     // FNV-1a is used only as a bounded optimistic-concurrency token; the
     // authenticated action envelope remains the security boundary.
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in queue.current.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    for byte in queue
-        .songs
-        .iter()
-        .flat_map(|song| song.as_bytes().iter().copied().chain(std::iter::once(0)))
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    if let Some(source) = queue.preferred_current_source() {
-        for byte in serde_json::to_vec(source).unwrap_or_default() {
-            hash ^= u64::from(byte);
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
+    };
+    mix(&queue.current.to_le_bytes());
+    mix(&queue.songs.len().to_le_bytes());
+    for song in &queue.songs {
+        // Length framing is required here: JSON strings may contain NUL, so a
+        // sentinel-delimited fold lets distinct durable queues share one CAS
+        // revision (for example ["a\\0", "b"] and ["a", "\\0b"]).
+        mix(&song.len().to_le_bytes());
+        mix(song.as_bytes());
+    }
+    if let Some(source) = queue.preferred_current_source() {
+        let source = serde_json::to_vec(source).unwrap_or_default();
+        mix(&[1]);
+        mix(&source.len().to_le_bytes());
+        mix(&source);
+    } else {
+        mix(&[0]);
     }
     hash
 }
@@ -421,6 +426,26 @@ mod tests {
         assert_ne!(revision(&first), revision(&reordered));
         assert_ne!(revision(&first), revision(&moved));
         assert_eq!(revision(&first), revision(&first.clone()));
+    }
+
+    #[test]
+    fn embedded_delimiters_cannot_substitute_durable_queue_revision_after_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("music-queue.json");
+        let authorized = q(&["a\0", "b"], 0);
+        let substituted = q(&["a", "\0b"], 0);
+
+        write_to(&path, &authorized).unwrap();
+        let authorized_after_restart = read_from(&path);
+        write_to(&path, &substituted).unwrap();
+        let substituted_after_restart = read_from(&path);
+
+        assert_ne!(authorized_after_restart, substituted_after_restart);
+        assert_ne!(
+            revision(&authorized_after_restart),
+            revision(&substituted_after_restart),
+            "distinct durable queue identities must not share CAS authority"
+        );
     }
 
     #[test]

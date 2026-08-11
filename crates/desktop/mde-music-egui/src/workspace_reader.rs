@@ -5,7 +5,7 @@
 //! UI only consumes the latest validated retained state so storage/download
 //! presentation cannot drift into a second authority.
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use mde_bus::persist::Persist;
 use mde_musicd::bus_responder::WORKSPACE_STATE_TOPIC;
@@ -64,7 +64,10 @@ impl WorkspaceReader {
             }
         };
         let snapshot = serde_json::from_str::<MusicWorkspaceSnapshotV1>(&body).ok()?;
-        if snapshot.validate().is_err() || snapshot.revision <= self.last_revision {
+        if snapshot.validate().is_err()
+            || !has_unambiguous_source_identities(&snapshot)
+            || snapshot.revision <= self.last_revision
+        {
             return None;
         }
         self.last_revision = snapshot.revision;
@@ -72,11 +75,25 @@ impl WorkspaceReader {
     }
 }
 
+/// A source id is the authority key used by the surface when presenting daemon
+/// reachability and capabilities. Reject the complete projection when that key
+/// is blank, non-canonical, or repeated: accepting either conflicting row would
+/// make provider order decide which daemon state the UI displays.
+fn has_unambiguous_source_identities(snapshot: &MusicWorkspaceSnapshotV1) -> bool {
+    let mut source_ids = BTreeSet::new();
+    snapshot.sources.iter().all(|source| {
+        let source_id = source.source_id.trim();
+        !source_id.is_empty() && source_id == source.source_id && source_ids.insert(source_id)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mde_bus::hooks::config::Priority;
-    use mde_musicd::domain::{MusicStorageSnapshot, MusicWorkspaceSnapshotV1, PlaybackSnapshot};
+    use mde_musicd::domain::{
+        MusicStorageSnapshot, MusicWorkspaceSnapshotV1, PlaybackSnapshot, ServerCapabilities,
+    };
 
     fn snapshot(revision: u64) -> MusicWorkspaceSnapshotV1 {
         MusicWorkspaceSnapshotV1 {
@@ -180,5 +197,41 @@ mod tests {
         drop(replacement);
 
         assert_eq!(reader.poll().unwrap().revision, 8);
+    }
+
+    #[test]
+    fn equivocated_source_identity_cannot_invent_daemon_reachability() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+        let mut equivocated = snapshot(7);
+        equivocated.any_source_reachable = true;
+        equivocated.sources = vec![
+            ServerCapabilities {
+                source_id: "airsonic-main".to_owned(),
+                api_profile: "subsonic-v1".to_owned(),
+                reachable: false,
+                authentication_required: true,
+                features: ["browse".to_owned()].into_iter().collect(),
+            },
+            ServerCapabilities {
+                source_id: "airsonic-main".to_owned(),
+                api_profile: "subsonic-v2".to_owned(),
+                reachable: true,
+                authentication_required: false,
+                features: ["stream".to_owned()].into_iter().collect(),
+            },
+        ];
+        persist
+            .write(
+                WORKSPACE_STATE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&equivocated).unwrap()),
+            )
+            .unwrap();
+
+        let mut reader = WorkspaceReader::from_root(Some(dir.path().to_path_buf()));
+        assert!(reader.poll().is_none());
+        assert_eq!(reader.last_revision, 0);
     }
 }

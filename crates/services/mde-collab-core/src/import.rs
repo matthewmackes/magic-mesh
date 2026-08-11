@@ -1010,6 +1010,29 @@ fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<Option<
         )));
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if entry.nlink() != 1 {
+            return Err(CollabError::Serde(format!(
+                "{label} must have exactly one filesystem link"
+            )));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // Linux fcntl.h: O_NOFOLLOW == 00400000 (octal). Bind the read to the
+        // checked leaf instead of following a symlink planted after metadata.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o400000)
+            .open(path)?
+    };
+    #[cfg(not(target_os = "linux"))]
     let file = std::fs::File::open(path)?;
     let opened = file.metadata()?;
     if !opened.file_type().is_file() {
@@ -1021,6 +1044,17 @@ fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<Option<
         return Err(CollabError::Serde(format!(
             "{label} exceeds {max_bytes} bytes"
         )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if opened.nlink() != 1 || opened.dev() != entry.dev() || opened.ino() != entry.ino() {
+            return Err(CollabError::Serde(format!(
+                "{label} changed identity while being opened"
+            )));
+        }
     }
 
     let mut bytes = Vec::with_capacity(opened.len() as usize);
@@ -1346,6 +1380,30 @@ mod tests {
         // A missing map file loads as empty (the first import).
         let fresh = ImportMap::load(&tmp.path().join("absent.json")).expect("load-absent");
         assert!(fresh.imported.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_map_hardlink_cannot_alias_replay_authority() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("externally-owned-map.json");
+        let alias = tmp.path().join("import-map.json");
+        let body = serde_json::to_vec(&ImportMap::new()).expect("encode map");
+        std::fs::write(&outside, &body).expect("write outside map");
+        std::fs::hard_link(&outside, &alias).expect("plant hard-linked replay map");
+
+        let error = ImportMap::load(&alias)
+            .expect_err("a multiply-linked file must not become replay authority");
+
+        assert!(
+            error.to_string().contains("exactly one filesystem link"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside map"),
+            body,
+            "rejected replay alias changed its external inode"
+        );
     }
 
     #[cfg(unix)]

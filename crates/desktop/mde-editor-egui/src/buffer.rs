@@ -43,7 +43,7 @@
 #![allow(clippy::module_name_repetitions, clippy::missing_const_for_fn)]
 
 use std::borrow::Cow;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -661,12 +661,20 @@ impl Buffer {
     }
 
     /// Stream the rope to `path`, creating/truncating it. Buffered + flushed so
-    /// the bytes are on disk when this returns.
+    /// the bytes are on disk when this returns. The destination is opened
+    /// without following its final symlink and validated as a single-link
+    /// regular file before truncation. After writing, the pathname must still
+    /// name that exact descriptor, so a replacement cannot redirect native
+    /// Editor persistence or make a displaced inode look successfully saved.
     fn write_to(&self, path: &Path) -> io::Result<()> {
-        let file = File::create(path)?;
+        let file = open_editor_destination(path)?;
+        validate_editor_destination(&file, path)?;
+        file.set_len(0)?;
         let mut writer = BufWriter::new(file);
         self.rope.write_to(&mut writer)?;
-        writer.flush()
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        validate_editor_destination(writer.get_ref(), path)
     }
 
     /// The on-disk file's state relative to the fingerprint captured at the last
@@ -727,6 +735,99 @@ impl Buffer {
         self.disk = stamp_of(&path);
         Ok(())
     }
+}
+
+/// Open an Editor save destination without following a replaced final symlink.
+/// Existing files are deliberately opened without truncation: descriptor shape
+/// and link-count validation must happen before any bytes can be destroyed.
+#[cfg(target_os = "linux")]
+fn open_editor_destination(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const O_NOFOLLOW: i32 = 0o400000;
+    const O_CLOEXEC: i32 = 0o2000000;
+
+    let mut existing = OpenOptions::new();
+    existing
+        .write(true)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC);
+    match existing.open(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+            .open(path),
+        Err(error) => Err(error),
+    }
+}
+
+/// Non-Linux development fallback. Production Linux gets the race-resistant
+/// `O_NOFOLLOW` open above; other targets still reject an observed symlink and
+/// use create-new semantics for a missing destination.
+#[cfg(not(target_os = "linux"))]
+fn open_editor_destination(path: &Path) -> io::Result<File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlinked Editor destination {}", path.display()),
+        )),
+        Ok(_) => OpenOptions::new().write(true).open(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            OpenOptions::new().write(true).create_new(true).open(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Prove both that the opened destination is a regular, unaliased file and that
+/// `path` still names that descriptor. This check runs before truncation and
+/// after the synchronized write.
+fn validate_editor_destination(file: &File, path: &Path) -> io::Result<()> {
+    let descriptor = file.metadata()?;
+    if !descriptor.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Editor destination is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let current = std::fs::symlink_metadata(path)?;
+    if !current.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Editor destination was replaced: {}", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if descriptor.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Editor destination has external aliases: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if descriptor.dev() != current.dev() || descriptor.ino() != current.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Editor destination changed during save: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -914,6 +1015,33 @@ mod tests {
         let mut buf = Buffer::from_text("scratch");
         let err = buf.save().expect_err("scratch buffer has no path");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_editor_save_path_cannot_redirect_native_document_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-authority.txt");
+        let selected = dir.path().join("selected-document.txt");
+        std::fs::write(&outside, b"operator-owned bytes").expect("seed outside file");
+        symlink(&outside, &selected).expect("replace selected path with symlink");
+
+        let mut buf = Buffer::from_text("new native Editor content");
+        buf.insert(buf.len_chars(), "\n");
+        let error = buf
+            .save_as(&selected)
+            .expect_err("a replaced save path must fail closed");
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside file"),
+            b"operator-owned bytes",
+            "the replacement target must never receive Editor bytes"
+        );
+        assert!(buf.path().is_none(), "failed save-as must not adopt the path");
+        assert!(buf.is_dirty(), "failed save-as must retain unsaved state");
     }
 
     // ── EDITOR-11: dirty revision, external-change detection, reload ──────────

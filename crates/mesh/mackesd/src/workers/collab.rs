@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,10 +55,14 @@ use std::str::FromStr;
 use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
-use mde_collab_core::{ActorLog, CollabEngine, Ed25519Signer, FileActorLog, Projection, RandomIds};
+use mde_collab_core::{
+    ingest_and_register_file, ActorLog, BlobStore, CollabEngine, Ed25519Signer, FileActorLog,
+    FsBlobStore, Projection, RandomIds,
+};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::value::{
-    sha256_hex, AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity,
+    sha256_hex, AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem,
+    PayloadRef, Severity,
 };
 use mde_collab_types::{
     ActorId, AiSuggestionRequestStatus, AiSuggestionRequestView, AiSuggestionRequests,
@@ -213,6 +217,8 @@ pub struct CollabWorker {
     signing_key: SigningKey,
     /// The Syncthing-replicable actor-log root (`<space>/<actor>.jsonl` beneath).
     log_root: PathBuf,
+    /// Syncthing-replicated content-addressed Files payload root.
+    content_root: PathBuf,
     /// Poll cadence.
     poll_interval: Duration,
     /// Bus root override (tests point it at a tempdir Persist).
@@ -247,10 +253,12 @@ impl CollabWorker {
     #[must_use]
     pub fn new(workgroup_root: PathBuf, self_host: String, signing_key: SigningKey) -> Self {
         let log_root = workgroup_root.join("collab").join("logs");
+        let content_root = workgroup_root.join("collab").join("content");
         Self {
             self_actor: ActorId::new(self_host),
             signing_key,
             log_root,
+            content_root,
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
             #[cfg(test)]
@@ -681,13 +689,55 @@ impl CollabWorker {
                     );
                     continue;
                 }
-                let events = match state.engine.apply(&cmd, &signer, &mut state.ids, now_ms) {
-                    Ok(evs) => evs,
-                    Err(e) => {
-                        // A denied action is a typed error — visible, never a silent no-op.
-                        tracing::warn!(target: "mackesd::collab", verb, error = %e, "collab command denied");
-                        continue;
+                let events = match &cmd {
+                    CollabCommand::LinkFile {
+                        space,
+                        file,
+                        reference,
+                    } => {
+                        let payload = PayloadRef {
+                            sha256_hex: reference.sha256_hex.clone(),
+                            len: reference.size,
+                            content_type: reference.mime.clone(),
+                        };
+                        let blobs = FsBlobStore::new(&self.content_root);
+                        let bytes = match blobs.get(&payload) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "mackesd::collab",
+                                    verb,
+                                    error = %error,
+                                    "refused LinkFile without exact canonical payload",
+                                );
+                                continue;
+                            }
+                        };
+                        match ingest_and_register_file(
+                            &mut state.engine,
+                            &blobs,
+                            *space,
+                            *file,
+                            reference.clone(),
+                            Cursor::new(bytes),
+                            &signer,
+                            &mut state.ids,
+                            now_ms,
+                        ) {
+                            Ok(registered) => registered.events,
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::collab", verb, error = %error, "collab file registration denied");
+                                continue;
+                            }
+                        }
                     }
+                    _ => match state.engine.apply(&cmd, &signer, &mut state.ids, now_ms) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::collab", verb, error = %error, "collab command denied");
+                            continue;
+                        }
+                    },
                 };
                 self.handle_ai_sidecar(&cmd, state, now_ms, touched, changed);
                 for env in &events {
@@ -3171,6 +3221,7 @@ mod tests {
         state: &mut CollabState,
         file: FileRefId,
         reference: FileRef,
+        bytes: &[u8],
         t0: i64,
     ) -> SpaceId {
         write_command(
@@ -3183,6 +3234,10 @@ mod tests {
         );
         w.tick_once(persist, state, t0);
         let space = only_space(state);
+        let mut blobs = FsBlobStore::new(&w.content_root);
+        let installed = blobs.put(bytes).expect("install canonical fixture payload");
+        assert_eq!(installed.sha256_hex, reference.sha256_hex);
+        assert_eq!(installed.len, reference.size);
         write_command(
             w,
             persist,
@@ -3208,13 +3263,22 @@ mod tests {
         w.tick_once(&persist, &mut state, 100); // seed cursors
 
         let file = FileRefId::new();
+        let bytes = b"deploy log bytes";
         let reference = FileRef {
             name: "deploy.log".into(),
-            size: 2048,
-            sha256_hex: sha256_hex(b"deploy log bytes"),
+            size: bytes.len() as u64,
+            sha256_hex: sha256_hex(bytes),
             mime: Some("text/plain".into()),
         };
-        let space = create_space_and_link(&w, &persist, &mut state, file, reference.clone(), 200);
+        let space = create_space_and_link(
+            &w,
+            &persist,
+            &mut state,
+            file,
+            reference.clone(),
+            bytes,
+            200,
+        );
 
         // The per-space file-references projection is published + carries the ref.
         let files_topic = topics::space_state_topic(proj::FILE_REFERENCES, space);
@@ -3270,6 +3334,63 @@ mod tests {
     }
 
     #[test]
+    fn link_file_requires_exact_canonical_payload_before_authoritative_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100);
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "payload admission".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        let file = FileRefId::new();
+        let bytes = b"canonical payload must exist";
+        let reference = FileRef {
+            name: "admitted.bin".into(),
+            size: bytes.len() as u64,
+            sha256_hex: sha256_hex(bytes),
+            mime: Some("application/octet-stream".into()),
+        };
+        let command = CollabCommand::LinkFile {
+            space,
+            file,
+            reference: reference.clone(),
+        };
+
+        write_command(&w, &persist, &command);
+        w.tick_once(&persist, &mut state, 300);
+        assert!(
+            !state.engine.all_events().iter().any(
+                |event| matches!(&event.kind, CollabEventKind::FileLinked { file: found, .. } if *found == file)
+            ),
+            "metadata alone must not create a usable Files identity"
+        );
+
+        let mut blobs = FsBlobStore::new(&w.content_root);
+        let installed = blobs.put(bytes).expect("install corrected-forward payload");
+        assert_eq!(installed.sha256_hex, reference.sha256_hex);
+        write_command(&w, &persist, &command);
+        w.tick_once(&persist, &mut state, 400);
+
+        let rows = state
+            .engine
+            .projection()
+            .file_references(space)
+            .expect("file projection");
+        assert_eq!(rows.files.len(), 1);
+        assert_eq!(rows.files[0].file, file);
+        assert_eq!(rows.files[0].reference, reference);
+    }
+
+    #[test]
     fn transfer_start_then_cancel_projects_the_shared_ledger_state() {
         // WL-FUNC-011 — a linked file's transfer flows through the shared ledger:
         // StartTransfer projects the control handle (Queued); ControlTransfer moves
@@ -3282,13 +3403,14 @@ mod tests {
         w.tick_once(&persist, &mut state, 100); // seed cursors
 
         let file = FileRefId::new();
+        let bytes = b"iso bytes";
         let reference = FileRef {
             name: "artifact.iso".into(),
-            size: 4096,
-            sha256_hex: sha256_hex(b"iso bytes"),
+            size: bytes.len() as u64,
+            sha256_hex: sha256_hex(bytes),
             mime: None,
         };
-        let space = create_space_and_link(&w, &persist, &mut state, file, reference, 200);
+        let space = create_space_and_link(&w, &persist, &mut state, file, reference, bytes, 200);
 
         let jobs_topic = topics::state_topic(proj::TRANSFER_JOBS);
         let read_jobs = |persist: &Persist| -> TransferJobs {

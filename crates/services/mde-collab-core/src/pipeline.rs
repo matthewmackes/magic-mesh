@@ -7,19 +7,27 @@
 //! injected [`EventSigner`] + [`IdSource`]. A rejected command returns a typed
 //! [`CollabError`] — the denial is *visible*, never a silent no-op.
 //!
-//! The pipeline itself performs no I/O and reads no wall clock: time, ids, and
-//! signing are all supplied through [`ApplyCtx`], so the same command replays to
-//! byte-identical events.
+//! [`apply_command`] itself performs no I/O and reads no wall clock: time, ids,
+//! and signing are all supplied through [`ApplyCtx`], so the same command
+//! replays to byte-identical events. [`ingest_and_register_file`] is the narrow
+//! production orchestration boundary which couples verified CAS installation
+//! to the normal authorized command path.
+
+use std::io::Read;
 
 use mde_collab_types::event::CollabEventKind;
-use mde_collab_types::ids::{EventId, SpaceId};
-use mde_collab_types::value::{AlertActionKind, CallParticipantState, MessageBody, TransferState};
+use mde_collab_types::ids::{EventId, FileRefId, SpaceId};
+use mde_collab_types::value::{
+    AlertActionKind, CallParticipantState, FileRef, MessageBody, PayloadRef, TransferState,
+};
 use mde_collab_types::{
-    ActorClock, CollabCommand, CollabEventEnvelope, PresenceState, SpaceRole, TransferControl,
-    MAX_TRANSFER_CONTENT_BYTES,
+    ActorClock, CollabCommand, CollabEventEnvelope, FileReferenceView, PresenceState, SpaceRole,
+    TransferControl, MAX_TRANSFER_CONTENT_BYTES,
 };
 
+use crate::blob::FsBlobStore;
 use crate::domain::DomainState;
+use crate::engine::CollabEngine;
 use crate::error::{CollabError, Result};
 use crate::signer::{EventSigner, IdSource};
 
@@ -54,6 +62,96 @@ pub const MAX_AI_REQUEST_ID_BYTES: usize = 128;
 /// invocation events and may be consumed by downstream verb/topic adapters;
 /// keep them bounded and token-shaped at the authority boundary.
 pub const MAX_ALERT_ACTION_ID_BYTES: usize = 128;
+
+/// A Files identity returned only after its signed `LinkFile` event and exact
+/// read-side row have committed successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredFile {
+    /// The caller-provided stable Files identity.
+    pub file: FileRefId,
+    /// The exact durable projection confirmed after command application.
+    pub projection: FileReferenceView,
+    /// Signed events produced by the normal command path. The runtime worker
+    /// durably appends these before publishing them on the live lane.
+    pub events: Vec<CollabEventEnvelope>,
+}
+
+/// Verify and install bytes in CAS, then register their stable Files identity
+/// through the engine's normal authenticated `LinkFile` command path.
+///
+/// `engine.actor()` is the authenticated actor. The operation accepts only an
+/// existing space where that actor is a present member because authorization is
+/// performed by [`CollabEngine::apply`], not by a parallel policy path. The CAS
+/// commit guard remains armed across command application: authorization or
+/// projection failure rolls back only an inode installed by this operation,
+/// while an exact pre-existing/concurrent blob is never removed.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_and_register_file<R: Read, S: EventSigner, I: IdSource>(
+    engine: &mut CollabEngine,
+    blobs: &FsBlobStore,
+    space: SpaceId,
+    file: FileRefId,
+    reference: FileRef,
+    reader: R,
+    signer: &S,
+    ids: &mut I,
+    now_unix_ms: i64,
+) -> Result<RegisteredFile> {
+    let payload = PayloadRef {
+        sha256_hex: reference.sha256_hex.clone(),
+        len: reference.size,
+        content_type: reference.mime.clone(),
+    };
+    let stage = blobs.stage(reader, &payload)?;
+    let commit = stage.commit()?;
+    let linked_by = engine.actor().clone();
+    let command = CollabCommand::LinkFile {
+        space,
+        file,
+        reference: reference.clone(),
+    };
+
+    let events = match engine.apply(&command, signer, ids, now_unix_ms) {
+        Ok(events) => events,
+        Err(apply_error) => {
+            return match commit.abort() {
+                Ok(()) => Err(apply_error),
+                Err(cleanup_error) => Err(CollabError::Io(format!(
+                    "file registration failed ({apply_error}); CAS rollback also failed ({cleanup_error})"
+                ))),
+            };
+        }
+    };
+
+    // `apply` returns only after the SQLite projection transaction commits.
+    // Query that exact durable row before reporting a usable Files identity.
+    let confirmation = engine.projection().file_references(space).and_then(|rows| {
+        rows.files
+            .into_iter()
+            .find(|row| {
+                row.file == file
+                    && row.reference == reference
+                    && row.linked_by == linked_by
+                    && row.linked_unix_ms == now_unix_ms
+            })
+            .ok_or_else(|| {
+                CollabError::Io(format!(
+                    "LinkFile projection did not confirm exact file identity {file}"
+                ))
+            })
+    });
+
+    // A successful `apply` means the durable signed event and projection now
+    // reference these bytes. Preserve CAS even if the confirmation read itself
+    // encounters a later SQLite error; deleting it would strand durable state.
+    let _ = commit.retain();
+    let projection = confirmation?;
+    Ok(RegisteredFile {
+        file,
+        projection,
+        events,
+    })
+}
 
 /// The injected authoring context for [`apply_command`]. Carries the local
 /// actor, the injected wall time, the actor's running HLC (advanced per emitted
@@ -147,7 +245,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
     cmd: &CollabCommand,
     ctx: &mut ApplyCtx<'_, S, I>,
 ) -> Result<Vec<CollabEventEnvelope>> {
-    match cmd {
+    let events: Result<Vec<CollabEventEnvelope>> = match cmd {
         // ---- Space lifecycle -------------------------------------------
         CollabCommand::CreateSpace { kind, name } => {
             // A fresh space; the creator becomes its first Owner. Two events.
@@ -1017,7 +1115,13 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             require_ai_request_id(request_id)?;
             Ok(Vec::new())
         }
+    };
+    let events = events?;
+
+    if let Some(invalid) = events.iter().find(|event| !event.verify()) {
+        return Err(CollabError::InvalidEvent(invalid.event_id));
     }
+    Ok(events)
 }
 
 fn is_nonzero_lower_sha256(value: &str) -> bool {
@@ -1345,13 +1449,16 @@ fn would_orphan(state: &DomainState, space: SpaceId, actor: &mde_collab_types::A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::{BlobStore, FsBlobStore};
+    use crate::engine::CollabEngine;
     use crate::signer::{Ed25519Signer, IdSource};
     use mde_collab_types::ids::{CallId, EventId, FileRefId, ThreadId, TransferId};
     use mde_collab_types::value::{
-        CallKind, ClipItemKind, ClipboardItem, FileRef, MessageBody, TransferDirection,
+        sha256_hex, CallKind, ClipItemKind, ClipboardItem, FileRef, MessageBody, TransferDirection,
         TransferMethod,
     };
     use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
+    use std::io::Cursor;
     use uuid::Uuid;
 
     struct SeqIds(u128);
@@ -1362,6 +1469,239 @@ mod tests {
             self.0 += 1;
             id
         }
+    }
+
+    struct ActorSubstitutingSigner(Ed25519Signer);
+
+    impl EventSigner for ActorSubstitutingSigner {
+        fn sign(&self, envelope: &mut CollabEventEnvelope) {
+            self.0.sign(envelope);
+            envelope.actor = ActorId::new("mallory");
+        }
+    }
+
+    #[test]
+    fn signer_actor_substitution_cannot_escape_the_authoring_pipeline() {
+        let signer = ActorSubstitutingSigner(Ed25519Signer::from_seed([46; 32]));
+        let mut ids = SeqIds(0x4600);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+
+        let denied = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "signature boundary".into(),
+            },
+            &mut alice,
+        );
+
+        assert!(matches!(
+            denied,
+            Err(CollabError::InvalidEvent(event))
+                if event == EventId::from_uuid(Uuid::from_u128(0x4600))
+        ));
+    }
+
+    fn create_files_space(
+        engine: &mut CollabEngine,
+        signer: &Ed25519Signer,
+        ids: &mut SeqIds,
+    ) -> SpaceId {
+        engine
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "files ingest".into(),
+                },
+                signer,
+                ids,
+                1_000,
+            )
+            .expect("create files space")[0]
+            .space_id
+    }
+
+    fn file_reference(name: &str, bytes: &[u8]) -> FileRef {
+        FileRef {
+            name: name.into(),
+            size: bytes.len() as u64,
+            sha256_hex: sha256_hex(bytes),
+            mime: Some("application/octet-stream".into()),
+        }
+    }
+
+    fn staged_residue(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut residue = Vec::new();
+        let Ok(shards) = std::fs::read_dir(root) else {
+            return residue;
+        };
+        for shard in shards.flatten() {
+            let Ok(entries) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            residue.extend(entries.flatten().filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+                    .then(|| entry.path())
+            }));
+        }
+        residue
+    }
+
+    #[test]
+    fn files_ingest_registers_verified_bytes_and_confirms_projection() {
+        let root = tempfile::tempdir().expect("blob root");
+        let store = FsBlobStore::new(root.path());
+        let signer = Ed25519Signer::from_seed([41; 32]);
+        let mut ids = SeqIds(0x4100);
+        let mut engine = CollabEngine::in_memory("alice").expect("engine");
+        let space = create_files_space(&mut engine, &signer, &mut ids);
+        let file = FileRefId::from_uuid(Uuid::from_u128(0x4101));
+        let bytes = b"authenticated Files payload";
+        let reference = file_reference("payload.bin", bytes);
+
+        let registered = ingest_and_register_file(
+            &mut engine,
+            &store,
+            space,
+            file,
+            reference.clone(),
+            Cursor::new(bytes),
+            &signer,
+            &mut ids,
+            2_000,
+        )
+        .expect("ingest and register");
+
+        assert_eq!(registered.file, file);
+        assert_eq!(registered.projection.file, file);
+        assert_eq!(registered.projection.reference, reference);
+        assert_eq!(registered.projection.linked_by, ActorId::new("alice"));
+        assert_eq!(registered.projection.linked_unix_ms, 2_000);
+        assert!(store.contains(&registered.projection.reference.sha256_hex));
+        assert!(staged_residue(root.path()).is_empty());
+    }
+
+    #[test]
+    fn files_ingest_non_member_refusal_cleans_owned_install() {
+        let root = tempfile::tempdir().expect("blob root");
+        let store = FsBlobStore::new(root.path());
+        let owner_signer = Ed25519Signer::from_seed([42; 32]);
+        let mut owner_ids = SeqIds(0x4200);
+        let mut owner = CollabEngine::in_memory("alice").expect("owner engine");
+        let space = create_files_space(&mut owner, &owner_signer, &mut owner_ids);
+        let mut intruder = CollabEngine::in_memory("mallory").expect("intruder engine");
+        intruder
+            .merge(owner.all_events())
+            .expect("replicate existing space");
+        let bytes = b"must be rolled back";
+        let reference = file_reference("denied.bin", bytes);
+        let digest = reference.sha256_hex.clone();
+
+        let error = ingest_and_register_file(
+            &mut intruder,
+            &store,
+            space,
+            FileRefId::from_uuid(Uuid::from_u128(0x4201)),
+            reference,
+            Cursor::new(bytes),
+            &Ed25519Signer::from_seed([43; 32]),
+            &mut SeqIds(0x4300),
+            2_000,
+        )
+        .expect_err("non-member must be refused");
+
+        assert!(matches!(
+            error,
+            CollabError::NotMember { space: found, actor }
+                if found == space && actor == ActorId::new("mallory")
+        ));
+        assert!(!store.contains(&digest));
+        assert!(staged_residue(root.path()).is_empty());
+    }
+
+    #[test]
+    fn files_ingest_reuses_exact_existing_blob_without_replacing_it() {
+        let root = tempfile::tempdir().expect("blob root");
+        let mut store = FsBlobStore::new(root.path());
+        let bytes = b"already durable CAS payload";
+        let existing = store.put(bytes).expect("prepopulate CAS");
+        let canonical = root
+            .path()
+            .join(&existing.sha256_hex[..2])
+            .join(&existing.sha256_hex);
+        #[cfg(unix)]
+        let existing_identity = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&canonical).expect("existing metadata");
+            (metadata.dev(), metadata.ino())
+        };
+        let signer = Ed25519Signer::from_seed([44; 32]);
+        let mut ids = SeqIds(0x4400);
+        let mut engine = CollabEngine::in_memory("alice").expect("engine");
+        let space = create_files_space(&mut engine, &signer, &mut ids);
+        let file = FileRefId::from_uuid(Uuid::from_u128(0x4401));
+
+        let registered = ingest_and_register_file(
+            &mut engine,
+            &store,
+            space,
+            file,
+            file_reference("existing.bin", bytes),
+            Cursor::new(bytes),
+            &signer,
+            &mut ids,
+            2_000,
+        )
+        .expect("register existing blob");
+
+        assert_eq!(registered.file, file);
+        assert!(store.contains(&existing.sha256_hex));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(canonical).expect("retained metadata");
+            assert_eq!((metadata.dev(), metadata.ino()), existing_identity);
+        }
+        assert!(staged_residue(root.path()).is_empty());
+    }
+
+    #[test]
+    fn files_ingest_projection_failure_rolls_back_owned_install() {
+        let root = tempfile::tempdir().expect("blob root");
+        let store = FsBlobStore::new(root.path());
+        let signer = Ed25519Signer::from_seed([45; 32]);
+        let mut ids = SeqIds(0x4500);
+        let mut engine = CollabEngine::in_memory("alice").expect("engine");
+        let space = create_files_space(&mut engine, &signer, &mut ids);
+        engine
+            .projection()
+            .connection()
+            .execute_batch("DROP TABLE file_refs")
+            .expect("inject projection failure");
+        let bytes = b"projection must reject";
+        let reference = file_reference("rollback.bin", bytes);
+        let digest = reference.sha256_hex.clone();
+        let event_count = engine.all_events().len();
+
+        ingest_and_register_file(
+            &mut engine,
+            &store,
+            space,
+            FileRefId::from_uuid(Uuid::from_u128(0x4501)),
+            reference,
+            Cursor::new(bytes),
+            &signer,
+            &mut ids,
+            2_000,
+        )
+        .expect_err("projection failure must reject registration");
+
+        assert_eq!(engine.all_events().len(), event_count);
+        assert!(!store.contains(&digest));
+        assert!(staged_residue(root.path()).is_empty());
     }
 
     #[test]

@@ -323,7 +323,20 @@ impl<E: MediaEngine> Player<E> {
     /// Returns [`PlayerError::Engine`] if the engine rejects the load.
     pub fn load(&mut self, url: impl Into<String>) -> Result<(), PlayerError> {
         let url = url.into();
-        self.engine.load_file(&url)?;
+        // A load starts a new media-identity generation. Signals already queued
+        // by the engine belong to the superseded generation; folding (for
+        // example) its EOF after `media` changes would falsely complete the new
+        // title before that title's own FileLoaded arrives.
+        let superseded_signals = self.engine.poll();
+        if let Err(error) = self.engine.load_file(&url) {
+            // A rejected replacement never established a new generation, so
+            // preserve the incumbent media's observations instead of losing
+            // them as collateral damage from the attempted handoff.
+            for signal in superseded_signals {
+                self.apply_signal(signal);
+            }
+            return Err(error.into());
+        }
         self.media = Some(url);
         self.recovery_attempts = 0;
         self.paused_intent = false;
@@ -1269,6 +1282,29 @@ mod tests {
 
         assert_eq!(p.state(), PlayerState::Playing);
         assert_eq!(p.media(), Some("second"));
+    }
+
+    #[test]
+    fn replacement_load_revokes_queued_eof_before_new_identity_can_be_completed() {
+        let mut p = player();
+        p.load("first").expect("first load");
+        p.pump();
+        let _ = p.drain_events();
+
+        // The old item reaches EOF, but replacement wins before the surface
+        // pumps that signal. The superseded EOF must not complete `second` or
+        // suppress its own readiness transition.
+        p.engine_mut().reach_eof();
+        p.load("second").expect("replacement load");
+        p.pump();
+
+        assert_eq!(p.state(), PlayerState::Playing);
+        assert_eq!(p.media(), Some("second"));
+        assert!(p
+            .resume_state()
+            .get("second")
+            .is_some_and(|entry| !entry.completed));
+        assert!(!p.drain_events().contains(&PlayerEvent::EndReached));
     }
 
     #[test]

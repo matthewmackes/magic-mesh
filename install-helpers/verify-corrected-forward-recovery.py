@@ -5,7 +5,9 @@ The live modes are read-only.  `preflight` proves the exact enrolled target and
 package-owned recovery path before an outer controller is allowed to reboot it.
 `post-reboot` additionally proves a new boot, dependency order, one identity,
 one process per grouped worker, strict coordination quorum, substrate health,
-and one active seat session.
+and one active seat session.  `verify-forward` binds those two captures to the
+exact package transition authorized by the release controller, so a retained
+pre-upgrade capture or rollback cannot satisfy corrected-forward evidence.
 """
 
 from __future__ import annotations
@@ -23,8 +25,10 @@ from typing import Any
 GROUPS = ("control", "observation", "actions", "data", "compute", "integrations")
 XDG_DIRS = ("Documents", "Downloads", "Music", "Pictures", "Videos")
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+PACKAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~:-]{0,255}$")
 OVERLAY = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$")
 MAX_OUTPUT = 16_384
+MAX_EVIDENCE = 64 * 1024
 TIMEOUT_SECONDS = 8
 # The package boot gate performs three bounded etcd endpoint-health probes in
 # addition to the local service and bind checks.  A healthy 2/3 live quorum took
@@ -86,6 +90,97 @@ def strict_majority(total: int) -> int:
     if total <= 0:
         refuse("coordination endpoint set is empty")
     return total // 2 + 1
+
+
+def bounded_evidence(path: Path) -> dict[str, Any]:
+    """Read one immutable, single-link evidence inode and revalidate its path."""
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        refuse(f"evidence file is unavailable or unsafe: {path}: {error}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            refuse(f"evidence must be a single-link regular file: {path}")
+        if before.st_size <= 0 or before.st_size > MAX_EVIDENCE:
+            refuse(f"evidence size is outside the supported bound: {path}")
+        chunks: list[bytes] = []
+        remaining = MAX_EVIDENCE + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        body = b"".join(chunks)
+        if len(body) > MAX_EVIDENCE:
+            refuse(f"evidence exceeded the supported bound while reading: {path}")
+        after = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            refuse(f"evidence inode changed while reading: {path}")
+        if identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns):
+            refuse(f"evidence path was replaced while reading: {path}")
+    except OSError as error:
+        refuse(f"evidence could not be read safely: {path}: {error}")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        refuse(f"evidence is not bounded UTF-8 JSON: {path}: {error}")
+    if not isinstance(value, dict):
+        refuse(f"evidence root must be an object: {path}")
+    return value
+
+
+def validate_corrected_forward(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    expect_target: str,
+    expect_previous_package: str,
+    expect_forward_package: str,
+) -> dict[str, str | bool]:
+    if not IDENTIFIER.fullmatch(expect_target):
+        refuse("expected target is malformed")
+    for value, label in (
+        (expect_previous_package, "expected previous package"),
+        (expect_forward_package, "expected forward package"),
+    ):
+        if not PACKAGE_ID.fullmatch(value):
+            refuse(f"{label} is malformed")
+    if expect_previous_package == expect_forward_package:
+        refuse("corrected-forward package must differ from the previous package")
+    for field in ("target", "role", "overlay", "session_user"):
+        if before.get(field) != after.get(field):
+            refuse(f"corrected-forward capture changed target authority: {field}")
+    if before.get("target") != expect_target:
+        refuse("corrected-forward capture does not belong to the expected target")
+    if before.get("package") != expect_previous_package:
+        refuse("pre-upgrade capture does not match the authorized previous package")
+    if after.get("package") != expect_forward_package:
+        refuse("post-upgrade capture does not match the authorized forward package")
+    before_boot_id = before.get("boot_id")
+    if not isinstance(before_boot_id, str) or not IDENTIFIER.fullmatch(before_boot_id):
+        refuse("pre-upgrade capture has an invalid boot identity")
+    after_boot_id = after.get("boot_id")
+    if not isinstance(after_boot_id, str) or not IDENTIFIER.fullmatch(after_boot_id):
+        refuse("post-upgrade capture has an invalid boot identity")
+    validate_post(after, before_boot_id)
+    return {
+        "corrected_forward": True,
+        "rollback": False,
+        "target": expect_target,
+        "previous_package": expect_previous_package,
+        "forward_package": expect_forward_package,
+        "before_boot_id": before_boot_id,
+        "after_boot_id": after_boot_id,
+    }
 
 
 def configured_etcd_endpoints(path: Path) -> list[str]:
@@ -497,16 +592,56 @@ def self_test() -> None:
         "xdg_binds": {},
     }
     validate_post(lighthouse, "before")
+    before = {
+        "target": "seat-15",
+        "role": "workstation",
+        "overlay": "172.20.0.15/24",
+        "session_user": "mm",
+        "package": "magic-mesh-32.0.0-1.x86_64",
+        "boot_id": "before",
+    }
+    forward = {
+        **valid,
+        "target": "seat-15",
+        "overlay": "172.20.0.15/24",
+        "session_user": "mm",
+        "package": "magic-mesh-33.0.0-1.x86_64",
+    }
+    validate_corrected_forward(
+        before,
+        forward,
+        expect_target="seat-15",
+        expect_previous_package="magic-mesh-32.0.0-1.x86_64",
+        expect_forward_package="magic-mesh-33.0.0-1.x86_64",
+    )
+    try:
+        validate_corrected_forward(
+            before,
+            {**forward, "package": before["package"]},
+            expect_target="seat-15",
+            expect_previous_package="magic-mesh-32.0.0-1.x86_64",
+            expect_forward_package="magic-mesh-33.0.0-1.x86_64",
+        )
+    except Refused:
+        pass
+    else:
+        raise AssertionError("retained pre-upgrade package authority was accepted")
     assert strict_majority(1) == 1
     assert strict_majority(3) == 2
     assert strict_majority(5) == 3
-    print("verify-corrected-forward-recovery: self-test passed 13/13")
+    print("verify-corrected-forward-recovery: self-test passed 14/14")
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     sub = result.add_subparsers(dest="command", required=True)
     sub.add_parser("self-test")
+    forward = sub.add_parser("verify-forward")
+    forward.add_argument("--before", type=Path, required=True)
+    forward.add_argument("--after", type=Path, required=True)
+    forward.add_argument("--expect-target", required=True)
+    forward.add_argument("--expect-previous-package", required=True)
+    forward.add_argument("--expect-forward-package", required=True)
     for name in ("preflight", "post-reboot"):
         command = sub.add_parser(name)
         command.add_argument("--expect-host", required=True)
@@ -523,6 +658,16 @@ def main() -> int:
     try:
         if args.command == "self-test":
             self_test()
+            return 0
+        if args.command == "verify-forward":
+            result = validate_corrected_forward(
+                bounded_evidence(args.before),
+                bounded_evidence(args.after),
+                expect_target=args.expect_target,
+                expect_previous_package=args.expect_previous_package,
+                expect_forward_package=args.expect_forward_package,
+            )
+            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             return 0
         snapshot = collect(args) if args.command == "preflight" else collect_post(args)
         print(json.dumps(snapshot, sort_keys=True, separators=(",", ":")))

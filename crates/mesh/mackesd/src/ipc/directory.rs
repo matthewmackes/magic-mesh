@@ -31,6 +31,30 @@ use serde_json::json;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
+/// Fold the joined directory into mutually exclusive health buckets.
+///
+/// Presence is the freshest reachability authority in a directory row.  A
+/// restarted daemon may still read the prior `healthy`/`degraded` value from a
+/// peer record after its heartbeat has aged offline; that historical value
+/// must not keep authorizing a current healthy bucket.  Unknown health on a
+/// non-offline peer remains unclassified rather than being invented as an
+/// outage.
+fn health_counts(peers: &[serde_json::Value]) -> (u32, u32, u32) {
+    let (mut healthy, mut degraded, mut unreachable) = (0u32, 0u32, 0u32);
+    for peer in peers {
+        if peer["presence"].as_str() == Some("offline") {
+            unreachable = unreachable.saturating_add(1);
+            continue;
+        }
+        match peer["health"].as_str() {
+            Some("healthy") => healthy = healthy.saturating_add(1),
+            Some("degraded") => degraded = degraded.saturating_add(1),
+            _ => {}
+        }
+    }
+    (healthy, degraded, unreachable)
+}
+
 /// The directory verb's action topic.
 pub const ACTION_TOPIC: &str = "action/mesh/directory";
 
@@ -309,22 +333,14 @@ impl DirectoryService {
         let dir = self.build_directory(now_ms);
         let peers = dir["peers"].as_array().cloned().unwrap_or_default();
         let total = u32::try_from(peers.len()).unwrap_or(u32::MAX);
-        let (mut healthy, mut degraded, mut unreachable) = (0u32, 0u32, 0u32);
+        let (healthy, degraded, unreachable) = health_counts(&peers);
         // HA-4 — count the lighthouses in the live directory so healthz can flag
         // `degraded: no HA` below the 2-lighthouse floor. The directory's `role`
         // is "lighthouse" for tagged peers (see `build_directory`).
         let mut lighthouses = 0u32;
         for p in &peers {
-            match p["health"].as_str() {
-                Some("healthy") => healthy += 1,
-                Some("degraded") => degraded += 1,
-                _ => {}
-            }
-            if p["presence"].as_str() == Some("offline") {
-                unreachable += 1;
-            }
             if p["role"].as_str() == Some("lighthouse") {
-                lighthouses += 1;
+                lighthouses = lighthouses.saturating_add(1);
             }
         }
         // SUBSTRATE-4/8 — leadership from the shared leader read (etcd lease when
@@ -768,6 +784,21 @@ mod tests {
         assert_eq!(presence_tier(now, now - 60 * 1000), "online");
         assert_eq!(presence_tier(now, now - 5 * 60 * 1000), "idle");
         assert_eq!(presence_tier(now, now - 11 * 60 * 1000), "offline");
+    }
+
+    #[test]
+    fn restarted_directory_cannot_count_stale_healthy_peer_as_current_and_unreachable() {
+        let peers = vec![
+            json!({"hostname":"stale","presence":"offline","health":"healthy"}),
+            json!({"hostname":"live","presence":"online","health":"healthy"}),
+            json!({"hostname":"slow","presence":"idle","health":"degraded"}),
+        ];
+
+        assert_eq!(
+            health_counts(&peers),
+            (1, 1, 1),
+            "offline presence must revoke retained historical health after restart"
+        );
     }
 
     #[test]

@@ -62,7 +62,9 @@ pub use import::{
     IMPORT_MAP_VERSION,
 };
 pub use log::{ActorLog, FileActorLog, MemoryActorLog};
-pub use pipeline::{apply_command, ApplyCtx, EDIT_WINDOW_MS};
+pub use pipeline::{
+    apply_command, ingest_and_register_file, ApplyCtx, RegisteredFile, EDIT_WINDOW_MS,
+};
 pub use projection::Projection;
 pub use purge::PurgeGate;
 pub use signer::{Ed25519Signer, EventSigner, IdSource, RandomIds};

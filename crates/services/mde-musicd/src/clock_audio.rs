@@ -489,6 +489,17 @@ impl ClockAudioAuthority {
     ) -> ClockAudioStatusV1 {
         if let Some(active) = &self.active {
             if active.key.matches(request) {
+                if active.request.body != request.body {
+                    return self.status(
+                        request,
+                        now_ms,
+                        ClockAudioPlaybackPhase::RefusedStale,
+                        ClockAudioProviderStatus::NotApplicable,
+                        None,
+                        None,
+                        Some("occurrence_payload_conflict"),
+                    );
+                }
                 return self.status(
                     request,
                     now_ms,
@@ -1104,6 +1115,43 @@ mod tests {
         );
         assert_eq!(snoozed.phase, ClockAudioPlaybackPhase::Snoozed);
         assert_eq!(effects.music_volume, Some(1.0));
+    }
+
+    #[test]
+    fn active_occurrence_cannot_acknowledge_a_conflicting_audio_payload() {
+        let mut authority = ClockAudioAuthority::default();
+        let mut effects = Effects {
+            music_volume: Some(0.8),
+            provider_available: true,
+            output_available: true,
+            music_audible: true,
+            ..Effects::default()
+        };
+        assert_eq!(
+            authority
+                .apply(music_start("original-start", 3), NOW, &mut effects)
+                .phase,
+            ClockAudioPlaybackPhase::PlayingMusic
+        );
+
+        let mut substituted = music_start("substituted-start", 3);
+        let ClockAudioActionV1::Start { audio, .. } = &mut substituted.body else {
+            unreachable!("Music start fixture changed action")
+        };
+        let ClockAudioRef::Music { remote_id, .. } = audio else {
+            unreachable!("Music start fixture changed reference")
+        };
+        *remote_id = "attacker-track".into();
+
+        let refused = authority.apply(substituted, NOW + 1, &mut effects);
+        assert_eq!(refused.phase, ClockAudioPlaybackPhase::RefusedStale);
+        assert_eq!(
+            refused.reason_code.as_deref(),
+            Some("occurrence_payload_conflict")
+        );
+        assert_eq!(effects.starts, ["music:track-1"]);
+        assert_eq!(effects.volume_writes, [0.2]);
+        assert_eq!(effects.stops, 0);
     }
 
     #[test]

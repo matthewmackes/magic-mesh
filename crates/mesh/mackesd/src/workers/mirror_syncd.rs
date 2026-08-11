@@ -3,10 +3,11 @@
 //!
 //! Ties the `mirrors` building blocks into a periodic daemon:
 //!
-//!   * **Every node, every tick** writes its dnf `.repo` so it self-serves
-//!     from the local `file://` mount (upstream as fallback, W62) — idempotent
-//!     and cheap, so even a node that joined after the last pull is pointed at
-//!     the replicated mirror immediately.
+//!   * **Every node** self-serves from its local `file://` mount (upstream as
+//!     fallback, W62), but a restarted worker first retracts the retained repo
+//!     advertisement. It republishes only after this process either completes
+//!     an authoritative leader sync or observes a strictly forward generation
+//!     replicated from the current puller.
 //!   * **Only the leader** runs the actual pull
 //!     ([`crate::mirrors::sync_mirror`]: `dnf reposync` → `createrepo_c` →
 //!     stamp `.last-sync`). Syncthing replicates the result to every other node,
@@ -17,6 +18,7 @@
 //! A bad tick (network down, `dnf`/`createrepo_c` missing) is logged and
 //! swallowed; the next tick retries.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -40,6 +42,9 @@ pub struct MirrorSyncd {
     repo_dir: PathBuf,
     tick_interval: Duration,
     runner: Box<dyn MirrorSyncRunner + Send + Sync>,
+    startup_prepared: bool,
+    retained_generations: BTreeMap<String, Option<u64>>,
+    ready_mirrors: BTreeSet<String>,
 }
 
 impl MirrorSyncd {
@@ -55,6 +60,9 @@ impl MirrorSyncd {
             repo_dir: PathBuf::from(mirrors::DEFAULT_REPO_DIR),
             tick_interval: DEFAULT_SYNC_INTERVAL,
             runner: Box::new(SubprocessSync),
+            startup_prepared: false,
+            retained_generations: BTreeMap::new(),
+            ready_mirrors: BTreeSet::new(),
         }
     }
 
@@ -100,9 +108,49 @@ impl MirrorSyncd {
         self
     }
 
-    /// One sweep: write every enabled mirror's `.repo` (self-serve), and —
-    /// when leader — pull each one. Per-mirror errors are logged + swallowed.
+    /// Retract prior-process repo advertisements and remember their generations.
+    /// A failure leaves startup pending so the next sweep retries rather than
+    /// treating retained state as current.
+    fn prepare_startup(&mut self) -> bool {
+        if self.startup_prepared {
+            return true;
+        }
+
+        let mirrors = mirrors::load_mirrors(&self.workgroup_root);
+        let mut retained_generations = BTreeMap::new();
+        for mirror in &mirrors {
+            retained_generations.insert(
+                mirror.name.clone(),
+                mirror.last_sync_ms(&self.workgroup_root),
+            );
+            let repo_path = self
+                .repo_dir
+                .join(format!("mackes-mirror-{}.repo", mirror.name));
+            if let Err(error) = std::fs::remove_file(&repo_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        mirror = %mirror.name,
+                        path = %repo_path.display(),
+                        error = %error,
+                        "mirror-syncd: retained repo retraction failed; startup remains pending"
+                    );
+                    return false;
+                }
+            }
+        }
+        self.retained_generations = retained_generations;
+        self.ready_mirrors.clear();
+        self.startup_prepared = true;
+        true
+    }
+
+    /// One sweep: when leader, pull each enabled mirror; otherwise wait for a
+    /// strictly forward replicated sync generation. Only then publish the local
+    /// `.repo` advertisement. Per-mirror errors are logged + swallowed.
     async fn tick(&mut self) {
+        if !self.prepare_startup() {
+            return;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
@@ -117,19 +165,69 @@ impl MirrorSyncd {
             .iter()
             .filter(|m| m.enabled)
         {
-            // Every node self-serves from its local mount.
-            if let Err(e) = mirrors::write_dnf_repo(m, &self.workgroup_root, &self.repo_dir) {
-                tracing::warn!(mirror = %m.name, error = %e, "mirror-syncd: .repo write failed");
-            }
-            // Single puller: only the leader fetches from upstream.
+            let current_generation = m.last_sync_ms(&self.workgroup_root);
+            let retained_generation = self
+                .retained_generations
+                .entry(m.name.clone())
+                .or_insert(current_generation);
+            let was_ready = self.ready_mirrors.contains(&m.name);
+            let mut admitted_generation = None;
+            let mut generation_verified = was_ready
+                && matches!(
+                    (*retained_generation, current_generation),
+                    (Some(admitted), Some(current)) if current >= admitted
+                );
+
+            // Single puller: only the current authoritative leader fetches from
+            // upstream. A successful pull is sufficient current-process proof.
             if is_leader {
                 match mirrors::sync_mirror(&*self.runner, m, &self.workgroup_root, now_ms) {
-                    Ok(r) => tracing::info!(
-                        mirror = %r.name, rpms = r.rpm_count, at_ms = r.synced_at_ms,
-                        "mirror-syncd: pulled + indexed"
-                    ),
+                    Ok(r) => {
+                        generation_verified = true;
+                        admitted_generation = Some(r.synced_at_ms);
+                        tracing::info!(
+                            mirror = %r.name, rpms = r.rpm_count, at_ms = r.synced_at_ms,
+                            "mirror-syncd: pulled + indexed"
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!(mirror = %m.name, error = %e, "mirror-syncd: sync failed");
+                    }
+                }
+            } else if !generation_verified {
+                generation_verified = match (*retained_generation, current_generation) {
+                    (None, Some(_)) => true,
+                    (Some(previous), Some(current)) => current > previous,
+                    _ => false,
+                };
+                admitted_generation = generation_verified.then_some(current_generation).flatten();
+            }
+
+            if generation_verified {
+                if let Err(e) = mirrors::write_dnf_repo(m, &self.workgroup_root, &self.repo_dir) {
+                    tracing::warn!(mirror = %m.name, error = %e, "mirror-syncd: .repo write failed");
+                } else {
+                    if let Some(generation) = admitted_generation.or(current_generation) {
+                        *retained_generation = Some(retained_generation.map_or(
+                            generation,
+                            |previous| previous.max(generation),
+                        ));
+                    }
+                    self.ready_mirrors.insert(m.name.clone());
+                }
+            } else if was_ready {
+                self.ready_mirrors.remove(&m.name);
+                let repo_path = self
+                    .repo_dir
+                    .join(format!("mackes-mirror-{}.repo", m.name));
+                if let Err(error) = std::fs::remove_file(&repo_path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            mirror = %m.name,
+                            path = %repo_path.display(),
+                            error = %error,
+                            "mirror-syncd: regressed mirror generation could not be retracted"
+                        );
                     }
                 }
             }
@@ -157,10 +255,13 @@ impl Worker for MirrorSyncd {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        let mut interval = tokio::time::interval(self.tick_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown.wait() => return Ok(()),
-                _ = tokio::time::sleep(self.tick_interval) => {
+                _ = interval.tick() => {
                     self.tick().await;
                 }
             }
@@ -185,6 +286,16 @@ mod tests {
         fn createrepo(&self, dir: &Path) -> Result<(), String> {
             std::fs::create_dir_all(dir.join("repodata")).unwrap();
             Ok(())
+        }
+    }
+
+    struct FailingRunner;
+    impl MirrorSyncRunner for FailingRunner {
+        fn reposync(&self, _name: &str, _upstream: &str, _dest: &Path) -> Result<u32, String> {
+            Err("injected upstream failure".into())
+        }
+        fn createrepo(&self, _dir: &Path) -> Result<(), String> {
+            panic!("createrepo must not run after reposync failure")
         }
     }
 
@@ -221,11 +332,21 @@ mod tests {
         let mut w = worker(tmp.path(), tmp.path().join("role.host"));
         w.tick().await;
         let m = &mirrors::core_pack()[0];
-        // No pull → no .last-sync; but the node still self-serves (.repo written).
+        // Retained or absent state is not advertised by a restarted process.
         assert!(
             m.last_sync_ms(tmp.path()).is_none(),
             "non-leader must NOT pull (single-puller contract)"
         );
+        assert!(!tmp
+            .path()
+            .join("yum.repos.d/mackes-mirror-magic-mesh.repo")
+            .exists());
+
+        // A strictly forward generation replicated from the live puller makes
+        // the local mirror eligible for self-service.
+        std::fs::create_dir_all(m.local_dir(tmp.path())).unwrap();
+        std::fs::write(m.local_dir(tmp.path()).join(".last-sync"), "2").unwrap();
+        w.tick().await;
         assert!(tmp
             .path()
             .join("yum.repos.d/mackes-mirror-magic-mesh.repo")
@@ -240,5 +361,67 @@ mod tests {
         let mut w = worker(tmp.path(), marker);
         w.tick().await;
         assert!(mirrors::core_pack()[0].last_sync_ms(tmp.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_republish_retained_generation_after_sync_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("role.host");
+        let mirror = &mirrors::core_pack()[0];
+        std::fs::create_dir_all(mirror.local_dir(tmp.path())).unwrap();
+        std::fs::write(mirror.local_dir(tmp.path()).join(".last-sync"), "1").unwrap();
+        mirrors::write_dnf_repo(mirror, tmp.path(), &tmp.path().join("yum.repos.d"))
+            .expect("retained repo advertisement");
+        crate::leader::force_take(&tmp.path().join(".mackesd-leader.lock"), "peer:test").unwrap();
+        crate::workers::nebula_supervisor::write_role_marker(&marker, "peer:test").unwrap();
+
+        let mut w = worker(tmp.path(), marker).with_runner(Box::new(FailingRunner));
+        w.tick().await;
+
+        assert_eq!(mirror.last_sync_ms(tmp.path()), Some(1));
+        assert!(
+            !tmp.path()
+                .join("yum.repos.d/mackes-mirror-magic-mesh.repo")
+                .exists(),
+            "a failed current-process sync must not republish retained readiness"
+        );
+
+        w.runner = Box::new(MockRunner);
+        w.tick().await;
+        assert!(tmp
+            .path()
+            .join("yum.repos.d/mackes-mirror-magic-mesh.repo")
+            .exists());
+        assert_ne!(mirror.last_sync_ms(tmp.path()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn replicated_generation_rollback_retracts_repo_until_corrected_forward_return() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = &mirrors::core_pack()[0];
+        std::fs::create_dir_all(mirror.local_dir(tmp.path())).unwrap();
+        let mut w = worker(tmp.path(), tmp.path().join("role.host"));
+
+        w.tick().await;
+        std::fs::write(mirror.local_dir(tmp.path()).join(".last-sync"), "2").unwrap();
+        w.tick().await;
+        let repo = tmp
+            .path()
+            .join("yum.repos.d/mackes-mirror-magic-mesh.repo");
+        assert!(repo.exists(), "forward peer generation must be admitted");
+
+        std::fs::write(mirror.local_dir(tmp.path()).join(".last-sync"), "1").unwrap();
+        w.tick().await;
+        assert!(
+            !repo.exists(),
+            "a rolled-back replicated generation must retract the advertised mirror"
+        );
+
+        std::fs::write(mirror.local_dir(tmp.path()).join(".last-sync"), "3").unwrap();
+        w.tick().await;
+        assert!(
+            repo.exists(),
+            "a strictly corrected-forward peer generation must restore the mirror"
+        );
     }
 }

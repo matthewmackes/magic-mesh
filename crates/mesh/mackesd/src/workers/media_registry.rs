@@ -148,9 +148,10 @@ pub fn publish_server_record(node_id: &str, reg: &MediaServerRecord) {
 /// Publish the complete operator-configured endpoint roster for a node.
 pub fn publish_server_records(node_id: &str, records: &[MediaServerRecord]) {
     let topic = mesh_media::media_registry_topic(node_id);
+    let records = unambiguous_server_records(records);
     if let Some(mut persist) = crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
     {
-        crate::bus_publish::publish_json(&mut persist, &topic, &records.to_vec());
+        crate::bus_publish::publish_json(&mut persist, &topic, &records);
     }
 }
 
@@ -161,10 +162,38 @@ pub fn write_shared_server_record(mount: &Path, hostname: &str, reg: &MediaServe
 
 /// Atomically mirror the complete endpoint roster to the shared registry.
 pub fn write_shared_server_records(mount: &Path, hostname: &str, records: &[MediaServerRecord]) {
-    let Ok(body) = serde_json::to_string(records) else {
+    let Ok(body) = serde_json::to_string(&unambiguous_server_records(records)) else {
         return;
     };
     write_shared_body(mount, hostname, &body);
+}
+
+/// Retain only exact, validated declarations for an unambiguous provider
+/// endpoint. Exact duplicates collapse; if one canonical endpoint carries two
+/// different declarations, every row for that endpoint is withheld. Publishing
+/// the resulting empty roster is intentional: it revokes an older retained
+/// provider instead of letting ordering choose a credential or health claim.
+fn unambiguous_server_records(records: &[MediaServerRecord]) -> Vec<MediaServerRecord> {
+    let mut accepted = Vec::<MediaServerRecord>::new();
+    let mut conflicted = Vec::<String>::new();
+
+    for record in records.iter().filter_map(MediaServerRecord::validated) {
+        if conflicted.iter().any(|endpoint| endpoint == &record.endpoint) {
+            continue;
+        }
+        if let Some(existing) = accepted
+            .iter()
+            .find(|existing| existing.endpoint == record.endpoint)
+        {
+            if existing != &record {
+                conflicted.push(record.endpoint.clone());
+                accepted.retain(|existing| existing.endpoint != record.endpoint);
+            }
+            continue;
+        }
+        accepted.push(record);
+    }
+    accepted
 }
 
 /// MEDIA-8 — resolve the read-only shared account to publish from the
@@ -225,7 +254,7 @@ pub struct MediaRegistryWorker {
     /// Optional operator-configured endpoint. When present, this is the
     /// versioned credential-free record published by the worker instead of
     /// the legacy locally-hosted registration.
-    operator_records: Vec<MediaServerRecord>,
+    operator_records: Option<Vec<MediaServerRecord>>,
 }
 
 impl MediaRegistryWorker {
@@ -244,7 +273,7 @@ impl MediaRegistryWorker {
             secret_store,
             publish_heartbeat: PUBLISH_HEARTBEAT,
             last_publish: Mutex::new(None),
-            operator_records: Vec::new(),
+            operator_records: None,
         }
     }
 
@@ -276,7 +305,7 @@ impl MediaRegistryWorker {
     /// record contains only a secret-store reference, never credentials.
     #[must_use]
     pub fn with_server_record(mut self, record: MediaServerRecord) -> Self {
-        self.operator_records = vec![record];
+        self.operator_records = Some(unambiguous_server_records(&[record]));
         self
     }
 
@@ -285,7 +314,12 @@ impl MediaRegistryWorker {
     /// server without losing the operator's ordering and health metadata.
     #[must_use]
     pub fn with_server_records(mut self, records: Vec<MediaServerRecord>) -> Self {
-        self.operator_records = records;
+        // An empty input means the legacy local registration remains active.
+        // A non-empty but wholly equivocated input remains explicitly configured
+        // as an empty roster so it revokes authority rather than falling back.
+        if !records.is_empty() {
+            self.operator_records = Some(unambiguous_server_records(&records));
+        }
         self
     }
 
@@ -301,8 +335,8 @@ impl MediaRegistryWorker {
     }
 
     fn tick_once(&self) -> bool {
-        if !self.operator_records.is_empty() {
-            if let Ok(body) = serde_json::to_string(&self.operator_records) {
+        if let Some(operator_records) = self.operator_records.as_ref() {
+            if let Ok(body) = serde_json::to_string(operator_records) {
                 let mut last = self
                     .last_publish
                     .lock()
@@ -317,11 +351,11 @@ impl MediaRegistryWorker {
                     now,
                     self.publish_heartbeat,
                 ) {
-                    publish_server_records(&self.node_id, &self.operator_records);
+                    publish_server_records(&self.node_id, operator_records);
                     *last = Some((body, now));
                 }
             }
-            write_shared_server_records(&self.mount, &self.hostname, &self.operator_records);
+            write_shared_server_records(&self.mount, &self.hostname, operator_records);
             return true;
         }
         let reg = self.build_registration();
@@ -541,6 +575,70 @@ mod tests {
         assert!(json.contains("\"credential_ref\":\"media/airsonic/nas\""));
         assert!(!json.contains("password"));
         assert_eq!(mesh_media::parse_media_server_records(&json), vec![record]);
+    }
+
+    #[test]
+    fn equivocated_provider_identity_is_revoked_without_legacy_fallback() {
+        let primary = MediaServerRecord::new(
+            "https://nas.lan:4040",
+            mesh_media::MediaServerKind::Airsonic,
+            10,
+            mesh_media::MediaServerHealth::Healthy,
+            Some(12),
+            "media/airsonic/nas-a",
+        )
+        .unwrap();
+        let conflicting = MediaServerRecord::new(
+            "HTTPS://NAS.LAN:4040/",
+            mesh_media::MediaServerKind::Airsonic,
+            10,
+            mesh_media::MediaServerHealth::Healthy,
+            Some(12),
+            "media/airsonic/nas-b",
+        )
+        .unwrap();
+        let unrelated = MediaServerRecord::new(
+            "https://backup.lan:4040",
+            mesh_media::MediaServerKind::Airsonic,
+            20,
+            mesh_media::MediaServerHealth::Degraded,
+            Some(30),
+            "media/airsonic/backup",
+        )
+        .unwrap();
+
+        let roster = unambiguous_server_records(&[
+            primary.clone(),
+            primary.clone(),
+            conflicting.clone(),
+            unrelated.clone(),
+        ]);
+        assert_eq!(roster, vec![unrelated], "unrelated provider must survive");
+
+        let worker = MediaRegistryWorker::new("peer:eagle".into(), "eagle".into())
+            .with_server_records(vec![primary.clone(), conflicting.clone()]);
+        assert_eq!(
+            worker.operator_records.as_deref(),
+            Some(&[] as &[MediaServerRecord]),
+            "an entirely conflicted configured roster must remain an explicit revocation"
+        );
+        assert!(
+            MediaRegistryWorker::new("peer:eagle".into(), "eagle".into())
+                .with_server_records(Vec::new())
+                .operator_records
+                .is_none(),
+            "an actually absent operator roster must retain legacy local discovery"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_shared_server_records(tmp.path(), "eagle", &[primary, conflicting]);
+        let body = std::fs::read_to_string(
+            tmp.path()
+                .join("eagle")
+                .join(mesh_media::MEDIA_REGISTRY_FILE),
+        )
+        .unwrap();
+        assert_eq!(body, "[]", "retained provider authority must be revoked");
     }
 
     #[test]

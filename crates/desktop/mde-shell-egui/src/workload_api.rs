@@ -163,6 +163,9 @@ pub(crate) fn read_state(persist: &Persist, node: &str) -> Option<WorkloadStateS
     reject_duplicate_json_keys(body.body.as_deref()?).ok()?;
     let snapshot: WorkloadStateSnapshot = serde_json::from_str(body.body.as_deref()?).ok()?;
     snapshot.validate(current_ms()).ok()?;
+    if snapshot.node != node {
+        return None;
+    }
     Some(snapshot)
 }
 
@@ -275,6 +278,32 @@ mod tests {
         assert!(
             read_state(&persist, "seat15").is_none(),
             "duplicate persisted JSON must never become shell projection state"
+        );
+    }
+
+    #[test]
+    fn foreign_node_projection_cannot_authorize_local_workload_presentation() {
+        let bus = tempfile::tempdir().expect("bus tempdir");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let snapshot = WorkloadStateSnapshot {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            node: "attacker".into(),
+            observed_at_ms: current_ms(),
+            workloads: Vec::new(),
+        };
+        let body = serde_json::to_string(&snapshot).expect("serialize hostile projection");
+        persist
+            .write(
+                &workload_state_topic("seat15"),
+                Priority::Default,
+                Some("foreign Workload projection"),
+                Some(&body),
+            )
+            .expect("persist hostile projection");
+
+        assert!(
+            read_state(&persist, "seat15").is_none(),
+            "a valid foreign-node projection must not become local readiness or presentation authority"
         );
     }
 }

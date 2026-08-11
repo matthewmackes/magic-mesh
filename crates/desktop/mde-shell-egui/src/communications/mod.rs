@@ -33,6 +33,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendE
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
+use mackes_mesh_types::clock::CLOCK_COMMAND_PREFIX;
 use mackes_mesh_types::vdi_clipboard::{
     ClipboardMaterialization, CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS,
     CLIPBOARD_MATERIALIZATION_TOPIC,
@@ -106,6 +107,25 @@ fn now_unix_ms() -> i64 {
 fn read_state<T: DeserializeOwned>(persist: &Persist, topic: &str) -> Option<T> {
     let msg = persist.read_latest(topic).ok().flatten()?;
     serde_json::from_str(&msg.body?).ok()
+}
+
+/// Remove Clock mutation capabilities from the retained collaboration mirror.
+///
+/// Mesh Teams remains a truthful retained notification view, but it is not a
+/// second Clock command authority.  In particular, a shell restart must not
+/// revive a generic `RunAlertAction` carrying an old `action/clock/command/*`
+/// verb after the daemon has replaced that occurrence generation.  Live Clock
+/// controls are rebuilt from the current bounded Clock projection and signed by
+/// `ClockState`; display-only alert history and unrelated alert actions remain.
+fn strip_retained_clock_command_authority(inbox: &mut AlertInbox) {
+    for row in &mut inbox.alerts {
+        row.alert.actions.retain(|action| {
+            !action
+                .verb
+                .as_deref()
+                .is_some_and(|verb| verb.starts_with(CLOCK_COMMAND_PREFIX))
+        });
+    }
 }
 
 /// Normalize line endings and bound one native clipboard value at a UTF-8
@@ -886,8 +906,14 @@ impl LiveCollabData {
         }
         let transfer_jobs =
             read_state::<TransferJobs>(&persist, &topics::state_topic(proj::TRANSFER_JOBS));
-        let alert_inbox =
-            read_state::<AlertInbox>(&persist, &topics::state_topic(proj::ALERT_INBOX));
+        let alert_inbox = read_state::<AlertInbox>(
+            &persist,
+            &topics::state_topic(proj::ALERT_INBOX),
+        )
+        .map(|mut inbox| {
+            strip_retained_clock_command_authority(&mut inbox);
+            inbox
+        });
         self.activity = activity;
         self.conversations = conversations;
         self.message_pins = message_pins;
@@ -1356,11 +1382,13 @@ pub(crate) fn read_acceptance_clipboard() -> Result<Option<(String, usize)>, Str
 mod tests {
     use super::*;
 
-    use mde_collab_types::value::{sha256_hex, CallKind, ClipItemKind, DeliveryState, MessageBody};
+    use mde_collab_types::value::{
+        sha256_hex, AlertActionKind, CallKind, ClipItemKind, DeliveryState, MessageBody, Severity,
+    };
     use mde_collab_types::{
-        ActivityEntry, ActorClock, CallParticipantState, CallParticipantView, CallView,
-        ChannelTasks, ClipboardView, EventId, MessagePins, MessageView, SavedMessageView,
-        SavedMessages, SpaceKind, SpaceRole, SpaceSummary, TaskView,
+        ActivityEntry, ActorClock, AlertAction, AlertPayload, AlertView, CallParticipantState,
+        CallParticipantView, CallView, ChannelTasks, ClipboardView, EventId, MessagePins,
+        MessageView, SavedMessageView, SavedMessages, SpaceKind, SpaceRole, SpaceSummary, TaskView,
     };
 
     fn persist_at(root: &Path) -> Persist {
@@ -1636,6 +1664,65 @@ mod tests {
         assert!(data.thread(SpaceId::new(), ThreadId::new()).is_none());
         assert!(data.transfer_jobs().is_none());
         assert!(data.alert_inbox().is_none());
+    }
+
+    #[test]
+    fn restarted_shell_cannot_adopt_retained_generic_clock_command_authority() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let stale_clock_verb = format!("{CLOCK_COMMAND_PREFIX}recycled-seat");
+        write_state(
+            &persist,
+            &topics::state_topic(proj::ALERT_INBOX),
+            &AlertInbox {
+                alerts: vec![AlertView {
+                    event_id: EventId::new(),
+                    space: SpaceId::new(),
+                    alert: AlertPayload {
+                        severity: Severity::Critical,
+                        source: "former-clock-generation".to_owned(),
+                        headline: "Retained ringing alarm".to_owned(),
+                        fields: std::collections::BTreeMap::new(),
+                        actions: vec![
+                            AlertAction {
+                                id: "stale-stop".to_owned(),
+                                label: "Stop".to_owned(),
+                                verb: Some(stale_clock_verb),
+                                kind: AlertActionKind::Safe,
+                            },
+                            AlertAction {
+                                id: "inspect".to_owned(),
+                                label: "Inspect".to_owned(),
+                                verb: Some("action/collab/inspect".to_owned()),
+                                kind: AlertActionKind::Safe,
+                            },
+                        ],
+                        goto: Some("clock".to_owned()),
+                    },
+                    acknowledged: false,
+                    snoozed_until_unix_ms: None,
+                }],
+            },
+        );
+
+        // A new shell process reloads the worker-retained inbox.  The row stays
+        // visible, but only a current Clock projection may mint Clock commands.
+        let mut restarted = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        restarted.refresh();
+        let inbox = restarted.alert_inbox().expect("retained inbox");
+        assert_eq!(inbox.alerts.len(), 1, "notification history remains visible");
+        assert_eq!(inbox.alerts[0].alert.headline, "Retained ringing alarm");
+        assert_eq!(inbox.alerts[0].alert.goto.as_deref(), Some("clock"));
+        assert_eq!(
+            inbox.alerts[0].alert.actions,
+            vec![AlertAction {
+                id: "inspect".to_owned(),
+                label: "Inspect".to_owned(),
+                verb: Some("action/collab/inspect".to_owned()),
+                kind: AlertActionKind::Safe,
+            }],
+            "the stale Clock verb is stripped without erasing unrelated alert actions"
+        );
     }
 
     #[test]

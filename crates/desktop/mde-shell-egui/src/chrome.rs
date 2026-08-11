@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mackes_mesh_types::health::SystemMeshHealthSnapshot;
+use mackes_mesh_types::health::{SystemMeshHealthSnapshot, HEALTH_SCHEMA_VERSION};
 use mackes_mesh_types::peers::default_workgroup_root;
 use mde_egui::egui;
 
@@ -187,10 +187,51 @@ impl HealthStatus {
     }
 }
 
-fn read_health(path: &Path) -> HealthStatus {
+/// Admit only the local observer's forward, unambiguous health authority.
+/// Kiron and the rest of shell chrome may retain a still-fresh last-known-good
+/// projection across a torn replacement, but a foreign observer, rollback, or
+/// same-generation equivocation cannot relabel the lower third.
+fn admit_health_snapshot(
+    current: Option<&SystemMeshHealthSnapshot>,
+    candidate: SystemMeshHealthSnapshot,
+    expected_observer: &str,
+    now_ms: u64,
+) -> Option<SystemMeshHealthSnapshot> {
+    if candidate.schema_version != HEALTH_SCHEMA_VERSION
+        || candidate.observer != expected_observer
+        || candidate.generation == 0
+        || !candidate.is_fresh(now_ms)
+    {
+        return current.filter(|snapshot| snapshot.is_fresh(now_ms)).cloned();
+    }
+
+    if let Some(current) = current {
+        if candidate.generation < current.generation
+            || (candidate.generation == current.generation && candidate != *current)
+        {
+            return current.is_fresh(now_ms).then(|| current.clone());
+        }
+    }
+
+    Some(candidate)
+}
+
+fn read_health(
+    path: &Path,
+    current: Option<&SystemMeshHealthSnapshot>,
+    now_ms: u64,
+) -> HealthStatus {
+    let expected_observer = path.file_stem().and_then(std::ffi::OsStr::to_str);
+    let candidate = read_bounded_chrome_record(path)
+        .and_then(|body| serde_json::from_str::<SystemMeshHealthSnapshot>(&body).ok());
+    let snapshot = match (expected_observer, candidate) {
+        (Some(expected_observer), Some(candidate)) => {
+            admit_health_snapshot(current, candidate, expected_observer, now_ms)
+        }
+        _ => current.filter(|snapshot| snapshot.is_fresh(now_ms)).cloned(),
+    };
     HealthStatus {
-        snapshot: read_bounded_chrome_record(path)
-            .and_then(|body| serde_json::from_str(&body).ok()),
+        snapshot,
         seen: true,
     }
 }
@@ -252,7 +293,7 @@ impl ChromeState {
             self.last_poll = Some(Instant::now());
             let snapshot = read_bounded_chrome_record(&self.snapshot_path).unwrap_or_default();
             self.summary = MeshSummary::from_snapshot(&snapshot);
-            self.health = read_health(&self.health_path);
+            self.health = read_health(&self.health_path, self.health.snapshot(), now_ms());
         }
         ctx.request_repaint_after(REFRESH);
     }
@@ -371,9 +412,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("health.json");
         std::fs::write(&path, "not-json").unwrap();
-        let health = read_health(&path);
+        let health = read_health(&path, None, 1_000);
         assert!(health.seen);
         assert!(health.snapshot().is_none());
         assert_eq!(health.active_count(), 0);
+    }
+
+    #[test]
+    fn hostile_health_replacement_cannot_take_kiron_lower_third_authority() {
+        use std::collections::BTreeSet;
+
+        let now_ms = 10_000;
+        let canonical_nodes = BTreeSet::new();
+        let current = mackes_mesh_types::health::fold_snapshot(
+            "seat-15",
+            "roster-7",
+            &canonical_nodes,
+            Vec::new(),
+            7,
+            now_ms,
+            5_000,
+            0,
+        );
+
+        let foreign = mackes_mesh_types::health::fold_snapshot(
+            "hostile-seat",
+            "roster-8",
+            &canonical_nodes,
+            Vec::new(),
+            8,
+            now_ms,
+            5_000,
+            0,
+        );
+        let rollback = mackes_mesh_types::health::fold_snapshot(
+            "seat-15",
+            "roster-6",
+            &canonical_nodes,
+            Vec::new(),
+            6,
+            now_ms,
+            5_000,
+            0,
+        );
+        let equivocation = mackes_mesh_types::health::fold_snapshot(
+            "seat-15",
+            "hostile-roster",
+            &canonical_nodes,
+            Vec::new(),
+            7,
+            now_ms,
+            5_000,
+            0,
+        );
+
+        for hostile in [foreign, rollback, equivocation] {
+            let admitted = admit_health_snapshot(Some(&current), hostile, "seat-15", now_ms)
+                .expect("fresh admitted authority remains available");
+            assert_eq!(admitted, current);
+        }
     }
 }

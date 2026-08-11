@@ -6,6 +6,7 @@
 //! connection/profile fields are never requested or serialized.
 
 use std::process::Command;
+use std::time::Duration;
 
 use mackes_mesh_types::network_status::{
     NetworkProvider, ProviderLinkObservation, ProviderLinkState, MAX_PROVIDER_LINKS,
@@ -16,6 +17,10 @@ use serde_json::{Map, Value};
 /// enumerate arbitrary device graphs; the world-readable status boundary must
 /// remain small even when a provider misbehaves.
 pub const MAX_STATUS_COMMAND_BYTES: usize = 64 * 1024;
+
+/// A wedged host provider must degrade to unavailable before it can pin the
+/// mesh-status worker's observation tick.
+const STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Honest availability of an observed audio component.  `Available` means
 /// that the component returned bounded evidence, not that playback works.
@@ -120,13 +125,32 @@ pub trait NetworkCommandRunner {
 /// is involved and no connection/profile data is requested.
 pub struct SystemNetworkCommandRunner;
 
+#[cfg(feature = "async-services")]
+fn run_status_command(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    let output = crate::workers::proc::output_with_timeout(command, timeout).ok()?;
+    output.status.success().then(|| {
+        let end = output.stdout.len().min(MAX_STATUS_COMMAND_BYTES);
+        String::from_utf8_lossy(&output.stdout[..end]).into_owned()
+    })
+}
+
+// `async-services` is the production daemon surface. Keep the read-only module
+// available to no-default-feature library consumers without pulling in the
+// worker pool; those consumers do not run the supervised provider collector.
+#[cfg(not(feature = "async-services"))]
+fn run_status_command(program: &str, args: &[&str], _timeout: Duration) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output.status.success().then(|| {
+        let end = output.stdout.len().min(MAX_STATUS_COMMAND_BYTES);
+        String::from_utf8_lossy(&output.stdout[..end]).into_owned()
+    })
+}
+
 impl NetworkCommandRunner for SystemNetworkCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(program).args(args).output().ok()?;
-        output.status.success().then(|| {
-            let end = output.stdout.len().min(MAX_STATUS_COMMAND_BYTES);
-            String::from_utf8_lossy(&output.stdout[..end]).into_owned()
-        })
+        run_status_command(program, args, STATUS_COMMAND_TIMEOUT)
     }
 }
 
@@ -410,6 +434,8 @@ pub fn merge_provider_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "async-services")]
+    use std::time::Instant;
 
     struct FakeRunner {
         nmcli: Option<&'static str>,
@@ -459,6 +485,23 @@ mod tests {
                 _ => None,
             }
         }
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn hostile_network_provider_cannot_pin_the_observation_worker() {
+        let started = Instant::now();
+        let output = run_status_command(
+            "sh",
+            &["-c", "exec sleep 60"],
+            Duration::from_millis(100),
+        );
+
+        assert!(output.is_none(), "timed-out provider must be unavailable");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "provider deadline must bound the observation tick"
+        );
     }
 
     #[test]

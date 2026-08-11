@@ -486,7 +486,8 @@ impl Probe {
 /// `ok` when the no-op command succeeds, `fail` otherwise (unreachable, auth,
 /// timeout, or a missing `ssh` binary).
 fn probe_dom0(key: &str, dom0: &str) -> Probe {
-    let out = std::process::Command::new("ssh")
+    let mut command = std::process::Command::new("ssh");
+    command
         .args([
             "-i",
             key,
@@ -498,8 +499,8 @@ fn probe_dom0(key: &str, dom0: &str) -> Probe {
             "ConnectTimeout=8",
             &format!("root@{dom0}"),
             "true",
-        ])
-        .output();
+        ]);
+    let out = run_dom0_probe_command(command, crate::workers::proc::DEFAULT_CMD_TIMEOUT);
     match out {
         Ok(o) if o.status.success() => Probe::ok("ssh reachable"),
         Ok(o) => Probe::fail(format!(
@@ -510,6 +511,13 @@ fn probe_dom0(key: &str, dom0: &str) -> Probe {
         )),
         Err(e) => Probe::fail(format!("ssh spawn failed: {e}")),
     }
+}
+
+fn run_dom0_probe_command(
+    command: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    crate::workers::proc::output_with_timeout(command, timeout)
 }
 
 /// Probe the SUBSTRATE-V2 etcd store's `/health` endpoint via `curl`. `ok` when
@@ -1038,6 +1046,14 @@ mod tests {
         let multi = "é".repeat(500);
         let rec2 = h.observe("dom0:x", "fail", &multi).unwrap();
         assert_eq!(rec2.detail.chars().count(), DETAIL_LEN);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dom0_probe_command_times_out_a_hung_child() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        assert!(run_dom0_probe_command(command, Duration::from_millis(50)).is_err());
     }
 
     // ---- VM-crash check ----

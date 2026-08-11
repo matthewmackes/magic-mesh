@@ -573,6 +573,31 @@ fn build_power_request(
     .map(Some)
 }
 
+/// Resolve lifecycle authority from the sole typed Workloads projection.
+///
+/// A discovery card is presentation data, not proof that the workload still
+/// exists.  Missing, malformed, or backend-equivocated projection rows must
+/// therefore fail closed instead of being converted into generation zero.
+fn authoritative_workload_generation(
+    root: &Path,
+    node: &str,
+    workload_id: &str,
+) -> Result<u64, String> {
+    let persist = mde_bus::persist::Persist::open(root.to_path_buf())
+        .map_err(|error| format!("authoritative Workload projection unavailable: {error}"))?;
+    let status = crate::workload_api::read_status(&persist, node, workload_id).ok_or_else(|| {
+        format!(
+            "authoritative Workload projection has no current row for {workload_id} on {node}"
+        )
+    })?;
+    if status.backend != WorkloadBackend::LibvirtVirtqemud {
+        return Err(format!(
+            "authoritative Workload row for {workload_id} is not a VM"
+        ));
+    }
+    Ok(status.generation)
+}
+
 // ─────────────── CHOOSER-8: card actions + find + offline states ───────────────
 
 /// Typed verb: add a manual desktop source (`action/desktops/add-source`). MUST
@@ -1847,12 +1872,14 @@ impl ChooserState {
             self.last_error = Some("No mesh Bus directory — VM power actions unavailable.".into());
             return;
         };
-        let expected_generation = mde_bus::persist::Persist::open(root.to_path_buf())
-            .ok()
-            .and_then(|persist| {
-                crate::workload_api::read_status(&persist, &source.node, &source.id)
-            })
-            .map_or(0, |status| status.generation);
+        let expected_generation =
+            match authoritative_workload_generation(root, &source.node, &source.id) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.last_error = Some(format!("VM power authorization unavailable: {error}"));
+                    return;
+                }
+            };
         let now_ms = unix_millis();
         let request = match build_power_request(sources, id, op, expected_generation, now_ms) {
             Ok(Some(request)) => request,
@@ -2629,6 +2656,18 @@ mod pinned_rail_sources_tests {
         );
         state.refresh();
         state
+    }
+
+    #[test]
+    fn stale_discovery_card_cannot_authorize_power_without_workload_projection() {
+        let root = tempfile::tempdir().expect("temporary Bus root");
+        let error = authoritative_workload_generation(root.path(), "elm", "vm:elm:dev")
+            .expect_err("a discovery-only card must not mint lifecycle authority");
+
+        assert!(
+            error.contains("no current row"),
+            "missing Workloads authority must fail closed: {error}"
+        );
     }
 
     #[test]

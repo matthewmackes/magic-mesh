@@ -16,7 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use mde_collab_types::{
@@ -28,6 +28,9 @@ use mde_collab_types::{
 use sha2::{Digest, Sha256};
 
 use super::job::{Method, TransferJob, TransferState};
+
+const MAX_STAGING_NAME_ATTEMPTS: u64 = 128;
+static STAGING_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Which side of a V2 route the Files authority is resolving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,21 +131,21 @@ pub trait FilesEndpointResolver: Send + Sync {
     ) -> Result<ResolvedFilesEndpoint, FilesResolveFailure>;
 
     /// Commit one fully written and verified staging file through the Files
-    /// authority that resolved the destination. Mutable test/alternate
-    /// authorities use the safe default atomic replacement; content-addressed
-    /// production authorities override this to update bytes and metadata with
-    /// corrected-forward ordering.
+    /// authority that resolved the destination. Implementations must update the
+    /// canonical Files generation; returning success after changing bytes alone
+    /// is insufficient because the executor independently confirms that
+    /// generation before completing the job.
     ///
     /// # Errors
     ///
     /// Returns a closed commit failure without exposing a host path.
     fn commit_staged_copy(
         &self,
-        admitted: &ResolvedTransferJobV2,
-        staged_path: &Path,
-        outcome: &FilesCopyOutcome,
+        _admitted: &ResolvedTransferJobV2,
+        _staged_path: &Path,
+        _outcome: &FilesCopyOutcome,
     ) -> Result<(), FilesCommitFailure> {
-        commit_replace_destination(admitted, staged_path, outcome)
+        Err(FilesCommitFailure::MutationUnsupported)
     }
 }
 
@@ -718,6 +721,7 @@ pub(super) fn open_bounded_files_source(
             field: "sha256",
         });
     }
+    ensure_current(resolver, identity, role, &record)?;
     file.rewind()
         .map_err(|_| TransferV2ResolutionError::MetadataUnavailable(role))?;
     Ok(file)
@@ -774,10 +778,12 @@ pub fn revalidate_for_open(
 /// destination object.
 ///
 /// The source is opened without following a final symlink after full resolver
-/// revalidation. Bytes are streamed into a create-new sibling, hashed while
-/// moving, synced, and compared with the bound generation. The destination is
-/// revalidated once more before an atomic rename; rename replaces a raced final
-/// symlink itself rather than following it. A canceled attempt never commits.
+/// revalidation. Bytes are streamed into a uniquely claimed create-new sibling,
+/// hashed while moving, synced, and compared with the bound generation. Dirty
+/// restart residue cannot block a retry and is never unlinked as if this
+/// process owned it. The destination is revalidated once more before an atomic
+/// rename; rename replaces a raced final symlink itself rather than following
+/// it. A canceled attempt never commits.
 ///
 /// # Errors
 ///
@@ -810,22 +816,7 @@ pub fn execute_local_mesh_copy(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(FilesCopyError::Commit(FilesCommitFailure::Filesystem))?;
-    let temporary = parent.join(format!(
-        ".{file_name}.transfer-{}-{}-{}.part",
-        admitted.job.transfer,
-        admitted.job.progress.attempt,
-        std::process::id()
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(0o400000);
-    }
-    let mut output = options
-        .open(&temporary)
-        .map_err(|_| FilesCopyError::Commit(FilesCommitFailure::Filesystem))?;
+    let (temporary, mut output) = claim_staging_file(parent, file_name, admitted)?;
 
     let result = (|| {
         let mut digest = Sha256::new();
@@ -872,6 +863,8 @@ pub fn execute_local_mesh_copy(
         resolver
             .commit_staged_copy(admitted, &temporary, &outcome)
             .map_err(FilesCopyError::Commit)?;
+        confirm_destination_generation(admitted, resolver, &outcome)
+            .map_err(FilesCopyError::Commit)?;
         Ok(outcome)
     })();
 
@@ -881,6 +874,83 @@ pub fn execute_local_mesh_copy(
     result
 }
 
+fn claim_staging_file(
+    parent: &Path,
+    file_name: &str,
+    admitted: &ResolvedTransferJobV2,
+) -> Result<(PathBuf, File), FilesCopyError> {
+    for _ in 0..MAX_STAGING_NAME_ATTEMPTS {
+        let sequence = STAGING_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{file_name}.transfer-{}-{}-{}-{sequence}.part",
+            admitted.job.transfer,
+            admitted.job.progress.attempt,
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(0o400000);
+        }
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                return Err(FilesCopyError::Commit(FilesCommitFailure::Filesystem));
+            }
+        }
+    }
+    Err(FilesCopyError::Commit(FilesCommitFailure::Filesystem))
+}
+
+/// Require a canonical destination-generation acknowledgement after the
+/// mutation authority returns. A retry may observe the desired bytes already
+/// bound to the generation admitted for that retry; otherwise the authority
+/// must advance monotonically from the admitted predecessor generation.
+fn confirm_destination_generation(
+    admitted: &ResolvedTransferJobV2,
+    resolver: &dyn FilesEndpointResolver,
+    outcome: &FilesCopyOutcome,
+) -> Result<u64, FilesCommitFailure> {
+    let identity = &admitted.job.endpoint.destination;
+    let predecessor = &admitted.destination_record;
+    let observed = resolver
+        .resolve(identity, FilesEndpointRole::Destination)
+        .map_err(|_| FilesCommitFailure::PublicationUnconfirmed)?;
+    let bound = bind_record(identity, FilesEndpointRole::Destination, &observed)
+        .map_err(|_| FilesCommitFailure::PublicationUnconfirmed)?;
+    ensure_current(
+        resolver,
+        identity,
+        FilesEndpointRole::Destination,
+        &observed,
+    )
+    .map_err(|_| FilesCommitFailure::ConcurrentDestination)?;
+
+    let desired_bytes = bound.size_bytes == outcome.bytes_copied
+        && bound.sha256_hex == outcome.sha256_hex;
+    if observed.generation < predecessor.generation {
+        return Err(FilesCommitFailure::ConcurrentDestination);
+    }
+    if observed.generation == predecessor.generation {
+        let retry_already_converged = predecessor.sha256_hex == outcome.sha256_hex
+            && predecessor.size_bytes == outcome.bytes_copied
+            && observed == *predecessor;
+        return if retry_already_converged && desired_bytes {
+            Ok(observed.generation)
+        } else {
+            Err(FilesCommitFailure::PublicationUnconfirmed)
+        };
+    }
+    if !desired_bytes {
+        return Err(FilesCommitFailure::ConcurrentDestination);
+    }
+    Ok(observed.generation)
+}
+
+#[cfg(test)]
 fn commit_replace_destination(
     admitted: &ResolvedTransferJobV2,
     staged_path: &Path,
@@ -1150,6 +1220,61 @@ mod tests {
             }
             .expect("fixture has one answer per resolver call")
         }
+
+        fn commit_staged_copy(
+            &self,
+            admitted: &ResolvedTransferJobV2,
+            staged_path: &Path,
+            outcome: &FilesCopyOutcome,
+        ) -> Result<(), FilesCommitFailure> {
+            let predecessor = admitted.destination_record();
+            if predecessor.sha256_hex == outcome.sha256_hex
+                && predecessor.size_bytes == outcome.bytes_copied
+            {
+                fs::remove_file(staged_path).map_err(|_| FilesCommitFailure::Filesystem)?;
+                return Ok(());
+            }
+            commit_replace_destination(admitted, staged_path, outcome)?;
+            let mut acknowledged = predecessor.clone();
+            acknowledged.generation = acknowledged
+                .generation
+                .checked_add(1)
+                .ok_or(FilesCommitFailure::Filesystem)?;
+            acknowledged.sha256_hex.clone_from(&outcome.sha256_hex);
+            acknowledged.size_bytes = outcome.bytes_copied;
+            for answer in self
+                .destination
+                .lock()
+                .expect("fixture destination lock")
+                .iter_mut()
+            {
+                *answer = Ok(acknowledged.clone());
+            }
+            Ok(())
+        }
+    }
+
+    struct UnacknowledgedCommitResolver {
+        inner: ResolverFixture,
+    }
+
+    impl FilesEndpointResolver for UnacknowledgedCommitResolver {
+        fn resolve(
+            &self,
+            identity: &TransferLocation,
+            role: FilesEndpointRole,
+        ) -> Result<ResolvedFilesEndpoint, FilesResolveFailure> {
+            self.inner.resolve(identity, role)
+        }
+
+        fn commit_staged_copy(
+            &self,
+            admitted: &ResolvedTransferJobV2,
+            staged_path: &Path,
+            outcome: &FilesCopyOutcome,
+        ) -> Result<(), FilesCommitFailure> {
+            commit_replace_destination(admitted, staged_path, outcome)
+        }
     }
 
     struct ExecutionFixture {
@@ -1315,6 +1440,94 @@ mod tests {
             .expect("registry root")
             .flatten()
             .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part")));
+    }
+
+    #[test]
+    fn descriptor_read_cannot_escape_a_replaced_source_generation() {
+        let fixture = execution_fixture();
+        let current = fixture.source.clone();
+        let mut replacement = current.clone();
+        replacement.generation += 1;
+        let resolver = ResolverFixture::sequence(
+            vec![Ok(current.clone()), Ok(current.clone()), Ok(replacement)],
+            vec![Ok(fixture.destination)],
+        );
+
+        assert!(matches!(
+            open_bounded_files_source(
+                &resolver,
+                &current.identity,
+                current.size_bytes,
+                &current.sha256_hex,
+            ),
+            Err(TransferV2ResolutionError::StaleResolution(
+                FilesEndpointRole::Source
+            ))
+        ));
+    }
+
+    #[test]
+    fn destination_generation_acknowledgement_blocks_false_completion_and_allows_replay() {
+        let fixture = execution_fixture();
+        let job = fixture.job.clone();
+        let source = fixture.source.clone();
+        let predecessor = fixture.destination.clone();
+        let resolver = UnacknowledgedCommitResolver {
+            inner: ResolverFixture::stable(source.clone(), predecessor.clone()),
+        };
+        let admitted =
+            resolve_for_execution(job.clone(), &resolver).expect("initial resolved admission");
+
+        assert_eq!(
+            execute_local_mesh_copy(&admitted, &resolver, &AtomicBool::new(false)),
+            Err(FilesCopyError::Commit(
+                FilesCommitFailure::PublicationUnconfirmed
+            )),
+            "changing bytes without a canonical generation acknowledgement is not completion"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("destination.bin")).unwrap(),
+            fs::read(fixture.root.join("source.bin")).unwrap(),
+            "the failed result represents the real post-write/pre-ack partial state"
+        );
+
+        let mut acknowledged = predecessor;
+        acknowledged.generation += 1;
+        acknowledged.sha256_hex.clone_from(&source.sha256_hex);
+        acknowledged.size_bytes = source.size_bytes;
+        let replay = ResolverFixture::stable(source.clone(), acknowledged.clone());
+        let admitted = resolve_for_execution(job, &replay).expect("acknowledged replay admission");
+        let outcome = execute_local_mesh_copy(&admitted, &replay, &AtomicBool::new(false))
+            .expect("already-converged retry");
+
+        assert_eq!(admitted.destination().generation(), acknowledged.generation);
+        assert_eq!(outcome.sha256_hex, source.sha256_hex);
+        assert_eq!(outcome.bytes_copied, source.size_bytes);
+    }
+
+    #[test]
+    fn stale_same_attempt_staging_inode_cannot_block_restart_retry() {
+        let fixture = execution_fixture();
+        let resolver = ResolverFixture::stable(fixture.source.clone(), fixture.destination.clone());
+        let admitted = resolve_for_execution(fixture.job, &resolver).expect("resolved admission");
+        let stale = fixture.root.join(format!(
+            ".destination.bin.transfer-{}-{}-{}.part",
+            admitted.job().transfer,
+            admitted.job().progress.attempt,
+            std::process::id()
+        ));
+        let stale_bytes = b"unowned dirty-shutdown residue";
+        fs::write(&stale, stale_bytes).expect("stale staging inode");
+
+        let outcome = execute_local_mesh_copy(&admitted, &resolver, &AtomicBool::new(false))
+            .expect("restart retry claims a distinct staging inode");
+
+        assert_eq!(outcome.sha256_hex, fixture.source.sha256_hex);
+        assert_eq!(fs::read(&stale).unwrap(), stale_bytes);
+        assert_eq!(
+            fs::read(fixture.root.join("destination.bin")).unwrap(),
+            fs::read(fixture.root.join("source.bin")).unwrap()
+        );
     }
 
     #[test]

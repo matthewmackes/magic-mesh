@@ -7,8 +7,9 @@
 //! back in software on any seat, with no GPU or codec pack assumed.
 //!
 //! It is a **pure value type** (no mpv linkage): the baseline is the
-//! software-decode set ffmpeg carries universally, so it is honest on the
-//! airgapped farm and does not need the `mpv` feature. The Jellyfin surface
+//! software-decode set Fedora's fallback `ffmpeg-free` carries, so it remains
+//! honest when the optional RPM Fusion codec pack is unavailable and does not
+//! need the `mpv` feature. The Jellyfin surface
 //! (`mde-jellyfin`'s playback negotiation, consumed by `mde-media-egui`) reads
 //! these sets to build the client capability profile it negotiates against —
 //! §6 glue, so the negotiation is unit-testable with no libmpv and no network.
@@ -50,10 +51,10 @@ impl MpvCapabilities {
 
     /// The realistic mpv/ffmpeg software-decode baseline.
     ///
-    /// The containers + codecs a stock ffmpeg (which mpv links) demuxes and
-    /// decodes on any host with no GPU or extra codec pack — so it is an honest
-    /// floor on the airgapped farm. An item outside this set negotiates to a
-    /// server transcode rather than a broken direct-play.
+    /// The containers + codecs Fedora's fallback `ffmpeg-free` (which mpv links)
+    /// demuxes and decodes with no GPU or optional codec pack — so it is an
+    /// honest floor on the airgapped farm. An item outside this set negotiates
+    /// to a server transcode rather than a broken direct-play.
     #[must_use]
     pub fn baseline() -> Self {
         let containers = [
@@ -61,11 +62,12 @@ impl MpvCapabilities {
             "asf", "mpg", "mpeg", "ogv", "ogg", "mp3", "flac", "wav", "m4a", "aac", "opus", "oga",
             "hls",
         ];
+        // H.264/AVC and H.265/HEVC are deliberately absent. The production
+        // image may install those through the optional RPM Fusion codec swap,
+        // but its documented offline fallback is Fedora's `ffmpeg-free`, which
+        // cannot provide them. A universal floor must not retain optional
+        // codec-pack authority and cause a broken direct-play decision.
         let video_codecs = [
-            "h264",
-            "avc",
-            "hevc",
-            "h265",
             "vp8",
             "vp9",
             "av1",
@@ -192,10 +194,23 @@ mod tests {
         let caps = MpvCapabilities::baseline();
         // The everyday container + codec combination direct-plays.
         assert!(caps.supports_container("mkv"));
-        assert!(caps.supports_video_codec("h264"));
-        assert!(caps.supports_video_codec("hevc"));
+        assert!(caps.supports_video_codec("vp9"));
+        assert!(caps.supports_video_codec("av1"));
         assert!(caps.supports_audio_codec("aac"));
         assert!(caps.supports_audio_codec("flac"));
+    }
+
+    #[test]
+    fn optional_codec_pack_cannot_leak_into_the_universal_baseline() {
+        let caps = MpvCapabilities::baseline();
+
+        // The bootc image explicitly permits the RPM Fusion swap to fail and
+        // continue with `ffmpeg-free`. Treating either spelling as universally
+        // available would direct-play media that the active fallback backend
+        // cannot decode instead of asking Jellyfin to transcode it.
+        for codec in ["h264", "avc", "hevc", "h265"] {
+            assert!(!caps.supports_video_codec(codec), "advertised {codec}");
+        }
     }
 
     #[test]

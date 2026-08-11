@@ -8,6 +8,9 @@
 
 use std::process::ExitCode;
 
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener};
+
 use clap::{Parser, Subcommand};
 
 use mde_musicd::airsonic::Client;
@@ -168,12 +171,41 @@ fn serve() -> ExitCode {
         tracing::error!("no Bus data dir (XDG) — cannot serve");
         return ExitCode::FAILURE;
     };
-    tracing::info!("serving action/music/* on the Bus");
-    // Runs until SIGTERM (the AIR-1 systemd unit manages the lifecycle);
-    // `serve`'s stop predicate is exercised by the unit tests' one-shot
-    // poll path. serve owns the Bus store so it can reopen on an index inode
-    // swap (MUSIC-WEDGE-2).
-    bus_responder::serve(bus_root, &queue::queue_path(), || false);
+    run_serve_with_authority(b"mde-musicd-serve", || {
+        tracing::info!("serving action/music/* on the Bus");
+        // Runs until SIGTERM (the AIR-1 systemd unit manages the lifecycle);
+        // `serve`'s stop predicate is exercised by the unit tests' one-shot
+        // poll path. serve owns the Bus store so it can reopen on an index inode
+        // swap (MUSIC-WEDGE-2).
+        bus_responder::serve(bus_root, &queue::queue_path(), || false);
+    })
+}
+
+/// Run one node-wide music authority while holding a kernel-lifetime claim.
+///
+/// An abstract Unix socket has no filesystem inode to survive a crash. Keeping
+/// the listener alive for the responder's whole lifetime therefore prevents a
+/// duplicate daemon from consuming the same actions while permitting immediate
+/// recovery after the owner exits.
+fn run_serve_with_authority<F>(lock_name: &[u8], responder: F) -> ExitCode
+where
+    F: FnOnce(),
+{
+    let address = match SocketAddr::from_abstract_name(lock_name) {
+        Ok(address) => address,
+        Err(error) => {
+            tracing::error!(%error, "invalid music daemon singleton identity");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _authority = match UnixListener::bind_addr(&address) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(%error, "another music daemon already owns playback authority");
+            return ExitCode::FAILURE;
+        }
+    };
+    responder();
     ExitCode::SUCCESS
 }
 
@@ -358,4 +390,30 @@ fn ping(retry: u32) -> ExitCode {
         }
     }
     ExitCode::from(3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_daemon_cannot_publish_and_released_owner_recovers_immediately() {
+        let lock_name = format!("mde-musicd-test-{}", std::process::id());
+        let address = SocketAddr::from_abstract_name(lock_name.as_bytes()).unwrap();
+        let incumbent = UnixListener::bind_addr(&address).unwrap();
+        let mut responder_started = false;
+
+        let duplicate = run_serve_with_authority(lock_name.as_bytes(), || {
+            responder_started = true;
+        });
+        assert_eq!(duplicate, ExitCode::FAILURE);
+        assert!(!responder_started);
+
+        drop(incumbent);
+        let recovered = run_serve_with_authority(lock_name.as_bytes(), || {
+            responder_started = true;
+        });
+        assert_eq!(recovered, ExitCode::SUCCESS);
+        assert!(responder_started);
+    }
 }

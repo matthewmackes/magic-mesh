@@ -216,17 +216,29 @@ pub(crate) fn mount(
 pub(crate) fn show(ui: &mut egui::Ui, overlay_above: bool) {
     let ctx = ui.ctx().clone();
     let state_key = egui::Id::new(STATE_KEY);
+    let home_id = egui::Id::new(SPRINGBOARD_BG);
     let mut state = ctx
         .data_mut(|d| d.get_temp::<SpringboardState>(state_key))
         .unwrap_or_default();
     // Front Door/search and the other Construct overlays own the pointer while
     // open.  The Home layer is still mounted underneath them for the cross-fade,
     // but it must not accept a pull-down through the overlay and produce a
-    // second, hidden launcher/search transition.
-    if overlay_above {
+    // second, hidden launcher/search transition. A focused foreign widget owns
+    // the same authority even without an overlay: revoke both the in-flight
+    // gesture and any retained action before mount can replay it after focus
+    // moved away from Home.
+    let foreign_focus = ctx.memory(|memory| {
+        memory
+            .focused()
+            .is_some_and(|focused| focused != home_id)
+    });
+    if overlay_above || foreign_focus {
         state.gesture = None;
+        state.actions.clear();
     } else {
         handle_drag(ui, &mut state, ui.max_rect());
+    }
+    if !overlay_above {
         install_home_accessibility(ui.ctx(), ui.max_rect());
     }
 
@@ -594,6 +606,42 @@ mod tests {
             None,
             "Front Door/search must own the pointer; Home cannot fire a hidden second launcher"
         );
+    }
+
+    #[test]
+    fn foreign_focus_cannot_replay_retained_home_search_authority() {
+        let ctx = ctx();
+        let state_key = egui::Id::new(STATE_KEY);
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                state_key,
+                SpringboardState {
+                    gesture: Some(Gesture::Pull {
+                        origin_frac_y: 0.1,
+                        dy: PULL_FIRE,
+                        fired: true,
+                    }),
+                    actions: vec![SpringboardAction::Spotlight],
+                },
+            );
+        });
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new("hostile-foreign-search"));
+        });
+
+        production_frame(&ctx, Vec::new());
+
+        let mut construct = ConstructChrome::default();
+        assert_eq!(
+            mount(&ctx, &mut construct),
+            None,
+            "a retained Home action must be revoked after another widget owns focus"
+        );
+        let state = ctx
+            .data_mut(|data| data.get_temp::<SpringboardState>(state_key))
+            .expect("springboard state remains mounted");
+        assert!(state.gesture.is_none(), "foreign focus cancels the pull");
+        assert!(state.actions.is_empty(), "foreign focus drains stale authority");
     }
 
     // --- the collapsed base layer paints honestly -----------------------------------

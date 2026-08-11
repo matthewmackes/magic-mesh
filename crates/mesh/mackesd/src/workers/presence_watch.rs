@@ -48,6 +48,28 @@ pub fn transitions(
     out
 }
 
+/// Fold one directory observation without forgetting a peer whose lease row
+/// disappeared.
+///
+/// Peer return commonly replaces the expired directory row instead of updating
+/// it in place. Treating an absent row as "unknown" loses both edges: no
+/// offline transition is emitted, and the replacement row is silently seeded
+/// on return. Keep one offline tombstone for every authenticated peer this
+/// process has actually observed so the subsequent row is recognized as a
+/// return. A daemon restart still seeds its first readable observation silently.
+fn reconcile_tiers(
+    prev: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> (HashMap<String, String>, Vec<(String, &'static str)>) {
+    let mut next = current.clone();
+    for host in prev.keys() {
+        next.entry(host.clone())
+            .or_insert_with(|| "offline".to_string());
+    }
+    let emitted = transitions(prev, &next);
+    (next, emitted)
+}
+
 /// The presence-transition watcher.
 pub struct PresenceWatchWorker {
     workgroup_root: PathBuf,
@@ -68,22 +90,29 @@ impl PresenceWatchWorker {
         }
     }
 
-    fn current_tiers(&self) -> HashMap<String, String> {
+    fn current_tiers(&self) -> Option<HashMap<String, String>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
-        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
-            &self.workgroup_root,
-        ))
-        .into_iter()
-        .filter(|r| r.hostname != self.self_hostname)
-        .map(|r| {
-            (
-                r.hostname,
-                presence_tier(now_ms, r.last_seen_ms).to_string(),
-            )
-        })
-        .collect()
+        let peers_dir = mackes_mesh_types::peers::peers_dir(&self.workgroup_root);
+        // `read_peers` intentionally maps an unreadable directory to an empty
+        // roster. At this recovery boundary those states differ: a transient
+        // unmount must not declare every peer offline or erase the return
+        // watermark. Probe readability first and retain the prior observation
+        // when the source itself is unavailable.
+        std::fs::read_dir(&peers_dir).ok()?;
+        Some(
+            mackes_mesh_types::peers::read_peers(&peers_dir)
+                .into_iter()
+                .filter(|r| r.hostname != self.self_hostname)
+                .map(|r| {
+                    (
+                        r.hostname,
+                        presence_tier(now_ms, r.last_seen_ms).to_string(),
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn emit(&self, host: &str, direction: &str) {
@@ -126,12 +155,19 @@ impl Worker for PresenceWatchWorker {
                 _ = shutdown.wait() => return Ok(()),
                 () = tokio::time::sleep(SWEEP_INTERVAL) => {}
             }
-            let current = self.current_tiers();
-            for (host, direction) in transitions(&prev, &current) {
+            let Some(current) = self.current_tiers() else {
+                continue;
+            };
+            let Some(previous) = prev.take() else {
+                prev = Some(current);
+                continue;
+            };
+            let (next, emitted) = reconcile_tiers(&previous, &current);
+            for (host, direction) in emitted {
                 tracing::info!(peer = %host, direction, "presence_watch: transition (PD-13)");
                 self.emit(&host, direction);
             }
-            prev = current;
+            prev = Some(next);
         }
     }
 }
@@ -177,5 +213,18 @@ mod tests {
         let prev = tiers(&[("pine", "online")]);
         let cur = tiers(&[("pine", "idle")]);
         assert!(transitions(&prev, &cur).is_empty());
+    }
+
+    #[test]
+    fn expired_peer_row_cannot_erase_the_return_transition() {
+        let observed = tiers(&[("pine", "online")]);
+
+        let (missing, offline) = reconcile_tiers(&observed, &HashMap::new());
+        assert_eq!(offline, vec![("pine".to_string(), "offline")]);
+        assert_eq!(missing.get("pine").map(String::as_str), Some("offline"));
+
+        let returned = tiers(&[("pine", "online")]);
+        let (_, online) = reconcile_tiers(&missing, &returned);
+        assert_eq!(online, vec![("pine".to_string(), "online")]);
     }
 }

@@ -4,6 +4,12 @@
 set -eu
 umask 077
 
+# xrdp carries an authenticated session environment into this process. Keep
+# that environment from selecting a host-provisioned helper or Browser binary:
+# every executable used below must come from the immutable guest image.
+PATH=/usr/sbin:/usr/bin
+export PATH
+
 case "${1:-}" in
     '')
         [ "$#" -eq 0 ] || { echo 'FATAL: unexpected Browser VM runtime arguments' >&2; exit 2; }
@@ -185,7 +191,13 @@ fi
 export WLR_RENDERER
 log "using wlroots renderer $WLR_RENDERER${render_node:+ with $render_node}"
 export WLR_NO_HARDWARE_CURSORS=1
-chromium_bin=$(command -v chromium || command -v chromium-browser || true)
+chromium_bin=
+for candidate in /usr/bin/chromium /usr/bin/chromium-browser; do
+    if [ -x "$candidate" ]; then
+        chromium_bin=$candidate
+        break
+    fi
+done
 if [ -z "$chromium_bin" ]; then
     write_runtime_evidence unavailable unavailable 0 0
     echo 'FATAL: Browser VM Chromium binary is unavailable' >&2

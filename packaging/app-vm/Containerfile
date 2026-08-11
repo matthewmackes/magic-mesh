@@ -15,24 +15,46 @@ COPY packaging/app-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate
 COPY packaging/app-vm/mcnf-app-vm-launch.sh /tmp/mcnf-app-vm-launch
 COPY packaging/app-vm/mcnf-app-vm-runtime-probe.sh /tmp/mcnf-app-vm-runtime-probe
+COPY packaging/app-vm/verify-rpm-supply.sh /tmp/mcnf-app-vm-verify-rpm-supply
+COPY packaging/app-vm/verify-rpm-build-identity.py /tmp/verify-rpm-build-identity.py
+COPY packaging/app-vm/verify-installed-rpm-identity.sh /tmp/verify-installed-rpm-identity.sh
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
+COPY packaging/repo/RPM-GPG-KEY-magic-mesh /tmp/RPM-GPG-KEY-magic-mesh
 
 RUN set -eux; \
     printf '%s\n' "${MCNF_APP_VM_BASE_IMAGE_ID}" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || { \
         echo "FATAL: App VM base image provenance must be a complete sha256 digest" >&2; exit 1; }; \
-    case "${MCNF_APP_VM_SOURCE_COMMIT}" in \
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]... ) ;; \
-        *) echo "FATAL: App VM source commit must be a non-empty 40-character lowercase Git revision" >&2; exit 1 ;; \
-    esac; \
+    printf '%s\n' "${MCNF_APP_VM_SOURCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' && \
+        [ "${MCNF_APP_VM_SOURCE_COMMIT}" != 0000000000000000000000000000000000000000 ] || { \
+        echo "FATAL: App VM source commit must be a non-null 40-character lowercase Git revision" >&2; exit 1; }; \
+    case "${MCNF_RPM_LANE}" in local|repo) ;; *) \
+        echo "FATAL: App VM RPM lane must be exactly local or repo" >&2; exit 1 ;; esac; \
     install -D -m 0755 /tmp/mcnf-app-vm-validate /usr/local/libexec/mcnf-app-vm-validate; \
     install -D -m 0755 /tmp/mcnf-app-vm-launch /usr/local/libexec/mcnf-app-vm-launch; \
     install -D -m 0755 /tmp/mcnf-app-vm-runtime-probe /usr/local/libexec/mcnf-app-vm-runtime-probe; \
-    if [ "${MCNF_RPM_LANE}" = "local" ]; then \
-        ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { \
-            echo "FATAL: local App VM image lane needs a magic-mesh RPM"; exit 1; }; \
-        dnf -y install /tmp/mcnf-rpms/magic-mesh-*.rpm; \
+    chmod 0755 /tmp/mcnf-app-vm-verify-rpm-supply /tmp/verify-rpm-build-identity.py \
+        /tmp/verify-installed-rpm-identity.sh; \
+    install -D -m 0644 /tmp/RPM-GPG-KEY-magic-mesh /etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh; \
+    sed -i 's#^gpgkey=.*#gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh#' /etc/yum.repos.d/magic-mesh.repo; \
+    grep -Fxq 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh' /etc/yum.repos.d/magic-mesh.repo; \
+    rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh; \
+    if [ "${MCNF_RPM_LANE}" = local ]; then \
+        [ "$(find /tmp/mcnf-rpms -mindepth 1 -maxdepth 1 -name '*.rpm' -printf . | wc -c)" -eq 1 ] || { \
+            echo "FATAL: local App VM image lane needs exactly one staged RPM" >&2; exit 1; }; \
+        /tmp/mcnf-app-vm-verify-rpm-supply \
+            --key /etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh \
+            --source-commit "${MCNF_APP_VM_SOURCE_COMMIT}" \
+            --candidate-manifest /tmp/mcnf-rpms/candidate-manifest.json \
+            /tmp/mcnf-rpms/magic-mesh-local.rpm; \
+        dnf -y --setopt=localpkg_gpgcheck=1 install /tmp/mcnf-rpms/magic-mesh-local.rpm; \
     else \
+        if find /tmp/mcnf-rpms -mindepth 1 -maxdepth 1 \
+            \( -name '*.rpm' -o -name 'candidate-manifest.json' \) -print -quit | grep -q .; then \
+            echo "FATAL: repo App VM image lane contains local candidate inputs" >&2; exit 1; \
+        fi; \
         dnf -y install magic-mesh; \
+        /tmp/verify-installed-rpm-identity.sh \
+            --source-commit "${MCNF_APP_VM_SOURCE_COMMIT}"; \
     fi; \
     dnf -y install \
         dbus-daemon dbus-tools \
@@ -79,7 +101,9 @@ RUN set -eux; \
         'not_ready_states=installing,starting_app,reconnecting,unavailable,failed' \
         'host_fallback=disabled' \
         > /usr/share/mcnf/app-vm/runtime-readiness; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-app-vm-validate /tmp/mcnf-app-vm-launch /tmp/mcnf-app-vm-runtime-probe; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-app-vm-validate /tmp/mcnf-app-vm-launch /tmp/mcnf-app-vm-runtime-probe \
+        /tmp/mcnf-app-vm-verify-rpm-supply /tmp/verify-rpm-build-identity.py \
+        /tmp/verify-installed-rpm-identity.sh /tmp/RPM-GPG-KEY-magic-mesh; \
     dnf clean all
 
 # The curated Flatpak remote is deliberately not created here. Its signed

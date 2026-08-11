@@ -907,12 +907,38 @@ fn app_entry_for_launch(svc: &AppsService, node: &str, app_id: &str) -> Option<A
     if app_id.is_empty() {
         return None;
     }
-    let entries = if node.is_empty() || node == svc.node_id {
+    let local = node.is_empty() || node == svc.node_id;
+    let entries = if local {
         scan_local_apps(&default_app_dirs(&svc.home))
     } else {
         read_peer_installed(&svc.workgroup_root, node)
     };
-    entries.into_iter().find(|entry| entry.id == app_id)
+    let app = entries.into_iter().find(|entry| entry.id == app_id)?;
+    if app.source != "flatpak" {
+        return Some(app);
+    }
+
+    // An exported `.desktop` row proves only that guest content was observed;
+    // it is not durable launch authority. Re-read the current admitted catalog
+    // for every launch so a removed, stale, unsigned, or action-restricted row
+    // cannot inherit authority from an older Front Door projection.
+    let catalog = if local {
+        read_local_flatpak_catalog(&svc.home)
+    } else {
+        read_peer_flatpak_catalog(&svc.workgroup_root, node)
+    }?;
+    catalog
+        .entries
+        .iter()
+        .any(|entry| {
+            entry.app_id == app.id
+                && entry.is_launchable()
+                && entry
+                    .supported_actions
+                    .iter()
+                    .any(|action| action == "launch")
+        })
+        .then_some(app)
 }
 
 /// Resolve a peer's remote-desktop `(protocol, target)` from the PD-2 directory
@@ -1529,6 +1555,93 @@ mod tests {
         let rejected: serde_json::Value =
             serde_json::from_str(&build_peer_list(&svc, "anvil")).unwrap();
         assert!(rejected["catalog"].is_null());
+    }
+
+    #[test]
+    fn replaced_flatpak_catalog_cannot_retain_prior_launch_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let peer_dir = root.join("anvil");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        std::fs::write(
+            peer_dir.join("apps-installed.json"),
+            json!({
+                "hostname": "anvil",
+                "entries": [{
+                    "id": "org.example.Editor",
+                    "name": "Editor",
+                    "kind": "app",
+                    "source": "flatpak",
+                    "node": "anvil",
+                    "exec": "flatpak run org.example.Editor"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let catalog_path = peer_dir.join("flatpak-catalog.json");
+        let catalog = |revision: &str, actions: &[&str]| {
+            json!({
+                "schema_version": 1,
+                "revision": revision,
+                "entries": [{
+                    "app_id": "org.example.Editor",
+                    "display_name": "Editor",
+                    "summary": "Guest editor",
+                    "icon_reference": "icon:editor",
+                    "source_revision": "curated-42",
+                    "declared_capabilities": ["audio"],
+                    "guest_profile": "wayland-standard",
+                    "supported_actions": actions,
+                    "provenance": {"source": "curated", "signature": "sig-42"},
+                    "state": "installed"
+                }]
+            })
+        };
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_vec(&catalog("catalog-42", &["launch"])).unwrap(),
+        )
+        .unwrap();
+
+        let svc = AppsService::new(root, "me", &root.join("home"));
+        let launch_body = json!({
+            "node": "anvil",
+            "app_id": "org.example.Editor"
+        })
+        .to_string();
+        let directory = || {
+            json!({
+                "peers": [{"hostname": "anvil", "overlay_ip": "10.42.0.8"}]
+            })
+        };
+        let admitted: serde_json::Value = serde_json::from_str(&build_reply(
+            &svc,
+            "launch",
+            Some(&launch_body),
+            directory,
+            || json!({}),
+        ))
+        .unwrap();
+        assert_eq!(admitted["ok"], true);
+
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_vec(&catalog("catalog-43", &["resume"])).unwrap(),
+        )
+        .unwrap();
+        let refused: serde_json::Value = serde_json::from_str(&build_reply(
+            &svc,
+            "launch",
+            Some(&launch_body),
+            directory,
+            || json!({}),
+        ))
+        .unwrap();
+        assert_eq!(refused["ok"], false);
+        assert!(refused["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("not published")));
     }
 
     #[test]

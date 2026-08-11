@@ -36,16 +36,23 @@ pub struct ShowTree {
 /// [`parent_id`](BaseItemDto::parent_id)); seasons are ordered by season number
 /// ([`index_number`](BaseItemDto::index_number)) and episodes within a season by
 /// episode number. Episodes that match no season are dropped (a well-formed
-/// Jellyfin response always sets the season id).
+/// Jellyfin response always sets the season id). Seasons and episodes whose
+/// owning series does not exactly match `series` are also dropped so a mixed or
+/// stale response cannot substitute another show's browse state.
 #[must_use]
 pub fn build_show_tree(
     series: BaseItemDto,
     mut seasons: Vec<BaseItemDto>,
     episodes: Vec<BaseItemDto>,
 ) -> ShowTree {
+    let series_id = series.id.as_str();
+
     // Group episodes by their owning season id in one pass.
     let mut by_season: BTreeMap<String, Vec<BaseItemDto>> = BTreeMap::new();
     for episode in episodes {
+        if episode.series_id.as_deref() != Some(series_id) {
+            continue;
+        }
         if let Some(season_id) = episode
             .season_id
             .clone()
@@ -54,6 +61,8 @@ pub fn build_show_tree(
             by_season.entry(season_id).or_default().push(episode);
         }
     }
+
+    seasons.retain(|season| season.series_id.as_deref() == Some(series_id));
 
     // Seasons in season-number order.
     seasons.sort_by_key(|s| s.index_number.unwrap_or(i32::MAX));
@@ -166,6 +175,27 @@ mod tests {
         // Episode points at a season that isn't in the season list.
         let tree = build_show_tree(series(), vec![season("s1", 1)], vec![episode("x", "s9", 1)]);
         assert!(tree.seasons[0].episodes.is_empty());
+    }
+
+    #[test]
+    fn foreign_series_items_cannot_substitute_browse_tree_state() {
+        let mut foreign_season = season("s1", 0);
+        foreign_season.series_id = Some("series-attacker".into());
+        let foreign_episode = BaseItemDto {
+            series_id: Some("series-attacker".into()),
+            ..episode("foreign", "s1", 0)
+        };
+
+        let tree = build_show_tree(
+            series(),
+            vec![foreign_season, season("s1", 1)],
+            vec![foreign_episode, episode("owned", "s1", 1)],
+        );
+
+        assert_eq!(tree.seasons.len(), 1);
+        assert_eq!(tree.seasons[0].season.name.as_deref(), Some("Season 1"));
+        assert_eq!(tree.seasons[0].episodes.len(), 1);
+        assert_eq!(tree.seasons[0].episodes[0].id, "owned");
     }
 
     #[test]

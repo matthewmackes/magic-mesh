@@ -101,6 +101,19 @@ const NETWORK_STABILITY_POLL: Duration = Duration::from_millis(500);
 const NETWORK_STABILITY_TIMEOUT: Duration = Duration::from_secs(60);
 const NETWORK_MANAGER_CONNECTED_SITE: u32 = 60;
 const NETWORK_STABILITY_SAMPLES: u8 = 2;
+const STARTUP_RETURN_STATES: &[NodeAvailabilityState] = &[
+    NodeAvailabilityState::Sleeping,
+    NodeAvailabilityState::ScheduledReboot,
+    NodeAvailabilityState::Rebooting,
+    NodeAvailabilityState::ShuttingDown,
+    NodeAvailabilityState::ShutDown,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostBusIdentity {
+    device: u64,
+    inode: u64,
+}
 
 /// The replicated per-node seat-mirror topic other peers read.
 #[must_use]
@@ -535,8 +548,15 @@ pub struct HostStateWorker {
     gate: ConfirmGate,
     /// Cursor into the local snapshot topic (mirror only fresh snapshots).
     snapshot_cursor: Option<String>,
+    /// Production activation starts behind a freshness barrier: retained shell
+    /// state must not be re-published, or used for an interlock, as a current
+    /// observation after this process restarts.
+    awaiting_fresh_snapshot: bool,
     /// Cursor into the remote-verb action topic.
     action_cursor: Option<String>,
+    /// Exact Bus index generation bound at activation. A same-path replacement
+    /// must establish a new tail/freshness barrier before any row is consumed.
+    bus_identity: Option<HostBusIdentity>,
 }
 
 impl HostStateWorker {
@@ -569,7 +589,9 @@ impl HostStateWorker {
             auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
             gate: ConfirmGate::default(),
             snapshot_cursor: None,
+            awaiting_fresh_snapshot: false,
             action_cursor: None,
+            bus_identity: None,
         }
     }
 
@@ -625,17 +647,42 @@ impl HostStateWorker {
         self.drain_actions(persist);
     }
 
-    /// Open the Bus and tail-prime the fixed remote-control lane as one
-    /// activation boundary. Retained host mutations must never execute merely
-    /// because this worker or its storage started late; durable seat snapshots
-    /// remain unprimed and are folded by `poll_once`.
+    /// Open the Bus and tail-prime the fixed remote-control and local snapshot
+    /// lanes as one activation boundary. Retained host mutations must never
+    /// execute merely because this worker or its storage started late. Retained
+    /// shell observations must likewise never acquire a new mirror record (or
+    /// authorize a host mutation) merely because this process restarted.
     fn activate_bus(&mut self, root: &Path) -> Result<Persist, String> {
-        let persist = Persist::open(root.to_path_buf()).map_err(|error| error.to_string())?;
-        let tail = persist
+        let (persist, identity) = open_current_host_bus(root)?;
+        let action_tail = persist
             .latest_ulid(&action_topic(&self.node_id))
             .map_err(|error| format!("prime host action cursor: {error}"))?;
-        self.action_cursor = tail;
+        let snapshot_tail = persist
+            .latest_ulid(LOCAL_SNAPSHOT_TOPIC)
+            .map_err(|error| format!("prime local host snapshot cursor: {error}"))?;
+        verify_host_bus_identity(&persist, root, identity)?;
+        self.action_cursor = action_tail;
+        self.snapshot_cursor = snapshot_tail;
+        self.awaiting_fresh_snapshot = true;
+        self.bus_identity = Some(identity);
         Ok(persist)
+    }
+
+    /// Poll only while the opened connection still names the Bus generation
+    /// activated by this worker. A replacement is activation, not continuity:
+    /// retained actions and snapshots in the new index are tail-skipped and a
+    /// post-replacement shell observation is required before authorization.
+    fn poll_current_bus(&mut self, root: &Path) -> Result<(), String> {
+        let (persist, identity) = open_current_host_bus(root)?;
+        if self.bus_identity != Some(identity) {
+            drop(persist);
+            drop(self.activate_bus(root)?);
+            return Ok(());
+        }
+        self.mirror_snapshot(&persist);
+        verify_host_bus_identity(&persist, root, identity)?;
+        self.drain_actions(&persist);
+        verify_host_bus_identity(&persist, root, identity)
     }
 
     /// Read the freshest local seat snapshot the shell published and re-publish it
@@ -649,16 +696,24 @@ impl HostStateWorker {
         let Some(latest) = msgs.into_iter().next_back() else {
             return;
         };
-        self.snapshot_cursor = Some(latest.ulid.clone());
+        let next_cursor = Some(latest.ulid.clone());
         let Some(body) = latest.body.as_deref() else {
+            self.snapshot_cursor = next_cursor;
             return;
         };
-        // Validate it decodes (never mirror a malformed body), then republish as-is.
-        if serde_json::from_str::<SeatMirror>(body).is_ok() {
-            let topic = mirror_topic(&self.node_id);
-            if let Err(e) = persist.write(&topic, Priority::Default, None, Some(body)) {
-                tracing::debug!(target: "mackesd::host_state", error = %e, "mirror publish failed");
-            }
+        // Malformed observations are consumed fail-closed. A valid observation
+        // remains at the cursor until its mirror write commits, so a transient
+        // Bus failure cannot strand the startup freshness barrier forever.
+        if serde_json::from_str::<SeatMirror>(body).is_err() {
+            self.snapshot_cursor = next_cursor;
+            return;
+        }
+        let topic = mirror_topic(&self.node_id);
+        if let Err(e) = persist.write(&topic, Priority::Default, None, Some(body)) {
+            tracing::debug!(target: "mackesd::host_state", error = %e, "mirror publish failed");
+        } else {
+            self.snapshot_cursor = next_cursor;
+            self.awaiting_fresh_snapshot = false;
         }
     }
 
@@ -805,6 +860,12 @@ impl HostStateWorker {
     /// interlocks, and either forward an approved verb to the shell's apply lane or
     /// echo a typed refusal on the result lane.
     fn drain_actions(&mut self, persist: &Persist) {
+        if self.awaiting_fresh_snapshot {
+            // Keep the action cursor parked. A forward request remains pending
+            // until the shell publishes a post-activation observation, so no
+            // stale replicated mirror can satisfy a safety interlock.
+            return;
+        }
         let topic = action_topic(&self.node_id);
         let Ok(msgs) = persist.list_since(&topic, self.action_cursor.as_deref()) else {
             return;
@@ -915,6 +976,54 @@ impl HostStateWorker {
     }
 }
 
+fn host_bus_identity(root: &Path) -> Result<HostBusIdentity, String> {
+    let index = root.join("index.sqlite");
+    let metadata = std::fs::metadata(&index)
+        .map_err(|error| format!("inspect Bus index {}: {error}", index.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Bus index {} is not a regular file",
+            index.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(HostBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(HostBusIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+}
+
+fn open_current_host_bus(root: &Path) -> Result<(Persist, HostBusIdentity), String> {
+    let persist = Persist::open(root.to_path_buf()).map_err(|error| error.to_string())?;
+    let identity = host_bus_identity(root)?;
+    if persist.index_inode() != Some(identity.inode) {
+        return Err("Bus connection/path identity changed while opening".to_string());
+    }
+    Ok((persist, identity))
+}
+
+fn verify_host_bus_identity(
+    persist: &Persist,
+    root: &Path,
+    expected: HostBusIdentity,
+) -> Result<(), String> {
+    if host_bus_identity(root)? != expected || persist.index_inode() != Some(expected.inode) {
+        return Err("Bus connection/path identity changed during host-state poll".to_string());
+    }
+    Ok(())
+}
+
 /// The shared Bus root used by the daemon and desktop publishers.
 fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
@@ -985,35 +1094,13 @@ async fn lifecycle_monitor_session(
         .await
         .map_err(|error| format!("subscribe PrepareForShutdown: {error}"))?;
 
-    if publisher
-        .current_intent()
-        .map_err(|error| error.to_string())?
-        .is_some_and(|intent| {
-            matches!(
-                intent.state,
-                NodeAvailabilityState::ScheduledReboot
-                    | NodeAvailabilityState::Rebooting
-                    | NodeAvailabilityState::ShuttingDown
-                    | NodeAvailabilityState::ShutDown
-            )
-        })
-    {
-        let stable = tokio::select! {
-            result = wait_for_network_manager_stability(&connection) => result?,
-            () = shutdown.wait() => return Ok(()),
-        };
-        publish_return_after_stability(
-            publisher,
-            &[
-                NodeAvailabilityState::ScheduledReboot,
-                NodeAvailabilityState::Rebooting,
-                NodeAvailabilityState::ShuttingDown,
-                NodeAvailabilityState::ShutDown,
-            ],
-            stable,
-            "system boot network stabilized",
-        )?;
-    }
+    reconcile_startup_return(
+        publisher,
+        shutdown,
+        LIFECYCLE_MONITOR_RETRY,
+        || wait_for_network_manager_stability(&connection),
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -1142,6 +1229,54 @@ fn publish_return_after_stability(
     Ok(true)
 }
 
+fn publish_startup_return_after_stability(
+    publisher: &RuntimeAvailabilityPublisher,
+    stable: bool,
+) -> Result<bool, String> {
+    publish_return_after_stability(
+        publisher,
+        STARTUP_RETURN_STATES,
+        stable,
+        "system startup network stabilized",
+    )
+}
+
+/// Reconcile a retained absence until the network really returns or another
+/// lifecycle producer supersedes it. A single transient NetworkManager timeout
+/// must not strand a node in Sleeping/Rebooting after the daemon missed the
+/// corresponding return signal.
+async fn reconcile_startup_return<F, Fut>(
+    publisher: &RuntimeAvailabilityPublisher,
+    shutdown: &mut ShutdownToken,
+    retry: Duration,
+    mut network_is_stable: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    loop {
+        let awaiting_return = publisher
+            .current_intent()
+            .map_err(|error| error.to_string())?
+            .is_some_and(|intent| STARTUP_RETURN_STATES.contains(&intent.state));
+        if !awaiting_return {
+            return Ok(());
+        }
+        let stable = tokio::select! {
+            result = network_is_stable() => result?,
+            () = shutdown.wait() => return Ok(()),
+        };
+        if publish_startup_return_after_stability(publisher, stable)? {
+            return Ok(());
+        }
+        tokio::select! {
+            () = tokio::time::sleep(retry) => {}
+            () = shutdown.wait() => return Ok(()),
+        }
+    }
+}
+
 fn host_state_bus_root(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
@@ -1211,11 +1346,8 @@ impl Worker for HostStateWorker {
         ));
         self.poll_once(&persist);
         loop {
-            match Persist::open(root.clone()) {
-                Ok(persist) => self.poll_once(&persist),
-                Err(e) => {
-                    tracing::debug!(target: "mackesd::host_state", error = %e, "bus open failed");
-                }
+            if let Err(e) = self.poll_current_bus(&root) {
+                tracing::debug!(target: "mackesd::host_state", error = %e, "bus poll failed");
             }
             tokio::select! {
                 () = tokio::time::sleep(self.poll) => {}
@@ -1343,6 +1475,291 @@ mod tests {
             .expect("shutdown completes")
             .expect("worker joins")
             .expect("worker exits cleanly");
+    }
+
+    #[test]
+    fn restart_requires_a_post_activation_snapshot_before_mirroring_or_authorizing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open Bus");
+
+        let retained = serde_json::to_string(&mirror_two_lit()).expect("retained snapshot");
+        persist
+            .write(
+                LOCAL_SNAPSHOT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&retained),
+            )
+            .expect("publish pre-restart shell snapshot");
+        let mut old_worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus.clone());
+        old_worker.poll_once(&persist);
+        assert_eq!(
+            persist
+                .list_since(&mirror_topic("nodeA"), None)
+                .unwrap()
+                .len(),
+            1,
+            "pre-restart observation is mirrored once"
+        );
+
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-restart-key".to_vec()));
+        let mut restarted = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus.clone())
+            .with_authorization(signer.clone(), temp.path().join("auth"));
+        restarted
+            .activate_bus(&bus)
+            .expect("activate restarted worker");
+        let activation_snapshot_cursor = restarted.snapshot_cursor.clone();
+
+        let request = req(
+            HostVerb::Display {
+                monitor: "HDMI-A-1".into(),
+                enable: false,
+            },
+            Phase::Confirm,
+        );
+        let body = armed_body(
+            &request,
+            "nodeA",
+            "host-restart-freshness-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        persist
+            .write(&action_topic("nodeA"), Priority::Default, None, Some(&body))
+            .expect("publish forward action after restart");
+
+        restarted.poll_once(&persist);
+        assert_eq!(
+            persist
+                .list_since(&mirror_topic("nodeA"), None)
+                .unwrap()
+                .len(),
+            1,
+            "retained snapshot must not be republished with a fresh record"
+        );
+        assert!(persist.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+        assert!(
+            persist
+                .list_since(&result_topic("nodeA"), None)
+                .unwrap()
+                .is_empty(),
+            "forward action stays pending until a post-activation observation exists"
+        );
+
+        let current = serde_json::to_string(&SeatMirror {
+            displays: vec![MirrorDisplay {
+                id: "HDMI-A-1".into(),
+                enabled: true,
+            }],
+            ..Default::default()
+        })
+        .expect("current snapshot");
+        persist
+            .write(
+                LOCAL_SNAPSHOT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&current),
+            )
+            .expect("publish post-activation shell snapshot");
+        {
+            let connection = rusqlite::Connection::open(bus.join("index.sqlite"))
+                .expect("open Bus index for transient mirror failure");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_host_mirror BEFORE INSERT ON messages
+                     WHEN NEW.topic = 'state/host/nodeA/seat'
+                     BEGIN SELECT RAISE(FAIL, 'host mirror rejected'); END;",
+                )
+                .expect("install transient mirror rejection");
+        }
+        restarted.poll_once(&persist);
+
+        assert_eq!(
+            restarted.snapshot_cursor, activation_snapshot_cursor,
+            "a valid snapshot stays retryable until its mirror publication commits"
+        );
+        assert!(restarted.awaiting_fresh_snapshot);
+        assert_eq!(
+            persist
+                .list_since(&mirror_topic("nodeA"), None)
+                .unwrap()
+                .len(),
+            1,
+            "failed publication must not create a mirror record"
+        );
+        assert!(persist.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+        assert!(
+            persist
+                .list_since(&result_topic("nodeA"), None)
+                .unwrap()
+                .is_empty(),
+            "actions remain parked while the valid observation is unpublished"
+        );
+
+        {
+            let connection = rusqlite::Connection::open(bus.join("index.sqlite"))
+                .expect("reopen Bus index after transient failure");
+            connection
+                .execute_batch("DROP TRIGGER reject_host_mirror")
+                .expect("restore mirror publication");
+        }
+        restarted.poll_once(&persist);
+
+        assert_eq!(
+            persist
+                .list_since(&mirror_topic("nodeA"), None)
+                .unwrap()
+                .len(),
+            2,
+            "the same post-activation observation retries and acquires one mirror record"
+        );
+        assert_ne!(restarted.snapshot_cursor, activation_snapshot_cursor);
+        assert!(!restarted.awaiting_fresh_snapshot);
+        assert!(
+            persist.list_since(APPLY_TOPIC, None).unwrap().is_empty(),
+            "the stale two-display observation must not authorize disabling the current last console"
+        );
+        let result = persist
+            .list_since(&result_topic("nodeA"), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .expect("typed refusal after fresh observation");
+        assert!(result.contains("would-black-last-console"), "{result}");
+    }
+
+    #[test]
+    fn same_path_bus_replacement_reestablishes_snapshot_freshness_barrier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus = temp.path().join("bus");
+        let original = Persist::open(bus.clone()).expect("open original Bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-replacement-key".to_vec()));
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus.clone())
+            .with_authorization(signer.clone(), temp.path().join("auth"));
+        drop(worker.activate_bus(&bus).expect("activate original Bus"));
+
+        let one_lit = serde_json::to_string(&SeatMirror {
+            displays: vec![MirrorDisplay {
+                id: "HDMI-A-1".into(),
+                enabled: true,
+            }],
+            ..Default::default()
+        })
+        .expect("one-display snapshot");
+        original
+            .write(
+                LOCAL_SNAPSHOT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&one_lit),
+            )
+            .expect("publish original fresh snapshot");
+        worker
+            .poll_current_bus(&bus)
+            .expect("admit original Bus generation");
+        assert!(!worker.awaiting_fresh_snapshot);
+        drop(original);
+
+        let replacement_root = temp.path().join("replacement-bus");
+        let replacement = Persist::open(replacement_root.clone()).expect("prepare replacement Bus");
+        replacement
+            .write(
+                LOCAL_SNAPSHOT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&mirror_two_lit()).expect("retained snapshot")),
+            )
+            .expect("publish retained replacement snapshot");
+        let request = req(
+            HostVerb::Display {
+                monitor: "HDMI-A-1".into(),
+                enable: false,
+            },
+            Phase::Confirm,
+        );
+        let retained = armed_body(
+            &request,
+            "nodeA",
+            "host-replacement-retained-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        replacement
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(&retained),
+            )
+            .expect("publish retained replacement action");
+        drop(replacement);
+
+        std::fs::rename(&bus, temp.path().join("retired-bus")).expect("retire original Bus");
+        std::fs::rename(&replacement_root, &bus).expect("install replacement Bus");
+        worker
+            .poll_current_bus(&bus)
+            .expect("activate replacement Bus generation");
+
+        let replacement = Persist::open(bus.clone()).expect("open installed replacement Bus");
+        assert!(worker.awaiting_fresh_snapshot);
+        assert!(replacement
+            .list_since(APPLY_TOPIC, None)
+            .unwrap()
+            .is_empty());
+        assert!(replacement
+            .list_since(&mirror_topic("nodeA"), None)
+            .unwrap()
+            .is_empty());
+        assert!(replacement
+            .list_since(&result_topic("nodeA"), None)
+            .unwrap()
+            .is_empty());
+
+        replacement
+            .write(
+                LOCAL_SNAPSHOT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&one_lit),
+            )
+            .expect("publish post-replacement snapshot");
+        let forward = armed_body(
+            &request,
+            "nodeA",
+            "host-replacement-forward-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        replacement
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(&forward),
+            )
+            .expect("publish post-replacement action");
+        worker
+            .poll_current_bus(&bus)
+            .expect("poll current replacement generation");
+
+        assert!(!worker.awaiting_fresh_snapshot);
+        assert!(replacement
+            .list_since(APPLY_TOPIC, None)
+            .unwrap()
+            .is_empty());
+        let results = replacement
+            .list_since(&result_topic("nodeA"), None)
+            .unwrap();
+        assert_eq!(results.len(), 1, "retained action must be tail-skipped");
+        assert!(results[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("would-black-last-console")));
     }
 
     fn armed_body(
@@ -2075,6 +2492,82 @@ mod tests {
             "system resume network stabilized",
         )
         .unwrap());
+        let returned = publisher.current_intent().unwrap().unwrap();
+        assert_eq!(returned.state, NodeAvailabilityState::Returned);
+        assert_eq!(returned.generation, 2);
+    }
+
+    #[test]
+    fn startup_reconciles_sleep_when_daemon_missed_the_wake_signal() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let durable = temp.path().join("availability/current.json");
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus.clone())
+            .with_availability_durable_path(durable.clone());
+        let publisher = worker.availability_publisher().unwrap();
+        let sleeping = publisher
+            .publish(RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::Sleeping,
+                "host-state-logind",
+                "system sleep preparation",
+                Some(SUSPEND_EXPECTED_RETURN),
+            ))
+            .expect("persist sleep before daemon restart");
+
+        let restarted = RuntimeAvailabilityPublisher::new(
+            "nodeA".to_string(),
+            "nodeA".to_string(),
+            NodeDeviceClass::Unknown,
+            bus.clone(),
+            durable,
+        );
+        assert!(publish_startup_return_after_stability(&restarted, true)
+            .expect("reconcile retained sleep after network stability"));
+
+        let returned = restarted.current_intent().unwrap().unwrap();
+        assert_eq!(returned.state, NodeAvailabilityState::Returned);
+        assert_eq!(returned.generation, sleeping.generation + 1);
+        let rows = Persist::open(bus)
+            .unwrap()
+            .list_since(&mackes_mesh_types::health::node_health_topic("nodeA"), None)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "restart must publish one returned event");
+    }
+
+    #[tokio::test]
+    async fn startup_return_retries_after_transient_network_instability() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_availability_durable_path(temp.path().join("availability/current.json"));
+        let publisher = worker.availability_publisher().unwrap();
+        publisher
+            .publish(RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::Sleeping,
+                "host-state-logind",
+                "system sleep preparation",
+                Some(SUSPEND_EXPECTED_RETURN),
+            ))
+            .expect("persist sleep before daemon restart");
+        let attempts = std::cell::Cell::new(0_u8);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = ShutdownToken::from_receiver(shutdown_rx);
+
+        reconcile_startup_return(
+            &publisher,
+            &mut shutdown,
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get().saturating_add(1));
+                std::future::ready(Ok(attempts.get() > 1))
+            },
+        )
+        .await
+        .expect("transient instability remains retryable");
+
+        assert_eq!(attempts.get(), 2, "one false verdict must trigger a retry");
         let returned = publisher.current_intent().unwrap().unwrap();
         assert_eq!(returned.state, NodeAvailabilityState::Returned);
         assert_eq!(returned.generation, 2);

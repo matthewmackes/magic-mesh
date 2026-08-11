@@ -194,6 +194,9 @@ struct CloudBusFaults {
 pub struct CloudWorker {
     /// This node's id — the `state/cloud/<host>` namespace and placement key.
     host: String,
+    /// Exact daemon node identity consumed by the node-local Workload worker.
+    /// Unlike `host`, this retains the `peer:` namespace when one is present.
+    workload_node_id: String,
     /// The pinned deployment role published in the cloud mirror.
     deployment_role: DeploymentRole,
     /// Whether this node may receive workload mutations. Lighthouses remain
@@ -267,12 +270,11 @@ impl CloudWorker {
     /// Construct with production defaults: the [`ShellCloudRunner`] over the
     /// deployed IaC tree + local libvirt, a placement-node-local arming authority,
     /// honest reconcile skeleton and the persisted Bus tree. `host` is this
-    /// node's id; the retained `_node_id` parameter preserves the worker
-    /// constructor shape while cloud-local lifecycle audit authority is retired;
+    /// placement key; `node_id` is the exact identity used by the Workload API;
     /// `workgroup_root` is the desired-state / tfvars root (reserved for the
     /// reconcile seam).
     #[must_use]
-    pub fn new(host: String, _node_id: String, workgroup_root: PathBuf) -> Self {
+    pub fn new(host: String, node_id: String, workgroup_root: PathBuf) -> Self {
         let runner = Arc::new(ShellCloudRunner::new(
             &default_iac_root(),
             default_libvirt_uri(),
@@ -338,6 +340,7 @@ impl CloudWorker {
 
         Self {
             host,
+            workload_node_id: node_id,
             deployment_role,
             workloads_allowed,
             runner,

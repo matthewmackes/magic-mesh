@@ -21,6 +21,111 @@ fail() {
     exit 1
 }
 
+verify_package_manifest() {
+    python3 - "$1" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    fd = os.open(path, flags)
+except OSError as exc:
+    raise SystemExit(
+        f"verify-android-contract: cannot open package manifest safely: {exc}"
+    ) from exc
+
+try:
+    opened = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        raise SystemExit(
+            "verify-android-contract: package manifest must be a single-link regular file"
+        )
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(
+            "verify-android-contract: package manifest changed before validation"
+        )
+    payload = os.read(fd, 262145)
+    if len(payload) > 262144:
+        raise SystemExit("verify-android-contract: package manifest exceeds 256 KiB")
+    if os.read(fd, 1):
+        raise SystemExit("verify-android-contract: package manifest grew during validation")
+    closed = os.stat(path, follow_symlinks=False)
+    if (opened.st_dev, opened.st_ino) != (closed.st_dev, closed.st_ino):
+        raise SystemExit(
+            "verify-android-contract: package manifest changed during validation"
+        )
+finally:
+    os.close(fd)
+
+try:
+    manifest = payload.decode("utf-8")
+except UnicodeDecodeError as exc:
+    raise SystemExit(
+        "verify-android-contract: package manifest is not valid UTF-8"
+    ) from exc
+
+required_sections = {
+    "package.metadata.generate-rpm.requires": "base",
+    "package.metadata.generate-rpm.variants.server.requires": "server",
+}
+observed = {section: set() for section in required_sections}
+section = None
+for raw_line in manifest.splitlines():
+    line = raw_line.strip()
+    if line.startswith("[") and line.endswith("]"):
+        section = line[1:-1]
+        continue
+    if section not in observed or line.startswith("#"):
+        continue
+    match = re.fullmatch(r'(gnupg2(?:-verify)?)\s*=\s*"\*"', line)
+    if match:
+        observed[section].add(match.group(1))
+
+for section, package_name in required_sections.items():
+    missing = [
+        name
+        for name in ("gnupg2", "gnupg2-verify")
+        if name not in observed[section]
+    ]
+    if missing:
+        raise SystemExit(
+            f"verify-android-contract: {package_name} RPM lacks hard Requires: {missing}"
+        )
+PY
+}
+
+if [[ ${1:-} == "--verify-package-manifest" ]]; then
+    [[ $# -eq 2 ]] || fail "--verify-package-manifest requires one path"
+    verify_package_manifest "$2"
+    exit 0
+fi
+
+if [[ ${1:-} == "--self-test" ]]; then
+    [[ $# -eq 1 ]] || fail "--self-test takes no arguments"
+    fixture=$(mktemp -d)
+    trap 'rm -rf -- "$fixture"' EXIT
+    printf '%s\n' \
+        '[package.metadata.generate-rpm.requires]' \
+        'gnupg2 = "*"' \
+        'gnupg2-verify = "*"' \
+        '[package.metadata.generate-rpm.variants.server.requires]' \
+        'gnupg2 = "*"' \
+        'gnupg2-verify = "*"' >"$fixture/Cargo.toml"
+    ln "$fixture/Cargo.toml" "$fixture/substituted-Cargo.toml"
+    if "$0" --verify-package-manifest "$fixture/substituted-Cargo.toml" \
+        >/dev/null 2>&1; then
+        fail "hard-linked package manifest gained Android packaging authority"
+    fi
+    echo "Android/Cuttlefish packaging contract self-test passed"
+    exit 0
+fi
+
+[[ $# -eq 0 ]] || fail "unexpected arguments: $*"
+
 [ -x "$MANIFEST_VERIFY" ] || fail "Android manifest verifier is not executable"
 [ -x "$TOOL_READINESS" ] || fail "guest-tool readiness recorder is not executable"
 [ -x "$PLACEMENT_READINESS" ] || fail "Cuttlefish placement verifier is not executable"
@@ -63,39 +168,7 @@ gpg --batch --no-options --with-colons --show-keys "$PROJECT_RELEASE_KEY" 2>/dev
 # Fedora 44 splits `gpg` and `gpgv` across two packages. Both the Workstation
 # base RPM and headless Server RPM can admit Android compute, so neither package
 # may ship this verifier without both hard runtime dependencies.
-python3 - "$PACKAGE_MANIFEST" <<'PY'
-import sys
-import re
-from pathlib import Path
-
-required_sections = {
-    "package.metadata.generate-rpm.requires": "base",
-    "package.metadata.generate-rpm.variants.server.requires": "server",
-}
-observed = {section: set() for section in required_sections}
-section = None
-for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    line = raw_line.strip()
-    if line.startswith("[") and line.endswith("]"):
-        section = line[1:-1]
-        continue
-    if section not in observed or line.startswith("#"):
-        continue
-    match = re.fullmatch(r'(gnupg2(?:-verify)?)\s*=\s*"\*"', line)
-    if match:
-        observed[section].add(match.group(1))
-
-for section, package_name in required_sections.items():
-    missing = [
-        name
-        for name in ("gnupg2", "gnupg2-verify")
-        if name not in observed[section]
-    ]
-    if missing:
-        raise SystemExit(
-            f"verify-android-contract: {package_name} RPM lacks hard Requires: {missing}"
-        )
-PY
+verify_package_manifest "$PACKAGE_MANIFEST"
 
 "$MANIFEST_VERIFY" --self-test >/dev/null
 "$TOOL_READINESS" --self-test >/dev/null

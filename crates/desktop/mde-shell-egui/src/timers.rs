@@ -698,6 +698,12 @@ fn acknowledgement_body(
     if occurrence.phase != ClockOccurrencePhase::Ringing {
         return Err("the occurrence is no longer ringing".to_owned());
     }
+    if !stop {
+        let schedule = find_schedule(snapshot, &occurrence.schedule_id)?;
+        if !matches!(schedule.schedule, ClockScheduleKindV1::Alarm(_)) {
+            return Err("only a ringing alarm can be snoozed".to_owned());
+        }
+    }
     Ok(ClockCommandKindV1::Acknowledge {
         occurrence_id: occurrence.occurrence_id.clone(),
         acknowledgement: ClockAcknowledgementV1 {
@@ -1188,13 +1194,18 @@ fn ringing_occurrences(ui: &mut egui::Ui, state: &mut ClockState, snapshot: &Clo
         .iter()
         .filter(|occurrence| occurrence.phase == ClockOccurrencePhase::Ringing)
     {
-        let label = snapshot
+        let Some(schedule) = snapshot
             .schedules
             .iter()
             .find(|schedule| schedule.schedule_id == occurrence.schedule_id)
-            .map_or("Clock alert", |schedule| schedule.label.as_str());
+        else {
+            continue;
+        };
+        if !matches!(schedule.schedule, ClockScheduleKindV1::Alarm(_)) {
+            continue;
+        }
         ui.horizontal(|ui| {
-            ui.colored_label(Style::WARN, format!("Ringing · {label}"));
+            ui.colored_label(Style::WARN, format!("Ringing · {}", schedule.label));
             if ui.button("Snooze").clicked() {
                 state.emit(ClockUiAction::AcknowledgeOccurrence {
                     occurrence_id: occurrence.occurrence_id.clone(),
@@ -1499,6 +1510,23 @@ mod tests {
         assert!(state
             .validate_banner_action(banners[0].actions[1].clone())
             .is_err());
+    }
+
+    #[test]
+    fn ringing_timer_cannot_cross_the_alarm_snooze_authority_boundary() {
+        let snapshot = ringing_snapshot();
+
+        let result = command_body(
+            ClockUiAction::AcknowledgeOccurrence {
+                occurrence_id: "occurrence-timer".into(),
+                stop: false,
+            },
+            &snapshot,
+            snapshot.produced_at_utc_ms,
+            1,
+        );
+
+        assert_eq!(result, Err("only a ringing alarm can be snoozed".to_owned()));
     }
 
     #[test]

@@ -5,22 +5,25 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use mackes_mesh_types::navigation::{
-    navigation_cancel_action_topic, navigation_progress_action_topic,
-    navigation_route_action_topic, navigation_state_topic, CancelNavigationRequest,
-    NavigationPhase, NavigationProgress, NavigationProgressRequest, NavigationSnapshot,
-    NavigationUnavailableReason, RouteRequest, RouteRequestKind, RouteResult,
-    NAVIGATION_SCHEMA_VERSION,
+    CancelNavigationRequest, NAVIGATION_SCHEMA_VERSION, NavigationPhase, NavigationProgress,
+    NavigationProgressRequest, NavigationSnapshot, NavigationUnavailableReason, RouteRequest,
+    RouteRequestKind, RouteResult, navigation_cancel_action_topic,
+    navigation_progress_action_topic, navigation_route_action_topic, navigation_state_topic,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ShutdownToken, Worker};
 
@@ -30,8 +33,14 @@ const MAX_BUS_RETRY: Duration = Duration::from_secs(2);
 const MAX_ACTION_AGE_MS: i64 = 10 * 60 * 1_000;
 const MAX_PERSISTED_BYTES: usize = 512 * 1024;
 const MAX_REPLAY_IDS: usize = 32;
+const MAX_PROVIDER_AUTHORITY_BYTES: usize = 16 * 1024;
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
+const MIN_PROVIDER_TIMEOUT_MS: u64 = 100;
+const MAX_PROVIDER_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_STATE_PATH: &str = "/var/lib/mackesd/navigation.json";
+const DEFAULT_PROVIDER_AUTHORITY_PATH: &str = "/etc/mackesd/navigation-provider.json";
 const STATE_PATH_ENV: &str = "MDE_NAVIGATION_STATE_PATH";
+const PROVIDER_SCHEMA_VERSION: u16 = 1;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -67,9 +76,11 @@ trait RouteProvider: Send + Sync {
     ) -> Result<RouteResult, RouteProviderError>;
 }
 
-/// Production is fail-closed until an approved offline/online routing engine is provisioned.
+/// Explicitly unavailable provider retained for deterministic failure fixtures.
+#[cfg(test)]
 struct UnavailableRouteProvider;
 
+#[cfg(test)]
 impl RouteProvider for UnavailableRouteProvider {
     fn calculate(
         &self,
@@ -78,6 +89,333 @@ impl RouteProvider for UnavailableRouteProvider {
     ) -> Result<RouteResult, RouteProviderError> {
         Err(RouteProviderError::NotConfigured)
     }
+}
+
+/// Root-governed, vendor-neutral route authority. The endpoint is deliberately
+/// restricted to a numeric loopback address: the installed provider must own
+/// its map data and offline behavior locally rather than turning mackesd into an
+/// implicit Internet routing client.
+#[derive(Debug, Clone)]
+struct RouteProviderAuthority {
+    provider_id: String,
+    endpoint: reqwest::Url,
+    timeout: Duration,
+    verifying_key: VerifyingKey,
+    source_dev: u64,
+    source_ino: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RouteProviderAuthorityFile {
+    schema_version: u16,
+    provider_id: String,
+    endpoint: String,
+    timeout_ms: u64,
+    ed25519_public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRouteRequest<'a> {
+    schema_version: u16,
+    request_sha256: &'a str,
+    request: &'a RouteRequest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRouteResponse {
+    schema_version: u16,
+    request_sha256: String,
+    route: RouteResult,
+    signature: String,
+}
+
+struct GovernedHttpRouteProvider {
+    authority_path: PathBuf,
+    authority_owner_uid: u32,
+}
+
+impl GovernedHttpRouteProvider {
+    fn production() -> Self {
+        Self {
+            authority_path: PathBuf::from(DEFAULT_PROVIDER_AUTHORITY_PATH),
+            authority_owner_uid: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(authority_path: PathBuf, authority_owner_uid: u32) -> Self {
+        Self {
+            authority_path,
+            authority_owner_uid,
+        }
+    }
+}
+
+impl RouteProvider for GovernedHttpRouteProvider {
+    fn calculate(
+        &self,
+        request: &RouteRequest,
+        _now_ms: i64,
+    ) -> Result<RouteResult, RouteProviderError> {
+        let authority = load_provider_authority(&self.authority_path, self.authority_owner_uid)
+            .map_err(|_| RouteProviderError::NotConfigured)?
+            .ok_or(RouteProviderError::NotConfigured)?;
+        let timeout = authority.timeout;
+        let request = request.clone();
+        let request_authority = authority.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("navigation-provider-http".into())
+            .spawn(move || {
+                let _ = send.send(calculate_http_route(&request_authority, &request));
+            })
+            .map_err(|_| RouteProviderError::Unavailable)?;
+        let result = receive
+            .recv_timeout(timeout.saturating_add(Duration::from_millis(250)))
+            .map_err(|_| RouteProviderError::Unavailable)?;
+        let current = load_provider_authority(&self.authority_path, self.authority_owner_uid)
+            .map_err(|_| RouteProviderError::NotConfigured)?
+            .ok_or(RouteProviderError::NotConfigured)?;
+        if !same_provider_authority(&authority, &current) {
+            return Err(RouteProviderError::NotConfigured);
+        }
+        result
+    }
+}
+
+fn same_provider_authority(
+    expected: &RouteProviderAuthority,
+    current: &RouteProviderAuthority,
+) -> bool {
+    expected.provider_id == current.provider_id
+        && expected.endpoint == current.endpoint
+        && expected.timeout == current.timeout
+        && expected.verifying_key.as_bytes() == current.verifying_key.as_bytes()
+        && expected.source_dev == current.source_dev
+        && expected.source_ino == current.source_ino
+}
+
+fn load_provider_authority(
+    path: &Path,
+    expected_owner_uid: u32,
+) -> io::Result<Option<RouteProviderAuthority>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_absolute())
+        .ok_or_else(|| io_invalid_data("navigation provider authority path is not absolute"))?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != expected_owner_uid
+        || parent_metadata.permissions().mode() & 0o022 != 0
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(io_invalid_data(
+            "navigation provider authority parent is not securely owned",
+        ));
+    }
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != expected_owner_uid
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.len() > MAX_PROVIDER_AUTHORITY_BYTES as u64
+    {
+        return Err(io_invalid_data(
+            "navigation provider authority is not a secure bounded regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.uid() != expected_owner_uid
+    {
+        return Err(io_invalid_data(
+            "navigation provider authority changed during secure open",
+        ));
+    }
+    let mut body = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_PROVIDER_AUTHORITY_BYTES + 1) as u64)
+        .read_to_end(&mut body)?;
+    if body.len() > MAX_PROVIDER_AUTHORITY_BYTES {
+        return Err(io_invalid_data(
+            "navigation provider authority is too large",
+        ));
+    }
+    let text = std::str::from_utf8(&body).map_err(io_invalid_data)?;
+    mackes_mesh_types::workloads::reject_duplicate_json_keys(text).map_err(io_invalid_data)?;
+    let authority: RouteProviderAuthorityFile =
+        serde_json::from_slice(&body).map_err(io_invalid_data)?;
+    validate_provider_authority(authority, opened.dev(), opened.ino()).map(Some)
+}
+
+fn validate_provider_authority(
+    authority: RouteProviderAuthorityFile,
+    source_dev: u64,
+    source_ino: u64,
+) -> io::Result<RouteProviderAuthority> {
+    if authority.schema_version != PROVIDER_SCHEMA_VERSION
+        || authority.provider_id.is_empty()
+        || authority.provider_id.len() > 128
+        || !authority
+            .provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        || !(MIN_PROVIDER_TIMEOUT_MS..=MAX_PROVIDER_TIMEOUT_MS).contains(&authority.timeout_ms)
+    {
+        return Err(io_invalid_data("invalid navigation provider authority"));
+    }
+    let endpoint = reqwest::Url::parse(&authority.endpoint).map_err(io_invalid_data)?;
+    let loopback = matches!(endpoint.host_str(), Some("127.0.0.1" | "::1" | "[::1]"));
+    if endpoint.scheme() != "http"
+        || !loopback
+        || endpoint.port().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.path() == "/"
+    {
+        return Err(io_invalid_data(
+            "navigation provider endpoint must be an explicit loopback HTTP route",
+        ));
+    }
+    let public_key = decode_hex::<32>(&authority.ed25519_public_key)
+        .ok_or_else(|| io_invalid_data("invalid navigation provider Ed25519 public key"))?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key).map_err(io_invalid_data)?;
+    Ok(RouteProviderAuthority {
+        provider_id: authority.provider_id,
+        endpoint,
+        timeout: Duration::from_millis(authority.timeout_ms),
+        verifying_key,
+        source_dev,
+        source_ino,
+    })
+}
+
+fn calculate_http_route(
+    authority: &RouteProviderAuthority,
+    request: &RouteRequest,
+) -> Result<RouteResult, RouteProviderError> {
+    let canonical_request =
+        serde_json::to_vec(request).map_err(|_| RouteProviderError::Unavailable)?;
+    let request_sha256 = sha256_hex(&canonical_request);
+    let body = serde_json::to_vec(&ProviderRouteRequest {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        request_sha256: &request_sha256,
+        request,
+    })
+    .map_err(|_| RouteProviderError::Unavailable)?;
+    let client = Client::builder()
+        .connect_timeout(authority.timeout)
+        .timeout(authority.timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| RouteProviderError::Unavailable)?;
+    let mut response = client
+        .post(authority.endpoint.clone())
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .map_err(|_| RouteProviderError::Unavailable)?;
+    if response.status() != reqwest::StatusCode::OK
+        || !response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
+        || response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES)
+    {
+        return Err(RouteProviderError::Unavailable);
+    }
+    let mut response_body = Vec::new();
+    response
+        .by_ref()
+        .take((MAX_PROVIDER_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response_body)
+        .map_err(|_| RouteProviderError::Unavailable)?;
+    if response_body.len() > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(RouteProviderError::Unavailable);
+    }
+    let text = std::str::from_utf8(&response_body).map_err(|_| RouteProviderError::Unavailable)?;
+    mackes_mesh_types::workloads::reject_duplicate_json_keys(text)
+        .map_err(|_| RouteProviderError::Unavailable)?;
+    let response: ProviderRouteResponse =
+        serde_json::from_slice(&response_body).map_err(|_| RouteProviderError::Unavailable)?;
+    if response.schema_version != PROVIDER_SCHEMA_VERSION
+        || response.request_sha256 != request_sha256
+        || response.route.request_id != request.request_id
+        || response.route.attribution.provider_id != authority.provider_id
+        || !response.route.attribution.offline
+    {
+        return Err(RouteProviderError::Unavailable);
+    }
+    let signature_bytes =
+        decode_hex::<64>(&response.signature).ok_or(RouteProviderError::Unavailable)?;
+    let signed = provider_response_signing_bytes(&request_sha256, &response.route)
+        .map_err(|_| RouteProviderError::Unavailable)?;
+    authority
+        .verifying_key
+        .verify_strict(&signed, &Signature::from_bytes(&signature_bytes))
+        .map_err(|_| RouteProviderError::Unavailable)?;
+    Ok(response.route)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    encode_hex(&digest)
+}
+
+fn provider_response_signing_bytes(
+    request_sha256: &str,
+    route: &RouteResult,
+) -> io::Result<Vec<u8>> {
+    let route = serde_json::to_vec(route).map_err(io_other)?;
+    let mut bytes = b"magic-mesh:navigation-provider-response:v1\0".to_vec();
+    bytes.extend_from_slice(request_sha256.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&route);
+    Ok(bytes)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 || !value.is_ascii() {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = char::from(pair[0]).to_digit(16)?;
+        let low = char::from(pair[1]).to_digit(16)?;
+        decoded[index] = u8::try_from((high << 4) | low).ok()?;
+    }
+    Some(decoded)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +505,9 @@ pub struct NavigationWorker {
 }
 
 impl NavigationWorker {
-    /// Construct the node-scoped production authority with a fail-closed provider.
+    /// Construct the node-scoped production authority. A provider is admitted
+    /// only through the secure local authority file; absent or invalid authority
+    /// retains the explicit provider-not-configured state.
     #[must_use]
     pub fn new(host: String) -> Self {
         Self {
@@ -178,7 +518,7 @@ impl NavigationWorker {
             bus_root: navigation_bus_root(crate::bus_publish::default_bus_root()),
             poll: POLL,
             clock: Arc::new(SystemClock),
-            provider: Arc::new(UnavailableRouteProvider),
+            provider: Arc::new(GovernedHttpRouteProvider::production()),
             authority: None,
             published_once: false,
             #[cfg(test)]
@@ -365,6 +705,16 @@ impl NavigationWorker {
                 return Ok(());
             }
         }
+        let replaced_route_id = match &self
+            .authority
+            .as_ref()
+            .expect("authority loaded")
+            .snapshot
+            .phase
+        {
+            NavigationPhase::Active { route, .. } => Some(route.route_id.clone()),
+            _ => None,
+        };
         let pre_action = self.authority.as_ref().expect("authority loaded").clone();
         {
             let authority = self.authority.as_mut().expect("authority loaded");
@@ -397,14 +747,21 @@ impl NavigationWorker {
                 ))),
             };
         }
-        let phase = match self.provider.calculate(&request, now_ms) {
+        let provider_result = self.provider.calculate(&request, now_ms);
+        let completed_at_ms = self.clock.now_ms();
+        let phase = match provider_result {
             Ok(route)
-                if route.request_id == request.request_id && route.validate_at(now_ms).is_ok() =>
+                if route_matches_request(
+                    &route,
+                    &request,
+                    completed_at_ms,
+                    replaced_route_id.as_deref(),
+                ) =>
             {
                 let progress = NavigationProgress {
                     route_id: route.route_id.clone(),
                     position: request.origin.point.clone(),
-                    observed_at_ms: now_ms,
+                    observed_at_ms: completed_at_ms,
                     maneuver_index: 0,
                     distance_remaining_metres: route.distance_metres,
                     duration_remaining_seconds: route.duration_seconds,
@@ -422,7 +779,7 @@ impl NavigationWorker {
             },
         };
         let authority = self.authority.as_mut().expect("authority loaded");
-        authority.snapshot.produced_at_ms = now_ms;
+        authority.snapshot.produced_at_ms = completed_at_ms;
         authority.snapshot.phase = phase;
         store_record(&self.state_path, authority)
     }
@@ -594,6 +951,23 @@ fn navigation_bus_root(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
+fn route_matches_request(
+    route: &RouteResult,
+    request: &RouteRequest,
+    now_ms: i64,
+    replaced_route_id: Option<&str>,
+) -> bool {
+    route.request_id == request.request_id
+        && replaced_route_id != Some(route.route_id.as_str())
+        && route.calculated_at_ms >= request.issued_at_ms
+        && route.validate_at(now_ms).is_ok()
+        && route.geometry.first() == Some(&request.origin.point)
+        && route.geometry.last() == Some(&request.destination.point)
+        && route.maneuvers.first().map(|maneuver| &maneuver.point) == Some(&request.origin.point)
+        && route.maneuvers.last().map(|maneuver| &maneuver.point)
+            == Some(&request.destination.point)
+}
+
 fn next_bus_retry(current: Duration) -> Duration {
     current
         .saturating_mul(2)
@@ -655,10 +1029,13 @@ fn io_other(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use mackes_mesh_types::navigation::{
         ManeuverKind, RouteAttribution, RouteEndpoint, RouteManeuver, RouteProfile,
     };
     use mackes_mesh_types::nws_alert::GeoPoint;
+    use std::io::BufRead as _;
+    use std::net::{TcpListener, TcpStream};
     use tempfile::TempDir;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -746,6 +1123,134 @@ mod tests {
         ) -> Result<RouteResult, RouteProviderError> {
             Err(RouteProviderError::Unavailable)
         }
+    }
+
+    struct StaleProvider;
+    impl RouteProvider for StaleProvider {
+        fn calculate(
+            &self,
+            request: &RouteRequest,
+            now_ms: i64,
+        ) -> Result<RouteResult, RouteProviderError> {
+            let mut route = FixtureProvider.calculate(request, now_ms)?;
+            route.calculated_at_ms = request.issued_at_ms - 1;
+            Ok(route)
+        }
+    }
+
+    struct ReusedRouteIdProvider;
+    impl RouteProvider for ReusedRouteIdProvider {
+        fn calculate(
+            &self,
+            request: &RouteRequest,
+            now_ms: i64,
+        ) -> Result<RouteResult, RouteProviderError> {
+            let mut route = FixtureProvider.calculate(request, now_ms)?;
+            route.route_id = "recycled-route-identity".into();
+            Ok(route)
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OwnedProviderRouteRequest {
+        schema_version: u16,
+        request_sha256: String,
+        request: RouteRequest,
+    }
+
+    fn write_provider_authority(
+        path: &Path,
+        endpoint: String,
+        timeout_ms: u64,
+        verifying_key: &VerifyingKey,
+    ) -> u32 {
+        let body = serde_json::to_vec(&RouteProviderAuthorityFile {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            provider_id: "fixture".into(),
+            endpoint,
+            timeout_ms,
+            ed25519_public_key: encode_hex(verifying_key.as_bytes()),
+        })
+        .unwrap();
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::metadata(path).unwrap().uid()
+    }
+
+    fn read_provider_request(stream: &mut TcpStream) -> OwnedProviderRouteRequest {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = io::BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        assert_eq!(request_line.trim_end(), "POST /v1/route HTTP/1.1");
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+        }
+        let length = content_length.expect("provider request Content-Length");
+        assert!(length <= MAX_PROVIDER_AUTHORITY_BYTES);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn serve_provider_once(
+        listener: TcpListener,
+        signing_key: SigningKey,
+    ) -> std::thread::JoinHandle<()> {
+        serve_provider_once_with(listener, signing_key, || {})
+    }
+
+    fn serve_provider_once_with<F>(
+        listener: TcpListener,
+        signing_key: SigningKey,
+        before_reply: F,
+    ) -> std::thread::JoinHandle<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let provider_request = read_provider_request(&mut stream);
+            assert_eq!(provider_request.schema_version, PROVIDER_SCHEMA_VERSION);
+            assert_eq!(
+                provider_request.request_sha256,
+                sha256_hex(&serde_json::to_vec(&provider_request.request).unwrap())
+            );
+            let route = FixtureProvider
+                .calculate(&provider_request.request, NOW)
+                .unwrap();
+            let signature = signing_key.sign(
+                &provider_response_signing_bytes(&provider_request.request_sha256, &route).unwrap(),
+            );
+            let body = serde_json::to_vec(&ProviderRouteResponse {
+                schema_version: PROVIDER_SCHEMA_VERSION,
+                request_sha256: provider_request.request_sha256,
+                route,
+                signature: encode_hex(&signature.to_bytes()),
+            })
+            .unwrap();
+            before_reply();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        })
     }
 
     struct Fixture {
@@ -1092,11 +1597,13 @@ mod tests {
         assert_eq!(after.progress_cursor, before.progress_cursor);
         assert_eq!(after.cancel_cursor, before.cancel_cursor);
         assert_eq!(after.seen_request_ids, before.seen_request_ids);
-        assert!(load_record(&fixture.worker.state_path)
-            .unwrap()
-            .unwrap()
-            .route_cursor
-            .is_none());
+        assert!(
+            load_record(&fixture.worker.state_path)
+                .unwrap()
+                .unwrap()
+                .route_cursor
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1243,6 +1750,263 @@ mod tests {
                 reason: NavigationUnavailableReason::ProviderUnavailable,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn provider_result_older_than_request_is_refused() {
+        let mut fixture = Fixture::new(Arc::new(StaleProvider));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-stale-provider-result"),
+        );
+
+        fixture.worker.tick_once().unwrap();
+
+        assert!(matches!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                request_id: Some(ref request_id),
+                reason: NavigationUnavailableReason::ProviderUnavailable,
+            } if request_id == "req-stale-provider-result"
+        ));
+    }
+
+    #[test]
+    fn replacement_route_cannot_reuse_active_route_identity() {
+        let mut fixture = Fixture::new(Arc::new(ReusedRouteIdProvider));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-original-route"),
+        );
+        fixture.worker.tick_once().unwrap();
+        assert!(matches!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Active { ref route, .. }
+                if route.route_id == "recycled-route-identity"
+        ));
+
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(1, "req-replacement-route"),
+        );
+        fixture.worker.tick_once().unwrap();
+
+        assert!(matches!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                request_id: Some(ref request_id),
+                reason: NavigationUnavailableReason::ProviderUnavailable,
+            } if request_id == "req-replacement-route"
+        ));
+    }
+
+    #[test]
+    fn governed_production_provider_is_bounded_and_request_bound() {
+        let authority_dir = tempfile::tempdir().unwrap();
+        let authority_path = authority_dir.path().join("navigation-provider.json");
+        let trusted_signer = SigningKey::from_bytes(&[17_u8; 32]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/route", listener.local_addr().unwrap());
+        let owner_uid = write_provider_authority(
+            &authority_path,
+            endpoint,
+            500,
+            &trusted_signer.verifying_key(),
+        );
+        let server = serve_provider_once(listener, trusted_signer.clone());
+        let mut fixture = Fixture::new(Arc::new(GovernedHttpRouteProvider::for_test(
+            authority_path.clone(),
+            owner_uid,
+        )));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-governed-provider"),
+        );
+
+        fixture.worker.tick_once().unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Active { ref route, .. }
+                if route.request_id == "req-governed-provider"
+                    && route.attribution.provider_id == "fixture"
+                    && route.attribution.offline
+        ));
+
+        let impersonator = TcpListener::bind("127.0.0.1:0").unwrap();
+        let impersonator_endpoint =
+            format!("http://{}/v1/route", impersonator.local_addr().unwrap());
+        write_provider_authority(
+            &authority_path,
+            impersonator_endpoint,
+            500,
+            &trusted_signer.verifying_key(),
+        );
+        let impersonator_server =
+            serve_provider_once(impersonator, SigningKey::from_bytes(&[19_u8; 32]));
+        let mut forged = Fixture::new(Arc::new(GovernedHttpRouteProvider::for_test(
+            authority_path.clone(),
+            owner_uid,
+        )));
+        forged.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-forged-local-provider"),
+        );
+        forged.worker.tick_once().unwrap();
+        impersonator_server.join().unwrap();
+        assert!(matches!(
+            forged.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                reason: NavigationUnavailableReason::ProviderUnavailable,
+                ..
+            }
+        ));
+
+        write_provider_authority(
+            &authority_path,
+            "http://198.51.100.9:8080/v1/route".into(),
+            500,
+            &trusted_signer.verifying_key(),
+        );
+        let mut remote = Fixture::new(Arc::new(GovernedHttpRouteProvider::for_test(
+            authority_path.clone(),
+            owner_uid,
+        )));
+        remote.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-remote-refused"),
+        );
+        remote.worker.tick_once().unwrap();
+        assert!(matches!(
+            remote.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                reason: NavigationUnavailableReason::ProviderNotConfigured,
+                ..
+            }
+        ));
+
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_endpoint =
+            format!("http://{}/v1/route", stalled_listener.local_addr().unwrap());
+        write_provider_authority(
+            &authority_path,
+            stalled_endpoint,
+            MIN_PROVIDER_TIMEOUT_MS,
+            &trusted_signer.verifying_key(),
+        );
+        let stalled_server = std::thread::spawn(move || {
+            let (_stream, _) = stalled_listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let mut stalled = Fixture::new(Arc::new(GovernedHttpRouteProvider::for_test(
+            authority_path,
+            owner_uid,
+        )));
+        stalled.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-timeout"),
+        );
+        let begun = std::time::Instant::now();
+        stalled.worker.tick_once().unwrap();
+        assert!(
+            begun.elapsed() < Duration::from_millis(400),
+            "provider I/O exceeded its governed timeout"
+        );
+        assert!(matches!(
+            stalled.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                reason: NavigationUnavailableReason::ProviderUnavailable,
+                ..
+            }
+        ));
+        stalled_server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_authority_replacement_during_calculation_revokes_result() {
+        let authority_dir = tempfile::tempdir().unwrap();
+        let authority_path = authority_dir.path().join("navigation-provider.json");
+        let trusted_signer = SigningKey::from_bytes(&[23_u8; 32]);
+        let replacement_signer = SigningKey::from_bytes(&[29_u8; 32]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/route", listener.local_addr().unwrap());
+        let owner_uid = write_provider_authority(
+            &authority_path,
+            endpoint.clone(),
+            500,
+            &trusted_signer.verifying_key(),
+        );
+        let replacement_path = authority_path.clone();
+        let replacement_endpoint = endpoint;
+        let server = serve_provider_once_with(listener, trusted_signer, move || {
+            write_provider_authority(
+                &replacement_path,
+                replacement_endpoint,
+                500,
+                &replacement_signer.verifying_key(),
+            );
+        });
+        let mut fixture = Fixture::new(Arc::new(GovernedHttpRouteProvider::for_test(
+            authority_path,
+            owner_uid,
+        )));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-revoked-provider"),
+        );
+
+        fixture.worker.tick_once().unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                request_id: Some(ref request_id),
+                reason: NavigationUnavailableReason::ProviderNotConfigured,
+            } if request_id == "req-revoked-provider"
+        ));
+    }
+
+    #[test]
+    fn byte_identical_authority_replacement_cannot_authorize_in_flight_route() {
+        let authority_dir = tempfile::tempdir().unwrap();
+        let authority_path = authority_dir.path().join("navigation-provider.json");
+        let trusted_signer = SigningKey::from_bytes(&[31_u8; 32]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/route", listener.local_addr().unwrap());
+        let owner_uid = write_provider_authority(
+            &authority_path,
+            endpoint,
+            500,
+            &trusted_signer.verifying_key(),
+        );
+        let replacement_path = authority_path.clone();
+        let server = serve_provider_once_with(listener, trusted_signer, move || {
+            let replacement = replacement_path.with_extension("replacement");
+            fs::copy(&replacement_path, &replacement).unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(replacement, &replacement_path).unwrap();
+        });
+        let mut fixture = Fixture::new(Arc::new(GovernedHttpRouteProvider::for_test(
+            authority_path,
+            owner_uid,
+        )));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-byte-identical-authority-replacement"),
+        );
+
+        fixture.worker.tick_once().unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(
+            fixture.worker.authority.as_ref().unwrap().snapshot.phase,
+            NavigationPhase::Unavailable {
+                request_id: Some(ref request_id),
+                reason: NavigationUnavailableReason::ProviderNotConfigured,
+            } if request_id == "req-byte-identical-authority-replacement"
         ));
     }
 }

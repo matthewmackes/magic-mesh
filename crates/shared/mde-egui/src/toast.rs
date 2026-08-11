@@ -54,6 +54,14 @@ pub const DWELL_OSD: Duration = Duration::from_millis(1500);
 /// The visible alert is additional to this bounded backlog.
 pub const MAX_ALERT_BACKLOG: usize = 64;
 
+/// Maximum health authorities whose admitted generation is retained.
+///
+/// A health authority is one `(node, condition)` pair. Keeping this cache
+/// bounded prevents a hostile publisher from growing the shell indefinitely.
+/// Once full, an unseen authority fails closed so every admitted authority's
+/// watermark remains valid for this [`ToastHost`]'s lifetime.
+const MAX_HEALTH_AUTHORITY_WATERMARKS: usize = 256;
+
 /// Stable flag for operator-originated AI deployment notices. These alerts use
 /// the centered, red, constrained presentation instead of the ambient banner.
 pub const AI_GENERATED_ALERT_FLAG: &str = "AI-GENERATED-ALERT";
@@ -203,6 +211,25 @@ pub struct ToastAction {
     pub verb: String,
 }
 
+/// Queue authority retained from one validated health snapshot.
+///
+/// `ToastHost` does not interpret health grades; it uses this identity only to
+/// prevent an older snapshot for the same node/condition from rolling back an
+/// already-admitted lower third.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthToastAuthority {
+    condition_id: String,
+    snapshot_generation: u64,
+}
+
+/// Highest health snapshot admitted for one node/condition authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthAuthorityWatermark {
+    source_host: String,
+    condition_id: String,
+    snapshot_generation: u64,
+}
+
 /// A single toast any surface constructs and hands to a [`ToastHost`].
 ///
 /// Reads like a TV news lower-third: a severity-colored category `flag`, the
@@ -222,6 +249,9 @@ pub struct Toast {
     pub action: Option<ToastAction>,
     /// How long this toast dwells before the host advances.
     pub dwell: Dwell,
+    /// Health snapshot identity, when this toast came from the governed health
+    /// projection rather than the generic notification lane.
+    health_authority: Option<HealthToastAuthority>,
 }
 
 impl Toast {
@@ -240,6 +270,7 @@ impl Toast {
             headline: headline.into(),
             action: None,
             dwell: severity.dwell(),
+            health_authority: None,
         }
     }
 
@@ -268,6 +299,25 @@ impl Toast {
         self
     }
 
+    /// Bind a governed health lower third to its condition and snapshot.
+    ///
+    /// The node identity is already carried in [`Self::source_host`]. A zero
+    /// generation or empty condition is retained as invalid input and rejected
+    /// by [`ToastHost::enqueue`], keeping construction ergonomic while making
+    /// admission fail closed.
+    #[must_use]
+    pub fn with_health_authority(
+        mut self,
+        condition_id: impl Into<String>,
+        snapshot_generation: u64,
+    ) -> Self {
+        self.health_authority = Some(HealthToastAuthority {
+            condition_id: condition_id.into(),
+            snapshot_generation,
+        });
+        self
+    }
+
     /// A hardware-level OSD toast (volume / brightness). Carries no host/flag/
     /// headline — it renders as the centered pill, not a chyron.
     #[must_use]
@@ -279,6 +329,7 @@ impl Toast {
             headline: String::new(),
             action: None,
             dwell: Dwell::For(DWELL_OSD),
+            health_authority: None,
         }
     }
 }
@@ -301,6 +352,10 @@ impl Active {
 
     const fn is_critical(&self) -> bool {
         matches!(self.toast.tier, Tier::Alert(Severity::Critical))
+    }
+
+    const fn requires_acknowledgement(&self) -> bool {
+        matches!(self.toast.dwell, Dwell::UntilAck)
     }
 }
 
@@ -352,6 +407,9 @@ pub struct ToastHost {
     chyron_fade: Option<Toast>,
     /// The last OSD painted, retained for its ease-out.
     osd_fade: Option<Toast>,
+    /// Highest admitted generation per health authority.
+    /// Unlike `current`/`pending`, clearing a toast does not clear this state.
+    health_watermarks: VecDeque<HealthAuthorityWatermark>,
 }
 
 impl ToastHost {
@@ -365,6 +423,7 @@ impl ToastHost {
             hovered: false,
             chyron_fade: None,
             osd_fade: None,
+            health_watermarks: VecDeque::new(),
         }
     }
 
@@ -400,6 +459,91 @@ impl ToastHost {
         Ok(())
     }
 
+    /// Admit only a forward health snapshot for one node/condition.
+    ///
+    /// Equal generations are coalesced as replays (including conflicting
+    /// bodies), lower generations are rejected, and a forward generation
+    /// replaces the older queued/current projection. This comparison happens
+    /// before severity preemption, so stale recovery cannot dismiss or
+    /// downgrade a visible grade E/F alert.
+    fn coalesce_health(&mut self, toast: &Toast) -> bool {
+        let Some(incoming) = &toast.health_authority else {
+            return true;
+        };
+        if incoming.snapshot_generation == 0 || incoming.condition_id.is_empty() {
+            return false;
+        }
+
+        let same_authority = |candidate: &Toast| {
+            candidate.source_host == toast.source_host
+                && candidate
+                    .health_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.condition_id == incoming.condition_id)
+        };
+        if let Some(watermark) = self.health_watermarks.iter_mut().find(|watermark| {
+            watermark.source_host == toast.source_host
+                && watermark.condition_id == incoming.condition_id
+        }) {
+            if watermark.snapshot_generation >= incoming.snapshot_generation {
+                return false;
+            }
+            watermark.snapshot_generation = incoming.snapshot_generation;
+        } else {
+            if self.health_watermarks.len() == MAX_HEALTH_AUTHORITY_WATERMARKS {
+                return false;
+            }
+            self.health_watermarks.push_back(HealthAuthorityWatermark {
+                source_host: toast.source_host.clone(),
+                condition_id: incoming.condition_id.clone(),
+                snapshot_generation: incoming.snapshot_generation,
+            });
+        }
+
+        self.pending.retain(|candidate| !same_authority(candidate));
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|active| same_authority(&active.toast))
+        {
+            self.current = Some(Active::new(toast.clone()));
+            return false;
+        }
+        true
+    }
+
+    fn health_watermark_before(&self, toast: &Toast) -> Option<u64> {
+        let authority = toast.health_authority.as_ref()?;
+        self.health_watermarks
+            .iter()
+            .find(|watermark| {
+                watermark.source_host == toast.source_host
+                    && watermark.condition_id == authority.condition_id
+            })
+            .map(|watermark| watermark.snapshot_generation)
+    }
+
+    /// Undo the provisional watermark update when queue admission itself fails.
+    /// A generation is admitted only when its toast is current or retained.
+    fn restore_health_watermark(&mut self, toast: &Toast, previous: Option<u64>) {
+        let Some(authority) = toast.health_authority.as_ref() else {
+            return;
+        };
+        let index = self.health_watermarks.iter().position(|watermark| {
+            watermark.source_host == toast.source_host
+                && watermark.condition_id == authority.condition_id
+        });
+        match (index, previous) {
+            (Some(index), Some(generation)) => {
+                self.health_watermarks[index].snapshot_generation = generation;
+            }
+            (Some(index), None) => {
+                self.health_watermarks.remove(index);
+            }
+            _ => {}
+        }
+    }
+
     /// Enqueue an alert. If nothing is showing it shows immediately; a **Critical**
     /// preempts a non-critical to the front (the displaced alert resumes after the
     /// Critical is acknowledged). An AI operator notice preempts every current alert,
@@ -413,6 +557,10 @@ impl ToastHost {
     pub fn enqueue(&mut self, toast: Toast) {
         if let Tier::Osd(level) = toast.tier {
             self.flash_osd(level);
+            return;
+        }
+        let previous_health_watermark = self.health_watermark_before(&toast);
+        if !self.coalesce_health(&toast) {
             return;
         }
         let incoming_critical = matches!(toast.tier, Tier::Alert(Severity::Critical));
@@ -432,7 +580,12 @@ impl ToastHost {
                             // A full acknowledgement-required backlog must not lose
                             // its visible Critical merely to show a newer alert.
                             self.current = Some(Active::new(displaced_toast));
-                            let _ = self.retain_pending(toast, false);
+                            if let Err(unadmitted) = self.retain_pending(toast, false) {
+                                self.restore_health_watermark(
+                                    &unadmitted,
+                                    previous_health_watermark,
+                                );
+                            }
                             return;
                         }
                     }
@@ -440,7 +593,9 @@ impl ToastHost {
                 self.current = Some(Active::new(toast));
             }
             Some(_) => {
-                let _ = self.retain_pending(toast, false);
+                if let Err(unadmitted) = self.retain_pending(toast, false) {
+                    self.restore_health_watermark(&unadmitted, previous_health_watermark);
+                }
             }
         }
     }
@@ -470,10 +625,16 @@ impl ToastHost {
         }
     }
 
-    /// Acknowledge the showing alert — the only way to clear a **Critical**. On a
-    /// non-critical this is a no-op (use [`dismiss`](Self::dismiss)).
+    /// Acknowledge the showing alert — the only way to clear an
+    /// [`Dwell::UntilAck`] alert. Timed Critical alerts (health grade E) retain
+    /// their governed countdown and use [`dismiss`](Self::dismiss); only held
+    /// Critical alerts (health grade F) enter this acknowledgement path.
     pub fn acknowledge(&mut self) {
-        if self.current.as_ref().is_some_and(Active::is_critical) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(Active::requires_acknowledgement)
+        {
             self.advance();
         }
     }
@@ -500,13 +661,20 @@ impl ToastHost {
         if self.hovered {
             return;
         }
-        if let Some(active) = &mut self.current {
-            if let Some(rem) = &mut active.remaining {
-                *rem = rem.saturating_sub(elapsed);
-                if rem.is_zero() {
-                    self.advance();
-                }
+        let mut alert_elapsed = elapsed;
+        loop {
+            let Some(active) = &mut self.current else {
+                break;
+            };
+            let Some(remaining) = &mut active.remaining else {
+                break;
+            };
+            if alert_elapsed < *remaining {
+                *remaining -= alert_elapsed;
+                break;
             }
+            alert_elapsed = alert_elapsed.saturating_sub(*remaining);
+            self.advance();
         }
     }
 
@@ -524,7 +692,8 @@ impl ToastHost {
         self.pending.len()
     }
 
-    /// Whether the showing alert is a Critical (held until acknowledged).
+    /// Whether the showing alert uses Critical presentation/preemption. Its
+    /// dwell still decides whether it is timed (health E) or held (health F).
     #[must_use]
     pub fn has_critical(&self) -> bool {
         self.current.as_ref().is_some_and(Active::is_critical)
@@ -746,6 +915,17 @@ fn banner_title_font() -> FontId {
 /// The banner detail face — the shared [`TypographyRole::Label`] role.
 fn banner_detail_font() -> FontId {
     Style::typography_font(TypographyRole::Label)
+}
+
+/// The lower-third close control follows the alert's lifecycle authority, not
+/// its visual severity. Health grades E and F are both Critical (and therefore
+/// both preempt), but only F carries [`Dwell::UntilAck`].
+fn close_control(toast: &Toast) -> (&'static str, bool) {
+    if matches!(toast.dwell, Dwell::UntilAck) {
+        ("Acknowledge", true)
+    } else {
+        ("Dismiss", false)
+    }
 }
 
 /// Paint the top-center HIG banner card and return what its widgets reported.
@@ -970,7 +1150,7 @@ fn paint_ai_generated_alert(
         muted_white,
     );
 
-    let critical = matches!(severity, Severity::Critical);
+    let (label, requires_acknowledgement) = close_control(toast);
     let button_count = if toast.action.is_some() { 2 } else { 1 };
     let gap = Style::SP_S;
     let total_w = AI_ALERT_BUTTON_W * button_count as f32 + gap * (button_count - 1) as f32;
@@ -1001,7 +1181,6 @@ fn paint_ai_generated_alert(
         x = rect.right() + gap;
     }
 
-    let label = if critical { "Acknowledge" } else { "Dismiss" };
     let rect = Rect::from_min_size(
         pos2(x, button_y),
         vec2(AI_ALERT_BUTTON_W, AI_ALERT_BUTTON_H),
@@ -1014,7 +1193,7 @@ fn paint_ai_generated_alert(
         .fill(white),
     );
     if response.clicked() {
-        if critical {
+        if requires_acknowledgement {
             out.acknowledged = true;
         } else {
             out.dismissed = true;
@@ -1037,18 +1216,13 @@ fn paint_banner_controls(
     backlog: usize,
     remaining: Option<Duration>,
 ) -> BandOutcome {
-    let critical = matches!(toast.tier, Tier::Alert(Severity::Critical));
+    let (label, is_ack) = close_control(toast);
     let cy = control_band.center().y;
     let btn_h = (control_band.height() - Style::SP_M).min(BANNER_H - Style::SP_M);
     let btn_w = BANNER_BUTTON_W;
     let mut rx = control_band.right() - Style::SP_M;
     let mut out = BandOutcome::default();
 
-    let (label, is_ack) = if critical {
-        ("Acknowledge", true)
-    } else {
-        ("Dismiss", false)
-    };
     let dz = Rect::from_min_max(
         pos2(rx - btn_w, cy - btn_h / 2.0),
         pos2(rx, cy + btn_h / 2.0),
@@ -1087,7 +1261,7 @@ fn paint_banner_controls(
     let mut meta: Vec<String> = Vec::new();
     if let Some(rem) = remaining {
         meta.push(format!("{:.0}s", rem.as_secs_f32().ceil()));
-    } else if critical {
+    } else if is_ack {
         meta.push("HOLD".to_owned());
     }
     if backlog > 0 {
@@ -1267,6 +1441,32 @@ mod tests {
     // ── queue: Critical preempt + until-ack hold ──────────────────────────────
 
     #[test]
+    fn delayed_tick_consumes_elapsed_across_timed_queue_but_cannot_cross_ack_hold() {
+        let mut host = ToastHost::new();
+        host.enqueue(
+            Toast::alert(
+                Severity::Critical,
+                "timed-grade-e",
+                "HEALTH · GRADE E",
+                "timed critical health alert",
+            )
+            .with_dwell(Dwell::For(Duration::from_secs(15))),
+        );
+        host.enqueue(info("second"));
+        host.enqueue(crit("held-f-grade"));
+
+        host.tick(Duration::from_secs(60));
+
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some("held-f-grade"),
+            "elapsed wall time must drain every expired timed alert"
+        );
+        assert_eq!(host.remaining(), None);
+        assert_eq!(host.backlog(), 0);
+    }
+
+    #[test]
     fn critical_preempts_to_front_and_displaced_resumes() {
         let mut host = ToastHost::new();
         host.enqueue(info("a"));
@@ -1298,6 +1498,238 @@ mod tests {
         assert!(host.has_critical()); // dismiss can't clear a Critical
         host.acknowledge();
         assert!(host.current().is_none()); // only ack clears it
+    }
+
+    #[test]
+    fn grade_e_timed_critical_cannot_enter_grade_f_acknowledgement_lifecycle() {
+        let grade_e = Toast::alert(
+            Severity::Critical,
+            "workstation-e",
+            "HEALTH · GRADE E · 4m 12s · nvme0n1",
+            "Storage latency is degrading interactive work",
+        )
+        .with_dwell(Dwell::For(Duration::from_secs(15)));
+        let grade_f = Toast::alert(
+            Severity::Critical,
+            "workstation-f",
+            "HEALTH · GRADE F · 7m 03s · eno1",
+            "The node is unreachable",
+        )
+        .with_dwell(Dwell::UntilAck);
+
+        assert_eq!(close_control(&grade_e), ("Dismiss", false));
+        assert_eq!(close_control(&grade_f), ("Acknowledge", true));
+
+        let mut host = ToastHost::new();
+        host.enqueue(grade_e);
+        host.enqueue(grade_f);
+        host.acknowledge();
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some("workstation-e"),
+            "the F-only acknowledgement action must not clear grade E"
+        );
+        assert_eq!(host.remaining(), Some(Duration::from_secs(15)));
+
+        host.tick(Duration::from_secs(15));
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some("workstation-f")
+        );
+        assert_eq!(host.remaining(), None);
+        host.acknowledge();
+        assert!(host.current().is_none());
+    }
+
+    #[test]
+    fn lower_generation_health_recovery_cannot_rollback_current_grade_f() {
+        let grade_f = Toast::alert(
+            Severity::Critical,
+            "workstation-7",
+            "HEALTH · GRADE F · 7m 03s · eno1",
+            "The node is unreachable",
+        )
+        .with_dwell(Dwell::UntilAck)
+        .with_health_authority("network.reachability", 44);
+        let stale_recovery = Toast::alert(
+            Severity::Info,
+            "workstation-7",
+            "HEALTH · GRADE A · 2s · eno1",
+            "The node recovered",
+        )
+        .with_dwell(Dwell::For(Duration::from_secs(3)))
+        .with_health_authority("network.reachability", 43);
+        let conflicting_replay = Toast::alert(
+            Severity::Critical,
+            "workstation-7",
+            "HEALTH · GRADE E · 7m 04s · eno1",
+            "A conflicting body reused the current generation",
+        )
+        .with_dwell(Dwell::For(Duration::from_secs(15)))
+        .with_health_authority("network.reachability", 44);
+
+        let mut host = ToastHost::new();
+        host.enqueue(grade_f);
+        host.enqueue(stale_recovery);
+        host.enqueue(conflicting_replay);
+
+        let current = host.current().expect("grade F must remain admitted");
+        assert_eq!(current.headline, "The node is unreachable");
+        assert_eq!(current.dwell, Dwell::UntilAck);
+        assert_eq!(host.backlog(), 0, "stale rollback must not remain queued");
+        host.tick(Duration::from_secs(3600));
+        host.dismiss();
+        assert_eq!(
+            host.current().map(|toast| toast.headline.as_str()),
+            Some("The node is unreachable"),
+            "lower/equal generation health cannot dismiss or downgrade grade F"
+        );
+    }
+
+    #[test]
+    fn cleared_health_authority_retains_bounded_watermark_and_only_moves_forward() {
+        fn health(
+            host: &str,
+            condition: &str,
+            generation: u64,
+            headline: &str,
+            dwell: Dwell,
+        ) -> Toast {
+            Toast::alert(Severity::Critical, host, "HEALTH", headline)
+                .with_dwell(dwell)
+                .with_health_authority(condition, generation)
+        }
+
+        let mut host = ToastHost::new();
+
+        host.enqueue(health(
+            "ack-node",
+            "network.reachability",
+            40,
+            "acknowledged generation",
+            Dwell::UntilAck,
+        ));
+        host.acknowledge();
+        host.enqueue(health(
+            "ack-node",
+            "network.reachability",
+            40,
+            "conflicting replay after acknowledge",
+            Dwell::UntilAck,
+        ));
+        assert!(host.current().is_none());
+
+        host.enqueue(health(
+            "dismiss-node",
+            "storage.pressure",
+            50,
+            "dismissed generation",
+            Dwell::For(Duration::from_secs(5)),
+        ));
+        host.dismiss();
+        host.enqueue(health(
+            "dismiss-node",
+            "storage.pressure",
+            49,
+            "stale replay after dismiss",
+            Dwell::For(Duration::from_secs(5)),
+        ));
+        assert!(host.current().is_none());
+
+        host.enqueue(health(
+            "timeout-node",
+            "cpu.temperature",
+            60,
+            "timed generation",
+            Dwell::For(Duration::from_secs(5)),
+        ));
+        host.tick(Duration::from_secs(5));
+        host.enqueue(health(
+            "timeout-node",
+            "cpu.temperature",
+            60,
+            "conflicting replay after timeout",
+            Dwell::For(Duration::from_secs(5)),
+        ));
+        assert!(host.current().is_none());
+
+        host.enqueue(health(
+            "timeout-node",
+            "cpu.temperature",
+            61,
+            "corrected-forward generation",
+            Dwell::For(Duration::from_secs(5)),
+        ));
+        assert_eq!(
+            host.current().map(|toast| toast.headline.as_str()),
+            Some("corrected-forward generation")
+        );
+        assert_eq!(host.health_watermarks.len(), 3);
+        assert!(host.health_watermarks.len() <= MAX_HEALTH_AUTHORITY_WATERMARKS);
+
+        host.dismiss();
+        for index in 3..MAX_HEALTH_AUTHORITY_WATERMARKS {
+            host.enqueue(health(
+                "flood-node",
+                &format!("hostile.condition.{index}"),
+                1,
+                "bounded authority",
+                Dwell::For(Duration::from_secs(1)),
+            ));
+            host.dismiss();
+        }
+        assert_eq!(
+            host.health_watermarks.len(),
+            MAX_HEALTH_AUTHORITY_WATERMARKS
+        );
+        host.enqueue(health(
+            "overflow-node",
+            "unseen.condition",
+            1,
+            "must fail closed at capacity",
+            Dwell::For(Duration::from_secs(1)),
+        ));
+        assert!(host.current().is_none());
+        host.enqueue(health(
+            "ack-node",
+            "network.reachability",
+            39,
+            "old authority still cannot roll back",
+            Dwell::UntilAck,
+        ));
+        assert!(host.current().is_none());
+    }
+
+    #[test]
+    fn rejected_full_backlog_does_not_advance_health_generation_watermark() {
+        let mut host = ToastHost::new();
+        host.enqueue(crit("visible-critical"));
+        for index in 0..MAX_ALERT_BACKLOG {
+            host.enqueue(crit(&format!("queued-critical-{index}")));
+        }
+        assert_eq!(host.backlog(), MAX_ALERT_BACKLOG);
+
+        let health = Toast::alert(
+            Severity::Critical,
+            "new-health-node",
+            "HEALTH",
+            "generation must be visible or queued before it is admitted",
+        )
+        .with_dwell(Dwell::UntilAck)
+        .with_health_authority("storage.pressure", 7);
+        host.enqueue(health.clone());
+        assert!(!host.health_watermarks.iter().any(|watermark| {
+            watermark.source_host == "new-health-node"
+                && watermark.condition_id == "storage.pressure"
+        }));
+
+        host.acknowledge();
+        host.enqueue(health);
+        assert!(host.health_watermarks.iter().any(|watermark| {
+            watermark.source_host == "new-health-node"
+                && watermark.condition_id == "storage.pressure"
+                && watermark.snapshot_generation == 7
+        }));
     }
 
     #[test]

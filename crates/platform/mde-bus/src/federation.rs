@@ -86,6 +86,14 @@ pub fn default_excluded_topics() -> Vec<String> {
     ]
 }
 
+/// Clipboard authority is scoped to one authenticated mesh.  A federation
+/// grant store is replicated configuration and therefore cannot be allowed to
+/// remove this boundary by omitting its default exclusions or adding a broad
+/// directional grant.
+fn is_intrinsically_excluded_topic(topic: &str) -> bool {
+    topic_pattern_matches("clipboard/*", topic)
+}
+
 /// Path of the grant store for `bus_root`.
 #[must_use]
 pub fn federation_yaml_path(bus_root: &Path) -> PathBuf {
@@ -321,8 +329,9 @@ impl FederationGrants {
     ///
     /// 1. No accepted pair for `peer_mesh_id` ⇒ `Deny(NoAcceptedPair)` — an
     ///    unaccepted or revoked foreign mesh can neither connect nor route.
-    /// 2. `topic` matches an excluded pattern ⇒ `Deny(ExcludedTopic)` — exclusions
-    ///    win even over an explicit grant.
+    /// 2. `topic` is intrinsically federation-private, or matches an excluded
+    ///    pattern ⇒ `Deny(ExcludedTopic)` — exclusions win even over an
+    ///    explicit grant.
     /// 3. `topic` matches a directional grant ⇒ `Allow`.
     /// 4. Otherwise ⇒ `Deny(NotGranted)`.
     #[must_use]
@@ -330,7 +339,8 @@ impl FederationGrants {
         let Some(pair) = self.accepted_peer(peer_mesh_id) else {
             return Decision::Deny(DenyReason::NoAcceptedPair);
         };
-        if pair
+        if is_intrinsically_excluded_topic(topic)
+            || pair
             .excluded_topics
             .iter()
             .any(|pat| topic_pattern_matches(pat, topic))
@@ -900,6 +910,28 @@ mod tests {
             grants.decide("MESH-A", "input/keys", Direction::Ingress),
             Decision::Deny(DenyReason::ExcludedTopic)
         );
+    }
+
+    #[test]
+    fn hostile_grant_replica_cannot_remove_clipboard_federation_boundary() {
+        let grants = FederationGrants {
+            pairs: vec![FederationPair {
+                peer_mesh_id: "MESH-HOSTILE".into(),
+                peer_mesh_label: "Hostile replica".into(),
+                established: "now".into(),
+                subscribe_topics: vec!["#".into()],
+                publish_topics: vec!["#".into()],
+                excluded_topics: vec![],
+            }],
+        };
+
+        for direction in [Direction::Ingress, Direction::Egress] {
+            assert_eq!(
+                grants.decide("MESH-HOSTILE", "clipboard/rich-offer", direction),
+                Decision::Deny(DenyReason::ExcludedTopic),
+                "persisted grants must not authorize clipboard traffic in {direction:?}"
+            );
+        }
     }
 
     #[test]

@@ -26,6 +26,9 @@ const MAX_READINESS_BODY_BYTES: usize = 256 * 1024;
 const MAX_VERIFICATION_SESSIONS: usize = 256;
 const MAX_VERIFICATION_ROWS: usize = 1024;
 const MAX_DETAIL_BYTES: usize = 512;
+// Private cache marker for a retained verification tombstone. This is not a
+// Bus payload and cannot collide with the serialized verification object.
+const VERIFICATION_UNAVAILABLE: &str = "\0call-media-verification-unavailable";
 
 pub(super) fn publish_retained_call_media_verification(
     persist: &Persist,
@@ -50,9 +53,25 @@ pub(super) fn publish_retained_call_media_verification(
             }
         },
         Err(e) => {
-            tracing::debug!(target: "mackesd::collab", topic, error = %e, "collab media verification unavailable")
+            tracing::debug!(target: "mackesd::collab", topic, error = %e, "collab media verification unavailable");
+            publish_call_media_verification_tombstone(persist, last_published, &topic);
         }
     }
+}
+
+fn publish_call_media_verification_tombstone(
+    persist: &Persist,
+    last_published: &mut BTreeMap<String, String>,
+    topic: &str,
+) {
+    if last_published.get(topic).map(String::as_str) == Some(VERIFICATION_UNAVAILABLE) {
+        return;
+    }
+    if let Err(e) = persist.write(topic, Priority::Default, None, None) {
+        tracing::debug!(target: "mackesd::collab", topic, error = %e, "collab media verification tombstone publish failed");
+        return;
+    }
+    last_published.insert(topic.to_string(), VERIFICATION_UNAVAILABLE.to_string());
 }
 
 fn verify_retained_call_media(
@@ -126,6 +145,16 @@ fn verify_candidate(
     adapter: CallMediaAdapter,
     providers: &CallMediaProviderRegistry,
 ) -> Result<CallMediaVerificationRow, CallMediaVerificationError> {
+    if !candidate_matches_session(session, adapter) {
+        return row(
+            session,
+            adapter,
+            CallMediaVerificationStatus::MediaNotProven,
+            None,
+            Some("candidate adapter or requirements do not match the declared call kind"),
+        );
+    }
+
     if session.admission == CallMediaAdmission::WaitingForConnectedPeer {
         return row(
             session,
@@ -171,6 +200,50 @@ fn verify_candidate(
             Some(detail.as_str()),
         ),
     }
+}
+
+fn candidate_matches_session(session: &CallMediaSession, adapter: CallMediaAdapter) -> bool {
+    let (requirements, adapters): (&[CallMediaRequirement], &[CallMediaAdapter]) =
+        match session.kind {
+            CallKind::Audio => (
+                &[CallMediaRequirement::Microphone],
+                &[
+                    CallMediaAdapter::WebRtcP2p,
+                    CallMediaAdapter::LiveKitSfu,
+                    CallMediaAdapter::SipGateway,
+                ],
+            ),
+            CallKind::Video => (
+                &[
+                    CallMediaRequirement::Microphone,
+                    CallMediaRequirement::Camera,
+                ],
+                &[
+                    CallMediaAdapter::WebRtcP2p,
+                    CallMediaAdapter::LiveKitSfu,
+                ],
+            ),
+            CallKind::Screen => (
+                &[
+                    CallMediaRequirement::Microphone,
+                    CallMediaRequirement::ScreenCapture,
+                ],
+                &[
+                    CallMediaAdapter::WebRtcP2p,
+                    CallMediaAdapter::LiveKitSfu,
+                ],
+            ),
+            CallKind::CoEdit => (
+                &[CallMediaRequirement::DocumentSync],
+                &[CallMediaAdapter::DocumentCollab],
+            ),
+            CallKind::RemoteDesktop => (
+                &[CallMediaRequirement::RemoteDesktopStream],
+                &[CallMediaAdapter::VdiRemoteDesktop],
+            ),
+        };
+
+    session.requirements == requirements && adapters.contains(&adapter)
 }
 
 fn row(
@@ -920,5 +993,137 @@ mod tests {
             .as_deref()
             .expect("detail")
             .contains("video frames"));
+    }
+
+    #[test]
+    fn verifier_refuses_misattributed_or_vacuous_provider_evidence() {
+        struct HostileProvider;
+        impl CallMediaFrameVerifier for HostileProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                panic!("invalid readiness must not consume provider evidence");
+            }
+        }
+
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::DocumentCollab, HostileProvider)
+            .expect("register hostile document provider");
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, HostileProvider)
+            .expect("register hostile WebRTC provider");
+
+        let mut wrong_adapter = ready_audio_session();
+        wrong_adapter.candidate_adapters = vec![CallMediaAdapter::DocumentCollab];
+        let mut vacuous_requirements = ready_audio_session();
+        vacuous_requirements.requirements.clear();
+        vacuous_requirements.candidate_adapters = vec![CallMediaAdapter::WebRtcP2p];
+        let readiness = CallMediaReadiness {
+            local_actor: ActorId::new("alice"),
+            sessions: vec![wrong_adapter, vacuous_requirements],
+        };
+
+        let board =
+            verify_call_media_readiness(&readiness, &providers).expect("verification board");
+
+        assert_eq!(board.rows.len(), 2);
+        assert!(board.rows.iter().all(|row| {
+            row.status == CallMediaVerificationStatus::MediaNotProven
+                && row.evidence.is_none()
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("do not match"))
+        }));
+    }
+
+    #[test]
+    fn corrupt_readiness_after_restart_revokes_stale_live_media_proof() {
+        struct AdvancingProvider;
+        impl CallMediaFrameVerifier for AdvancingProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                Ok(CallMediaFrameEvidence {
+                    audio_frames: 4,
+                    video_frames: 0,
+                    screen_frames: 0,
+                    data_messages: 0,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let mut session = ready_audio_session();
+        session.candidate_adapters = vec![CallMediaAdapter::WebRtcP2p];
+        let readiness = CallMediaReadiness {
+            local_actor: ActorId::new("alice"),
+            sessions: vec![session],
+        };
+        write_readiness(&persist, &readiness);
+
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, AdvancingProvider)
+            .expect("register provider");
+        let mut before_restart = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut before_restart, &providers);
+        let verification_topic = topics::state_topic(proj::CALL_MEDIA_VERIFICATION);
+        let live = persist
+            .read_latest(&verification_topic)
+            .expect("read live verification")
+            .expect("live verification");
+        let live: CallMediaVerification =
+            serde_json::from_str(live.body.as_deref().expect("live body"))
+                .expect("decode live verification");
+        assert_eq!(
+            live.rows[0].status,
+            CallMediaVerificationStatus::LiveMediaVerified
+        );
+
+        persist
+            .write(
+                &topics::state_topic(proj::CALL_MEDIA_READINESS),
+                Priority::Default,
+                None,
+                Some("{corrupt"),
+            )
+            .expect("corrupt retained readiness");
+
+        // A fresh cache models daemon restart. The stale retained live board
+        // must still be revoked even though this process did not publish it.
+        let mut after_restart = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut after_restart, &providers);
+        let revoked = persist
+            .read_latest(&verification_topic)
+            .expect("read revoked verification")
+            .expect("verification tombstone");
+        assert!(
+            revoked.body.is_none(),
+            "invalid readiness must tombstone stale live provider proof"
+        );
+
+        // Corrected-forward readiness must leave the tombstone state and be
+        // sampled normally without requiring another daemon restart.
+        write_readiness(&persist, &readiness);
+        publish_retained_call_media_verification(&persist, &mut after_restart, &providers);
+        let repaired = persist
+            .read_latest(&verification_topic)
+            .expect("read repaired verification")
+            .expect("repaired verification");
+        let repaired: CallMediaVerification =
+            serde_json::from_str(repaired.body.as_deref().expect("repaired body"))
+                .expect("decode repaired verification");
+        assert_eq!(
+            repaired.rows[0].status,
+            CallMediaVerificationStatus::LiveMediaVerified
+        );
     }
 }

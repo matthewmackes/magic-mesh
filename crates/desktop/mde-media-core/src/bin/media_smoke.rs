@@ -20,6 +20,48 @@ use mde_media_core::{
     TrackSelect, TrackSelection, VideoConfig, VideoFilter,
 };
 
+#[cfg(feature = "mpv")]
+use mde_media_core::MediaEngine;
+
+/// Facts that must all come from the real engine before this binary may print a
+/// successful real-clip result. A terminal state alone is not playback proof:
+/// mpv can stop immediately after rejecting a file, and the old smoke treated
+/// that path (and its timeout path) as success.
+#[cfg(any(feature = "mpv", test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RealSmokeProof {
+    reached_playing: bool,
+    resolved_audio: bool,
+    decoded_nonblank_frame: bool,
+}
+
+#[cfg(any(feature = "mpv", test))]
+impl RealSmokeProof {
+    fn observe_state(&mut self, state: PlayerState) {
+        self.reached_playing |= state == PlayerState::Playing;
+    }
+
+    fn observe_audio(&mut self, current_ao: &str) {
+        self.resolved_audio |= !current_ao.trim().is_empty();
+    }
+
+    fn observe_frame(&mut self, nonblank: bool) {
+        self.decoded_nonblank_frame |= nonblank;
+    }
+
+    const fn is_complete(&self) -> bool {
+        self.reached_playing && self.resolved_audio && self.decoded_nonblank_frame
+    }
+
+    fn incomplete_error(&self, reason: &str) -> std::io::Error {
+        std::io::Error::other(format!(
+            "real-clip smoke {reason} without complete playback proof \
+             (playing={}, audio={}, nonblank_frame={})",
+            self.reached_playing, self.resolved_audio, self.decoded_nonblank_frame
+        ))
+    }
+}
+
 fn sample_tracks() -> Vec<Track> {
     vec![
         Track {
@@ -294,6 +336,7 @@ fn run_real_smoke(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("== mde-media-core real-clip smoke (libmpv): {path} ==");
     let mut player = Player::new(MpvEngine::new()?);
     player.load(path)?;
+    let mut proof = RealSmokeProof::default();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -301,26 +344,60 @@ fn run_real_smoke(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         for ev in player.drain_events() {
             println!("  event: {ev:?}");
         }
-        match player.state() {
-            PlayerState::Stopped | PlayerState::Ended => break,
-            _ => {
-                println!(
-                    "  state={:?} pos={:.1}s / {:?}",
-                    player.state(),
-                    player.position(),
-                    player.duration()
-                );
-            }
+        let state = player.state();
+        proof.observe_state(state);
+        let current_ao = player
+            .engine()
+            .raw()
+            .get_property::<String>("current-ao")
+            .unwrap_or_default();
+        proof.observe_audio(&current_ao);
+        if let Some(frame) = player.engine_mut().latest_frame() {
+            proof.observe_frame(!frame.is_blank());
         }
-        if Instant::now() > deadline {
-            println!("  (30s smoke window elapsed — stopping)");
+        println!(
+            "  state={state:?} pos={:.1}s / {:?}",
+            player.position(),
+            player.duration()
+        );
+
+        if proof.is_complete() {
             player.stop()?;
-            break;
+            println!("== real-clip smoke OK: playing + audio + nonblank frame ==");
+            return Ok(());
+        }
+        if matches!(state, PlayerState::Stopped | PlayerState::Ended) {
+            return Err(proof.incomplete_error("terminated").into());
+        }
+        if Instant::now() >= deadline {
+            player.stop()?;
+            return Err(proof.incomplete_error("timed out after 30s").into());
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    println!("== real-clip smoke OK ==");
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_or_timeout_without_decode_proof_cannot_report_smoke_success() {
+        let mut proof = RealSmokeProof::default();
+        proof.observe_state(PlayerState::Playing);
+        proof.observe_audio("   ");
+        proof.observe_frame(false);
+
+        assert!(!proof.is_complete());
+        let terminal = proof.incomplete_error("terminated").to_string();
+        assert!(terminal.contains("playing=true"));
+        assert!(terminal.contains("audio=false"));
+        assert!(terminal.contains("nonblank_frame=false"));
+
+        proof.observe_audio("pipewire");
+        proof.observe_frame(true);
+        assert!(proof.is_complete());
+    }
 }
 
 fn main() {

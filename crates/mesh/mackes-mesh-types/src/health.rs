@@ -36,6 +36,12 @@ pub const MAX_NODE_AVAILABILITY_REASON_BYTES: usize = 256;
 pub const MAX_NODE_CONNECTIVITY_INTERFACE_BYTES: usize = 64;
 /// Maximum lifetime admitted for one node-health publication.
 pub const MAX_NODE_HEALTH_PUBLICATION_TTL_MS: u64 = 10 * 60 * 1_000;
+/// Maximum age of resolved condition history admitted into a publication.
+///
+/// This enforces the fleet privacy epoch at the shared contract boundary so an
+/// offline or hostile publisher cannot restore expired history by republishing
+/// it inside an otherwise fresh node-health record.
+pub const MAX_HEALTH_HISTORY_RETENTION_MS: u64 = 6 * 60 * 60 * 1_000;
 /// Maximum conditions retained in either publication lifecycle lane.
 pub const MAX_NODE_HEALTH_CONDITIONS: usize = 256;
 /// Maximum remediations attached to one condition.
@@ -1155,6 +1161,7 @@ pub enum HealthActionOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthActionResult {
     pub schema_version: u16,
     pub request_id: String,
@@ -1166,6 +1173,41 @@ pub struct HealthActionResult {
     pub completed_at_ms: u64,
     pub snapshot_generation: u64,
     pub refreshed_evidence: Option<HealthEvidence>,
+}
+
+impl HealthActionResult {
+    /// Validate one remediation result before durable publication, replay, or
+    /// presentation. Result timestamps are bounded by the consumer's current
+    /// clock, and refreshed evidence cannot claim an observation after the
+    /// remediation completed.
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), NodeHealthValidationError> {
+        if self.schema_version != HEALTH_SCHEMA_VERSION {
+            return Err(NodeHealthValidationError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        validate_health_identifier("action_result.request_id", &self.request_id)?;
+        validate_health_identifier("action_result.condition_id", &self.condition_id)?;
+        validate_health_text("action_result.detail", &self.detail)?;
+        if contains_secret_material(&self.detail) {
+            return Err(NodeHealthValidationError::SecretBearing(
+                "action_result.detail",
+            ));
+        }
+        validate_health_identifier("action_result.audit_id", &self.audit_id)?;
+        if self.completed_at_ms == 0 || self.completed_at_ms > now_ms {
+            return Err(NodeHealthValidationError::InvalidTimestamp(
+                "action_result.completed_at_ms",
+            ));
+        }
+        if self.snapshot_generation == 0 {
+            return Err(NodeHealthValidationError::InvalidGeneration);
+        }
+        if let Some(evidence) = &self.refreshed_evidence {
+            validate_evidence(evidence, self.completed_at_ms)?;
+        }
+        Ok(())
+    }
 }
 
 /// Node-owned publication folded by every observer against the live roster.
@@ -1345,6 +1387,15 @@ fn validate_condition(
         }) {
             return Err(NodeHealthValidationError::InvalidTimestamp(field));
         }
+    }
+    if !expected_active
+        && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
+            published_at_ms.saturating_sub(resolved_at_ms) > MAX_HEALTH_HISTORY_RETENTION_MS
+        })
+    {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "condition.resolved_at_ms",
+        ));
     }
     if condition
         .snoozed_until_ms
@@ -1540,6 +1591,38 @@ pub fn fold_snapshot(
     validity_ms: u64,
     reachable_lighthouses: usize,
 ) -> SystemMeshHealthSnapshot {
+    fold_snapshot_with_availability(
+        observer,
+        roster_revision,
+        canonical_nodes,
+        publications,
+        &BTreeMap::new(),
+        generation,
+        now_ms,
+        validity_ms,
+        reachable_lighthouses,
+    )
+}
+
+/// Fold canonical health publications while applying governed availability
+/// assessments to roster nodes whose publisher is currently absent.
+///
+/// Availability never manufactures a fresh node row. It only explains a
+/// missing publisher as an expected absence or replaces the generic freshness
+/// warning with the shared missed-return severity. Nodes without a conclusive
+/// assessment retain the ordinary missing-publisher warning.
+#[must_use]
+pub fn fold_snapshot_with_availability(
+    observer: impl Into<String>,
+    roster_revision: impl Into<String>,
+    canonical_nodes: &BTreeSet<String>,
+    publications: Vec<NodeHealthState>,
+    availability: &BTreeMap<String, NodeAvailabilityAssessment>,
+    generation: u64,
+    now_ms: u64,
+    validity_ms: u64,
+    reachable_lighthouses: usize,
+) -> SystemMeshHealthSnapshot {
     let roster_revision = roster_revision.into();
     let mut by_publisher: BTreeMap<String, Option<NodeHealthState>> = BTreeMap::new();
     for state in publications {
@@ -1588,29 +1671,75 @@ pub fn fold_snapshot(
             .filter(|node| !accepted.iter().any(|state| &state.publisher == *node))
             .cloned()
             .collect();
-        active_conditions.push(HealthCondition {
-            id: "mesh:publisher-freshness".into(),
-            scope: HealthScope::Mesh,
-            component: HealthComponent::Evidence,
-            source: "health-roster-fold".into(),
-            severity: HealthSeverity::Warning,
-            requirement: RequirementClass::Required,
-            evidence: HealthEvidence {
-                provider: "health-roster-fold".into(),
-                summary: format!(
-                    "Current health evidence is missing for: {}.",
-                    missing.join(", ")
+        let mut unexplained = Vec::new();
+        for node in missing {
+            let (severity, requirement, summary) = match availability.get(&node) {
+                Some(NodeAvailabilityAssessment::ExpectedAbsence) => (
+                    HealthSeverity::Warning,
+                    RequirementClass::Informational,
+                    "Health publication is absent during a declared lifecycle window.",
                 ),
-                facts: BTreeMap::from([("missing_nodes".into(), missing.join(","))]),
-                observed_at_ms: now_ms,
-            },
-            active_since_ms: now_ms,
-            last_observed_ms: now_ms,
-            resolved_at_ms: None,
-            acknowledged_at_ms: None,
-            snoozed_until_ms: None,
-            remediation: Vec::new(),
-        });
+                Some(NodeAvailabilityAssessment::WarningMissedReturn) => (
+                    HealthSeverity::Warning,
+                    RequirementClass::Required,
+                    "Health publication is absent after the declared return time.",
+                ),
+                Some(NodeAvailabilityAssessment::CriticalMissedReturn) => (
+                    HealthSeverity::Critical,
+                    RequirementClass::Required,
+                    "Health publication remains absent beyond the governed return grace.",
+                ),
+                _ => {
+                    unexplained.push(node);
+                    continue;
+                }
+            };
+            active_conditions.push(HealthCondition {
+                id: format!("{node}:publisher-availability"),
+                scope: HealthScope::Node { node: node.clone() },
+                component: HealthComponent::Evidence,
+                source: "health-availability-fold".into(),
+                severity,
+                requirement,
+                evidence: HealthEvidence {
+                    provider: "health-availability-fold".into(),
+                    summary: summary.to_string(),
+                    facts: BTreeMap::from([("missing_node".into(), node)]),
+                    observed_at_ms: now_ms,
+                },
+                active_since_ms: now_ms,
+                last_observed_ms: now_ms,
+                resolved_at_ms: None,
+                acknowledged_at_ms: None,
+                snoozed_until_ms: None,
+                remediation: Vec::new(),
+            });
+        }
+        if !unexplained.is_empty() {
+            active_conditions.push(HealthCondition {
+                id: "mesh:publisher-freshness".into(),
+                scope: HealthScope::Mesh,
+                component: HealthComponent::Evidence,
+                source: "health-roster-fold".into(),
+                severity: HealthSeverity::Warning,
+                requirement: RequirementClass::Required,
+                evidence: HealthEvidence {
+                    provider: "health-roster-fold".into(),
+                    summary: format!(
+                        "Current health evidence is missing for: {}.",
+                        unexplained.join(", ")
+                    ),
+                    facts: BTreeMap::from([("missing_nodes".into(), unexplained.join(","))]),
+                    observed_at_ms: now_ms,
+                },
+                active_since_ms: now_ms,
+                last_observed_ms: now_ms,
+                resolved_at_ms: None,
+                acknowledged_at_ms: None,
+                snoozed_until_ms: None,
+                remediation: Vec::new(),
+            });
+        }
     }
     let current_node_grades: Vec<NodeGrade> = accepted
         .iter()
@@ -2440,6 +2569,88 @@ mod tests {
                 "condition identity appears in both lifecycle lanes"
             ))
         );
+    }
+
+    #[test]
+    fn node_health_publication_rejects_resolved_history_outside_privacy_epoch() {
+        let published_at_ms = MAX_HEALTH_HISTORY_RETENTION_MS + 101;
+        let mut publication = state("node", 1, published_at_ms);
+        let mut expired_history = condition("node", HealthSeverity::Warning);
+        expired_history.resolved_at_ms = Some(100);
+        publication.resolved_conditions.push(expired_history);
+
+        assert_eq!(
+            publication.validate_at(published_at_ms),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "condition.resolved_at_ms"
+            )),
+            "a fresh envelope cannot restore condition history older than the privacy epoch"
+        );
+    }
+
+    #[test]
+    fn health_action_result_contract_rejects_malformed_oversized_and_unknown_rows() {
+        let valid = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: "request-1".into(),
+            condition_id: "node:disk".into(),
+            action: HealthAction::RefreshProvider,
+            outcome: HealthActionOutcome::Applied,
+            detail: "provider refresh completed".into(),
+            audit_id: "health:node:01J00000000000000000000001".into(),
+            completed_at_ms: 200,
+            snapshot_generation: 2,
+            refreshed_evidence: Some(HealthEvidence {
+                provider: "fixture".into(),
+                summary: "provider is current".into(),
+                facts: BTreeMap::new(),
+                observed_at_ms: 200,
+            }),
+        };
+        valid.validate_at(200).expect("valid result contract");
+
+        let malformed = HealthActionResult {
+            request_id: "../escaped request".into(),
+            ..valid.clone()
+        };
+        assert!(matches!(
+            malformed.validate_at(200),
+            Err(NodeHealthValidationError::InvalidField(
+                "action_result.request_id"
+            ))
+        ));
+
+        let oversized = HealthActionResult {
+            detail: "x".repeat(MAX_HEALTH_TEXT_BYTES + 1),
+            ..valid.clone()
+        };
+        assert!(matches!(
+            oversized.validate_at(200),
+            Err(NodeHealthValidationError::FieldTooLong(
+                "action_result.detail"
+            ))
+        ));
+
+        let mut unknown = serde_json::to_value(&valid).expect("encode result");
+        unknown
+            .as_object_mut()
+            .expect("result object")
+            .insert("untrusted_extension".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<HealthActionResult>(unknown).is_err());
+
+        let future_completion = HealthActionResult {
+            completed_at_ms: 201,
+            ..valid.clone()
+        };
+        assert!(future_completion.validate_at(200).is_err());
+
+        let mut future_evidence = valid;
+        future_evidence
+            .refreshed_evidence
+            .as_mut()
+            .expect("evidence")
+            .observed_at_ms = 201;
+        assert!(future_evidence.validate_at(200).is_err());
     }
 
     #[test]

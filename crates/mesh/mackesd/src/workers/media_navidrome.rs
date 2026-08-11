@@ -29,6 +29,8 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub enum Action {
     /// Run the setup helper because one or both units are absent.
     RunSetup(PathBuf),
+    /// Withdraw Navidrome while its backing store is unavailable.
+    StopNow(&'static str),
     /// Ensure a unit is enabled and active.
     EnableNow(&'static str),
 }
@@ -75,14 +77,24 @@ impl UnitState {
 #[must_use]
 pub fn plan_tick(store: UnitState, navidrome: UnitState, helper: Option<&Path>) -> Vec<Action> {
     if !store.exists || !navidrome.exists {
-        return helper
-            .map(|path| vec![Action::RunSetup(path.to_path_buf())])
-            .unwrap_or_default();
+        let mut actions = Vec::new();
+        if navidrome.active {
+            actions.push(Action::StopNow(NAVIDROME_UNIT));
+        }
+        if let Some(path) = helper {
+            actions.push(Action::RunSetup(path.to_path_buf()));
+        }
+        return actions;
     }
 
     let mut actions = Vec::new();
     if !store.active {
+        if navidrome.active {
+            actions.push(Action::StopNow(NAVIDROME_UNIT));
+        }
         actions.push(Action::EnableNow(STORE_UNIT));
+        actions.push(Action::EnableNow(NAVIDROME_UNIT));
+        return actions;
     }
     if !navidrome.active {
         actions.push(Action::EnableNow(NAVIDROME_UNIT));
@@ -98,6 +110,8 @@ pub trait MediaNavidromeOps: Send {
     fn setup_helper(&mut self) -> Option<PathBuf>;
     /// Run the setup helper.
     fn run_setup(&mut self, helper: &Path) -> Result<(), String>;
+    /// Stop a unit before withdrawing unsafe provider authority.
+    fn stop_now(&mut self, unit: &str) -> Result<(), String>;
     /// Enable and start a unit.
     fn enable_now(&mut self, unit: &str) -> Result<(), String>;
 }
@@ -141,6 +155,22 @@ impl MediaNavidromeOps for SystemOps {
             Err(format!(
                 "{} exited {}: {}",
                 helper.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    fn stop_now(&mut self, unit: &str) -> Result<(), String> {
+        let mut command = Command::new("systemctl");
+        command.args(["stop", unit]);
+        let out = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
+            .map_err(|e| format!("systemctl stop {unit}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "systemctl stop {unit} exited {}: {}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
             ))
@@ -205,6 +235,7 @@ impl<O: MediaNavidromeOps> MediaNavidromeWorker<O> {
         for action in &actions {
             match action {
                 Action::RunSetup(path) => self.ops.run_setup(path)?,
+                Action::StopNow(unit) => self.ops.stop_now(unit)?,
                 Action::EnableNow(unit) => self.ops.enable_now(unit)?,
             }
         }
@@ -215,7 +246,9 @@ impl<O: MediaNavidromeOps> MediaNavidromeWorker<O> {
 #[async_trait::async_trait]
 impl<O: MediaNavidromeOps + 'static> Worker for MediaNavidromeWorker<O> {
     fn name(&self) -> &'static str {
-        "media_navidrome"
+        // Preserve the installed worker identity while this implementation
+        // replaces the retired single-unit supervisor behind that authority.
+        "navidrome_supervisor"
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
@@ -227,7 +260,7 @@ impl<O: MediaNavidromeOps + 'static> Worker for MediaNavidromeWorker<O> {
                 _ = shutdown.wait() => break,
                 _ = ticker.tick() => {
                     if let Err(err) = self.tick_once() {
-                        tracing::warn!(error = %err, "media_navidrome: reconcile failed");
+                        tracing::warn!(error = %err, "navidrome_supervisor: reconcile failed");
                     }
                 }
             }
@@ -245,6 +278,7 @@ mod tests {
         nav: UnitState,
         helper: Option<PathBuf>,
         calls: Vec<String>,
+        fail_enable: Option<&'static str>,
     }
 
     impl MediaNavidromeOps for FakeOps {
@@ -265,8 +299,16 @@ mod tests {
             Ok(())
         }
 
+        fn stop_now(&mut self, unit: &str) -> Result<(), String> {
+            self.calls.push(format!("stop:{unit}"));
+            Ok(())
+        }
+
         fn enable_now(&mut self, unit: &str) -> Result<(), String> {
             self.calls.push(format!("enable:{unit}"));
+            if self.fail_enable == Some(unit) {
+                return Err(format!("injected failure enabling {unit}"));
+            }
             Ok(())
         }
     }
@@ -289,7 +331,11 @@ mod tests {
     fn plan_starts_only_inactive_existing_units() {
         assert_eq!(
             plan_tick(UnitState::inactive(), UnitState::active(), None),
-            vec![Action::EnableNow(STORE_UNIT)]
+            vec![
+                Action::StopNow(NAVIDROME_UNIT),
+                Action::EnableNow(STORE_UNIT),
+                Action::EnableNow(NAVIDROME_UNIT),
+            ]
         );
         assert_eq!(
             plan_tick(UnitState::active(), UnitState::inactive(), None),
@@ -305,6 +351,7 @@ mod tests {
             nav: UnitState::missing(),
             helper: Some(helper.clone()),
             calls: Vec::new(),
+            fail_enable: None,
         };
         let mut worker = MediaNavidromeWorker::with_ops(ops, Duration::from_secs(1));
         let actions = worker.tick_once().expect("tick");
@@ -312,6 +359,31 @@ mod tests {
         assert_eq!(
             worker.ops.calls,
             vec![format!("setup:{}", helper.display())]
+        );
+    }
+
+    #[test]
+    fn failed_store_recovery_leaves_navidrome_withdrawn() {
+        let ops = FakeOps {
+            store: UnitState::inactive(),
+            nav: UnitState::active(),
+            helper: None,
+            calls: Vec::new(),
+            fail_enable: Some(STORE_UNIT),
+        };
+        let mut worker = MediaNavidromeWorker::with_ops(ops, Duration::from_secs(1));
+
+        let error = worker
+            .tick_once()
+            .expect_err("failed store recovery must fail closed");
+
+        assert!(error.contains(STORE_UNIT));
+        assert_eq!(
+            worker.ops.calls,
+            vec![
+                format!("stop:{NAVIDROME_UNIT}"),
+                format!("enable:{STORE_UNIT}"),
+            ]
         );
     }
 

@@ -15,21 +15,16 @@ fail() {
 
 verify_manifest() {
     local manifest=${1:?manifest path is required}
-    [ -f "$manifest" ] || fail "manifest is not a regular file: $manifest"
-    [ ! -L "$manifest" ] || fail "manifest symlink is not admitted: $manifest"
-    local size
-    size=$(stat -c '%s' -- "$manifest")
-    if [ "$size" -le 0 ] || [ "$size" -gt "$MAX_MANIFEST_BYTES" ]; then
-        fail "manifest size is outside the bounded range: $size"
-    fi
-
-    python3 - "$manifest" <<'PY'
+    python3 - "$manifest" "$MAX_MANIFEST_BYTES" <<'PY'
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+MAX_MANIFEST_BYTES = int(sys.argv[2])
 MAX_ID_BYTES = 128
 MAX_VERSION_BYTES = 128
 MAX_U64 = (1 << 64) - 1
@@ -80,14 +75,49 @@ def bounded_identity(value, label):
         reject(f"{label} is blank, oversized, or unsafe")
 
 
+def descriptor_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_manifest():
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            reject("manifest is not a regular file")
+        if before.st_nlink != 1:
+            reject("manifest has an external hard-link alias")
+        if before.st_size <= 0 or before.st_size > MAX_MANIFEST_BYTES:
+            reject(f"manifest size is outside the bounded range: {before.st_size}")
+        body = os.read(descriptor, MAX_MANIFEST_BYTES + 1)
+        if len(body) != before.st_size:
+            reject("manifest changed or was not read completely")
+        after = os.fstat(descriptor)
+        if descriptor_identity(after) != descriptor_identity(before):
+            reject("manifest identity changed while being read")
+        return body.decode("utf-8")
+    finally:
+        os.close(descriptor)
+
+
 def main():
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            document = json.load(
-                stream,
-                object_pairs_hook=unique_object,
-                parse_constant=lambda value: reject(f"non-finite JSON number: {value}"),
-            )
+        document = json.loads(
+            read_manifest(),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda value: reject(f"non-finite JSON number: {value}"),
+        )
         exact_fields(document, {"schema_version", "image_provenance", "packages"}, "manifest")
         if type(document["schema_version"]) is not int or document["schema_version"] != 1:
             reject("unsupported schema_version")
@@ -150,6 +180,14 @@ def main():
 
 raise SystemExit(main())
 PY
+}
+
+hostile_manifest_hardlink_cannot_alias_package_authority() {
+    local fixture=$1
+    ln -- "$fixture/valid.json" "$fixture/aliased.json"
+    if verify_manifest "$fixture/valid.json" >/dev/null 2>&1; then
+        fail "self-test admitted a manifest with a hostile hard-link alias"
+    fi
 }
 
 self_test() {
@@ -235,6 +273,7 @@ PY
             fail "self-test accepted $candidate manifest"
         fi
     done
+    hostile_manifest_hardlink_cannot_alias_package_authority "$android_manifest_fixture"
     echo "Android image manifest verification self-tests passed"
 }
 

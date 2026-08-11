@@ -796,7 +796,7 @@ fn handle_alt_mnemonics(
 /// Paint one right-aligned status chip: a rounded [`Style::SURFACE_HI`] plate with
 /// the tone-coloured `icon + text` at the caption size.
 fn status_chip(ui: &mut Ui, chip: &StatusChip) {
-    let color = Style::resolve_color(ui.ctx(), chip.tone.color());
+    let color = status_chip_color(ui.ctx(), chip.tone, ui.is_enabled());
     let text = chip
         .icon
         .as_ref()
@@ -815,13 +815,30 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
     ui.add_space(Style::SP_XS);
 }
 
+/// Resolve a chip's semantic ink at the final paint boundary.
+///
+/// An enclosing disabled surface is authoritative over the last live tone it
+/// happened to retain. In particular, a cached [`ChipTone::Ok`] must not keep
+/// painting success green while its workspace is unavailable. Resolving the
+/// shared disabled token here also keeps that fail-closed state correct in
+/// Quazar Light and the Car appearance without making callers restyle chips.
+fn status_chip_color(ctx: &egui::Context, tone: ChipTone, enabled: bool) -> Color32 {
+    let token = if enabled {
+        tone.color()
+    } else {
+        Style::DISABLED
+    };
+    Style::resolve_color(ctx, token)
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp, clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::{
         display_title, menu_label_job, mnemonic_key, motion_secs, remote_sessions_button_id,
-        resolve_mnemonics, take_remote_sessions_request, ChipTone, Entry, Item, Menu, MenuBar,
-        MenuBarModel, MenuColors, StatusChip, BAR_HEIGHT, MENU_FONT_SIZE, TITLE_FONT_SIZE,
+        resolve_mnemonics, status_chip_color, take_remote_sessions_request, ChipTone, Entry, Item,
+        Menu, MenuBar, MenuBarModel, MenuColors, StatusChip, BAR_HEIGHT, MENU_FONT_SIZE,
+        TITLE_FONT_SIZE,
     };
     use crate::{Density, Motion, Style, StyleColorScheme};
 
@@ -944,6 +961,34 @@ mod tests {
             assert_eq!(section.format.color, Style::QUAZAR_LIGHT_TEXT);
             if section.byte_range == (0..1) {
                 assert_eq!(section.format.underline.color, Style::QUAZAR_LIGHT_TEXT);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_workspace_cannot_retain_a_live_status_tone_across_appearances() {
+        let ctx = egui::Context::default();
+
+        for (scheme, expected) in [
+            (StyleColorScheme::Dark, Style::DISABLED),
+            (StyleColorScheme::Light, Style::QUAZAR_LIGHT_DISABLED),
+            (StyleColorScheme::AutoSync3, Style::SYNC3_DISABLED),
+        ] {
+            Style::install_color_scheme_with_density(&ctx, scheme, Density::Mouse);
+
+            for hostile_retained_tone in [
+                ChipTone::Info,
+                ChipTone::Ok,
+                ChipTone::Warn,
+                ChipTone::Danger,
+            ] {
+                let color = status_chip_color(&ctx, hostile_retained_tone, false);
+                assert_eq!(color, expected, "disabled state must override live tone");
+                assert_ne!(
+                    color,
+                    Style::resolve_color(&ctx, hostile_retained_tone.color()),
+                    "a disabled workspace must not present retained live semantics"
+                );
             }
         }
     }

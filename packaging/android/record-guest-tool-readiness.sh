@@ -126,20 +126,103 @@ guest_compatibility() {
 write_receipt() {
     local workload_id=$1 image_digest=$2 release_digest=$3 manifest_digest=$4
     local payload_digest=$5 architecture=$6 compatibility=$7 cvd_version=$8 adb_version=$9
-    local output=${10} now tmp
+    local output=${10} now receipt
     now=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || unavailable timestamp_unavailable
-    tmp="${output}.tmp.$$"
-    if [[ -e "$output" && -L "$output" ]]; then
-        echo "record-guest-tool-readiness: refusing symlinked output: $output" >&2
-        exit 2
-    fi
-    printf '{"schema_version":%d,"kind":"%s","workload_id":"%s","image_digest":"%s","release_artifact_digest":"%s","package_manifest_digest":"%s","installed_guest_payload_digest":"%s","architecture":"%s","compatibility_version":"%s","cvd_version":"%s","adb_version":"%s","kvm_access":true,"recorded_at":"%s"}\n' \
+    printf -v receipt '{"schema_version":%d,"kind":"%s","workload_id":"%s","image_digest":"%s","release_artifact_digest":"%s","package_manifest_digest":"%s","installed_guest_payload_digest":"%s","architecture":"%s","compatibility_version":"%s","cvd_version":"%s","adb_version":"%s","kvm_access":true,"recorded_at":"%s"}\n' \
         "$SCHEMA_VERSION" "$RECEIPT_KIND" "$workload_id" "$image_digest" \
         "$release_digest" "$manifest_digest" "$payload_digest" "$architecture" \
-        "$compatibility" "$cvd_version" "$adb_version" "$now" >"$tmp" || exit 1
-    chmod 0600 "$tmp"
-    mv -f -- "$tmp" "$output"
-    printf '%s\n' "$(<"$output")"
+        "$compatibility" "$cvd_version" "$adb_version" "$now" || exit 1
+
+    # Walk every output-directory component under O_NOFOLLOW and keep the final
+    # directory descriptor open through publication.  A restarted recorder must
+    # never follow a substituted parent or predictable staging symlink into a
+    # different authority domain.
+    python3 - "$output" "$receipt" <<'PY'
+import errno
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
+
+
+output = Path(sys.argv[1])
+payload = sys.argv[2].encode("utf-8")
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+parent_fd = os.open("/", directory_flags)
+staging = None
+try:
+    for component in output.parent.parts[1:]:
+        next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+
+    name = output.name
+    if not name or name in {".", ".."}:
+        raise OSError(errno.EINVAL, "invalid output basename")
+    try:
+        existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise OSError(errno.EPERM, "output is not a regular file")
+
+    for _ in range(32):
+        candidate = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+        try:
+            staging_fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            staging = candidate
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise OSError(errno.EEXIST, "cannot allocate exclusive staging file")
+
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(staging_fd, view)
+            view = view[written:]
+        os.fsync(staging_fd)
+    finally:
+        os.close(staging_fd)
+
+    os.replace(staging, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    staging = None
+    os.fsync(parent_fd)
+except OSError as error:
+    print(f"record-guest-tool-readiness: secure receipt publication failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    if staging is not None:
+        try:
+            os.unlink(staging, dir_fd=parent_fd)
+        except OSError:
+            pass
+    os.close(parent_fd)
+PY
+    printf '%s' "$receipt"
+}
+
+hostile_symlinked_output_parent_cannot_redirect_readiness_receipt() {
+    local fixture=$1 bin=$2 workload=$3 digest=$4 release_digest=$5 manifest_digest=$6
+    mkdir "$fixture/receipt-authority"
+    ln -s receipt-authority "$fixture/substituted-parent"
+    if PATH="$bin:/usr/bin:/bin" MCNF_CUTTLEFISH_SELF_TEST=1 \
+        MCNF_CUTTLEFISH_KVM_DEVICE=/dev/null \
+        "$0" --workload-id "$workload" --image-digest "$digest" \
+        --release-artifact-digest "$release_digest" \
+        --package-manifest-digest "$manifest_digest" \
+        --output "$fixture/substituted-parent/receipt.json" >/dev/null 2>&1; then
+        echo "record-guest-tool-readiness: accepted a substituted output parent" >&2
+        return 1
+    fi
+    [[ ! -e "$fixture/receipt-authority/receipt.json" ]]
 }
 
 self_test() {
@@ -228,6 +311,8 @@ EOF
     if valid_digest "sha256:$(printf '%064d' 0)"; then
         return 1
     fi
+    hostile_symlinked_output_parent_cannot_redirect_readiness_receipt \
+        "$fixture" "$bin" "$workload" "$digest" "$release_digest" "$manifest_digest"
     rm -rf -- "$fixture"
     trap - EXIT
     echo "record-guest-tool-readiness: self-test passed"

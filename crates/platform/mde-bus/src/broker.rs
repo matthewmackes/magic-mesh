@@ -26,6 +26,7 @@
 //! HW carve-out per the BUS-1.2 task body. Local tests cover the
 //! pure helpers (render, decide-spawn) deterministically.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -93,6 +94,8 @@ pub enum BrokerSkipReason {
     NoOverlayIp,
     /// Publish file exists but is empty or whitespace-only.
     EmptyOverlayIp,
+    /// Publish file does not contain one canonical unicast overlay address.
+    InvalidOverlayIp,
     /// `ntfy` binary not on PATH.
     NtfyMissing,
     /// Template file at `<template_path>` doesn't exist.
@@ -107,6 +110,9 @@ impl std::fmt::Display for BrokerSkipReason {
             }
             Self::EmptyOverlayIp => {
                 write!(f, "overlay-IP publish file empty (enrolment in progress)")
+            }
+            Self::InvalidOverlayIp => {
+                write!(f, "overlay-IP publish file is not a unicast mesh address")
             }
             Self::NtfyMissing => write!(f, "ntfy binary not on PATH (install the `ntfy` RPM)"),
             Self::TemplateMissing => {
@@ -142,6 +148,17 @@ pub fn evaluate_prereqs(cfg: &BrokerConfig) -> Prereqs {
     if overlay_ip.is_empty() {
         return Prereqs::Skip(BrokerSkipReason::EmptyOverlayIp);
     }
+    let overlay_ip = match overlay_ip.parse::<IpAddr>() {
+        Ok(address)
+            if !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !matches!(address, IpAddr::V4(ipv4) if ipv4.is_broadcast()) =>
+        {
+            address.to_string()
+        }
+        Ok(_) | Err(_) => return Prereqs::Skip(BrokerSkipReason::InvalidOverlayIp),
+    };
     if !cfg.template_path.exists() {
         return Prereqs::Skip(BrokerSkipReason::TemplateMissing);
     }
@@ -357,6 +374,36 @@ mod tests {
             evaluate_prereqs(&cfg),
             Prereqs::Skip(BrokerSkipReason::EmptyOverlayIp)
         );
+    }
+
+    #[test]
+    fn hostile_overlay_publish_cannot_redirect_rich_clipboard_broker_authority() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay-ip");
+        let template = tmp.path().join("template.tmpl");
+        std::fs::write(&template, template_body()).expect("seed template");
+        let cfg = BrokerConfig {
+            overlay_ip_path: overlay.clone(),
+            template_path: template,
+            cache_dir: tmp.path().join("cache"),
+            listen_port: 8443,
+            ntfy_bin: "sh".to_string(),
+        };
+
+        for hostile in [
+            "0.0.0.0\n",
+            "::\n",
+            "127.0.0.1\n",
+            "255.255.255.255\n",
+            "10.42.0.5\"\nlisten-http: \"0.0.0.0:8443\n",
+        ] {
+            std::fs::write(&overlay, hostile).expect("replace hostile overlay authority");
+            assert_eq!(
+                evaluate_prereqs(&cfg),
+                Prereqs::Skip(BrokerSkipReason::InvalidOverlayIp),
+                "hostile overlay value must fail closed: {hostile:?}"
+            );
+        }
     }
 
     #[test]

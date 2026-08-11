@@ -245,8 +245,9 @@ impl BusMediaSources {
         })
     }
 
-    /// Apply the latest roster to a controller. Errors become visible status, not
-    /// panics; a missing Bus/record leaves the current controller state unchanged.
+    /// Apply the latest roster to a controller. Missing or malformed retained state
+    /// revokes the previous roster before reporting the condition: the UI must not
+    /// preserve a selectable route after its publishing authority disappears.
     pub fn refresh_controller<E: MediaEngine>(&mut self, controller: &mut MediaController<E>) {
         match self.read_latest() {
             Ok(Some(state)) if self.last_applied_state.as_ref() != Some(&state) => {
@@ -254,8 +255,15 @@ impl BusMediaSources {
                 controller.set_mesh_media_sources(Some(state));
             }
             Ok(Some(_)) => {}
-            Ok(None) => {}
-            Err(e) => controller.ui_mut().status = Some(format!("Mesh media sources: {e}")),
+            Ok(None) => {
+                self.last_applied_state = None;
+                controller.set_mesh_media_sources(None);
+            }
+            Err(e) => {
+                self.last_applied_state = None;
+                controller.set_mesh_media_sources(None);
+                controller.ui_mut().status = Some(format!("Mesh media sources: {e}"));
+            }
         }
     }
 }
@@ -3991,9 +3999,26 @@ mod tests {
     }
 
     #[test]
-    fn bus_media_sources_malformed_json_reports_status_without_panicking() {
+    fn malformed_roster_revokes_retained_mesh_playback_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
         let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&mesh_sources_state()).expect("json")),
+            )
+            .expect("write valid roster");
+
+        let mut reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
+        let mut c = controller();
+        reader.refresh_controller(&mut c);
+        assert!(c.select_mesh_jellyfin_source("gateway"));
+        assert!(c.active_mesh_jellyfin_source().is_some());
+
+        // A corrupt newer publication cannot leave the previously selected route
+        // actionable merely because the egui process retained its old projection.
         persist
             .write(
                 MEDIA_SOURCES_TOPIC,
@@ -4003,14 +4028,20 @@ mod tests {
             )
             .expect("write");
 
-        let mut reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
         assert!(reader
             .read_latest()
             .expect_err("malformed")
             .contains("decode"));
 
-        let mut c = controller();
         reader.refresh_controller(&mut c);
+        assert!(
+            c.mesh_jellyfin_sources().is_empty(),
+            "malformed replacement state must revoke every retained UI route"
+        );
+        assert!(
+            c.active_mesh_jellyfin_source().is_none(),
+            "the stale selection must not remain actionable after roster revocation"
+        );
         assert!(c
             .ui()
             .status

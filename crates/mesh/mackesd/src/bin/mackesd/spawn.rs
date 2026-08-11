@@ -12,6 +12,105 @@
 
 use super::*;
 
+const INSTALLED_MACKESD_EXECUTABLE: &str = "/usr/bin/mackesd";
+
+/// Bind worker authority to the installed executable inode, not merely to
+/// attacker-controlled argv text.  In particular, an old process whose binary
+/// was replaced during an upgrade must not repopulate a worker group while
+/// systemd is trying to restart the current image.
+fn validate_worker_process_executable(
+    argv0: &std::path::Path,
+    running_executable: &std::path::Path,
+    installed_executable: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if argv0 != installed_executable {
+        return Err(format!(
+            "worker process executable must be {}",
+            installed_executable.display()
+        ));
+    }
+    let installed_link = std::fs::symlink_metadata(installed_executable).map_err(|error| {
+        format!(
+            "installed executable {} is unavailable: {error}",
+            installed_executable.display()
+        )
+    })?;
+    if installed_link.file_type().is_symlink() || !installed_link.file_type().is_file() {
+        return Err(format!(
+            "installed executable {} is not a regular, non-symlink file",
+            installed_executable.display()
+        ));
+    }
+    let running = std::fs::metadata(running_executable).map_err(|error| {
+        format!(
+            "running executable {} is unavailable: {error}",
+            running_executable.display()
+        )
+    })?;
+    let installed = std::fs::metadata(installed_executable).map_err(|error| {
+        format!(
+            "installed executable {} is unavailable: {error}",
+            installed_executable.display()
+        )
+    })?;
+    if !running.file_type().is_file()
+        || running.dev() != installed.dev()
+        || running.ino() != installed.ino()
+    {
+        return Err(format!(
+            "running executable identity does not match {}",
+            installed_executable.display()
+        ));
+    }
+    Ok(())
+}
+
+fn current_worker_process_group() -> Result<mackesd_core::worker_role::WorkerGroup, String> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let argv0 = args
+        .first()
+        .ok_or_else(|| "worker process argv is empty".to_string())?;
+    validate_worker_process_executable(
+        std::path::Path::new(argv0),
+        std::path::Path::new("/proc/self/exe"),
+        std::path::Path::new(INSTALLED_MACKESD_EXECUTABLE),
+    )?;
+    process_group_from_args(args)
+}
+
+#[cfg(not(test))]
+fn worker_process_executable_admitted(scope: &str) -> bool {
+    let argv0 = std::env::args_os().next();
+    let result = argv0
+        .as_deref()
+        .ok_or_else(|| "worker process argv is empty".to_string())
+        .and_then(|argv0| {
+            validate_worker_process_executable(
+                std::path::Path::new(argv0),
+                std::path::Path::new("/proc/self/exe"),
+                std::path::Path::new(INSTALLED_MACKESD_EXECUTABLE),
+            )
+        });
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, scope, "refusing worker start from an untrusted executable");
+            false
+        }
+    }
+}
+
+// Unit tests execute inside Cargo's test harness rather than the installed
+// binary.  The pure validator below remains fully exercised by the hostile
+// inode-replacement regression; existing spawn-census tests must retain their
+// hermetic constructors.
+#[cfg(test)]
+fn worker_process_executable_admitted(_scope: &str) -> bool {
+    true
+}
+
 /// Resolve the production `serve --group` selection without trusting an
 /// ambient mutable global. Clap has already validated this argument before
 /// `run_serve` reaches these helpers; this second, tiny parser lets raw OS
@@ -57,7 +156,7 @@ where
 /// Fail-closed admission for responder/maintenance threads that bypass the
 /// async `Supervisor`. The canonical registry remains the ownership authority.
 fn responders_admitted(names: &[&str]) -> bool {
-    let group = match process_group_from_args(std::env::args_os()) {
+    let group = match current_worker_process_group() {
         Ok(group) => group,
         Err(error) => {
             tracing::error!(%error, ?names, "refusing responder starts without an exact process group");
@@ -80,7 +179,7 @@ pub(crate) fn register_process_infrastructure(
     worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     name: &'static str,
 ) -> bool {
-    let group = match process_group_from_args(std::env::args_os()) {
+    let group = match current_worker_process_group() {
         Ok(group) => group,
         Err(error) => {
             tracing::error!(%error, name, "refusing process infrastructure without an exact process group");
@@ -127,6 +226,9 @@ pub(crate) fn spawn_tiered<W, F>(
     W: mackesd_core::workers::Worker,
     F: FnOnce() -> W,
 {
+    if !worker_process_executable_admitted(name) {
+        return;
+    }
     if !sup.accepts_worker(name) {
         return;
     }
@@ -1526,6 +1628,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     daemon_cfg: &mackesd_core::config::daemon::MackesdConfig,
     nebula_signal_slot: &mackesd_core::ipc::nebula::SignalSenderSlot,
 ) {
+    if !worker_process_executable_admitted("compute lifecycle workers") {
+        return;
+    }
     use mackesd_core::workers::{heartbeat::HeartbeatWorker, mdns_relay::MdnsRelayWorker};
     // MESH-MDNS-RELAY — native cross-segment mDNS service relay (browses
     // the local LAN, publishes services to the mesh Bus). Rank 0: a relay
@@ -2009,6 +2114,9 @@ pub(crate) fn spawn_mesh_plumbing_workers(
     workgroup_root: &PathBuf,
     db_path: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("mesh plumbing workers") {
+        return;
+    }
     use mackesd_core::workers::{
         device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile, job_exec, mesh_dns,
         netstate_apply, presence_watch, router_action, ssh_pubkey_gossip,
@@ -2204,6 +2312,9 @@ pub(crate) fn spawn_datacenter_scheduler_workers(
     node_id: &String,
     workgroup_root: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("datacenter scheduler workers") {
+        return;
+    }
     use mackesd_core::workers::{RestartPolicy, Spawn};
     // MON-4 (v2.6) — alert relay worker. Polls
     // ~/.local/share/mde/alerts/*.json for events
@@ -2485,6 +2596,9 @@ pub(crate) fn spawn_broker_terminal_workers(
     role_rank: u8,
     workgroup_root: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("broker terminal workers") {
+        return;
+    }
     // FILEMGR-5 — the mesh-mount worker owns the sshfs mount lifecycle over
     // the Nebula overlay for the Files surface (design `file-manager-full.md`
     // locks 11/13/15/17): it drains `action/mesh-mount/<host>` (typed verb —
@@ -2540,6 +2654,9 @@ pub(crate) fn spawn_bookmark_workers(
     node_id: &String,
     workgroup_root: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("bookmark workers") {
+        return;
+    }
     // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
     // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
     // `action/bookmarks/*` (add/edit/move/delete/add-folder/rename — minting
@@ -2596,6 +2713,9 @@ pub(crate) fn spawn_desktop_discovery_workers(
     node_id: &String,
     workgroup_root: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("desktop discovery workers") {
+        return;
+    }
     // KDC-MESH-6 — seat-side phone remote-input consumer. `kdc_host`
     // publishes sanitized `action/seat/remote-input` rows after the paired
     // phone/protocol checks; this worker owns the local injection seam and
@@ -2658,6 +2778,9 @@ pub(crate) fn spawn_fleet_compute_workers(
     workgroup_root: &PathBuf,
     db_path: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("fleet compute workers") {
+        return;
+    }
     use mackesd_core::workers::{RestartPolicy, Spawn};
     // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
     // node so failover is seamless, but LEADER-gated internally (lock 7):
@@ -2793,10 +2916,11 @@ pub(crate) fn spawn_fleet_compute_workers(
             .expect("worker_names mutex")
             .push("media_registry".into());
 
-        // MEDIA-pkg-2 — self-heal the Navidrome systemd unit (restart-if-down,
-        // re-provision-if-missing via the RPM-shipped setup-media-navidrome).
+        // MEDIA-3 / MEDIA-pkg-2 — the production Navidrome authority adopts
+        // both the backing-store and container units. It withdraws Navidrome
+        // before store recovery and re-enables it only after that succeeds.
         sup.spawn(Spawn::new(
-            mackesd_core::workers::navidrome_supervisor::NavidromeSupervisor::new(),
+            mackesd_core::workers::media_navidrome::MediaNavidromeWorker::new(),
             RestartPolicy::Always,
         ));
         worker_names
@@ -3018,6 +3142,9 @@ pub(crate) fn spawn_probe_observability_workers(
     db_path: &PathBuf,
     daemon_cfg: &mackesd_core::config::daemon::MackesdConfig,
 ) {
+    if !worker_process_executable_admitted("probe observability workers") {
+        return;
+    }
     use mackesd_core::workers::{RestartPolicy, Spawn};
     use std::sync::Arc;
     // EPIC-MESH-PROBE (MESH-PROBE-4) — scheduled two-tier nmap
@@ -3432,6 +3559,9 @@ fn spawn_mirror_syncd_if_owned(
 ) {
     use mackesd_core::workers::{RestartPolicy, Spawn};
 
+    if !worker_process_executable_admitted("mirror sync worker") {
+        return;
+    }
     if !sup.accepts_worker("mirror_syncd") {
         return;
     }
@@ -3453,6 +3583,9 @@ pub(crate) fn spawn_messaging_sync_workers(
     node_id: &String,
     workgroup_root: &PathBuf,
 ) {
+    if !worker_process_executable_admitted("messaging sync workers") {
+        return;
+    }
     // v4.0.1 KDC2-3.3 wire-up (2026-05-23) — spawn the KDC host
     // worker. Owns the pairing store at $XDG_CONFIG_HOME/mde/
     // connect (default ~/.config/mde/connect), the shared
@@ -3697,6 +3830,29 @@ pub(crate) fn spawn_messaging_sync_workers(
 mod process_group_thread_admission_tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn replaced_installed_executable_cannot_repopulate_worker_group_after_restart() {
+        let temp = tempfile::tempdir().expect("temporary executable identities");
+        let running = temp.path().join("running-mackesd");
+        let installed = temp.path().join("mackesd");
+        std::fs::write(&running, b"first governed executable")
+            .expect("write running executable fixture");
+        std::fs::hard_link(&running, &installed).expect("bind initial installed inode");
+
+        validate_worker_process_executable(&installed, &running, &installed)
+            .expect("the running and installed inode initially agree");
+
+        std::fs::remove_file(&installed).expect("replace installed executable name");
+        std::fs::write(&installed, b"first governed executable")
+            .expect("write byte-identical replacement inode");
+        let error = validate_worker_process_executable(&installed, &running, &installed)
+            .expect_err("a surviving old process must not start workers after replacement");
+        assert!(
+            error.contains("running executable identity does not match"),
+            "unexpected refusal: {error}"
+        );
+    }
 
     #[test]
     fn process_group_argument_parser_accepts_clap_spellings() {

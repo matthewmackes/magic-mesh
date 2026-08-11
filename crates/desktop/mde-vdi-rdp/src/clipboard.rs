@@ -42,14 +42,92 @@ pub fn html_format() -> ClipboardFormat {
 enum RemoteFormat {
     UnicodeText,
     Html(ClipboardFormatId),
+    Dib,
+    DibV5,
 }
 
 impl RemoteFormat {
-    const fn id(self) -> ClipboardFormatId {
+    fn id(self) -> ClipboardFormatId {
         match self {
             Self::UnicodeText => ClipboardFormatId::CF_UNICODETEXT,
             Self::Html(id) => id,
+            Self::Dib => DIB_FORMAT.id(),
+            Self::DibV5 => DIBV5_FORMAT.id(),
         }
+    }
+}
+
+fn negotiated_html_format(available_formats: &[ClipboardFormat]) -> Option<RemoteFormat> {
+    let is_html = |format: &ClipboardFormat| {
+        format.id().is_registered()
+            && format
+                .name()
+                .is_some_and(|name| name.value() == ClipboardFormatName::HTML.value())
+    };
+    let mut negotiated_id = None;
+    for format in available_formats.iter().filter(|format| is_html(format)) {
+        match negotiated_id {
+            None => negotiated_id = Some(format.id()),
+            Some(id) if id == format.id() => {}
+            Some(_) => return None,
+        }
+    }
+    let id = negotiated_id?;
+
+    // Registered IDs have meaning only within this advertised format list. If
+    // the peer assigns the selected ID both to HTML and to an unnamed or
+    // differently named entry, a later response cannot prove which MIME it
+    // represents. Refuse the equivocation instead of making offer order an
+    // authority decision.
+    if available_formats
+        .iter()
+        .any(|format| format.id() == id && !is_html(format))
+    {
+        return None;
+    }
+    Some(RemoteFormat::Html(id))
+}
+
+/// One bounded guest image admitted from the exact negotiated CLIPRDR format.
+///
+/// Keeping the wire format in the type prevents a caller from treating a
+/// CF_DIB response as CF_DIBV5 (or vice versa) while materializing the rich
+/// clipboard payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteClipboardImageFormat {
+    /// A validated CF_DIB payload.
+    Dib,
+    /// A validated CF_DIBV5 payload.
+    DibV5,
+}
+
+/// Validated guest bitmap bytes paired with their exact negotiated format.
+/// The fields are private so code outside this admission boundary cannot forge
+/// a value around unvalidated bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteClipboardImage {
+    format: RemoteClipboardImageFormat,
+    data: Vec<u8>,
+}
+
+impl RemoteClipboardImage {
+    fn new(format: RemoteClipboardImageFormat, data: &[u8]) -> Self {
+        Self {
+            format,
+            data: data.to_vec(),
+        }
+    }
+
+    /// Exact CLIPRDR format against which these bytes were validated.
+    #[must_use]
+    pub const fn format(&self) -> RemoteClipboardImageFormat {
+        self.format
+    }
+
+    /// Return the validated DIB bytes without discarding their typed format.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -58,16 +136,19 @@ struct ClipboardState {
     ready: bool,
     initial_format_list_requested: bool,
     local_generation: u64,
+    local_advertised_generation: Option<u64>,
     local_text: Option<String>,
     local_html: Option<Vec<u8>>,
     local_dib: Option<Vec<u8>>,
-    local_data_request: Option<(FormatDataRequest, u64)>,
+    local_data_request: Option<(FormatDataRequest, Option<u64>)>,
     remote_unicode_offer: Option<RemoteFormat>,
     remote_html_offer: Option<RemoteFormat>,
+    remote_image_offer: Option<RemoteFormat>,
     pending_remote_request: Option<RemoteFormat>,
     discard_replaced_response: bool,
     remote_text: Option<String>,
     remote_html: Option<String>,
+    remote_image: Option<RemoteClipboardImage>,
 }
 
 /// Thread-local connection handle used by the wire pump to service CLIPRDR
@@ -94,10 +175,12 @@ impl ClipboardBridge {
     /// send a CLIPRDR format list through `Cliprdr::initiate_copy`.
     pub fn offer_host_text(&self, text: String) -> Result<(), ClipboardBridgeError> {
         if text.len() > MAX_VDI_CLIPBOARD_TEXT_BYTES {
-            return Err(ClipboardBridgeError::TooLarge {
+            let error = ClipboardBridgeError::TooLarge {
                 bytes: text.len(),
                 max_bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES,
-            });
+            };
+            self.revoke_local_offer();
+            return Err(error);
         }
         let mut state = self.lock();
         state.local_generation = state.local_generation.wrapping_add(1);
@@ -111,10 +194,12 @@ impl ClipboardBridge {
     /// Windows CF_HTML registered format.
     pub fn offer_host_html(&self, html: String) -> Result<(), ClipboardBridgeError> {
         if html.len() > MAX_VDI_CLIPBOARD_TEXT_BYTES {
-            return Err(ClipboardBridgeError::TooLarge {
+            let error = ClipboardBridgeError::TooLarge {
                 bytes: html.len(),
                 max_bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES,
-            });
+            };
+            self.revoke_local_offer();
+            return Err(error);
         }
         let wire = encode_cf_html(&html);
         let mut state = self.lock();
@@ -129,7 +214,10 @@ impl ClipboardBridge {
     /// Image decoding remains in the shell, which owns the Files descriptor;
     /// this protocol boundary accepts only a structurally valid DIB allocation.
     pub fn offer_host_dibv5(&self, dib: Vec<u8>) -> Result<(), ClipboardBridgeError> {
-        validate_dib(&dib, Some(DIBV5_FORMAT.id()))?;
+        if let Err(error) = validate_dib(&dib, Some(DIBV5_FORMAT.id())) {
+            self.revoke_local_offer();
+            return Err(error);
+        }
         let mut state = self.lock();
         state.local_generation = state.local_generation.wrapping_add(1);
         state.local_text = None;
@@ -141,7 +229,8 @@ impl ClipboardBridge {
     /// Return only formats backed by the current local offer.
     #[must_use]
     pub fn advertised_formats(&self) -> Vec<ClipboardFormat> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.local_advertised_generation = Some(state.local_generation);
         if state.local_text.is_some() {
             vec![UNICODE_TEXT_FORMAT]
         } else if state.local_html.is_some() {
@@ -162,7 +251,7 @@ impl ClipboardBridge {
     pub fn take_local_data_response(&self) -> Option<OwnedFormatDataResponse> {
         let mut state = self.lock();
         let (request, requested_generation) = state.local_data_request.take()?;
-        if requested_generation != state.local_generation {
+        if requested_generation != Some(state.local_generation) {
             return Some(OwnedFormatDataResponse::new_error());
         }
         Some(if request.format == ClipboardFormatId::CF_UNICODETEXT {
@@ -186,8 +275,8 @@ impl ClipboardBridge {
     }
 
     /// Take the next truthfully negotiated remote format and bind the eventual
-    /// callback to it. Unicode remains first so existing consumers retain their
-    /// plain-text path when a peer advertises both formats.
+    /// callback to it. Unicode and HTML remain first so existing consumers
+    /// retain their established paths when a peer also advertises images.
     pub fn take_remote_format_request(&self) -> Option<ClipboardFormatId> {
         let mut state = self.lock();
         if state.pending_remote_request.is_some() || state.discard_replaced_response {
@@ -196,7 +285,8 @@ impl ClipboardBridge {
         let format = state
             .remote_unicode_offer
             .take()
-            .or_else(|| state.remote_html_offer.take())?;
+            .or_else(|| state.remote_html_offer.take())
+            .or_else(|| state.remote_image_offer.take())?;
         state.pending_remote_request = Some(format);
         Some(format.id())
     }
@@ -211,6 +301,11 @@ impl ClipboardBridge {
         self.lock().remote_html.take()
     }
 
+    /// Take the latest bounded guest image with its negotiated wire format.
+    pub fn take_remote_image(&self) -> Option<RemoteClipboardImage> {
+        self.lock().remote_image.take()
+    }
+
     /// Whether CLIPRDR completed its capability handshake.
     #[must_use]
     pub fn is_ready(&self) -> bool {
@@ -221,6 +316,14 @@ impl ClipboardBridge {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn revoke_local_offer(&self) {
+        let mut state = self.lock();
+        state.local_generation = state.local_generation.wrapping_add(1);
+        state.local_text = None;
+        state.local_html = None;
+        state.local_dib = None;
     }
 }
 
@@ -301,8 +404,10 @@ impl CliprdrBackend for TextCliprdrBackend {
             }
             state.remote_unicode_offer = None;
             state.remote_html_offer = None;
+            state.remote_image_offer = None;
             state.remote_text = None;
             state.remote_html = None;
+            state.remote_image = None;
 
             if available_formats.len() > MAX_REMOTE_FORMATS {
                 return;
@@ -311,19 +416,26 @@ impl CliprdrBackend for TextCliprdrBackend {
                 .iter()
                 .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT)
                 .then_some(RemoteFormat::UnicodeText);
-            state.remote_html_offer = available_formats.iter().find_map(|format| {
-                (format.id().is_registered()
-                    && format
-                        .name()
-                        .is_some_and(|name| name.value() == ClipboardFormatName::HTML.value()))
-                .then_some(RemoteFormat::Html(format.id()))
-            });
+            state.remote_html_offer = negotiated_html_format(available_formats);
+            state.remote_image_offer = if available_formats
+                .iter()
+                .any(|format| format.id() == DIBV5_FORMAT.id())
+            {
+                Some(RemoteFormat::DibV5)
+            } else if available_formats
+                .iter()
+                .any(|format| format.id() == DIB_FORMAT.id())
+            {
+                Some(RemoteFormat::Dib)
+            } else {
+                None
+            };
         });
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         self.with_state(|state| {
-            state.local_data_request = Some((request, state.local_generation));
+            state.local_data_request = Some((request, state.local_advertised_generation));
         });
     }
 
@@ -344,6 +456,7 @@ impl CliprdrBackend for TextCliprdrBackend {
                 match format {
                     RemoteFormat::UnicodeText => state.remote_text = None,
                     RemoteFormat::Html(_) => state.remote_html = None,
+                    RemoteFormat::Dib | RemoteFormat::DibV5 => state.remote_image = None,
                 }
                 return;
             }
@@ -354,6 +467,26 @@ impl CliprdrBackend for TextCliprdrBackend {
                 RemoteFormat::Html(_) => {
                     state.remote_html = decode_cf_html(response.data())
                         .filter(|html| guest_html_fragment_is_safe(html));
+                }
+                RemoteFormat::Dib => {
+                    state.remote_image = validate_dib(response.data(), Some(DIB_FORMAT.id()))
+                        .is_ok()
+                        .then(|| {
+                            RemoteClipboardImage::new(
+                                RemoteClipboardImageFormat::Dib,
+                                response.data(),
+                            )
+                        });
+                }
+                RemoteFormat::DibV5 => {
+                    state.remote_image = validate_dib(response.data(), Some(DIBV5_FORMAT.id()))
+                        .is_ok()
+                        .then(|| {
+                            RemoteClipboardImage::new(
+                                RemoteClipboardImageFormat::DibV5,
+                                response.data(),
+                            )
+                        });
                 }
             }
         });
@@ -601,8 +734,8 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
 mod tests {
     use super::{
         decode_cf_html, decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe,
-        html_format, ClipboardBridge, ClipboardBridgeError, DIBV5_FORMAT, DIB_FORMAT,
-        HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
+        html_format, ClipboardBridge, ClipboardBridgeError, RemoteClipboardImageFormat,
+        DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
     };
     use ironrdp_cliprdr::pdu::{
         ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FormatDataRequest,
@@ -624,6 +757,18 @@ mod tests {
         dib[48..52].copy_from_slice(&0x0000_00ff_u32.to_le_bytes());
         dib[52..56].copy_from_slice(&0xff00_0000_u32.to_le_bytes());
         dib[124..128].copy_from_slice(&[0x33, 0x22, 0x11, 0xff]);
+        dib
+    }
+
+    fn one_pixel_dib() -> Vec<u8> {
+        let mut dib = vec![0_u8; 40 + 4];
+        dib[0..4].copy_from_slice(&40_u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1_i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-1_i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32_u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&4_u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&[0x33, 0x22, 0x11, 0xff]);
         dib
     }
 
@@ -727,6 +872,43 @@ mod tests {
     }
 
     #[test]
+    fn guest_html_registered_format_identity_equivocation_is_refused() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        let first_id = ClipboardFormatId(0xC101);
+        let second_id = ClipboardFormatId(0xC102);
+        let first = ClipboardFormat::new(first_id).with_name(ClipboardFormatName::HTML);
+        let second = ClipboardFormat::new(second_id).with_name(ClipboardFormatName::HTML);
+
+        backend.on_remote_copy(&[first.clone(), second]);
+        assert_eq!(
+            bridge.take_remote_format_request(),
+            None,
+            "one registered MIME name cannot authorize two wire identities"
+        );
+
+        backend.on_remote_copy(&[first.clone(), ClipboardFormat::new(first_id)]);
+        assert_eq!(
+            bridge.take_remote_format_request(),
+            None,
+            "one wire identity cannot simultaneously mean HTML and unnamed data"
+        );
+
+        backend.on_remote_copy(&[first.clone(), first]);
+        assert_eq!(
+            bridge.take_remote_format_request(),
+            Some(first_id),
+            "an identical duplicate is not an equivocation"
+        );
+        backend.on_format_data_response(FormatDataResponse::new_data(encode_cf_html(
+            "<strong>exact</strong>",
+        )));
+        assert_eq!(
+            bridge.take_remote_html().as_deref(),
+            Some("<strong>exact</strong>")
+        );
+    }
+
+    #[test]
     fn replacement_and_unsupported_formats_refuse_stale_callbacks() {
         let (bridge, mut backend) = ClipboardBridge::pair();
         backend.on_remote_copy(&[UNICODE_TEXT_FORMAT]);
@@ -779,6 +961,59 @@ mod tests {
     }
 
     #[test]
+    fn rejected_oversized_replacement_revokes_stale_host_clipboard_authority() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        bridge
+            .offer_host_text("previous secret".into())
+            .expect("bounded initial offer");
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+
+        let oversized = "x".repeat(MAX_VDI_CLIPBOARD_TEXT_BYTES + 1);
+        assert!(matches!(
+            bridge.offer_host_html(oversized),
+            Err(ClipboardBridgeError::TooLarge { .. })
+        ));
+
+        assert_eq!(bridge.advertised_formats(), Vec::<ClipboardFormat>::new());
+        assert!(bridge
+            .take_local_data_response()
+            .expect("queued stale request must receive a response")
+            .is_error());
+    }
+
+    #[test]
+    fn stale_request_cannot_read_replacement_before_its_generation_is_advertised() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        bridge.offer_host_text("old".into()).expect("initial offer");
+        assert_eq!(bridge.advertised_formats(), vec![UNICODE_TEXT_FORMAT]);
+
+        bridge
+            .offer_host_text("replacement secret".into())
+            .expect("replacement offer");
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        assert!(bridge
+            .take_local_data_response()
+            .expect("stale request must receive a response")
+            .is_error());
+
+        assert_eq!(bridge.advertised_formats(), vec![UNICODE_TEXT_FORMAT]);
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        assert_eq!(
+            bridge
+                .take_local_data_response()
+                .expect("current request")
+                .data(),
+            FormatDataResponse::new_unicode_string("replacement secret").data()
+        );
+    }
+
+    #[test]
     fn bounded_dibv5_negotiation_round_trips_and_rejects_hostile_geometry() {
         let (bridge, mut backend) = ClipboardBridge::pair();
         let dib = one_pixel_dibv5();
@@ -794,11 +1029,6 @@ mod tests {
                 .data(),
             dib
         );
-
-        // Guest-to-host image publication still needs a Files write authority;
-        // do not request image bytes merely because the guest advertises them.
-        backend.on_remote_copy(&[DIB_FORMAT, DIBV5_FORMAT]);
-        assert_eq!(bridge.take_remote_format_request(), None);
 
         let mut hostile = one_pixel_dibv5();
         hostile[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
@@ -818,6 +1048,75 @@ mod tests {
         assert_eq!(
             super::validate_dib(&missing_bitfield_masks, Some(DIB_FORMAT.id())),
             Err(ClipboardBridgeError::InvalidImage)
+        );
+    }
+
+    #[test]
+    fn guest_dib_and_dibv5_are_admitted_as_typed_one_use_images() {
+        for (format, wire, expected_format) in [
+            (DIB_FORMAT, one_pixel_dib(), RemoteClipboardImageFormat::Dib),
+            (
+                DIBV5_FORMAT,
+                one_pixel_dibv5(),
+                RemoteClipboardImageFormat::DibV5,
+            ),
+        ] {
+            let (bridge, mut backend) = ClipboardBridge::pair();
+            let format_id = format.id();
+            backend.on_remote_copy(&[format]);
+            assert_eq!(bridge.take_remote_format_request(), Some(format_id));
+
+            backend.on_format_data_response(FormatDataResponse::new_data(wire));
+            let admitted = bridge.take_remote_image().expect("typed guest image");
+            assert_eq!(admitted.format(), expected_format);
+            assert_eq!(
+                admitted.data(),
+                match expected_format {
+                    RemoteClipboardImageFormat::Dib => one_pixel_dib(),
+                    RemoteClipboardImageFormat::DibV5 => one_pixel_dibv5(),
+                }
+            );
+            assert_eq!(bridge.take_remote_image(), None);
+            assert_eq!(bridge.take_remote_format_request(), None);
+        }
+
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        backend.on_remote_copy(&[DIB_FORMAT, DIBV5_FORMAT]);
+        assert_eq!(
+            bridge.take_remote_format_request(),
+            Some(DIBV5_FORMAT.id()),
+            "prefer the stronger V5 representation independent of offer order"
+        );
+    }
+
+    #[test]
+    fn guest_image_format_confusion_replacement_and_replay_fail_closed() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        backend.on_remote_copy(&[DIBV5_FORMAT]);
+        assert_eq!(bridge.take_remote_format_request(), Some(DIBV5_FORMAT.id()));
+
+        // A structurally valid classic DIB is not valid for the negotiated V5
+        // request, even though both formats carry bitmap bytes.
+        backend.on_format_data_response(FormatDataResponse::new_data(one_pixel_dib()));
+        assert_eq!(bridge.take_remote_image(), None);
+
+        backend.on_remote_copy(&[DIB_FORMAT]);
+        assert_eq!(bridge.take_remote_format_request(), Some(DIB_FORMAT.id()));
+        backend.on_remote_copy(&[DIBV5_FORMAT]);
+        assert_eq!(bridge.take_remote_format_request(), None);
+        backend.on_format_data_response(FormatDataResponse::new_data(one_pixel_dib()));
+        assert_eq!(bridge.take_remote_image(), None, "stale response refused");
+        assert_eq!(bridge.take_remote_format_request(), Some(DIBV5_FORMAT.id()));
+
+        let admitted = one_pixel_dibv5();
+        backend.on_format_data_response(FormatDataResponse::new_data(admitted.clone()));
+        backend.on_format_data_response(FormatDataResponse::new_data(one_pixel_dibv5()));
+        assert_eq!(
+            bridge
+                .take_remote_image()
+                .map(|image| (image.format(), image.data().to_vec())),
+            Some((RemoteClipboardImageFormat::DibV5, admitted)),
+            "unsolicited replay cannot replace the admitted image"
         );
     }
 }

@@ -33,6 +33,10 @@ const CARD_MS: u64 = 120_000;
 // scan can take longer than CARD_MS, and dropping the typed card earlier makes
 // it disappear between otherwise healthy inventory publications.
 const PROBED_RDP_MAX_AGE_MS: u64 = 300_000;
+// The service aggregator applies the same five-minute lease before marking a
+// retained row stale. Revalidate it here because a replayed or inconsistent
+// ServicesState must not regain Available health merely by being republished.
+const SERVICE_RECORD_MAX_AGE_MS: u64 = 300_000;
 // Retained desktop-source cards use the same five-minute freshness lease as
 // the desktop-source adapter. Do not let a delayed or replayed roster revive
 // an RDP endpoint after that lease has elapsed.
@@ -551,7 +555,17 @@ fn observed_card(
         format!("service/{host}/{kind}"),
         vec![],
     )?;
-    let (health, lifecycle, failure) = match record.health {
+    let record_is_fresh = u64::try_from(record.last_seen_ms).ok().is_some_and(|observed| {
+        observed > 0
+            && observed <= now
+            && now.saturating_sub(observed) <= SERVICE_RECORD_MAX_AGE_MS
+    });
+    let effective_health = if record_is_fresh {
+        record.health
+    } else {
+        ServiceHealth::Stale
+    };
+    let (health, lifecycle, failure) = match effective_health {
         ServiceHealth::Up => (
             HealthStatus::Available,
             ServiceLifecycleStatus::Healthy,
@@ -880,8 +894,10 @@ fn load_configurations(workgroup_root: &Path) -> Vec<StoredServiceConfiguration>
             }
             let bytes = std::fs::read(path).ok()?;
             let config: StoredServiceConfiguration = serde_json::from_slice(&bytes).ok()?;
+            let canonical_name = format!("{}.json", config.service_kind);
             (config.schema_version == SERVICE_CONFIG_VERSION
-                && registered_service(&config.service_kind).is_ok())
+                && registered_service(&config.service_kind).is_ok()
+                && entry.file_name() == std::ffi::OsStr::new(&canonical_name))
             .then_some(config)
         })
         .collect()
@@ -1579,6 +1595,52 @@ mod tests {
     }
 
     #[test]
+    fn replayed_service_rows_cannot_regain_available_health_from_catalog_publication() {
+        const NOW: i64 = 1_700_000_000_000;
+        let catalog = catalog_from_services(&ServicesState {
+            host: "seat-15".into(),
+            records: vec![
+                observed_service(
+                    "stale-host",
+                    "ssh",
+                    "10.42.0.8:22",
+                    vec![ServiceProvenance::Probe],
+                    ServiceHealth::Up,
+                    NOW - i64::try_from(SERVICE_RECORD_MAX_AGE_MS).unwrap() - 1,
+                ),
+                observed_service(
+                    "future-host",
+                    "https",
+                    "10.42.0.9:443",
+                    vec![ServiceProvenance::Probe],
+                    ServiceHealth::Up,
+                    NOW + 1,
+                ),
+            ],
+            published_at_ms: NOW,
+        })
+        .expect("invalid source freshness degrades rather than refreshing service rows");
+
+        for host in ["stale-host", "future-host"] {
+            let card = catalog
+                .cards
+                .iter()
+                .find(|card| {
+                    card.service.as_ref().is_some_and(|service| {
+                        service.stack.hosting_nodes == [host.to_owned()]
+                    })
+                })
+                .expect("retained service remains inspectable");
+            assert_eq!(card.health.status, HealthStatus::Stale);
+            assert_eq!(
+                card.service.as_ref().expect("service interface").lifecycle,
+                ServiceLifecycleStatus::Degraded
+            );
+        }
+        catalog.validate().expect("validated fail-closed catalog");
+    }
+
+    #[test]
     fn optional_desktop_state_adds_stable_deduplicated_cards() {
         let root = tempfile::tempdir().unwrap();
         let services = ServicesState {
@@ -1806,6 +1868,55 @@ SERVER: MCNF/1.0\r\n\r\n";
                 action.verb == verb && action.availability.status == ActionAvailabilityStatus::Ready
             }));
         }
+    }
+
+    #[test]
+    fn restart_ignores_uncommitted_service_configuration_staging_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = configuration_dir(root.path());
+        std::fs::create_dir_all(&directory).unwrap();
+        let staged = StoredServiceConfiguration {
+            schema_version: SERVICE_CONFIG_VERSION,
+            service_kind: "jellyfin".into(),
+            non_secret_values: BTreeMap::from([(
+                "endpoint".into(),
+                "https://uncommitted.example.test".into(),
+            )]),
+            secret_fields: vec!["api-key".into()],
+            credential_ref: "service/jellyfin/jellyfin".into(),
+            enabled: true,
+            last_test_ok: Some(true),
+            updated_at_ms: 1_700_000_000_000,
+        };
+        std::fs::write(
+            directory.join(".jellyfin.4242.tmp"),
+            serde_json::to_vec_pretty(&staged).unwrap(),
+        )
+        .unwrap();
+
+        let catalog = catalog_from_services_with_root(
+            &ServicesState {
+                host: "seat-15".into(),
+                records: vec![],
+                published_at_ms: 1_700_000_000_000,
+            },
+            root.path(),
+        )
+        .expect("abandoned staging state is ignored after restart");
+        let card = catalog
+            .cards
+            .iter()
+            .find(|card| card.display_name == "Jellyfin")
+            .expect("registered Jellyfin adapter");
+        assert_eq!(
+            card.service.as_ref().expect("service interface").lifecycle,
+            ServiceLifecycleStatus::Unconfigured
+        );
+        assert!(card.actions.iter().any(|action| {
+            action.verb == ResourceActionVerb::Launch
+                && action.availability.status == ActionAvailabilityStatus::Unavailable
+        }));
+        catalog.validate().expect("validated fail-closed catalog");
     }
 
     #[test]

@@ -39,7 +39,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -665,13 +665,7 @@ impl KeyProvider for SecretStoreKeyProvider {
                     "shared mesh SSH key `{MESH_SSH_KEY_REF}` not sealed yet (FILEMGR-6)"
                 ))
             })?;
-        if let Some(parent) = self.key_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MountError::Backend(format!("mkdir key dir: {e}")))?;
-        }
-        std::fs::write(&self.key_path, material.as_bytes())
-            .map_err(|e| MountError::Backend(format!("write key: {e}")))?;
-        set_mode_600(&self.key_path).map_err(|e| MountError::Backend(format!("chmod key: {e}")))?;
+        materialize_identity_key(&self.key_path, material.as_bytes())?;
         Ok(self.key_path.clone())
     }
 }
@@ -687,10 +681,130 @@ pub(crate) fn binary_on_path(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// chmod 600 a freshly-written private key (Unix).
-fn set_mode_600(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+/// Atomically materialize the shared SSH identity without following any path
+/// component. A crashed prior worker may leave the final path as a symlink or a
+/// hard link; writing that inode in place would redirect or mutate the identity
+/// used after restart. Walk from `/` with directory descriptors, write a fresh
+/// exclusive sibling, sync it, and rename it over the retained leaf instead.
+fn materialize_identity_key(path: &Path, material: &[u8]) -> Result<(), MountError> {
+    use rand::RngCore as _;
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use std::ffi::OsString;
+    use std::io::Write as _;
+
+    if !path.is_absolute() {
+        return Err(MountError::Backend(format!(
+            "mesh SSH key path must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut components = Vec::<OsString>::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(MountError::Backend(format!(
+                    "mesh SSH key path contains an unsafe component: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let file_name = components.pop().ok_or_else(|| {
+        MountError::Backend(format!("mesh SSH key path has no filename: {}", path.display()))
+    })?;
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = rustix::fs::open("/", directory_flags, Mode::empty())
+        .map_err(|error| MountError::Backend(format!("open key-path root: {error}")))?;
+    for component in components {
+        directory = match rustix::fs::openat(
+            &directory,
+            &component,
+            directory_flags,
+            Mode::empty(),
+        ) {
+            Ok(next) => next,
+            Err(rustix::io::Errno::NOENT) => {
+                match rustix::fs::mkdirat(
+                    &directory,
+                    &component,
+                    Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => {
+                        return Err(MountError::Backend(format!(
+                            "create secure key directory {component:?}: {error}"
+                        )));
+                    }
+                }
+                rustix::fs::openat(
+                    &directory,
+                    &component,
+                    directory_flags,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    MountError::Backend(format!(
+                        "open secure key directory {component:?}: {error}"
+                    ))
+                })?
+            }
+            Err(error) => {
+                return Err(MountError::Backend(format!(
+                    "key path component {component:?} is not a safe directory: {error}"
+                )));
+            }
+        };
+    }
+
+    let mut random = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let temp_name = format!(
+        ".mesh-ssh-key-{}.tmp",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let temp = rustix::fs::openat(
+        &directory,
+        temp_name.as_str(),
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| MountError::Backend(format!("create secure key staging file: {error}")))?;
+    let mut temp_file: std::fs::File = temp.into();
+    if let Err(error) = temp_file
+        .write_all(material)
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = rustix::fs::unlinkat(&directory, temp_name.as_str(), AtFlags::empty());
+        return Err(MountError::Backend(format!(
+            "persist secure key staging file: {error}"
+        )));
+    }
+    drop(temp_file);
+    if let Err(error) = rustix::fs::renameat(
+        &directory,
+        temp_name.as_str(),
+        &directory,
+        file_name.as_os_str(),
+    ) {
+        let _ = rustix::fs::unlinkat(&directory, temp_name.as_str(), AtFlags::empty());
+        return Err(MountError::Backend(format!(
+            "install secure mesh SSH identity: {error}"
+        )));
+    }
+    let directory_file: std::fs::File = directory.into();
+    directory_file
+        .sync_all()
+        .map_err(|error| MountError::Backend(format!("sync mesh SSH key directory: {error}")))
 }
 
 // ── the published state record ─────────────────────────────────────────────
@@ -1575,6 +1689,43 @@ mod tests {
         // that has them the missing key is still a Gated refusal. Either way it's
         // never Ok and never a different (unexpected) success.
         assert!(matches!(res, Err(MountError::Gated(_))));
+    }
+
+    #[test]
+    fn restarted_worker_key_aliases_cannot_redirect_the_authenticated_mesh_identity() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("runtime/mde-mesh/.mesh-ssh-key");
+        let parent = key.parent().expect("key parent");
+        std::fs::create_dir_all(parent).expect("key directory");
+        let victim = dir.path().join("foreign-identity");
+        std::fs::write(&victim, b"foreign-generation").expect("victim identity");
+
+        std::os::unix::fs::symlink(&victim, &key).expect("retained symlink");
+        materialize_identity_key(&key, b"corrected-forward-generation")
+            .expect("replace retained symlink without following it");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"foreign-generation",
+            "restart must never write key material through a retained symlink"
+        );
+        assert_eq!(std::fs::read(&key).unwrap(), b"corrected-forward-generation");
+
+        std::fs::remove_file(&key).expect("remove first materialization");
+        std::fs::hard_link(&victim, &key).expect("retained hard-link alias");
+        materialize_identity_key(&key, b"next-authenticated-generation")
+            .expect("replace retained hard link without mutating its inode");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"foreign-generation",
+            "restart must never mutate an aliased identity inode"
+        );
+        assert_eq!(std::fs::read(&key).unwrap(), b"next-authenticated-generation");
+        let metadata = std::fs::symlink_metadata(&key).expect("installed identity metadata");
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

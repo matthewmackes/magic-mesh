@@ -1289,17 +1289,24 @@ pub fn registration_with_account(
 /// [`SharedAccount`] a Workstation can auto-configure against. The same
 /// `read_dir`-over-the-share discipline `app_sync` / `apps::fleet_*` use.
 ///
-/// Prefers an account from a registration whose instance is [`is_up`], so a
+/// Prefers an account from registrations whose instance is [`is_up`], so a
 /// Workstation auto-configures against a *serving* node when one is published;
-/// falls back to any published account otherwise (the account is the same shared
-/// creds regardless of which node published it — they all point at `music.mesh`).
-/// `None` when the share isn't mounted or no registration carries an account.
+/// falls back to unavailable registrations otherwise. Every publisher in the
+/// selected health tier must agree on the exact account. Conflicting replicas
+/// fail closed instead of making credential authority depend on `read_dir`
+/// ordering after a restart. A healthy tier may legitimately supersede stale,
+/// unavailable credentials during rotation.
+///
+/// Returns `None` when the share isn't mounted, no registration carries an
+/// account, or the selected tier equivocates.
 ///
 /// [`is_up`]: MediaRegistration::is_up
 #[must_use]
 pub fn read_shared_account_from_plane(workgroup_root: &Path) -> Option<SharedAccount> {
     let entries = std::fs::read_dir(workgroup_root).ok()?;
+    let mut healthy: Option<SharedAccount> = None;
     let mut fallback: Option<SharedAccount> = None;
+    let mut fallback_equivocated = false;
     for ent in entries.flatten() {
         let path = ent.path().join(MEDIA_REGISTRY_FILE);
         let Some(body) = read_bounded_media_json(&path, MAX_MEDIA_REGISTRY_BYTES) else {
@@ -1313,14 +1320,27 @@ pub fn read_shared_account_from_plane(workgroup_root: &Path) -> Option<SharedAcc
         let Some(acct) = reg.shared_account else {
             continue;
         };
-        // A serving (up) instance wins immediately; otherwise remember the
-        // first account as a fallback and keep scanning for an up one.
         if up {
-            return Some(acct);
+            if healthy.as_ref().is_some_and(|admitted| admitted != &acct) {
+                return None;
+            }
+            healthy.get_or_insert(acct);
+        } else if fallback
+            .as_ref()
+            .is_some_and(|admitted| admitted != &acct)
+        {
+            fallback_equivocated = true;
+        } else {
+            fallback.get_or_insert(acct);
         }
-        fallback.get_or_insert(acct);
     }
-    fallback
+    if healthy.is_some() {
+        healthy
+    } else if fallback_equivocated {
+        None
+    } else {
+        fallback
+    }
 }
 
 #[cfg(test)]
@@ -2124,6 +2144,28 @@ ND_ADMIN_PASS='p@ss=word'\n";
         let acct = read_shared_account_from_plane(&tmp).expect("the down account is the fallback");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(acct.username, "mesh-music");
+    }
+
+    #[test]
+    fn restarted_music_client_cannot_adopt_equivocated_healthy_shared_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (host, username, password) in [
+            ("healthy-a", "mesh-music", "credential-a"),
+            ("healthy-b", "replacement", "credential-b"),
+        ] {
+            seed_plane_doc(
+                tmp.path(),
+                host,
+                &registration_with_account(
+                    &format!("peer:{host}"),
+                    NAVIDROME_PORT,
+                    HEALTH_UP,
+                    Some(SharedAccount::new(username, password)),
+                ),
+            );
+        }
+
+        assert_eq!(read_shared_account_from_plane(tmp.path()), None);
     }
 
     #[test]

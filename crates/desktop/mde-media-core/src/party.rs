@@ -514,8 +514,34 @@ pub enum PartyPoll {
     Offline,
 }
 
+/// The complete ordering key of the last party head this seat observed.
+///
+/// Sequence alone is insufficient: two seats can concurrently issue the same next
+/// sequence, and [`resolve_head`] settles that race with `issued_ms` and `origin_seat`.
+#[derive(Debug, Clone)]
+struct AppliedHead {
+    seq: u64,
+    issued_ms: u64,
+    origin_seat: String,
+}
+
+impl AppliedHead {
+    fn from_event(event: &SyncEvent) -> Self {
+        Self {
+            seq: event.seq,
+            issued_ms: event.issued_ms,
+            origin_seat: event.origin_seat.clone(),
+        }
+    }
+
+    fn precedes(&self, event: &SyncEvent) -> bool {
+        (self.seq, self.issued_ms, self.origin_seat.as_str())
+            < (event.seq, event.issued_ms, event.origin_seat.as_str())
+    }
+}
+
 /// The per-seat party controller: owns the [`PartyStore`] seam, this seat's latest
-/// originated event, the highest sequence it has applied, and any deferred sync.
+/// originated event, the highest elected head it has applied, and any deferred sync.
 ///
 /// The surface drives it: [`join`](Self::join) on entering a party (sync to the head),
 /// [`apply_pending`](Self::apply_pending) each pump (land a deferred open-sync once
@@ -532,9 +558,9 @@ pub struct PartySession {
     seat: String,
     /// Whether this seat has joined (a store write happened / would have).
     joined: bool,
-    /// The highest sequence this seat has issued or applied (so it never re-applies
-    /// its own control or an already-seen one).
-    applied_seq: u64,
+    /// The complete election key this seat has issued or applied (so a later winner
+    /// of a same-sequence race is still observed exactly once).
+    applied_head: Option<AppliedHead>,
     /// This seat's latest originated event, re-published on each presence refresh so
     /// it stays in the head fold (a poll that applies another seat's control must not
     /// clobber it).
@@ -552,7 +578,7 @@ impl PartySession {
             party: party.into(),
             seat: seat.into(),
             joined: false,
-            applied_seq: 0,
+            applied_head: None,
             last_event: None,
             pending: None,
         }
@@ -612,11 +638,11 @@ impl PartySession {
         self.last_event = None;
         let head = self.store.head(&self.party);
         let synced = if let Some(head) = &head {
-            self.applied_seq = head.seq;
+            self.applied_head = Some(AppliedHead::from_event(head));
             self.converge(player, &head.intent());
             true
         } else {
-            self.applied_seq = 0;
+            self.applied_head = None;
             false
         };
         self.publish_presence(now_ms);
@@ -660,7 +686,7 @@ impl PartySession {
         let seq = self.store.next_seq(&self.party);
         let base = TransportSnapshot::from_player(player);
         let event = SyncEvent::new(&self.party, seq, &self.seat, now_ms, command, &base);
-        self.applied_seq = seq;
+        self.applied_head = Some(AppliedHead::from_event(&event));
         self.last_event = Some(event);
         self.publish_presence(now_ms);
     }
@@ -675,8 +701,14 @@ impl PartySession {
         }
         let head = self.store.head(&self.party);
         let outcome = match head {
-            Some(head) if head.seq > self.applied_seq && head.origin_seat != self.seat => {
-                self.applied_seq = head.seq;
+            Some(head)
+                if self
+                    .applied_head
+                    .as_ref()
+                    .is_none_or(|applied| applied.precedes(&head))
+                    && head.origin_seat != self.seat =>
+            {
+                self.applied_head = Some(AppliedHead::from_event(&head));
                 self.converge(player, &head.intent());
                 PartyPoll::Applied(head.command)
             }
@@ -870,6 +902,49 @@ mod tests {
         assert_eq!(resolve_head(&events).expect("head").origin_seat, "seat-b");
         let tie = vec![event("seat-a", 2, 200), event("seat-b", 2, 200)];
         assert_eq!(resolve_head(&tie).expect("head").origin_seat, "seat-b");
+    }
+
+    #[test]
+    fn later_same_sequence_winner_replaces_already_applied_party_authority() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PartyStore::new(dir.path().to_path_buf());
+        let record = |seat: &str, issued_ms: u64, command: SyncCommand| PartySeatRecord {
+            party: "movie-night".to_owned(),
+            seat: seat.to_owned(),
+            joined_ms: 1,
+            updated_ms: issued_ms,
+            event: Some(SyncEvent::new(
+                "movie-night",
+                2,
+                seat,
+                issued_ms,
+                command,
+                &snapshot(Some("movie.mkv"), 30.0, false),
+            )),
+        };
+
+        store
+            .publish(&record("seat-a", 100, SyncCommand::Pause))
+            .expect("publish first race candidate");
+        let mut local = player();
+        local.load("movie.mkv").expect("load");
+        local.pump();
+        let mut session = PartySession::new(store.clone(), "movie-night", "seat-local");
+        assert_eq!(
+            session.join(&mut local, 150),
+            JoinOutcome::Joined { synced: true }
+        );
+        assert_eq!(local.state(), PlayerState::Paused);
+
+        store
+            .publish(&record("seat-b", 200, SyncCommand::Play))
+            .expect("publish later same-sequence winner");
+        assert!(matches!(
+            session.poll(&mut local, 250),
+            PartyPoll::Applied(SyncCommand::Play)
+        ));
+        assert_eq!(local.state(), PlayerState::Playing);
+        assert_eq!(session.poll(&mut local, 300), PartyPoll::InSync);
     }
 
     // ── the store round-trips + skips corruption ───────────────────────────────

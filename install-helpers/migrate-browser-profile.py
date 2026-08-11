@@ -11,12 +11,12 @@ skipped; they are never read or copied.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
-import shutil
 import stat
 import tempfile
 from typing import Iterable
@@ -362,6 +362,96 @@ def verify_existing_bundle(output: Path, manifest: dict) -> None:
         raise MigrationError("existing bundle contains missing or unexpected files")
 
 
+def directory_identity(path: Path) -> tuple[int, int]:
+    """Return the stable filesystem identity of a real directory."""
+
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise MigrationError("existing output is not a real directory")
+    return metadata.st_dev, metadata.st_ino
+
+
+def exchange_directories(left: Path, right: Path) -> None:
+    """Atomically exchange two Linux directory names on the same filesystem."""
+
+    rename_exchange = 2
+    at_fdcwd = -100
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError("renameat2 is unavailable; refusing non-atomic replacement") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        at_fdcwd,
+        os.fsencode(left),
+        at_fdcwd,
+        os.fsencode(right),
+        rename_exchange,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def publish_bundle(
+    staging: Path,
+    output: Path,
+    replaced_identity: tuple[int, int] | None,
+) -> None:
+    """Publish *staging* without destroying the last admitted bundle first.
+
+    A replacement atomically exchanges the exact verified directory with the
+    staged bundle. Keeping an open directory descriptor across the exchange
+    prevents a last-moment output substitution from turning ``--replace`` into
+    deletion authority for an unrelated directory. At every instant the public
+    path therefore names either the complete old bundle or the complete new one.
+    """
+
+    if replaced_identity is None:
+        if output.exists() or output.is_symlink():
+            raise MigrationError("output appeared during migration; refusing overwrite")
+        os.replace(staging, output)
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        output_descriptor = os.open(output, flags)
+    except OSError as error:
+        raise MigrationError("existing output changed before replacement") from error
+    try:
+        opened = os.fstat(output_descriptor)
+        if (opened.st_dev, opened.st_ino) != replaced_identity:
+            raise MigrationError("existing output changed before replacement")
+        staged_identity = directory_identity(staging)
+        try:
+            exchange_directories(staging, output)
+        except OSError as publish_error:
+            raise MigrationError(
+                "replacement publication failed; original bundle preserved"
+            ) from publish_error
+        moved = directory_identity(staging)
+        published = directory_identity(output)
+        if moved != replaced_identity or published != staged_identity:
+            try:
+                exchange_directories(staging, output)
+            except OSError as rollback_error:
+                raise MigrationError(
+                    "atomic replacement moved an unexpected directory and could not be reversed"
+                ) from rollback_error
+            raise MigrationError(
+                "atomic replacement moved an unexpected directory; exchange reversed"
+            )
+    finally:
+        os.close(output_descriptor)
+
+
 def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) -> dict:
     validate_roots(roots, output)
     validate_output_parent(output)
@@ -369,9 +459,13 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
         raise MigrationError("output must not be a symlink")
     if output.exists() and not output.is_dir():
         raise MigrationError("output is not a directory")
-    if output.exists() and not replace:
+    replaced_identity = None
+    if output.exists():
         previous = manifest_for(output)
         verify_existing_bundle(output, previous)
+        replaced_identity = directory_identity(output)
+        if replace:
+            previous = None
     else:
         previous = None
 
@@ -509,11 +603,7 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
         (staging / "manifest.json").write_text(encoded, encoding="utf-8")
         os.chmod(staging / "manifest.json", stat.S_IRUSR | stat.S_IWUSR)
         verify_existing_bundle(staging, manifest)
-        if output.exists():
-            if not replace:
-                raise MigrationError("output appeared during migration; refusing overwrite")
-            shutil.rmtree(output)
-        os.replace(staging, output)
+        publish_bundle(staging, output, replaced_identity if replace else None)
     os.chmod(output, stat.S_IRWXU)
     return manifest
 
@@ -553,6 +643,47 @@ def self_test() -> None:
         assert first["counts"]["failed"] == 0
         assert not any("SECRET" in path.read_text(errors="ignore") for path in output.rglob("*") if path.is_file())
         assert (output / "payload" / "downloads" / "report.pdf").read_bytes() == b"download"
+
+        unrelated = Path(raw) / "unrelated-output"
+        unrelated.mkdir()
+        retained = unrelated / "operator-data"
+        retained.write_text("must survive", encoding="utf-8")
+        try:
+            migrate(roots, unrelated, replace=True)
+        except MigrationError as error:
+            assert str(error) == "existing output is not a migration bundle"
+        else:
+            raise AssertionError("--replace accepted an unrelated output directory")
+        assert retained.read_text(encoding="utf-8") == "must survive"
+
+        # A failed replacement publish must put the exact prior bundle back,
+        # not strand the caller between an old-bundle deletion and a new-bundle
+        # rename.  The next normal replacement must still advance cleanly.
+        old_manifest = (output / "manifest.json").read_bytes()
+        old_bookmarks = (output / "payload" / "bookmarks" / "Bookmarks").read_bytes()
+        (root / "Bookmarks").write_text('{"roots":{"new":{}}}\n', encoding="utf-8")
+        real_exchange = exchange_directories
+
+        def fail_new_bundle_publish(_left: Path, _right: Path) -> None:
+            raise OSError("hostile publish failure")
+
+        globals()["exchange_directories"] = fail_new_bundle_publish
+        try:
+            try:
+                migrate(roots, output, replace=True)
+            except MigrationError as error:
+                assert str(error) == "replacement publication failed; original bundle preserved"
+            else:
+                raise AssertionError("failed replacement publication was accepted")
+        finally:
+            globals()["exchange_directories"] = real_exchange
+        assert (output / "manifest.json").read_bytes() == old_manifest
+        assert (output / "payload" / "bookmarks" / "Bookmarks").read_bytes() == old_bookmarks
+        replaced = migrate(roots, output, replace=True)
+        assert replaced["entries"] != first["entries"]
+        assert (output / "payload" / "bookmarks" / "Bookmarks").read_text(
+            encoding="utf-8"
+        ) == '{"roots":{"new":{}}}\n'
 
         overflow = Path(raw) / "overflow"
         overflow.mkdir()

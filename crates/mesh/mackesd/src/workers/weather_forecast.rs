@@ -989,15 +989,18 @@ fn load_cache(path: &Path) -> io::Result<Option<WeatherCache>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+    {
         return Err(io::Error::other(
-            "weather cache must be a regular non-symlink file",
+            "weather cache must be a single-link regular non-symlink file",
         ));
     }
     if metadata.len() > u64::try_from(MAX_CACHE_BYTES).unwrap_or(u64::MAX) {
         return Err(io::Error::other("weather cache exceeds its byte limit"));
     }
-    let file: File = rustix::fs::open(
+    let mut file: File = rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::NOFOLLOW
@@ -1008,16 +1011,34 @@ fn load_cache(path: &Path) -> io::Result<Option<WeatherCache>> {
     .into();
     let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file()
+        || opened_metadata.nlink() != 1
         || opened_metadata.dev() != metadata.dev()
         || opened_metadata.ino() != metadata.ino()
     {
         return Err(io::Error::other("weather cache changed during secure open"));
     }
     let mut body = Vec::with_capacity(metadata.len() as usize);
-    file.take(u64::try_from(MAX_CACHE_BYTES).unwrap_or(u64::MAX) + 1)
+    Read::by_ref(&mut file)
+        .take(u64::try_from(MAX_CACHE_BYTES).unwrap_or(u64::MAX) + 1)
         .read_to_end(&mut body)?;
     if body.len() > MAX_CACHE_BYTES {
         return Err(io::Error::other("weather cache exceeds its byte limit"));
+    }
+    let final_opened_metadata = file.metadata()?;
+    let final_path_metadata = fs::symlink_metadata(path)?;
+    if !final_opened_metadata.is_file()
+        || final_opened_metadata.nlink() != 1
+        || final_opened_metadata.dev() != opened_metadata.dev()
+        || final_opened_metadata.ino() != opened_metadata.ino()
+        || final_path_metadata.file_type().is_symlink()
+        || !final_path_metadata.is_file()
+        || final_path_metadata.nlink() != 1
+        || final_path_metadata.dev() != opened_metadata.dev()
+        || final_path_metadata.ino() != opened_metadata.ino()
+    {
+        return Err(io::Error::other(
+            "weather cache authority changed during secure read",
+        ));
     }
     let text = std::str::from_utf8(&body).map_err(io_other)?;
     mackes_mesh_types::workloads::reject_duplicate_json_keys(text).map_err(io_other)?;
@@ -2283,6 +2304,23 @@ mod tests {
         file.set_len(u64::try_from(MAX_CACHE_BYTES + 1).unwrap())
             .expect("set len");
         assert!(load_cache(&oversized).is_err());
+    }
+
+    #[test]
+    fn hard_linked_restart_cache_cannot_retain_weather_authority() {
+        let temp = TempDir::new().expect("temp");
+        let cache_path = temp.path().join("weather-cache.json");
+        let authority = location(7, -71.0589);
+        let EffectiveLocationState::Available { location } = &authority.state else {
+            panic!("fixture location");
+        };
+        let cache = WeatherCache::empty("workstation-1", 7, location);
+        store_cache(&cache_path, &cache).expect("store valid cache");
+        fs::hard_link(&cache_path, temp.path().join("hostile-cache-alias"))
+            .expect("retain cache inode through hostile alias");
+
+        let error = load_cache(&cache_path).expect_err("shared inode must lose cache authority");
+        assert!(error.to_string().contains("single-link"));
     }
 
     #[test]

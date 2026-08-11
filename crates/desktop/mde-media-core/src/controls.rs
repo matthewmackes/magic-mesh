@@ -61,11 +61,16 @@ pub enum AbLoop {
 
 impl AbLoop {
     /// The `(ab-loop-a, ab-loop-b)` property values (`"no"`/`"no"` when off).
+    /// Malformed ranges fail closed to off rather than forwarding non-finite,
+    /// negative, or reversed timestamps to the active player.
     #[must_use]
     pub fn as_mpv(self) -> (String, String) {
         match self {
             Self::Off => ("no".to_owned(), "no".to_owned()),
-            Self::Range { a, b } => (fmt_num(a), fmt_num(b)),
+            Self::Range { a, b } if a.is_finite() && b.is_finite() && a >= 0.0 && a < b => {
+                (fmt_num(a), fmt_num(b))
+            }
+            Self::Range { .. } => ("no".to_owned(), "no".to_owned()),
         }
     }
 }
@@ -144,9 +149,22 @@ impl PlaybackControls {
     #[must_use]
     pub fn properties(&self) -> Vec<(String, String)> {
         let (ab_a, ab_b) = self.ab_loop.as_mpv();
+        // mpv accepts playback speeds in 0.01..=100. Invalid values must not be
+        // sent to the current player: use the neutral speed instead. Likewise,
+        // a non-finite delay cannot describe a real A/V offset and is cleared.
+        let speed = if self.speed.is_finite() && (0.01..=100.0).contains(&self.speed) {
+            self.speed
+        } else {
+            1.0
+        };
+        let audio_delay = if self.audio_delay.is_finite() {
+            self.audio_delay
+        } else {
+            0.0
+        };
         vec![
-            ("speed".to_owned(), fmt_num(self.speed)),
-            ("audio-delay".to_owned(), fmt_num(self.audio_delay)),
+            ("speed".to_owned(), fmt_num(speed)),
+            ("audio-delay".to_owned(), fmt_num(audio_delay)),
             (
                 "prefetch-playlist".to_owned(),
                 yes_no(self.gapless).to_owned(),
@@ -228,6 +246,41 @@ mod tests {
     #[test]
     fn ab_loop_off_clears_both_endpoints() {
         assert_eq!(AbLoop::Off.as_mpv(), ("no".to_owned(), "no".to_owned()));
+    }
+
+    #[test]
+    fn malformed_numeric_controls_cannot_reach_the_active_player() {
+        for controls in [
+            PlaybackControls {
+                speed: f64::NAN,
+                audio_delay: f64::INFINITY,
+                ab_loop: AbLoop::Range { a: 8.0, b: 2.0 },
+                ..PlaybackControls::new()
+            },
+            PlaybackControls {
+                speed: 0.0,
+                audio_delay: f64::NEG_INFINITY,
+                ab_loop: AbLoop::Range { a: -1.0, b: 2.0 },
+                ..PlaybackControls::new()
+            },
+            PlaybackControls {
+                speed: 100.01,
+                ab_loop: AbLoop::Range {
+                    a: 1.0,
+                    b: f64::NAN,
+                },
+                ..PlaybackControls::new()
+            },
+        ] {
+            let properties = controls.properties();
+            assert!(properties.contains(&("speed".to_owned(), "1".to_owned())));
+            assert!(properties.contains(&("audio-delay".to_owned(), "0".to_owned())));
+            assert!(properties.contains(&("ab-loop-a".to_owned(), "no".to_owned())));
+            assert!(properties.contains(&("ab-loop-b".to_owned(), "no".to_owned())));
+            assert!(properties
+                .iter()
+                .all(|(_, value)| !value.contains("NaN") && !value.contains("inf")));
+        }
     }
 
     #[test]

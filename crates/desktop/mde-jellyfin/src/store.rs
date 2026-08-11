@@ -21,6 +21,7 @@
 //! so per the MEDIA-9 spec this uses a documented `0600` JSON at the user
 //! config dir instead.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -208,6 +209,9 @@ pub enum StoreError {
     /// The store file was not valid JSON.
     #[error("jellyfin server store parse error: {0}")]
     Parse(String),
+    /// The parsed store contains ambiguous or otherwise invalid identities.
+    #[error("jellyfin server store identity error: {0}")]
+    Identity(String),
 }
 
 impl ServerStore {
@@ -302,12 +306,21 @@ impl ServerStore {
     ///
     /// # Errors
     /// [`StoreError::Missing`] when absent, [`StoreError::Io`] /
-    /// [`StoreError::Parse`] otherwise.
+    /// [`StoreError::Parse`] / [`StoreError::Identity`] otherwise.
     pub fn load_from(path: &Path) -> Result<Self, StoreError> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let mut store: Self =
                     serde_json::from_str(&text).map_err(|e| StoreError::Parse(e.to_string()))?;
+                let mut server_ids = HashSet::with_capacity(store.servers.len());
+                for server in &store.servers {
+                    if !server_ids.insert(server.id.as_str()) {
+                        return Err(StoreError::Identity(format!(
+                            "duplicate server id {:?}",
+                            server.id
+                        )));
+                    }
+                }
                 for server in &mut store.servers {
                     server.normalize();
                 }
@@ -646,6 +659,24 @@ mod tests {
             ServerStore::load_from(&path),
             Err(StoreError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn load_rejects_duplicate_server_identity_before_selecting_cache_authority() {
+        let equivocated = r#"{"servers":[
+            {"id":"srv-a","name":"Trusted","base_url":"https://trusted.mesh"},
+            {"id":"srv-a","name":"Forged","base_url":"https://forged.invalid"}
+        ]}"#;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        std::fs::write(&path, equivocated).expect("write equivocated store");
+
+        let error = ServerStore::load_from(&path)
+            .expect_err("duplicate server identity must fail closed before cache selection");
+        assert!(
+            matches!(&error, StoreError::Identity(message) if message.contains("srv-a")),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

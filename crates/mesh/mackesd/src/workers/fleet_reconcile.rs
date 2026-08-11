@@ -11,7 +11,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{ShutdownToken, Worker};
@@ -22,6 +22,11 @@ pub const CADENCE: Duration = Duration::from_secs(900);
 
 /// Nudge poll interval — how fast an "Apply now" lands.
 pub const NUDGE_POLL: Duration = Duration::from_secs(10);
+
+/// A reconcile must finish inside one recovery window. A wedged automation
+/// child must not pin daemon shutdown or prevent a corrected-forward revision
+/// from being attempted on the next poll.
+pub const RECONCILE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The reconcile driver worker.
 pub struct FleetReconcileWorker {
@@ -40,26 +45,53 @@ impl FleetReconcileWorker {
         }
     }
 
-    async fn run_reconcile(&self) {
-        let root = self.workgroup_root.display().to_string();
-        match tokio::process::Command::new("magic-fleet")
-            .args([
-                "reconcile",
-                &format!("--root={root}"),
-                &format!("--hostname={}", self.hostname),
-            ])
-            .status()
+    async fn run_reconcile(&self) -> bool {
+        self.run_reconcile_with_timeout(Path::new("magic-fleet"), RECONCILE_TIMEOUT)
             .await
-        {
+    }
+
+    async fn run_reconcile_with(&self, program: &Path) -> bool {
+        self.run_reconcile_with_timeout(program, RECONCILE_TIMEOUT)
+            .await
+    }
+
+    async fn run_reconcile_with_timeout(&self, program: &Path, timeout: Duration) -> bool {
+        let root = self.workgroup_root.display().to_string();
+        let mut command = tokio::process::Command::new(program);
+        command.args([
+            "reconcile",
+            &format!("--root={root}"),
+            &format!("--hostname={}", self.hostname),
+        ]);
+        match super::proc::status_with_timeout_async(command, timeout).await {
             Ok(st) if st.success() => {
                 tracing::info!("fleet_reconcile: converged (magic-fleet reconcile ok)");
+                true
             }
             Ok(st) => {
                 tracing::warn!("fleet_reconcile: magic-fleet reconcile exited {st}");
+                false
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                tracing::warn!(
+                    "fleet_reconcile: magic-fleet exceeded {timeout:?}; killing it so corrected-forward recovery remains due"
+                );
+                false
             }
             Err(e) => {
                 tracing::debug!("fleet_reconcile: magic-fleet unavailable: {e}");
+                false
             }
+        }
+    }
+
+    fn record_attempt(last_full: &mut Instant, reconciled: bool) {
+        if reconciled {
+            *last_full = Instant::now();
+        } else {
+            *last_full = Instant::now()
+                .checked_sub(CADENCE)
+                .unwrap_or_else(Instant::now);
         }
     }
 
@@ -134,8 +166,14 @@ impl Worker for FleetReconcileWorker {
                 if nudged {
                     tracing::info!("fleet_reconcile: nudged — reconciling now (PD-9)");
                 }
-                self.run_reconcile().await;
-                last_full = Instant::now();
+                // Dropping the bounded command future on shutdown also drops
+                // its kill-on-drop child, so a wedged reconcile cannot hold a
+                // daemon restart open until the command deadline.
+                let reconciled = tokio::select! {
+                    result = self.run_reconcile() => result,
+                    _ = shutdown.wait() => return Ok(()),
+                };
+                Self::record_attempt(&mut last_full, reconciled);
             }
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
@@ -199,5 +237,64 @@ mod tests {
 
         magic_fleet::store::write_nudge_payload(workgroup.path(), "pine", &armed).unwrap();
         assert!(!worker.consume_authorized_nudge(&authorizer));
+    }
+
+    #[tokio::test]
+    async fn failed_reconcile_remains_due_for_corrected_forward_retry() {
+        let worker = FleetReconcileWorker::new(PathBuf::from("/tmp/x"), "pine".into());
+        let mut last_full = Instant::now();
+
+        let reconciled = worker.run_reconcile_with(Path::new("/usr/bin/false")).await;
+        FleetReconcileWorker::record_attempt(&mut last_full, reconciled);
+
+        assert!(
+            last_full.elapsed() >= CADENCE,
+            "a failed restart or peer-return reconcile must remain immediately retryable"
+        );
+
+        FleetReconcileWorker::record_attempt(&mut last_full, true);
+        assert!(last_full.elapsed() < CADENCE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wedged_reconcile_cannot_block_restart_or_corrected_forward_generation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("wedged-magic-fleet");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in
+        --root=*) root="${argument#--root=}" ;;
+    esac
+done
+printf started > "$root/wedged-started"
+exec /usr/bin/sleep 600
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).unwrap();
+
+        let worker = FleetReconcileWorker::new(root.path().to_path_buf(), "pine".into());
+        let reconciled = worker
+            .run_reconcile_with_timeout(&program, Duration::from_millis(500))
+            .await;
+
+        assert!(root.path().join("wedged-started").is_file());
+        assert!(!reconciled, "a timed-out generation must never count as converged");
+        assert!(
+            worker
+                .run_reconcile_with_timeout(
+                    Path::new("/usr/bin/true"),
+                    Duration::from_secs(1),
+                )
+                .await,
+            "the corrected-forward generation must run after the wedged child is killed"
+        );
     }
 }

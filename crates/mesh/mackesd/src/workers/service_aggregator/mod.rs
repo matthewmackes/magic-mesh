@@ -685,6 +685,29 @@ impl ServiceAggregatorWorker {
         })
     }
 
+    fn require_retained_inputs_current(
+        &self,
+        persist: &Persist,
+        identity: &LastPublication,
+    ) -> Result<(), String> {
+        for (topic, staged_ulid) in [
+            (SOURCES_TOPIC, identity.desktop_ulid.as_deref()),
+            (SSH_X11_SOURCES_TOPIC, identity.ssh_x11_ulid.as_deref()),
+            (UPNP_SOURCES_TOPIC, identity.upnp_ulid.as_deref()),
+        ] {
+            let live_ulid = persist
+                .read_latest(topic)
+                .map_err(|error| format!("recheck retained source {topic}: {error}"))?
+                .map(|message| message.ulid);
+            if live_ulid.as_deref() != staged_ulid {
+                return Err(format!(
+                    "retained source {topic} advanced while staging the resource catalog"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_resource_mirror_outputs(
         &self,
         catalog: &ResourceCatalog,
@@ -782,13 +805,16 @@ impl ServiceAggregatorWorker {
         outputs.extend(self.prepare_resource_mirror_outputs(&catalog)?);
         require_live_bus_index(persist, &self.bus_root)?;
 
+        let identity = LastPublication {
+            services,
+            desktop_ulid: desktop.ulid,
+            ssh_x11_ulid: ssh_x11.ulid,
+            upnp_ulid: upnp.ulid,
+        };
+        self.require_retained_inputs_current(persist, &identity)?;
+
         Ok(StagedPublication {
-            identity: LastPublication {
-                services,
-                desktop_ulid: desktop.ulid,
-                ssh_x11_ulid: ssh_x11.ulid,
-                upnp_ulid: upnp.ulid,
-            },
+            identity,
             outputs,
         })
     }
@@ -1561,6 +1587,47 @@ mod tests {
                     .then_some(())
                     .ok_or_else(|| format!("injected final-source read failure for {topic}"))
             }));
+        let mut last = None;
+        let mut last_pub_at = None;
+
+        assert!(worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .is_err());
+        for topic in [
+            state_topic("me"),
+            resource_adapters::RESOURCE_ADAPTER_STATUS_TOPIC.to_owned(),
+            RESOURCE_CATALOG_TOPIC.to_owned(),
+            RESOURCE_DISCOVERY_TOPIC.to_owned(),
+        ] {
+            assert!(persist
+                .read_latest(&topic)
+                .expect("read output topic")
+                .is_none());
+        }
+        assert!(last.is_none());
+        assert!(last_pub_at.is_none());
+    }
+
+    #[test]
+    fn retained_source_advance_during_stage_cannot_publish_mixed_generation() {
+        let bus = tempfile::tempdir().expect("bus tempdir");
+        write_desktop_state(bus.path(), &valid_desktop_state());
+        let advanced = Arc::new(AtomicBool::new(false));
+        let bus_root = bus.path().to_path_buf();
+        let worker = worker_with(vec![], vec![])
+            .with_bus_root(Some(bus_root.clone()))
+            .with_bus_read_gate({
+                let advanced = Arc::clone(&advanced);
+                Arc::new(move |_topic, index| {
+                    if index == 2 && !advanced.swap(true, Ordering::SeqCst) {
+                        let mut replacement = valid_desktop_state();
+                        replacement.sources[0].name = "Forward Seat".into();
+                        write_desktop_state(&bus_root, &replacement);
+                    }
+                    Ok(())
+                })
+            });
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let mut last = None;
         let mut last_pub_at = None;
 

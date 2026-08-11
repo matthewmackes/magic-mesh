@@ -8,6 +8,7 @@ tasks.
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
 - **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
   vertical slices FUNC-011/FUNC-016, FUNC-017, FUNC-021, and FUNC-022 next. Integrate
@@ -92,7 +93,7 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
-- Current state: typed contracts, journals, cancellation, Display1, hostile tests, cleanup; adapters, recovery, KMS/EGL, packaging, and Dell/seat-15 proof remain.
+- Current state: typed authority exists; KMS/EGL and live proof remain. Evidence: `evidence/WL-ARCH-010-2026-08-11-running-reservation-restart-r458.md`.
 - Remaining work: **Recovered lease deadline (2026-08-10):** expired attachment leases refused; BigBoy: `evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
 - **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
@@ -102,34 +103,34 @@ behavioral evidence is not completion.
 - **Bounded mountinfo (2026-08-11):** storage protection/topology refuse over-1 MiB input; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-mountinfo-bound-r233.md`.
 - **Bounded compute expose probes (2026-08-11):** firewalld/NM/interface probes time out; `.90` passed 1/1: `evidence/WL-ARCH-010-2026-08-11-compute-expose-timeout-r234.md`.
 - **Bounded compute migration probe (2026-08-11):** local `ip` path is timeout-bound; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-compute-migrate-ip-bound-r233.md`.
+- **Libvirt start replay:** active VM resumes readiness; unrelated errors fail; `.90` 1/1: `evidence/WL-ARCH-010-2026-08-11-libvirt-start-replay-r237.md`.
 - **VM/image cleanup:** `evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
-- **Attachment cleanup:** `evidence/WL-ARCH-010-2026-08-10-start-failure-attachment-revocation-r172.md`, `evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
-- **Storage safety:** seat `.90` passed partition geometry, mountpoint, and storage-name refusal:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
+- **Attachment cleanup:** cancellation durably detaches before exact lease revocation; `.50` 1/1: `evidence/WL-ARCH-010-2026-08-11-cancel-presentation-revocation-r258.md`.
+- **Terminal detach:** persist before revoke; flush failure withholds effects; BigBoy 1/1: `evidence/WL-ARCH-010-2026-08-11-terminal-detach-ordering-r298.md`.
+- **Storage safety:** `.90` passed partition geometry, mountpoint, and storage-name refusal: `evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`,
+  `evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`, `evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
 - **Label bound (2026-08-11):** 255-byte/control refusal before filesystem commands; BigBoy: `evidence/WL-ARCH-010-2026-08-11-storage-label-admission-r225.md`.
 - **Virtual output bound (2026-08-11):** qemu-img drains both streams, retaining 64 KiB each; BigBoy: `evidence/WL-ARCH-010-2026-08-11-virtual-storage-output-bound-r225.md`.
 - **Bounded workload capacity probe (2026-08-11):** `/proc/meminfo` input is capped at 64 KiB; BigBoy passed 1/1: `evidence/WL-ARCH-010-2026-08-11-workload-meminfo-bound-r228.md`.
-- **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
-- **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
+- **Display1 disconnect:** dead relay/input authority is revoked before readiness; `.90` 1/1: `evidence/WL-ARCH-010-2026-08-11-display1-pre-presentation-disconnect-r246.md`.
+- **Display1 socket generation:** stale cleanup preserves a newer inode; BigBoy 1/1: `docs/platform/evidence/WL-ARCH-010-2026-08-11-display1-socket-generation-r286.md`.
+- **Capacity authority:** completed workloads and prior running generations survive failed retries; `.50`/`.90` 1/1 each:
+  `evidence/WL-ARCH-010-2026-08-11-completed-workload-reservation-r367.md`, `evidence/WL-ARCH-010-2026-08-11-failed-retry-reservation-r391.md`.
+- **Post-ack presentation:** disconnect revokes frames; BigBoy 1/1: `evidence/WL-ARCH-010-2026-08-11-display1-post-presentation-revocation-r368.md`.
+- **Generic session identity:** active IDs cannot retarget workload/route; `.90` 1/1: `evidence/WL-ARCH-010-2026-08-11-generic-session-identity-r369.md`.
+- **VDI input generation:** replacement/retry/resize revoke input until a fresh frame; BigBoy 1/1: `evidence/WL-ARCH-010-2026-08-11-vdi-input-generation-r372.md`.
+- **Native attachment:** lease bounds/revocation/relay reset passed: `evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`,
+  `evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`, `evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
+- **Uncommitted lease:** rejected transitions revoke it before final outcomes; `.90`: `evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
 - **Cleanup idempotence (2026-08-06):** sole libvirt actuator passed 23/23 on `.90`: `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
-- **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
-  `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
+- **Dell Display1/RDP:** D-Bus QEMU boots a GL head with disk identity and RDP ready: `evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
 - **Admission/live proof:** helper passed placement/resource/retry/lease; Dell was unreachable; seat 15 acceptance refused for missing receipt/projection/operation/generation.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
 - **Native attachment route (2026-08-09):** invalid routes fail before effects; farm proof: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
-- **Console authority removal checkpoint (2026-08-08):** raw console relay, cloud dispatch, shell reader, obsolete Browser envelope, and live verifier were deleted.
-  Typed Workload Open plus authenticated Display1 leases remain; focused BigBoy/`.90` gates pass. Only the Workload reconciler executes cold-migration VM effects;
-  Restart persists Stop/Starting before effects, replays starts, and owns cancelled Restart; evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`. Other evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
-- **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and libvirt inventory shortcuts and Datacenter's retired Nova-name heuristic were
-  deleted. One typed Workloads link/projection remains; the strengthened
-  authority guard and three focused BigBoy shell tests pass. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-08-shell-runtime-projection-hard-cut-r4.md`.
+- **Console authority removal:** Workload owns migration/restart and raw console/cloud/shell/Browser paths are gone:
+  `evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`, `evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`,
+  `evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`, `evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
+- **Shell runtime projection:** raw Podman/libvirt/Nova shortcuts are gone; BigBoy passed: `evidence/WL-ARCH-010-2026-08-08-shell-runtime-projection-hard-cut-r4.md`.
 - **Heartbeat runtime-projection hard cut (2026-08-08):** peer heartbeats no
   longer probe or replicate raw Podman/libvirt inventories. Remote VM desktop
   cards consume the serving node's validated typed Workload snapshot; rolling
@@ -167,17 +168,13 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-input-audio-r23.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-clipboard-authority-hard-cut-s6.md`.
 - **Storage Bus transaction checkpoint (2026-08-09):** stable reads precede effects; late/replaced storage and failed publication correct forward without repeated operations.
   BigBoy passed six exact gates: `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`.
-- **Durable journal checkpoint (2026-08-06):** persisted Workload journals reject
-  recursive duplicate JSON keys before replay; BigBoy passed 8/8 reconciler tests.
+- **Durable journal checkpoint (2026-08-06):** persisted journals reject recursive duplicate JSON keys before replay; BigBoy passed 8/8 reconciler tests.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-ledger-duplicate-keys-r1.md`.
-- **VDI reconnect checkpoint (2026-08-06):** generation-zero reconnect evidence
-  is refused; BigBoy passed 1/1. Evidence:
+- **VDI reconnect checkpoint (2026-08-06):** generation-zero reconnect evidence is refused; BigBoy passed 1/1. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-vdi-reconnect-generation-r1.md`.
-- **Journal rollback checkpoint (2026-08-06):** failed atomic phase flushes roll
-  back in-memory status; BigBoy passed 9/9. Evidence:
+- **Journal rollback checkpoint (2026-08-06):** failed atomic phase flushes roll back in-memory status; BigBoy passed 9/9. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-ledger-flush-rollback-r1.md`.
-- **Attachment generation checkpoint (2026-08-06):** stale lease generations
-  are rejected; BigBoy passed 1/1. Evidence:
+- **Attachment generation checkpoint (2026-08-06):** stale lease generations are rejected; BigBoy passed 1/1. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-status-attachment-generation-r1.md`.
 - **Quadlet catalog checkpoint (2026-08-06):** Start/StartAndAttach validate a
   promoted non-empty OCI artifact before systemd or Display1; `.90` passed 2/2.
@@ -326,6 +323,16 @@ behavioral evidence is not completion.
 - **Dell Display1/RDP (2026-08-09):** guest RDP boot proof: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
 - **Host-browser profile (2026-08-10):** manifest self-test passed: `docs/platform/evidence/WL-ARCH-008-2026-08-10-host-browser-profile-refusal-r156.md`.
 - Remaining work:
+- **Browser runtime path:** xrdp cannot redirect executable lookup outside immutable guest entrypoints; `.196` self-test:
+  `evidence/WL-ARCH-008-2026-08-11-browser-runtime-path-r443.md`.
+- **Bookmark clock generation:** transplanted clocks cannot roll back snapshot history; `.50` 1/1: `evidence/WL-ARCH-008-2026-08-11-bookmark-clock-generation-r430.md`.
+- **App-VM base authority:** conflicting duplicate base declarations fail verification; `.196` passed: `evidence/WL-ARCH-008-2026-08-11-app-vm-base-declaration-r379.md`.
+- **Session restart readiness (2026-08-11):** the broker demotes recovered
+  historical `Active` rows before first convergence, replacing stale shared
+  ready state until a forward authorized reconnect; `.50` passed 1/1:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-11-session-restart-readiness-r265.md`.
+- **Browser reconnect identity (2026-08-11):** exact replay preserves the live route/transport while retargeting fails closed; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-11-browser-reconnect-identity-r245.md`.
 - **Early file-count admission (2026-08-11):** Browser migration carries the
   remaining `MAX_FILES` budget into traversal and refuses the next source entry
   before retaining more candidates; `.50` passed the self-test:
@@ -336,10 +343,9 @@ behavioral evidence is not completion.
 - **Special-node refusal (2026-08-10):** `.90` passed the migration boundary
   fixture that refuses an allowlisted FIFO instead of silently omitting it:
   `docs/platform/evidence/WL-ARCH-008-2026-08-10-special-node-refusal-r185.md`.
-- **Portable destination-parent integrity (2026-08-10):** migration now refuses
-  an existing symlink or non-directory in the bundle output parent before
-  staging, and `.90` proved that a redirected target receives no bundle:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-10-output-parent-integrity-r192.md`.
+- **Portable publication integrity:** unsafe parents and unrelated outputs fail closed; replacement atomically preserves one complete bundle. Farm gates passed:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-10-output-parent-integrity-r192.md`,
+  `docs/platform/evidence/WL-ARCH-008-2026-08-11-atomic-bundle-replacement-r279.md`.
 - **Browser source-parent integrity (2026-08-10):** symlinked/non-directory
   ancestors are rejected before bundle publication; farm self-tests passed:
   `docs/platform/evidence/WL-ARCH-008-2026-08-10-source-parent-integrity-r212.md`.
@@ -411,29 +417,33 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
 - Required outcome: six supervised groups publish bounded snapshots; Surface::Workers owns worker tree/graph/inspector/Network Operations/Action Console; remove duplicate surfaces.
-- Current state: all 152 registered starts have bounded runtime contracts; six grouped services ship, but complete ownership, UI cutover, and fleet proof remain.
+- Current state: bounded starts and six groups ship; ownership, UI cutover, and fleet proof remain. Latest: `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console evidence (2026-08-08/09):** generation/digest gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census/aggregate (2026-08-09):** 160 starts fail closed without stable rows; live proof: `evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
+- **Readiness republish:** failure invalidates healthy probe caches; `.50` 1/1: `evidence/WL-ARCH-009-2026-08-11-readiness-publication-recovery-r301.md`.
 - **Bounded job input (2026-08-11):** signed playbooks cap at 1 MiB before digest/apply; BigBoy: `evidence/WL-ARCH-009-2026-08-11-job-playbook-bound-r226.md`.
 - **Bounded mesh-DNS directory (2026-08-11):** over-12-peer directories fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-mesh-dns-directory-bound-r229.md`.
 - **Bounded Nebula systemctl (2026-08-11):** hung commands die at 2 seconds with 8 KiB caps; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-nebula-systemctl-bound-r230.md`.
 - **Bounded Netdata overlay IP (2026-08-11):** source files cap at 256 bytes before trim; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-netdata-overlay-bound-r231.md`.
+- **Fleet reconcile retry:** failed attempts remain due; `.50` passed 1/1: `docs/platform/evidence/WL-ARCH-009-WL-CRIT-007-2026-08-11-fleet-reconcile-retry-r276.md`.
 - Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip bursts; evidence: `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
+- **Service-catalog canonical file (2026-08-11):** crash-left staging files cannot enable uncommitted services; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-11-service-catalog-canonical-file-r312.md`.
+- **Bounded DC health probe (2026-08-11):** Dom0 SSH hangs fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-dc-health-dom0-timeout-r233.md`.
+- **Flat Workers catalog:** leaf-only navigation; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-flat-workers-catalog-r236.md`.
 - **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
 - **HTTPS policy source-parent integrity (2026-08-10):** `.90` passed symlinked-ancestor refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-parent-r214.md`.
-- **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
-  active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
-- **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
+- **Live duplicate owner:** Dell refused a second Control owner; installed owner stayed active: `evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
+- **Cross-process owner:** six groups hold shared-root leases and refuse duplicates; BigBoy: `evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
+- **Renamed service owner:** noncanonical packaged units cannot launch `mackesd serve`; `.90` self-test: `evidence/WL-ARCH-009-2026-08-11-renamed-service-owner-r383.md`.
+- **Pre-activation ownership:** `serve --group` claims its kernel lease before effects; BigBoy passed: `evidence/WL-ARCH-009-2026-08-11-pre-activation-process-owner-r249.md`.
 - **Symlink-safe group leases:** seat `.90` passed kernel-enforced lock-leaf refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-group-lease-symlink-r179.md`.
-- **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that `Requires=` edges cascaded one integrations crash through all six groups.
-  Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects regressions in the process-boundary validator, and restarts an already-active
-  target during RPM upgrade. Seat 15 proved isolated integrations and control
-  crashes while every unaffected PID and restart counter remained unchanged;
-  target, mesh-health, and RPM verification stayed healthy. Dell was offline
-  for corrected-package deployment. Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`.
+- **Grouped crash isolation:** Release 23 replaced cascading `Requires=` with ordered `Wants=`; seat 15 preserved every unaffected PID/restart counter
+  through integrations and control crashes:
+  `evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`. CI now runs the package verifier, rejecting peer lifecycle coupling and non-exact/unlimited cgroup policy:
+  `evidence/WL-ARCH-009-2026-08-11-exact-group-policy-r250.md`.
 - **Live cgroup-enforcement checkpoint (2026-08-08):** Release 23 on seat 15 placed six groups in distinct cgroup-v2 paths with package-matched CPU, memory, task, and I/O limits.
   A bounded transient
   128 MiB allocation under a 16 MiB/no-swap boundary was OOM-killed exactly at
@@ -542,13 +552,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
-- **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
-  is now the canonical node-management route; Fleet & Mesh, This Node,
-  System, Storage, About, and Phones deep links normalize into it. Phones is a
-  Workers → Phones subtab and is absent from the launcher and pin catalog.
-  Eastern current and retained timestamps now apply the daylight-saving offset.
-  Focused farm route gates passed; the full shell suite passed 1,453 tests with
-  five unrelated pre-existing pixel/IaC failures. Evidence:
+- **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers` is the canonical node-management route; prior node routes normalize into it.
+  Phones is a Workers subtab absent from launcher/pins; Eastern timestamps apply DST. Focused routes passed; the shell suite passed 1,453 tests with five baseline failures.
   `docs/platform/evidence/WL-ARCH-009-2026-08-07-workers-phones-clock-r1.md`.
 - **Current release-5 clock binding (2026-08-07):** the fresh artifact hash
   `8219d399ae7abf498f4916c9c43240628bbef02e9ef71971d235db3ada450be3` is
@@ -646,7 +651,22 @@ behavioral evidence is not completion.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
   Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
 - Remaining work:
-- **Conflicting duplicate checkpoint (2026-08-10):** signed event-ID conflicts fail closed in log and batch; exact duplicates remain idempotent. `.90` passed 1/1:
+- **CAS read-only replay:** canonical bytes are sealed and substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-readonly-replay-r377.md`.
+- **CAS purge inode:** concurrent replacements cannot redirect destructive purge; `.50` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-purge-inode-binding-r428.md`.
+- **Import-map inode:** hard-link aliases cannot mutate migration replay authority; BigBoy 1/1:
+  `evidence/WL-FUNC-011-2026-08-11-import-map-inode-r449.md`.
+- **Actor-log authenticity:** unsigned/invalid/future-schema envelopes fail before durable admission; `.196` 1/1: `evidence/WL-FUNC-011-2026-08-11-actor-log-authenticity-r375.md`.
+- **Pipeline signer verification:** actor substitution cannot escape authoring; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-pipeline-signer-verification-r413.md`.
+- **Descriptor source generation:** post-hash replacement fails closed; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-descriptor-source-generation-r416.md`.
+- **Files CAS registration (2026-08-11):** authenticated staging, worker admission, projection, and rollback passed 15/15 on BigBoy:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-11-cas-stream-staging-r275.md`.
+- **Calls proof attribution (2026-08-11):** incompatible adapters and altered/vacuous requirements fail before provider evidence; the exact farm gate is capacity-blocked:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-11-call-media-proof-attribution-r261.md`.
+- **Calls readiness restart:** missing/corrupt readiness revokes stale media proof; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-calls-readiness-restart-r297.md`.
+- **Actor-log path identity (2026-08-11):** misplaced `(space, actor)` events fail before append and after restart; `.50` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-11-actor-log-path-identity-r311.md`.
+- **Conflicting duplicate checkpoint (2026-08-10/11):** event-ID conflicts fail closed in merge, batch, and the restart-safe actor log; exact replay remains idempotent.
+  `.90` passed both exact gates:
   `docs/platform/evidence/WL-FUNC-011-2026-08-10-conflicting-event-duplicates-r157.md`.
 - **Alert action ID admission (2026-08-10):** unsafe IDs are rejected before
   lookup/signing; `.90` passed with `.50` format proof:
@@ -681,6 +701,9 @@ behavioral evidence is not completion.
   commits with an atomic same-directory no-replace install, closing the check-then-replace
   race that could let a concurrent replay overwrite the first durable row. `.90` passed the
   exact regression: `docs/platform/evidence/WL-FUNC-011-2026-08-10-v2-transfer-no-replace-r195.md`.
+- **Destination-generation acknowledgement (2026-08-11):** byte-only commits fail; exact advanced generations and lost-ack replay pass. `.90` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-11-destination-generation-ack-r259.md`.
+- **V2 staging restart:** stale residue cannot block bounded create-new retry; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-v2-staging-restart-r306.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
@@ -779,10 +802,24 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **Invalid replacement revocation:** rejected local replacements revoke stale offer/request authority; `.170` 1/1:
+  `evidence/WL-FUNC-016-2026-08-11-invalid-replacement-revocation-r376.md`.
+- **Native offer revocation:** invalid provider replacement revokes stale DRM selection authority; BigBoy exact:
+  `evidence/WL-FUNC-016-2026-08-11-native-offer-revocation-r457.md`.
 - **Future VDI envelope admission (2026-08-11):** future-dated clipboard envelopes are rejected before replay admission; `.90` passed the exact regression:
   `docs/platform/evidence/WL-FUNC-016-2026-08-11-vdi-future-envelope-r216.md`.
 - **Materialization envelope expiry (2026-08-11):** one-use descriptor authority expires at the earlier lease or envelope deadline; BigBoy passed the exact regression:
   `docs/platform/evidence/WL-FUNC-016-2026-08-11-envelope-expiry-r219.md`.
+- **V2 checkpoint ordering (2026-08-11):** a failed durable cursor write stops later rich-envelope materialization; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-v2-checkpoint-ordering-r241.md`.
+- **V2 consent ordering (2026-08-11):** a consent-withheld row blocks later cursor advance until retry; `.170` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-v2-consent-ordering-r294.md`.
+- **Consent epoch revocation:** re-enable cannot resurrect prior-epoch clipboard content; `.90` 1/1: `evidence/WL-FUNC-016-2026-08-11-consent-epoch-revocation-r393.md`.
+- **Consent checkpoint failure:** a failed durable consent write cannot disclose queued content before or after restart; `.90` 1/1:
+  `evidence/WL-FUNC-016-2026-08-11-consent-checkpoint-failure-r441.md`.
+- **RDP advertised generation:** delayed old requests cannot read unadvertised replacement content; `.50` 1/1: `evidence/WL-FUNC-016-2026-08-11-rdp-advertised-generation-r412.md`.
+- **RDP guest-key generation:** a restarted endpoint cannot adopt a replacement TLS key before credentials; BigBoy 1/1:
+  `evidence/WL-FUNC-016-2026-08-11-rdp-guest-key-generation-r447.md`.
 - **VDI replay expiry:** `.90` passed bounded expired-session cleanup before fresh clipboard admission:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-expiry-r182.md`.
 - **VDI replay retention:** `.90` passed refusal of an older replay after a newer
@@ -794,11 +831,11 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-bitfield-admission-r157.md`.
 - **Rich-session replay-capacity checkpoint (2026-08-10):** expired signed collaboration sessions release bounded ledger capacity before fresh intake while newer
   replay expiry remains monotonic; machine 9 passed the exact regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-rich-session-replay-capacity-r121.md`.
-- **RDP CF_HTML checkpoint (2026-08-10):** the production CLIPRDR adapter now
-  preserves Unicode text while adding bounded registered `HTML Format`
-  negotiation, CF_HTML offset validation, and stale/replacement refusal; four
-  focused exact `.50` tests pass:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-cf-html-r125.md`.
+- **RDP CF_HTML:** bounded offsets, stale replies, and registered-format equivocation fail closed; `.50`/BigBoy gates passed:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-cf-html-r125.md`,
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-rdp-html-format-equivocation-r283.md`.
+- **RDP session declaration (2026-08-11):** endpoint/user/domain/geometry substitution is rejected before transport effects; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-rdp-session-declaration-r295.md`.
 - **RDP duplicate-response checkpoint (2026-08-10):** an unsolicited CLIPRDR
   format-data response is now treated as a replay and cannot erase an already
   admitted clipboard value; the focused exact farm regression is recorded in
@@ -809,6 +846,12 @@ behavioral evidence is not completion.
   CF_DIBV5 negotiation. Four focused farm gates passed on `.50`, `.90`, `.170`,
   and `.196`; guest-to-host images and live Windows proof remain:
   `docs/platform/evidence/WL-FUNC-016-WL-ARCH-010-2026-08-10-rdp-image-materialization-r138.md`.
+- **RDP guest image admission (2026-08-11):** CF_DIB/CF_DIBV5 responses are
+  format-bound, structurally bounded, replay-safe, and production-reachable.
+  Until daemon Files/CAS ingest exists the live shell emits truthful
+  `FilesProviderUnavailable` and drops raw bytes; exact gates are
+  capacity-deferred and the guest-to-host image gap remains open:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-rdp-guest-image-admission-r270.md`.
 - **Expired consent capacity checkpoint (2026-08-10):** every clipboard consent sweep removes expired authority before admission, including an empty sweep; machine 193
   passed the exact denial regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-consent-capacity-cleanup-r22.md`.
 - **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks
@@ -897,36 +940,38 @@ behavioral evidence is not completion.
 - Required outcome: Maps provides production offline maps, turn-by-turn navigation, and a map-first current/1-day/3-day/5-day weather experience. A live weather icon
   and temperature beside the clock deep-link into Maps. Car exposes typed route/vehicle/radio health; MG90 is bounded, reconnectable, multi-manager, and never presents
   fabricated position, weather, forecast, or link state.
-- Current state: Typed weather/location providers, catalog-bound cache, UI, launcher, and navigation authority exist; offline data/routes, radio recovery, and live proof remain.
+- Current state: typed providers exist; offline data and live proof remain. Evidence: `evidence/WL-FUNC-017-2026-08-11-mg90-source-generation-r470.md`.
 - **Current/forecast provider (2026-08-08):** generation-bound 5/10-minute NWS refresh, provider freshness, bounded cache/retry, and off-runtime I/O passed 8/8 twice;
   live NWS/Maps proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-weather-provider-s3-r1.md`.
 - **Atmospheric provider (2026-08-08):** exact nowCOAST WMS identity, bounded PNG/cache, and latest-wins dual-generation viewport admission passed ten focused tests;
   GUI publication/live proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-atmospheric-map-provider-s4-r1.md`.
-- **Clock weather launcher (2026-08-08):** typed icon/temperature deep-link and weather→battery→time geometry passed 5/5; installed live captures remain:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-08-clock-weather-launcher-s9-r1.md`.
+- **Clock weather launcher:** typed routing/geometry passed 5/5; live captures remain: `docs/platform/evidence/WL-FUNC-017-2026-08-08-clock-weather-launcher-s9-r1.md`.
 - **Navigation authority (2026-08-09):** route/progress/replay/restart passed 9/9; generation-exhaustion atomicity passed 4/4:
   `docs/platform/evidence/WL-FUNC-017-2026-08-08-navigation-authority-s6-r1.md`; `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-generation-atomicity-r2.md`.
 - **Offline catalog binding (2026-08-09):** replacement/expiry revokes tiles and schema-v1 upgrades open empty instead of failing; `.90` passed 7/7:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
+- **Status weather identity (2026-08-11):** conditions require exact effective-location coordinates; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-11-status-weather-coordinate-r308.md`.
 - **MG90 failover safety:** source publication epoch preserved across manager loss; `.90`: `docs/platform/evidence/WL-FUNC-017-2026-08-10-mg90-nonselected-loss-r193.md`.
+- **MG90 radio refresh failure (2026-08-11):** retained Cellular/Wi-Fi rows become stale and lose active-path claims; `.50` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-11-mg90-radio-stale-r304.md`.
 - **Offline timeline (r160):** impossible access order fails closed; BigBoy passed `docs/platform/evidence/WL-FUNC-017-2026-08-10-offline-timeline-r160.md`.
 - **Offline basemap admission:** unsafe candidates fail closed; `.90` 6/6; live proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
-- **Offline index corruption recovery (2026-08-09):** malformed metadata is replaced atomically; future schemas and non-regular paths fail closed. Machine 193 passed:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
+- **Offline index recovery:** hostile metadata fails closed; machine 193: `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
 - **Basemap cache reload:** `.90` passed atomic replacement: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-cache-revalidation-r215.md`.
-- **Weather cache identity checkpoint (2026-08-09):** restart recovery now
-  binds nested current/forecast snapshots to exact host, location generation, point, and timezone; mismatches publish typed unavailable state. Machine 194 passed:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
-- **Malformed weather cache (2026-08-10):** `.90` passed recovery evidence: `docs/platform/evidence/WL-FUNC-017-2026-08-10-weather-cache-recovery-r204.md`.
+- **Weather cache recovery:** restart binds source identity and rejects malformed state; `.194`: `evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
+- **Atmospheric cache quarantine:** malformed bytes leave authority before fallback; `.90` 1/1: `evidence/WL-FUNC-017-2026-08-11-atmosphere-cache-quarantine-r237.md`.
+- **Atmospheric viewport restart:** retained geometry/generation match source identity; BigBoy 1/1: `evidence/WL-FUNC-017-2026-08-11-atmosphere-viewport-restart-r305.md`.
+- **Location provenance:** same-generation substitution discards snapshots; BigBoy 1/1: `evidence/WL-FUNC-017-2026-08-11-location-provenance-revalidation-r374.md`.
 - **Future cache fallback (2026-08-11):** `.50` passed: `docs/platform/evidence/WL-FUNC-017-2026-08-11-future-cache-fallback-r219.md`.
-- **Navigation action retry checkpoint (2026-08-09):** route, progress, and
-  cancellation cursors now acknowledge only after governed effects succeed;
-  interrupted calculations roll back their replay reservation, while final
-  publication retries without repeating route calculation. Machines 193/9 passed seven exact tests:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-action-retry-r7.md`,
-  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
+- **Governed route provider:** signed bounded loopback and stale-result refusal; `.90` 2/2: `evidence/WL-FUNC-017-2026-08-11-provider-route-freshness-r255.md`.
+- **Navigation source inodes:** replacement routes and hard-linked gazetteers fail closed; `.90`/BigBoy 1/1:
+  `evidence/WL-FUNC-017-2026-08-11-navigation-authority-inode-r406.md`, `evidence/WL-FUNC-017-2026-08-11-gazetteer-inode-r450.md`.
+- **Route identity:** replacement geometry cannot reuse the active ID; BigBoy 1/1: `evidence/WL-FUNC-017-2026-08-11-route-identity-replacement-r296.md`.
+- **Navigation action retry:** cursors follow effects and publication retries without recalculation; machines 193/9 passed seven tests:
+  `evidence/WL-FUNC-017-2026-08-09-navigation-action-retry-r7.md`, `evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
 - **Vehicle audit-truth checkpoint (2026-08-09):** an MG90 reboot reports
   `audited=true` only after its AdminAction row commits; audit failure preserves
   the applied reboot while returning `audited=false` and a bounded error. BigBoy passed both exact fixtures:
@@ -944,9 +989,7 @@ behavioral evidence is not completion.
   storage recovers, effective location is rechecked after provider I/O, and both
   requested projections serialize before writes. Machine 193 passed three exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
-- **Atmospheric-map transaction checkpoint (2026-08-09):** the exact
-  location/viewport identity is rechecked after NOAA I/O, then a fresh cache
-  commits before map publication. Machine 9 passed two exact tests:
+- **Atmospheric-map transaction checkpoint (2026-08-09):** exact location/viewport identity is rechecked after NOAA I/O; fresh cache precedes publication. Machine 9 passed:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
 - **Airspace publication checkpoint (2026-08-09):** late Bus startup recovers,
   and a failed write retries the same bounded survey without another MG90
@@ -1110,7 +1153,6 @@ behavioral evidence is not completion.
   full live-layer, current/manual-location, and clock-adjacent launcher decisions.
 
 ### WL-FUNC-018 - Seamless Flatpak Front Door backed by App VMs
-
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
@@ -1119,6 +1161,7 @@ behavioral evidence is not completion.
   predictably.
 - Current state: bounded signed catalog admission, deterministic search, and a production-registered fail-closed importer now exist alongside typed App VM/OpenApp/session
   contracts; trust provisioning, image supply, launch readiness, UX, security, and live proof remain.
+- **Catalog replacement authority:** replaced Flatpak state cannot retain launch authority; `.90` 1/1: `evidence/WL-FUNC-018-2026-08-11-flatpak-catalog-replacement-r461.md`.
 - **Catalog checkpoints (2026-08-08):** exact-signer admission/ranking and root-owned rollback-safe import passed `.196`; `.170` compiled production:
   `docs/platform/evidence/WL-FUNC-018-2026-08-08-signed-app-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-018-2026-08-08-catalog-importer-s1-r1.md`.
 - **App VM profile checkpoint (2026-08-08):** the immutable Wayland/Flatpak contract, supervisor, readiness/provenance, and hostile fixtures passed on `.170`;
@@ -1129,11 +1172,31 @@ behavioral evidence is not completion.
 - **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
   machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
+- **Governed App-VM RPM supply (2026-08-11):** local image builds admit one
+  bounded immutable `magic-mesh` RPM, verify its governed signature and exact
+  compile-time source revision before/after staging and inside the build, and
+  enable DNF local signature checking; repo installs verify both ELF identities
+  and exact owning-RPM SHA-256 manifests before layering. Hostile fixtures passed:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-11-governed-rpm-supply-r253.md`.
 - **Bounded persistence recovery (2026-08-11):** retained App-catalog and
   durable-cursor reads refuse data beyond declared limits; `.90` passed:
   `docs/platform/evidence/WL-FUNC-018-2026-08-11-bounded-persistence-read-r224.md`.
 - **Durable App-catalog restart cursor (2026-08-11):** committed rows are checkpointed and skipped after restart without emitting an idempotent replay; `.90` passed:
   `docs/platform/evidence/WL-FUNC-018-2026-08-11-app-catalog-restart-cursor-r216.md`.
+- **Authenticated first-launch handoff (2026-08-11):** cold boot publishes signed `StartAndAttach` then identity-bound VDI `OpenApp`; replay is effect-idempotent.
+  BigBoy/`.90` passed 5/5:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-11-first-launch-cold-boot-r239.md`.
+- **App-open identity:** active sessions bind catalog revision/capabilities/resume; stale/future substitution emits no extra effects; `.50`/`.90` 1/1 each:
+  `evidence/WL-FUNC-018-2026-08-11-app-open-declaration-identity-r285.md`, `evidence/WL-FUNC-018-2026-08-11-active-app-catalog-revision-r390.md`.
+- **Restart readiness:** recovered `Connected` requires a forward generation; `.50` 1/1: `evidence/WL-FUNC-018-WL-ARCH-010-2026-08-11-app-vm-restart-readiness-r403.md`.
+- **Front Door serving route:** unsafe node IDs fail before App launch emission; `.50` 1/1: `evidence/WL-FUNC-018-2026-08-11-front-door-serving-route-r424.md`.
+- **App-VM base variable:** hard-coded substitute bases fail the image contract; `.50` passed: `evidence/WL-FUNC-018-2026-08-11-app-vm-base-variable-r408.md`.
+- **App-VM ExecStart authority:** one active canonical runtime is required; `.196` self-test: `evidence/WL-FUNC-018-WL-ARCH-008-2026-08-11-app-vm-execstart-authority-r425.md`.
+- **App-VM base image ID:** mutable tags cannot substitute build inputs; `.196` self-test:
+  `evidence/WL-FUNC-018-WL-ARCH-008-2026-08-11-app-vm-base-image-id-r427.md`.
+- **App session client binding:** restart cannot rebind another initiating seat; `.90` 1/1: `evidence/WL-FUNC-018-WL-ARCH-010-2026-08-11-app-session-client-binding-r433.md`.
+- **Front Door equivocation (2026-08-11):** conflicting declarations suppress only their app identity; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-11-front-door-equivocation-r299.md`.
 - **Launch-action admission checkpoint (2026-08-10):** installed Flatpak rows without exact `launch` authority are withheld before App-VM projection; seat 90 passed:
   `docs/platform/evidence/WL-FUNC-018-2026-08-10-launch-action-admission-r162.md`.
 - **Blocked App-VM authorization checkpoint (2026-08-10):** stale, unavailable, or malformed blocked Flatpak rows now fail before root authorization or Bus payload;
@@ -1226,21 +1289,23 @@ behavioral evidence is not completion.
 - Problem: Remote Sessions is a narrow desktop chooser and does not admit all governed resources, typed capabilities, provenance, or safe actions.
 - Required outcome: one universal resource browser discovers peers, VMs, containers, Apps, Android apps, media, files, and services; deduplicates them by stable identity;
   exposes typed Open/Start/Resume/Transfer actions; and never launches an untrusted or ambiguous resource.
-- Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
-  fixtures, responsive captures, and live recovery proof remain.
+- Current state: contracts, adapters/deduplication, a pure searchable model, and fail-closed actions exist; route fixtures, captures, and live recovery remain.
 - Remaining work:
-- **Fresh-probe action projection (2026-08-11):** advertised-only and stale service rows expose no action; only fresh probe-confirmed rows receive one; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-019-2026-08-11-service-action-fresh-probe-r217.md`.
-- **Android readiness action projection (2026-08-11):** catalog Start remains
-  visible as evidence but is unavailable until live guest readiness; `.90`
-  passed:
-  `docs/platform/evidence/WL-FUNC-019-2026-08-11-android-readiness-action-r220.md`.
+- **Action-reply generation:** stale receipts cannot become cancellation handles; `.170` 1/1: `evidence/WL-FUNC-019-2026-08-11-action-reply-generation-r281.md`.
+- **Peer freshness:** hostile remote identities cannot authorize resources; BigBoy 1/1: `evidence/WL-FUNC-019-2026-08-11-peer-directory-freshness-r287.md`.
+- **Stale peer health:** expired membership cannot retain `healthy`; BigBoy 1/1: `evidence/WL-FUNC-019-2026-08-11-stale-peer-resource-health-r394.md`.
+- **Peer-card admission:** malformed rows cannot authorize downstream reads; BigBoy 1/1: `evidence/WL-FUNC-019-2026-08-11-peer-card-admission-r402.md`.
+- **Desktop heartbeat:** zero/future observations cannot authorize resources; BigBoy 1/1: `evidence/WL-FUNC-019-2026-08-11-desktop-heartbeat-freshness-r307.md`.
+- **mDNS name collision:** LAN names cannot inject peer transports; `.170` 1/1: `evidence/WL-FUNC-019-2026-08-11-mdns-name-collision-r405.md`.
+- **Fresh-probe actions:** only fresh probe-confirmed services expose action; `.90` passed: `evidence/WL-FUNC-019-2026-08-11-service-action-fresh-probe-r217.md`.
+- **Service-record freshness:** replay cannot renew stale/zero/future health; `.170` 1/1: `evidence/WL-FUNC-019-2026-08-11-service-record-freshness-r415.md`.
+- **Catalog generation:** mid-stage advancement and malformed forward snapshots revoke mixed/retained launch authority; `.170`/BigBoy exact:
+  `evidence/WL-FUNC-019-2026-08-11-retained-source-stage-generation-r419.md`, `evidence/WL-FUNC-019-2026-08-11-resource-snapshot-revocation-r454.md`.
+- **Android readiness:** Start remains unavailable until live guest readiness; `.90` passed: `evidence/WL-FUNC-019-2026-08-11-android-readiness-action-r220.md`.
 - **Service action schema admission (2026-08-11):** future schemas and unsafe
   correlation IDs fail before capability targeting; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-11-service-action-schema-r220.md`.
-- **Service-action admission checkpoint (2026-08-10):** ready service actions fail closed when authentication, target identity,
-  issuance, expiry, or ambiguity checks do not hold;
-  seat 50 passed:
+- **Service-action admission (2026-08-10):** invalid authentication, target, issuance, expiry, or ambiguity fails closed; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-action-admission-r159.md`.
 - **Failed-probe launch admission checkpoint (2026-08-10):** an enabled service
   whose latest endpoint test failed remains unavailable and cannot expose a typed
@@ -1254,6 +1319,10 @@ behavioral evidence is not completion.
   host/name records restored from the JSON store, so persisted data cannot
   bypass request validation:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-manual-store-admission-r193e.md`.
+- **Manual-source metadata replacement (2026-08-11):** authenticated updates to
+  one stable endpoint now atomically replace durable/published metadata without
+  creating a duplicate; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-11-manual-source-metadata-replacement-r238.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
 - **Ambiguous peer identity isolation (2026-08-10):** divergent hostname claims
@@ -1330,6 +1399,8 @@ behavioral evidence is not completion.
   preserving boot and read-only catalog access; `.90` gates passed: `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-readiness-r4.md`.
 - **Catalog rollback checkpoint (2026-08-09):** same-publisher rollback/equivocation preserves last-good cards and revokes stale actions; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-remote-sessions-catalog-rollback-r5.md`.
+- **Media stable-ID equivocation:** conflicting raw rows are suppressed before redaction/deduplication while unrelated cards survive; exact gate deferred:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-11-media-stable-id-equivocation-r272.md`.
 - **Live Windows authority checkpoints (2026-08-09):** seat 15 detects RDP; signed Open/revocation passed on `.196`, and the formerly absent shared publisher key is sealed.
   Installed credential activation/live login remain: `evidence/WL-FUNC-019-2026-08-09-rdp-authority-handoff-r8.md`,
   `evidence/WL-FUNC-019-2026-08-09-resource-publisher-key-r9.md`.
@@ -1451,10 +1522,25 @@ behavioral evidence is not completion.
 - **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
 - Remaining work:
+- **Typed Android Workload start (2026-08-11):** governed outer-VM `Start`
+  validates the declaration and publishes a signed, generation-bound,
+  replay-stable operation; clean BigBoy slot 2 passed 1/1:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-11-typed-workload-start-r256.md`.
+- **Corrupt catalog restart (2026-08-11):** invalid durable state cannot become empty authority or switch identity; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-11-corrupt-catalog-restart-r293.md`.
+- **Signed Android desired definition (2026-08-11):** provision re-verifies the durable catalog, exact artifact/package provenance, capacity, and provider before
+  persistence; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-11-signed-desired-definition-r263.md`.
+- **Typed lifecycle delegation:** signed-catalog-bound Start/Stop use Workloads only; Cancel stays refused without a prior request ID. BigBoy passed 2/2:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-11-android-lifecycle-delegation-r273.md`.
 - **Bounded Android host probes (2026-08-11):** `/proc` and nested-KVM sysfs reads reject oversized host text before parsing; BigBoy passed 1/1:
   `evidence/WL-FUNC-020-2026-08-11-android-host-probe-bound-r227.md`.
 - **Bounded cloud replay cleanup (2026-08-11):** expired nonce rows reject symlinks and payloads over 128 bytes before parsing; BigBoy passed 1/1:
   `evidence/WL-FUNC-020-2026-08-11-cloud-gate-nonce-bound-r227.md`.
+- **Authenticated Cuttlefish relay (2026-08-11):** the production guest
+  transport rejects writable, substituted, ownership-drifted, or peer-credential-
+  mismatched Unix relays before sending governed request bytes; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-11-authenticated-cuttlefish-relay-r248.md`.
 - **VDI source identity checkpoint (2026-08-10):** Cuttlefish VDI sources now require current guest-ready state plus
   matching workload, image provenance, and generation. `.90` passed a hostile mismatched-workload regression:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-vdi-source-identity-r187.md`.
@@ -1465,6 +1551,17 @@ behavioral evidence is not completion.
 - **Stale Android generation admission (2026-08-10):** non-ready or stale
   Cuttlefish operations stop before backend contact; `.90` passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-stale-generation-admission-r210.md`.
+- **Cuttlefish readiness revocation (2026-08-11):** failed refresh revokes retained launch/VDI authority before backend contact; `.50` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-11-cuttlefish-readiness-revocation-r315.md`.
+- **Future guest inventory:** future observations cannot fabricate fresh readiness; BigBoy 1/1: `evidence/WL-FUNC-020-2026-08-11-future-guest-inventory-r382.md`.
+- **Guest exchange generation:** pre-restart inventory cannot authorize current readiness; `.196` 1/1: `evidence/WL-FUNC-020-2026-08-11-cuttlefish-exchange-generation-r436.md`.
+- **Guest readiness publication:** parent/staging substitution cannot redirect the receipt; `.196` self-test:
+  `evidence/WL-FUNC-020-2026-08-11-guest-readiness-publication-r445.md`.
+- **VDI host canonicalization:** hostile aliases cannot cross mesh-host authority; BigBoy 1/1:
+  `evidence/WL-FUNC-020-2026-08-11-vdi-host-canonicalization-r448.md`.
+- **Expired catalog replay:** replacement Bus activation retains only anti-rollback identity; BigBoy 1/1: `evidence/WL-FUNC-020-2026-08-11-expired-catalog-bus-replacement-r384.md`.
+- **Catalog Bus generation:** replay/import progress cannot cross a replaced index; `.170` 1/1: `evidence/WL-FUNC-020-2026-08-11-catalog-bus-generation-r401.md`.
+- **Retry generation:** terminal retry cannot relabel running power; `.196` 1/1: `evidence/WL-FUNC-020-WL-ARCH-010-2026-08-11-cuttlefish-failed-retry-generation-r407.md`.
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
     libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
   - **Signed release-artifact admission (2026-08-09):** schema v3 requires one bounded detached signature from the pinned installed MCNF key before provisioning; missing,
@@ -1543,15 +1640,76 @@ behavioral evidence is not completion.
 - **Bounded Navidrome commands (2026-08-11):** systemctl uses shared 15s boundary; BigBoy passed 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-bound-r231.md`.
 - **Navidrome setup bound (2026-08-11):** re-provision shares 15s timeout; `.90` 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-setup-timeout-r232.md`.
 - Remaining work: **Artwork byte bound (2026-08-11):** non-regular/over-4M reads and oversized writes refuse; `.50`: `evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
+- **Revoked renderer generation:** device loss blocks in-flight audio/queue commit; `.170` 1/1: `evidence/WL-FUNC-021-2026-08-11-revoked-renderer-generation-r429.md`.
+- **Transcode generation binding:** source/session substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-transcode-generation-binding-r432.md`.
+- **Queue persistence rollback:** failed durable writes roll memory back and report failure; BigBoy 1/1: `evidence/WL-FUNC-021-2026-08-11-queue-persistence-rollback-r410.md`.
+- **Media-source heartbeat:** impossible retained observations cannot restore reachability; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-media-source-heartbeat-r313.md`.
+- **Provider identity:** endpoint equivocation revokes fallback; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-provider-identity-equivocation-r314.md`.
+- **Manifest/Jellyfin identities:** forged/duplicate manifest items and server IDs fail closed; `.196`/`.50` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-media-manifest-item-identity-r317.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-server-identity-r316.md`.
+- **Jellyfin cache/sync:** exact digests and URL segments reject content/path substitution; `.50`/`.196` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-jellyfin-cache-digest-r319.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-sync-path-identity-r320.md`.
+- **Jellyfin metadata generation:** stale/equivocal replay cannot roll back cache; BigBoy 1/1: `evidence/WL-FUNC-021-2026-08-11-jellyfin-metadata-generation-r411.md`.
+- **Playlist persistence:** symlink-safe atomic saves/loads; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-playlist-symlink-atomicity-r318.md`.
+- **Finite resume:** nonfinite samples preserve valid durable state; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-finite-resume-state-r321.md`.
+- **Roaming lease:** playback arms only after exact durable ownership; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-roaming-lease-publication-r322.md`.
+- **Party election:** same-sequence deterministic winners replace losing authority; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-party-election-key-r324.md`.
+- **Jellyfin transcode authority:** hostile redirects cannot escape server/item identity; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-jellyfin-transcode-authority-r323.md`.
+- **Proxy commitment/route authority:** post-commit failure and in-flight Bus replacement fail closed; `.196` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-airsonic-response-commit-r325.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-inflight-route-r326.md`.
+- **Music cache/retry:** exact path identity and saturating backoff survive hostile inputs; `.196` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-music-cache-path-identity-r327.md`, `evidence/WL-FUNC-021-2026-08-11-reconnect-backoff-overflow-r328.md`.
+- **Cast/stream identities:** renderer equivocation and ambiguous network authorities fail closed; `.196` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-cast-discovery-equivocation-r329.md`, `evidence/WL-FUNC-021-2026-08-11-stream-authority-admission-r330.md`.
+- **Jellyfin request paths:** remote IDs cannot escape endpoint segments; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-jellyfin-client-path-identity-r331.md`.
+- **Player/control generations:** replacement signals and malformed numeric controls fail closed; BigBoy 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-player-replacement-generation-r332.md`, `evidence/WL-FUNC-021-2026-08-11-finite-media-controls-r333.md`.
+- **Library/browse identities:** playback paths and series trees reject substituted durable/provider state; BigBoy/`.196` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-library-playback-path-identity-r334.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-browse-series-identity-r335.md`.
+- **Frame layout authority:** malformed RGBA geometry/length cannot prove playback; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-frame-layout-authority-r336.md`.
+- **Production Navidrome:** failed store repair stays withdrawn; BigBoy 1/1: `evidence/WL-FUNC-021-2026-08-11-production-navidrome-withdrawal-r337.md`.
+- **Subtitle/redirect authority:** ambiguous subtitle sources and Jellyfin cross-authority redirects fail closed; `.170` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-subtitle-source-admission-r338.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-redirect-authority-r339.md`.
+- **Transport redirect authority:** caller policy cannot forward credentials to a provider-selected host; `.90` 1/1:
+  `evidence/WL-FUNC-021-2026-08-11-jellyfin-transport-redirect-r442.md`.
+- **Lockscreen media identity:** replacement playback cannot inherit retained controls; BigBoy exact:
+  `evidence/WL-FUNC-021-2026-08-11-lockscreen-media-identity-r455.md`.
+- **Video/audio generations:** replacement frame adjustments and sink choice explicitly reset; `.170`/`.196` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-video-adjustment-revocation-r340.md`, `evidence/WL-FUNC-021-2026-08-11-audio-sink-revocation-r342.md`.
+- **Provider item equivocation:** OpenSubtitles and Jellyfin conflicting identities fail closed; `.170` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-opensubtitles-equivocation-r341.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-item-admission-r343.md`.
+- **Capture path authority:** device aliases/traversal fail closed; `.170` 1/1: `evidence/WL-FUNC-021-2026-08-11-capture-device-path-authority-r344.md`.
+- **Codec/yt-dlp authority:** baseline capabilities and extracted URLs fail closed without optional/runtime authority; `.170` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-universal-codec-capability-r345.md`, `evidence/WL-FUNC-021-2026-08-11-ytdlp-authority-boundary-r346.md`.
+- **Smoke proof:** success requires Playing, audio, and nonblank frame; `.170` 1/1: `evidence/WL-FUNC-021-2026-08-11-media-smoke-proof-integrity-r347.md`.
+- **Media roster authority:** publication watermark and malformed-state revocation prevent stale gateways; `.196`/`.170` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-media-roster-watermark-r348.md`, `evidence/WL-FUNC-021-2026-08-11-media-roster-revocation-r349.md`.
+- **Media menu identity:** stale track actions cannot target replacement media; `.170` 1/1: `evidence/WL-FUNC-021-2026-08-11-media-menu-track-identity-r350.md`.
+- **Music server generation:** old-server playback stops before replacement authority; `.90` 1/1: `evidence/WL-FUNC-021-2026-08-11-music-server-generation-revocation-r351.md`.
+- **Music source equivocation:** provider order cannot invent reachability/capabilities; `.90` 1/1: `evidence/WL-FUNC-021-2026-08-11-music-source-equivocation-r352.md`.
+- **Music catalog/radio identity:** conflicting current rows and withdrawn details cannot publish stale UI intent; `.170` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-music-current-catalog-equivocation-r354.md`, `evidence/WL-FUNC-021-2026-08-11-music-radio-detail-revalidation-r353.md`.
+- **Airsonic/queue identity:** substituted songs and conflicting queue IDs fail closed; `.90`/`.170` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-airsonic-track-identity-r355.md`, `evidence/WL-FUNC-021-2026-08-11-queue-entry-identity-r356.md`.
+- **Queue/mpv generations:** framed CAS and ordered current-load events reject substituted durable/frame state; `.90` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-queue-cas-framing-r357.md`, `evidence/WL-FUNC-021-2026-08-11-mpv-frame-generation-r358.md`.
+- **Credential/state files:** no-follow bounded regular-file reads reject substitution; `.90` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-credential-file-identity-r359.md`, `evidence/WL-FUNC-021-2026-08-11-state-file-nofollow-r362.md`.
+- **Daemon/seat identity:** kernel singleton and PipeWire serial/process binding revoke duplicate/recycled owners; `.90` 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-daemon-kernel-singleton-r360.md`, `evidence/WL-FUNC-021-2026-08-11-seat-audio-object-identity-r361.md`.
+- **MPRIS generation:** seek binds the audible track, not an advanced queue cursor; `.170` 1/1: `evidence/WL-FUNC-021-2026-08-11-mpris-audible-generation-r363.md`.
+- **Workspace request binding:** durable IDs bind exact digests; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-workspace-request-binding-r244.md`.
+- **Action-ledger privacy:** restart enforces the six-hour epoch and rejects future rows; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-action-ledger-privacy-r309.md`.
+- **Live-ledger saturation:** full live epochs reject new mutations without eviction; `.90` 1/1: `evidence/WL-FUNC-021-2026-08-11-live-ledger-saturation-r364.md`.
+- **Audible fallback/loss:** inaudible candidates cannot suppress fallback; audible loss drains its valid tail and preserves handoff; focused farms 1/1 each:
+  `evidence/WL-FUNC-021-2026-08-11-audible-fallback-authority-r366.md`, `evidence/WL-FUNC-021-2026-08-11-audible-provider-loss-tail-r385.md`.
+- **Bounded bookmark link probe (2026-08-11):** HTTP curl hangs fail closed; `.50` passed 1/1: `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-11-bookmark-probe-timeout-r235.md`.
 - **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
-- **Cast media URL admission checkpoint (2026-08-10):** unsafe/local/credential-bearing URLs refused; BigBoy passed:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
-- **Direct media URL admission (2026-08-10):** `.90` passed malformed/credential-bearing/unsafe URL refusal:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-10-direct-media-url-admission-r214.md`.
+- **Cast URL admission:** unsafe/local/credential-bearing URLs refused; BigBoy: `evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
+- **Direct URL admission:** malformed/credential-bearing/unsafe URLs refused; `.90`: `evidence/WL-FUNC-021-2026-08-10-direct-media-url-admission-r214.md`.
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
-- **Signed live-radio (2026-08-08):** release 8 live on five seats; Dell/15 C-SPAN pass and capture non-silent; T480/Eagle/Surface mutation and speaker judgment remain open.
-  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-radio-release8-r1.md`.
+- **Signed live-radio:** release 8 Dell/15 C-SPAN capture passed; remaining seats/judgment open: `evidence/WL-FUNC-021-2026-08-08-live-radio-release8-r1.md`.
 - **Library checkpoint (2026-08-06):** typed collections replace Airsonic rows; UI 44/44 on `.50`, fmt `.90`; `evidence/WL-FUNC-021-2026-08-06-daemon-library-r1.md`.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
 - **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass.
@@ -1559,128 +1717,63 @@ behavioral evidence is not completion.
 - **Music cache completeness (2026-08-10):** `.90` passed truncated/replaced-file refusal: `docs/platform/evidence/WL-FUNC-021-2026-08-10-cache-completeness-r208.md`.
 - **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
   Live proof remains: `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`, `evidence/WL-FUNC-021-2026-08-09-mpv-playlist-continuation-r11.md`.
-- **Daemon Album/download/workerless checkpoint (2026-08-06):** Home, Library, and Search open retained albums; detail emits typed play without `LoadAlbum` worker requests.
-  Library, Album, and Downloads publish bounded actions; daemon is 168/168 on `.90`, Music UI is 47/47 on `.50`, and embedded construction starts no worker.
+- **Daemon Album/download/workerless:** retained albums emit typed play; bounded actions pass daemon 168/168 and UI 47/47; construction starts no worker.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-managed-download-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-embedded-workerless-r1.md`.
-- **Typed target handoff checkpoint (2026-08-06):** bounded peer heartbeats project honestly; fresh idle mesh seats publish typed `transfer`, stale/owning peers remain browse-only.
-  Music UI is 48/48 on `.50`, format is clean, and the hostile test covers `peer:seat-15`; live owner-yield/resume and DLNA/provider/package proof remain open.
+- **Typed target handoff checkpoint (2026-08-06):** fresh idle peers publish typed `transfer`; stale/owning peers remain browse-only. `.50` passed 48/48; live proof remains:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-target-handoff-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-peer-targets-r1.md`.
 - **Handoff routing:** owner/bystander pumps preserve another seat's completion; BigBoy 12/12; evidence: `evidence/WL-FUNC-021-08-09-handoff-target-routing-r95.md`.
-- **Cast checkpoints (2026-08-06/09):** real DLNA control and off-render native Chromecast discovery are bounded; authenticated CastV2/live-seat proof remain open.
-  `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`.
-- **Live provider-loss checkpoint (2026-08-08):** release 11 on seat 15 passed a controlled healthy → provider loss → healthy transition with cached catalog/state available.
-  The daemon stayed active with zero restarts and the seat-local firewall rule was removed; two-catalog outage and audible stream continuity remain open.
-  `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.
-- **Provider-loss reconnect checkpoint (2026-08-06):** the native engine now retries a failed Subsonic stream from the audible playhead using bounded
-  `timeOffset` resumes, clears buffered-ahead samples before retry, preserves
-  the complete-track cache, and refuses arbitrary direct/radio URLs. BigBoy
-  passed the full mde-musicd suite at 176/176, focused engine lane at 21/21,
-  and reconnect-timeout lane at 2/2. Controlled live provider loss/recovery now
-  passes on seat 15 while the daemon and cached typed surfaces stay available;
-  audible in-progress stream continuity remains open.
+- **Cast:** bounds passed; live open: `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`.
+- **Live provider loss:** seat 15 recovered with zero restarts; audible continuity remains: `evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.
+- **Provider-loss reconnect:** bounded `timeOffset` resume clears buffered-ahead samples, preserves cache, and refuses arbitrary URLs; focused gates pass.
+  Seat 15 recovers the provider while daemon/cached projections remain available; audible in-progress continuity remains open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-network-loss-reconnect-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-reconnect-timeout-r1.md`.
-- **Cast loopback checkpoint (2026-08-06):** a bounded local renderer accepts
-  discovery, description, `SetAVTransportURI`, `Play`, and finite `Seek`, while
-  malformed and non-finite seeks are refused and the listener is cleaned up.
-  Live DLNA/Chromecast, mesh-owner, and seat-handoff proof remain open.
-  `install-helpers/verify-music-cast-loopback.sh`;
-  `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
-- **Two-seat handoff checkpoints (2026-08-08/09):** roaming passed 11/11; fixtures prove exact-once transfer; preflight refuses mismatch/stale peers; records are atomic.
-  `.50`/`.90` passed; `.170` passed 19/19: `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`,
-  `evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-physical-two-seat-handoff-preflight-r5.md`,
-  `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
-- **Cast runtime audit checkpoint (2026-08-06):** read-only seat inspection
-  found no physical UPnP renderer, usable Chromecast discovery path, target
-  cast-receiver unit, or second admitted peer. Typed mesh transfer and the
-  separate Media DLNA implementation remain fixture/source-proven only;
-  physical renderer, Chromecast, mesh-owner, and two-seat continuity proof
-  remain open.
+- **Zero-audio failover:** empty streams cannot suppress fallback; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-zero-audio-provider-failover-r289.md`.
+- **Cast loopback:** bounded discovery/control/seek passes; live proof open: `evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
+- **Two-seat handoff:** exact-once transfer, mismatch/stale refusal, and atomic records pass `.50`/`.90`/`.170`; live boundary:
+  `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`, `evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
+- **Cast runtime audit:** no physical renderer, usable Chromecast path, receiver unit, or second admitted peer was found; typed paths remain fixture-proven.
+  Physical renderer, Chromecast, mesh-owner, and two-seat continuity remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-runtime-audit-r1.md`.
 - **Cast-admission checkpoint (2026-08-06):** URLs, titles, and HTTP endpoints reject oversized/control-bearing input before the network gate; BigBoy tests
   passed 20/20. Live renderer, Chromecast, mesh-owner, and seat proof remain open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-admission-r1.md`.
 - **Two-catalog outage checkpoint (2026-08-06):** source projection retains two admitted variants under one logical queue track.
-  Failed-first/healthy-second decoding is fixture-verified.
-  BigBoy fixture 1/1, source projection 1/1, and full mde-musicd 173/173; live provider outage, mid-track resume, and hardware/package proof remain open.
+  Failed-first/healthy-second decoding and BigBoy gates pass; live outage, mid-track resume, and hardware/package proof remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-two-catalog-outage-r1.md`.
-- **Jellyfin outage (2026-08-06):** known-good cache survives failures; truncated manifests refused; 90 unit/12 browse/1 outage/9 playback/doctest pass; live proof remains.
-  `docs/platform/evidence/WL-FUNC-021-2026-08-06-jellyfin-outage-r1.md`.
-- **GUI authority checkpoint (2026-08-08):** embedded and standalone Music both
-  consume daemon projections, start no provider/playback worker, and fail closed
-  without an authenticated writer. Focused `.50` regression passed. Evidence:
+- **Jellyfin outage:** known-good cache survives failures; truncated manifests refused; live proof remains: `evidence/WL-FUNC-021-2026-08-06-jellyfin-outage-r1.md`.
+- **GUI authority:** both Music surfaces consume daemon projections, start no provider/playback worker, and require an authenticated writer; `.50` passed:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-standalone-daemon-authority-r1.md`.
-- **Renderer recovery checkpoint (2026-08-08):** renderer failure revokes playback/MPRIS authority; reacquisition resumes the exact finite track at its audible
-  position unless a control cancels it. Two hostile `.50` regressions passed; physical PipeWire/audible and two-seat proof remain. Evidence:
+- **Renderer recovery:** failure revokes playback/MPRIS; reacquisition resumes the exact finite track unless cancelled; live audible/two-seat proof remains:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-renderer-recovery-r1.md`.
 - **Real-mpv UI (2026-08-07):** frames clear; 110/110 UI and 257 tests passed; physical proof remains: `docs/platform/evidence/WL-FUNC-021-2026-08-07-media-render-clear-r1.md`.
-- **Continuation (2026-08-07):** mde-musicd 182/182, roaming root-loss 18/18,
-  reconnect 8/8, mesh-router 26/26, and Dell CPU proof max 385‰/mean 283‰
-  passed. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-root-loss-r1.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-06-reconnect-loop-audit-r1.md`, and `docs/platform/evidence/WL-FUNC-021-2026-08-06-cpu-bridge-r1.md`.
-- **Live-boundary continuation (2026-08-07):** provider-loss loopback proves
-  same-provider `timeOffset=1` recovery with no fallback; cast found zero physical SSDP/Chromecast targets. Dell auth material provisioned, signed mutation refused,
-  then Dell became unreachable. Shell signing now matches daemon hostname canonicalization; the Fedora 44 release-5 RPM rebuilt and passed payload gates. Live loss, renderer,
-  Handoff, auth, and rotation remain; canonical peer filenames, bounded state, and DLNA Stop rollback pass 15/15, 27/27, 1/1; physical renderer/two-seat proof unavailable.
-  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-07-auth-runtime-guard-r1.md`.
-  CPU mitigations are farm-verified; gateway phases pass focused tests; Dell/seat-15 release CPU proof passes.
-  Evidence: `evidence/WL-FUNC-021-2026-08-07-runtime-status-phase-coalescing-r1.md`, `evidence/WL-FUNC-021-2026-08-07-mesh-status-dedupe-r1.md`.
-  Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; three-seat CPU/NWS recovery remains open.
-- **Seat-15 CPU (2026-08-10):** two bounded samples found Syncthing convergence plus shell diagnostics; load stayed below capacity and no daemon was pegged.
-  Steady-state retest remains: `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-retest-r157.md`.
-- **Idle-state coalescing (2026-08-10):** BigBoy passed transition/heartbeat-preserving idle suppression:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-10-idle-state-coalescing-r155.md`.
-- **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427` completed through `mde-musicd` while a bounded PipeWire default-sink monitor
-  captured 26.8 MiB of 48 kHz stereo s32le; 6,287,357/6,717,440 samples were
-  nonzero and playback returned 0. Temporary capture files were removed.
-  Provider/network-loss resume, physical-speaker judgment, and authenticated
-  mutation delivery remain open.
+- **Continuation:** daemon 182/182, roaming 18/18, reconnect 8/8, router 26/26, and Dell CPU passed:
+  `evidence/WL-FUNC-021-2026-08-06-roaming-root-loss-r1.md`, `evidence/WL-FUNC-021-2026-08-06-reconnect-loop-audit-r1.md`.
+- **Live boundary:** same-provider resume and package/gateway gates pass; no physical cast target was found and Dell later became unreachable.
+  Live loss, renderer, handoff, auth/rotation, physical cast/two-seat, and three-seat CPU/NWS remain open.
+  `evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`, `evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`.
+- **Seat-15 CPU:** bounded samples found Syncthing convergence; load stayed below capacity and no daemon was pegged; steady-state retest remains:
+  `evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`, `evidence/WL-FUNC-021-2026-08-10-seat15-cpu-retest-r157.md`.
+- **Idle-state coalescing:** transition/heartbeat-preserving suppression passes BigBoy: `evidence/WL-FUNC-021-2026-08-10-idle-state-coalescing-r155.md`.
+- **State revision replay:** rollback/equivocation fails closed; BigBoy passed 1/1: `docs/platform/evidence/WL-FUNC-021-2026-08-11-state-revision-replay-r269.md`.
+- **Live provider audio:** Airsonic track `23427` completed with 6,287,357/6,717,440 monitored samples nonzero; temporary capture was removed.
+  Provider-loss resume, speaker judgment, and authenticated mutation remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-live-audio-capture-r1.md`.
-- **Live Music DRM checkpoint (2026-08-06):** seat 15 produced a settled
-  1920x1080 direct-DRM EGL frame (`DrmFourcc(XR30)`) with SHA-256
-  `3a7ec14c51a5a46dde509c2b6c57cba5920cdfb8af5da19917d20a385ff5a199`.
-  The generic Construct-Home verifier correctly rejected the taskbar-shaped
-  profile; the new Music-specific verifier self-test passed and accepted the
-  frame with 15 separated foreground components. The temporary drop-in was
-  removed and the service returned active with zero restarts. Full rendered
-  Music acceptance, provider/network-loss resume, handoff, and package proof
-  remain open.
+- **Live Music DRM:** seat 15 produced a settled 1920x1080 direct-DRM EGL frame; the Music verifier accepted 15 separated foreground components.
+  The temporary drop-in was removed, service returned active with zero restarts, and full acceptance/loss/handoff/package proof remains open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-live-drm-frame-r1.md`;
   `install-helpers/verify-music-drm-proof.py`.
-- **RPM/install checkpoint (2026-08-06):** native F44 `.131` release 5 passed build/payload/size gates; base 83.5 MiB; Dell live proof passed (CPU max `437‰`, mean `218‰`).
-  Seat 15 remained release 4. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-dell-release5-cpu-r1.md`.
-- **Artwork/pagination checkpoint (2026-08-07):** mde-musicd 199/199, mde-music-egui 64/64, shell route 1/1, UI format pass; release-6
-  `magic-mesh-12.1.6-6.x86_64` is live on Dell and seat 15 (87,591,150 bytes; SHA-256 `eb9d6194b6a03a835a4b533f124260a39afbdb8297d81da410fdedf45f6d225e`).
-  Both live gates pass with `NRestarts=0`; album offsets 0, 100, and 1600 return distinct rows, final 70/`has_more=false`; album/podcast art are local JPEGs.
-  C-SPAN lacks a token; open: renderer, provider-loss, cast, handoff, radio playback, three-seat CPU/NWS.
+- **RPM/install:** F44 release 5 passed payload/size and Dell CPU proof; seat 15 remained release 4: `evidence/WL-FUNC-021-2026-08-06-dell-release5-cpu-r1.md`.
+- **Artwork/pagination:** daemon/UI/shell gates pass; release 6 is live on Dell/seat 15 with distinct bounded pages and local JPEG art.
+  Open: renderer, provider-loss, cast, handoff, radio playback, and three-seat CPU/NWS.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-music-artwork-release6-r1.md`.
-- **Mutation authorization delivery audit (2026-08-06):** the audit confirms
-  that the daemon's legacy HMAC verifier remains fail-closed, while the Music
-  lane now uses a dedicated domain-separated Ed25519 capability. The root DRM
-  shell alone receives the encrypted private seed; `mde-musicd` receives only a
-  validated public key, with exact-body digest, scope, expiry, and replay
-  checks. Shared types passed 431/431 tests and mde-musicd passed 174/174 on
-  the farm. Host provisioning and package paths are source-verified; live
-  authorized mutation delivery and installed-seat rotation proof remain open.
+- **Mutation authorization delivery:** domain-separated Ed25519 capabilities bind digest/scope/expiry/replay; daemon receives only the public key.
+  Shared types 431/431 and daemon 174/174 pass; live authorized mutation and installed-seat rotation remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-auth-delivery-audit-r2.md`.
-- **Mutation authorization package audit (2026-08-06):** base-RPM asset,
-  manifest, systemd, helper self-test, and package dependency checks found
-  that the provisioner also requires `openssl` and `curl`; those hard RPM
-  requirements are now declared in `crates/mesh/mackesd/Cargo.toml` and are
-  present in the fresh base RPM header. Installed-seat provisioning, mutation,
-  and rotation proof remain open.
+- **Mutation authorization package:** RPM assets/systemd/helper and dependency checks declare required `openssl`/`curl` in the fresh base header.
+  Installed-seat provisioning, mutation, and rotation proof remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-auth-package-audit-r2.md`;
   prior audit: `docs/platform/evidence/WL-FUNC-021-2026-08-06-auth-package-audit-r1.md`.
-- **Reusable live-seat gate (2026-08-06):**
-  `install-helpers/verify-music-live-seat.sh --self-test` passes without SSH,
-  and its bounded read-only default run passes on seat 15: `mde-musicd` active
-  with `NRestarts=0`, ping answered, canonical `get-state` answered, and
-  canonical `list-albums` answered. The explicit play probe was also run
-  against live song `23427`, bounded at 15 seconds with no client process left
-  behind; this does not claim audible or rendered acceptance. The helper uses
-  no secret output and caps SSH/command/probe timeouts.
-- **Queue durability checkpoint (2026-08-09):** synced atomic replacement preserves the last-good queue and cleans failed temporary writes; `.50` passed 14/14:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-09-queue-atomic-persistence-r1.md`.
+- **Reusable live-seat gate:** self-test and bounded seat-15 read-only checks pass; the 15-second song probe left no client process and claims no audible/rendered acceptance.
+- **Queue durability:** atomic replacement preserves last-good and cleans failed staging; `.50` 14/14: `evidence/WL-FUNC-021-2026-08-09-queue-atomic-persistence-r1.md`.
   1. S1 Freeze catalog/provider authority.
      - Objective: make mde-musicd the only catalog/source/queue authority for Subsonic, local, Jellyfin, and approved providers.
      - Inputs: music types/domain, resource catalog, Jellyfin store.
@@ -1766,6 +1859,17 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Clock-audio payload authority:** same-generation retries cannot substitute an active occurrence's source; BigBoy 1/1:
+  `evidence/WL-FUNC-022-2026-08-11-clock-audio-payload-authority-r373.md`.
+- **Ringing schedule authority:** restart cannot graft replacement payloads onto a ringing occurrence; `.90` 1/1:
+  `evidence/WL-FUNC-022-2026-08-11-ringing-schedule-authority-r370.md`.
+- **Timer/alarm action boundary:** timers cannot enter alarm-only ringing or Snooze paths; `.90` 1/1:
+  `evidence/WL-FUNC-022-2026-08-11-timer-snooze-boundary-r371.md`.
+- **Disabled-alarm snooze:** disabling cancels retained snooze generations; `.170` 1/1: `evidence/WL-FUNC-022-2026-08-11-disabled-alarm-snooze-r417.md`.
+- **Clock action payload:** retained controls cannot authorize replaced daemon payloads; BigBoy exact:
+  `evidence/WL-FUNC-022-2026-08-11-clock-action-payload-r453.md`.
+- **Occurrence payload binding (2026-08-11):** active generations reject conflicting audio/volume; `.90` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-11-clock-occurrence-payload-binding-r365.md`.
 - **Peer convergence probe budget (2026-08-11):** retry-suppressed peer probes
   are capped independently at 512 per tick, preventing large retained snapshots
   from consuming unbounded convergence work; evidence:
@@ -1800,6 +1904,17 @@ behavioral evidence is not completion.
 - **Single Clock sample (2026-08-11):** each tick reuses one wall-clock value
   across validation and publication; `.90` passed:
   `docs/platform/evidence/WL-FUNC-022-2026-08-11-single-clock-sample-r221.md`.
+- **Ringing-audio restart recovery (2026-08-11):** restart reasserts ringing with a fresh TTL and deterministic effect ID; `.90` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-11-ringing-audio-restart-r242.md`.
+- **Command-generation-loss recovery (2026-08-11):** a command committed before
+  Bus publication failure is recovered from durable authority even after the
+  transient Bus generation loses the command; `.50` passed 1/1:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-11-command-generation-loss-r284.md`.
+- **Deadline publication repair (2026-08-11):** a deadline commit followed by
+  Bus publication failure reloads durable authority and repairs on the next
+  sweep without duplicating its occurrence or audio effect; the exact gate is
+  capacity-deferred:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-11-deadline-publication-repair-r267.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Clock documentation/package hard-cut checkpoint (2026-08-09):** the visible
@@ -1935,8 +2050,7 @@ behavioral evidence is not completion.
   signed schema-5 evidence proves six-node acceptance using exactly three
   physical test seats plus three lighthouses, package/runtime integrity,
   recovery, and corrected-forward promotion without rollback.
-- Current state: evidence schema/signing, topology, recovery, and live/VDI helpers exist; current release binding, seats, lighthouse convergence, and complete failure
-  matrix remain.
+- Current state: signing exists; live release proof remains. Evidence: `evidence/WL-CRIT-006-WL-ARCH-009-2026-08-11-worker-executable-generation-r467.md`.
 - **Farm expansion (2026-08-08):** XEN-196 is a verified fifth build node; topology is 5/5 with 10 slots and `.196` passed `mde-bus` 425/425:
   `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
 - **Artifact claim checkpoint (2026-08-09):** one capture cannot satisfy independent node/scenario claims; `.90` passed 2 positive and 18 negative fixtures:
@@ -1948,14 +2062,46 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- **Two-stage mandatory signing evidence (2026-08-11):** operator-only RPM
+  preparation embeds signatures without publication output; final publication
+  binds validated input/output inodes, atomically publishes no-replace files,
+  requires matching evidence, and refuses unsigned/replaced RPMs or hostile
+  output paths before success. The finalizer now consumes private stable-inode
+  snapshots and rechecks original bytes and directory membership immediately
+  before publication; signer and 15-fixture finalizer self-tests passed:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-mandatory-signing-evidence-r246.md`.
+- **Signing rollback:** failed publication preserves substituted paths and restores every RPM in a failed batch; focused farm self-tests passed:
+  `evidence/WL-CRIT-006-2026-08-11-signing-partial-rollback-r300.md`, `evidence/WL-CRIT-006-2026-08-11-multi-rpm-signing-rollback-r387.md`.
+- **Exact production topology roster (2026-08-11):** schema-5 publication
+  cross-binds verified topology identities to the gate manifest's exact three
+  governed seats and three canonical lighthouses; helper self-test passed:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-exact-topology-roster-r251.md`.
 - **Farm orchestrator timeout boundary (2026-08-11):** etcd curl range/get calls kill hung children and fail closed; BigBoy passed 1/1:
   `evidence/WL-CRIT-006-2026-08-11-farm-orchestrator-timeout-r227.md`.
 - **Evidence identity binding (2026-08-10):** the release verifier rejects
   cross-wired seat evidence filenames; `.90` passed 1 valid and 16 hostile
   fixtures: `docs/platform/evidence/WL-CRIT-006-2026-08-10-evidence-identity-r177.md`.
+- **CI source identity:** authoritative gates reject dirty, untracked,
+  unresolved, or mid-run-mutated source; `.90` self-test passed:
+  `evidence/WL-CRIT-006-2026-08-11-ci-source-identity-r397.md`.
 - **Release gate identity bounds (2026-08-10):** oversized authenticated farm
   identities are rejected; the `.90` CI-gate self-test passed:
   `docs/platform/evidence/WL-CRIT-006-2026-08-10-release-identity-bound-r211.md`.
+- **Release-binding inode stability (2026-08-11):** final descriptors are read
+  through one stable descriptor and both pathname replacement and same-inode
+  mutation fail without changing authenticated gate evidence. `.50` self-test
+  passed:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-release-binding-inode-stability-r288.md`.
+- **Publisher-attestation inode:** byte-identical replacement fails validation; `.130` self-test passed: `evidence/WL-CRIT-006-2026-08-11-publisher-attestation-inode-r398.md`.
+- **Process namespace identity:** namespace directives cannot substitute the packaged binary; `.196` self-test:
+  `evidence/WL-CRIT-006-WL-ARCH-009-2026-08-11-process-namespace-identity-r423.md`.
+- **Release signer identity:** ambiguous/substituted primary keys roll back publication; `.196` self-test: `evidence/WL-CRIT-006-2026-08-11-release-signer-identity-r431.md`.
+- **Release-evidence inode:** replacement/mutation during capture fails closed; `.90` self-test: `evidence/WL-CRIT-006-2026-08-11-release-evidence-inode-r435.md`.
+- **Finalizer candidate inode:** post-verification replacement fails with identical bytes; `.170` self-test: `evidence/WL-CRIT-006-2026-08-11-finalizer-candidate-inode-r437.md`.
+- **CI log inode:** promotion verification binds digest and semantics to one opened log inode; `.196` self-test: `evidence/WL-CRIT-006-2026-08-11-ci-log-inode-r439.md`.
+- **Bootc image ID:** mutable tags cannot switch candidate bytes during verification; `.196` self-test:
+  `evidence/WL-CRIT-006-2026-08-11-bootc-image-id-r444.md`.
+- **Finalizer inode:** byte-identical replacement fails stable hashing; `.170` self-test passed: `evidence/WL-CRIT-006-2026-08-11-finalizer-artifact-inode-r404.md`.
 - **Gate command-control boundary (2026-08-11):** shell control syntax is
   rejected in bounded release commands while safe parameter expansion remains
   allowed; `.50` passed 18 hostile fixtures:
@@ -1989,10 +2135,15 @@ behavioral evidence is not completion.
   artifact reused across independent gates; canonical matrix validation passed
   17 required gates and 15 hostile fixtures:
   `docs/platform/evidence/WL-CRIT-006-2026-08-10-unique-evidence-claims-r155.md`.
-- **Artifact revalidation (2026-08-10):** `release-evidence.sh validate` now
-  rejects missing or replaced artifact bytes even after an outer binding is
-  refreshed and CI provenance is removed; `.90` passed the focused hostile
-  self-test: `docs/platform/evidence/WL-CRIT-006-2026-08-10-artifact-revalidation-r186.md`.
+- **Singleton evidence claims (2026-08-11):** repeated manifests/topology/attestations/verdicts fail without replacing output; BigBoy self-test passed:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-singleton-evidence-claims-r303.md`.
+- **Artifact inode revalidation:** validation hashes one opened inode and rechecks path/metadata; same-size replacement fails; focused farms passed:
+  `evidence/WL-CRIT-006-2026-08-10-artifact-revalidation-r186.md`, `evidence/WL-CRIT-006-2026-08-11-artifact-hash-inode-binding-r380.md`.
+- **Evidence inode stability (2026-08-11):** validation reads one opened evidence
+  inode and recursively verifies a private, digest-bound gate-manifest snapshot;
+  atomic replacement and same-inode mutation fail closed. Hostile local
+  self-tests passed:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-evidence-inode-stability-r260.md`.
 - **Production matrix identity gate (2026-08-10):** a production `pass` now
   invokes the canonical release-matrix verifier and refuses an incomplete,
   reordered, or source-revision-mismatched gate manifest; the helper self-test
@@ -2064,36 +2215,37 @@ behavioral evidence is not completion.
 - Origin or merged source IDs: 2026-07-30 fit-for-purpose audit and archived release/acceptance IDs.
 
 ### WL-CRIT-007 - Boot, sleep/resume, and fleet peer return recovery
-
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: boot and laptop sleep can leave Nebula, mackesd, Syncthing, etcd, and desktop state stale or duplicated.
 - Required outcome: every enrolled workstation and lighthouse returns to one authenticated identity, one healthy daemon/session, synchronized substrate, and visible
   recovery state after boot, sleep, reboot, network transition, or corrected-forward upgrade.
-- Current state: eight identities and recovery helpers exist; the rejoin helper
-  now requires a successful `mackesd leave --yes`, validates that stale
-  certificate/key/role state is gone, and rejects unsupported roles before
-  joining. Ordering, desktop restoration, and fleet convergence proof remain.
+- Current state: bounded recovery exists; ordering, desktop restore, and fleet proof remain. Latest: `evidence/WL-CRIT-007-2026-08-11-peer-return-transition-r464.md`.
 - Remaining work:
-- **All-home XDG preflight:** seat `.50` refused a later hostile target before any mount mutation:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-10-xdg-all-home-preflight-r178.md`.
-- **Missing Workstation session return (2026-08-10):** inactive shell sessions are restored additively without restarting healthy mesh services; `.90` passed:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-10-session-return-r205.md`.
-- **Stale-session duplicate guard (2026-08-10):** orphaned shell processes block
-  duplicate recovery before XDG mutation; `.90` fixtures passed:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-10-stale-session-guard-r213.md`.
-- **Post-etcd substrate boundary (2026-08-11):** recovery re-attests physical
-  network readiness before Syncthing mutation and emits `offline-after-etcd`
-  when the link disappears at that boundary. `.90` passed all recovery
-  fixtures:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-11-recovery-substrate-boundary-r218.md`.
-- **SSH overlay-IP admission (2026-08-11):** invalid values defer before drop-in
-  or reload; BigBoy passed 1/1:
-  `evidence/WL-CRIT-007-2026-08-11-sshd-overlay-admission-r231.md`.
+- **Etcd restart authority:** etcd outage cannot use stale filesystem health; `.196` 1/1: `evidence/WL-CRIT-007-2026-08-11-etcd-restart-source-authority-r381.md`.
+- **Fleet retry:** failure cannot defer the corrected next poll; `.90` 1/1: `evidence/WL-CRIT-007-2026-08-11-fleet-reconcile-corrected-forward-r396.md`.
+- **Startup return retry:** transient instability cannot strand retained absence; `.90` 1/1: `evidence/WL-CRIT-007-2026-08-11-startup-return-retry-r399.md`.
+- **Boot etcd authority:** failed directory reads cannot substitute stale filesystem peers; `.50` 1/1: `evidence/WL-CRIT-007-2026-08-11-boot-etcd-source-authority-r392.md`.
+- **Boot overlay generation:** marker replacement/duplicate IP ownership blocks readiness; `.170` 1/1: `evidence/WL-CRIT-007-2026-08-11-boot-overlay-generation-r434.md`.
+- **Missed-wake restart:** retained Sleeping returns after network stability; BigBoy 1/1: `evidence/WL-CRIT-007-2026-08-11-missed-wake-restart-r245.md`.
+- **Expired-intent generation:** expiry cannot ignore newer Bus generation; BigBoy 1/1: `evidence/WL-CRIT-007-2026-08-11-expired-intent-generation-r290.md`.
+- **Availability class:** restart and older Bus rows cannot substitute class; `.50`/`.90` 1/1 each: `evidence/WL-CRIT-007-2026-08-11-node-availability-device-class-r388.md`,
+  `evidence/WL-CRIT-007-2026-08-11-availability-class-chain-r420.md`.
+- **Host-state Bus inode:** same-path replacement blocks mutation pending fresh seat state; `.50` 1/1: `evidence/WL-CRIT-007-2026-08-11-host-state-bus-inode-r310.md`.
+- **Restart barrier:** gaps clear readiness and force probes; `.50`/BigBoy passed 2/2: `evidence/WL-CRIT-007-2026-08-11-restart-readiness-barrier-r252.md`.
+- **All-home XDG preflight:** `.50` refused hostile targets before mount mutation: `docs/platform/evidence/WL-CRIT-007-2026-08-10-xdg-all-home-preflight-r178.md`.
+- **Missing Workstation session return:** additive restore passed `.90`: `docs/platform/evidence/WL-CRIT-007-2026-08-10-session-return-r205.md`.
+- **Host snapshot freshness:** stale mirrors cannot authorize; `.50` passed 1/1: `docs/platform/evidence/WL-CRIT-007-2026-08-11-host-snapshot-freshness-r271.md`.
+- **Nebula restart:** retained overlay readiness retracts until reload and active verification; focused farms 1/1 each:
+  `evidence/WL-CRIT-007-2026-08-11-nebula-overlay-readiness-r274.md`, `evidence/WL-CRIT-007-2026-08-11-nebula-restart-revalidation-r389.md`.
+- **Mirror readiness:** restart and rollback retract DNF readiness until corrected-forward; BigBoy 1/1 each:
+  `evidence/WL-CRIT-007-2026-08-11-mirror-restart-readiness-r277.md`, `evidence/WL-CRIT-007-2026-08-11-mirror-generation-rollback-r418.md`.
+- **Stale-session guard:** orphaned shells block duplicate recovery before XDG mutation; `.90`: `evidence/WL-CRIT-007-2026-08-10-stale-session-guard-r213.md`.
+- **Post-etcd boundary:** recovery re-attests network before Syncthing mutation; `.90` fixtures: `evidence/WL-CRIT-007-2026-08-11-recovery-substrate-boundary-r218.md`.
+- **SSH overlay IP:** invalid values block drop-in/reload; BigBoy 1/1: `evidence/WL-CRIT-007-2026-08-11-sshd-overlay-admission-r231.md`.
 - **Bounded SSH overlay (2026-08-11):** file and reset/reload commands are bounded; BigBoy passed 9/9: `evidence/WL-CRIT-007-2026-08-11-sshd-bounded-r233.md`.
-- **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
-  the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
+- **Syncthing registry bound (2026-08-10):** hostile output is capped before CLI mutation; BigBoy passed and seat 15 remained non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.
 - **Bounded boot command output (2026-08-11):** `systemctl` readiness output is capped at 4096 bytes and oversized producers are killed; BigBoy passed 1/1:
   `evidence/WL-CRIT-007-2026-08-11-boot-command-output-bound-r229.md`.
@@ -2298,6 +2450,9 @@ behavioral evidence is not completion.
 - **Carbon icon registry drift gate (2026-08-10):** exact 44-asset parity,
   symbolic SVG, safe-name, and Apache-2.0 checks passed:
   `docs/platform/evidence/WL-UX-009-2026-08-10-carbon-registry-r213.md`.
+- **Finite motion restart:** corrupt/non-finite timelines settle without repaint loops; `.50` 1/1: `evidence/WL-UX-009-2026-08-11-motion-finite-restart-r426.md`.
+- **Disabled status tone:** unavailable workspaces cannot retain live semantic colors; BigBoy exact:
+  `evidence/WL-UX-009-2026-08-11-disabled-status-tone-r456.md`.
 - Remaining work:
   1. S1 Freeze tokens, fonts, and icon registry.
      - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.
@@ -2359,7 +2514,7 @@ behavioral evidence is not completion.
 - Problem: node hardware and OS observations/actions are incomplete, duplicated, and not consistently capability-driven or safe.
 - Required outcome: credential-free Workers providers publish bounded sourced hardware/OS entities and only allow capability-gated, generation-bound, audited safe
   controls for Wi-Fi, audio, display, input, storage, printers, services, power, and virtualization.
-- Current state: device catalog and typed provider scaffolding exist; provider coverage, conflict/history, safe actions, and fleet proof remain.
+- Current state: typed providers exist; coverage, safe actions, and fleet proof remain. Latest: `evidence/WL-UX-011-2026-08-11-hardware-staging-generation-r472.md`.
 - **Device-control ownership checkpoint (2026-08-09):** privileged controls now
   require an exact match on provider host, category, name, sysfs path, and
   driver; forged and foreign-host targets cannot reach mutation. `.90` passed
@@ -2371,9 +2526,15 @@ behavioral evidence is not completion.
   contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
 - **Unavailable provider control (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-UX-011-2026-08-10-unavailable-control-r207.md`.
 - Remaining work:
-- **Device command timeout (2026-08-11):** fixed device helpers now have a
-  30-second deadline with child termination on drop; `.90` passed:
-  `docs/platform/evidence/WL-UX-011-2026-08-11-command-timeout-r224.md`.
+- **Inventory generation:** delayed pre-restart probes cannot replace newer truth; `.196` 1/1: `evidence/WL-UX-011-2026-08-11-device-inventory-generation-r386.md`.
+- **Inventory staging identity:** symlink/hard-link substitution cannot redirect publication; `.90` 1/1: `evidence/WL-UX-011-2026-08-11-inventory-staging-nofollow-r421.md`.
+- **Sysfs identity equivocation (2026-08-11):** aliases deduplicate and conflicts suppress only their hardware identity; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-UX-011-2026-08-11-sysfs-identity-equivocation-r278.md`.
+- **Phone physical identity (2026-08-11):** exact duplicates collapse and conflicting device IDs suppress only that phone; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-UX-011-2026-08-11-phone-identity-equivocation-r292.md`.
+- **Physical block provider bound (2026-08-11):** virtual rows are filtered before the 256-physical-device budget; `.50` passed 1/1:
+  `docs/platform/evidence/WL-UX-011-2026-08-11-physical-block-provider-bound-r246.md`.
+- **Device command timeout (2026-08-11):** fixed helpers terminate on a 30-second deadline; `.90` passed: `docs/platform/evidence/WL-UX-011-2026-08-11-command-timeout-r224.md`.
 - **CONNECT text bound (2026-08-11):** state/Caddy reads cap content at 128 KiB; BigBoy: `docs/platform/evidence/WL-UX-011-2026-08-11-connect-managed-text-bound-r225.md`.
 - **CONNECT policy bound (2026-08-11):** exposure/DDNS reads cap at 128 KiB; BigBoy passed 1/1: `evidence/WL-UX-011-2026-08-11-connect-config-bound-r233.md`.
 - **Unavailable control all-verbs admission (2026-08-11):** unresolved provider state blocks Enable, Disable, Reload Module, and Rescan Bus without sysfs mutation;
@@ -2512,10 +2673,12 @@ behavioral evidence is not completion.
   320px; `.50` passed 50/50: `docs/platform/evidence/WL-UX-012-2026-08-09-narrow-center-geometry-r3.md`.
 - **Taskbar action map (2026-08-10):** typed Start/Search/Back/Home map passed; conflicting cycle deleted: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-action-map-r4.md`.
 - **Taskbar pin identity (2026-08-10):** BigBoy passed stable deduplication: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-pin-dedupe-r156.md`.
-- **Front Door command-input boundary (2026-08-10):** BigBoy passed rejection of control-separated and over-budget `>` command input before terminal activation:
-  `docs/platform/evidence/WL-UX-012-2026-08-10-command-input-boundary-r187.md`.
-- **Short Left rail (2026-08-10):** `.90` passed bounded 320×160 containment: `docs/platform/evidence/WL-UX-012-2026-08-10-short-left-rail-r197.md`.
+- **Front Door command boundary:** unsafe/oversized `>` input refuses before terminal activation; BigBoy passed: `evidence/WL-UX-012-2026-08-10-command-input-boundary-r187.md`.
+- **Short Left rail:** 320×160 containment and placement escape passed BigBoy: `evidence/WL-UX-012-2026-08-11-left-placement-escape-r280.md`.
+- **Future preference schema:** untrusted placement/pins fail to empty Bottom; `.50` 1/1: `evidence/WL-UX-012-2026-08-11-future-preference-schema-r422.md`.
 - Remaining work:
+- **Home wallpaper inode:** replaced or non-regular cache paths cannot redirect decode; BigBoy exact:
+  `evidence/WL-UX-012-2026-08-11-home-wallpaper-inode-r452.md`.
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
      - Inputs: shell navigation, UX-009 Style/Visuals, platform interfaces.
@@ -2567,14 +2730,25 @@ behavioral evidence is not completion.
 - Problem: the centered Health modal lacks complete expected-state intent, adaptive durations, history/recurrence, safe recovery, and truthful transition handling.
 - Required outcome: one centered System and Mesh Health authority distinguishes expected absence from outage, computes A-F grades from signed bounded evidence, keeps
   active issues above paged history, supports filters/detail/recurrence/export, and offers only governed recovery.
-- Current state: health contracts, worker, Bus projection, and A-F policy exist;
-  the expected-state boundary now covers max-timestamp return and rejects
-  oversized availability TTLs. Expected-state publishers, transition
-  evaluation, history/detail, recovery/export, and three-seat proof remain.
+- Current state: signed A-F authority exists; live proof remains. Evidence: `evidence/WL-UX-013-2026-08-11-health-history-capacity-r460.md`.
 - Remaining work:
 - **Bounded heartbeat fallback (2026-08-11):** peer heartbeat recovery uses
   the existing regular-file byte bound before JSON parsing; `.90` passed:
   `docs/platform/evidence/WL-UX-013-2026-08-11-heartbeat-byte-bound-r224.md`.
+- **Expected-absence legacy fold (2026-08-11):** planned absence suppresses false outage while missed return escalates through shared policy; `.90` passed 2/2:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-expected-absence-legacy-fold-r240.md`.
+- **Post-intent heartbeat (2026-08-11):** later heartbeat evidence supersedes stale expected absence after restart; `.196` passed 1/1:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-post-intent-heartbeat-r291.md`.
+- **Canonical expected-state transition (2026-08-11):** bounded intent keeps declared absence informational and escalates missed return;
+  isolated `.90` gate passed 1/1: `docs/platform/evidence/WL-UX-013-2026-08-11-canonical-expected-state-r254.md`.
+- **Truthful recovery timing (2026-08-11):** resolved health history preserves
+  the final positive observation and records detection of recovery separately,
+  so incident duration cannot absorb an unobserved gap; `.90` passed 1/1:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-truthful-recovery-timing-r247.md`.
+- **History privacy epoch:** restart and fresh publications reject resolved incidents beyond six hours; focused farms passed 1/1 each:
+  `evidence/WL-UX-013-2026-08-11-history-privacy-epoch-r302.md`, `evidence/WL-UX-013-2026-08-11-resolved-history-privacy-r378.md`.
+- **Active-condition continuity:** forward generations cannot silently erase active issues; `.170` 1/1: `evidence/WL-UX-013-2026-08-11-active-condition-continuity-r438.md`.
+- **Health-modal privacy:** hostile projection text cannot expose secrets or local paths; `.170` 1/1: `evidence/WL-UX-013-2026-08-11-health-modal-privacy-r440.md`.
 - **Decommissioned health projection cleanup (2026-08-11):** retired publishers are evicted from ledger, cursor, projection, and restart checkpoint after staged roster reads;
   `.90` passed:
   `docs/platform/evidence/WL-UX-013-2026-08-11-health-decommissioned-projection-r217.md`.
@@ -2593,6 +2767,10 @@ behavioral evidence is not completion.
   `evidence/WL-UX-013-2026-08-11-alert-relay-bound-r228.md`.
 - **Future health freshness:** `.50` passed refusal of zero/future-dated snapshots:
   `docs/platform/evidence/WL-UX-013-2026-08-10-future-health-freshness-r181.md`.
+- **Device-inventory provenance:** future-dated or foreign-host inventory cannot
+  contribute an A grade; `.196` 1/1:
+  `evidence/WL-UX-013-2026-08-11-device-inventory-provenance-r395.md`.
+- **Modal generation authority:** fresh-timestamp rollback cannot erase outages; `.50` 1/1: `evidence/WL-UX-013-2026-08-11-modal-generation-authority-r414.md`.
 - **Duplicate active-condition admission:** `.90` passed refusal of repeated active
   `(scope, id)` identities while preserving repeated resolved records for recurrence:
   `docs/platform/evidence/WL-UX-013-2026-08-10-duplicate-active-condition-r185.md`.
@@ -2637,6 +2815,19 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-2026-08-10-future-heartbeat-r155.md`.
 - **Recovery target checkpoint (2026-08-09):** a condition cannot authorize remediation on another node; machine 194 passed 13/13:
   `docs/platform/evidence/WL-UX-013-2026-08-09-recovery-target-binding-r3.md`.
+- **Final-boundary recovery authority (2026-08-11):** the Health modal
+  revalidates current canonical condition/scope, snapshot generation, offered
+  remediation, and confirmation before Bus publication; BigBoy passed 1/1:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-final-recovery-authority-r257.md`.
+- **Action-result progress (2026-08-11):** exact node/mesh publisher identity and generation bind terminal results; unresolved conditions report partial failure. `.50` passed 1/1:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-action-result-progress-r262.md`.
+- **Bounded action-result contract (2026-08-11):** unknown, oversized, secret-bearing, future, or malformed rows fail before journal/publication/presentation; its
+  exact extension gate is capacity-blocked:
+  `docs/platform/evidence/WL-UX-013-2026-08-11-action-result-contract-r264.md`.
+- **Action-result replay conflict (2026-08-11):** restart recovery acknowledges
+  an existing result only on complete typed equality; a conflicting body under
+  the same audit ID leaves the genuine journal and cursor intact. BigBoy passed
+  1/1: `docs/platform/evidence/WL-UX-013-2026-08-11-action-result-replay-conflict-r266.md`.
 - **Grade E authority checkpoint (2026-08-09):** two distinct active required warnings produce E without duplicate-delivery inflation; machines 9 and 194 passed the
   shared and worker suites: `docs/platform/evidence/WL-UX-013-WL-UX-014-2026-08-09-grade-e-authority-r5.md`.
 - **History/selection checkpoint (2026-08-09):** paint-time history retains only the ordered top eight node rows, and live reorder/removal cannot silently move the
@@ -2756,7 +2947,7 @@ behavioral evidence is not completion.
 - Problem: KIRON has generic typed toasts but no governed A-F payload, authored scenes, audio, ticker, fallback ladder, or bounded health interaction.
 - Required outcome: one ToastHost renders six license-clean A-F health scenes and recovery transitions from UX-013 authority, with exact dwell/audio, grouping/ticker,
   safe deep links, live-3D/pre-rendered/static fallback, and no second renderer or sound owner.
-- Current state: ToastHost queue, A-F health schema/mapping, sound bridge, motion, and DRM/GLES seams exist; assets, renderer, fallback, ticker, and live proof remain.
+- Current state: A-F authority exists; assets and live proof remain. Evidence: `evidence/WL-UX-014-2026-08-11-node-grade-observer-generation-r468.md`.
 - **F-grade backlog checkpoint (2026-08-09):** the hold-until-ack queue is capped at 64 waiters without displacing admitted critical FIFO; BigBoy passed 34/34:
   `docs/platform/evidence/WL-UX-014-2026-08-09-f-grade-backlog-bound-r1.md`.
 - **Shared KIRON contract (2026-08-09):** canonical UX-013 grade/generation/timing metadata maps into one ToastHost with safe Workers routing. Grade E now has sole-policy
@@ -2769,6 +2960,16 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-014-2026-08-10-future-timestamp-admission-r194.md`.
 - **Kiron asset admission (2026-08-10):** self-test passed coverage/license/size/path/digest rules: `docs/platform/evidence/WL-UX-014-2026-08-10-kiron-asset-admission-r212.md`.
 - Remaining work:
+- **Kiron asset inode:** multiply-linked scenes cannot retain mutation authority across restart; `.196` self-test:
+  `evidence/WL-UX-014-2026-08-11-kiron-asset-inode-r446.md`.
+- **Health toast watermark (2026-08-11):** stale replay stays refused after queue removal and overflow fails closed; `.170` passed 1/1:
+  `docs/platform/evidence/WL-UX-014-2026-08-11-health-toast-watermark-r282.md`.
+- **Grade E/F lifecycle (2026-08-11):** timed grade E cannot enter grade F's acknowledgement-only path; `.90` passed 1/1:
+  `docs/platform/evidence/WL-UX-014-2026-08-11-grade-e-f-lifecycle-r243.md`.
+- **Delayed timeline:** elapsed drains timed alerts but stops at grade-F acknowledgement; `.90` 1/1: `evidence/WL-UX-014-2026-08-11-delayed-toast-timeline-r400.md`.
+- **KIRON generation bridge:** stale/equal replay cannot replace grade F; `.90` 1/1: `evidence/WL-UX-014-2026-08-11-kiron-generation-bridge-r409.md`.
+- **Status-grade watermark:** foreign/rollback/equivocal health cannot relabel chrome; BigBoy 1/1:
+  `evidence/WL-UX-014-2026-08-11-status-grade-watermark-r451.md`.
   1. S1 Freeze authority, payload, and queue.
      - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.
      - Inputs: UX-013 health contract, mde-egui toast/motion.

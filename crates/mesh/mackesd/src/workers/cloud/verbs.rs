@@ -241,6 +241,9 @@ pub(crate) struct CloudActionBody {
     /// Stable session identity used to converge repeated launches.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Authenticated initiating peer whose shell will drive the App surface.
+    #[serde(default)]
+    pub client_peer: Option<String>,
     /// Resume an existing guest session when available.
     #[serde(default)]
     pub resume: bool,

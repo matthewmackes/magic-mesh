@@ -138,11 +138,14 @@ impl NavigationConsumer {
 
     /// Materialize one canonical action outside render using caller-captured time.
     pub fn prepare_action(&mut self, host: &str, now_ms: i64) -> Option<&NavigationWireAction> {
+        if self.host.as_deref().is_some_and(|bound| bound != host) {
+            self.refusal = Some("Navigation action refused: foreign host authority");
+            return None;
+        }
         if self.wire_action.is_some() {
             return self.wire_action.as_ref();
         }
         let intent = self.intent.as_ref()?;
-        self.host = Some(host.to_string());
         self.request_sequence = self.request_sequence.saturating_add(1);
         let kind = match intent {
             NavigationIntent::RequestRoute { .. } => "route",
@@ -198,6 +201,8 @@ impl NavigationConsumer {
                 )
             }
         };
+        self.host = Some(host.to_string());
+        self.refusal = None;
         self.wire_action = Some(NavigationWireAction {
             request_id,
             topic,
@@ -222,6 +227,10 @@ impl NavigationConsumer {
     pub fn fold(&mut self, host: &str, snapshot: NavigationSnapshot, now_ms: i64) -> bool {
         if snapshot.host != host || snapshot.validate_at(now_ms).is_err() {
             self.refusal = Some("Navigation state refused: invalid authority projection");
+            return false;
+        }
+        if self.host.as_deref().is_some_and(|bound| bound != host) {
+            self.refusal = Some("Navigation state refused: foreign host authority");
             return false;
         }
         if let Some(accepted) = self.accepted.as_ref() {
@@ -450,5 +459,31 @@ mod tests {
         ));
         assert_eq!(state.status().label(), "Routing provider not configured");
         assert!(state.route().is_none());
+    }
+
+    #[test]
+    fn retained_navigation_consumer_cannot_rebind_projection_or_action_to_foreign_host() {
+        let mut state = NavigationConsumer::default();
+        assert!(state.fold("seat-1", snapshot("seat-1", 4, active_phase("req-1")), NOW));
+
+        assert!(!state.fold(
+            "seat-2",
+            snapshot("seat-2", 5, NavigationPhase::Idle),
+            NOW + 1,
+        ));
+        assert_eq!(
+            state.refusal(),
+            Some("Navigation state refused: foreign host authority")
+        );
+        assert_eq!(
+            state.route().map(|route| route.route_id.as_str()),
+            Some("route-1")
+        );
+
+        state.cancel();
+        assert!(state.prepare_action("seat-2", NOW + 2).is_none());
+        assert!(state.has_pending_action());
+        let local_action = state.prepare_action("seat-1", NOW + 3).unwrap();
+        assert_eq!(local_action.topic, navigation_cancel_action_topic("seat-1"));
     }
 }

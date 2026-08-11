@@ -42,8 +42,7 @@ pub fn backoff_delay_secs(attempt: u32, base_secs: u64, cap_secs: u64) -> u64 {
     let cap_secs = cap_secs.max(MIN_RETRY_DELAY_SECS);
     let base_secs = base_secs.max(MIN_RETRY_DELAY_SECS).min(cap_secs);
     base_secs
-        .checked_shl(attempt)
-        .unwrap_or(u64::MAX)
+        .saturating_mul(2_u64.saturating_pow(attempt))
         .min(cap_secs)
 }
 
@@ -100,6 +99,14 @@ mod tests {
     fn backoff_large_attempt_saturates_to_cap_not_wrap() {
         // 1 << 100 overflows u64 → saturates to cap, never panics/wraps.
         assert_eq!(backoff_delay_secs(100, 1, 60), 60);
+    }
+
+    #[test]
+    fn large_custom_base_cannot_wrap_a_retry_delay_to_zero() {
+        let base = 1_u64 << 63;
+        assert_eq!(backoff_delay_secs(0, base, u64::MAX), base);
+        assert_eq!(backoff_delay_secs(1, base, u64::MAX), u64::MAX);
+        assert_eq!(backoff_delay_secs(63, base, u64::MAX), u64::MAX);
     }
 
     #[test]

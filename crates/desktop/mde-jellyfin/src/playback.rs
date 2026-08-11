@@ -316,13 +316,98 @@ pub fn transcode_url(
     )
 }
 
-/// Resolve a possibly-relative server URL (Jellyfin's `TranscodingUrl` is a
-/// site-root path) against `base_url`.
-fn absolutize(base_url: &str, url: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        url.to_string()
-    } else {
-        format!("{}{}", trim_base(base_url), url)
+/// Admit Jellyfin's server-selected transcode URL only when it remains bound to
+/// the selected server, media kind, and item. PlaybackInfo normally returns a
+/// site-root path; accepting an absolute or different-item URL would let a
+/// stale or hostile response redirect playback outside that authority.
+fn admitted_transcoding_url(
+    base_url: &str,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    media_type: StreamMediaType,
+    play_session_id: Option<&str>,
+    url: &str,
+) -> Option<String> {
+    if !url.starts_with('/')
+        || url.starts_with("//")
+        || url.contains(['\r', '\n', '#'])
+        || url.len() > 16 * 1024
+    {
+        return None;
+    }
+
+    let path = url.split('?').next().unwrap_or_default();
+    let expected = format!("/{}/{item_id}/", media_type.segment());
+    let Some(prefix) = path.get(..expected.len()) else {
+        return None;
+    };
+    let endpoint = &path[expected.len()..];
+    if !prefix.eq_ignore_ascii_case(&expected)
+        || endpoint.is_empty()
+        || endpoint == "."
+        || endpoint == ".."
+        || !endpoint
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+
+    let mut source_seen = false;
+    let mut session_seen = false;
+    if let Some(query) = url.split_once('?').map(|(_, query)| query) {
+        for field in query.split('&') {
+            let (key, value) = field.split_once('=').unwrap_or((field, ""));
+            let key = decode_query_component(key)?;
+            let value = decode_query_component(value)?;
+            if key.eq_ignore_ascii_case("MediaSourceId") {
+                if source_seen || media_source_id != Some(value.as_str()) {
+                    return None;
+                }
+                source_seen = true;
+            } else if key.eq_ignore_ascii_case("PlaySessionId") {
+                if session_seen || play_session_id != Some(value.as_str()) {
+                    return None;
+                }
+                session_seen = true;
+            }
+        }
+    }
+
+    Some(format!("{}{}", trim_base(base_url), url))
+}
+
+fn decode_query_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'%' => {
+                let high = *bytes.get(cursor + 1)?;
+                let low = *bytes.get(cursor + 2)?;
+                decoded.push((hex_nibble(high)? << 4) | hex_nibble(low)?);
+                cursor += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                cursor += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                cursor += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -356,10 +441,22 @@ pub fn build_playback_decision(
             (url, Some(remux))
         }
         PlaybackMethod::Transcode => {
-            let url = source.transcoding_url.as_deref().map_or_else(
-                || transcode_url(base_url, item_id, sid, media_type, token, play_session_id),
-                |server_url| absolutize(base_url, server_url),
-            );
+            let url = source
+                .transcoding_url
+                .as_deref()
+                .and_then(|server_url| {
+                    admitted_transcoding_url(
+                        base_url,
+                        item_id,
+                        sid,
+                        media_type,
+                        play_session_id,
+                        server_url,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    transcode_url(base_url, item_id, sid, media_type, token, play_session_id)
+                });
             (url, Some("ts".to_string()))
         }
     };
@@ -587,6 +684,72 @@ mod tests {
         assert_eq!(
             d.url,
             "https://jelly.mesh:8096/videos/movie-3/main.m3u8?api_key=SRV&x=1"
+        );
+    }
+
+    #[test]
+    fn hostile_transcode_url_cannot_escape_selected_server_or_item_authority() {
+        for hostile_url in [
+            "https://attacker.invalid/Videos/movie-3/main.m3u8?api_key=STOLEN",
+            "/Videos/movie-else/main.m3u8?api_key=STALE",
+            "//attacker.invalid/Videos/movie-3/main.m3u8?api_key=STOLEN",
+        ] {
+            let mut src = source("mkv", &["vp9"], &["aac"]);
+            src.transcoding_url = Some(hostile_url.into());
+            let d = build_playback_decision(
+                "https://jelly.mesh:8096",
+                "movie-3",
+                &src,
+                &caps(),
+                StreamMediaType::Video,
+                Some("SELECTED_TOKEN"),
+                Some("selected-session"),
+            );
+
+            assert!(d
+                .url
+                .starts_with("https://jelly.mesh:8096/Videos/movie-3/main.m3u8?"));
+            assert!(d.url.contains("api_key=SELECTED_TOKEN"));
+            assert!(d.url.contains("playSessionId=selected-session"));
+            assert!(!d.url.contains("attacker.invalid"));
+            assert!(!d.url.contains("movie-else"));
+            assert!(!d.url.contains("STOLEN"));
+            assert!(!d.url.contains("STALE"));
+        }
+    }
+
+    #[test]
+    fn stale_transcode_generation_cannot_relabel_media_source_or_play_session() {
+        let mut src = source("mkv", &["vp9"], &["aac"]);
+        src.id = Some("source-after-restart".into());
+        src.transcoding_url = Some(
+            "/Videos/movie-3/main.m3u8?MediaSourceId=source-before-restart&PlaySessionId=session-before-restart"
+                .into(),
+        );
+
+        let decision = build_playback_decision(
+            "https://jelly.mesh:8096",
+            "movie-3",
+            &src,
+            &caps(),
+            StreamMediaType::Video,
+            Some("CURRENT_TOKEN"),
+            Some("session-after-restart"),
+        );
+
+        assert!(decision
+            .url
+            .starts_with("https://jelly.mesh:8096/Videos/movie-3/main.m3u8?"));
+        assert!(decision.url.contains("mediaSourceId=source-after-restart"));
+        assert!(decision.url.contains("playSessionId=session-after-restart"));
+        assert!(!decision.url.contains("before-restart"));
+        assert_eq!(
+            decision.media_source_id.as_deref(),
+            Some("source-after-restart")
+        );
+        assert_eq!(
+            decision.play_session_id.as_deref(),
+            Some("session-after-restart")
         );
     }
 

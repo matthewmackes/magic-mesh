@@ -15,9 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::device_inventory::{self, DeviceInventory, DeviceStatus};
 use mackes_mesh_types::health::{
-    action_result_topic, fold_snapshot, node_health_topic, GradeFactors, HealthAction,
-    HealthActionOutcome, HealthActionRequest, HealthActionResult, HealthComponent, HealthCondition,
-    HealthEvidence, HealthRemediation, HealthScope, HealthSeverity, NodeGrade, NodeHealthState,
+    action_result_topic, fold_snapshot_with_availability, node_health_topic, GradeFactors,
+    HealthAction, HealthActionOutcome, HealthActionRequest, HealthActionResult, HealthComponent,
+    HealthCondition, HealthEvidence, HealthRemediation, HealthScope, HealthSeverity,
+    NodeAvailabilityAssessment, NodeAvailabilityPolicy, NodeGrade, NodeHealthState,
     RequirementClass, SystemMeshHealthSnapshot, ACTION_TOPIC, CRITICAL_NOTIFY_TOPIC,
     HEALTH_SCHEMA_VERSION, SNAPSHOT_TOPIC,
 };
@@ -25,6 +26,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
 
+use super::node_availability::read_runtime_availability_intent;
 use super::{ShutdownToken, Worker};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -49,6 +51,11 @@ const HEALTH_PUBLICATION_HEARTBEAT_MS: u64 = 60_000;
 // Keep the folded snapshot file and Bus projection fresh without rewriting
 // them for every 10-second sample. This remains below SNAPSHOT_VALIDITY_MS.
 const SNAPSHOT_PUBLICATION_HEARTBEAT_MS: u64 = 15_000;
+// Resolved conditions are history, not current materialized health. Keep the
+// producer's durable row inside the fleet-wide privacy epoch so restart and
+// Syncthing replication cannot republish an incident after its retention
+// window. The inclusive boundary gives every record its complete six hours.
+const HEALTH_HISTORY_RETENTION_MS: u64 = 6 * 60 * 60 * 1_000;
 const SUSTAINED_SAMPLES: usize = 3;
 const MAX_HEALTH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MESH_STATUS_PATH: &str = "/run/mde/mesh-status.json";
@@ -752,8 +759,27 @@ fn evaluate_conditions(
                 false,
             )],
         )),
+        Some(inventory) if inventory.host != host || inventory.published_at_ms > now_ms =>
+        {
+            conditions.push(condition(
+                host,
+                "device-evidence-invalid",
+                HealthComponent::Evidence,
+                "device-inventory",
+                HealthSeverity::Warning,
+                "Required device inventory evidence has invalid node or time provenance.",
+                now_ms,
+                vec![remediation(
+                    host,
+                    HealthAction::RefreshProvider,
+                    generation,
+                    "Refresh the bounded hardware inventory provider.",
+                    false,
+                )],
+            ));
+        }
         Some(inventory)
-            if now_ms.saturating_sub(inventory.published_at_ms) > DEVICE_INVENTORY_VALIDITY_MS =>
+            if now_ms - inventory.published_at_ms > DEVICE_INVENTORY_VALIDITY_MS =>
         {
             conditions.push(condition(
                 host,
@@ -856,7 +882,7 @@ fn factor_from_headroom(
     })
 }
 
-fn factors(observations: &HealthObservations) -> GradeFactors {
+fn factors(host: &str, observations: &HealthObservations, now_ms: u64) -> GradeFactors {
     GradeFactors {
         cpu: factor_from_headroom(observations.resources.cpu_load_ratio, 0.50, 0.75, false),
         memory: factor_from_headroom(
@@ -883,23 +909,31 @@ fn factors(observations: &HealthObservations) -> GradeFactors {
                 80
             },
         ),
-        devices: observations.device_inventory.as_ref().map(|inventory| {
-            if inventory
-                .categories
-                .iter()
-                .flat_map(|category| &category.devices)
-                .any(|device| {
-                    matches!(
-                        device.status,
-                        DeviceStatus::Disabled | DeviceStatus::Degraded
-                    )
-                })
-            {
-                80
-            } else {
-                100
-            }
-        }),
+        devices: observations
+            .device_inventory
+            .as_ref()
+            .filter(|inventory| {
+                inventory.host == host
+                    && inventory.published_at_ms <= now_ms
+                    && now_ms - inventory.published_at_ms <= DEVICE_INVENTORY_VALIDITY_MS
+            })
+            .map(|inventory| {
+                if inventory
+                    .categories
+                    .iter()
+                    .flat_map(|category| &category.devices)
+                    .any(|device| {
+                        matches!(
+                            device.status,
+                            DeviceStatus::Disabled | DeviceStatus::Degraded
+                        )
+                    })
+                {
+                    80
+                } else {
+                    100
+                }
+            }),
     }
 }
 
@@ -1258,6 +1292,22 @@ fn read_state(path: &Path) -> Option<NodeHealthState> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// Admit the producer's durable row only as its own restart generation.
+///
+/// The canonical directory is replicated, so the filename alone cannot prove
+/// that a row belongs to this producer. Validate the complete row at its
+/// publication instant (which still permits a truthful expired row after a
+/// long restart), bind it to the expected publisher, and reject observations
+/// from ahead of the local clock before they can seed generation or lifecycle
+/// state.
+fn read_restart_state(path: &Path, publisher: &str, now_ms: u64) -> Option<NodeHealthState> {
+    let state = read_state(path)?;
+    (state.publisher == publisher
+        && state.published_at_ms <= now_ms
+        && state.validate_at(state.published_at_ms).is_ok())
+    .then_some(state)
+}
+
 #[must_use]
 fn read_canonical_states(workgroup_root: &Path) -> Vec<NodeHealthState> {
     let Ok(entries) = std::fs::read_dir(node_dir(workgroup_root)) else {
@@ -1277,12 +1327,69 @@ fn read_canonical_states(workgroup_root: &Path) -> Vec<NodeHealthState> {
         .collect()
 }
 
+fn availability_assessments(
+    workgroup_root: &Path,
+    canonical_nodes: &BTreeSet<String>,
+    now_ms: u64,
+) -> BTreeMap<String, NodeAvailabilityAssessment> {
+    canonical_nodes
+        .iter()
+        .filter_map(|node| {
+            let intent = read_runtime_availability_intent(workgroup_root, node)
+                .ok()
+                .flatten()?;
+            let assessment = NodeAvailabilityPolicy::for_device_class(intent.device_class).assess(
+                Some(&intent),
+                now_ms,
+                None,
+            );
+            matches!(
+                assessment,
+                NodeAvailabilityAssessment::ExpectedAbsence
+                    | NodeAvailabilityAssessment::WarningMissedReturn
+                    | NodeAvailabilityAssessment::CriticalMissedReturn
+            )
+            .then(|| (node.clone(), assessment))
+        })
+        .collect()
+}
+
+fn fold_health_snapshot(
+    workgroup_root: &Path,
+    observer: &str,
+    roster_revision: String,
+    canonical_nodes: &BTreeSet<String>,
+    publications: Vec<NodeHealthState>,
+    generation: u64,
+    now_ms: u64,
+    reachable_lighthouses: usize,
+) -> SystemMeshHealthSnapshot {
+    let availability = availability_assessments(workgroup_root, canonical_nodes, now_ms);
+    fold_snapshot_with_availability(
+        observer,
+        roster_revision,
+        canonical_nodes,
+        publications,
+        &availability,
+        generation,
+        now_ms,
+        SNAPSHOT_VALIDITY_MS,
+        reachable_lighthouses,
+    )
+}
+
 fn merge_lifecycle(
     previous: Option<&NodeHealthState>,
     current: &mut [HealthCondition],
     now_ms: u64,
 ) -> Vec<HealthCondition> {
     let mut resolved = previous.map_or_else(Vec::new, |state| state.resolved_conditions.clone());
+    resolved.retain(|condition| {
+        condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
+            resolved_at_ms <= now_ms
+                && now_ms.saturating_sub(resolved_at_ms) <= HEALTH_HISTORY_RETENTION_MS
+        })
+    });
     // Own the ids so the lifecycle pass can mutate `current` while it compares
     // the previous active set. Borrowing `&str` here would keep an immutable
     // borrow of the entire slice alive through `iter_mut()`.
@@ -1306,7 +1413,10 @@ fn merge_lifecycle(
             if !current_ids.contains(old.id.as_str()) {
                 let mut closed = old.clone();
                 closed.resolved_at_ms = Some(now_ms);
-                closed.last_observed_ms = now_ms;
+                // The recovery sample proves that the condition is absent; it
+                // does not prove that the condition remained present until
+                // this instant. Preserve the final positive observation so
+                // history durations do not silently absorb the detection gap.
                 resolved.push(closed);
             }
         }
@@ -1849,6 +1959,7 @@ impl NodeGradeWorker {
         let messages = persist
             .list_since(&topic, None)
             .map_err(|error| format!("action result lane {topic} unreadable: {error}"))?;
+        let mut exact_result_found = false;
         for message in messages {
             let body = message
                 .body
@@ -1856,11 +1967,20 @@ impl NodeGradeWorker {
                 .ok_or_else(|| format!("action result lane {topic} contains an empty row"))?;
             let published: HealthActionResult = serde_json::from_str(body)
                 .map_err(|error| format!("action result lane {topic} is invalid: {error}"))?;
+            published
+                .validate_at(now_ms())
+                .map_err(|error| format!("action result lane {topic} is invalid: {error}"))?;
             if published.audit_id == result.audit_id {
-                return Ok(true);
+                if published != *result {
+                    return Err(format!(
+                        "action result lane {topic} contains a conflicting body for audit id {}",
+                        result.audit_id
+                    ));
+                }
+                exact_result_found = true;
             }
         }
-        Ok(false)
+        Ok(exact_result_found)
     }
 
     fn publish_action_result(
@@ -1868,6 +1988,10 @@ impl NodeGradeWorker {
         persist: &mut Persist,
         staged: &StagedActionResult,
     ) -> Result<(), String> {
+        staged
+            .result
+            .validate_at(now_ms())
+            .map_err(|error| format!("action result publication refused: {error}"))?;
         if !staged.already_published {
             let topic = action_result_topic(&staged.result.request_id);
             let body = serde_json::to_string(&staged.result).map_err(|error| error.to_string())?;
@@ -1953,6 +2077,9 @@ impl NodeGradeWorker {
                     (source_ulid, result, Some(complete))
                 }
             };
+            result
+                .validate_at(now_ms())
+                .map_err(|error| format!("action result journal is invalid: {error}"))?;
             let already_published = Self::action_result_published(persist, &result)?;
             staged.push(StagedActionResult {
                 source_ulid,
@@ -2032,7 +2159,7 @@ impl NodeGradeWorker {
     ) -> Result<SystemMeshHealthSnapshot, String> {
         let now = now_ms();
         let path = node_dir(&self.workgroup_root).join(format!("{}.json", self.host));
-        let previous = read_state(&path);
+        let previous = read_restart_state(&path, &self.host, now);
         // The in-memory counter used to restart at zero. Durable ingress then
         // rejected every post-restart publication until the counter caught up
         // with its retained high-water mark (hours on a long-running seat).
@@ -2055,7 +2182,7 @@ impl NodeGradeWorker {
         pressure.observe(observations.resources);
         let mut active = evaluate_conditions(&self.host, &observations, &pressure, generation, now);
         let resolved = merge_lifecycle(previous.as_ref(), &mut active, now);
-        let grade_factors = factors(&observations);
+        let grade_factors = factors(&self.host, &observations, now);
         let grade = NodeGrade::evaluate(
             &self.host,
             capability_score(grade_factors),
@@ -2101,14 +2228,14 @@ impl NodeGradeWorker {
         let mut publications = read_canonical_states(&self.workgroup_root);
         publications.retain(|published| published.publisher != self.host);
         publications.push(state.clone());
-        let snapshot = fold_snapshot(
+        let snapshot = fold_health_snapshot(
+            &self.workgroup_root,
             &self.host,
             observations.roster_revision,
             &observations.canonical_nodes,
             publications,
             generation,
             now,
-            SNAPSHOT_VALIDITY_MS,
             observations.reachable_lighthouses,
         );
         let snapshot_key = snapshot_publication_key(&snapshot);
@@ -2199,7 +2326,7 @@ impl NodeGradeWorker {
             let rows = persist
                 .list_since(&topic, None)
                 .map_err(|error| format!("action result lane {topic} unreadable: {error}"))?;
-            let mut result_already_published = false;
+            let mut published_result = None;
             for row in rows {
                 let body = row
                     .body
@@ -2207,12 +2334,33 @@ impl NodeGradeWorker {
                     .ok_or_else(|| format!("action result lane {topic} contains an empty row"))?;
                 let result: HealthActionResult = serde_json::from_str(body)
                     .map_err(|error| format!("action result lane {topic} is invalid: {error}"))?;
-                result_already_published |= result.audit_id == audit_id;
+                result
+                    .validate_at(now_ms())
+                    .map_err(|error| format!("action result lane {topic} is invalid: {error}"))?;
+                if result.audit_id == audit_id {
+                    if result.request_id != request.request_id
+                        || result.condition_id != request.condition_id
+                        || result.action != request.action
+                    {
+                        return Err(format!(
+                            "action result lane {topic} contains a conflicting request body for audit id {audit_id}"
+                        ));
+                    }
+                    if published_result
+                        .as_ref()
+                        .is_some_and(|published| published != &result)
+                    {
+                        return Err(format!(
+                            "action result lane {topic} contains conflicting bodies for audit id {audit_id}"
+                        ));
+                    }
+                    published_result = Some(result);
+                }
             }
             staged.push(StagedActionMessage::Request {
                 source_ulid: message.ulid,
                 request,
-                result_already_published,
+                result_already_published: published_result.is_some(),
             });
         }
         Ok(staged)
@@ -2406,6 +2554,9 @@ impl NodeGradeWorker {
                 snapshot_generation: result_generation,
                 refreshed_evidence,
             };
+            result
+                .validate_at(now_ms())
+                .map_err(|error| format!("action result generation refused: {error}"))?;
             let complete = DurableHealthAction::Complete {
                 source_ulid: source_ulid.clone(),
                 result: result.clone(),
@@ -2544,6 +2695,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::health::fold_snapshot;
 
     #[derive(Clone)]
     struct FixtureSampler(HealthObservations);
@@ -2612,6 +2764,170 @@ mod tests {
     }
 
     #[test]
+    fn resolution_preserves_last_positive_observation_before_recovery() {
+        let sample = observations("workstation");
+        let mut active = condition(
+            "node",
+            "root-space",
+            HealthComponent::Resources,
+            "root-filesystem",
+            HealthSeverity::Warning,
+            "Root filesystem utilization breached policy.",
+            100,
+            Vec::new(),
+        );
+        active.last_observed_ms = 140;
+        active.evidence.observed_at_ms = 140;
+        let previous = NodeHealthState {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            publisher: "node".into(),
+            roster_revision: "r1".into(),
+            generation: 7,
+            published_at_ms: 150,
+            valid_until_ms: 270,
+            grade: NodeGrade::evaluate(
+                "node",
+                100,
+                factors("node", &sample, 150),
+                std::slice::from_ref(&active),
+                150,
+            ),
+            active_conditions: vec![active],
+            resolved_conditions: Vec::new(),
+        };
+
+        let resolved = merge_lifecycle(Some(&previous), &mut [], 200);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].last_observed_ms, 140);
+        assert_eq!(resolved[0].evidence.observed_at_ms, 140);
+        assert_eq!(resolved[0].resolved_at_ms, Some(200));
+    }
+
+    #[test]
+    fn restart_prunes_resolved_history_outside_the_six_hour_privacy_epoch() {
+        let now = HEALTH_HISTORY_RETENTION_MS.saturating_add(10_000);
+        let sample = observations("workstation");
+        let resolved_condition = |id: &str, resolved_at_ms: u64| {
+            let mut condition = condition(
+                "node",
+                id,
+                HealthComponent::Resources,
+                "history-fixture",
+                HealthSeverity::Warning,
+                "Resolved history fixture.",
+                resolved_at_ms.saturating_sub(1),
+                Vec::new(),
+            );
+            condition.last_observed_ms = resolved_at_ms.saturating_sub(1);
+            condition.evidence.observed_at_ms = resolved_at_ms.saturating_sub(1);
+            condition.resolved_at_ms = Some(resolved_at_ms);
+            condition
+        };
+        let previous = NodeHealthState {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            publisher: "node".into(),
+            roster_revision: "r1".into(),
+            generation: 7,
+            published_at_ms: now.saturating_sub(1),
+            valid_until_ms: now.saturating_add(PUBLICATION_VALIDITY_MS),
+            grade: NodeGrade::evaluate("node", 100, factors("node", &sample, now), &[], now),
+            active_conditions: Vec::new(),
+            resolved_conditions: vec![
+                resolved_condition("recent", now.saturating_sub(1_000)),
+                resolved_condition("inclusive-boundary", now - HEALTH_HISTORY_RETENTION_MS),
+                resolved_condition(
+                    "expired",
+                    now.saturating_sub(HEALTH_HISTORY_RETENTION_MS.saturating_add(1)),
+                ),
+                resolved_condition("future", now.saturating_add(1)),
+            ],
+        };
+
+        let retained = merge_lifecycle(Some(&previous), &mut [], now);
+        let retained_ids: BTreeSet<_> = retained
+            .iter()
+            .map(|condition| condition.id.as_str())
+            .collect();
+
+        assert_eq!(
+            retained_ids,
+            BTreeSet::from(["node:inclusive-boundary", "node:recent"]),
+            "restart must not carry expired, unresolved, or future-dated history into a fresh authority row"
+        );
+    }
+
+    #[test]
+    fn declared_seat_absence_escalates_only_after_its_return_deadline() {
+        use super::super::node_availability::runtime_availability_path;
+        use mackes_mesh_types::health::{
+            ExpectedReturn, NodeAvailabilityIntent, NodeAvailabilityState, NodeConnectionType,
+            NodeDeviceClass, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+        };
+
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let node = "seat-remote";
+        let intent = NodeAvailabilityIntent {
+            schema_version: NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+            node_id: node.into(),
+            device_id: "seat-remote-device".into(),
+            device_class: NodeDeviceClass::Laptop,
+            connection_type: NodeConnectionType::Wifi,
+            state: NodeAvailabilityState::Sleeping,
+            reason: "local seat suspend".into(),
+            source: "host-state".into(),
+            event_id: "sleep-1".into(),
+            generation: 1,
+            observed_at_ms: 1_000,
+            expires_at_ms: 500_000,
+            expected_return: Some(ExpectedReturn::new(31_000)),
+            old_connectivity: None,
+            new_connectivity: None,
+        };
+        write_json_atomic(&runtime_availability_path(workgroup.path(), node), &intent)
+            .expect("write lifecycle intent");
+        let canonical = BTreeSet::from([node.to_string()]);
+        let fold_at = |now_ms| {
+            fold_health_snapshot(
+                workgroup.path(),
+                "observer",
+                "r1".into(),
+                &canonical,
+                Vec::new(),
+                1,
+                now_ms,
+                1,
+            )
+        };
+
+        let expected = fold_at(40_000);
+        assert_eq!(expected.active_conditions.len(), 1);
+        assert_eq!(
+            expected.active_conditions[0].severity,
+            HealthSeverity::Warning
+        );
+        assert_eq!(
+            expected.active_conditions[0].requirement,
+            RequirementClass::Informational
+        );
+        assert_ne!(expected.active_conditions[0].id, "mesh:publisher-freshness");
+
+        let warning = fold_at(91_000);
+        assert_eq!(warning.active_conditions.len(), 1);
+        assert_eq!(
+            warning.active_conditions[0].severity,
+            HealthSeverity::Warning
+        );
+
+        let critical = fold_at(331_000);
+        assert_eq!(critical.active_conditions.len(), 1);
+        assert_eq!(
+            critical.active_conditions[0].severity,
+            HealthSeverity::Critical
+        );
+    }
+
+    #[test]
     fn audio_probe_requires_all_bounded_provider_bits() {
         assert_eq!(
             parse_audio_probe("graph=1 pulse=0 wireplumber=1 playback=1 capture=0\n"),
@@ -2638,7 +2954,30 @@ mod tests {
         assert!(
             evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100).is_empty()
         );
-        assert_eq!(factors(&sample).system, Some(100));
+        assert_eq!(factors("node", &sample, 100).system, Some(100));
+    }
+
+    #[test]
+    fn future_device_inventory_cannot_publish_an_a_grade() {
+        let now = 1_000;
+        let mut sample = observations("workstation");
+        sample.device_inventory.as_mut().unwrap().published_at_ms = now + 1;
+
+        let conditions =
+            evaluate_conditions("node", &sample, &PressureWindow::default(), 1, now);
+        let grade_factors = factors("node", &sample, now);
+        let grade = NodeGrade::evaluate(
+            "node",
+            capability_score(grade_factors),
+            grade_factors,
+            &conditions,
+            now,
+        );
+
+        assert_eq!(grade.factors.devices, None);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].id, "node:device-evidence-invalid");
+        assert_eq!(grade.grade, mackes_mesh_types::health::GradeLetter::D);
     }
 
     #[test]
@@ -2717,7 +3056,7 @@ mod tests {
         }
         assert!(evaluate_conditions("node", &sample, &pressure, 1, 100).is_empty());
         assert_eq!(
-            NodeGrade::evaluate("node", 70, factors(&sample), &[], 100)
+            NodeGrade::evaluate("node", 70, factors("node", &sample, 100), &[], 100)
                 .grade
                 .as_str(),
             "C"
@@ -2737,7 +3076,7 @@ mod tests {
             .iter()
             .any(|condition| condition.id == "node:workstation-audio"));
         assert_eq!(
-            NodeGrade::evaluate("node", 99, factors(&sample), &conditions, 100).grade,
+            NodeGrade::evaluate("node", 99, factors("node", &sample, 100), &conditions, 100).grade,
             mackes_mesh_types::health::GradeLetter::E
         );
     }
@@ -2901,7 +3240,13 @@ mod tests {
             generation: 1,
             published_at_ms: 100,
             valid_until_ms: 200,
-            grade: NodeGrade::evaluate("node", 100, factors(&sample), &[], 100),
+            grade: NodeGrade::evaluate(
+                "node",
+                100,
+                factors("node", &sample, 100),
+                &[],
+                100,
+            ),
             active_conditions: Vec::new(),
             resolved_conditions: Vec::new(),
         };
@@ -2923,7 +3268,7 @@ mod tests {
             generation: 136,
             published_at_ms: now.saturating_sub(1),
             valid_until_ms: now.saturating_add(PUBLICATION_VALIDITY_MS),
-            grade: NodeGrade::evaluate("node", 100, factors(&sample), &[], now),
+            grade: NodeGrade::evaluate("node", 100, factors("node", &sample, now), &[], now),
             active_conditions: Vec::new(),
             resolved_conditions: Vec::new(),
         };
@@ -2958,6 +3303,68 @@ mod tests {
             "a restarted producer must immediately clear the retained ingress high-water"
         );
         assert!(recovered.generation > stale_counter.generation);
+    }
+
+    #[test]
+    fn foreign_restart_row_cannot_seed_local_health_generation_or_lifecycle() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let nodes = node_dir(workgroup.path());
+        std::fs::create_dir_all(&nodes).unwrap();
+        let published_at_ms = now_ms().saturating_sub(1);
+        let mut foreign_sample = observations("workstation");
+        foreign_sample.device_inventory.as_mut().unwrap().host = "foreign-node".into();
+        foreign_sample
+            .device_inventory
+            .as_mut()
+            .unwrap()
+            .published_at_ms = published_at_ms;
+        let foreign_condition = condition(
+            "foreign-node",
+            "fabricated-critical",
+            HealthComponent::Evidence,
+            "replicated-replacement",
+            HealthSeverity::Critical,
+            "A foreign producer replaced the local canonical filename.",
+            published_at_ms,
+            Vec::new(),
+        );
+        let foreign = NodeHealthState {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            publisher: "foreign-node".into(),
+            roster_revision: "r1".into(),
+            generation: published_at_ms,
+            published_at_ms,
+            valid_until_ms: published_at_ms.saturating_add(PUBLICATION_VALIDITY_MS),
+            grade: NodeGrade::evaluate(
+                "foreign-node",
+                100,
+                factors("foreign-node", &foreign_sample, published_at_ms),
+                std::slice::from_ref(&foreign_condition),
+                published_at_ms,
+            ),
+            active_conditions: vec![foreign_condition],
+            resolved_conditions: Vec::new(),
+        };
+        assert!(foreign.validate_at(published_at_ms).is_ok());
+        write_json_atomic(&nodes.join("node.json"), &foreign).unwrap();
+
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = action_test_worker(workgroup.path(), bus.path());
+        let snapshot = worker.cycle(Some(&mut persist)).unwrap();
+        let recovered = read_state(&nodes.join("node.json")).unwrap();
+
+        assert_eq!(recovered.publisher, "node");
+        assert_eq!(recovered.generation, 1);
+        assert!(
+            recovered.resolved_conditions.is_empty(),
+            "foreign lifecycle state must not be rewritten as local resolved history"
+        );
+        assert!(recovered.validate_at(now_ms()).is_ok());
+        assert!(snapshot
+            .current_node_grades
+            .iter()
+            .any(|grade| grade.node == "node"));
     }
 
     #[test]
@@ -3406,6 +3813,135 @@ mod tests {
             serde_json::from_str(results[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(result.outcome, HealthActionOutcome::Applied);
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn conflicting_same_audit_result_cannot_acknowledge_restart_replay() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = action_test_worker(workgroup.path(), bus.path());
+        let snapshot = worker.cycle(Some(&mut persist)).unwrap();
+        let request = acknowledge_request(&snapshot, "conflicting-replay-result");
+        let message = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request).unwrap()),
+            )
+            .unwrap();
+        let result = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            condition_id: request.condition_id.clone(),
+            action: request.action,
+            outcome: HealthActionOutcome::Applied,
+            detail: "genuine durable action result".into(),
+            audit_id: format!("health:node:{}", message.ulid),
+            completed_at_ms: now_ms(),
+            snapshot_generation: snapshot.generation,
+            refreshed_evidence: None,
+        };
+        let record = DurableHealthAction::Complete {
+            source_ulid: message.ulid.clone(),
+            result: result.clone(),
+        };
+        worker
+            .store_action_journal(&message.ulid, &record)
+            .unwrap();
+        let conflicting = HealthActionResult {
+            detail: "hostile conflicting result".into(),
+            ..result.clone()
+        };
+        persist
+            .write(
+                &action_result_topic(&request.request_id),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&conflicting).unwrap()),
+            )
+            .unwrap();
+        let journal_path = action_journal_path(&worker.action_state_root, &message.ulid);
+        let trusted_uid = worker.trusted_action_owner_uid();
+        drop(worker);
+
+        let mut restarted = action_test_worker(workgroup.path(), bus.path());
+        restarted.cycle(Some(&mut persist)).unwrap();
+        let error = restarted.drain_actions(&mut persist).unwrap_err();
+
+        assert!(error.contains("conflicting body for audit id"), "{error}");
+        assert_eq!(restarted.action_execution_count, 0);
+        assert_eq!(restarted.action_cursor, None);
+        assert_eq!(
+            read_action_journal(
+                &restarted.action_state_root,
+                &journal_path,
+                trusted_uid
+            )
+            .unwrap(),
+            Some(record),
+            "a conflicting Bus row must not discard the genuine durable result"
+        );
+        let rows = persist
+            .list_since(&action_result_topic(&request.request_id), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<HealthActionResult>(rows[0].body.as_deref().unwrap()).unwrap(),
+            conflicting
+        );
+    }
+
+    #[test]
+    fn invalid_action_result_cannot_publish_or_satisfy_replay() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let worker = action_test_worker(workgroup.path(), bus.path());
+        let request_id = "invalid-result";
+        let valid = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request_id.into(),
+            condition_id: "node:required-service-workbench".into(),
+            action: HealthAction::Acknowledge,
+            outcome: HealthActionOutcome::Applied,
+            detail: "acknowledgement completed".into(),
+            audit_id: "health:node:01J00000000000000000000001".into(),
+            completed_at_ms: now_ms(),
+            snapshot_generation: 1,
+            refreshed_evidence: None,
+        };
+        let staged = StagedActionResult {
+            source_ulid: "01J00000000000000000000001".into(),
+            result: HealthActionResult {
+                detail: "x".repeat(mackes_mesh_types::health::MAX_HEALTH_TEXT_BYTES + 1),
+                ..valid.clone()
+            },
+            complete: None,
+            already_published: false,
+        };
+
+        assert!(worker
+            .publish_action_result(&mut persist, &staged)
+            .is_err());
+        let topic = action_result_topic(request_id);
+        assert!(persist.list_since(&topic, None).unwrap().is_empty());
+
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("untrusted_extension".into(), serde_json::json!(true));
+        persist
+            .write(
+                &topic,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&unknown).unwrap()),
+            )
+            .unwrap();
+        assert!(NodeGradeWorker::action_result_published(&mut persist, &valid).is_err());
     }
 
     #[test]

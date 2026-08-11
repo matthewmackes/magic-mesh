@@ -144,9 +144,16 @@ verify_desktop_chain() {
         'exec /usr/local/libexec/mcnf-browser-vm-runtime' ] \
         || fail "xrdp startwm does not remain attached to the Browser runtime"
 
+    has_active_line "$runtime" 'PATH=/usr/sbin:/usr/bin' \
+        || fail "runtime does not pin executable lookup to the immutable guest image"
+    has_active_line "$runtime" 'export PATH' \
+        || fail "runtime does not export its image-owned executable lookup path"
     has_active_line "$runtime" \
-        'chromium_bin=$(command -v chromium || command -v chromium-browser || true)' \
-        || fail "runtime does not resolve the image-owned Chromium binary"
+        'for candidate in /usr/bin/chromium /usr/bin/chromium-browser; do' \
+        || fail "runtime does not select Chromium from fixed image-owned entrypoints"
+    if active_code_contains "$runtime" 'command -v chromium'; then
+        fail "runtime still permits environment-directed Chromium lookup"
+    fi
     verify_foreground_bootstrap "$runtime"
     verify_sway_chromium_block "$runtime"
     has_active_line "$runtime" \
@@ -490,6 +497,15 @@ self_test() {
     sed -i 's/ --force-prefers-reduced-motion//' \
         "$source_fixture/mcnf-browser-vm-runtime.sh"
     expect_rejected 'source with mutated Chromium runtime flags' \
+        verify_source "$source_fixture"
+
+    # Hostile regression: an xrdp-provided PATH must never redirect the guest
+    # runtime to a host-provisioned Browser/helper executable after restart.
+    cp "$script_dir/mcnf-browser-vm-runtime.sh" \
+        "$source_fixture/mcnf-browser-vm-runtime.sh"
+    sed -i 's#^PATH=/usr/sbin:/usr/bin$#PATH=/tmp/host-browser-bin:/usr/sbin:/usr/bin#' \
+        "$source_fixture/mcnf-browser-vm-runtime.sh"
+    expect_rejected 'runtime with a host-directed executable search path' \
         verify_source "$source_fixture"
 
     cp "$script_dir/mcnf-browser-vm-runtime.sh" \

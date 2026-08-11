@@ -236,6 +236,11 @@ pub enum CollabError {
     /// A blob referenced by digest is not present in the store.
     #[error("blob {0} not found")]
     BlobNotFound(String),
+    /// A durable actor log already contains this event id with different
+    /// signed contents. Exact replay is idempotent; conflicting reuse is an
+    /// authority violation and must never be hidden as a duplicate.
+    #[error("actor log event {0} conflicts with the durable signed event")]
+    ConflictingEventId(EventId),
     /// A SQLite projection failure.
     #[error("projection sql error: {0}")]
     Sql(String),

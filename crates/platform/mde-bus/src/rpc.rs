@@ -64,6 +64,13 @@ pub const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// The `action/` namespace prefix every command topic must carry.
 pub const ACTION_PREFIX: &str = "action/";
 
+/// Distributed Clock commands are signed, revision-bound contracts written by
+/// the dedicated Clock client/worker transport.  The generic opaque-body RPC
+/// helper must not become a second publication authority: accepting this
+/// namespace here would let a caller copy a retained signed command onto a
+/// different peer's topic without constructing a fresh target-specific action.
+const RESERVED_CLOCK_COMMAND_PREFIX: &str = "action/clock/command/";
+
 /// Reply topic for a request whose action message has ULID `ulid`:
 /// `reply/<ulid>`.
 #[must_use]
@@ -77,6 +84,8 @@ pub enum RpcError {
     /// The action topic didn't start with `action/`. Commands live
     /// in their own namespace so events + commands never collide.
     BadActionTopic(String),
+    /// A typed authority namespace was offered to the generic opaque RPC path.
+    ReservedActionTopic(String),
     /// A persist read/write failed.
     Persist(String),
     /// No reply landed on `reply/<ulid>` within the timeout.
@@ -97,6 +106,10 @@ impl std::fmt::Display for RpcError {
                 f,
                 "RPC action topic {t:?} must start with `action/` \
                  (e.g. action/meshfs/rebalance)",
+            ),
+            Self::ReservedActionTopic(t) => write!(
+                f,
+                "RPC action topic {t:?} is reserved for its typed authority transport",
             ),
             Self::Persist(e) => write!(f, "RPC persist: {e}"),
             Self::Timeout {
@@ -121,6 +134,7 @@ impl std::error::Error for RpcError {}
 ///
 /// # Errors
 /// [`RpcError::BadActionTopic`] for a non-`action/` topic;
+/// [`RpcError::ReservedActionTopic`] for a typed Clock command topic;
 /// [`RpcError::Persist`] on a write failure.
 pub fn publish_request(
     persist: &Persist,
@@ -131,6 +145,9 @@ pub fn publish_request(
 ) -> Result<String, RpcError> {
     if !action_topic.starts_with(ACTION_PREFIX) {
         return Err(RpcError::BadActionTopic(action_topic.to_string()));
+    }
+    if action_topic.starts_with(RESERVED_CLOCK_COMMAND_PREFIX) {
+        return Err(RpcError::ReservedActionTopic(action_topic.to_string()));
     }
     let msg = persist
         .write(action_topic, priority, title, body)
@@ -253,6 +270,27 @@ mod tests {
         let (_tmp, p) = persist();
         let r = publish_request(&p, "fleet/announce", Priority::Default, None, None);
         assert!(matches!(r, Err(RpcError::BadActionTopic(_))));
+    }
+
+    #[test]
+    fn generic_rpc_cannot_replay_retained_clock_command_to_foreign_peer() {
+        let (_tmp, p) = persist();
+        let foreign_topic = "action/clock/command/foreign-seat";
+        let retained_signed_body = r#"{"request_id":"retained-command","signature":"opaque"}"#;
+
+        let result = publish_request(
+            &p,
+            foreign_topic,
+            Priority::Default,
+            None,
+            Some(retained_signed_body),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RpcError::ReservedActionTopic(topic)) if topic == foreign_topic
+        ));
+        assert!(p.list_since(foreign_topic, None).unwrap().is_empty());
     }
 
     #[test]

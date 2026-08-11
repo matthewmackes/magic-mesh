@@ -340,6 +340,13 @@ pub enum ClipboardSessionConsentBoundaryError {
     Missing,
     /// A consent record exists, but it is explicitly disabled.
     Disabled,
+    /// The envelope was authored before the currently admitted consent epoch.
+    PredatesConsentEpoch {
+        /// Source-authored envelope timestamp.
+        envelope_timestamp_ms: u64,
+        /// Timestamp of the latest authenticated consent state change.
+        consent_updated_at_ms: u64,
+    },
     /// The shared consent contract rejected the record or its freshness.
     Admission(ClipboardSessionConsentValidationError),
     /// The bounded in-memory consent table has no free identity lane.
@@ -354,6 +361,13 @@ impl std::fmt::Display for ClipboardSessionConsentBoundaryError {
         match self {
             Self::Missing => formatter.write_str("no consent is admitted for the source session"),
             Self::Disabled => formatter.write_str("source-session clipboard consent is disabled"),
+            Self::PredatesConsentEpoch {
+                envelope_timestamp_ms,
+                consent_updated_at_ms,
+            } => write!(
+                formatter,
+                "clipboard envelope timestamp {envelope_timestamp_ms} predates consent epoch {consent_updated_at_ms}"
+            ),
             Self::Admission(error) => write!(formatter, "{error}"),
             Self::LedgerCapacityExceeded { max } => write!(
                 formatter,
@@ -367,7 +381,10 @@ impl std::error::Error for ClipboardSessionConsentBoundaryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Admission(error) => Some(error),
-            Self::Missing | Self::Disabled | Self::LedgerCapacityExceeded { .. } => None,
+            Self::Missing
+            | Self::Disabled
+            | Self::PredatesConsentEpoch { .. }
+            | Self::LedgerCapacityExceeded { .. } => None,
         }
     }
 }
@@ -1316,6 +1333,7 @@ impl ClipboardSessionConsentLedger {
             &envelope.source_node,
             &envelope.source_seat,
             &envelope.source_session,
+            envelope.timestamp_ms,
             now_ms,
         )
     }
@@ -1335,6 +1353,7 @@ impl ClipboardSessionConsentLedger {
             &source_node,
             &source_seat,
             &source_session,
+            envelope.created_unix_ms,
             now_ms,
         )
     }
@@ -1345,6 +1364,7 @@ impl ClipboardSessionConsentLedger {
         source_node: &str,
         source_seat: &str,
         source_session: &str,
+        envelope_timestamp_ms: u64,
         now_ms: u64,
     ) -> Result<(), ClipboardSessionConsentBoundaryError> {
         let Some(consent) = self.latest_by_identity.get(&key) else {
@@ -1355,6 +1375,16 @@ impl ClipboardSessionConsentLedger {
             .map_err(ClipboardSessionConsentBoundaryError::Admission)?;
         if !enabled {
             return Err(ClipboardSessionConsentBoundaryError::Disabled);
+        }
+        // A disable/re-enable transition starts a new authority epoch. Without
+        // this binding, a retained envelope authored under an older grant can
+        // become eligible again and disclose clipboard content after consent
+        // is restored for an unrelated later interaction.
+        if envelope_timestamp_ms < consent.updated_at_ms {
+            return Err(ClipboardSessionConsentBoundaryError::PredatesConsentEpoch {
+                envelope_timestamp_ms,
+                consent_updated_at_ms: consent.updated_at_ms,
+            });
         }
         Ok(())
     }
@@ -1939,10 +1969,17 @@ impl ClipboardSyncWorker {
     fn acknowledge_consent(
         cursor: &mut Option<String>,
         checkpoint: Option<&Path>,
+        ledger: &mut ClipboardSessionConsentLedger,
         ulid: &str,
     ) -> bool {
         if let Some(path) = checkpoint {
             if let Err(error) = write_consent_cursor(path, ulid) {
+                // Authorization precedes cursor persistence because verifying
+                // the signed command can consume replay state. If persistence
+                // fails, retain no in-memory grant: otherwise this tick could
+                // disclose clipboard content under authority that a restart
+                // cannot reconstruct or retry.
+                ledger.latest_by_identity.clear();
                 warn!(
                     target: "clipboard_sync",
                     ulid,
@@ -1982,7 +2019,7 @@ impl ClipboardSyncWorker {
                         error = %error,
                         "clipboard consent control rejected before authorization"
                     );
-                    if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                    if !Self::acknowledge_consent(cursor, checkpoint, ledger, &message.ulid) {
                         break;
                     }
                     continue;
@@ -2006,7 +2043,7 @@ impl ClipboardSyncWorker {
                     error = %error,
                     "clipboard consent control unauthorized"
                 );
-                if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                if !Self::acknowledge_consent(cursor, checkpoint, ledger, &message.ulid) {
                     break;
                 }
                 continue;
@@ -2018,12 +2055,12 @@ impl ClipboardSyncWorker {
                     error = %error,
                     "clipboard consent control failed ledger admission"
                 );
-                if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                if !Self::acknowledge_consent(cursor, checkpoint, ledger, &message.ulid) {
                     break;
                 }
                 continue;
             }
-            if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+            if !Self::acknowledge_consent(cursor, checkpoint, ledger, &message.ulid) {
                 break;
             }
             admitted += 1;
@@ -2091,7 +2128,9 @@ impl ClipboardSyncWorker {
                         error = %error,
                         "clipboard V2 envelope rejected"
                     );
-                    let _ = Self::acknowledge_v2(cursor, checkpoint, &message.ulid);
+                    if !Self::acknowledge_v2(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -2105,10 +2144,25 @@ impl ClipboardSyncWorker {
                     error = %error,
                     "clipboard V2 envelope withheld pending explicit fresh consent"
                 );
+                if matches!(
+                    error,
+                    ClipboardSessionConsentBoundaryError::PredatesConsentEpoch { .. }
+                ) {
+                    // Consent updates are strictly monotonic, so an envelope
+                    // from an older epoch can never become authorized later.
+                    // Retire it without pinning fresh content behind it.
+                    ledger.record(&envelope);
+                    if !Self::acknowledge_v2(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
+                    continue;
+                }
                 // Consent is an authenticated control lane. Leave this
                 // envelope unacknowledged and do not advance replay state so a
-                // later admitted update can authorize the same envelope.
-                continue;
+                // later admitted update can authorize the same envelope. Stop
+                // this ordered drain as well: acknowledging a later source's
+                // envelope would durably skip this row after restart.
+                break;
             }
             let fold = match fold_clipboard_envelope_v2(envelope.clone()) {
                 Ok(fold) => fold,
@@ -2124,7 +2178,9 @@ impl ClipboardSyncWorker {
                     // admission. Record its sequence even though this worker
                     // cannot currently preserve its representation.
                     ledger.record(&envelope);
-                    let _ = Self::acknowledge_v2(cursor, checkpoint, &message.ulid);
+                    if !Self::acknowledge_v2(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -2408,6 +2464,16 @@ impl ClipboardSyncWorker {
                     error = %error,
                     "collaboration clipboard V2 withheld pending explicit fresh consent"
                 );
+                if matches!(
+                    error,
+                    ClipboardSessionConsentBoundaryError::PredatesConsentEpoch { .. }
+                ) {
+                    ledger.record(&envelope);
+                    if !Self::acknowledge_collab_v2(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
+                    continue;
+                }
                 // Preserve ordering and retry eligibility: no later row may
                 // advance the cursor past a consent-withheld envelope.
                 break;
@@ -3036,6 +3102,104 @@ mod tests {
     }
 
     #[test]
+    fn reenabled_session_cannot_apply_clipboard_from_a_revoked_consent_epoch() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let stale = ClipboardEnvelopeV2::new_inline_text(
+            "node-a",
+            "seat-a",
+            "session-a",
+            1,
+            1_700_000_000_005,
+            vec!["text/plain".to_owned()],
+            "stale secret",
+            VdiClipboardText::new("stale secret").expect("bounded stale text"),
+            1_700_000_060_000,
+        )
+        .expect("valid stale envelope");
+        let fresh = ClipboardEnvelopeV2::new_inline_text(
+            "node-a",
+            "seat-a",
+            "session-a",
+            2,
+            1_700_000_000_021,
+            vec!["text/plain".to_owned()],
+            "fresh clipboard",
+            VdiClipboardText::new("fresh clipboard").expect("bounded fresh text"),
+            1_700_000_060_000,
+        )
+        .expect("valid fresh envelope");
+        for envelope in [&stale, &fresh] {
+            persist
+                .write(
+                    CLIPBOARD_ENVELOPE_V2_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(envelope).expect("encode envelope")),
+                )
+                .expect("publish envelope");
+        }
+
+        let initial = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-a",
+            true,
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        let disabled = initial
+            .update(false, 1_700_000_000_010, 1_700_000_060_000)
+            .expect("disable clipboard");
+        let reenabled = disabled
+            .update(true, 1_700_000_000_020, 1_700_000_060_000)
+            .expect("start new consent epoch");
+        let mut consent_ledger = ClipboardSessionConsentLedger::default();
+        consent_ledger
+            .admit(initial, 1_700_000_000_001)
+            .expect("admit initial consent");
+        consent_ledger
+            .admit(disabled, 1_700_000_000_011)
+            .expect("admit revocation");
+        consent_ledger
+            .admit(reenabled, 1_700_000_000_021)
+            .expect("admit later consent epoch");
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_target_seat("seat:eagle");
+        let checkpoint = v2_cursor_path(bus_dir.path());
+        let mut cursor = None;
+        let mut ledger = ClipboardEnvelopeV2Ledger::default();
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_021,
+            ),
+            1,
+            "only content authored in the current consent epoch may materialize"
+        );
+        let handoffs = persist
+            .list_since(CLIPBOARD_MATERIALIZATION_TOPIC, None)
+            .expect("list clipboard handoffs");
+        assert_eq!(handoffs.len(), 1, "revoked-epoch content must not leak");
+        let handoff: ClipboardMaterialization = serde_json::from_str(
+            handoffs[0]
+                .body
+                .as_deref()
+                .expect("fresh clipboard handoff body"),
+        )
+        .expect("decode fresh clipboard handoff");
+        assert_eq!(handoff.text.as_str(), "fresh clipboard");
+        assert_eq!(read_v2_cursor(&checkpoint), cursor);
+    }
+
+    #[test]
     fn consent_sweep_releases_expired_capacity_before_fresh_admission() {
         let history_dir = tempfile::tempdir().expect("history root");
         let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf());
@@ -3171,6 +3335,103 @@ mod tests {
             ledger.authorize_envelope(&v2_inline(2, &["text/plain"]), CONSENT_AUTH_NOW as u64 + 11),
             Err(ClipboardSessionConsentBoundaryError::Disabled)
         ));
+    }
+
+    #[test]
+    fn failed_consent_checkpoint_cannot_authorize_clipboard_before_or_after_restart() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let auth_dir = tempfile::tempdir().expect("auth root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_consent_authorizer(consent_authorizer(auth_dir.path()));
+        let enabled = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-a",
+            true,
+            CONSENT_AUTH_NOW as u64,
+            CONSENT_AUTH_NOW as u64 + 60_000,
+        );
+        let consent_message = persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_consent(
+                    &enabled,
+                    "consent-checkpoint-failure-000000000000000",
+                )),
+            )
+            .expect("publish signed enable");
+        let envelope = v2_inline(1, &["text/plain"]);
+        let envelope_message = persist
+            .write(
+                CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&envelope).expect("encode envelope")),
+            )
+            .expect("publish clipboard envelope");
+
+        let consent_checkpoint = consent_cursor_path(bus_dir.path());
+        let checkpoint_blocker = consent_checkpoint.with_extension("json.tmp");
+        std::fs::create_dir(&checkpoint_blocker).expect("block atomic consent checkpoint");
+        let mut consent_cursor = None;
+        let mut consent_ledger = ClipboardSessionConsentLedger::default();
+        assert_eq!(
+            worker.drain_clipboard_consents(
+                &mut persist,
+                &mut consent_cursor,
+                Some(&consent_checkpoint),
+                &mut consent_ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            0
+        );
+        assert!(consent_cursor.is_none());
+        assert!(matches!(
+            consent_ledger.authorize_envelope(&envelope, CONSENT_AUTH_NOW as u64 + 1),
+            Err(ClipboardSessionConsentBoundaryError::Missing)
+        ));
+
+        let mut envelope_cursor = None;
+        let mut envelope_ledger = ClipboardEnvelopeV2Ledger::default();
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut envelope_cursor,
+                Some(&v2_cursor_path(bus_dir.path())),
+                &mut envelope_ledger,
+                &consent_ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            0
+        );
+        assert!(envelope_cursor.is_none());
+        assert!(persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read materialization lane")
+            .is_none());
+
+        std::fs::remove_dir(&checkpoint_blocker).expect("repair checkpoint path");
+        let restarted = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .activate_bus(&persist, bus_dir.path(), CONSENT_AUTH_NOW as u64 + 2)
+            .expect("restart with repaired checkpoint path");
+        assert_eq!(
+            restarted.consent_cursor.as_deref(),
+            Some(consent_message.ulid.as_str())
+        );
+        assert_eq!(
+            restarted.v2_cursor.as_deref(),
+            Some(envelope_message.ulid.as_str())
+        );
+        assert!(persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read post-restart materialization lane")
+            .is_none());
     }
 
     #[test]
@@ -3435,6 +3696,185 @@ mod tests {
                 .expect("list V2 handoffs")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn v2_consent_withheld_row_blocks_later_authorized_cursor_advance() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let withheld = v2_inline(1, &["text/plain"]);
+        let later = ClipboardEnvelopeV2::new_inline_text(
+            "node-b",
+            "seat-b",
+            "session-b",
+            1,
+            1_700_000_000_000,
+            vec!["text/plain".to_owned()],
+            "later preview",
+            VdiClipboardText::new("later authorized").expect("bounded later text"),
+            1_700_000_060_000,
+        )
+        .expect("valid later V2 envelope");
+        for envelope in [&withheld, &later] {
+            let body = serde_json::to_string(envelope).expect("encode V2 envelope");
+            persist
+                .write(
+                    CLIPBOARD_ENVELOPE_V2_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&body),
+                )
+                .expect("publish ordered V2 envelope");
+        }
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_target_seat("seat:eagle");
+        let mut consent_ledger = ClipboardSessionConsentLedger::default();
+        consent_ledger
+            .admit(
+                v2_consent(
+                    "node-b",
+                    "seat-b",
+                    "session-b",
+                    true,
+                    1_700_000_000_000,
+                    1_700_000_060_000,
+                ),
+                1_700_000_000_001,
+            )
+            .expect("authorize only the later source");
+        let checkpoint = v2_cursor_path(bus_dir.path());
+        let mut cursor = None;
+        let mut ledger = ClipboardEnvelopeV2Ledger::default();
+
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_001,
+            ),
+            0
+        );
+        assert!(cursor.is_none(), "later row must not advance the cursor");
+        assert!(
+            !checkpoint.exists(),
+            "no durable checkpoint may leap over withheld consent"
+        );
+        assert!(
+            persist
+                .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+                .expect("read materialization lane")
+                .is_none(),
+            "later authorized payload must wait behind the withheld row"
+        );
+
+        consent_ledger
+            .admit(
+                v2_consent(
+                    "node-a",
+                    "seat-a",
+                    "session-a",
+                    true,
+                    1_700_000_000_000,
+                    1_700_000_060_000,
+                ),
+                1_700_000_000_001,
+            )
+            .expect("authorize the withheld source");
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_001,
+            ),
+            2,
+            "both rows materialize in original Bus order after consent arrives"
+        );
+        assert_eq!(
+            persist
+                .list_since(CLIPBOARD_MATERIALIZATION_TOPIC, None)
+                .expect("list ordered materializations")
+                .len(),
+            2
+        );
+        assert_eq!(read_v2_cursor(&checkpoint), cursor);
+    }
+
+    #[test]
+    fn v2_checkpoint_failure_stops_before_later_materialization() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        persist
+            .write(
+                CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some("not a clipboard envelope"),
+            )
+            .expect("publish terminal malformed envelope");
+        let body = serde_json::to_string(&v2_inline(1, &["text/plain"]))
+            .expect("encode valid V2 envelope");
+        persist
+            .write(
+                CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish later valid envelope");
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_target_seat("seat:eagle");
+        let mut consent_ledger = ClipboardSessionConsentLedger::default();
+        consent_ledger
+            .admit(
+                v2_consent(
+                    "node-a",
+                    "seat-a",
+                    "session-a",
+                    true,
+                    1_700_000_000_000,
+                    1_700_000_060_000,
+                ),
+                1_700_000_000_001,
+            )
+            .expect("admit explicit fresh consent");
+        let checkpoint_parent = bus_dir.path().join("not-a-directory");
+        std::fs::write(&checkpoint_parent, b"block cursor parent")
+            .expect("create cursor parent blocker");
+        let checkpoint = checkpoint_parent.join("cursor.json");
+        let mut cursor = None;
+        let mut ledger = ClipboardEnvelopeV2Ledger::default();
+
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_001,
+            ),
+            0
+        );
+        assert!(cursor.is_none(), "failed checkpoint must not advance the cursor");
+        assert!(
+            persist
+                .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+                .expect("read materialization lane")
+                .is_none(),
+            "a later rich clipboard row must not leap over an unacknowledged row"
         );
     }
 

@@ -93,6 +93,7 @@ mod toast_bridge;
 mod vdi;
 mod web;
 mod workbench;
+mod workers_catalog;
 mod workload_api;
 
 use std::time::{Duration, Instant};
@@ -118,6 +119,7 @@ use web::MediaTransportAction;
 // listener source for `loginctl lock-session` (the trait's `poll`).
 use lock_signal::LockSignals;
 use workbench::Plane;
+use workers_catalog::{CatalogEntry, WorkersDestination};
 
 /// perf-11 — the six Workbench data planes share a 5 s `last_poll: None` + `REFRESH`
 /// gate. Polled cold on one frame they all fire together AND re-expire in lockstep
@@ -1255,6 +1257,7 @@ struct Shell {
     this_node_page: this_node_catalog::PageEntry,
     /// Persistent query for the This Node section search.
     this_node_search: String,
+    workers_destination: WorkersDestination,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
@@ -1457,6 +1460,7 @@ impl Shell {
             this_node_section: this_node_catalog::Section::default(),
             this_node_page: this_node_catalog::page_index()[0],
             this_node_search: String::new(),
+            workers_destination: workers_catalog::default_destination(),
             self_test: mesh_view::SelfTestWatch::default(),
             clock: timers::ClockState::default(),
             power_honor: power_honor::PowerHonor::default(),
@@ -1692,33 +1696,40 @@ impl Shell {
             Surface::FleetMesh => {
                 self.workers_tab = WorkersTab::Control;
                 self.fleet_mesh_tab = FleetMeshTab::Workbench;
+                self.workers_destination = WorkersDestination::ThisNode;
                 self.nav.surface = Surface::Workers;
             }
             Surface::Workbench => {
                 self.workers_tab = WorkersTab::Control;
                 self.fleet_mesh_tab = FleetMeshTab::Workbench;
+                self.workers_destination = WorkersDestination::ThisNode;
                 self.nav.surface = Surface::Workers;
             }
             Surface::MeshView => {
                 self.workers_tab = WorkersTab::Network;
                 self.fleet_mesh_tab = FleetMeshTab::MeshMap;
+                self.workers_destination = WorkersDestination::MeshMap;
                 self.nav.surface = Surface::Workers;
             }
             Surface::Explorer => {
                 self.workers_tab = WorkersTab::Discovery;
                 self.fleet_mesh_tab = FleetMeshTab::Explorer;
+                self.workers_destination = WorkersDestination::Discovery;
                 self.nav.surface = Surface::Workers;
             }
             Surface::Phones => {
                 self.workers_tab = WorkersTab::Phones;
+                self.workers_destination = WorkersDestination::Phones;
                 self.nav.surface = Surface::Workers;
             }
             Surface::ThisNode => {
                 self.workers_tab = WorkersTab::LocalNode;
+                self.workers_destination = WorkersDestination::ThisNode;
                 self.nav.surface = Surface::Workers;
             }
             Surface::System => {
                 self.workers_tab = WorkersTab::LocalNode;
+                self.workers_destination = WorkersDestination::ThisNodePage(this_node_catalog::page_for_route("this-node/overview").unwrap_or(this_node_catalog::page_index()[0]));
                 self.this_node_tab = ThisNodeTab::System;
                 self.this_node_section = this_node_catalog::Section::Overview;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/overview")
@@ -1727,6 +1738,7 @@ impl Shell {
             }
             Surface::Storage => {
                 self.workers_tab = WorkersTab::LocalNode;
+                self.workers_destination = WorkersDestination::ThisNodePage(this_node_catalog::page_for_route("this-node/storage").unwrap_or(this_node_catalog::page_index()[0]));
                 self.this_node_tab = ThisNodeTab::Storage;
                 self.this_node_section = this_node_catalog::Section::Hardware;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/storage")
@@ -1735,6 +1747,7 @@ impl Shell {
             }
             Surface::About => {
                 self.workers_tab = WorkersTab::LocalNode;
+                self.workers_destination = WorkersDestination::ThisNodePage(this_node_catalog::page_for_route("this-node/hardware").unwrap_or(this_node_catalog::page_index()[0]));
                 self.this_node_tab = ThisNodeTab::About;
                 self.this_node_section = this_node_catalog::Section::Hardware;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/hardware")
@@ -2173,70 +2186,78 @@ impl Shell {
         self.mesh_view.poll(ctx);
     }
 
-    /// Render the canonical Workers workspace. Fleet & Mesh and This Node are
-    /// compatibility names for the child modes below, never sibling surfaces.
+    /// Render Workers from one flat, leaf-only catalog. Provider views are
+    /// mounted below this boundary and cannot contribute navigation chrome.
     fn show_workers(&mut self, ui: &mut egui::Ui) {
         self.normalize_surface_aliases();
-        let mut tab = self.workers_tab;
+        let entries = workers_catalog::catalog();
+        let mut destination = self.workers_destination;
         ui.push_id("shell-workers", |ui| {
             let _ = AppFrame::new("Workers").leading_title().show(ui);
-            ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                "One worker-owned workspace for node operations, network state, discovery, and local resources.",
-            );
             ui.add_space(Style::SP_S);
-            ui.horizontal_wrapped(|ui| {
-                for candidate in WorkersTab::ALL {
-                    if ui
-                        .selectable_label(tab == candidate, candidate.label())
-                        .clicked()
-                    {
-                        tab = candidate;
-                    }
-                }
-            });
-            ui.separator();
-            ui.add_space(Style::SP_S);
+            let narrow = ui.available_width() < 900.0 || ui.ctx().zoom_factor() > 1.1;
+            if narrow {
+                egui::ScrollArea::horizontal().show(ui, |ui| self.show_workers_catalog(ui, &entries, &mut destination));
+                ui.separator();
+            } else {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| self.show_workers_catalog(ui, &entries, &mut destination));
+                    ui.separator();
+                    ui.add_space(Style::SP_M);
+                    ui.vertical(|ui| self.show_workers_destination(ui, destination));
+                });
+                return;
+            }
+            self.show_workers_destination(ui, destination);
+        });
+        self.workers_destination = destination;
+    }
 
-            match tab {
-                WorkersTab::Control => {
-                    self.fleet_mesh_tab = FleetMeshTab::Workbench;
-                    self.show_fleet_mesh(ui);
-                    tab = match self.fleet_mesh_tab {
-                        FleetMeshTab::Workbench => WorkersTab::Control,
-                        FleetMeshTab::MeshMap => WorkersTab::Network,
-                        FleetMeshTab::Explorer => WorkersTab::Discovery,
-                    };
-                }
-                WorkersTab::Network => {
-                    self.fleet_mesh_tab = FleetMeshTab::MeshMap;
-                    self.show_fleet_mesh(ui);
-                    tab = match self.fleet_mesh_tab {
-                        FleetMeshTab::Workbench => WorkersTab::Control,
-                        FleetMeshTab::MeshMap => WorkersTab::Network,
-                        FleetMeshTab::Explorer => WorkersTab::Discovery,
-                    };
-                }
-                WorkersTab::Discovery => {
-                    self.fleet_mesh_tab = FleetMeshTab::Explorer;
-                    self.show_fleet_mesh(ui);
-                    tab = match self.fleet_mesh_tab {
-                        FleetMeshTab::Workbench => WorkersTab::Control,
-                        FleetMeshTab::MeshMap => WorkersTab::Network,
-                        FleetMeshTab::Explorer => WorkersTab::Discovery,
-                    };
-                }
-                WorkersTab::LocalNode => self.show_this_node(ui),
-                WorkersTab::Phones => {
-                    let phones = &mut self.phones_hub;
-                    ui.push_id("shell-workers-phones", |ui| {
-                        phones.show(ui);
-                    });
+    fn show_workers_catalog(&mut self, ui: &mut egui::Ui, entries: &[CatalogEntry], selected: &mut WorkersDestination) {
+        ui.set_min_width(Style::SP_XL * 8.0);
+        for entry in entries {
+            if ui.selectable_label(*selected == entry.destination, entry.label).clicked() {
+                *selected = entry.destination;
+            }
+        }
+    }
+
+    fn show_workers_destination(&mut self, ui: &mut egui::Ui, destination: WorkersDestination) {
+        let title = workers_catalog::catalog().into_iter().find(|entry| entry.destination == destination).map_or("This Node", |entry| entry.label);
+        let _ = AppFrame::new(title).show(ui);
+        ui.add_space(Style::SP_S);
+        match destination {
+            WorkersDestination::ThisNode => {
+                if let Some(handoff) = workbench::show_catalog_plane(ui, Plane::ThisNode, &mut self.datacenter, &mut self.thisnode, &mut self.system, &mut self.surface_card, &self.network, &self.provisioning, &mut self.spawn_lighthouse) {
+                    self.apply_surface_card_handoff(handoff);
                 }
             }
-        });
-        self.workers_tab = tab;
+            WorkersDestination::ThisNodePage(page) => {
+                let mut section = page.section;
+                let mut selected_page = page;
+                let mut tab = ThisNodeTab::System;
+                self.show_this_node_workspace(ui, &mut tab, &mut section, &mut selected_page);
+                self.this_node_section = section;
+                self.this_node_page = selected_page;
+            }
+            WorkersDestination::MeshMap => self.show_mesh_map(ui),
+            WorkersDestination::Discovery => self.show_explorer(ui),
+            WorkersDestination::Phones | WorkersDestination::PhoneFiles | WorkersDestination::PhoneServices | WorkersDestination::PhoneCommands | WorkersDestination::PhonePair => {
+                let tab = match destination {
+                    WorkersDestination::Phones => "Phones",
+                    WorkersDestination::PhoneFiles => "Files",
+                    WorkersDestination::PhoneServices => "Services",
+                    WorkersDestination::PhoneCommands => "Commands",
+                    WorkersDestination::PhonePair => "Pair",
+                    _ => unreachable!(),
+                };
+                self.phones_hub.show_catalog(ui, tab);
+            }
+            WorkersDestination::ActionConsole => workbench::show_action_console(ui),
+            plane @ (WorkersDestination::Network | WorkersDestination::Fleet | WorkersDestination::Provisioning) => {
+                workbench::show_catalog_plane(ui, workers_catalog::plane(plane).expect("catalog plane"), &mut self.datacenter, &mut self.thisnode, &mut self.system, &mut self.surface_card, &self.network, &self.provisioning, &mut self.spawn_lighthouse);
+            }
+        }
     }
 
     /// Render the mesh-control child views inside Workers. The old method name
@@ -2418,23 +2439,6 @@ impl Shell {
         section: &mut this_node_catalog::Section,
         page: &mut this_node_catalog::PageEntry,
     ) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new("Workspace")
-                    .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM))
-                    .size(Style::SMALL),
-            );
-            let actions_selected = self.thisnode.actions_selected();
-            if ui
-                .selectable_label(!actions_selected, "Inventory")
-                .clicked()
-            {
-                self.thisnode.set_actions_selected(false);
-            }
-            if ui.selectable_label(actions_selected, "Actions").clicked() {
-                self.thisnode.set_actions_selected(true);
-            }
-        });
         if self.thisnode.actions_selected() {
             ui.separator();
             self.thisnode.show_actions_with_system(ui, &mut self.system);
@@ -2460,25 +2464,6 @@ impl Shell {
             ui.push_id("this-node-system-provider", |ui| system.show(ui));
             return;
         }
-        ui.horizontal(|ui| {
-            for (candidate, label) in [
-                (ThisNodeTab::System, "System"),
-                (ThisNodeTab::Storage, "Storage"),
-                (ThisNodeTab::About, "About"),
-            ] {
-                if ui.selectable_label(*tab == candidate, label).clicked() {
-                    *tab = candidate;
-                    *section = match candidate {
-                        ThisNodeTab::System => this_node_catalog::Section::Overview,
-                        ThisNodeTab::Storage | ThisNodeTab::About => {
-                            this_node_catalog::Section::Hardware
-                        }
-                    };
-                    *page = this_node_catalog::first_page_for_section(*section).unwrap_or(*page);
-                }
-            }
-        });
-        ui.separator();
         match (page.route, *tab) {
             ("this-node/storage", _) => {
                 let storage = &mut self.storage;

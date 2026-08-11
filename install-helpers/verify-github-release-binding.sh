@@ -37,6 +37,10 @@ verify_bundle() {
   [ -d "$bundle_root" ] && [ ! -L "$bundle_root" ] \
     || die "bundle root is not a non-symlink directory: $bundle_root"
   bundle_root="$(realpath -e -- "$bundle_root")"
+  [ -d "$artifact_root" ] && [ ! -L "$artifact_root" ] \
+    || die "artifact root is not a non-symlink directory: $artifact_root"
+  artifact_root="$(realpath -e -- "$artifact_root")" \
+    || die "artifact root cannot be resolved"
   case "$artifact_root" in
     /tmp/mcnf-github-release-*/artifacts) ;;
     *) die "artifact root is outside the workflow-owned /tmp namespace" ;;
@@ -184,9 +188,10 @@ expect_reject() {
 }
 
 self_test() {
-  local work bundle origin revision job host slot binding_sha log_digest artifact digest
+  local work escaped bundle origin revision job host slot binding_sha log_digest artifact digest
   work="$(mktemp -d "${TMPDIR:-/tmp}/mcnf-github-release-self-test.XXXXXX")"
-  trap 'rm -rf -- "$work"' RETURN
+  escaped="$(mktemp -d "${TMPDIR:-/tmp}/mcnf-release-escape.XXXXXX")"
+  trap 'rm -rf -- "$work" "$escaped"' RETURN
   bundle="$work/bundle"
   origin="$work/artifacts"
   revision=0123456789abcdef0123456789abcdef01234567
@@ -232,6 +237,25 @@ self_test() {
     ' >"$bundle/ci-gate-status.json"
 
   verify_bundle "$bundle" "$origin" "$revision" "$job" "$host" "$slot" >/dev/null
+  mkdir -p -- "$escaped/artifacts"
+  cp -- "$origin/"*.rpm "$escaped/artifacts/"
+  ln -s -- "$escaped" "$work/redirect"
+  cp -- "$bundle/release-binding.json" "$work/binding.before-root-escape"
+  cp -- "$bundle/ci-gate.log" "$work/log.before-root-escape"
+  cp -- "$bundle/ci-gate-status.json" "$work/status.before-root-escape"
+  jq --arg root "$work/redirect/artifacts" '
+    .artifacts |= map(.path = ($root + "/" + (.path | split("/") | last)))
+  ' "$work/binding.before-root-escape" >"$bundle/release-binding.json"
+  binding_sha="$(jq -cS . "$bundle/release-binding.json" | sha256sum | awk '{print $1}')"
+  sed "s/^  release-evidence-binding sha256=.*/  release-evidence-binding sha256=$binding_sha/" \
+    "$work/log.before-root-escape" >"$bundle/ci-gate.log"
+  log_digest="$(sha256_file "$bundle/ci-gate.log")"
+  jq --arg digest "$log_digest" '.evidence.gate_log.sha256 = $digest' \
+    "$work/status.before-root-escape" >"$bundle/ci-gate-status.json"
+  expect_reject "$bundle" "$work/redirect/artifacts" "$revision" "$job" "$host" "$slot"
+  mv -- "$work/binding.before-root-escape" "$bundle/release-binding.json"
+  mv -- "$work/log.before-root-escape" "$bundle/ci-gate.log"
+  mv -- "$work/status.before-root-escape" "$bundle/ci-gate-status.json"
   artifact="$bundle/release-artifacts/magic-mesh-1.x86_64.rpm"
   printf 'tamper\n' >>"$artifact"
   expect_reject "$bundle" "$origin" "$revision" "$job" "$host" "$slot"
@@ -257,7 +281,7 @@ self_test() {
     "$bundle/ci-gate-status.json" >"$work/status.updated"
   mv -- "$work/status.updated" "$bundle/ci-gate-status.json"
   expect_reject "$bundle" "$origin" "$revision" "$job" "$host" "$slot"
-  echo "verify-github-release-binding: self-test passed — hostile artifact, identity, set, symlink, path, and unbound-log cases rejected"
+  echo "verify-github-release-binding: self-test passed — hostile artifact root, artifact, identity, set, symlink, path, and unbound-log cases rejected"
 }
 
 usage() {

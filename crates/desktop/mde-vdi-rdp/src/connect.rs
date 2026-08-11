@@ -31,11 +31,11 @@
 //! key** (which a MITM cannot reproduce) is SHA-256 fingerprinted and compared
 //! against a **trust-on-first-use** pin ([`crate::pin`]). A first connect records
 //! the pin and accepts; a later connect whose fingerprint **changed** (i.e. the
-//! server presented a different key) is the MITM signal — it is logged loudly and
-//! surfaced to the shell as a [`CertPinChange`], while (by default) still letting
-//! the connection through so a legitimate self-signed rotation is not a hard
-//! outage. Setting `MDE_RDP_STRICT_PIN` flips a changed cert to a hard
-//! [`ConnectError::CertPinChanged`] before any credentials are sent.
+//! server presented a different key) is the MITM / replaced-guest-generation
+//! signal. It is rejected before credentials are sent and the old pin is
+//! retained, so a daemon restart cannot silently adopt a replacement guest.
+//! Same-key certificate renewal remains admitted because the public-key pin is
+//! unchanged.
 //!
 //! Honest bounds: CredSSP is in-band NTLM only (a Kerberos KDC round trip
 //! surfaces as a typed error, not a silent retry), and a server-initiated
@@ -74,7 +74,7 @@ use tokio::net::TcpStream;
 use crate::audio::{
     PendingWave, PipeWireRdpsndHandler, PreparedAudio, RdpAudioCapability, RdpAudioStats,
 };
-use crate::clipboard::ClipboardBridge;
+use crate::clipboard::{ClipboardBridge, RemoteClipboardImage};
 use crate::config::RdpConfig;
 use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
@@ -156,11 +156,9 @@ pub enum ConnectError {
     /// The server's TLS certificate carried no extractable public key — the
     /// RDP security exchange cannot bind to the channel without it.
     NoServerPublicKey,
-    /// Strict pinning (`MDE_RDP_STRICT_PIN`) is on and the host's TLS certificate
-    /// fingerprint **changed** since it was pinned — a potential MITM. The
-    /// connection is refused before credentials are sent. (Default posture keeps
-    /// TOFU non-strict: the change is surfaced, not rejected — see
-    /// [`CertPinChange`].)
+    /// The host's TLS certificate public key changed since it was pinned. The
+    /// connection is refused before credentials are sent and the old pin is
+    /// retained as the guest-generation authority.
     CertPinChanged {
         /// The `host:port` whose certificate changed.
         host: String,
@@ -176,6 +174,9 @@ pub enum ConnectError {
     Session(SessionError),
     /// The negotiated CLIPRDR channel refused a bounded clipboard operation.
     Clipboard(String),
+    /// A live transport was presented with a session other than the exact
+    /// endpoint/user/domain/geometry declaration it authenticated for.
+    SessionIdentityMismatch,
     /// A decoded update did not fit the session framebuffer — the negotiated
     /// desktop differs from the [`RdpConfig`] geometry the session was built
     /// with (rebuild the session at [`Negotiated::desktop_size`]).
@@ -227,6 +228,10 @@ impl core::fmt::Display for ConnectError {
             Self::Connector(e) => write!(f, "rdp connection sequence failed: {e}"),
             Self::Session(e) => write!(f, "rdp active stage failed: {}", e.report()),
             Self::Clipboard(e) => write!(f, "rdp clipboard failed: {e}"),
+            Self::SessionIdentityMismatch => write!(
+                f,
+                "rdp transport does not belong to the supplied session declaration"
+            ),
             Self::Blit(e) => write!(f, "decoded update does not fit the session desktop: {e}"),
             Self::Timeout { phase } => write!(
                 f,
@@ -253,6 +258,42 @@ impl core::fmt::Display for ConnectError {
     }
 }
 
+/// Non-secret declaration that owns one authenticated live transport.
+///
+/// `RdpSession` deliberately has no public mutable configuration. Capturing its
+/// declaration at connect time lets every later session-taking API refuse a
+/// cross-session handoff before it drains input, applies guest pixels, or
+/// services CLIPRDR callbacks. The password is intentionally excluded: it is a
+/// handshake secret, not a post-authentication routing identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionBinding {
+    host: String,
+    port: u16,
+    username: String,
+    domain: Option<String>,
+    width: u16,
+    height: u16,
+}
+
+impl SessionBinding {
+    fn from_config(config: &RdpConfig) -> Self {
+        Self {
+            host: config.host.clone(),
+            port: config.port,
+            username: config.username.clone(),
+            domain: config.domain.clone(),
+            width: config.width,
+            height: config.height,
+        }
+    }
+
+    fn admits(&self, session: &RdpSession) -> Result<(), ConnectError> {
+        (self == &Self::from_config(session.config()))
+            .then_some(())
+            .ok_or(ConnectError::SessionIdentityMismatch)
+    }
+}
+
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -262,6 +303,7 @@ impl std::error::Error for ConnectError {
             Self::Blit(e) => Some(e),
             Self::NoServerPublicKey
             | Self::Clipboard(_)
+            | Self::SessionIdentityMismatch
             | Self::CertPinChanged { .. }
             | Self::Timeout { .. }
             | Self::Reactivation
@@ -327,42 +369,47 @@ fn live_clipboard_status() -> VdiClipboardStatus {
 /// A detected TLS-certificate change for a host that was already pinned
 /// (vdi-vm-6).
 ///
-/// Produced only on a non-strict connect whose fingerprint differed from the
-/// trust-on-first-use pin; the connection was **still allowed** (the Nebula floor
-/// is the trust anchor) but this is surfaced so the shell can warn the operator
-/// that the change could be a MITM. Strict mode turns the same condition into a
-/// hard [`ConnectError::CertPinChanged`] instead.
+/// Retained as the typed diagnostic shape consumed by existing shell status
+/// plumbing. Changed pins now fail closed before a live connection is returned,
+/// so new connections do not surface this warning as an admitted state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertPinChange {
     /// The `host:port` whose certificate changed.
     pub host: String,
     /// The previously pinned fingerprint (hex).
     pub stored: String,
-    /// The newly presented (and now adopted) fingerprint (hex).
+    /// The newly presented, rejected fingerprint (hex).
     pub current: String,
 }
 
 impl CertPinChange {
-    fn new(host: String, stored: &Fingerprint, current: &Fingerprint) -> Self {
-        Self {
-            host,
-            stored: stored.to_hex(),
-            current: current.to_hex(),
-        }
-    }
-
     /// A short, operator-facing banner for the shell's live-status line.
     #[must_use]
     pub fn operator_message(&self) -> String {
         let short = |hex: &str| hex.split(':').take(4).collect::<Vec<_>>().join(":");
         format!(
             "⚠ RDP host {} presented a DIFFERENT TLS certificate than last time \
-             (pinned {}…, now {}…) — possible MITM; connection allowed on the \
-             Nebula-authenticated link",
+             (pinned {}…, now {}…) — possible MITM; replacement rejected before credentials",
             self.host,
             short(&self.stored),
             short(&self.current),
         )
+    }
+}
+
+/// Admit only first-use or same-key pin outcomes. Both legacy changed-key
+/// actions are rejected here so live transport policy cannot be weakened by an
+/// unset process environment after restart.
+fn admit_guest_pin_action(host: &str, action: PinAction) -> Result<(), ConnectError> {
+    match action {
+        PinAction::Proceed => Ok(()),
+        PinAction::Warn { stored, current } | PinAction::Reject { stored, current } => {
+            Err(ConnectError::CertPinChanged {
+                host: host.to_owned(),
+                stored: stored.to_hex(),
+                current: current.to_hex(),
+            })
+        }
     }
 }
 
@@ -567,9 +614,10 @@ pub struct RdpConnection {
     negotiated: Negotiated,
     audio: PreparedAudio,
     clipboard: ClipboardBridge,
-    /// A TLS-certificate change detected against the trust-on-first-use pin at
-    /// connect time (vdi-vm-6). `Some` only on a non-strict connect whose
-    /// fingerprint differed from the pin — the shell surfaces it as a warning.
+    /// Exact non-secret session declaration authenticated by this transport.
+    session_binding: SessionBinding,
+    /// Legacy admitted certificate-change diagnostic retained for the shell
+    /// status API. New handshakes reject changed keys and leave this empty.
     cert_pin_change: Option<CertPinChange>,
     started: Instant,
     /// Reassert focus immediately before the first operator input.  The
@@ -596,6 +644,7 @@ impl RdpConnection {
         let config = connector_config_for(session.config(), &settings);
         let host = session.config().host.clone();
         let port = session.config().port;
+        let session_binding = SessionBinding::from_config(session.config());
         let mut audio = PreparedAudio::new();
         let initial_audio = audio.initial_capability;
         let audio_handler = audio.handler.take();
@@ -649,6 +698,7 @@ impl RdpConnection {
             negotiated,
             audio,
             clipboard,
+            session_binding,
             cert_pin_change,
             started: Instant::now(),
             first_input_focus_pending: true,
@@ -763,12 +813,11 @@ impl RdpConnection {
     /// Compare the host's TLS public-key fingerprint against the trust-on-
     /// first-use pin store and apply the [`pin::pin_action`] policy (vdi-vm-6).
     ///
-    /// Returns `Ok(Some(change))` when a non-strict connect saw a **changed**
-    /// key (surface it, but proceed — the Nebula link is the trust floor),
-    /// `Ok(None)` on a first-use or unchanged key, and
-    /// `Err(ConnectError::CertPinChanged)` when strict mode
-    /// (`MDE_RDP_STRICT_PIN`) rejects a changed key. All the branch-selecting
-    /// logic lives in the pure [`pin`] seams; this only does the I/O + logging.
+    /// Returns `Ok(None)` on first use or an unchanged key. Every changed key is
+    /// rejected before CredSSP finalization and the old pin is retained. The
+    /// underlying policy seam still distinguishes warn/reject for compatibility;
+    /// this live transport treats both changed-key actions as a replaced guest
+    /// generation.
     // The store guard is deliberately held across `decision` + `record`: the
     // read-then-pin must be atomic so two concurrent workers connecting to the
     // same host cannot interleave and clobber each other's pin.
@@ -782,7 +831,8 @@ impl RdpConnection {
         let fingerprint = Fingerprint::from_der(server_public_key);
         let mut store = pin::lock_global();
         let outcome = store.decision(&key, &fingerprint);
-        match pin::pin_action(&outcome, pin::strict_mode()) {
+        let action = pin::pin_action(&outcome, pin::strict_mode());
+        match &action {
             PinAction::Proceed => {
                 if matches!(outcome, PinOutcome::FirstUse) {
                     tracing::info!(
@@ -790,39 +840,21 @@ impl RdpConnection {
                         fingerprint = %fingerprint.to_hex(),
                         "rdp TLS certificate pinned (trust-on-first-use)"
                     );
-                    store.record(key, fingerprint);
+                    store.record(key.clone(), fingerprint);
                 }
-                Ok(None)
             }
-            PinAction::Warn { stored, current } => {
-                tracing::warn!(
-                    host = %key,
-                    stored = %stored.to_hex(),
-                    current = %current.to_hex(),
-                    "rdp TLS certificate CHANGED since it was pinned — accepting on the \
-                     Nebula-authenticated link, but this is a potential MITM signal \
-                     (set MDE_RDP_STRICT_PIN to reject instead)"
-                );
-                // Adopt-after-warn: re-pin so a legitimate self-signed rotation
-                // (e.g. a rebuilt VDI VM) does not re-warn on every reconnect.
-                store.record(key.clone(), current.clone());
-                Ok(Some(CertPinChange::new(key, &stored, &current)))
-            }
-            PinAction::Reject { stored, current } => {
+            PinAction::Warn { stored, current } | PinAction::Reject { stored, current } => {
                 tracing::error!(
                     host = %key,
                     stored = %stored.to_hex(),
                     current = %current.to_hex(),
-                    "rdp TLS certificate CHANGED and strict pinning is on — refusing the \
-                     connection before credentials are sent (possible MITM)"
+                    "rdp TLS public key changed — refusing the replacement guest generation \
+                     before credentials are sent and retaining the old pin"
                 );
-                Err(ConnectError::CertPinChanged {
-                    host: key,
-                    stored: stored.to_hex(),
-                    current: current.to_hex(),
-                })
             }
         }
+        admit_guest_pin_action(&key, action)?;
+        Ok(None)
     }
 
     /// What the server actually granted (geometry, compression, tier), plus
@@ -845,11 +877,9 @@ impl RdpConnection {
         self.audio.stats()
     }
 
-    /// A TLS-certificate change detected against the trust-on-first-use pin at
-    /// connect time (vdi-vm-6), or `None` if the cert was first-use or unchanged.
-    /// The shell surfaces this as a non-fatal MITM warning; in strict mode the
-    /// same condition is a hard [`ConnectError::CertPinChanged`] instead, so this
-    /// is only ever `Some` on a connection that was allowed through.
+    /// A legacy admitted certificate-change diagnostic. Changed public keys now
+    /// fail closed during the handshake, so newly built connections return
+    /// `None`; the accessor remains while shell status plumbing migrates.
     #[must_use]
     pub const fn cert_pin_change(&self) -> Option<&CertPinChange> {
         self.cert_pin_change.as_ref()
@@ -919,6 +949,14 @@ impl RdpConnection {
     /// Take the newest bounded guest HTML fragment returned by CF_HTML.
     pub fn take_guest_html_clipboard(&self) -> Option<String> {
         self.clipboard.take_remote_html()
+    }
+
+    /// Take the newest bounded guest bitmap admitted against its exact
+    /// negotiated CF_DIB/CF_DIBV5 response. The caller must still place the
+    /// bytes behind its governed rich-clipboard/Files authority before
+    /// publishing them outside this transport.
+    pub fn take_guest_image_clipboard(&self) -> Option<RemoteClipboardImage> {
+        self.clipboard.take_remote_image()
     }
 
     fn write_clipboard_messages(
@@ -1035,6 +1073,7 @@ impl RdpConnection {
     /// compatibility workaround for an activation timing race, and live xrdp
     /// proof shows rendering can otherwise succeed while input is ignored.
     fn send_focus_in(&mut self, session: &mut RdpSession) -> Result<(), ConnectError> {
+        self.session_binding.admits(session)?;
         let events = focus_in_events();
         for _ in 0..FOCUS_IN_REPEAT_COUNT {
             let outputs = self
@@ -1160,6 +1199,10 @@ impl RdpConnection {
         session: &mut RdpSession,
         timeout: Duration,
     ) -> Result<PumpOutcome, ConnectError> {
+        // Refuse before reading guest data or dispatching CLIPRDR callbacks: a
+        // connection must never project one guest's clipboard into another
+        // shell session after a worker/session replacement race.
+        self.session_binding.admits(session)?;
         // `tokio::time::timeout` registers its timer against the *current*
         // runtime handle the instant it is constructed, so it MUST be built
         // inside the runtime context — constructing it eagerly as a `block_on`
@@ -1205,6 +1248,9 @@ impl RdpConnection {
     /// # Errors
     /// [`ConnectError`] on encoding or transport failure.
     pub fn flush_input(&mut self, session: &mut RdpSession) -> Result<usize, ConnectError> {
+        // Check before `take_input`, otherwise a mismatched transport could
+        // consume another session's one-use operator input even when rejected.
+        self.session_binding.admits(session)?;
         let intents = session.take_input();
         if intents.is_empty() {
             return Ok(0);
@@ -1237,6 +1283,7 @@ impl RdpConnection {
     /// [`ConnectError`] if the shutdown PDU cannot be built or written; the
     /// connection is consumed either way.
     pub fn shutdown(mut self, session: &mut RdpSession) -> Result<(), ConnectError> {
+        self.session_binding.admits(session)?;
         let outputs = self
             .active_stage
             .graceful_shutdown()
@@ -1249,16 +1296,17 @@ impl RdpConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        connector_config_for, ensure_rustls_crypto_provider, focus_in_events, push_fastpath_events,
-        refresh_region_for_area, CertPinChange, ConnectError, PumpOutcome, FOCUS_IN_REPEAT_COUNT,
-        TAB_SCANCODE,
+        admit_guest_pin_action, connector_config_for, ensure_rustls_crypto_provider,
+        focus_in_events, push_fastpath_events, refresh_region_for_area, CertPinChange,
+        ConnectError, PumpOutcome, SessionBinding, FOCUS_IN_REPEAT_COUNT, TAB_SCANCODE,
     };
     use crate::audio::{RdpAudioCapability, RdpAudioUnsupportedReason};
     use crate::config::RdpConfig;
     use crate::input::{MouseButton, RdpInputEvent, Scancode};
     use crate::link::QualityTier;
-    use crate::pin::Fingerprint;
+    use crate::pin::{pin_action, Fingerprint, PinStore};
     use crate::pixel::FramebufferError;
+    use crate::session::RdpSession;
     use crate::tier::RdpTierSettings;
     use ironrdp_connector::Credentials;
     use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
@@ -1323,6 +1371,59 @@ mod tests {
         assert_eq!(minimal_bitmap.color_depth, 15, "the connector's floor");
         assert!(minimal_bitmap.codecs.0.is_empty(), "no RemoteFX on Minimal");
         assert_eq!(minimal.compression_type, None);
+    }
+
+    #[test]
+    fn connection_binding_rejects_cross_session_clipboard_transport_reuse() {
+        let owner_config = RdpConfig::new("desktop-a.mesh", "operator", "secret")
+            .with_domain("MESH")
+            .with_resolution(1_920, 1_080);
+        let owner = RdpSession::new(owner_config.clone()).expect("owner session");
+        let binding = SessionBinding::from_config(owner.config());
+        assert!(binding.admits(&owner).is_ok());
+
+        for hostile in [
+            RdpConfig::new("desktop-b.mesh", "operator", "secret")
+                .with_domain("MESH")
+                .with_resolution(1_920, 1_080),
+            RdpConfig::new("desktop-a.mesh", "other-user", "secret")
+                .with_domain("MESH")
+                .with_resolution(1_920, 1_080),
+            RdpConfig::new("desktop-a.mesh", "operator", "secret")
+                .with_domain("OTHER")
+                .with_resolution(1_920, 1_080),
+            owner_config.with_resolution(1_280, 720),
+        ] {
+            let foreign = RdpSession::new(hostile).expect("foreign session");
+            assert!(matches!(
+                binding.admits(&foreign),
+                Err(ConnectError::SessionIdentityMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn restarted_guest_key_replacement_cannot_be_adopted_without_generation_authority() {
+        let key = "desktop.mesh:3389".to_owned();
+        let original = Fingerprint::from_der(b"guest-generation-one");
+        let replacement = Fingerprint::from_der(b"guest-generation-two");
+        let mut restarted_store = PinStore::in_memory();
+        restarted_store.record(key.clone(), original.clone());
+
+        let outcome = restarted_store.decision(&key, &replacement);
+        let error = admit_guest_pin_action(&key, pin_action(&outcome, false))
+            .expect_err("the legacy non-strict branch must fail closed on the live transport");
+
+        assert!(matches!(error, ConnectError::CertPinChanged { .. }));
+        assert_eq!(
+            restarted_store.get(&key),
+            Some(&original),
+            "a rejected replacement must not become the next restart's authority"
+        );
+        assert!(matches!(
+            restarted_store.decision(&key, &replacement),
+            crate::pin::PinOutcome::Changed { .. }
+        ));
     }
 
     #[test]
@@ -1493,11 +1594,11 @@ mod tests {
 
     #[test]
     fn cert_pin_change_operator_message_names_the_host_and_the_risk() {
-        let change = CertPinChange::new(
-            "desktop.mesh:3389".into(),
-            &Fingerprint::from_der(b"old-cert"),
-            &Fingerprint::from_der(b"new-cert"),
-        );
+        let change = CertPinChange {
+            host: "desktop.mesh:3389".into(),
+            stored: Fingerprint::from_der(b"old-cert").to_hex(),
+            current: Fingerprint::from_der(b"new-cert").to_hex(),
+        };
         let msg = change.operator_message();
         assert!(msg.contains("desktop.mesh:3389"), "names the host");
         assert!(msg.contains("MITM"), "flags the risk to the operator");

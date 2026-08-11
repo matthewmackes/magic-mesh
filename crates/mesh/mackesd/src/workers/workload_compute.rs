@@ -1872,7 +1872,7 @@ impl SystemWorkloadActuator {
     }
 
     fn run_power_command(request: &WorkloadOperationRequest, verb: &str) -> Result<(), String> {
-        let status = match request.backend {
+        match request.backend {
             WorkloadBackend::LibvirtVirtqemud => {
                 if verb == "start" {
                     require_workload_audio_endpoint()?;
@@ -1885,19 +1885,19 @@ impl SystemWorkloadActuator {
                     verb,
                     &domain,
                 ]);
-                status_with_timeout(command, DEFAULT_CMD_TIMEOUT)
+                run_libvirt_power_command(command, verb, DEFAULT_CMD_TIMEOUT)
             }
             WorkloadBackend::QuadletSystemd => {
                 let mut command = Command::new("systemctl");
                 command.args(["--system", verb, &Self::unit_name(request)]);
-                status_with_timeout(command, DEFAULT_CMD_TIMEOUT)
+                let status = status_with_timeout(command, DEFAULT_CMD_TIMEOUT)
+                    .map_err(|error| format!("{verb} actuator failed to start: {error}"))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("{verb} actuator exited with {status}"))
+                }
             }
-        }
-        .map_err(|error| format!("{verb} actuator failed to start: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{verb} actuator exited with {status}"))
         }
     }
 
@@ -2120,6 +2120,32 @@ fn libvirt_domain_already_running(detail: &str) -> bool {
     normalized.contains("domain is already active")
         || normalized.contains("domain is already running")
         || normalized.contains("already active")
+}
+
+/// Execute one libvirt lifecycle command while preserving replay idempotence.
+///
+/// `Defining` is durable before `virsh start`, but the daemon can still stop
+/// after libvirt commits the start and before the resulting `WaitingForGuest`
+/// phase reaches the journal. Replaying that boundary receives libvirt's
+/// "already active" error. Treating that observation as success lets the sole
+/// Workload reconciler resume readiness observation instead of exhausting its
+/// retry budget against a VM that is already running.
+fn run_libvirt_power_command(
+    command: Command,
+    verb: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let output = output_with_timeout(command, timeout)
+        .map_err(|error| format!("{verb} actuator failed to start: {error}"))?;
+    let detail = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || (verb == "start" && libvirt_domain_already_running(&detail)) {
+        return Ok(());
+    }
+    Err(format!(
+        "{verb} actuator exited with {}: {}",
+        output.status,
+        bounded_reason(detail.trim())
+    ))
 }
 
 impl WorkloadActuator for SystemWorkloadActuator {
@@ -2668,6 +2694,21 @@ fn queued_status(request: &WorkloadOperationRequest) -> WorkloadOperationStatus 
     }
 }
 
+/// Compare the durable operation identity and payload while treating the
+/// short-lived capability as delivery metadata. Every lifecycle field remains
+/// exact; only `armed_token` may rotate when a producer retries the same
+/// already-authorized operation.
+fn semantic_workload_replay(
+    existing: &WorkloadOperationRequest,
+    incoming: &WorkloadOperationRequest,
+) -> bool {
+    let mut existing = existing.clone();
+    let mut incoming = incoming.clone();
+    existing.armed_token = None;
+    incoming.armed_token = None;
+    existing == incoming
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HandleResult {
     Accepted(WorkloadOperationStatus),
@@ -3143,11 +3184,13 @@ impl WorkloadComputeWorker {
         now_ms: u64,
     ) -> HandleResult {
         let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
-        // An identical request-id is a read-only replay. Check the durable
-        // record before consuming the one-use capability so a duplicate Bus
-        // delivery cannot turn a valid idempotent operation into an auth error.
+        // A semantically identical request-id is a read-only replay. Check the
+        // durable record before consuming a rotated one-use capability so a
+        // producer retry cannot turn a valid idempotent operation into either
+        // an auth error or a repeated side effect. Every field except the
+        // delivery capability must remain exact.
         if let Some(existing) = ledger.request(&request.request_id) {
-            if existing == &request {
+            if semantic_workload_replay(existing, &request) {
                 return ledger.status(&request.request_id).cloned().map_or(
                     HandleResult::Rejected(WorkloadOperationErrorCode::JournalUnavailable),
                     HandleResult::Accepted,
@@ -3327,7 +3370,7 @@ impl WorkloadComputeWorker {
             );
             return;
         };
-        let Some(target_status) = ledger.status(target_id).cloned() else {
+        let Some(mut target_status) = ledger.status(target_id).cloned() else {
             self.fail(
                 ledger,
                 &request,
@@ -3409,6 +3452,45 @@ impl WorkloadComputeWorker {
                 now_ms,
             );
             return;
+        }
+
+        // Cancellation revokes presentation authority before asking the
+        // backend to stop. A graceful libvirt shutdown can remain in
+        // `Stopping` across retries or a daemon crash; retaining the Display1
+        // lease during that interval would let a cancelled session continue
+        // accepting frames and input. Persist the detached target first so a
+        // restart cannot republish the old lease while cancellation owns it.
+        if target_status.attachment.is_some() {
+            let attached_target = target_status.clone();
+            let mut detached_target = target_status;
+            detached_target.attachment = None;
+            detached_target.readiness = WorkloadReadiness::Unavailable;
+            detached_target.signals = WorkloadRuntimeSignals::from_readiness(
+                detached_target.phase,
+                detached_target.readiness,
+            );
+            detached_target.reason = Some(
+                "presentation authority revoked while target cancellation is in progress".into(),
+            );
+            detached_target.remediation = None;
+            match ledger.advance(target_id, detached_target, now_ms) {
+                Ok(persisted) => {
+                    // The external revocation effect is authorized only by
+                    // the durable detached record. Pass the captured prior
+                    // identity so the actuator removes that exact lease.
+                    self.actuator.revoke_attachment(&attached_target);
+                    target_status = persisted;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "target presentation revocation could not be journaled");
+                    // Keep cancellation nonterminal even if this retry state
+                    // cannot be flushed. Its already-durable queued record
+                    // must continue owning the target after restart; marking
+                    // it Failed would release the still-attached target.
+                    self.wait_for_cancel_cleanup(ledger, &request, status, now_ms);
+                    return;
+                }
+            }
         }
 
         match self.actuator.cancel(&target_request, &target_status) {
@@ -3545,13 +3627,13 @@ impl WorkloadComputeWorker {
         retryable: bool,
         now_ms: u64,
     ) {
-        // A terminal failure cannot retain an attachment capability. This is
-        // especially important during restart recovery: a persisted in-flight
-        // StartAndAttach may already carry a Display1 lease when observation
-        // fails permanently. Revoke that exact identity before journaling the
-        // failure so neither the durable record nor its projection can expose
-        // a stale session endpoint.
-        self.actuator.revoke_attachment(&status);
+        // A terminal failure cannot retain an attachment capability. Persist
+        // the detached failure before revoking the external endpoint: if the
+        // journal flush fails, the previous durable status still owns the
+        // lease and restart recovery must not observe a revoked-but-published
+        // capability. The captured status authorizes revocation of the exact
+        // prior identity only after the durable projection no longer can.
+        let attached_status = status.attachment.as_ref().map(|_| status.clone());
         status.attachment = None;
         status.phase = WorkloadOperationPhase::Failed;
         status.power = WorkloadPowerState::Failed;
@@ -3564,8 +3646,15 @@ impl WorkloadComputeWorker {
         status.next_retry_at_ms = 0;
         status.reason = Some(bounded_reason(reason));
         status.remediation = Some(bounded_reason(remediation));
-        if let Err(error) = ledger.advance(&request.request_id, status, now_ms) {
-            tracing::error!(%error, "workload failure could not be journaled");
+        match ledger.advance(&request.request_id, status, now_ms) {
+            Ok(_) => {
+                if let Some(attached_status) = attached_status.as_ref() {
+                    self.actuator.revoke_attachment(attached_status);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "workload failure could not be journaled");
+            }
         }
     }
 
@@ -4489,36 +4578,115 @@ fn live_capacity<'a>(
                 .map(|kb| kb / 1024)
         })
         .unwrap_or(0);
-    let mut latest = BTreeMap::<&str, &WorkloadOperationStatus>::new();
+    let mut latest = BTreeMap::<&str, (u64, Vec<&WorkloadOperationStatus>)>::new();
+    let mut latest_consuming =
+        BTreeMap::<&str, (u64, Vec<&WorkloadOperationStatus>)>::new();
     for status in statuses {
         let key = status.workload_id.as_str();
-        if latest
-            .get(key)
-            .is_none_or(|current| current.generation <= status.generation)
-        {
-            latest.insert(key, status);
+        match latest.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((status.generation, vec![status]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (generation, rows) = entry.get_mut();
+                match status.generation.cmp(generation) {
+                    std::cmp::Ordering::Greater => {
+                        *generation = status.generation;
+                        rows.clear();
+                        rows.push(status);
+                    }
+                    std::cmp::Ordering::Equal => rows.push(status),
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+        }
+        if status_reserves_capacity(status) {
+            match latest_consuming.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((status.generation, vec![status]));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (generation, rows) = entry.get_mut();
+                    match status.generation.cmp(generation) {
+                        std::cmp::Ordering::Greater => {
+                            *generation = status.generation;
+                            rows.clear();
+                            rows.push(status);
+                        }
+                        std::cmp::Ordering::Equal => rows.push(status),
+                        std::cmp::Ordering::Less => {}
+                    }
+                }
+            }
         }
     }
     let mut allocated_vcpu = 0_u16;
     let mut allocated_memory_mb = 0_u32;
     let mut allocated_vm_storage_gb = 0_u32;
     let mut allocated_container_storage_gb = 0_u32;
-    for status in latest
-        .into_values()
-        .filter(|status| !status.phase.is_terminal())
-    {
-        allocated_vcpu = allocated_vcpu.saturating_add(status.resources.vcpu);
-        allocated_memory_mb = allocated_memory_mb.saturating_add(status.resources.memory_mb);
-        match status.backend {
-            WorkloadBackend::LibvirtVirtqemud => {
-                allocated_vm_storage_gb =
-                    allocated_vm_storage_gb.saturating_add(status.resources.disk_gb);
-            }
-            WorkloadBackend::QuadletSystemd => {
-                allocated_container_storage_gb =
-                    allocated_container_storage_gb.saturating_add(status.resources.disk_gb);
-            }
+    for (workload_id, (_, latest_rows)) in latest {
+        // A failed operation does not prove that an already-running prior
+        // generation stopped. Admission, authorization, or adapter setup can
+        // fail before any lifecycle effect, while `fail()` honestly records
+        // only that the new operation's power is unknown/Failed. Retain the
+        // newest still-consuming generation until a later Completed/Cancelled
+        // status positively reports Stopped; otherwise one rejected retry can
+        // erase a live VM from admission accounting and overcommit the host.
+        // More than one durable row at the same newest generation is itself a
+        // conflict. Reconstruct the reservation conservatively across all of
+        // them: a substituted terminal row must never win by journal ordering
+        // and make a still-running workload disappear from host accounting.
+        let reserving: Vec<_> = latest_rows
+            .iter()
+            .copied()
+            .filter(|status| status_reserves_capacity(status))
+            .collect();
+        let statuses = if !reserving.is_empty() {
+            reserving
+        } else if latest_rows
+            .iter()
+            .any(|status| status.phase == WorkloadOperationPhase::Failed)
+        {
+            latest_consuming
+                .get(workload_id)
+                .map(|(_, rows)| rows.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if statuses.is_empty() {
+            continue;
         }
+        allocated_vcpu = allocated_vcpu.saturating_add(
+            statuses
+                .iter()
+                .map(|status| status.resources.vcpu)
+                .max()
+                .unwrap_or(0),
+        );
+        allocated_memory_mb = allocated_memory_mb.saturating_add(
+            statuses
+                .iter()
+                .map(|status| status.resources.memory_mb)
+                .max()
+                .unwrap_or(0),
+        );
+        allocated_vm_storage_gb = allocated_vm_storage_gb.saturating_add(
+            statuses
+                .iter()
+                .filter(|status| status.backend == WorkloadBackend::LibvirtVirtqemud)
+                .map(|status| status.resources.disk_gb)
+                .max()
+                .unwrap_or(0),
+        );
+        allocated_container_storage_gb = allocated_container_storage_gb.saturating_add(
+            statuses
+                .iter()
+                .filter(|status| status.backend == WorkloadBackend::QuadletSystemd)
+                .map(|status| status.resources.disk_gb)
+                .max()
+                .unwrap_or(0),
+        );
     }
     let vm_storage_gb = probe_storage_gb(VM_STORAGE_PATH);
     let container_storage_gb = probe_storage_gb(CONTAINER_STORAGE_PATH);
@@ -4539,6 +4707,20 @@ fn live_capacity<'a>(
         allocated_container_storage_gb,
     };
     (host, storage)
+}
+
+fn status_reserves_capacity(status: &WorkloadOperationStatus) -> bool {
+    // `Completed` terminates the operation, not necessarily the workload. A
+    // successful Start/Resume remains Running (and Pause remains Paused), so
+    // only terminal rows whose power no longer consumes host resources release
+    // their reservation.
+    !status.phase.is_terminal()
+        || matches!(
+            status.power,
+            WorkloadPowerState::Running
+                | WorkloadPowerState::Paused
+                | WorkloadPowerState::Stopping
+        )
 }
 
 fn probe_storage_gb(path: &str) -> u32 {
@@ -5111,6 +5293,215 @@ mod tests {
         );
     }
 
+    struct SlowCancellationPresentationActuator {
+        state_root: PathBuf,
+        lease: WorkloadAttachmentLease,
+        revoked: Arc<Mutex<Vec<(String, u64)>>>,
+        saw_durable_detach_before_revoke: Arc<AtomicBool>,
+        cancel_calls: Arc<AtomicU64>,
+    }
+
+    impl WorkloadActuator for SlowCancellationPresentationActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            Ok(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::WaitingForGuest,
+                power: WorkloadPowerState::Starting,
+                readiness: WorkloadReadiness::WaitingForGuest,
+                retryable: true,
+                reason: None,
+                remediation: None,
+                attachment: Some(self.lease.clone()),
+            })
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            status: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            assert!(status.attachment.is_none());
+            self.cancel_calls.fetch_add(1, Ordering::AcqRel);
+            // Model a hostile/slow adapter that neither removes presentation
+            // itself nor reaches a terminal backend state on this attempt.
+            Ok(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::Stopping,
+                power: WorkloadPowerState::Stopping,
+                readiness: WorkloadReadiness::Unavailable,
+                retryable: true,
+                reason: Some("backend remains active during graceful shutdown".into()),
+                remediation: None,
+                attachment: None,
+            })
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            unreachable!("cancellation owns target observation")
+        }
+
+        fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+            if let Some(lease) = status.attachment.as_ref() {
+                let reopened = WorkloadOperationLedger::open(&self.state_root)
+                    .expect("reopen cancellation journal at revocation boundary");
+                self.saw_durable_detach_before_revoke.store(
+                    reopened
+                        .status(&status.request_id)
+                        .is_some_and(|durable| durable.attachment.is_none()),
+                    Ordering::Release,
+                );
+                self.revoked
+                    .lock()
+                    .expect("presentation revocations")
+                    .push((lease.lease_id.clone(), lease.generation));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_revokes_and_journals_presentation_before_slow_backend_cleanup() {
+        let temp = tempfile::tempdir().expect("cancellation state");
+        let started_at = now_ms();
+        let mut target = request();
+        target.request_id = "target-with-presentation".into();
+        target.deadline_at_ms = started_at.saturating_add(20_000);
+        let lease = SystemWorkloadActuator::attachment_lease(&target, 1, started_at);
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let saw_durable_detach_before_revoke = Arc::new(AtomicBool::new(false));
+        let cancel_calls = Arc::new(AtomicU64::new(0));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(SlowCancellationPresentationActuator {
+                state_root: temp.path().to_path_buf(),
+                lease: lease.clone(),
+                revoked: Arc::clone(&revoked),
+                saw_durable_detach_before_revoke: Arc::clone(
+                    &saw_durable_detach_before_revoke,
+                ),
+                cancel_calls: Arc::clone(&cancel_calls),
+            }));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        let target_raw = serde_json::to_string(&target).expect("target wire");
+        worker.handle_request(&mut ledger, &target_raw, target.clone(), started_at);
+        assert_eq!(
+            ledger
+                .status(&target.request_id)
+                .and_then(|status| status.attachment.as_ref()),
+            Some(&lease)
+        );
+
+        let mut cancel = target.clone();
+        cancel.request_id = "cancel-presented-target".into();
+        cancel.action = WorkloadOperationAction::Cancel;
+        cancel.expected_generation = 1;
+        cancel.target_request_id = Some(target.request_id.clone());
+        cancel.preferred_attachment = None;
+        let cancel_raw = serde_json::to_string(&cancel).expect("cancel wire");
+        worker.handle_request(&mut ledger, &cancel_raw, cancel.clone(), started_at);
+
+        assert!(saw_durable_detach_before_revoke.load(Ordering::Acquire));
+        assert_eq!(cancel_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            revoked.lock().expect("presentation revocations").as_slice(),
+            &[(lease.lease_id, lease.generation)]
+        );
+        let target_status = ledger.status(&target.request_id).expect("target status");
+        assert_eq!(target_status.phase, WorkloadOperationPhase::Stopping);
+        assert_eq!(target_status.readiness, WorkloadReadiness::Unavailable);
+        assert!(target_status.attachment.is_none());
+        assert_eq!(
+            ledger.status(&cancel.request_id).expect("cancel status").phase,
+            WorkloadOperationPhase::Stopping
+        );
+
+        // A failed durable detach authorizes neither endpoint revocation nor
+        // backend cancellation. The queued cancellation remains the durable
+        // owner, and the target retains the journaled lease for a later retry.
+        let failed = tempfile::tempdir().expect("failed cancellation state");
+        let mut failed_target = request();
+        failed_target.request_id = "target-detach-flush-fails".into();
+        failed_target.deadline_at_ms = started_at.saturating_add(20_000);
+        let failed_lease =
+            SystemWorkloadActuator::attachment_lease(&failed_target, 1, started_at);
+        let failed_revoked = Arc::new(Mutex::new(Vec::new()));
+        let failed_saw_detach = Arc::new(AtomicBool::new(false));
+        let failed_cancel_calls = Arc::new(AtomicU64::new(0));
+        let mut failed_worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(failed.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(SlowCancellationPresentationActuator {
+                state_root: failed.path().to_path_buf(),
+                lease: failed_lease.clone(),
+                revoked: Arc::clone(&failed_revoked),
+                saw_durable_detach_before_revoke: Arc::clone(&failed_saw_detach),
+                cancel_calls: Arc::clone(&failed_cancel_calls),
+            }));
+        let mut failed_ledger =
+            WorkloadOperationLedger::open(failed.path()).expect("failed-path ledger");
+        let failed_target_raw =
+            serde_json::to_string(&failed_target).expect("failed target wire");
+        failed_worker.handle_request(
+            &mut failed_ledger,
+            &failed_target_raw,
+            failed_target.clone(),
+            started_at,
+        );
+        let mut failed_cancel = failed_target.clone();
+        failed_cancel.request_id = "cancel-detach-flush-fails".into();
+        failed_cancel.action = WorkloadOperationAction::Cancel;
+        failed_cancel.expected_generation = 1;
+        failed_cancel.target_request_id = Some(failed_target.request_id.clone());
+        failed_cancel.preferred_attachment = None;
+        let failed_cancel_status = failed_ledger
+            .accept(failed_cancel.clone(), started_at)
+            .expect("persist queued failed-path cancellation");
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let writable_mode = fs::metadata(failed.path())
+            .expect("failed-path metadata")
+            .permissions()
+            .mode();
+        fs::set_permissions(failed.path(), fs::Permissions::from_mode(0o500))
+            .expect("make cancellation journal unwritable");
+        failed_worker.drive_accepted(
+            &mut failed_ledger,
+            failed_cancel.clone(),
+            failed_cancel_status,
+            started_at,
+        );
+        fs::set_permissions(
+            failed.path(),
+            fs::Permissions::from_mode(writable_mode),
+        )
+        .expect("restore cancellation journal permissions");
+
+        assert!(!failed_saw_detach.load(Ordering::Acquire));
+        assert!(failed_revoked.lock().expect("failed revocations").is_empty());
+        assert_eq!(failed_cancel_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            failed_ledger
+                .status(&failed_target.request_id)
+                .and_then(|status| status.attachment.as_ref()),
+            Some(&failed_lease)
+        );
+        assert_eq!(
+            failed_ledger
+                .status(&failed_cancel.request_id)
+                .expect("queued cancellation remains owner")
+                .phase,
+            WorkloadOperationPhase::Queued
+        );
+    }
+
     struct TimeoutCleanupActuator {
         apply_calls: Arc<Mutex<u32>>,
         cleanup_calls: Arc<Mutex<u32>>,
@@ -5442,6 +5833,56 @@ mod tests {
         }
     }
 
+    struct OrderedFailureRevocationActuator {
+        state_root: PathBuf,
+        revoked: Arc<Mutex<Vec<(String, u64)>>>,
+        saw_durable_detach_before_revoke: Arc<AtomicBool>,
+    }
+
+    impl WorkloadActuator for OrderedFailureRevocationActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("failure-order test invokes the terminal boundary directly")
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("failure-order test invokes the terminal boundary directly")
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            unreachable!("failure-order test invokes the terminal boundary directly")
+        }
+
+        fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+            let Some(lease) = status.attachment.as_ref() else {
+                return;
+            };
+            let reopened = WorkloadOperationLedger::open(&self.state_root)
+                .expect("reopen failure journal at revocation boundary");
+            self.saw_durable_detach_before_revoke.store(
+                reopened.status(&status.request_id).is_some_and(|durable| {
+                    durable.phase == WorkloadOperationPhase::Failed
+                        && durable.attachment.is_none()
+                }),
+                Ordering::Release,
+            );
+            self.revoked
+                .lock()
+                .expect("failure revocations")
+                .push((lease.lease_id.clone(), lease.generation));
+        }
+    }
+
     struct HostileAttachmentOutcomeActuator {
         calls: Arc<Mutex<u32>>,
         revoked: Arc<Mutex<Vec<(String, u64)>>>,
@@ -5641,6 +6082,32 @@ mod tests {
         }
     }
 
+    fn arm_request(
+        request: &WorkloadOperationRequest,
+        signer: &HmacTokenSigner,
+        nonce: &str,
+        now: u64,
+    ) -> (WorkloadOperationRequest, String) {
+        let mut armed = request.clone();
+        armed.armed_token = None;
+        let unsigned = serde_json::to_string(&armed).expect("unsigned Workload request");
+        let digest = mackes_mesh_types::cloud::cloud_request_digest(&unsigned)
+            .expect("Workload request digest");
+        let now_i64 = i64::try_from(now).expect("test clock");
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer,
+            nonce,
+            now_i64 + 20_000,
+            AUTH_VERB,
+            &armed.target_node,
+            &format!("workload:{}", armed.workload_id.as_str()),
+            &digest,
+        );
+        armed.armed_token = Some(token.encode());
+        let raw = serde_json::to_string(&armed).expect("armed Workload request");
+        (armed, raw)
+    }
+
     fn seed_completed_attachment(
         ledger: &mut WorkloadOperationLedger,
         request: WorkloadOperationRequest,
@@ -5673,6 +6140,40 @@ mod tests {
                 .advance(&request.request_id, status, now)
                 .expect("advance recovery record");
         }
+    }
+
+    fn seed_inflight_attachment(
+        ledger: &mut WorkloadOperationLedger,
+        request: &WorkloadOperationRequest,
+        lease: &WorkloadAttachmentLease,
+        now: u64,
+    ) -> WorkloadOperationStatus {
+        let mut status = ledger
+            .accept(request.clone(), now)
+            .expect("queue attached operation");
+        for phase in [
+            WorkloadOperationPhase::Validating,
+            WorkloadOperationPhase::Admitting,
+            WorkloadOperationPhase::Defining,
+            WorkloadOperationPhase::Starting,
+            WorkloadOperationPhase::WaitingForGuest,
+            WorkloadOperationPhase::WaitingForService,
+            WorkloadOperationPhase::PreparingDisplay,
+            WorkloadOperationPhase::WaitingForFirstFrame,
+        ] {
+            status.phase = phase;
+            if phase == WorkloadOperationPhase::WaitingForFirstFrame {
+                status.power = WorkloadPowerState::Running;
+                status.readiness = WorkloadReadiness::PreparingDisplay;
+                status.attachment = Some(lease.clone());
+                status.signals =
+                    WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
+            }
+            status = ledger
+                .advance(&request.request_id, status, now)
+                .expect("advance attached operation");
+        }
+        status
     }
 
     fn test_capacity() -> HostCapacity {
@@ -5828,6 +6329,27 @@ mod tests {
         assert!(!libvirt_domain_already_running(
             "permission denied while contacting virtqemud"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replayed_libvirt_start_accepts_already_active_backend() {
+        let mut already_active = Command::new("sh");
+        already_active.args([
+            "-c",
+            "printf '%s' 'Requested operation is not valid: domain is already active' >&2; exit 1",
+        ]);
+        run_libvirt_power_command(already_active, "start", Duration::from_secs(1))
+            .expect("already-running VM is the committed result of the replayed start");
+
+        let mut denied = Command::new("sh");
+        denied.args([
+            "-c",
+            "printf '%s' 'permission denied while contacting virtqemud' >&2; exit 1",
+        ]);
+        let error = run_libvirt_power_command(denied, "start", Duration::from_secs(1))
+            .expect_err("unrelated libvirt failures must remain failures");
+        assert!(error.contains("permission denied while contacting virtqemud"));
     }
 
     #[test]
@@ -6473,6 +6995,70 @@ mod tests {
             ledger.status("op-1").expect("status").phase,
             WorkloadOperationPhase::WaitingForGuest
         );
+    }
+
+    #[test]
+    fn rotated_token_replay_is_idempotent_but_semantic_change_conflicts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let auth_root = temp.path().join("auth");
+        let calls = Arc::new(Mutex::new(0));
+        let key = b"workload-semantic-replay-key".to_vec();
+        let mint_signer = HmacTokenSigner::new(key.clone());
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(ArmedWorkloadAuthorizer {
+                signer: Box::new(HmacTokenSigner::new(key)),
+                auth_root: auth_root.clone(),
+            }))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: calls.clone(),
+            }));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        let started_at = now_ms();
+        let mut base = request();
+        base.deadline_at_ms = started_at + 20_000;
+        let (initial, initial_raw) =
+            arm_request(&base, &mint_signer, "initial-capability", started_at);
+
+        let accepted = worker.handle_request(
+            &mut ledger,
+            &initial_raw,
+            initial.clone(),
+            started_at,
+        );
+        assert!(matches!(accepted, HandleResult::Accepted(_)));
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert!(!claim_nonce(
+            &auth_root,
+            "initial-capability",
+            i64::try_from(started_at).unwrap() + 20_000,
+            i64::try_from(started_at).unwrap(),
+        )
+        .expect("inspect consumed initial capability"));
+
+        let (rotated, rotated_raw) =
+            arm_request(&base, &mint_signer, "rotated-capability", started_at);
+        let replay = worker.handle_request(&mut ledger, &rotated_raw, rotated, started_at);
+        assert!(matches!(replay, HandleResult::Accepted(_)));
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert!(claim_nonce(
+            &auth_root,
+            "rotated-capability",
+            i64::try_from(started_at).unwrap() + 20_000,
+            i64::try_from(started_at).unwrap(),
+        )
+        .expect("rotated replay capability remains unconsumed"));
+
+        let mut changed = base;
+        changed.resources.memory_mb += 512;
+        let (changed, changed_raw) =
+            arm_request(&changed, &mint_signer, "changed-capability", started_at);
+        assert_eq!(
+            worker.handle_request(&mut ledger, &changed_raw, changed, started_at),
+            HandleResult::Rejected(WorkloadOperationErrorCode::Conflict)
+        );
+        assert_eq!(*calls.lock().expect("calls"), 1);
     }
 
     #[test]
@@ -7349,6 +7935,117 @@ mod tests {
     }
 
     #[test]
+    fn completed_running_workload_remains_reserved_against_new_placement() {
+        let mut running = queued_status(&request());
+        running.phase = WorkloadOperationPhase::Completed;
+        running.power = WorkloadPowerState::Running;
+
+        let (host, storage) = live_capacity(std::iter::once(&running));
+
+        assert_eq!(host.allocated_vcpu, running.resources.vcpu);
+        assert_eq!(host.allocated_memory_mb, running.resources.memory_mb);
+        assert_eq!(
+            storage.allocated_vm_storage_gb,
+            running.resources.disk_gb
+        );
+        assert!(
+            !admit_workload_for_backend(
+                WorkloadProfile::Small.resources(),
+                WorkloadBackend::LibvirtVirtqemud,
+                HostCapacity {
+                    logical_cpus: 5,
+                    memory_mb: 16_384,
+                    storage_gb: host.storage_gb,
+                    ..host
+                },
+                storage,
+            )
+            .admitted,
+            "a completed operation whose workload is still running must retain its placement reservation"
+        );
+    }
+
+    #[test]
+    fn failed_retry_cannot_release_prior_running_workload_reservation() {
+        let mut running = queued_status(&request());
+        running.phase = WorkloadOperationPhase::Completed;
+        running.power = WorkloadPowerState::Running;
+
+        let mut failed_retry = running.clone();
+        failed_retry.request_id = "failed-retry".into();
+        failed_retry.generation = running.generation + 1;
+        failed_retry.phase = WorkloadOperationPhase::Failed;
+        failed_retry.power = WorkloadPowerState::Failed;
+        failed_retry.readiness = WorkloadReadiness::Failed;
+        failed_retry.reason = Some("admission failed before any backend effect".into());
+
+        // Put the newer failed row first to prove selection does not depend on
+        // journal request-id order.
+        let (host, storage) = live_capacity([&failed_retry, &running].into_iter());
+
+        assert_eq!(host.allocated_vcpu, running.resources.vcpu);
+        assert_eq!(host.allocated_memory_mb, running.resources.memory_mb);
+        assert_eq!(
+            storage.allocated_vm_storage_gb,
+            running.resources.disk_gb
+        );
+        assert!(
+            !admit_workload_for_backend(
+                WorkloadProfile::Small.resources(),
+                WorkloadBackend::LibvirtVirtqemud,
+                HostCapacity {
+                    logical_cpus: 5,
+                    memory_mb: 16_384,
+                    storage_gb: host.storage_gb,
+                    ..host
+                },
+                storage,
+            )
+            .admitted,
+            "a failed no-effect retry must not make the still-running prior generation available for another placement"
+        );
+    }
+
+    #[test]
+    fn same_generation_stopped_substitution_cannot_release_running_reservation_after_restart() {
+        let mut running = queued_status(&request());
+        running.phase = WorkloadOperationPhase::Completed;
+        running.power = WorkloadPowerState::Running;
+
+        let mut substituted = running.clone();
+        substituted.request_id = "substituted-stop".into();
+        substituted.phase = WorkloadOperationPhase::Completed;
+        substituted.power = WorkloadPowerState::Stopped;
+        substituted.readiness = WorkloadReadiness::Unavailable;
+
+        // Put the hostile row last: the old reconstruction selected the last
+        // equal-generation journal row and silently released the real VM.
+        let (host, storage) = live_capacity([&running, &substituted].into_iter());
+
+        assert_eq!(host.allocated_vcpu, running.resources.vcpu);
+        assert_eq!(host.allocated_memory_mb, running.resources.memory_mb);
+        assert_eq!(
+            storage.allocated_vm_storage_gb,
+            running.resources.disk_gb
+        );
+        assert!(
+            !admit_workload_for_backend(
+                WorkloadProfile::Small.resources(),
+                WorkloadBackend::LibvirtVirtqemud,
+                HostCapacity {
+                    logical_cpus: 5,
+                    memory_mb: 16_384,
+                    storage_gb: host.storage_gb,
+                    ..host
+                },
+                storage,
+            )
+            .admitted,
+            "a same-generation stopped substitution must not release the running reservation"
+        );
+    }
+
+    #[test]
     fn retryable_observation_honors_durable_backoff_after_restart() {
         let temp = tempfile::tempdir().expect("temp");
         let observe_calls = Arc::new(Mutex::new(0));
@@ -7443,6 +8140,113 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("hostile peer credentials")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_failure_detaches_durably_before_revocation_and_preserves_on_flush_failure() {
+        let started_at = now_ms();
+        let successful = tempfile::tempdir().expect("successful failure state");
+        let mut successful_request = request();
+        successful_request.request_id = "durable-terminal-detach".into();
+        successful_request.deadline_at_ms = started_at.saturating_add(20_000);
+        let successful_lease =
+            SystemWorkloadActuator::attachment_lease(&successful_request, 1, started_at);
+        let mut successful_ledger =
+            WorkloadOperationLedger::open(successful.path()).expect("successful ledger");
+        let successful_status = seed_inflight_attachment(
+            &mut successful_ledger,
+            &successful_request,
+            &successful_lease,
+            started_at,
+        );
+        let successful_revoked = Arc::new(Mutex::new(Vec::new()));
+        let saw_durable_detach = Arc::new(AtomicBool::new(false));
+        let successful_worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(
+            Box::new(OrderedFailureRevocationActuator {
+                state_root: successful.path().to_path_buf(),
+                revoked: Arc::clone(&successful_revoked),
+                saw_durable_detach_before_revoke: Arc::clone(&saw_durable_detach),
+            }),
+        );
+
+        successful_worker.fail(
+            &mut successful_ledger,
+            &successful_request,
+            successful_status,
+            "hostile terminal observation",
+            "repair the backend",
+            false,
+            started_at,
+        );
+
+        assert!(saw_durable_detach.load(Ordering::Acquire));
+        assert_eq!(
+            successful_revoked
+                .lock()
+                .expect("successful revocations")
+                .as_slice(),
+            &[(successful_lease.lease_id, successful_lease.generation)]
+        );
+        let durable_failure = successful_ledger
+            .status(&successful_request.request_id)
+            .expect("durable terminal failure");
+        assert_eq!(durable_failure.phase, WorkloadOperationPhase::Failed);
+        assert!(durable_failure.attachment.is_none());
+
+        // If the detached terminal status cannot be persisted, external
+        // revocation is not authorized. The durable in-flight record and its
+        // exact lease remain aligned for corrected-forward recovery.
+        let failed = tempfile::tempdir().expect("failed failure state");
+        let mut failed_request = request();
+        failed_request.request_id = "terminal-detach-flush-fails".into();
+        failed_request.deadline_at_ms = started_at.saturating_add(20_000);
+        let failed_lease =
+            SystemWorkloadActuator::attachment_lease(&failed_request, 1, started_at);
+        let mut failed_ledger =
+            WorkloadOperationLedger::open(failed.path()).expect("failed-path ledger");
+        let failed_status = seed_inflight_attachment(
+            &mut failed_ledger,
+            &failed_request,
+            &failed_lease,
+            started_at,
+        );
+        let failed_revoked = Arc::new(Mutex::new(Vec::new()));
+        let failed_saw_detach = Arc::new(AtomicBool::new(false));
+        let failed_worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(
+            Box::new(OrderedFailureRevocationActuator {
+                state_root: failed.path().to_path_buf(),
+                revoked: Arc::clone(&failed_revoked),
+                saw_durable_detach_before_revoke: Arc::clone(&failed_saw_detach),
+            }),
+        );
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let writable_mode = fs::metadata(failed.path())
+            .expect("failed-path metadata")
+            .permissions()
+            .mode();
+        fs::set_permissions(failed.path(), fs::Permissions::from_mode(0o500))
+            .expect("make failure journal unwritable");
+        failed_worker.fail(
+            &mut failed_ledger,
+            &failed_request,
+            failed_status,
+            "hostile terminal observation",
+            "repair the backend",
+            false,
+            started_at,
+        );
+        fs::set_permissions(failed.path(), fs::Permissions::from_mode(writable_mode))
+            .expect("restore failure journal permissions");
+
+        assert!(!failed_saw_detach.load(Ordering::Acquire));
+        assert!(failed_revoked.lock().expect("failed revocations").is_empty());
+        let retained = failed_ledger
+            .status(&failed_request.request_id)
+            .expect("retained durable operation");
+        assert_eq!(retained.phase, WorkloadOperationPhase::WaitingForFirstFrame);
+        assert_eq!(retained.attachment.as_ref(), Some(&failed_lease));
     }
 
     #[test]

@@ -345,7 +345,24 @@ fn ensure_regular_gazetteer(db: &Path) -> rusqlite::Result<()> {
             "offline gazetteer path must be a regular file".to_string(),
         ));
     }
+    if has_multiple_links(&metadata) {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "offline gazetteer must not share an inode with another path".to_string(),
+        ));
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn has_multiple_links(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.nlink() != 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_links(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Open a gazetteer without allowing pathname changes between validation and
@@ -390,6 +407,11 @@ fn open_gazetteer(db: &Path) -> rusqlite::Result<Connection> {
         if !opened.file_type().is_file() {
             return Err(rusqlite::Error::InvalidParameterName(
                 "offline gazetteer path must be a regular file".to_string(),
+            ));
+        }
+        if has_multiple_links(&opened) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "offline gazetteer must not share an inode with another path".to_string(),
             ));
         }
 
@@ -771,6 +793,24 @@ mod tests {
             error,
             rusqlite::Error::InvalidParameterName(message)
                 if message.contains("parent must not be a symlink")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_gazetteer_cannot_alias_navigation_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let writable_source = dir.path().join("writable-source.sqlite");
+        synth_gazetteer(&writable_source);
+        let installed = dir.path().join("gazetteer.sqlite");
+        std::fs::hard_link(&writable_source, &installed).unwrap();
+
+        let error = query_db(&installed, "athens", 10)
+            .expect_err("a second path must not retain mutation authority over the gazetteer");
+        assert!(matches!(
+            error,
+            rusqlite::Error::InvalidParameterName(message)
+                if message.contains("must not share an inode")
         ));
     }
 

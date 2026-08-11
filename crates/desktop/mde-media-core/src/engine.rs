@@ -130,8 +130,25 @@ impl VideoFrame {
     /// Compares whole 4-byte pixels, not raw bytes: a uniform *black* frame
     /// (every pixel `[0, 0, 0, 255]`) must read as blank even though its own
     /// bytes aren't all numerically equal (0 vs. the 255 alpha channel).
+    /// Malformed geometry or an inexact RGBA buffer also fails closed as blank;
+    /// partial/trailing pixels must not become proof that decoding succeeded.
     #[must_use]
     pub fn is_blank(&self) -> bool {
+        let Some(expected_len) = usize::try_from(self.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return true;
+        };
+        if expected_len == 0 || self.rgba.len() != expected_len {
+            return true;
+        }
+
         let mut pixels = self.rgba.chunks_exact(4);
         pixels
             .next()
@@ -399,6 +416,37 @@ mod tests {
     #[test]
     fn a_varied_frame_is_not_blank() {
         assert!(!frame(vec![10, 20, 30, 255, 40, 50, 60, 255]).is_blank());
+    }
+
+    #[test]
+    fn malformed_rgba_layout_cannot_report_nonblank_decode_success() {
+        for hostile in [
+            VideoFrame {
+                width: 2,
+                height: 1,
+                rgba: vec![10, 20, 30, 255, 40, 50, 60],
+            },
+            VideoFrame {
+                width: 2,
+                height: 1,
+                rgba: vec![10, 20, 30, 255, 40, 50, 60, 255, 99],
+            },
+            VideoFrame {
+                width: 0,
+                height: 1,
+                rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            },
+            VideoFrame {
+                width: u32::MAX,
+                height: u32::MAX,
+                rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+            },
+        ] {
+            assert!(
+                hostile.is_blank(),
+                "an inexact frame buffer must fail closed instead of proving playback"
+            );
+        }
     }
 
     #[test]

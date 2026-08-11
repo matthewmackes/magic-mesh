@@ -208,6 +208,26 @@ pub(crate) fn trim_base(base_url: &str) -> &str {
     base_url.strip_suffix('/').unwrap_or(base_url)
 }
 
+/// Encode one opaque Jellyfin identity as exactly one URL path segment.
+///
+/// IDs originate at a remote server and must not be able to introduce a path
+/// separator, query, fragment, or pre-encoded escape into a later request.
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 /// The standard JSON headers for a request, with the `Authorization` line.
 pub(crate) fn json_headers(
     device: &ClientInfo,
@@ -486,7 +506,7 @@ pub fn build_items_request(
     let url = format!(
         "{}/Users/{}/Items{}",
         trim_base(base_url),
-        user_id,
+        encode_path_segment(user_id),
         render_query(&query.to_pairs()),
     );
     HttpRequest::get(url, json_headers(device, token, false))
@@ -503,7 +523,7 @@ fn build_seasons_request(
     let url = format!(
         "{}/Shows/{}/Seasons{}",
         trim_base(base_url),
-        series_id,
+        encode_path_segment(series_id),
         render_query(&[("userId", user_id.to_string())]),
     );
     HttpRequest::get(url, json_headers(device, token, false))
@@ -522,7 +542,7 @@ fn build_episodes_request(
     let url = format!(
         "{}/Shows/{}/Episodes{}",
         trim_base(base_url),
-        series_id,
+        encode_path_segment(series_id),
         render_query(&[
             ("userId", user_id.to_string()),
             ("seasonId", season_id.unwrap_or_default().to_string()),
@@ -766,7 +786,7 @@ pub fn image_url(
     format!(
         "{}/Items/{}/Images/{}{}",
         trim_base(base_url),
-        item_id,
+        encode_path_segment(item_id),
         image_type.as_str(),
         render_query(&pairs),
     )
@@ -1391,6 +1411,43 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "Authorization" && v.contains("Token=\"T\"")));
+    }
+
+    #[test]
+    fn remote_ids_cannot_escape_their_request_path_segment() {
+        let hostile = "victim/../admin?scope=all#fragment%2Fchild";
+        let encoded = "victim%2F..%2Fadmin%3Fscope%3Dall%23fragment%252Fchild";
+
+        let items = build_items_request(
+            "https://j.mesh",
+            hostile,
+            &ItemsQuery::default(),
+            &device(),
+            Some("T"),
+        );
+        assert_eq!(items.url, format!("https://j.mesh/Users/{encoded}/Items"));
+        assert!(items
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value.contains("Token=\"T\"")));
+
+        let seasons =
+            build_seasons_request("https://j.mesh", hostile, "user", &device(), Some("T"));
+        assert_eq!(
+            seasons.url,
+            format!("https://j.mesh/Shows/{encoded}/Seasons?userId=user")
+        );
+
+        let artwork = image_url(
+            "https://j.mesh",
+            hostile,
+            ImageType::Primary,
+            &ImageQuery::default(),
+        );
+        assert_eq!(
+            artwork,
+            format!("https://j.mesh/Items/{encoded}/Images/Primary")
+        );
     }
 
     #[test]

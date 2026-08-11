@@ -41,8 +41,13 @@
 //! and badge carry the exact unacknowledged actionable count; A–F is shown only
 //! inside the centered modal.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use mackes_mesh_types::health::{
+    GradeLetter, HEALTH_SCHEMA_VERSION, HealthSeverity, MAX_HEALTH_ID_BYTES,
+    MAX_NODE_HEALTH_CONDITIONS, NodeGrade, RequirementClass, SystemMeshHealthSnapshot,
+};
 use mde_egui::egui;
 use mde_egui::{Motion, Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
@@ -50,7 +55,7 @@ use mde_theme::brand::icons::IconId;
 use crate::chrome::HealthStatus;
 use crate::construct::ConstructChrome;
 use crate::status::StatusSegments;
-use crate::surfaces::{icon_texture, Surface, TOOL_TRAY_SURFACES};
+use crate::surfaces::{Surface, TOOL_TRAY_SURFACES, icon_texture};
 
 /// The locked strip height (Q12: "~24px").
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
@@ -80,6 +85,9 @@ const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
 const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
 const BOTTOM_TRAY_STATUS_MENU_W: f32 = 40.0;
 const NOTIFICATION_BELL_W: f32 = 32.0;
+/// The health and Mesh Teams launchers share the notification bell's compact
+/// hit target so the three adjacent controls read as one intentional group.
+const STATUS_LAUNCHER_W: f32 = NOTIFICATION_BELL_W;
 const BATTERY_STATUS_W: f32 = 58.0;
 const WEATHER_STATUS_W: f32 = 64.0;
 const WEATHER_STATUS_COMPACT_W: f32 = STATUS_BAR_H;
@@ -91,6 +99,212 @@ const STATUS_CLOCK_MIN_W: f32 = Style::SP_XL;
 /// the current fixed labels, but prevents a future daemon-provided label from
 /// turning the rail into an unbounded layout job.
 const MAX_STATUS_TEXT_CHARS: usize = 256;
+
+const HEALTH_INDICATOR_AUTHORITY_ID: &str = "status-bar-health-indicator-authority-v1";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HealthIndicator {
+    grade: Option<GradeLetter>,
+    count: usize,
+}
+
+impl HealthIndicator {
+    const fn fresh(self) -> bool {
+        self.grade.is_some()
+    }
+
+    const fn severity(self) -> Option<HealthSeverity> {
+        match self.grade {
+            Some(GradeLetter::F) => Some(HealthSeverity::Critical),
+            Some(GradeLetter::D | GradeLetter::E) => Some(HealthSeverity::Warning),
+            Some(GradeLetter::A | GradeLetter::B | GradeLetter::C) | None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HealthIndicatorAuthority {
+    watermark: Option<SystemMeshHealthSnapshot>,
+    visible: HealthIndicator,
+}
+
+fn grade_from_summary(capability: u8, warnings: usize, critical: usize) -> GradeLetter {
+    if critical > 0 {
+        GradeLetter::F
+    } else if warnings >= 2 {
+        GradeLetter::E
+    } else if warnings == 1 {
+        GradeLetter::D
+    } else {
+        match capability {
+            90..=u8::MAX => GradeLetter::A,
+            80..=89 => GradeLetter::B,
+            _ => GradeLetter::C,
+        }
+    }
+}
+
+/// Revalidate the complete UX-013 authority before its grade reaches persistent
+/// chrome. This is intentionally a consumer-side admission check: a replaced
+/// on-disk projection must not become trusted merely because it deserializes.
+fn health_indicator_from_snapshot(
+    snapshot: &SystemMeshHealthSnapshot,
+    expected_observer: &str,
+    now_ms: u64,
+) -> Option<HealthIndicator> {
+    if snapshot.schema_version != HEALTH_SCHEMA_VERSION
+        || snapshot.observer != expected_observer
+        || snapshot.generation == 0
+        || !snapshot.is_fresh(now_ms)
+        || snapshot.roster_revision.is_empty()
+        || snapshot.roster_revision.len() > MAX_HEALTH_ID_BYTES
+        || snapshot.roster_revision.trim() != snapshot.roster_revision
+        || !snapshot.roster_revision.is_ascii()
+        || snapshot.roster_revision.chars().any(char::is_control)
+        || snapshot.current_node_grades.len() != snapshot.mesh_summary.fresh_nodes
+        || snapshot.mesh_summary.fresh_nodes > snapshot.mesh_summary.canonical_nodes
+        || snapshot.active_conditions.len() > MAX_NODE_HEALTH_CONDITIONS
+    {
+        return None;
+    }
+
+    let mut nodes = BTreeSet::new();
+    for grade in &snapshot.current_node_grades {
+        if grade.node.is_empty()
+            || grade.node.len() > MAX_HEALTH_ID_BYTES
+            || grade.node.trim() != grade.node
+            || !grade.node.is_ascii()
+            || !nodes.insert(grade.node.as_str())
+            || grade.capability_score > 100
+            || grade.evaluated_at_ms == 0
+            || grade.evaluated_at_ms > snapshot.generated_at_ms
+            || NodeGrade::evaluate(
+                grade.node.clone(),
+                grade.capability_score,
+                grade.factors,
+                &snapshot.active_conditions,
+                grade.evaluated_at_ms,
+            )
+            .grade
+                != grade.grade
+        {
+            return None;
+        }
+    }
+
+    let mut strongest = BTreeMap::new();
+    for condition in snapshot.active_conditions.iter().filter(|condition| {
+        condition.is_active() && condition.requirement == RequirementClass::Required
+    }) {
+        if condition.source != condition.evidence.provider
+            || condition.active_since_ms == 0
+            || condition.active_since_ms > condition.last_observed_ms
+            || condition.last_observed_ms > snapshot.generated_at_ms
+            || condition.evidence.observed_at_ms > condition.last_observed_ms
+        {
+            return None;
+        }
+        strongest
+            .entry((condition.scope.clone(), condition.id.as_str()))
+            .and_modify(|severity: &mut HealthSeverity| {
+                *severity = (*severity).max(condition.severity);
+            })
+            .or_insert(condition.severity);
+    }
+    let (warnings, critical) = strongest.values().fold(
+        (0usize, 0usize),
+        |(warnings, critical), severity| match severity {
+            HealthSeverity::Warning => (warnings + 1, critical),
+            HealthSeverity::Critical => (warnings, critical + 1),
+        },
+    );
+    let count = snapshot.active_issue_count(now_ms);
+    let capability = snapshot
+        .current_node_grades
+        .iter()
+        .map(|grade| grade.capability_score)
+        .min()
+        .unwrap_or(70);
+    let grade = grade_from_summary(capability, warnings, critical);
+    if snapshot.mesh_summary.active_warnings != warnings
+        || snapshot.mesh_summary.active_critical != critical
+        || snapshot.mesh_summary.unacknowledged_actionable != count
+        || snapshot.mesh_summary.grade != grade
+    {
+        return None;
+    }
+    Some(HealthIndicator {
+        grade: Some(grade),
+        count,
+    })
+}
+
+fn reconcile_health_indicator(
+    watermark: Option<&SystemMeshHealthSnapshot>,
+    candidate: Option<&SystemMeshHealthSnapshot>,
+    expected_observer: &str,
+    now_ms: u64,
+) -> HealthIndicatorAuthority {
+    let Some(candidate) = candidate else {
+        return HealthIndicatorAuthority {
+            watermark: watermark.cloned(),
+            visible: HealthIndicator::default(),
+        };
+    };
+    let Some(candidate_indicator) =
+        health_indicator_from_snapshot(candidate, expected_observer, now_ms)
+    else {
+        return HealthIndicatorAuthority {
+            watermark: watermark.cloned(),
+            visible: HealthIndicator::default(),
+        };
+    };
+    let admitted = match watermark {
+        None => candidate.clone(),
+        Some(previous) if previous == candidate => previous.clone(),
+        Some(previous)
+            if previous.observer == candidate.observer
+                && previous.generation < candidate.generation
+                && previous.generated_at_ms < candidate.generated_at_ms =>
+        {
+            candidate.clone()
+        }
+        Some(previous) => previous.clone(),
+    };
+    let visible = if &admitted == candidate {
+        candidate_indicator
+    } else {
+        health_indicator_from_snapshot(&admitted, expected_observer, now_ms).unwrap_or_default()
+    };
+    HealthIndicatorAuthority {
+        watermark: Some(admitted),
+        visible,
+    }
+}
+
+fn sync_health_indicator(ctx: &egui::Context, health: &HealthStatus) {
+    let id = egui::Id::new(HEALTH_INDICATOR_AUTHORITY_ID);
+    let previous = ctx
+        .data(|data| data.get_temp::<HealthIndicatorAuthority>(id))
+        .unwrap_or_default();
+    let now_ms = u64::try_from(crate::timers::now_unix())
+        .unwrap_or(0)
+        .saturating_mul(1_000);
+    let next = reconcile_health_indicator(
+        previous.watermark.as_ref(),
+        health.snapshot(),
+        &crate::explorer::local_hostname(),
+        now_ms,
+    );
+    ctx.data_mut(|data| data.insert_temp(id, next));
+}
+
+fn health_indicator(ctx: &egui::Context) -> HealthIndicator {
+    ctx.data(|data| {
+        data.get_temp::<HealthIndicatorAuthority>(egui::Id::new(HEALTH_INDICATOR_AUTHORITY_ID))
+            .map_or_else(HealthIndicator::default, |state| state.visible)
+    })
+}
 
 /// Live primary-battery summary folded from the off-render UPower snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,12 +372,17 @@ impl LiveWeatherStatus {
         let (Some(location), Some(current)) = (location, current) else {
             return Self::unavailable();
         };
+        let effective_location = match &location.state {
+            EffectiveLocationState::Available { location }
+            | EffectiveLocationState::Stale { location, .. } => location,
+            EffectiveLocationState::Unavailable { .. } => return Self::unavailable(),
+        };
         if location.validate_at(now_ms).is_err()
             || current.validate_at(now_ms).is_err()
             || location.host != host
             || current.host != host
             || current.location_generation != location.generation
-            || matches!(&location.state, EffectiveLocationState::Unavailable { .. })
+            || current.location_point.as_ref() != Some(&effective_location.point)
             || matches!(
                 &current.availability,
                 WeatherAvailability::Unavailable { .. }
@@ -523,6 +742,10 @@ pub(crate) fn mount_top_with_active(
     battery: Option<LiveBatteryStatus>,
     weather: Option<LiveWeatherStatus>,
 ) -> bool {
+    // Refresh authority even while Bottom placement has faded this strip out;
+    // the bottom tray reads the same state and must not preserve pre-restart
+    // mutable chrome fields when the current projection is absent or hostile.
+    sync_health_indicator(ctx, health);
     let visible = status_bar_visible(env);
     // The U09 chrome-contract tests drive all mount slots on a bare Context to
     // prove intent routing without opening a frame. Keep this persistent
@@ -953,8 +1176,9 @@ fn paint_health_status(
     placement: &'static str,
 ) {
     let response = ui.interact(rect, health_status_id(placement), egui::Sense::click());
-    let count = construct.health_count;
-    let label = health_status_label(construct.health_fresh, count);
+    let indicator = health_indicator(ui.ctx());
+    let count = indicator.count;
+    let label = health_status_label(indicator.fresh(), count);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
     });
@@ -967,10 +1191,10 @@ fn paint_health_status(
             Style::SURFACE_HI.gamma_multiply(opacity),
         );
     }
-    let color = match construct.health_severity {
+    let color = match indicator.severity() {
         Some(mackes_mesh_types::health::HealthSeverity::Critical) => Style::SUPPORT_ERROR,
         Some(mackes_mesh_types::health::HealthSeverity::Warning) => Style::SUPPORT_WARNING,
-        None if construct.health_fresh => Style::SUPPORT_SUCCESS,
+        None if indicator.fresh() => Style::SUPPORT_SUCCESS,
         None => Style::TEXT_DIM,
     }
     .gamma_multiply(opacity);
@@ -1120,6 +1344,60 @@ fn paint_notification_bell(
     }
     if response.clicked() {
         construct.notification_center_open = true;
+    }
+}
+
+/// Paint the Mesh Teams launcher beside the notification bell. Navigation is
+/// delegated to the existing Communications surface; this control owns no
+/// second Teams state or presentation.
+fn paint_mesh_teams_launcher(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    construct: &mut ConstructChrome,
+    active: bool,
+    foreground: egui::Color32,
+    hover: egui::Color32,
+) {
+    let label = "Mesh Teams — open Mesh Teams";
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("construct-status-bar", "mesh-teams")),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let response = response.on_hover_text(label);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
+    }
+    if let Some(texture) = icon_texture(
+        ui.ctx(),
+        Surface::Communications.icon_id(),
+        STATUS_CONTROL_ICON,
+        foreground,
+    ) {
+        let draw = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
+        );
+        painter.image(
+            texture.id(),
+            draw,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            foreground,
+        );
+    }
+    if active {
+        let indicator = egui::Rect::from_min_max(
+            egui::pos2(rect.center().x - 5.0, rect.bottom() - 3.0),
+            egui::pos2(rect.center().x + 5.0, rect.bottom() - 1.0),
+        );
+        painter.rect_filled(indicator, egui::CornerRadius::same(1), Style::ACCENT);
+    }
+    if response.clicked() {
+        construct.request_workspace_tray(Surface::Communications);
     }
 }
 
@@ -1278,8 +1556,21 @@ fn strip(
         bar.width(),
     ));
     let time_w = time_galley.size().x;
-    let clock_rect = clock_target_rect(bar, time_w, controls_rect);
-    let bell_left = (clock_rect.right() + STATUS_CONTROL_GAP).min(controls_rect.left());
+    // Reserve the complete health/bell/Teams cluster when finding the clock
+    // lane. Without this reservation the newly-adjacent health target could
+    // steal the clock's hit region on narrow bars.
+    let launcher_cluster_w = STATUS_LAUNCHER_W * 3.0 + STATUS_CONTROL_GAP * 4.0;
+    let clock_controls = egui::Rect::from_min_max(
+        egui::pos2(
+            (controls_rect.left() - launcher_cluster_w).max(bar.left()),
+            controls_rect.top(),
+        ),
+        controls_rect.max,
+    );
+    let clock_rect = clock_target_rect(bar, time_w, clock_controls);
+    let bell_left =
+        (clock_rect.right() + STATUS_CONTROL_GAP + STATUS_LAUNCHER_W + STATUS_CONTROL_GAP)
+            .min(controls_rect.left());
     let bell_rect = egui::Rect::from_min_max(
         egui::pos2(bell_left, bar.top()),
         egui::pos2(
@@ -1348,20 +1639,41 @@ fn strip(
         "left",
     );
 
-    // One logical health affordance replaces the grade/status cluster. The
-    // grade stays available in the modal, while the badge is the exact active,
-    // unacknowledged actionable count.
-    let workspace_rect = workspace_tray_rect(bar, bell_rect);
-    let cluster_rect = bounded_cluster_rect(
-        bar,
-        bell_rect,
-        egui::Rect::from_min_max(
-            egui::pos2(bar.left(), bar.top()),
-            egui::pos2(workspace_rect.left(), bar.bottom()),
+    // Keep the three launchers together in the requested order:
+    // System and Mesh Health, Notification, Mesh Teams. Each uses the same
+    // compact hit target; the health badge remains the exact live count.
+    let health_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (bell_rect.left() - STATUS_CONTROL_GAP - STATUS_LAUNCHER_W).max(bar.left()),
+            bar.top(),
         ),
-        36.0,
+        egui::pos2(
+            (bell_rect.left() - STATUS_CONTROL_GAP).max(bar.left()),
+            bar.bottom(),
+        ),
     );
-    paint_health_status(ui, cluster_rect, construct, 1.0, "top");
+    paint_health_status(ui, health_rect, construct, 1.0, "top");
+
+    let teams_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (bell_rect.right() + STATUS_CONTROL_GAP).min(controls_rect.left()),
+            bar.top(),
+        ),
+        egui::pos2(
+            (bell_rect.right() + STATUS_CONTROL_GAP + STATUS_LAUNCHER_W).min(controls_rect.left()),
+            bar.bottom(),
+        ),
+    );
+    paint_mesh_teams_launcher(
+        ui,
+        teams_rect,
+        construct,
+        active_surface == Some(Surface::Communications),
+        Style::TEXT,
+        Style::SURFACE_HI,
+    );
+
+    let workspace_rect = workspace_tray_rect(bar, teams_rect);
 
     paint_workspace_tray(
         ui,
@@ -1590,32 +1902,36 @@ mod tests {
         assert_eq!(status.percent, 73);
         assert_eq!(status.state, mde_seat::BatteryState::Charging);
         assert_eq!(status.icon(), IconId::BatteryBolt);
-        assert!(LiveBatteryStatus::from_batteries(&[battery(
-            7.0,
-            mde_seat::BatteryState::Discharging,
-            false,
-        )])
-        .is_none());
-        assert!(LiveBatteryStatus::from_batteries(&[battery(
-            f64::NAN,
-            mde_seat::BatteryState::Unknown,
-            true,
-        )])
-        .is_none());
+        assert!(
+            LiveBatteryStatus::from_batteries(&[battery(
+                7.0,
+                mde_seat::BatteryState::Discharging,
+                false,
+            )])
+            .is_none()
+        );
+        assert!(
+            LiveBatteryStatus::from_batteries(&[battery(
+                f64::NAN,
+                mde_seat::BatteryState::Unknown,
+                true,
+            )])
+            .is_none()
+        );
     }
 
     #[test]
     fn weather_projection_is_generation_scoped_fresh_or_explicitly_stale() {
         use mackes_mesh_types::location::{
             EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
-            EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
-            WEATHER_LOCATION_SCHEMA_VERSION,
+            EffectiveWeatherLocation, WEATHER_LOCATION_SCHEMA_VERSION, WeatherCoverage,
+            WeatherLocationMode,
         };
         use mackes_mesh_types::nws_alert::GeoPoint;
         use mackes_mesh_types::weather::{
             CurrentConditions, CurrentWeatherSnapshot, Temperature, TemperatureUnit,
-            WeatherAttribution, WeatherAvailability, WeatherConditionKind, WeatherProvider,
-            WeatherStaleReason, WEATHER_CONTRACT_SCHEMA_VERSION,
+            WEATHER_CONTRACT_SCHEMA_VERSION, WeatherAttribution, WeatherAvailability,
+            WeatherConditionKind, WeatherProvider, WeatherStaleReason,
         };
 
         const NOW: i64 = 1_800_000_000_000;
@@ -1698,6 +2014,25 @@ mod tests {
             LiveWeatherStatus::from_projections("seat", Some(&location), Some(&current), NOW);
         assert_eq!(unavailable.icon, IconId::WeatherUnavailable);
         assert_eq!(unavailable.temperature, None);
+
+        current.location_generation = location.generation;
+        current.location_point = Some(GeoPoint {
+            latitude: 41.82,
+            longitude: -71.41,
+        });
+        let wrong_point =
+            LiveWeatherStatus::from_projections("seat", Some(&location), Some(&current), NOW);
+        assert_eq!(wrong_point, LiveWeatherStatus::unavailable());
+
+        current.location_point = match &location.state {
+            EffectiveLocationState::Available { location }
+            | EffectiveLocationState::Stale { location, .. } => Some(location.point),
+            EffectiveLocationState::Unavailable { .. } => unreachable!("fixture is available"),
+        };
+        let corrected_forward =
+            LiveWeatherStatus::from_projections("seat", Some(&location), Some(&current), NOW);
+        assert_eq!(corrected_forward.temperature.as_deref(), Some("72°F"));
+        assert!(corrected_forward.label.contains("stale"));
     }
 
     #[test]
@@ -1939,6 +2274,120 @@ mod tests {
     }
 
     #[test]
+    fn restarted_status_bar_cannot_relabel_health_grade_from_foreign_or_rolled_back_generation() {
+        use mackes_mesh_types::health::{
+            GradeFactors, HealthComponent, HealthCondition, HealthEvidence, HealthScope,
+            MeshHealthSummary,
+        };
+
+        const NOW: u64 = 1_800_000_000_000;
+        fn snapshot(
+            observer: &str,
+            generation: u64,
+            generated_at_ms: u64,
+            grade: GradeLetter,
+        ) -> SystemMeshHealthSnapshot {
+            let conditions = if grade == GradeLetter::F {
+                vec![HealthCondition {
+                    id: "seat:storage".into(),
+                    scope: HealthScope::Node {
+                        node: "seat".into(),
+                    },
+                    component: HealthComponent::Resources,
+                    source: "node-grade".into(),
+                    severity: HealthSeverity::Critical,
+                    requirement: RequirementClass::Required,
+                    evidence: HealthEvidence {
+                        provider: "node-grade".into(),
+                        summary: "Storage evidence exceeded its governed threshold.".into(),
+                        facts: BTreeMap::new(),
+                        observed_at_ms: generated_at_ms,
+                    },
+                    active_since_ms: generated_at_ms,
+                    last_observed_ms: generated_at_ms,
+                    resolved_at_ms: None,
+                    acknowledged_at_ms: None,
+                    snoozed_until_ms: None,
+                    remediation: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let node_grade = NodeGrade::evaluate(
+                "seat",
+                95,
+                GradeFactors::default(),
+                &conditions,
+                generated_at_ms,
+            );
+            let critical = usize::from(grade == GradeLetter::F);
+            SystemMeshHealthSnapshot {
+                schema_version: HEALTH_SCHEMA_VERSION,
+                observer: observer.into(),
+                roster_revision: "roster-7".into(),
+                generation,
+                generated_at_ms,
+                fresh_until_ms: NOW + 60_000,
+                current_node_grades: vec![node_grade],
+                active_conditions: conditions,
+                resolved_conditions: Vec::new(),
+                mesh_summary: MeshHealthSummary {
+                    grade,
+                    canonical_nodes: 1,
+                    fresh_nodes: 1,
+                    reachable_lighthouses: 1,
+                    active_warnings: 0,
+                    active_critical: critical,
+                    unacknowledged_actionable: critical,
+                },
+            }
+        }
+
+        // A restarted shell may legitimately bootstrap from the latest retained
+        // local projection, but that establishes a generation/provenance
+        // watermark before any grade reaches persistent chrome.
+        let critical = snapshot("seat", 42, NOW - 4_000, GradeLetter::F);
+        let restarted = reconcile_health_indicator(None, Some(&critical), "seat", NOW);
+        assert_eq!(restarted.visible.grade, Some(GradeLetter::F));
+
+        let foreign = snapshot("other-seat", 43, NOW - 3_000, GradeLetter::A);
+        let substituted =
+            reconcile_health_indicator(restarted.watermark.as_ref(), Some(&foreign), "seat", NOW);
+        assert_eq!(
+            substituted.visible,
+            HealthIndicator::default(),
+            "foreign provenance must render stale, never a calm grade"
+        );
+
+        let rollback = snapshot("seat", 41, NOW - 2_000, GradeLetter::A);
+        let rolled_back = reconcile_health_indicator(
+            substituted.watermark.as_ref(),
+            Some(&rollback),
+            "seat",
+            NOW,
+        );
+        assert_eq!(rolled_back.visible.grade, Some(GradeLetter::F));
+
+        let equivocation = snapshot("seat", 42, NOW - 1_000, GradeLetter::A);
+        let equivocated = reconcile_health_indicator(
+            rolled_back.watermark.as_ref(),
+            Some(&equivocation),
+            "seat",
+            NOW,
+        );
+        assert_eq!(equivocated.visible.grade, Some(GradeLetter::F));
+
+        let corrected = snapshot("seat", 43, NOW, GradeLetter::A);
+        let corrected_forward = reconcile_health_indicator(
+            equivocated.watermark.as_ref(),
+            Some(&corrected),
+            "seat",
+            NOW,
+        );
+        assert_eq!(corrected_forward.visible.grade, Some(GradeLetter::A));
+    }
+
+    #[test]
     fn bottom_taskbar_foreground_stays_white_when_shell_is_light() {
         // The bottom tray is painted over the shared black taskbar, so it must
         // not inherit the page's Light-mode dark text token.
@@ -2160,6 +2609,50 @@ mod tests {
             "bell opens Notification Center"
         );
         assert_eq!(construct.take_workspace_tray_target(), None);
+    }
+
+    #[test]
+    fn default_launcher_orders_health_notification_and_mesh_teams_with_equal_targets() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let grades = HealthStatus::default();
+        for _ in 0..3 {
+            let _ = drive(
+                &ctx,
+                &mut construct,
+                &segments,
+                &grades,
+                visible_env(),
+                Vec::new(),
+            );
+        }
+
+        let health = ctx
+            .read_response(health_status_id("top"))
+            .expect("health launcher registered")
+            .rect;
+        let bell = ctx
+            .read_response(notification_bell_id("left"))
+            .expect("notification launcher registered")
+            .rect;
+        let teams = ctx
+            .read_response(egui::Id::new(("construct-status-bar", "mesh-teams")))
+            .expect("Mesh Teams launcher registered")
+            .rect;
+
+        assert!(health.right() <= bell.left());
+        assert!(bell.right() <= teams.left());
+        assert!((health.width() - bell.width()).abs() < f32::EPSILON);
+        assert!((bell.width() - teams.width()).abs() < f32::EPSILON);
+
+        click(&ctx, &mut construct, &segments, &grades, teams.center());
+        assert_eq!(
+            construct.take_workspace_tray_target(),
+            Some(Surface::Communications),
+            "Mesh Teams launcher keeps its existing surface route"
+        );
     }
 
     #[test]

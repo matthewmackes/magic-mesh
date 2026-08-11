@@ -930,7 +930,14 @@ impl Client {
     /// Transport / API / parse failures.
     pub async fn get_song(&self, id: &str) -> Result<Song, AirsonicError> {
         let inner = self.get("getSong", &[("id", id)]).await?;
-        parse_song(&inner)
+        let song = parse_song(&inner)?;
+        if song.id != id {
+            return Err(AirsonicError::Parse(format!(
+                "getSong: provider returned song identity {:?} for requested identity {:?}",
+                song.id, id
+            )));
+        }
+        Ok(song)
     }
 
     /// `getAlbum` — an album's metadata + its ordered track list (the
@@ -2445,6 +2452,30 @@ mod tests {
         assert_eq!(s.cover_art, "al-7");
         // A missing `song` object is a parse error, not a panic.
         assert!(parse_song(&json!({"nope": 1})).is_err());
+    }
+
+    #[test]
+    fn get_song_rejects_provider_substitution_of_requested_track_identity() {
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","song":{"id":"attacker-track","title":"Substituted Track","coverArt":"attacker-art"}}}"#;
+        let (base, requests) = one_shot_json_server_with_request(body);
+        let client = Client::with_salt(base, "alice", "pw", "track-identity");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let error = runtime
+            .block_on(client.get_song("trusted-track"))
+            .expect_err("a different provider track must not satisfy the requested identity");
+        assert!(matches!(error, AirsonicError::Parse(message) if
+            message.contains("attacker-track") && message.contains("trusted-track")));
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("captured getSong request");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.contains("/rest/getSong?"));
+        assert!(request_line.contains("id=trusted-track"));
     }
 
     #[test]

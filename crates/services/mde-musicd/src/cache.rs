@@ -1,7 +1,7 @@
 //! AIR-7 (v6.1) — mesh-shared audio cache + LRU eviction.
 //!
 //! Streamed audio is written to
-//! `~/.local/share/mde/music-cache/<song-id>.<suffix>` — under the
+//! `~/.local/share/mde/music-cache/<exact-song-id>.<exact-suffix>` — under the
 //! mesh-shared data dir, so a track cached on one peer replicates to the
 //! others (play on peer A, then play it offline on peer B). An
 //! `index.json` alongside tracks `(song-id, bytes, last-played-ts,
@@ -26,6 +26,7 @@ use serde_json::Value;
 pub const DEFAULT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Version of the durable cache index envelope.
 pub const CACHE_SCHEMA_VERSION: u16 = 1;
+const EXACT_TRACK_PATH_VERSION: u8 = 2;
 
 /// MUSIC-ART-SYNC — the communal cover-art cache on the QNM-Shared mount. mackesd
 /// (root) provisions `<mount>/music/artwork` 0777; musicd reads-through /
@@ -141,6 +142,9 @@ pub struct CacheEntry {
     /// File suffix (`flac` / `mp3` / `opus` / …) — locates the file.
     #[serde(default)]
     pub suffix: String,
+    /// On-disk pathname scheme. Zero is the pre-v2 lossy sanitized mapping.
+    #[serde(default)]
+    pub path_version: u8,
 }
 
 /// The cache index: `song-id → entry`.
@@ -173,6 +177,7 @@ impl CacheIndex {
                 last_played_ms: now_ms,
                 starred,
                 suffix: suffix.to_string(),
+                path_version: EXACT_TRACK_PATH_VERSION,
             },
         );
     }
@@ -239,6 +244,31 @@ pub fn now_ms() -> u64 {
 /// Safe on-disk file name for a cached audio track.
 #[must_use]
 pub fn track_filename(song_id: &str, suffix: &str) -> String {
+    // Sanitizing alone is not an identity mapping: `song/a` and `song_a`, for
+    // example, both collapse to `song_a`.  Encode the exact UTF-8 bytes so two
+    // server-owned declarations can never address the same cache object.
+    fn exact_component(raw: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(raw.len().saturating_mul(2).saturating_add(1));
+        if raw.is_empty() {
+            return "e".to_string();
+        }
+        encoded.push('x');
+        for byte in raw.as_bytes() {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    format!(
+        "track-{}.{}",
+        exact_component(song_id),
+        exact_component(suffix)
+    )
+}
+
+fn legacy_track_filename(song_id: &str, suffix: &str) -> String {
     format!("{}.{}", safe_component(song_id), safe_component(suffix))
 }
 
@@ -248,6 +278,30 @@ pub fn track_path(dir: &Path, song_id: &str, suffix: &str) -> PathBuf {
     dir.join(track_filename(song_id, suffix))
 }
 
+fn indexed_track_path(
+    dir: &Path,
+    index: &CacheIndex,
+    song_id: &str,
+    entry: &CacheEntry,
+) -> Option<PathBuf> {
+    match entry.path_version {
+        EXACT_TRACK_PATH_VERSION => Some(track_path(dir, song_id, &entry.suffix)),
+        0 => {
+            let legacy_name = legacy_track_filename(song_id, &entry.suffix);
+            let declarations = index
+                .entries
+                .iter()
+                .filter(|(candidate_id, candidate)| {
+                    candidate.path_version == 0
+                        && legacy_track_filename(candidate_id, &candidate.suffix) == legacy_name
+                })
+                .count();
+            (declarations == 1).then(|| dir.join(legacy_name))
+        }
+        _ => None,
+    }
+}
+
 /// Read fully cached audio bytes for `song_id`, if the index points at a
 /// non-empty local file. Successful reads bump the LRU timestamp so replaying a
 /// recently-played cached track during an AirSonic outage keeps it hot.
@@ -255,7 +309,7 @@ pub fn track_path(dir: &Path, song_id: &str, suffix: &str) -> PathBuf {
 pub fn read_cached_track_bytes(dir: &Path, song_id: &str, now_ms: u64) -> Option<Vec<u8>> {
     let mut index = read_index(dir);
     let entry = index.entries.get(song_id)?.clone();
-    let path = track_path(dir, song_id, &entry.suffix);
+    let path = indexed_track_path(dir, &index, song_id, &entry)?;
     let bytes = std::fs::read(path).ok()?;
     if entry.bytes == 0 || u64::try_from(bytes.len()).ok()? != entry.bytes {
         return None;
@@ -275,7 +329,7 @@ pub fn cached_track_suffix(dir: &Path, song_id: &str) -> Option<String> {
     if entry.bytes == 0 {
         return None;
     }
-    let path = track_path(dir, song_id, &entry.suffix);
+    let path = indexed_track_path(dir, &index, song_id, entry)?;
     let metadata = std::fs::metadata(path).ok()?;
     (metadata.is_file() && metadata.len() == entry.bytes).then(|| entry.suffix.clone())
 }
@@ -296,10 +350,31 @@ pub fn write_cached_track(
     }
     std::fs::create_dir_all(dir)?;
     let name = track_filename(song_id, suffix);
-    let tmp = dir.join(format!(".{name}.tmp"));
+    // Linux NAME_MAX is 255 bytes on the production filesystems.  Return a
+    // stable input error instead of allowing an oversized hostile ID to leave
+    // an implementation-dependent filesystem failure halfway through a write.
+    if name.len() > 255 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "music cache track identity exceeds the filename bound",
+        ));
+    }
+    let tmp = dir.join(format!(".track-write-{}.tmp", ulid::Ulid::new()));
     let path = dir.join(&name);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
+    let result = (|| {
+        let mut temporary = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        temporary.write_all(bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     let mut index = read_index(dir);
     index.upsert(
         song_id,
@@ -316,14 +391,17 @@ pub fn write_cached_track(
 /// eviction or manual cache cleanup without manufacturing a failure.
 pub fn remove_cached_track(dir: &Path, song_id: &str) -> std::io::Result<bool> {
     let mut index = read_index(dir);
-    let Some(entry) = index.entries.remove(song_id) else {
+    let Some(entry) = index.entries.get(song_id).cloned() else {
         return Ok(false);
     };
-    let path = track_path(dir, song_id, &entry.suffix);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    let path = indexed_track_path(dir, &index, song_id, &entry);
+    index.entries.remove(song_id);
+    if let Some(path) = path {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     write_index(dir, &index)?;
     Ok(true)
@@ -470,9 +548,12 @@ pub fn run_gc(dir: &Path, cap_bytes: u64) -> std::io::Result<Vec<String>> {
     let mut index = read_index(dir);
     let plan = index.evict_plan(cap_bytes);
     for id in &plan {
-        if let Some(entry) = index.entries.remove(id) {
-            let file = track_path(dir, id, &entry.suffix);
-            let _ = std::fs::remove_file(file); // best-effort; absent is fine.
+        if let Some(entry) = index.entries.get(id).cloned() {
+            let file = indexed_track_path(dir, &index, id, &entry);
+            index.entries.remove(id);
+            if let Some(file) = file {
+                let _ = std::fs::remove_file(file); // best-effort; absent is fine.
+            }
         }
     }
     if !plan.is_empty() {
@@ -694,6 +775,35 @@ mod tests {
     }
 
     #[test]
+    fn sanitized_id_alias_cannot_substitute_same_sized_offline_audio_after_restart() {
+        let dir = tempdir().unwrap();
+        let slash_id = "song/a";
+        let underscore_id = "song_a";
+        assert_eq!(
+            safe_component(slash_id),
+            safe_component(underscore_id),
+            "fixture must exercise the former lossy pathname mapping"
+        );
+
+        write_cached_track(dir.path(), slash_id, "flac", b"audio-one", 10, false).unwrap();
+        write_cached_track(dir.path(), underscore_id, "flac", b"audio-two", 11, false).unwrap();
+
+        assert_ne!(
+            track_path(dir.path(), slash_id, "flac"),
+            track_path(dir.path(), underscore_id, "flac")
+        );
+        assert_eq!(
+            read_cached_track_bytes(dir.path(), slash_id, 20),
+            Some(b"audio-one".to_vec())
+        );
+        assert_eq!(
+            read_cached_track_bytes(dir.path(), underscore_id, 21),
+            Some(b"audio-two".to_vec())
+        );
+        assert_eq!(read_index(dir.path()).entries.len(), 2);
+    }
+
+    #[test]
     fn truncated_cached_track_is_not_admitted_as_complete() {
         let dir = tempdir().unwrap();
         write_cached_track(
@@ -708,11 +818,7 @@ mod tests {
 
         // Keep the file non-empty: a presence-only check would incorrectly
         // admit this as an offline playback source.
-        std::fs::write(
-            track_path(dir.path(), "song-truncated", "flac"),
-            b"partial",
-        )
-        .unwrap();
+        std::fs::write(track_path(dir.path(), "song-truncated", "flac"), b"partial").unwrap();
 
         assert_eq!(cached_track_suffix(dir.path(), "song-truncated"), None);
         assert_eq!(

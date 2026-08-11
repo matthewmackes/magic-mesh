@@ -140,9 +140,12 @@ fn health_kiron_toast(alert: HealthKironAlert) -> Toast {
         flag.push_str(" · ");
         flag.push_str(device);
     }
+    let condition_id = alert.condition_id;
+    let snapshot_generation = alert.snapshot_generation;
     Toast::alert(severity, alert.node, flag, alert.headline)
         .with_dwell(dwell)
         .with_action("Open Workers", "shell/goto/workers")
+        .with_health_authority(condition_id, snapshot_generation)
 }
 
 /// Decode a raw `event/toast/show` body into an alert [`Toast`]. `None` on a
@@ -1036,7 +1039,7 @@ mod tests {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use mde_egui::egui::{self, Rect, pos2, vec2};
-    use mde_egui::{Style, Tier, Toast};
+    use mde_egui::{Style, Tier, Toast, ToastHost};
 
     use super::{
         Chime, ChimeBackend, Navigate, Severity, Suppress, TOAST_TOPIC, ToastBridge,
@@ -1405,6 +1408,39 @@ mod tests {
         let grade_f = decode(&health_kiron_body(GradeLetter::F)).expect("grade F admitted");
         assert_eq!(grade_f.tier, Tier::Alert(Severity::Critical));
         assert_eq!(grade_f.dwell, mde_egui::Dwell::UntilAck);
+    }
+
+    #[test]
+    fn governed_health_generation_survives_decode_and_blocks_grade_f_rollback() {
+        use mackes_mesh_types::health::GradeLetter;
+
+        let current_f = decode(&health_kiron_body(GradeLetter::F)).expect("grade F admitted");
+
+        let mut stale_recovery: serde_json::Value =
+            serde_json::from_str(&health_kiron_body(GradeLetter::A))
+                .expect("valid stale recovery body");
+        stale_recovery["snapshot_generation"] = serde_json::json!(41);
+        stale_recovery["headline"] = serde_json::json!("Host recovered in stale snapshot");
+        let stale_recovery = decode(&stale_recovery.to_string()).expect("stale body is well-formed");
+
+        let mut conflicting_replay: serde_json::Value =
+            serde_json::from_str(&health_kiron_body(GradeLetter::E))
+                .expect("valid conflicting replay body");
+        conflicting_replay["headline"] =
+            serde_json::json!("Same generation claims a different grade");
+        let conflicting_replay =
+            decode(&conflicting_replay.to_string()).expect("conflicting body is well-formed");
+
+        let mut host = ToastHost::new();
+        host.enqueue(current_f);
+        host.enqueue(stale_recovery);
+        host.enqueue(conflicting_replay);
+
+        let current = host.current().expect("current grade F must remain visible");
+        assert_eq!(current.flag, "HEALTH · GRADE F · 1m 10s · nvme0n1");
+        assert_eq!(current.headline, "Storage pressure remains active");
+        assert_eq!(current.dwell, mde_egui::Dwell::UntilAck);
+        assert_eq!(host.backlog(), 0, "rollback projections must not queue");
     }
 
     #[test]

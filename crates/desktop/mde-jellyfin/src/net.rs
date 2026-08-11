@@ -141,17 +141,25 @@ impl ReqwestTransport {
     /// # Errors
     /// Returns [`TransportError`] if the underlying HTTP client cannot be built.
     pub fn new() -> Result<Self, TransportError> {
-        let http = reqwest::blocking::Client::builder()
+        Self::with_builder(reqwest::blocking::Client::builder())
+    }
+
+    /// Build a transport from a customized client builder while retaining the
+    /// transport's authority boundary.
+    ///
+    /// # Errors
+    /// Returns [`TransportError`] if the underlying HTTP client cannot be built.
+    pub fn with_builder(
+        builder: reqwest::blocking::ClientBuilder,
+    ) -> Result<Self, TransportError> {
+        let http = builder
+            // Apply this last: even a caller requesting redirect handling must
+            // not move a server-bound request or its query credentials to a
+            // provider-selected authority.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| TransportError(e.to_string()))?;
         Ok(Self { http })
-    }
-
-    /// Wrap a pre-built `reqwest::blocking` client (so the caller can set
-    /// timeouts / a proxy / a custom root store).
-    #[must_use]
-    pub const fn with_client(http: reqwest::blocking::Client) -> Self {
-        Self { http }
     }
 }
 
@@ -212,6 +220,9 @@ pub fn encode_query_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn http_request_get_has_no_body() {
@@ -278,6 +289,53 @@ mod tests {
             .execute(&HttpRequest::get("https://jelly.mesh/x", vec![]))
             .expect("boxed transport forwards");
         assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn provider_redirect_cannot_contact_a_different_authority() {
+        let redirector = TcpListener::bind("127.0.0.1:0").expect("bind redirector");
+        let redirector_addr = redirector.local_addr().expect("redirector address");
+        let substituted = TcpListener::bind("127.0.0.1:0").expect("bind substituted authority");
+        substituted
+            .set_nonblocking(true)
+            .expect("make substituted authority observable without blocking");
+        let substituted_addr = substituted.local_addr().expect("substituted address");
+
+        let server = thread::spawn(move || {
+            let (mut connection, _) = redirector.accept().expect("accept original request");
+            let mut request = [0_u8; 2048];
+            let bytes = connection
+                .read(&mut request)
+                .expect("read original request");
+            assert!(String::from_utf8_lossy(&request[..bytes]).contains("GET /trusted"));
+            write!(
+                connection,
+                "HTTP/1.1 302 Found\r\nLocation: http://{substituted_addr}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write hostile redirect");
+        });
+
+        let transport = ReqwestTransport::with_builder(
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                // Keep a regressed implementation bounded instead of waiting
+                // forever for the hostile authority to answer.
+                .timeout(std::time::Duration::from_millis(500)),
+        )
+        .expect("build production transport from hostile redirect configuration");
+        let response = transport
+            .execute(&HttpRequest::get(
+                format!("http://{redirector_addr}/trusted?api_key=secret"),
+                vec![("Authorization".into(), "MediaBrowser Token=secret".into())],
+            ))
+            .expect("return the redirect without following it");
+
+        server.join().expect("redirector thread");
+        assert_eq!(response.status, 302);
+        assert!(response.body.is_empty());
+        assert!(
+            matches!(substituted.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

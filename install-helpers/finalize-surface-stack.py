@@ -9,6 +9,8 @@ then atomically emits a ready schema-v2 candidate plus its exact artifact set.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -16,9 +18,11 @@ import re
 import resource
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +38,8 @@ MAX_RPM = 2 * 1024 * 1024 * 1024
 MAX_MODULE = 64 * 1024 * 1024
 MAX_MODULES = 4096
 MAX_TOOL_OUTPUT = 4 * 1024 * 1024
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
 USERSPACE_RPMS = {
     "iptsd": {"iptsd-3.1.0-1.fc44.src.rpm", "iptsd-3.1.0-1.fc44.x86_64.rpm"},
     "libwacom-surface": {
@@ -57,6 +63,228 @@ class Refusal(RuntimeError):
 
 def refuse(message: str) -> None:
     raise Refusal(message)
+
+
+@dataclass(frozen=True)
+class FrozenFile:
+    """Identity and bytes copied into the finalizer's private input snapshot."""
+
+    source: Path
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class FrozenDirectory:
+    """Directory identity and exact entry set captured by the finalizer."""
+
+    source: Path
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+    entries: tuple[str, ...]
+
+
+def stable_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def freeze_file(
+    source: Path,
+    destination: Path,
+    files: list[FrozenFile],
+    *,
+    directory_fd: int | None = None,
+) -> None:
+    """Copy one regular file from one stable inode into a private snapshot."""
+    descriptor = None
+    try:
+        opened_name: str | Path = source.name if directory_fd is not None else source
+        descriptor = os.open(
+            opened_name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size == 0:
+            refuse(f"required artifact is not a non-empty regular file: {source}")
+        if before.st_size > MAX_RPM:
+            refuse(f"artifact exceeds the finalizer input bound: {source.name}")
+        value = hashlib.sha256()
+        with os.fdopen(descriptor, "rb", closefd=False) as incoming, destination.open("xb") as outgoing:
+            os.chmod(destination, 0o600)
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                value.update(chunk)
+                outgoing.write(chunk)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        os.chmod(destination, 0o400)
+        after = os.fstat(descriptor)
+        try:
+            current = (os.stat(source.name, dir_fd=directory_fd, follow_symlinks=False)
+                       if directory_fd is not None else source.lstat())
+        except OSError as error:
+            refuse(f"input changed while it was snapshotted: {source}: {error}")
+        if stable_identity(before) != stable_identity(after) or stable_identity(after) != stable_identity(current):
+            refuse(f"input changed while it was snapshotted: {source}")
+        files.append(FrozenFile(
+            source=source, device=before.st_dev, inode=before.st_ino,
+            size=before.st_size, mtime_ns=before.st_mtime_ns,
+            ctime_ns=before.st_ctime_ns, sha256=value.hexdigest(),
+        ))
+    except OSError as error:
+        destination.unlink(missing_ok=True)
+        refuse(f"could not snapshot input {source}: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def freeze_directory(
+    source: Path,
+    destination: Path,
+    files: list[FrozenFile],
+    directories: list[FrozenDirectory],
+) -> Path:
+    """Capture an exact flat input directory into a private immutable view."""
+    descriptor = None
+    try:
+        descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
+        before = os.fstat(descriptor)
+        entries = tuple(sorted(os.listdir(descriptor)))
+        if not entries:
+            refuse(f"input directory is empty: {source}")
+        destination.mkdir(mode=0o700)
+        for name in entries:
+            if not SAFE_NAME.fullmatch(name):
+                refuse(f"unsafe directory entry: {name!r}")
+            freeze_file(source / name, destination / name, files, directory_fd=descriptor)
+        after_entries = tuple(sorted(os.listdir(descriptor)))
+        after = os.fstat(descriptor)
+        try:
+            current = source.lstat()
+        except OSError as error:
+            refuse(f"input directory changed while it was snapshotted: {source}: {error}")
+        if (entries != after_entries
+                or stable_identity(before) != stable_identity(after)
+                or stable_identity(after) != stable_identity(current)):
+            refuse(f"input directory changed while it was snapshotted: {source}")
+        directories.append(FrozenDirectory(
+            source=source, device=before.st_dev, inode=before.st_ino,
+            mtime_ns=before.st_mtime_ns, ctime_ns=before.st_ctime_ns,
+            entries=entries,
+        ))
+        os.chmod(destination, 0o500)
+        return destination
+    except OSError as error:
+        refuse(f"could not snapshot input directory {source}: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def recheck_frozen_inputs(files: list[FrozenFile], directories: list[FrozenDirectory]) -> None:
+    """Refuse publication if any validated source identity or bytes changed."""
+    for frozen in files:
+        try:
+            info = frozen.source.lstat()
+        except OSError as error:
+            refuse(f"validated input disappeared before publication: {frozen.source}: {error}")
+        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        expected = (frozen.device, frozen.inode, frozen.size, frozen.mtime_ns, frozen.ctime_ns)
+        if identity != expected or digest(frozen.source) != frozen.sha256:
+            refuse(f"validated input changed before publication: {frozen.source}")
+    for frozen in directories:
+        try:
+            info = frozen.source.lstat()
+            entries = tuple(sorted(os.listdir(frozen.source)))
+        except OSError as error:
+            refuse(f"validated input directory disappeared before publication: {frozen.source}: {error}")
+        identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+        expected = (frozen.device, frozen.inode, frozen.mtime_ns, frozen.ctime_ns)
+        if identity != expected or entries != frozen.entries:
+            refuse(f"validated input directory changed before publication: {frozen.source}")
+
+
+def seal_candidate_tree(root: Path, artifact_names: set[str]) -> tuple[list[FrozenFile], list[FrozenDirectory]]:
+    """Bind the verifier-approved candidate to its exact inodes and bytes."""
+    files: list[FrozenFile] = []
+    directories: list[FrozenDirectory] = []
+    expected = {
+        root: {"artifacts", "surface-stack.f44.json", "surface-stack.install.lock"},
+        root / "artifacts": artifact_names,
+    }
+    for directory, entries in expected.items():
+        descriptor = None
+        try:
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            )
+            before = os.fstat(descriptor)
+            actual = tuple(sorted(os.listdir(descriptor)))
+            if set(actual) != entries:
+                refuse(f"verified candidate directory set differs: {directory}")
+            after = os.fstat(descriptor)
+            current = directory.lstat()
+            if (stable_identity(before) != stable_identity(after)
+                    or stable_identity(after) != stable_identity(current)):
+                refuse(f"verified candidate directory changed while it was sealed: {directory}")
+            directories.append(FrozenDirectory(
+                source=directory, device=before.st_dev, inode=before.st_ino,
+                mtime_ns=before.st_mtime_ns, ctime_ns=before.st_ctime_ns,
+                entries=actual,
+            ))
+        except OSError as error:
+            refuse(f"could not seal verified candidate directory {directory}: {error}")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    candidate_files = {
+        root / "surface-stack.f44.json",
+        root / "surface-stack.install.lock",
+        *(root / "artifacts" / name for name in artifact_names),
+    }
+    for path in candidate_files:
+        descriptor = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            info = os.fstat(descriptor)
+            value = digest_opened_file(path, descriptor)
+            files.append(FrozenFile(
+                source=path, device=info.st_dev, inode=info.st_ino,
+                size=info.st_size, mtime_ns=info.st_mtime_ns,
+                ctime_ns=info.st_ctime_ns, sha256=value,
+            ))
+        except OSError as error:
+            refuse(f"could not seal verified candidate artifact {path}: {error}")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    return files, directories
+
+
+def publish_directory_noreplace(stage: Path, output: Path) -> None:
+    """Atomically publish *stage* without replacing any destination object."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (OSError, AttributeError) as error:
+        refuse(f"atomic no-replace publication is unavailable: {error}")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(AT_FDCWD, os.fsencode(stage), AT_FDCWD, os.fsencode(output), RENAME_NOREPLACE) == 0:
+        return
+    failure = ctypes.get_errno()
+    if failure == errno.EEXIST:
+        refuse("--output appeared during finalization; refusing to replace it")
+    if failure in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        refuse("atomic no-replace publication is unsupported on this host")
+    refuse(f"atomic candidate publication failed: {os.strerror(failure)}")
 
 
 def strict_object(pairs):
@@ -91,12 +319,35 @@ def regular(path: Path, *, max_bytes: int | None = None) -> Path:
     return path
 
 
-def digest(path: Path) -> str:
+def digest_opened_file(path: Path, descriptor: int) -> str:
+    """Hash one regular file while proving its opened inode stayed at *path*."""
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size == 0:
+        refuse(f"required artifact is not a non-empty regular file: {path}")
     value = hashlib.sha256()
-    with regular(path).open("rb") as stream:
+    with os.fdopen(descriptor, "rb", closefd=False) as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             value.update(chunk)
+    after = os.fstat(descriptor)
+    try:
+        current = path.lstat()
+    except OSError as error:
+        refuse(f"artifact changed while it was hashed: {path}: {error}")
+    if stable_identity(before) != stable_identity(after) or stable_identity(after) != stable_identity(current):
+        refuse(f"artifact changed while it was hashed: {path}")
     return value.hexdigest()
+
+
+def digest(path: Path) -> str:
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        return digest_opened_file(path, descriptor)
+    except OSError as error:
+        refuse(f"could not hash artifact {path}: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def limit_tool_output() -> None:
@@ -284,28 +535,19 @@ def require_same_payload(unsigned_value: str, signed_value: str, name: str) -> N
         refuse(f"release signing changed or obscured the producer RPM payload: {name}")
 
 
-def verify_signed_bundle(root: Path, unsigned: list[Path], key: Path) -> tuple[dict[str, Path], str, set[str], dict[str, str]]:
+def verify_prepared_bundle(root: Path, unsigned: list[Path], key: Path) -> tuple[dict[str, Path], str, set[str], dict[str, str]]:
     unsigned_by_name = {path.name: path for path in unsigned}
     if len(unsigned_by_name) != len(unsigned):
         refuse("producer RPM basenames collide")
     expected = set(unsigned_by_name)
-    exact_directory(root, expected | {"SHA256SUMS", "SHA256SUMS.asc"})
-    verify_checksums(root, expected)
+    # sign-release.sh --prepare-rpms is deliberately not a publication step.
+    # This input contains only its header-signed RPMs; the final checksum and
+    # provenance signature are emitted later, after release evidence hashes the
+    # completed candidate bytes.
+    exact_directory(root, expected)
     fingerprint, admitted_fingerprints = key_fingerprints(key)
     rpm_signers = {}
-    with tempfile.TemporaryDirectory(prefix="surface-finalize-gpg-") as home, tempfile.TemporaryDirectory(prefix="surface-finalize-rpmdb-") as rpmdb:
-        os.chmod(home, 0o700)
-        env = {"PATH": "/usr/sbin:/usr/bin", "LANG": "C", "LC_ALL": "C", "GNUPGHOME": home}
-        run(["gpg", "--batch", "--import", str(key)], "release key import", env=env)
-        envelope = run(
-            ["gpg", "--batch", "--status-fd=1", "--verify", str(root / "SHA256SUMS.asc"), str(root / "SHA256SUMS")],
-            "signed checksum-envelope verification", env=env,
-        )
-        valid = [line.split() for line in envelope.splitlines() if line.startswith("[GNUPG:] VALIDSIG ")]
-        envelope_signer = valid[0][2].upper() if len(valid) == 1 and len(valid[0]) >= 3 else ""
-        if (envelope_signer not in admitted_fingerprints
-                or (envelope_signer != fingerprint and valid[0][-1].upper() != fingerprint)):
-            refuse("checksum envelope is not signed by the governed release key")
+    with tempfile.TemporaryDirectory(prefix="surface-finalize-rpmdb-") as rpmdb:
         run(["rpm", "--dbpath", rpmdb, "--initdb"], "temporary RPM database initialization")
         run(["rpm", "--dbpath", rpmdb, "--import", str(key)], "release RPM key import")
         for name, old in unsigned_by_name.items():
@@ -474,6 +716,38 @@ def finalize(args) -> None:
     output = args.output.resolve(strict=False)
     if output.exists() or not output.parent.is_dir():
         refuse("--output must name a new directory under an existing parent")
+    frozen_files: list[FrozenFile] = []
+    frozen_directories: list[FrozenDirectory] = []
+    with tempfile.TemporaryDirectory(prefix=".surface-inputs-", dir=output.parent) as temp:
+        snapshot_root = Path(temp)
+        frozen_args = argparse.Namespace(**vars(args))
+        directory_inputs = {
+            "source_bundle": args.source_bundle,
+            "kernel_output": args.kernel_output,
+            "iptsd_output": args.iptsd_output,
+            "libwacom_output": args.libwacom_output,
+            "surface_control_output": args.surface_control_output,
+            "surface_secureboot_output": args.surface_secureboot_output,
+            "signed_dir": args.signed_dir,
+        }
+        for attribute, source in directory_inputs.items():
+            setattr(frozen_args, attribute, freeze_directory(
+                source, snapshot_root / attribute, frozen_files, frozen_directories,
+            ))
+        frozen_args.release_key = snapshot_root / "release-key"
+        freeze_file(args.release_key, frozen_args.release_key, frozen_files)
+        frozen_args.certificate = snapshot_root / "surface-certificate"
+        freeze_file(args.certificate, frozen_args.certificate, frozen_files)
+        finalize_frozen(frozen_args, output, frozen_files, frozen_directories)
+
+
+def finalize_frozen(
+    args,
+    output: Path,
+    frozen_files: list[FrozenFile],
+    frozen_directories: list[FrozenDirectory],
+) -> None:
+    """Verify and emit a candidate using only the finalizer's private snapshots."""
     lock = load_json(LOCK)
     sources = verify_source_bundle(args.source_bundle, lock)
     regular(args.release_key, max_bytes=1024 * 1024)
@@ -487,7 +761,7 @@ def finalize(args) -> None:
         manifest, artifacts = verify_producer(root, package, lock)
         manifests[package] = {"value": manifest, "root": root}
         all_unsigned.extend(artifacts)
-    signed, fingerprint, admitted_fingerprints, rpm_signers = verify_signed_bundle(args.signed_dir, all_unsigned, args.release_key)
+    signed, fingerprint, admitted_fingerprints, rpm_signers = verify_prepared_bundle(args.signed_dir, all_unsigned, args.release_key)
     chosen = selected_rpms(signed)
     kernel_signed = [path for path in signed.values() if rpm_name(path).startswith("kernel-surface")]
     signer, cert_sha = verify_module_binding(kernel_signed, args.certificate, manifests["kernel-surface"])
@@ -500,6 +774,7 @@ def finalize(args) -> None:
         artifacts.mkdir(mode=0o700)
         key_name = "RPM-GPG-KEY-magic-mesh.asc"
         shutil.copyfile(args.release_key, artifacts / key_name)
+        artifact_names = {key_name}
         rows = []
         used_sources = set()
         for package in PACKAGES:
@@ -510,6 +785,7 @@ def finalize(args) -> None:
             used_sources.add(source_name)
             shutil.copyfile(sources[package_map[package]], artifacts / source_name)
             shutil.copyfile(chosen[package], artifacts / chosen[package].name)
+            artifact_names.update({source_name, chosen[package].name})
             required = package in {"kernel-surface", "surface-secureboot"}
             rows.append({
                 "name": package, "availability": "ready", "blocker": None,
@@ -526,7 +802,10 @@ def finalize(args) -> None:
         manifest = stage / "surface-stack.f44.json"
         manifest.write_text(json.dumps(candidate, indent=2) + "\n", encoding="utf-8")
         run([str(VERIFIER), "--manifest", str(manifest), "--artifact-dir", str(artifacts), "--emit-lock", str(stage / "surface-stack.install.lock")], "final Surface candidate verification")
-        os.rename(stage, output)
+        sealed_files, sealed_directories = seal_candidate_tree(stage, artifact_names)
+        recheck_frozen_inputs(frozen_files, frozen_directories)
+        recheck_frozen_inputs(sealed_files, sealed_directories)
+        publish_directory_noreplace(stage, output)
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
         raise
@@ -576,9 +855,57 @@ def self_test() -> None:
             "Header V4 RSA/SHA256 Signature, key ID DEADBEEF: OK",
             {primary, subkey}, "wrong-key.rpm",
         ))
-    if failures != 13:
-        raise AssertionError(f"expected 13 hostile refusals, saw {failures}")
-    print("Surface stack finalizer self-test passed (13 hostile fixtures rejected)")
+        publication = root / "publication"
+        destination = root / "candidate"
+        publication.mkdir()
+        (publication / "manifest").write_text("validated\n", encoding="utf-8")
+        destination.mkdir()
+        destination_identity = (destination.stat().st_dev, destination.stat().st_ino)
+        rejected(lambda: publish_directory_noreplace(publication, destination))
+        if (not (publication / "manifest").is_file()
+                or not destination.is_dir()
+                or (destination.stat().st_dev, destination.stat().st_ino) != destination_identity):
+            raise AssertionError("no-replace publication altered source or destination")
+        hostile_source = root / "hostile-producer"
+        hostile_snapshot = root / "hostile-snapshot"
+        hostile_source.mkdir()
+        (hostile_source / "validated.rpm").write_bytes(b"validated producer bytes")
+        frozen_files: list[FrozenFile] = []
+        frozen_directories: list[FrozenDirectory] = []
+        freeze_directory(hostile_source, hostile_snapshot, frozen_files, frozen_directories)
+        if digest(hostile_snapshot / "validated.rpm") != digest(hostile_source / "validated.rpm"):
+            raise AssertionError("input snapshot did not preserve the validated bytes")
+        replacement = root / "replacement.rpm"
+        replacement.write_bytes(b"hostile replacement bytes")
+        os.replace(replacement, hostile_source / "validated.rpm")
+        hostile_output = root / "hostile-candidate"
+        rejected(lambda: recheck_frozen_inputs(frozen_files, frozen_directories))
+        if hostile_output.exists():
+            raise AssertionError("changed validated input produced a candidate")
+        digest_source = root / "digest-source"
+        digest_source.write_bytes(b"validated digest bytes")
+        descriptor = os.open(digest_source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        digest_replacement = root / "digest-replacement"
+        digest_replacement.write_bytes(b"validated digest bytes")
+        os.replace(digest_replacement, digest_source)
+        try:
+            rejected(lambda: digest_opened_file(digest_source, descriptor))
+        finally:
+            os.close(descriptor)
+        sealed_candidate = root / "sealed-candidate"
+        sealed_artifacts = sealed_candidate / "artifacts"
+        sealed_artifacts.mkdir(parents=True)
+        (sealed_candidate / "surface-stack.f44.json").write_text("manifest\n", encoding="utf-8")
+        (sealed_candidate / "surface-stack.install.lock").write_text("lock\n", encoding="utf-8")
+        (sealed_artifacts / "signed.rpm").write_bytes(b"verified signed rpm")
+        sealed_files, sealed_directories = seal_candidate_tree(sealed_candidate, {"signed.rpm"})
+        replacement = root / "replacement-signed.rpm"
+        replacement.write_bytes(b"verified signed rpm")
+        os.replace(replacement, sealed_artifacts / "signed.rpm")
+        rejected(lambda: recheck_frozen_inputs(sealed_files, sealed_directories))
+    if failures != 17:
+        raise AssertionError(f"expected 17 hostile refusals, saw {failures}")
+    print("Surface stack finalizer self-test passed (17 hostile fixtures rejected)")
 
 
 def parser() -> argparse.ArgumentParser:

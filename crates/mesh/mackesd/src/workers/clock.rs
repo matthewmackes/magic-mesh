@@ -373,6 +373,29 @@ impl ClockWorker {
         self.peer_last_sent_ms = checkpoint.peer_last_sent_ms;
     }
 
+    fn reload_durable_authority(&mut self, now_ms: i64) -> anyhow::Result<()> {
+        let record = self
+            .store
+            .load(&self.node_id)?
+            .ok_or_else(|| anyhow::anyhow!("Clock durable authority disappeared"))?;
+        let snapshot = ClockSnapshotV1::from_persisted_json_at(
+            record.snapshot_json.as_bytes(),
+            &self.context(now_ms),
+        )?;
+        anyhow::ensure!(snapshot.node_id == self.node_id, "Clock node mismatch");
+        anyhow::ensure!(
+            snapshot.revision == record.revision,
+            "Clock revision mismatch"
+        );
+        validate_stopwatch_deadlines(&snapshot, now_ms)?;
+        self.snapshot = Some(snapshot);
+        self.action_cursor = record.action_cursor;
+        // A durable commit may have succeeded immediately before its Bus
+        // publication failed. Force the next sweep to repair that publication.
+        self.published_once = false;
+        Ok(())
+    }
+
     fn initial_snapshot(&self, now_ms: i64) -> ClockSnapshotV1 {
         ClockSnapshotV1 {
             schema_version: CLOCK_SCHEMA_VERSION,
@@ -392,7 +415,7 @@ impl ClockWorker {
         }
         let now_ms = self.clock.now_ms();
         if let Some(record) = self.store.load(&self.node_id)? {
-            let snapshot = ClockSnapshotV1::from_persisted_json_at(
+            let mut snapshot = ClockSnapshotV1::from_persisted_json_at(
                 record.snapshot_json.as_bytes(),
                 &self.context(now_ms),
             )?;
@@ -403,6 +426,33 @@ impl ClockWorker {
             );
             validate_stopwatch_deadlines(&snapshot, now_ms)?;
             self.action_cursor = record.action_cursor;
+            // Music's alert authority is intentionally in-process. If both
+            // daemons restart after Start was acknowledged, its renderer and
+            // replay ledger are gone while this durable occurrence is still
+            // Ringing. Re-create the deterministic Start rows before touching
+            // the transient Bus. A surviving Music daemon recognizes the same
+            // request id as an exact replay; a restarted daemon restores the
+            // missing alert effect.
+            let audio_requests = clock_audio_recovery_requests(&snapshot, now_ms, &self.node_id)?;
+            if !audio_requests.is_empty() {
+                // This same-revision write is a fresh production of unchanged
+                // semantic state. It lets the writer validate recovery rows
+                // against the restart sample instead of the stale pre-crash
+                // snapshot timestamp.
+                snapshot.produced_at_utc_ms = now_ms;
+                anyhow::ensure!(
+                    self.store.commit(
+                        &self.node_id,
+                        snapshot.revision,
+                        &snapshot,
+                        None,
+                        None,
+                        self.action_cursor.as_deref(),
+                        &audio_requests,
+                    )?,
+                    "Clock ringing recovery was not persisted"
+                );
+            }
             self.snapshot = Some(snapshot);
             return Ok(());
         }
@@ -644,6 +694,14 @@ impl ClockWorker {
                         existing.origin_node_id == schedule.origin_node_id,
                         "Clock schedule identity conflict"
                     );
+                    anyhow::ensure!(
+                        schedule.revision <= existing.revision
+                            || !snapshot.occurrences.iter().any(|occurrence| {
+                                occurrence.schedule_id == existing.schedule_id
+                                    && occurrence.phase == ClockOccurrencePhase::Ringing
+                            }),
+                        "Clock ringing occurrence retains its schedule authority"
+                    );
                     if schedule.revision < existing.revision {
                         return Ok(false);
                     }
@@ -783,11 +841,22 @@ impl ClockWorker {
                 if peer_origin {
                     anyhow::bail!("peer Clock enable mutation is not authoritative");
                 }
-                if alarm.enabled == enabled {
-                    return Ok(false);
-                }
+                let mut changed = alarm.enabled != enabled;
                 alarm.enabled = enabled;
-                true
+                if !enabled {
+                    // Snooze creates a durable Scheduled child independently
+                    // of the parent alarm's recurrence.  Once the parent is
+                    // disabled, that child must not survive to ring later. A
+                    // one-time alarm is already disabled when it first rings,
+                    // so cancellation itself must count as the mutation.
+                    let occurrence_count = snapshot.occurrences.len();
+                    snapshot.occurrences.retain(|occurrence| {
+                        occurrence.schedule_id != schedule_id
+                            || occurrence.phase != ClockOccurrencePhase::Scheduled
+                    });
+                    changed |= snapshot.occurrences.len() != occurrence_count;
+                }
+                changed
             }
             ClockCommandKindV1::Acknowledge {
                 occurrence_id,
@@ -1049,16 +1118,29 @@ impl ClockWorker {
         })();
         if let Err(error) = deadline_result {
             self.restore_checkpoint(deadline_checkpoint);
+            // Deadline advancement has no command request id to replay. If the
+            // atomic authority/outbox commit won and only publication failed,
+            // adopt that durable winner so the next sweep repairs publication
+            // instead of retrying forever from a stale expected revision.
+            self.reload_durable_authority(now_ms)
+                .context("reloading Clock authority after deadline failure")?;
             return Err(error);
         }
 
         for (cursor, body) in actions {
             let checkpoint = self.checkpoint();
             advance_clock_cursor(&mut self.action_cursor, &cursor);
-            if let Err(error) =
-                self.process_command(transaction, body.as_bytes(), now_ms)
-            {
+            if let Err(error) = self.process_command(transaction, body.as_bytes(), now_ms) {
                 self.restore_checkpoint(checkpoint);
+                // The command and its replay identity may already be durable
+                // even when the required state publication failed. The Bus
+                // generation can be replaced before that command is replayed,
+                // so do not depend on the transient row to recover our memory.
+                // Adopting the SQLite winner also makes the next generation
+                // publish corrected-forward authority without reapplying the
+                // command or duplicating its effects.
+                self.reload_durable_authority(now_ms)
+                    .context("reloading Clock authority after command failure")?;
                 return Err(error);
             }
         }
@@ -1483,10 +1565,7 @@ fn clock_bus_root(override_root: Option<PathBuf>) -> PathBuf {
 }
 
 fn advance_clock_cursor(cursor: &mut Option<String>, candidate: &str) {
-    if cursor
-        .as_deref()
-        .is_none_or(|current| candidate > current)
-    {
+    if cursor.as_deref().is_none_or(|current| candidate > current) {
         *cursor = Some(candidate.to_owned());
     }
 }
@@ -1577,17 +1656,11 @@ fn due_now_or_before(schedule: &ClockScheduleV1, now_ms: i64) -> anyhow::Result<
     }
 }
 
-fn peer_schedule_is_converged(
-    candidate: &ClockScheduleV1,
-    desired: &ClockScheduleV1,
-) -> bool {
+fn peer_schedule_is_converged(candidate: &ClockScheduleV1, desired: &ClockScheduleV1) -> bool {
     candidate == desired
 }
 
-fn peer_stopwatch_is_converged(
-    candidate: &ClockStopwatchV1,
-    desired: &ClockStopwatchV1,
-) -> bool {
+fn peer_stopwatch_is_converged(candidate: &ClockStopwatchV1, desired: &ClockStopwatchV1) -> bool {
     candidate == desired
 }
 
@@ -2066,20 +2139,14 @@ fn clock_targets_are_admitted(
         .all(|target| target == local_node_id || approved_peer_ids.contains(target))
 }
 
-fn validate_stopwatch_deadlines(
-    snapshot: &ClockSnapshotV1,
-    now_ms: i64,
-) -> anyhow::Result<()> {
+fn validate_stopwatch_deadlines(snapshot: &ClockSnapshotV1, now_ms: i64) -> anyhow::Result<()> {
     for stopwatch in &snapshot.stopwatches {
         validate_stopwatch_deadline(stopwatch, now_ms)?;
     }
     Ok(())
 }
 
-fn validate_stopwatch_deadline(
-    stopwatch: &ClockStopwatchV1,
-    now_ms: i64,
-) -> anyhow::Result<()> {
+fn validate_stopwatch_deadline(stopwatch: &ClockStopwatchV1, now_ms: i64) -> anyhow::Result<()> {
     if stopwatch.phase != mackes_mesh_types::clock::ClockStopwatchPhase::Running {
         return Ok(());
     }
@@ -2276,34 +2343,80 @@ fn clock_audio_transitions(
         let Some((generation, action, body)) = transition else {
             continue;
         };
-        let request_id = clock_audio_request_id(
-            &occurrence.occurrence_id,
-            &occurrence.global_event_id,
-            generation,
-            action,
-        );
-        let request = ClockAudioRequestV1 {
-            schema_version: CLOCK_SCHEMA_VERSION,
-            request_id: request_id.clone(),
-            occurrence_id: occurrence.occurrence_id.clone(),
-            global_event_id: occurrence.global_event_id.clone(),
-            occurrence_generation: generation,
-            issued_at_utc_ms: now_ms,
-            expires_at_utc_ms: now_ms.saturating_add(MAX_CLOCK_AUDIO_REQUEST_TTL_MS),
-            body,
-            music_auth: None,
-        };
-        request.validate_at(now_ms)?;
-        requests.push(writer::ClockAudioOutboxWrite {
-            request_id,
-            occurrence_id: request.occurrence_id.clone(),
-            global_event_id: request.global_event_id.clone(),
-            occurrence_generation: generation,
-            request_json: serde_json::to_string(&request)?,
-            created_at_ms: now_ms,
-        });
+        requests.push(clock_audio_outbox_write(
+            occurrence, generation, action, body, now_ms,
+        )?);
     }
     Ok(requests)
+}
+
+fn clock_audio_recovery_requests(
+    snapshot: &ClockSnapshotV1,
+    created_at_ms: i64,
+    local_node_id: &str,
+) -> anyhow::Result<Vec<writer::ClockAudioOutboxWrite>> {
+    let mut requests = Vec::new();
+    for occurrence in &snapshot.occurrences {
+        if occurrence.phase != ClockOccurrencePhase::Ringing
+            || !occurrence.targets.iter().any(|target| {
+                target.target_node_id == local_node_id
+                    && target.disposition == ClockTargetDisposition::Ringing
+            })
+        {
+            continue;
+        }
+        let schedule = snapshot
+            .schedules
+            .iter()
+            .find(|value| value.schedule_id == occurrence.schedule_id)
+            .ok_or_else(|| anyhow::anyhow!("Clock audio schedule is missing"))?;
+        requests.push(clock_audio_outbox_write(
+            occurrence,
+            occurrence.revision,
+            "start",
+            ClockAudioActionV1::Start {
+                audio: schedule_audio(schedule).clone(),
+                alarm_volume_milli: 1_000,
+            },
+            created_at_ms,
+        )?);
+    }
+    Ok(requests)
+}
+
+fn clock_audio_outbox_write(
+    occurrence: &ClockOccurrenceV1,
+    generation: u64,
+    action: &str,
+    body: ClockAudioActionV1,
+    created_at_ms: i64,
+) -> anyhow::Result<writer::ClockAudioOutboxWrite> {
+    let request_id = clock_audio_request_id(
+        &occurrence.occurrence_id,
+        &occurrence.global_event_id,
+        generation,
+        action,
+    );
+    let request = ClockAudioRequestV1 {
+        schema_version: CLOCK_SCHEMA_VERSION,
+        request_id: request_id.clone(),
+        occurrence_id: occurrence.occurrence_id.clone(),
+        global_event_id: occurrence.global_event_id.clone(),
+        occurrence_generation: generation,
+        issued_at_utc_ms: created_at_ms,
+        expires_at_utc_ms: created_at_ms.saturating_add(MAX_CLOCK_AUDIO_REQUEST_TTL_MS),
+        body,
+        music_auth: None,
+    };
+    request.validate_at(created_at_ms)?;
+    Ok(writer::ClockAudioOutboxWrite {
+        request_id,
+        occurrence_id: request.occurrence_id.clone(),
+        global_event_id: request.global_event_id.clone(),
+        occurrence_generation: generation,
+        request_json: serde_json::to_string(&request)?,
+        created_at_ms,
+    })
 }
 
 fn schedule_audio(schedule: &ClockScheduleV1) -> &mackes_mesh_types::clock::ClockAudioRef {
@@ -3082,6 +3195,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(published.revision, 3);
+    }
+
+    #[test]
+    fn deadline_publish_failure_reloads_durable_occurrence_before_replay() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&fixture.timer_command("deadline-publish-replay", 1, NOW + 5_000));
+        fixture.worker.tick_once().unwrap();
+
+        fixture.clock.0.store(NOW + 10_000, Ordering::Relaxed);
+        let state_root = fixture.bus.join("state");
+        std::fs::remove_dir_all(&state_root).unwrap();
+        std::fs::write(&state_root, b"blocks Clock state publication").unwrap();
+
+        assert!(fixture.worker.tick_once().is_err());
+        let durable = SqliteClockStore {
+            db_path: fixture.db.clone(),
+        }
+        .load("seat-1")
+        .unwrap()
+        .unwrap();
+        let durable_snapshot: ClockSnapshotV1 =
+            serde_json::from_str(&durable.snapshot_json).unwrap();
+        assert_eq!(durable_snapshot.revision, 3);
+        assert_eq!(durable_snapshot.occurrences.len(), 1);
+        assert_eq!(
+            durable_snapshot.occurrences[0].phase,
+            ClockOccurrencePhase::Ringing
+        );
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap(), &durable_snapshot);
+        assert!(!fixture.worker.published_once);
+        assert!(fixture.audio_messages().is_empty());
+        assert_eq!(
+            Connection::open(&fixture.db)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM clock_audio_outbox WHERE node_id = 'seat-1' AND acknowledged_at_ms IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "the effect must be durable before its Bus publication"
+        );
+
+        std::fs::remove_file(&state_root).unwrap();
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            fixture.worker.snapshot.as_ref().unwrap().occurrences.len(),
+            1
+        );
+        assert_eq!(fixture.audio_messages().len(), 1);
+
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            fixture.worker.snapshot.as_ref().unwrap().occurrences.len(),
+            1
+        );
+        assert_eq!(
+            fixture.audio_messages().len(),
+            1,
+            "same-worker replay must not duplicate the recovered effect"
+        );
+    }
+
+    #[test]
+    fn command_commit_survives_publication_failure_and_bus_generation_loss() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&fixture.timer_command(
+            "command-generation-loss",
+            1,
+            NOW + 60_000,
+        ));
+
+        let state_root = fixture.bus.join("state");
+        std::fs::remove_dir_all(&state_root).unwrap();
+        std::fs::write(&state_root, b"blocks Clock state publication").unwrap();
+
+        assert!(fixture.worker.tick_once().is_err());
+        let durable = SqliteClockStore {
+            db_path: fixture.db.clone(),
+        }
+        .load("seat-1")
+        .unwrap()
+        .unwrap();
+        let durable_snapshot: ClockSnapshotV1 =
+            serde_json::from_str(&durable.snapshot_json).unwrap();
+        assert_eq!(durable_snapshot.revision, 2);
+        assert_eq!(durable_snapshot.schedules.len(), 1);
+        assert_eq!(fixture.worker.snapshot.as_ref(), Some(&durable_snapshot));
+        assert!(!fixture.worker.published_once);
+
+        // Replace the transient Bus with an empty generation. The committed
+        // command no longer exists anywhere in the new index, so recovery can
+        // only come from the durable Clock authority adopted above.
+        let replacement_root = fixture._temp.path().join("command-replacement-bus");
+        drop(Persist::open(replacement_root.clone()).unwrap());
+        let old_identity = clock_bus_identity(&fixture.bus).unwrap();
+        let retired_index = fixture._temp.path().join("command-retired-index.sqlite");
+        fs::rename(fixture.bus.join("index.sqlite"), &retired_index).unwrap();
+        fs::rename(
+            replacement_root.join("index.sqlite"),
+            fixture.bus.join("index.sqlite"),
+        )
+        .unwrap();
+        let replacement_identity = clock_bus_identity(&fixture.bus).unwrap();
+        assert_ne!(old_identity, replacement_identity);
+        std::fs::remove_file(&state_root).unwrap();
+
+        fixture.worker.tick_once().unwrap();
+        let recovered = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(recovered.revision, 2);
+        assert_eq!(recovered.schedules.len(), 1);
+        assert_eq!(
+            recovered.schedules[0].schedule_id,
+            "timer-command-generation-loss"
+        );
+        assert_eq!(fixture.worker.active_bus_identity, Some(replacement_identity));
+        let published: ClockSnapshotV1 = serde_json::from_str(
+            &Persist::open(fixture.bus.clone())
+                .unwrap()
+                .read_latest(&clock_state_topic("seat-1").unwrap())
+                .unwrap()
+                .unwrap()
+                .body
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published, *recovered);
+        assert_eq!(
+            Connection::open(&fixture.db)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM clock_request_ledger WHERE node_id = 'seat-1' AND request_id = 'command-generation-loss'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "corrected-forward publication must not reapply the command"
+        );
     }
 
     #[test]
@@ -3962,6 +4217,184 @@ mod tests {
     }
 
     #[test]
+    fn restart_reasserts_acknowledged_ringing_audio_with_same_effect_id() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&fixture.timer_command("restart-ringing", 1, NOW + 5_000));
+        fixture.worker.tick_once().unwrap();
+
+        fixture.clock.0.store(NOW + 10_000, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let first_audio = fixture.audio_messages();
+        assert_eq!(first_audio.len(), 1);
+        let first_request =
+            ClockAudioRequestV1::from_json_at(first_audio[0].as_bytes(), NOW + 10_000).unwrap();
+        assert!(matches!(
+            first_request.body,
+            ClockAudioActionV1::Start { .. }
+        ));
+
+        let status = ClockAudioStatusV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: first_request.request_id.clone(),
+            occurrence_id: first_request.occurrence_id.clone(),
+            global_event_id: first_request.global_event_id.clone(),
+            occurrence_generation: first_request.occurrence_generation,
+            observed_at_utc_ms: NOW + 10_000,
+            phase: ClockAudioPlaybackPhase::PlayingBundled,
+            provider_status: ClockAudioProviderStatus::NotApplicable,
+            fallback_tone_id: None,
+            acknowledgement_id: None,
+            reason_code: None,
+        };
+        Persist::open(fixture.bus.clone())
+            .unwrap()
+            .write(
+                &clock_audio_status_topic("seat-1").unwrap(),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&status).unwrap()),
+            )
+            .unwrap();
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            Connection::open(&fixture.db)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM clock_audio_outbox WHERE node_id = 'seat-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "the original Start must be acknowledged before recovery is exercised"
+        );
+
+        let restart_now = NOW + 10_000 + MAX_CLOCK_AUDIO_REQUEST_TTL_MS + 1;
+        fixture.clock.0.store(restart_now, Ordering::Relaxed);
+
+        let mut restarted = ClockWorker {
+            node_id: "seat-1".into(),
+            bus_root: Some(fixture.bus.clone()),
+            poll: POLL,
+            clock: fixture.clock.clone(),
+            store: Arc::new(SqliteClockStore {
+                db_path: fixture.db.clone(),
+            }),
+            signer: fixture.worker.signer.clone(),
+            command_signing_key: fixture.worker.command_signing_key.clone(),
+            approved_peer_ids: fixture.worker.approved_peer_ids.clone(),
+            blocked_origin_ids: fixture.worker.blocked_origin_ids.clone(),
+            disabled_schedule_ids: fixture.worker.disabled_schedule_ids.clone(),
+            music_signing_seed: fixture.worker.music_signing_seed,
+            snapshot: None,
+            action_cursor: None,
+            active_bus_identity: None,
+            published_once: false,
+            audio_status_cursor: None,
+            audio_last_sent_ms: BTreeMap::new(),
+            peer_last_sent_ms: BTreeMap::new(),
+        };
+        restarted.tick_once().unwrap();
+
+        let recovered_audio = fixture.audio_messages();
+        assert_eq!(recovered_audio.len(), 2);
+        let recovered_request = ClockAudioRequestV1::from_json_at(
+            recovered_audio.last().unwrap().as_bytes(),
+            restart_now,
+        )
+        .unwrap();
+        assert_eq!(recovered_request.issued_at_utc_ms, restart_now);
+        assert_eq!(
+            recovered_request.expires_at_utc_ms,
+            restart_now + MAX_CLOCK_AUDIO_REQUEST_TTL_MS
+        );
+        assert_eq!(recovered_request.request_id, first_request.request_id);
+        assert_eq!(recovered_request.occurrence_id, first_request.occurrence_id);
+        assert_eq!(
+            recovered_request.occurrence_generation,
+            first_request.occurrence_generation
+        );
+        assert!(matches!(
+            recovered_request.body,
+            ClockAudioActionV1::Start { .. }
+        ));
+        assert_eq!(
+            restarted.snapshot.as_ref().unwrap().occurrences[0].phase,
+            ClockOccurrencePhase::Ringing
+        );
+    }
+
+    #[test]
+    fn ringing_occurrence_cannot_inherit_replacement_schedule_authority_after_restart() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&fixture.alarm_command("frozen-ring", 1, NOW + 5_000));
+        fixture.worker.tick_once().unwrap();
+
+        let ringing_at = NOW + 10_000;
+        fixture.clock.0.store(ringing_at, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let ringing = fixture.worker.snapshot.as_ref().unwrap().clone();
+        assert_eq!(ringing.revision, 3);
+        assert_eq!(ringing.occurrences[0].phase, ClockOccurrencePhase::Ringing);
+
+        let mut replacement = ringing.schedules[0].clone();
+        replacement.revision += 1;
+        let ClockScheduleKindV1::Alarm(alarm) = &mut replacement.schedule else {
+            panic!("fixture schedule changed kind");
+        };
+        alarm.sound = ClockAudioRef::Bundled {
+            tone_id: "substituted-tone".into(),
+        };
+        let command = ClockCommandV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: "replace-ringing-schedule".into(),
+            origin_node_id: "seat-1".into(),
+            expected_revision: ringing.revision,
+            issued_at_utc_ms: ringing_at,
+            expires_at_utc_ms: ringing_at + MAX_CLOCK_COMMAND_TTL_MS,
+            body: ClockCommandKindV1::UpsertSchedule {
+                schedule: replacement,
+            },
+            signer_id: String::new(),
+            signature: String::new(),
+        }
+        .sign(
+            "seat-1-key",
+            &fixture.signing_key,
+            &fixture.worker.context(ringing_at),
+        )
+        .unwrap();
+        fixture.publish(&command);
+        fixture.worker.tick_once().unwrap();
+
+        let retained = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(retained.revision, ringing.revision);
+        let ClockScheduleKindV1::Alarm(alarm) = &retained.schedules[0].schedule else {
+            panic!("ringing alarm changed kind");
+        };
+        assert_eq!(
+            alarm.sound,
+            ClockAudioRef::Bundled {
+                tone_id: "bell".into()
+            }
+        );
+
+        let recovered = clock_audio_recovery_requests(retained, ringing_at, "seat-1").unwrap();
+        assert_eq!(recovered.len(), 1);
+        let request: ClockAudioRequestV1 =
+            serde_json::from_str(&recovered[0].request_json).unwrap();
+        assert!(matches!(
+            request.body,
+            ClockAudioActionV1::Start {
+                audio: ClockAudioRef::Bundled { ref tone_id },
+                ..
+            } if tone_id == "bell"
+        ));
+    }
+
+    #[test]
     fn alarm_banner_snooze_and_stop_are_atomic_bounded_and_replay_closed() {
         let mut fixture = Fixture::new();
         fixture.worker.tick_once().unwrap();
@@ -4231,6 +4664,107 @@ mod tests {
             fixture.worker.snapshot.as_ref().unwrap().occurrences.len(),
             2
         );
+    }
+
+    #[test]
+    fn disabled_alarm_cannot_ring_a_preexisting_snooze_generation() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&fixture.alarm_command("disable-snooze", 1, NOW + 5_000));
+        fixture.worker.tick_once().unwrap();
+
+        let snooze_time = NOW + 10_000;
+        fixture.clock.0.store(snooze_time, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let ringing = fixture.worker.snapshot.as_ref().unwrap().occurrences[0].clone();
+        fixture.publish(&fixture.snooze_command("disable-snooze-ack", 3, &ringing, snooze_time));
+        fixture.worker.tick_once().unwrap();
+
+        let snoozed = fixture.worker.snapshot.as_ref().unwrap().clone();
+        let source = snoozed
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.occurrence_id == ringing.occurrence_id)
+            .unwrap();
+        let child_id = snooze_occurrence_id(source, source.acknowledgement.as_ref().unwrap());
+        let child_due = snoozed
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.occurrence_id == child_id)
+            .unwrap()
+            .due_at_utc_ms;
+
+        let persist = Persist::open(fixture.bus.clone()).unwrap();
+        for body in fixture.audio_messages() {
+            let request = ClockAudioRequestV1::from_json_at(body.as_bytes(), snooze_time).unwrap();
+            let status = ClockAudioStatusV1 {
+                schema_version: CLOCK_SCHEMA_VERSION,
+                request_id: request.request_id,
+                occurrence_id: request.occurrence_id,
+                global_event_id: request.global_event_id,
+                occurrence_generation: request.occurrence_generation,
+                observed_at_utc_ms: snooze_time,
+                phase: ClockAudioPlaybackPhase::PlayingBundled,
+                provider_status: ClockAudioProviderStatus::NotApplicable,
+                fallback_tone_id: None,
+                acknowledgement_id: None,
+                reason_code: None,
+            };
+            persist
+                .write(
+                    &clock_audio_status_topic("seat-1").unwrap(),
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(&status).unwrap()),
+                )
+                .unwrap();
+        }
+
+        let disable = ClockCommandV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: "disable-snooze-parent".into(),
+            origin_node_id: "seat-1".into(),
+            expected_revision: 4,
+            issued_at_utc_ms: snooze_time,
+            expires_at_utc_ms: snooze_time + MAX_CLOCK_COMMAND_TTL_MS,
+            body: ClockCommandKindV1::SetScheduleEnabled {
+                schedule_id: "alarm-disable-snooze".into(),
+                enabled: false,
+            },
+            signer_id: String::new(),
+            signature: String::new(),
+        }
+        .sign(
+            "seat-1-key",
+            &fixture.signing_key,
+            &fixture.worker.context(snooze_time),
+        )
+        .unwrap();
+        fixture.publish(&disable);
+        fixture.worker.tick_once().unwrap();
+
+        let disabled = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(disabled.revision, 5);
+        assert!(!matches!(
+            &disabled.schedules[0].schedule,
+            ClockScheduleKindV1::Alarm(ClockAlarmV1 { enabled: true, .. })
+        ));
+        assert!(
+            disabled
+                .occurrences
+                .iter()
+                .all(|occurrence| occurrence.occurrence_id != child_id),
+            "disabling the parent must cancel its scheduled snooze generation"
+        );
+
+        fixture.clock.0.store(child_due, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let after_deadline = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(after_deadline.revision, 5);
+        assert!(after_deadline.occurrences.iter().all(|occurrence| {
+            occurrence.occurrence_id != child_id
+                && occurrence.phase != ClockOccurrencePhase::Ringing
+        }));
     }
 
     #[test]
@@ -4545,7 +5079,13 @@ mod tests {
             )
             .unwrap());
         assert_eq!(
-            fixture.worker.store.load("seat-1").unwrap().unwrap().action_cursor,
+            fixture
+                .worker
+                .store
+                .load("seat-1")
+                .unwrap()
+                .unwrap()
+                .action_cursor,
             Some(cursor.clone())
         );
 
@@ -4567,7 +5107,13 @@ mod tests {
             )
             .unwrap());
         assert_eq!(
-            fixture.worker.store.load("seat-1").unwrap().unwrap().action_cursor,
+            fixture
+                .worker
+                .store
+                .load("seat-1")
+                .unwrap()
+                .unwrap()
+                .action_cursor,
             Some(cursor)
         );
     }
@@ -4576,23 +5122,14 @@ mod tests {
     fn stale_clock_action_and_audio_cursors_cannot_regress() {
         let mut action_cursor = Some(String::from("01J00000000000000000000002"));
         advance_clock_cursor(&mut action_cursor, "01J00000000000000000000001");
-        assert_eq!(
-            action_cursor.as_deref(),
-            Some("01J00000000000000000000002")
-        );
+        assert_eq!(action_cursor.as_deref(), Some("01J00000000000000000000002"));
         advance_clock_cursor(&mut action_cursor, "01J00000000000000000000003");
-        assert_eq!(
-            action_cursor.as_deref(),
-            Some("01J00000000000000000000003")
-        );
+        assert_eq!(action_cursor.as_deref(), Some("01J00000000000000000000003"));
 
         let mut audio_cursor = None;
         advance_clock_cursor(&mut audio_cursor, "01J00000000000000000000007");
         advance_clock_cursor(&mut audio_cursor, "01J00000000000000000000006");
-        assert_eq!(
-            audio_cursor.as_deref(),
-            Some("01J00000000000000000000007")
-        );
+        assert_eq!(audio_cursor.as_deref(), Some("01J00000000000000000000007"));
     }
 
     #[test]
@@ -4673,13 +5210,9 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.worker.tick_once().unwrap();
 
-        let mut unapproved_schedule = fixture.timer_command(
-            "unapproved-schedule-target",
-            1,
-            NOW + 60_000,
-        );
-        let ClockCommandKindV1::UpsertSchedule { schedule } = &mut unapproved_schedule.body
-        else {
+        let mut unapproved_schedule =
+            fixture.timer_command("unapproved-schedule-target", 1, NOW + 60_000);
+        let ClockCommandKindV1::UpsertSchedule { schedule } = &mut unapproved_schedule.body else {
             unreachable!();
         };
         schedule.selected_target_ids = vec!["seat-9".into()];
@@ -4782,8 +5315,7 @@ mod tests {
         };
         stopwatch.phase = mackes_mesh_types::clock::ClockStopwatchPhase::Running;
         stopwatch.started_wall_utc_ms = Some(
-            NOW
-                .checked_sub(MAX_CLOCK_STOPWATCH_ELAPSED_MS as i64)
+            NOW.checked_sub(MAX_CLOCK_STOPWATCH_ELAPSED_MS as i64)
                 .and_then(|value| value.checked_sub(1))
                 .unwrap(),
         );
@@ -5116,17 +5648,19 @@ mod tests {
             .as_mut()
             .unwrap()
             .stopwatches
-            .extend((0..=MAX_PEER_COMMANDS_PER_TICK).map(|index| ClockStopwatchV1 {
-                stopwatch_id: format!("stopwatch-{index}"),
-                origin_node_id: "seat-1".into(),
-                mirror_target_ids: vec!["seat-2".into()],
-                revision: 1,
-                phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
-                started_wall_utc_ms: None,
-                started_monotonic_ms: None,
-                accumulated_elapsed_ms: 0,
-                laps: Vec::new(),
-            }));
+            .extend(
+                (0..=MAX_PEER_COMMANDS_PER_TICK).map(|index| ClockStopwatchV1 {
+                    stopwatch_id: format!("stopwatch-{index}"),
+                    origin_node_id: "seat-1".into(),
+                    mirror_target_ids: vec!["seat-2".into()],
+                    revision: 1,
+                    phase: mackes_mesh_types::clock::ClockStopwatchPhase::Paused,
+                    started_wall_utc_ms: None,
+                    started_monotonic_ms: None,
+                    accumulated_elapsed_ms: 0,
+                    laps: Vec::new(),
+                }),
+            );
 
         let transaction = fixture.worker.open_bus_transaction().unwrap();
         let peer_snapshot = fixture.worker.initial_snapshot(NOW);
@@ -5162,7 +5696,10 @@ mod tests {
                 laps: Vec::new(),
             })
             .collect();
-        for stopwatch in stopwatches.iter().take(MAX_PEER_CONVERGENCE_PROBES_PER_TICK) {
+        for stopwatch in stopwatches
+            .iter()
+            .take(MAX_PEER_CONVERGENCE_PROBES_PER_TICK)
+        {
             fixture.worker.peer_last_sent_ms.insert(
                 peer_request_id(
                     "stopwatch",
@@ -5208,10 +5745,7 @@ mod tests {
         fixture.worker.clock = clock.clone();
         let transaction = fixture.worker.open_bus_transaction().unwrap();
 
-        fixture
-            .worker
-            .tick_with_transaction(&transaction)
-            .unwrap();
+        fixture.worker.tick_with_transaction(&transaction).unwrap();
 
         assert_eq!(
             clock.reads.load(Ordering::SeqCst),
@@ -5286,8 +5820,8 @@ mod tests {
             .list_since(&clock_command_topic("seat-2").unwrap(), None)
             .unwrap();
         assert_eq!(messages.len(), 1, "conflicting peer payload needs repair");
-        let command: ClockCommandV1 = serde_json::from_str(messages[0].body.as_deref().unwrap())
-            .unwrap();
+        let command: ClockCommandV1 =
+            serde_json::from_str(messages[0].body.as_deref().unwrap()).unwrap();
         let ClockCommandKindV1::UpsertStopwatch { stopwatch } = command.body else {
             panic!("peer repair must carry the stopwatch payload");
         };

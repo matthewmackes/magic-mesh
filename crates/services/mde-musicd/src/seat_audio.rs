@@ -103,7 +103,17 @@ fn parse_pw_dump(bytes: &[u8]) -> Result<serde_json::Value, SeatAudioError> {
 #[derive(Debug, Clone, PartialEq)]
 struct StreamLevel {
     node_id: u32,
+    object_serial: u64,
+    process_id: u64,
     exact_level: f64,
+}
+
+impl StreamLevel {
+    fn same_stream(&self, current: &Self) -> bool {
+        self.node_id == current.node_id
+            && self.object_serial == current.object_serial
+            && self.process_id == current.process_id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,9 +190,29 @@ impl SeatAudioAuthority {
         let Some(mut lease) = self.lease.take() else {
             return Ok(());
         };
+        let current = match self
+            .io
+            .dump()
+            .and_then(|dump| admitted_streams(&dump, self.excluded_process_id))
+        {
+            Ok(current) => current,
+            Err(error) => {
+                self.lease = Some(lease);
+                return Err(error);
+            }
+        };
         let mut failed = Vec::new();
         let mut first_error = None;
         for stream in lease.pending_restore.drain(..) {
+            // PipeWire numeric node IDs are reusable. Once the exact object and
+            // process binding disappears, this lease has no authority over a
+            // replacement stream occupying the same numeric ID.
+            if !current
+                .iter()
+                .any(|candidate| stream.same_stream(candidate))
+            {
+                continue;
+            }
             if let Err(error) = self.io.set_volume(stream.node_id, stream.exact_level) {
                 first_error.get_or_insert(error);
                 failed.push(stream);
@@ -211,18 +241,18 @@ fn admitted_streams(
     let nodes = dump.as_array().ok_or(SeatAudioError::InvalidGraph)?;
     let mut client_processes = BTreeMap::new();
     for client in nodes.iter().filter(|entry| {
-        entry.get("type").and_then(serde_json::Value::as_str)
-            == Some("PipeWire:Interface:Client")
+        entry.get("type").and_then(serde_json::Value::as_str) == Some("PipeWire:Interface:Client")
     }) {
         let id = bounded_u32(client.get("id")).ok_or(SeatAudioError::InvalidGraph)?;
-        let process_id = process_id(&client["info"]["props"])
-            .ok_or(SeatAudioError::InvalidGraph)?;
+        let process_id =
+            process_id(&client["info"]["props"]).ok_or(SeatAudioError::InvalidGraph)?;
         if client_processes.insert(id, process_id).is_some() {
             return Err(SeatAudioError::InvalidGraph);
         }
     }
     let mut admitted = Vec::new();
     let mut ids = BTreeSet::new();
+    let mut object_serials = BTreeSet::new();
     for node in nodes {
         if node.get("type").and_then(serde_json::Value::as_str) != Some("PipeWire:Interface:Node") {
             continue;
@@ -255,6 +285,19 @@ fn admitted_streams(
         if !ids.insert(id) {
             return Err(SeatAudioError::InvalidGraph);
         }
+        let object_serial = props
+            .get("object.serial")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                props
+                    .get("object.serial")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| raw.parse().ok())
+            })
+            .ok_or(SeatAudioError::InvalidGraph)?;
+        if !object_serials.insert(object_serial) {
+            return Err(SeatAudioError::InvalidGraph);
+        }
         let pw_props = info
             .get("params")
             .and_then(|params| params.get("Props"))
@@ -263,6 +306,8 @@ fn admitted_streams(
         let exact_level = exact_scalar_level(pw_props)?;
         admitted.push(StreamLevel {
             node_id: id,
+            object_serial,
+            process_id,
             exact_level,
         });
         if admitted.len() > MAX_ADMITTED_STREAMS {
@@ -364,7 +409,8 @@ mod tests {
             "info": {
                 "props": {
                     "media.class": CLASS_STREAM_OUTPUT,
-                    "application.process.id": process.to_string()
+                    "application.process.id": process.to_string(),
+                    "object.serial": u64::from(id) + 10_000
                 },
                 "params": { "Props": [{ "channelVolumes": [volume, volume] }] }
             }
@@ -505,10 +551,16 @@ mod tests {
     fn client_owned_process_identity_excludes_daemon_streams_and_admits_external_streams() {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let mut daemon = node(41, 42, 1.0);
-        daemon["info"]["props"].as_object_mut().unwrap().remove("application.process.id");
+        daemon["info"]["props"]
+            .as_object_mut()
+            .unwrap()
+            .remove("application.process.id");
         daemon["info"]["props"]["client.id"] = serde_json::json!(40);
         let mut external = node(51, 700, 0.8);
-        external["info"]["props"].as_object_mut().unwrap().remove("application.process.id");
+        external["info"]["props"]
+            .as_object_mut()
+            .unwrap()
+            .remove("application.process.id");
         external["info"]["props"]["client.id"] = serde_json::json!(50);
         let io = FixtureIo {
             dump: serde_json::json!([client(40, 42), daemon, client(50, 700), external]),
@@ -521,5 +573,50 @@ mod tests {
         authority.restore().unwrap();
 
         assert_eq!(*writes.lock().unwrap(), [(51, 0.2), (51, 0.8)]);
+    }
+
+    #[test]
+    fn recycled_node_id_cannot_restore_volume_into_a_replacement_stream() {
+        struct ReplacedNodeIo {
+            dumps: Mutex<std::collections::VecDeque<serde_json::Value>>,
+            writes: Arc<Mutex<Vec<(u32, f64)>>>,
+        }
+
+        impl PipeWireIo for ReplacedNodeIo {
+            fn dump(&self) -> Result<serde_json::Value, SeatAudioError> {
+                self.dumps
+                    .lock()
+                    .expect("dump fixture lock")
+                    .pop_front()
+                    .ok_or(SeatAudioError::Unavailable)
+            }
+
+            fn set_volume(&self, node_id: u32, level: f64) -> Result<(), SeatAudioError> {
+                self.writes
+                    .lock()
+                    .expect("write fixture lock")
+                    .push((node_id, level));
+                Ok(())
+            }
+        }
+
+        let original = node(17, 700, 0.8);
+        let mut replacement = node(17, 701, 0.6);
+        replacement["info"]["props"]["object.serial"] = serde_json::json!(20_017_u64);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let io = ReplacedNodeIo {
+            dumps: Mutex::new(std::collections::VecDeque::from([
+                serde_json::json!([original]),
+                serde_json::json!([replacement]),
+            ])),
+            writes: writes.clone(),
+        };
+        let mut authority = SeatAudioAuthority::with_io(Box::new(io), 42);
+
+        authority.duck(generation(1)).unwrap();
+        authority.restore().unwrap();
+
+        assert_eq!(*writes.lock().unwrap(), [(17, 0.2)]);
+        assert_eq!(authority.pending_restore_count(), 0);
     }
 }

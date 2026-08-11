@@ -31,7 +31,42 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{Track, TrackKind};
+use crate::{
+    engine::{Track, TrackKind},
+    stream::{classify_url, UrlKind},
+};
+
+/// Admit only unambiguous local files or credential-free HTTP(S) subtitle URLs.
+///
+/// mpv accepts several pseudo-protocols in `sub-add`; passing an arbitrary string
+/// through would let a subtitle declaration select generated or network content
+/// that is not the displayed file/URL identity. Remote `file://host` paths and
+/// ambiguous authorities are rejected for the same reason.
+fn subtitle_source_is_admitted(path: &str) -> bool {
+    if path.is_empty() || path != path.trim() || path.chars().any(char::is_control) {
+        return false;
+    }
+
+    match classify_url(path) {
+        UrlKind::LocalFile => {
+            let lower = path.to_ascii_lowercase();
+            !path.starts_with("//")
+                && !path.starts_with(r"\\")
+                && (!lower.starts_with("file://") || lower.starts_with("file:///"))
+        }
+        UrlKind::DirectStream | UrlKind::WebPage => {
+            let Some((scheme, remainder)) = path.split_once("://") else {
+                return false;
+            };
+            if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+                return false;
+            }
+            let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+            !authority.contains('%')
+        }
+        UrlKind::Invalid => false,
+    }
+}
 
 /// Format an `f64` for an mpv property argument (stable, no stray `-0`).
 ///
@@ -312,7 +347,8 @@ impl SubtitleConfig {
     }
 
     /// Compile the ordered `sub-add` commands (with the command name) for every
-    /// external subtitle file, in declared order.
+    /// admitted external subtitle file, in declared order. Unsafe or ambiguous
+    /// sources fail closed and produce no command.
     ///
     /// Each entry is a full argv (`["sub-add", <path>, <flags>, …]`) ready to hand
     /// to mpv's command interface.
@@ -320,6 +356,7 @@ impl SubtitleConfig {
     pub fn commands(&self) -> Vec<Vec<String>> {
         self.external
             .iter()
+            .filter(|sub| subtitle_source_is_admitted(&sub.path))
             .map(|sub| {
                 let mut argv = vec!["sub-add".to_owned()];
                 argv.extend(sub.command_args());
@@ -524,6 +561,38 @@ mod tests {
                     "sub-add".to_owned(),
                     "b.ass".to_owned(),
                     "select".to_owned()
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn ambiguous_subtitle_source_cannot_substitute_loaded_content() {
+        let cfg = SubtitleConfig {
+            external: vec![
+                ExternalSub::new("https://trusted.mesh@attacker.example/movie.srt"),
+                ExternalSub::new("https://trusted.mesh%40attacker.example/movie.srt"),
+                ExternalSub::new("file://attacker.example/share/movie.srt"),
+                ExternalSub::new(r"\\attacker.example\share\movie.srt"),
+                ExternalSub::new("memory://forged subtitle content"),
+                ExternalSub::new("/subs/local.srt"),
+                ExternalSub::new("https://subs.mesh/movie.eng.srt?token=a%2Fb"),
+            ],
+            ..SubtitleConfig::new()
+        };
+
+        assert_eq!(
+            cfg.commands(),
+            vec![
+                vec![
+                    "sub-add".to_owned(),
+                    "/subs/local.srt".to_owned(),
+                    "select".to_owned(),
+                ],
+                vec![
+                    "sub-add".to_owned(),
+                    "https://subs.mesh/movie.eng.srt?token=a%2Fb".to_owned(),
+                    "select".to_owned(),
                 ],
             ]
         );

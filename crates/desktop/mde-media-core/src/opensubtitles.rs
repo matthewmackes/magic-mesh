@@ -183,13 +183,16 @@ struct RawFile {
 ///
 /// Tolerant of the API's optional fields (any missing field becomes [`None`] /
 /// `false`) and flattens the first downloadable `files[]` entry of each datum into
-/// the result. Pure — the live client feeds it the fetched body.
+/// the result. Exact duplicate file identities collapse; if one `file_id` is
+/// attached to conflicting metadata, every result carrying that id is suppressed
+/// so provider response ordering cannot choose which subtitle it authorizes. Pure
+/// — the live client feeds it the fetched body.
 ///
 /// # Errors
 /// Returns the [`serde_json::Error`] if the body is not the expected JSON shape.
 pub fn parse_search_response(body: &str) -> Result<Vec<SubtitleSearchResult>, serde_json::Error> {
     let raw: RawResponse = serde_json::from_str(body)?;
-    Ok(raw
+    let projected = raw
         .data
         .into_iter()
         .map(|datum| {
@@ -205,7 +208,39 @@ pub fn parse_search_response(body: &str) -> Result<Vec<SubtitleSearchResult>, se
                 moviehash_match: attrs.moviehash_match,
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    // A file id is the authority handed to the provider's download endpoint. If
+    // the response binds one id to two different result identities, retaining
+    // either binding would let provider-controlled response order select which
+    // subtitle the caller believes it is loading. Preserve fieldless display
+    // results, collapse byte-for-byte duplicate bindings, and fail conflicting
+    // download identities closed.
+    let mut by_file_id = std::collections::HashMap::<i64, usize>::new();
+    let mut conflicted = std::collections::HashSet::<i64>::new();
+    let mut results = Vec::<Option<SubtitleSearchResult>>::with_capacity(projected.len());
+    for candidate in projected {
+        let Some(file_id) = candidate.file_id else {
+            results.push(Some(candidate));
+            continue;
+        };
+        if conflicted.contains(&file_id) {
+            continue;
+        }
+        if let Some(&index) = by_file_id.get(&file_id) {
+            if results[index].as_ref() == Some(&candidate) {
+                continue;
+            }
+            results[index] = None;
+            by_file_id.remove(&file_id);
+            conflicted.insert(file_id);
+            continue;
+        }
+        by_file_id.insert(file_id, results.len());
+        results.push(Some(candidate));
+    }
+
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// A soft failure from the live `OpenSubtitles` fetch.
@@ -464,5 +499,42 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(parse_search_response("not json").is_err());
+    }
+
+    #[test]
+    fn equivocated_file_identity_cannot_be_selected_by_provider_order() {
+        let body = r#"{
+          "data": [
+            {"attributes": {
+              "language": "en", "release": "trusted-release", "format": "srt",
+              "moviehash_match": true,
+              "files": [{"file_id": 41, "file_name": "trusted.srt"}]
+            }},
+            {"attributes": {
+              "language": "fr", "release": "substituted-release", "format": "ass",
+              "moviehash_match": false,
+              "files": [{"file_id": 41, "file_name": "substituted.ass"}]
+            }},
+            {"attributes": {
+              "language": "es", "release": "unrelated", "format": "srt",
+              "moviehash_match": true,
+              "files": [{"file_id": 52, "file_name": "unrelated.srt"}]
+            }},
+            {"attributes": {
+              "language": "es", "release": "unrelated", "format": "srt",
+              "moviehash_match": true,
+              "files": [{"file_id": 52, "file_name": "unrelated.srt"}]
+            }}
+          ]
+        }"#;
+
+        let results = parse_search_response(body).expect("parse hostile provider response");
+        assert_eq!(results.len(), 1, "exact duplicate should collapse");
+        assert_eq!(results[0].file_id, Some(52));
+        assert_eq!(results[0].file_name.as_deref(), Some("unrelated.srt"));
+        assert!(
+            results.iter().all(|result| result.file_id != Some(41)),
+            "every conflicting binding must lose download authority"
+        );
     }
 }

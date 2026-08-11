@@ -13,7 +13,8 @@
 //! - an [`af_graph`](AudioConfig::af_graph) string — the ordered filter chain
 //!   (EQ bands → loudness → user filters), the value of mpv's `af` property; and
 //! - a [`properties`](AudioConfig::properties) list — `ao` (the `PipeWire` ao),
-//!   optional `audio-device`, `replaygain*`, and `gapless-audio`.
+//!   `audio-device` (a specific sink or an explicit `auto` reset),
+//!   `replaygain*`, and `gapless-audio`.
 //!
 //! [`crate::MediaEngine::apply_audio_config`] applies both to the engine; the real
 //! [`MpvEngine`](crate::mpv::MpvEngine) sets them as mpv properties, and
@@ -77,8 +78,8 @@ impl AudioDriver {
 pub struct AudioOutput {
     /// The ao driver (default: `PipeWire` — the seat audio server).
     pub driver: AudioDriver,
-    /// A specific ao device to select (`audio-device`), or [`None`] for the
-    /// driver's default sink.
+    /// A specific ao device to select (`audio-device`), or [`None`] to reset to
+    /// mpv's automatic device selection.
     pub device: Option<String>,
 }
 
@@ -301,17 +302,25 @@ impl AudioConfig {
     }
 
     /// Compile the non-`af` mpv properties this config sets, in a stable order:
-    /// `ao` (unless auto), optional `audio-device`, `replaygain`, optional
+    /// `ao` (unless auto), `audio-device`, `replaygain`, optional
     /// `replaygain-preamp`/`replaygain-clip`, and `gapless-audio`.
+    ///
+    /// `audio-device` is always emitted because mpv properties persist across
+    /// applications. A missing device therefore folds to mpv's `auto` value so
+    /// clearing an explicit sink cannot leave the old sink authoritative.
     #[must_use]
     pub fn properties(&self) -> Vec<(String, String)> {
         let mut props = Vec::new();
         if let Some(ao) = self.output.driver.ao_property() {
             props.push(("ao".to_owned(), ao));
         }
-        if let Some(device) = &self.output.device {
-            props.push(("audio-device".to_owned(), device.clone()));
-        }
+        props.push((
+            "audio-device".to_owned(),
+            self.output
+                .device
+                .clone()
+                .unwrap_or_else(|| "auto".to_owned()),
+        ));
         props.push(("replaygain".to_owned(), self.replaygain.as_mpv().to_owned()));
         if self.replaygain_preamp_db.abs() > f64::EPSILON {
             props.push((
@@ -347,6 +356,7 @@ mod tests {
             cfg.properties(),
             vec![
                 ("ao".to_owned(), "pipewire,null".to_owned()),
+                ("audio-device".to_owned(), "auto".to_owned()),
                 ("replaygain".to_owned(), "no".to_owned()),
                 ("gapless-audio".to_owned(), "yes".to_owned()),
             ]
@@ -491,6 +501,32 @@ mod tests {
             ..AudioConfig::new()
         };
         assert!(!cfg.properties().iter().any(|(k, _)| k == "ao"));
+    }
+
+    #[test]
+    fn clearing_explicit_device_revokes_the_stale_sink() {
+        let explicit = AudioConfig {
+            output: AudioOutput {
+                driver: AudioDriver::PipeWire,
+                device: Some("pipewire/seat-headset".to_owned()),
+            },
+            ..AudioConfig::new()
+        };
+        assert!(explicit.properties().contains(&(
+            "audio-device".to_owned(),
+            "pipewire/seat-headset".to_owned()
+        )));
+
+        let cleared = AudioConfig {
+            output: AudioOutput {
+                driver: AudioDriver::PipeWire,
+                device: None,
+            },
+            ..AudioConfig::new()
+        };
+        assert!(cleared
+            .properties()
+            .contains(&("audio-device".to_owned(), "auto".to_owned())));
     }
 
     #[test]

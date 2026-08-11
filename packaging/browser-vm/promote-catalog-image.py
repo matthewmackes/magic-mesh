@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,79 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_mode,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_mode,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def copy_admitted(
+    source: Path,
+    destination: Path,
+    label: str,
+    admitted: os.stat_result,
+    expected_digest: str,
+) -> None:
+    """Copy admitted bytes without retaining authority through a source inode."""
+    source_descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(source_descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not same_file_version(opened, admitted):
+            die(f"{label} identity changed before isolated catalog copy")
+
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o644,
+        )
+        digest = hashlib.sha256()
+        try:
+            while chunk := os.read(source_descriptor, 1024 * 1024):
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_descriptor, view)
+                    if written == 0:
+                        raise OSError(errno.EIO, "short catalog write", destination)
+                    view = view[written:]
+            os.fsync(destination_descriptor)
+            copied = os.fstat(destination_descriptor)
+        except BaseException:
+            os.close(destination_descriptor)
+            destination.unlink(missing_ok=True)
+            raise
+        else:
+            os.close(destination_descriptor)
+
+        finished = os.fstat(source_descriptor)
+        if not same_file_version(opened, finished):
+            destination.unlink(missing_ok=True)
+            die(f"{label} changed during isolated catalog copy")
+        if copied.st_ino == opened.st_ino and copied.st_dev == opened.st_dev:
+            destination.unlink(missing_ok=True)
+            die(f"{label} catalog copy retained the source inode")
+        if copied.st_nlink != 1 or not stat.S_ISREG(copied.st_mode):
+            destination.unlink(missing_ok=True)
+            die(f"{label} catalog copy is not an isolated regular file")
+        if digest.hexdigest() != expected_digest:
+            destination.unlink(missing_ok=True)
+            die(f"{label} bytes changed during isolated catalog copy")
+    finally:
+        os.close(source_descriptor)
 
 
 def write_synced(path: Path, body: bytes, mode: int = 0o644) -> None:
@@ -111,16 +185,51 @@ def checked_json(path: Path) -> dict[str, object]:
     return value
 
 
+def hostile_regression_source_alias_cannot_mutate_promoted_guest() -> None:
+    with tempfile.TemporaryDirectory(prefix="browser-vm-promotion-alias-") as raw:
+        root = Path(raw)
+        source = root / "browser-vm.qcow2"
+        promoted = root / "catalog" / "browser-vm.qcow2"
+        promoted.parent.mkdir()
+        admitted_bytes = b"admitted-browser-vm-generation\n"
+        source.write_bytes(admitted_bytes)
+        source.chmod(0o644)
+        admitted = regular_nonsymlink(source, "hostile fixture image")
+        copy_admitted(
+            source,
+            promoted,
+            "image",
+            admitted,
+            hashlib.sha256(admitted_bytes).hexdigest(),
+        )
+
+        source.write_bytes(b"replacement-browser-vm-generation\n")
+        if promoted.read_bytes() != admitted_bytes:
+            raise AssertionError("source alias changed the promoted Browser VM generation")
+        if source.stat().st_ino == promoted.stat().st_ino:
+            raise AssertionError("promotion retained source inode authority")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Promote an exact Browser VM artifact+manifest into a new isolated catalog"
     )
-    parser.add_argument("--catalog-root", required=True, type=Path)
-    parser.add_argument("--image", required=True, type=Path)
-    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--catalog-root", type=Path)
+    parser.add_argument("--image", type=Path)
+    parser.add_argument("--manifest", type=Path)
     parser.add_argument("--name", default="browser-vm-chromium")
-    parser.add_argument("--version", required=True)
+    parser.add_argument("--version")
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+
+    if args.self_test:
+        if any((args.catalog_root, args.image, args.manifest, args.version)):
+            die("--self-test does not accept promotion arguments")
+        hostile_regression_source_alias_cannot_mutate_promoted_guest()
+        print("Browser VM catalog source-alias hostile regression passed")
+        return 0
+    if any(value is None for value in (args.catalog_root, args.image, args.manifest, args.version)):
+        die("--catalog-root, --image, --manifest, and --version are required")
 
     if not TOKEN.fullmatch(args.name):
         die("name must be a bounded lowercase catalog token")
@@ -189,23 +298,29 @@ def main() -> int:
         version_dir = stage / "images" / args.name / args.version
         version_dir.mkdir(parents=True, mode=0o755)
 
-        # Preserve the exact source pair under its original canonical names.
-        # The Workload VM resolver's established `<name>.img` artifact is a
-        # hard link to those same admitted bytes, not a converted image.
+        # Copy the admitted source pair onto catalog-owned inodes. The source
+        # may remain writable by its owner after promotion, so retaining its
+        # inode here would let that external authority mutate the guest image.
+        # The resolver alias may share the catalog-owned image inode.
         preserved_image = version_dir / args.image.name
         preserved_manifest = version_dir / args.manifest.name
         workload_image = version_dir / f"{args.name}.img"
-        try:
-            os.link(args.image, preserved_image, follow_symlinks=False)
-            os.link(args.manifest, preserved_manifest, follow_symlinks=False)
-            if workload_image != preserved_image:
-                os.link(preserved_image, workload_image, follow_symlinks=False)
-        except OSError as error:
-            die(f"catalog and source must share a filesystem for exact hard-link promotion: {error}")
+        copy_admitted(args.image, preserved_image, "image", image_before, image_digest)
+        copy_admitted(
+            args.manifest,
+            preserved_manifest,
+            "identity manifest",
+            manifest_before,
+            identity_digest,
+        )
+        if workload_image != preserved_image:
+            os.link(preserved_image, workload_image, follow_symlinks=False)
 
         if sha256(workload_image) != image_digest or sha256(preserved_manifest) != identity_digest:
             die("catalog bytes changed while staging promotion")
-        if args.image.stat()[:2] != image_before[:2] or args.manifest.stat()[:2] != manifest_before[:2]:
+        if not same_file_version(args.image.stat(), image_before) or not same_file_version(
+            args.manifest.stat(), manifest_before
+        ):
             die("source identity changed while staging promotion")
 
         built_at_ms = int(manifest.get("created_unix_ms", 0))

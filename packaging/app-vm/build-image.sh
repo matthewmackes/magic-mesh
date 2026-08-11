@@ -11,14 +11,71 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 APP_VM_DIR="$REPO/packaging/app-vm"
 CONTAINERFILE="$APP_VM_DIR/Containerfile"
 RPMS_DIR="$APP_VM_DIR/rpms"
+RPM_SUPPLY_VERIFY="$APP_VM_DIR/verify-rpm-supply.sh"
+RPM_KEY="$REPO/packaging/repo/RPM-GPG-KEY-magic-mesh"
 IMAGE="localhost/magic-mesh-app-vm-wayland:latest"
 BASE=""
 LANE="repo"
 RPMS=()
+CANDIDATE_MANIFEST=""
 DISK=""
 OUT="$APP_VM_DIR/out"
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
+
+canonical_image_id() { # $1 = raw Podman image ID
+    local raw="$1"
+    if [[ "$raw" == sha256:* ]]; then
+        [[ "$raw" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || return 1
+        printf '%s\n' "$raw"
+    elif [[ "$raw" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        printf 'sha256:%s\n' "$raw"
+    else
+        return 1
+    fi
+}
+
+append_pinned_base_arg() { # $1 = selected mutable ref, $2 = captured immutable ID
+    local selected_ref="$1" immutable_id="$2"
+    [[ -n "$selected_ref" ]] || {
+        echo "FATAL: cannot pin an empty App VM base reference" >&2
+        return 2
+    }
+    canonical_image_id "$immutable_id" >/dev/null || {
+        echo "FATAL: cannot pin App VM build to invalid base image ID: $immutable_id" >&2
+        return 2
+    }
+    args+=(--build-arg "APP_VM_BASE=$immutable_id")
+}
+
+self_test() {
+    # Hostile case: a mutable selected tag is assumed to be retargeted after
+    # inspection. It must never cross the Containerfile FROM boundary.
+    local selected_ref='registry.example.invalid/app-vm-base:latest'
+    local captured_id='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    local rendered
+    args=()
+    append_pinned_base_arg "$selected_ref" "$captured_id"
+    rendered=" ${args[*]} "
+    [[ "$rendered" == *" APP_VM_BASE=$captured_id "* ]] || {
+        echo "self-test: immutable base ID was not passed to the build" >&2
+        return 1
+    }
+    [[ "$rendered" != *"$selected_ref"* ]] || {
+        echo "self-test: mutable base tag escaped into the build" >&2
+        return 1
+    }
+    echo "build-image.sh: self-test passed"
+}
+
+if [[ "${1:-}" == --self-test ]]; then
+    [[ "$#" -eq 1 ]] || {
+        echo "FATAL: --self-test takes no other arguments" >&2
+        exit 2
+    }
+    self_test
+    exit
+fi
 
 SOURCE_COMMIT="${MCNF_APP_VM_SOURCE_COMMIT:-$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null || true)}"
 
@@ -29,8 +86,10 @@ fi
 
 usage() {
     cat <<'EOF'
-Usage: packaging/app-vm/build-image.sh [--rpm PATH]... [--base IMAGE]
+Usage: packaging/app-vm/build-image.sh [--rpm PATH --candidate-manifest PATH]
+       [--base IMAGE]
        [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]
+       packaging/app-vm/build-image.sh --self-test
 
 Builds the fixed wayland-standard App VM guest image. A disk output uses
 bootc-image-builder and is suitable for the app_base_image_source OpenTofu
@@ -41,7 +100,10 @@ The build is fail-closed: a missing base image is pulled once with a bounded
 timeout, and an unreachable registry exits 3 before podman build starts. A
 successful image build is always passed through verify-image.sh before a disk
 artifact is emitted. The source revision is recorded in both the image label
-and the guest-readable provenance file.
+and the guest-readable provenance file. The local lane checks the candidate
+manifest against authoritative RPM NEVRA/payload metadata, then authenticates
+the requested revision against the signed binaries' compile-time build identity
+before and after staging and inside the Containerfile.
 EOF
 }
 
@@ -76,6 +138,7 @@ resolve_image() { # $1 = image ref, $2 = human-readable purpose
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --rpm) RPMS+=("${2:?--rpm needs a path}"); LANE=local; shift 2 ;;
+        --candidate-manifest) CANDIDATE_MANIFEST="${2:?--candidate-manifest needs a path}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
         --disk) DISK="${2:?--disk needs a type}"; shift 2 ;;
@@ -90,15 +153,19 @@ command -v podman >/dev/null 2>&1 || missing+=("podman is required")
 [ -f "$CONTAINERFILE" ] || missing+=("Containerfile missing: $CONTAINERFILE")
 [ -d "$RPMS_DIR" ] || missing+=("RPM staging directory missing: $RPMS_DIR")
 [ -f "$REPO/packaging/repo/magic-mesh.repo" ] || missing+=("channel repo file missing: $REPO/packaging/repo/magic-mesh.repo")
+[ -x "$RPM_SUPPLY_VERIFY" ] || missing+=("RPM supply verifier missing or not executable: $RPM_SUPPLY_VERIFY")
+[ -f "$RPM_KEY" ] || missing+=("governed RPM key missing: $RPM_KEY")
 
 if [ "$LANE" = "local" ]; then
+    [ "${#RPMS[@]}" -eq 1 ] || missing+=("local lane requires exactly one magic-mesh RPM")
+    [ -n "$CANDIDATE_MANIFEST" ] || missing+=("local lane requires --candidate-manifest")
+    [ -z "$CANDIDATE_MANIFEST" ] || [ -f "$CANDIDATE_MANIFEST" ] \
+        || missing+=("--candidate-manifest path does not exist: $CANDIDATE_MANIFEST")
     for rpm in "${RPMS[@]}"; do
         [ -f "$rpm" ] || missing+=("--rpm path does not exist: $rpm")
-        case "$(basename "$rpm")" in
-            magic-mesh-*.rpm) ;;
-            *) missing+=("--rpm must be a magic-mesh-*.rpm (got: $(basename "$rpm"))") ;;
-        esac
     done
+elif [ -n "$CANDIDATE_MANIFEST" ]; then
+    missing+=("--candidate-manifest is only valid with the local --rpm lane")
 fi
 
 [ -n "$OUT" ] && [ -z "$DISK" ] && [ "$OUT" != "$APP_VM_DIR/out" ] && \
@@ -119,10 +186,24 @@ case "$DISK" in
     *) echo "FATAL: invalid --disk" >&2; exit 2 ;;
 esac
 
-find "$RPMS_DIR" -maxdepth 1 -type f -name '*.rpm' -delete
-for rpm in "${RPMS[@]}"; do
-    cp -v "$rpm" "$RPMS_DIR/"
-done
+if [ "$LANE" = "local" ]; then
+    # The caller-supplied manifest is a consistency record, not revision trust.
+    # The verifier authenticates SOURCE_COMMIT from the signed RPM binaries'
+    # compile-time BuildInfo before touching the build context. Repeat against
+    # the read-only copies; the Containerfile performs the same gate on the
+    # bytes crossing the actual image-build boundary.
+    "$RPM_SUPPLY_VERIFY" --key "$RPM_KEY" --source-commit "$SOURCE_COMMIT" \
+        --candidate-manifest "$CANDIDATE_MANIFEST" "${RPMS[0]}"
+fi
+find "$RPMS_DIR" -maxdepth 1 -type f \
+    \( -name '*.rpm' -o -name 'candidate-manifest.json' \) -delete
+if [ "$LANE" = "local" ]; then
+    install -v -m 0444 -- "${RPMS[0]}" "$RPMS_DIR/magic-mesh-local.rpm"
+    install -v -m 0444 -- "$CANDIDATE_MANIFEST" "$RPMS_DIR/candidate-manifest.json"
+    "$RPM_SUPPLY_VERIFY" --key "$RPM_KEY" --source-commit "$SOURCE_COMMIT" \
+        --candidate-manifest "$RPMS_DIR/candidate-manifest.json" \
+        "$RPMS_DIR/magic-mesh-local.rpm"
+fi
 
 EFFECTIVE_BASE="${BASE:-$(sed -n 's/^ARG APP_VM_BASE=//p' "$CONTAINERFILE" | head -n 1)}"
 [ -n "$EFFECTIVE_BASE" ] || {
@@ -136,13 +217,7 @@ resolve_image "$EFFECTIVE_BASE" "App VM base"
 # that may be admitted as a VM root. The immutable image ID is carried as a
 # label and checked again before any disk conversion.
 BASE_ID_RAW="$(podman image inspect --format '{{.Id}}' "$EFFECTIVE_BASE" 2>/dev/null || true)"
-if [[ "$BASE_ID_RAW" == sha256:* ]]; then
-    BASE_ID="$BASE_ID_RAW"
-elif [[ "$BASE_ID_RAW" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    # Rootless Podman on some farm images omits the algorithm prefix. Restore
-    # the canonical OCI form before carrying the identity into provenance.
-    BASE_ID="sha256:$BASE_ID_RAW"
-else
+if ! BASE_ID="$(canonical_image_id "$BASE_ID_RAW")"; then
     echo "FATAL: resolved App VM base has no immutable image ID: $EFFECTIVE_BASE" >&2
     exit 2
 fi
@@ -154,7 +229,9 @@ args=(
     --build-arg "MCNF_APP_VM_SOURCE_COMMIT=$SOURCE_COMMIT"
     --build-arg "MCNF_APP_VM_BASE_IMAGE_ID=$BASE_ID"
 )
-[ -n "$BASE" ] && args+=(--build-arg "APP_VM_BASE=$BASE")
+# Never let the mutable selection ref cross the build boundary. A tag may be
+# retargeted after resolve/inspect; FROM consumes the captured immutable ID.
+append_pinned_base_arg "$EFFECTIVE_BASE" "$BASE_ID"
 podman build "${args[@]}" \
     --label "org.mcnf.app-vm.profile=$CONTRACT_ID" \
     --label "org.mcnf.app-vm.base-image=$EFFECTIVE_BASE" \
@@ -168,13 +245,17 @@ podman build "${args[@]}" \
 # Inspect the built image before producing a disk artifact. This is a contents
 # gate, not a boot claim: the image must contain the fixed guest contract and
 # must not silently acquire a public Flatpak remote.
-"$REPO/packaging/app-vm/verify-image.sh" "$IMAGE"
+IMAGE_ID_RAW="$(podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+if ! IMAGE_ID="$(canonical_image_id "$IMAGE_ID_RAW")"; then
+    echo "FATAL: built App VM tag has no immutable image ID: $IMAGE" >&2
+    exit 2
+fi
+"$REPO/packaging/app-vm/verify-image.sh" "$IMAGE_ID"
 
-IMAGE_ID="$(podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
-IMAGE_PROFILE="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.profile\"}}' "$IMAGE" 2>/dev/null || true)"
-IMAGE_BASE_ID="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.base-image-id\"}}' "$IMAGE" 2>/dev/null || true)"
-IMAGE_SOURCE_COMMIT="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.source-commit\"}}' "$IMAGE" 2>/dev/null || true)"
-if [ -z "$IMAGE_ID" ] || [ "$IMAGE_PROFILE" != "$CONTRACT_ID" ] || \
+IMAGE_PROFILE="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.profile\"}}' "$IMAGE_ID" 2>/dev/null || true)"
+IMAGE_BASE_ID="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.base-image-id\"}}' "$IMAGE_ID" 2>/dev/null || true)"
+IMAGE_SOURCE_COMMIT="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.source-commit\"}}' "$IMAGE_ID" 2>/dev/null || true)"
+if [ "$IMAGE_PROFILE" != "$CONTRACT_ID" ] || \
    [ "$IMAGE_BASE_ID" != "$BASE_ID" ] || [ "$IMAGE_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
     echo "FATAL: built App VM image failed immutable provenance verification" >&2
     echo "  image_id=$IMAGE_ID profile=$IMAGE_PROFILE base_id=$IMAGE_BASE_ID expected_base_id=$BASE_ID" >&2
@@ -191,5 +272,5 @@ if [ -n "$DISK" ]; then
         -v "$OUT:/output" \
         -v /var/lib/containers/storage:/var/lib/containers/storage \
         "$BIB_IMAGE" \
-        --type "$DISK" --local "$IMAGE"
+        --type "$DISK" --local "$IMAGE_ID"
 fi

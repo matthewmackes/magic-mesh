@@ -14,9 +14,11 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mde_collab_types::value::sha256_hex;
 use mde_collab_types::PayloadRef;
+use sha2::{Digest, Sha256};
 
 use crate::error::{CollabError, Result};
 
@@ -24,6 +26,197 @@ const SHA256_HEX_LEN: usize = 64;
 /// Payloads are materialized in memory by this store. Keep the limit aligned
 /// with the Communications file/clipboard transfer ceiling.
 const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A private, verified blob which has not yet been installed in canonical CAS.
+///
+/// Dropping or aborting this value removes only its create-new staging inode.
+/// Call [`commit`](Self::commit) immediately before the durable operation which
+/// will reference the blob.
+#[derive(Debug)]
+pub struct FsBlobStage {
+    path: Option<PathBuf>,
+    file: File,
+    canonical_path: PathBuf,
+    reference: PayloadRef,
+}
+
+/// An installed blob whose canonical inode is still owned by this transaction.
+///
+/// [`retain`](Self::retain) makes the installation permanent after the caller's
+/// durable reference commit succeeds. Until then, abort/Drop removes the
+/// canonical path only when it still names the exact inode installed by this
+/// token. A concurrent replacement is never removed.
+#[derive(Debug)]
+pub struct FsBlobCommit {
+    canonical_path: PathBuf,
+    file: Option<File>,
+    reference: PayloadRef,
+    owns_install: bool,
+}
+
+impl FsBlobStage {
+    /// The exact digest and length verified while streaming into this stage.
+    #[must_use]
+    pub fn reference(&self) -> &PayloadRef {
+        &self.reference
+    }
+
+    /// Atomically install this stage without replacing an existing CAS entry.
+    ///
+    /// A hard link is the portable no-replace primitive here: the staging file
+    /// and canonical file are siblings on one filesystem, and `hard_link`
+    /// fails with `AlreadyExists` instead of overwriting a concurrent writer.
+    pub fn commit(mut self) -> Result<FsBlobCommit> {
+        let commit_file = self.file.try_clone()?;
+        let path = self.path.as_ref().expect("live staging path");
+        let owns_install = match fs::hard_link(path, &self.canonical_path) {
+            Ok(()) => {
+                let canonical = match FsBlobStore::open_blob_no_follow(&self.canonical_path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        remove_if_same_file(&self.canonical_path, &self.file);
+                        return Err(error.into());
+                    }
+                };
+                let bound = match same_file(&canonical, &self.file) {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        remove_if_same_file(&self.canonical_path, &self.file);
+                        return Err(error.into());
+                    }
+                };
+                if !bound {
+                    remove_if_same_file(&self.canonical_path, &self.file);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "canonical blob did not bind to the owned staging inode",
+                    )
+                    .into());
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = verify_file_at_path(&self.canonical_path, &self.reference)?;
+                seal_file_read_only(&existing)?;
+                let current = FsBlobStore::open_blob_no_follow(&self.canonical_path)?;
+                if !same_file(&existing, &current)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "canonical blob changed while sealing replay authority",
+                    )
+                    .into());
+                }
+                false
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        if let Some(path) = self.path.clone() {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    self.path = None;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.path = None;
+                }
+                Err(error) => {
+                    if owns_install {
+                        remove_if_same_file(&self.canonical_path, &self.file);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        if let Err(error) = sync_parent(&self.canonical_path) {
+            if owns_install {
+                remove_if_same_file(&self.canonical_path, &self.file);
+            }
+            return Err(error.into());
+        }
+
+        Ok(FsBlobCommit {
+            canonical_path: self.canonical_path.clone(),
+            file: Some(commit_file),
+            reference: self.reference.clone(),
+            owns_install,
+        })
+    }
+
+    /// Explicitly discard this private stage. Drop provides the same cleanup.
+    pub fn abort(mut self) -> Result<()> {
+        self.remove_stage()
+    }
+
+    fn remove_stage(&mut self) -> Result<()> {
+        let Some(path) = self.path.take() else {
+            return Ok(());
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_parent(&path)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for FsBlobStage {
+    fn drop(&mut self) {
+        let _ = self.remove_stage();
+    }
+}
+
+impl FsBlobCommit {
+    /// The exact digest and length installed or found in canonical CAS.
+    #[must_use]
+    pub fn reference(&self) -> &PayloadRef {
+        &self.reference
+    }
+
+    /// Whether this token, rather than a concurrent idempotent writer,
+    /// installed the canonical inode.
+    #[must_use]
+    pub fn owns_install(&self) -> bool {
+        self.owns_install
+    }
+
+    /// Keep the canonical blob after the caller durably commits its reference.
+    #[must_use]
+    pub fn retain(mut self) -> PayloadRef {
+        self.owns_install = false;
+        self.file = None;
+        self.reference.clone()
+    }
+
+    /// Roll back this token's canonical installation, if it is still the same
+    /// inode. An idempotent token which found another writer's blob is a no-op.
+    pub fn abort(mut self) -> Result<()> {
+        self.cleanup_install()
+    }
+
+    fn cleanup_install(&mut self) -> Result<()> {
+        if !self.owns_install {
+            return Ok(());
+        }
+        self.owns_install = false;
+        let Some(file) = self.file.take() else {
+            return Ok(());
+        };
+        if remove_if_same_file(&self.canonical_path, &file) {
+            sync_parent(&self.canonical_path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FsBlobCommit {
+    fn drop(&mut self) {
+        let _ = self.cleanup_install();
+    }
+}
 
 /// Verify that `bytes` match `reference` (both digest and length). The single
 /// integrity gate every fetch funnels through.
@@ -200,6 +393,198 @@ impl FsBlobStore {
             File::open(path)
         }
     }
+
+    /// Stream a blob into a private create-new file while enforcing the exact
+    /// caller-provided length and SHA-256. No unverified bytes become visible
+    /// at the canonical content address.
+    pub fn stage<R: Read>(&self, mut reader: R, expected: &PayloadRef) -> Result<FsBlobStage> {
+        if expected.len > MAX_BLOB_BYTES {
+            return Err(oversized_blob_error(expected.len));
+        }
+        if !is_canonical_digest(&expected.sha256_hex) {
+            return Err(CollabError::BlobHashMismatch {
+                expected: expected.sha256_hex.clone(),
+                actual: "non-canonical expected SHA-256".to_owned(),
+            });
+        }
+
+        let canonical_path = self
+            .path_for(&expected.sha256_hex)
+            .expect("validated canonical digest");
+        self.reject_unsafe_parent(&canonical_path)?;
+        let parent = canonical_path
+            .parent()
+            .expect("CAS path has shard")
+            .to_owned();
+        fs::create_dir_all(&parent)?;
+        self.reject_unsafe_parent(&canonical_path)?;
+
+        let (path, file) = create_private_stage(&parent, &expected.sha256_hex)?;
+        let mut stage = FsBlobStage {
+            path: Some(path),
+            file,
+            canonical_path,
+            reference: expected.clone(),
+        };
+
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let remaining = expected.len.saturating_add(1).saturating_sub(total);
+            if remaining == 0 {
+                break;
+            }
+            let read_len = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded read length fits usize");
+            let count = reader.read(&mut buffer[..read_len])?;
+            if count == 0 {
+                break;
+            }
+            total += count as u64;
+            if total > expected.len {
+                return Err(CollabError::BlobSizeMismatch {
+                    expected: expected.len,
+                    actual: total,
+                });
+            }
+            hasher.update(&buffer[..count]);
+            stage.file.write_all(&buffer[..count])?;
+        }
+
+        if total != expected.len {
+            return Err(CollabError::BlobSizeMismatch {
+                expected: expected.len,
+                actual: total,
+            });
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected.sha256_hex {
+            return Err(CollabError::BlobHashMismatch {
+                expected: expected.sha256_hex.clone(),
+                actual,
+            });
+        }
+        stage.file.sync_all()?;
+        seal_file_read_only(&stage.file)?;
+        sync_directory(&parent)?;
+        Ok(stage)
+    }
+}
+
+fn create_private_stage(parent: &Path, digest: &str) -> std::io::Result<(PathBuf, File)> {
+    for _ in 0..128 {
+        let id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".{digest}.{}.{}.tmp", std::process::id(), id));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a private blob staging file",
+    ))
+}
+
+fn verify_file_at_path(path: &Path, reference: &PayloadRef) -> Result<File> {
+    let mut file = FsBlobStore::open_blob_no_follow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(CollabError::BlobNotFound(reference.sha256_hex.clone()));
+    }
+    if metadata.len() != reference.len {
+        return Err(CollabError::BlobSizeMismatch {
+            expected: reference.len,
+            actual: metadata.len(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(MAX_BLOB_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    verify_bytes(&bytes, reference)?;
+    Ok(file)
+}
+
+fn verify_open_file_digest(file: &mut File, expected_digest: &str) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(CollabError::BlobNotFound(expected_digest.to_owned()));
+    }
+    if metadata.len() > MAX_BLOB_BYTES {
+        return Err(oversized_blob_error(metadata.len()));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_digest {
+        return Err(CollabError::BlobHashMismatch {
+            expected: expected_digest.to_owned(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn seal_file_read_only(file: &File) -> std::io::Result<()> {
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_readonly(true);
+    file.set_permissions(permissions)?;
+    file.sync_all()
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(unix)]
+fn same_file(left: &File, right: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &File, _right: &File) -> std::io::Result<bool> {
+    // std does not expose a stable file identity on these targets. Refusing to
+    // claim ownership is safer than unlinking a same-length replacement.
+    Ok(false)
+}
+
+fn remove_if_same_file(path: &Path, owned: &File) -> bool {
+    let Ok(current) = FsBlobStore::open_blob_no_follow(path) else {
+        return false;
+    };
+    if !same_file(&current, owned).unwrap_or(false) {
+        return false;
+    }
+    fs::remove_file(path).is_ok()
 }
 
 fn is_canonical_digest(digest: &str) -> bool {
@@ -217,40 +602,9 @@ fn oversized_blob_error(len: u64) -> CollabError {
 
 impl BlobStore for FsBlobStore {
     fn put(&mut self, bytes: &[u8]) -> Result<PayloadRef> {
-        if bytes.len() as u64 > MAX_BLOB_BYTES {
-            return Err(oversized_blob_error(bytes.len() as u64));
-        }
         let reference = PayloadRef::of_bytes(bytes);
-        let path = self
-            .path_for(&reference.sha256_hex)
-            .expect("PayloadRef::of_bytes always creates a canonical digest");
-        self.reject_unsafe_parent(&path)?;
-        if self.existing_blob_path(&reference.sha256_hex).is_some() {
-            return Ok(reference);
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        self.reject_unsafe_parent(&path)?;
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("blob path is not a regular file: {}", path.display()),
-                )
-                .into());
-            }
-            return Ok(reference);
-        }
-        // Write to a temp sibling then rename, so a reader never sees a partial
-        // blob under its final content-addressed name.
-        let tmp = path.with_extension("tmp");
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &path)?;
-        Ok(reference)
+        let stage = self.stage(std::io::Cursor::new(bytes), &reference)?;
+        Ok(stage.commit()?.retain())
     }
 
     fn get(&self, reference: &PayloadRef) -> Result<Vec<u8>> {
@@ -301,11 +655,21 @@ impl BlobStore for FsBlobStore {
         let Some(path) = self.existing_blob_path(sha256_hex) else {
             return Ok(false);
         };
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e.into()),
+        let mut owned = match Self::open_blob_no_follow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        verify_open_file_digest(&mut owned, sha256_hex)?;
+        if !remove_if_same_file(&path, &owned) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical blob changed after purge identity verification",
+            )
+            .into());
         }
+        sync_parent(&path)?;
+        Ok(true)
     }
 }
 
@@ -322,6 +686,46 @@ mod tests {
     use super::{is_canonical_digest, BlobStore, FsBlobStore, MAX_BLOB_BYTES};
     use mde_collab_types::value::sha256_hex;
     use mde_collab_types::PayloadRef;
+    use std::io::{Cursor, Read};
+    use std::sync::{Arc, Barrier};
+
+    fn staging_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let Ok(shards) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for shard in shards.flatten() {
+            let Ok(entries) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            found.extend(entries.flatten().filter_map(|entry| {
+                let name = entry.file_name();
+                name.to_string_lossy()
+                    .ends_with(".tmp")
+                    .then(|| entry.path())
+            }));
+        }
+        found
+    }
+
+    struct FailingReader {
+        bytes: Cursor<Vec<u8>>,
+        successful_reads_left: usize,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.successful_reads_left == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected stream failure",
+                ));
+            }
+            self.successful_reads_left -= 1;
+            let limit = buffer.len().min(3);
+            self.bytes.read(&mut buffer[..limit])
+        }
+    }
 
     #[test]
     fn canonical_digest_validation_rejects_path_components() {
@@ -409,6 +813,212 @@ mod tests {
         let error = store.get(&reference).expect_err("oversized blob");
         assert!(
             matches!(error, crate::error::CollabError::Io(message) if message.contains("exceeding"))
+        );
+    }
+
+    #[test]
+    fn fs_put_uses_verified_staging_without_tmp_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = b"production put through owned staging";
+        let mut store = FsBlobStore::new(dir.path());
+
+        let reference = store.put(bytes).expect("put");
+
+        assert_eq!(store.get(&reference).expect("get"), bytes);
+        assert!(staging_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn fs_stage_rejects_hash_and_length_mismatch_without_tmp_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FsBlobStore::new(dir.path());
+        let expected = PayloadRef::of_bytes(b"expected");
+
+        assert!(matches!(
+            store.stage(Cursor::new(b"attacker"), &expected),
+            Err(crate::error::CollabError::BlobHashMismatch { .. })
+        ));
+        assert!(staging_files(dir.path()).is_empty());
+
+        assert!(matches!(
+            store.stage(Cursor::new(b"expected-extra"), &expected),
+            Err(crate::error::CollabError::BlobSizeMismatch { .. })
+        ));
+        assert!(staging_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn fs_stage_stream_failure_and_drop_clean_private_inode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FsBlobStore::new(dir.path());
+        let expected = PayloadRef::of_bytes(b"streamed bytes");
+        let reader = FailingReader {
+            bytes: Cursor::new(b"streamed bytes".to_vec()),
+            successful_reads_left: 1,
+        };
+
+        assert!(matches!(
+            store.stage(reader, &expected),
+            Err(crate::error::CollabError::Io(message)) if message.contains("injected")
+        ));
+        assert!(staging_files(dir.path()).is_empty());
+
+        let stage = store
+            .stage(Cursor::new(b"streamed bytes"), &expected)
+            .expect("stage");
+        assert_eq!(staging_files(dir.path()).len(), 1);
+        drop(stage);
+        assert!(staging_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn concurrent_commits_never_replace_and_only_installer_can_abort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FsBlobStore::new(dir.path());
+        let bytes = b"concurrent identical content";
+        let expected = PayloadRef::of_bytes(bytes);
+        let first = store
+            .stage(Cursor::new(bytes), &expected)
+            .expect("first stage");
+        let second = store
+            .stage(Cursor::new(bytes), &expected)
+            .expect("second stage");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = Arc::clone(&barrier);
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.commit().expect("first commit")
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.commit().expect("second commit")
+        });
+        barrier.wait();
+
+        let mut commits = vec![
+            first_thread.join().expect("first thread"),
+            second_thread.join().expect("second thread"),
+        ];
+        assert_eq!(
+            commits
+                .iter()
+                .filter(|commit| commit.owns_install())
+                .count(),
+            1
+        );
+        let non_owner_index = commits
+            .iter()
+            .position(|commit| !commit.owns_install())
+            .expect("non-owner");
+        let non_owner = commits.remove(non_owner_index);
+        non_owner.abort().expect("non-owner abort");
+        assert_eq!(store.get(&expected).expect("winner remains"), bytes);
+        let _ = commits.pop().expect("owner").retain();
+        assert!(staging_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn owned_commit_abort_removes_only_its_canonical_inode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FsBlobStore::new(dir.path());
+        let bytes = b"transaction candidate";
+        let expected = PayloadRef::of_bytes(bytes);
+        let commit = store
+            .stage(Cursor::new(bytes), &expected)
+            .expect("stage")
+            .commit()
+            .expect("commit");
+        assert!(commit.owns_install());
+
+        commit.abort().expect("abort");
+
+        assert!(!store.contains(&expected.sha256_hex));
+        assert!(staging_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn retained_blob_replay_cannot_leave_canonical_bytes_owner_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FsBlobStore::new(dir.path());
+        let bytes = b"immutable authenticated collaboration payload";
+        let expected = PayloadRef::of_bytes(bytes);
+        let _ = store
+            .stage(Cursor::new(bytes), &expected)
+            .expect("first stage")
+            .commit()
+            .expect("first commit")
+            .retain();
+        let replay = store
+            .stage(Cursor::new(bytes), &expected)
+            .expect("replay stage")
+            .commit()
+            .expect("idempotent replay");
+        assert!(!replay.owns_install());
+        let _ = replay.retain();
+
+        let canonical = store.path_for(&expected.sha256_hex).expect("path");
+        assert!(std::fs::metadata(&canonical)
+            .expect("canonical metadata")
+            .permissions()
+            .readonly());
+        let mutation = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&canonical);
+        assert!(matches!(
+            mutation,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.get(&expected).expect("immutable bytes"), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abort_does_not_remove_a_replacement_canonical_inode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FsBlobStore::new(dir.path());
+        let bytes = b"owned bytes";
+        let expected = PayloadRef::of_bytes(bytes);
+        let commit = store
+            .stage(Cursor::new(bytes), &expected)
+            .expect("stage")
+            .commit()
+            .expect("commit");
+        let canonical = store.path_for(&expected.sha256_hex).expect("path");
+        std::fs::remove_file(&canonical).expect("remove owned canonical");
+        std::fs::write(&canonical, b"another writer's inode").expect("replacement");
+
+        commit.abort().expect("guarded abort");
+
+        assert_eq!(
+            std::fs::read(&canonical).expect("replacement remains"),
+            b"another writer's inode"
+        );
+        assert!(staging_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn restarted_purge_cannot_unlink_a_concurrent_non_cas_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = b"durable CAS bytes";
+        let mut writer = FsBlobStore::new(dir.path());
+        let reference = writer.put(bytes).expect("initial put");
+        let canonical = writer.path_for(&reference.sha256_hex).expect("path");
+        drop(writer);
+
+        let mut restarted = FsBlobStore::new(dir.path());
+        std::fs::remove_file(&canonical).expect("retire original inode");
+        std::fs::write(&canonical, b"concurrent non-CAS replacement")
+            .expect("install hostile replacement");
+
+        assert!(matches!(
+            restarted.purge(&reference.sha256_hex),
+            Err(crate::error::CollabError::BlobHashMismatch { .. })
+        ));
+        assert_eq!(
+            std::fs::read(&canonical).expect("replacement survives"),
+            b"concurrent non-CAS replacement"
         );
     }
 }

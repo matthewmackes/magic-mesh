@@ -49,24 +49,50 @@ def no_duplicate_json(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def regular_asset(root: Path, relative: object, label: str) -> tuple[Path, int]:
+def regular_asset(root: Path, relative: object, label: str) -> tuple[bytes, int]:
     if not isinstance(relative, str) or not relative or "\\" in relative:
         fail(f"{label} path is malformed")
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts or any(part == "" for part in path.parts):
         fail(f"{label} path escapes the package root")
-    target = root / path
+    return read_regular_file(root / path, label, MAX_ASSET_BYTES)
+
+
+def read_regular_file(path: Path, label: str, maximum: int) -> tuple[bytes, int]:
+    """Read one immutable package inode without reopening its mutable path."""
     try:
-        metadata = target.lstat()
+        before = path.lstat()
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
     except OSError as exc:
         fail(f"{label} is unavailable: {exc}")
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        fail(f"{label} must be a regular non-symlink file")
-    if metadata.st_size <= 0 or metadata.st_size > MAX_ASSET_BYTES:
-        fail(f"{label} size is outside the bounded contract")
-    if metadata.st_mode & 0o022:
-        fail(f"{label} must not be writable by group or other")
-    return target, metadata.st_size
+
+    try:
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            fail(f"{label} changed identity while it was opened")
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(opened.st_mode):
+            fail(f"{label} must be a regular non-symlink file")
+        if opened.st_nlink != 1:
+            fail(f"{label} must have exactly one package link")
+        if opened.st_size <= 0 or opened.st_size > maximum:
+            fail(f"{label} size is outside the bounded contract")
+        if opened.st_mode & 0o022:
+            fail(f"{label} must not be writable by group or other")
+
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            contents = handle.read(maximum + 1)
+        after = os.fstat(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(opened, field) != getattr(after, field) for field in stable_fields):
+            fail(f"{label} changed while it was read")
+        if len(contents) != opened.st_size:
+            fail(f"{label} read did not match its admitted size")
+        return contents, opened.st_size
+    finally:
+        os.close(descriptor)
 
 
 def sha256(path: Path) -> str:
@@ -91,16 +117,9 @@ def digest(value: object, label: str) -> str:
 
 def verify_manifest(root: Path, manifest: Path) -> None:
     try:
-        metadata = manifest.lstat()
-    except OSError as exc:
-        fail(f"manifest is unavailable: {exc}")
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        fail("manifest must be a regular non-symlink file")
-    if metadata.st_size <= 0 or metadata.st_size > MAX_MANIFEST_BYTES:
-        fail("manifest size is outside the bounded contract")
-    try:
-        value = json.loads(manifest.read_text(encoding="utf-8"), object_pairs_hook=no_duplicate_json)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        manifest_bytes, _ = read_regular_file(manifest, "manifest", MAX_MANIFEST_BYTES)
+        value = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=no_duplicate_json)
+    except (UnicodeError, json.JSONDecodeError) as exc:
         fail(f"manifest is malformed: {exc}")
 
     document = exact_keys(value, {"kind", "schema_version", "assets"}, "manifest")
@@ -125,10 +144,10 @@ def verify_manifest(root: Path, manifest: Path) -> None:
         if not isinstance(row["bytes"], int) or isinstance(row["bytes"], bool) or row["bytes"] <= 0 or row["bytes"] > MAX_ASSET_BYTES:
             fail(f"assets[{index}].bytes is outside the bounded contract")
         expected = digest(row["sha256"], f"assets[{index}].sha256")
-        path, size = regular_asset(root, row["path"], f"assets[{index}]")
+        contents, size = regular_asset(root, row["path"], f"assets[{index}]")
         if size != row["bytes"]:
             fail(f"assets[{index}] byte count does not match the file")
-        if sha256(path) != expected:
+        if hashlib.sha256(contents).hexdigest() != expected:
             fail(f"assets[{index}] digest does not match the file")
 
     expected_identities = {(grade, mode) for grade in GRADES for mode in MODES}
@@ -183,6 +202,19 @@ def self_test() -> None:
             pass
         else:
             fail("self-test accepted an incomplete static fallback")
+
+        # A package admitted before restart must not let an external alias mutate
+        # the grade-F scene bytes while retaining the old governed manifest.
+        write_fixture(root, manifest)
+        f_static = root / "assets/f-static.bin"
+        alias = root / "f-static-restart-alias.bin"
+        os.link(f_static, alias)
+        try:
+            verify_manifest(root, manifest)
+        except ManifestError:
+            pass
+        else:
+            fail("self-test accepted a multiply-linked grade-F restart scene")
     print("Kiron asset manifest verification self-tests passed")
 
 

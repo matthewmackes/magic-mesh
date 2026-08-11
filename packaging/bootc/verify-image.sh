@@ -11,13 +11,78 @@
 # operator-gated — see README.md "Verification status".
 #
 # Usage: verify-image.sh [image:tag]     (default localhost/magic-mesh-bootc:latest)
+#        verify-image.sh --self-test     (hostile mutable-tag regression)
 # Exit:  0 all checks pass; 1 any check failed (each failure itemized).
 set -euo pipefail
+
+readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+
+self_test() {
+    local fixture output expected_id
+    fixture="$(mktemp -d)"
+    trap 'rm -rf -- "$fixture"' RETURN
+    expected_id="sha256:$(printf '7%.0s' {1..64})"
+
+    cat >"$fixture/podman" <<'FAKE_PODMAN'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+    "image inspect")
+        printf '%s\n' "$EXPECTED_IMAGE_ID"
+        ;;
+    "run --rm")
+        saw_id=0
+        for argument in "$@"; do
+            [ "$argument" = "$EXPECTED_IMAGE_ID" ] && saw_id=1
+            if [ "$argument" = "localhost/magic-mesh-bootc:hostile" ]; then
+                echo "mutable tag reached execution after replacement" >&2
+                exit 91
+            fi
+        done
+        [ "$saw_id" -eq 1 ] || {
+            echo "resolved image identity did not reach execution" >&2
+            exit 92
+        }
+        cat >/dev/null
+        printf '  OK   hostile fixture inspected immutable image identity\n'
+        ;;
+    *)
+        echo "unexpected podman invocation: $*" >&2
+        exit 93
+        ;;
+esac
+FAKE_PODMAN
+    chmod 0755 "$fixture/podman"
+
+    if ! output="$(
+        PATH="$fixture:$PATH" EXPECTED_IMAGE_ID="$expected_id" \
+            "$SCRIPT_PATH" localhost/magic-mesh-bootc:hostile 2>&1
+    )"; then
+        printf '%s\n' "$output" >&2
+        echo "[FAIL] mutable image tag crossed the production-verification boundary" >&2
+        return 1
+    fi
+    grep -Fq "ALL STATIC CHECKS PASS" <<<"$output" || {
+        printf '%s\n' "$output" >&2
+        echo "[FAIL] hostile fixture did not complete the verifier" >&2
+        return 1
+    }
+    echo "[PASS] hostile mutable image tag cannot replace the inspected bootc candidate"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    [ "$#" -eq 1 ] || { echo "FATAL: --self-test takes no arguments" >&2; exit 2; }
+    self_test
+    exit
+fi
 
 TAG="${1:-localhost/magic-mesh-bootc:latest}"
 
 command -v podman >/dev/null 2>&1 || { echo "FATAL: podman not on PATH" >&2; exit 1; }
-podman image exists "$TAG" || { echo "FATAL: image not in local storage: $TAG (build it first)" >&2; exit 1; }
+IMAGE_ID="$(podman image inspect --format '{{.Id}}' "$TAG")" \
+    || { echo "FATAL: image not in local storage: $TAG (build it first)" >&2; exit 1; }
+[[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { echo "FATAL: image has a malformed immutable identity: $TAG" >&2; exit 1; }
 
 # The in-image check script (quoted heredoc: nothing expands host-side).
 INNER_SCRIPT="$(cat <<'INNER'
@@ -141,7 +206,7 @@ INNER
 # -i is load-bearing: without it the container's stdin is closed, `bash -s`
 # reads EOF, runs ZERO checks and exits 0 — a false green (caught live).
 rc=0
-out="$(printf '%s\n' "$INNER_SCRIPT" | podman run --rm -i "$TAG" /bin/bash -s)" || rc=$?
+out="$(printf '%s\n' "$INNER_SCRIPT" | podman run --rm -i "$IMAGE_ID" /bin/bash -s)" || rc=$?
 printf '%s\n' "$out"
 
 # Silence is not success: a run that produced no itemized lines is a failure
@@ -150,7 +215,7 @@ grep -q '^  OK '   <<<"$out" || { echo "FATAL: no checks executed — stdin/exec
 grep -q '^  FAIL ' <<<"$out" && rc=1
 
 if [ "$rc" -eq 0 ]; then
-    echo "==> verify-image: ALL STATIC CHECKS PASS for $TAG (boot acceptance still gated)"
+    echo "==> verify-image: ALL STATIC CHECKS PASS for $TAG ($IMAGE_ID; boot acceptance still gated)"
 else
     echo "==> verify-image: FAILURES above for $TAG" >&2
 fi

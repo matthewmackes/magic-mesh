@@ -46,6 +46,7 @@ use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedT
 use serde_json::{json, Value};
 
 use super::{ShutdownToken, Worker};
+use crate::workers::proc::{output_with_timeout, status_with_timeout};
 use crate::ipc::action_auth::{
     production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
     MAX_AUTH_TTL_MS,
@@ -68,6 +69,11 @@ pub const CLEANUP_EXTRA_GRACE_SECONDS: u64 = 86_400;
 /// cleanup quorum (so a permanently-gone peer doesn't pin an intent
 /// file forever). Twelve hours.
 pub const PEER_UNREACHABLE_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// Hard deadline for either privileged package operation. The shared process
+/// runner also isolates each invocation in its own process group, so a wedged
+/// package hook cannot pin this worker or leave helper descendants behind.
+pub const UPGRADE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Base RPM upgraded on every peer (renamed `mde` → `mde-core` 2026-05-29).
 pub const BASE_PACKAGE: &str = "mde-core";
@@ -511,6 +517,7 @@ pub struct UpgradeIntentWatcher {
     leader_lock: PathBuf,
     dnf_binary: String,
     install_binary: String,
+    command_timeout: Duration,
     /// Verifier for the root-issued, exact-body intent capability.
     authorizer: ActionAuthorizer,
     /// Root signer used to issue the next exact-body capability after this
@@ -552,6 +559,7 @@ impl UpgradeIntentWatcher {
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             dnf_binary: "dnf".to_string(),
             install_binary: "mde-install".to_string(),
+            command_timeout: UPGRADE_COMMAND_TIMEOUT,
             authorizer: ActionAuthorizer::production(),
             signer,
             #[cfg(test)]
@@ -755,15 +763,15 @@ impl UpgradeIntentWatcher {
     /// already present so a headless peer doesn't pull the desktop.
     fn run_dnf_upgrade(&self) -> Result<String, String> {
         let mut pkgs = vec![BASE_PACKAGE];
-        if rpm_installed(DESKTOP_PACKAGE) {
+        if rpm_installed(DESKTOP_PACKAGE, self.command_timeout) {
             pkgs.push(DESKTOP_PACKAGE);
         }
         let mut cmd = Command::new(&self.dnf_binary);
         cmd.arg("upgrade").arg("-y").args(&pkgs);
-        match cmd.status() {
-            Ok(s) if s.success() => Ok(rpm_version(BASE_PACKAGE)),
+        match status_with_timeout(cmd, self.command_timeout) {
+            Ok(s) if s.success() => Ok(rpm_version(BASE_PACKAGE, self.command_timeout)),
             Ok(s) => Err(format!("dnf upgrade exit {}", s.code().unwrap_or(-1))),
-            Err(e) => Err(format!("dnf spawn failed: {e}")),
+            Err(e) => Err(format!("dnf upgrade failed: {e}")),
         }
     }
 
@@ -772,11 +780,12 @@ impl UpgradeIntentWatcher {
     /// wrote; absent → `full` (the most-capable safe default).
     fn run_mde_install(&self) -> Result<(), String> {
         let profile = installed_profile().unwrap_or_else(|| "full".to_string());
-        let status = Command::new(&self.install_binary)
+        let mut command = Command::new(&self.install_binary);
+        command
             .arg("--yes")
-            .arg(format!("--profile={profile}"))
-            .status()
-            .map_err(|e| format!("mde-install spawn failed: {e}"))?;
+            .arg(format!("--profile={profile}"));
+        let status = status_with_timeout(command, self.command_timeout)
+            .map_err(|e| format!("mde-install failed: {e}"))?;
         if status.success() {
             Ok(())
         } else {
@@ -901,18 +910,18 @@ where
     result
 }
 
-fn rpm_installed(pkg: &str) -> bool {
-    Command::new("rpm")
-        .args(["-q", pkg])
-        .output()
+fn rpm_installed(pkg: &str, timeout: Duration) -> bool {
+    let mut command = Command::new("rpm");
+    command.args(["-q", pkg]);
+    output_with_timeout(command, timeout)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn rpm_version(pkg: &str) -> String {
-    Command::new("rpm")
-        .args(["-q", "--queryformat", "%{VERSION}", pkg])
-        .output()
+fn rpm_version(pkg: &str, timeout: Duration) -> String {
+    let mut command = Command::new("rpm");
+    command.args(["-q", "--queryformat", "%{VERSION}", pkg]);
+    output_with_timeout(command, timeout)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -1187,6 +1196,36 @@ mod tests {
         assert!(
             !install_marker.exists(),
             "tampered quorum state must not reach mde-install"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hostile_installer_cannot_pin_the_upgrade_worker_past_its_process_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let home = tempdir().unwrap();
+        let installer = home.path().join("hostile-mde-install");
+        fs::write(&installer, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&installer, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut watcher =
+            UpgradeIntentWatcher::new(home.path().join("workgroup"), "node-test".to_string());
+        watcher.install_binary = installer.display().to_string();
+        watcher.command_timeout = Duration::from_millis(50);
+
+        let started = Instant::now();
+        let error = watcher
+            .run_mde_install()
+            .expect_err("a hostile installer must exceed the process budget");
+        assert!(
+            error.contains("timed out") || error.contains("timeout"),
+            "the bounded process seam must report its timeout: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the hostile installer pinned the worker past its process budget"
         );
     }
 

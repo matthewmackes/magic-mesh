@@ -314,16 +314,16 @@ impl<'a> Sheet<'a> {
         state: &mut SheetState,
         content: impl FnOnce(&mut Ui) -> R,
     ) -> Option<SheetResponse<R>> {
-        debug_assert!(
-            self.detents
-                .iter()
-                .all(|d| d.is_finite() && *d > 0.0 && *d <= 1.0),
-            "sheet detents are fractions in (0.0, 1.0]"
-        );
-        debug_assert!(
-            self.detents.windows(2).all(|w| w[0] < w[1]),
-            "sheet detents must be sorted ascending"
-        );
+        // Detents are caller-owned authority over modal geometry and the
+        // settle target. Validate in release builds: a NaN/Infinity or an
+        // equivocated ordering would otherwise poison the spring state and
+        // can leave the shared modal requesting repaints forever. Invalid
+        // authority has no safe presentation, so close without invoking the
+        // content closure.
+        if !valid_sheet_detents(self.detents) {
+            *state = SheetState::closed();
+            return None;
+        }
 
         let screen = ctx.screen_rect();
         let presentation = sheet_presentation(screen);
@@ -462,6 +462,15 @@ impl<'a> Sheet<'a> {
         }
         false
     }
+}
+
+/// Whether caller-provided detents form one unambiguous bounded motion ladder.
+fn valid_sheet_detents(detents: &[f32]) -> bool {
+    !detents.is_empty()
+        && detents
+            .iter()
+            .all(|detent| detent.is_finite() && *detent > 0.0 && *detent <= 1.0)
+        && detents.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// The sheet body frame: base surface fill, hairline border, the deepest
@@ -702,6 +711,7 @@ fn paint_arrow(painter: &egui::Painter, body: Rect, side: PopoverSide, anchor: R
 mod tests {
     use super::*;
     use crate::motion::MotionMode;
+    use std::cell::Cell;
 
     const DT: f64 = 1.0 / 60.0;
     /// A screen narrow enough for the bottom-sheet presentation (< 2×540).
@@ -709,6 +719,32 @@ mod tests {
     /// A screen wide enough for the form-sheet presentation (≥ 2×540).
     const WIDE_SCREEN: Vec2 = Vec2::new(1280.0, 720.0);
     const DETENTS: [f32; 2] = [0.35, 0.9];
+
+    #[test]
+    fn hostile_detent_authority_cannot_poison_shared_modal_geometry_or_motion() {
+        let ctx = egui::Context::default();
+        let content_called = Cell::new(false);
+
+        for detents in [
+            &[0.35, f32::NAN, 0.9][..],
+            &[0.35, f32::INFINITY][..],
+            &[0.9, 0.35][..],
+            &[0.35, 0.35][..],
+            &[][..],
+        ] {
+            let mut state = SheetState::closed();
+            state.open_at(0.9);
+            let response = Sheet::new("hostile-detents", detents).show(
+                &ctx,
+                &mut state,
+                |_| content_called.set(true),
+            );
+
+            assert!(response.is_none(), "invalid detents must fail closed");
+            assert_eq!(state, SheetState::closed());
+            assert!(!content_called.get(), "untrusted modal content must not run");
+        }
+    }
 
     fn run_frame(
         ctx: &egui::Context,

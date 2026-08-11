@@ -173,12 +173,27 @@ fn canonical_peer_state_path(path: &Path, peer: &str) -> bool {
 }
 
 fn read_bounded_bytes(path: &Path) -> Option<Vec<u8>> {
-    let length = std::fs::metadata(path).ok()?.len();
-    if length > MAX_STATE_RECORD_BYTES {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
         return None;
     }
-    let mut bytes = Vec::with_capacity(length as usize);
-    let mut file = std::fs::File::open(path).ok()?;
+
+    let mut file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_STATE_RECORD_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.by_ref()
         .take(MAX_STATE_RECORD_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -188,6 +203,34 @@ fn read_bounded_bytes(path: &Path) -> Option<Vec<u8>> {
 
 fn decode_bounded<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
     serde_json::from_slice(bytes).ok()
+}
+
+fn decode_state_record(bytes: &[u8]) -> Option<MusicState> {
+    decode_bounded::<StateFileV1>(bytes)
+        .filter(|file| file.schema_version == STATE_SCHEMA_VERSION)
+        .map(|file| file.state)
+        .filter(valid_state_record)
+        .or_else(|| decode_bounded::<MusicState>(bytes).filter(valid_state_record))
+}
+
+fn admit_state_revision(path: &Path, candidate: &MusicState) -> std::io::Result<()> {
+    let Some(current) = read_bounded_bytes(path).and_then(|bytes| decode_state_record(&bytes))
+    else {
+        return Ok(());
+    };
+
+    if candidate.updated_ms < current.updated_ms
+        || (candidate.updated_ms == current.updated_ms && candidate != &current)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "music state revision {} conflicts with durable revision {}",
+                candidate.updated_ms, current.updated_ms
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ───────────────────────── pure decisions ─────────────────────────
@@ -369,11 +412,7 @@ pub fn completions_dir(dir: &Path) -> PathBuf {
 #[must_use]
 pub fn read_state(dir: &Path) -> Option<MusicState> {
     let bytes = read_bounded_bytes(&state_path(dir))?;
-    decode_bounded::<StateFileV1>(&bytes)
-        .filter(|file| file.schema_version == STATE_SCHEMA_VERSION)
-        .map(|file| file.state)
-        .filter(valid_state_record)
-        .or_else(|| decode_bounded::<MusicState>(&bytes).filter(valid_state_record))
+    decode_state_record(&bytes)
 }
 
 /// Replace one coordination record without exposing a partially written JSON
@@ -444,7 +483,9 @@ fn encode_state_record(state: &MusicState) -> std::io::Result<String> {
 pub fn write_peer_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
     let json = encode_state_record(state)?;
     std::fs::create_dir_all(dir)?;
-    write_record_atomically(&by_peer_path(dir, &state.peer), json.as_bytes())
+    let path = by_peer_path(dir, &state.peer);
+    admit_state_revision(&path, state)?;
+    write_record_atomically(&path, json.as_bytes())
 }
 
 /// Write `music-state.json` (+ this peer's by-peer snapshot).
@@ -455,6 +496,11 @@ pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
     let json = encode_state_record(state)?;
     std::fs::create_dir_all(dir)?;
     let bp = by_peer_path(dir, &state.peer);
+    // A daemon recovering stale in-memory state must not roll either durable
+    // projection backward. Check both records before committing authority so a
+    // rejected roster replay cannot leave a half-admitted ownership update.
+    admit_state_revision(&state_path(dir), state)?;
+    admit_state_revision(&bp, state)?;
     // These two records are independently atomic, not a filesystem transaction.
     // Commit authority first: if the derived snapshot then fails, remote roster
     // readers remain safely stale instead of observing state this owner never
@@ -894,6 +940,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_revision_replay_after_restart_preserves_newer_durable_state() {
+        let dir = tempdir().unwrap();
+        let current = MusicState {
+            peer: "anvil".into(),
+            playing: false,
+            song_id: "song-after-restart".into(),
+            position_ms: 82_000,
+            updated_ms: 200,
+        };
+        write_state(dir.path(), &current).unwrap();
+
+        let stale_replay = MusicState {
+            peer: "anvil".into(),
+            playing: true,
+            song_id: "song-before-crash".into(),
+            position_ms: 41_000,
+            updated_ms: 100,
+        };
+        let error = write_state(dir.path(), &stale_replay)
+            .expect_err("recovered stale memory must not replace durable state");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+        assert_eq!(read_state(dir.path()), Some(current.clone()));
+        assert_eq!(read_all_peer_states(dir.path()), vec![current.clone()]);
+
+        let mut conflicting_same_revision = current.clone();
+        conflicting_same_revision.playing = true;
+        let error = write_state(dir.path(), &conflicting_same_revision)
+            .expect_err("one revision must identify exactly one durable state");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(read_state(dir.path()), Some(current.clone()));
+        assert_eq!(read_all_peer_states(dir.path()), vec![current]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_cannot_restore_substituted_playback_authority_after_restart() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let substituted = tempdir().unwrap();
+        let forged = MusicState {
+            peer: "retired-owner".into(),
+            playing: true,
+            song_id: "stale-song".into(),
+            position_ms: 91_000,
+            updated_ms: u64::MAX,
+        };
+        let body = encode_state_record(&forged).unwrap();
+        let outside = substituted.path().join("forged-state.json");
+        std::fs::write(&outside, body).unwrap();
+        symlink(&outside, state_path(dir.path())).unwrap();
+
+        assert_eq!(read_state(dir.path()), None);
+    }
+
+    #[test]
     fn idle_peer_heartbeat_does_not_replace_playback_authority() {
         let dir = tempdir().unwrap();
         let authority = state("anvil", true, 1234);
@@ -949,12 +1052,10 @@ mod tests {
         .expect_err("failed replacement must be reported");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert_eq!(read_completions(dir.path()), vec![last_good]);
-        assert!(
-            std::fs::read_dir(completions_dir(dir.path()))
-                .unwrap()
-                .flatten()
-                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "tmp"))
-        );
+        assert!(std::fs::read_dir(completions_dir(dir.path()))
+            .unwrap()
+            .flatten()
+            .all(|entry| entry.path().extension().is_none_or(|ext| ext != "tmp")));
     }
 
     #[test]
@@ -1051,11 +1152,9 @@ mod tests {
         assert_eq!(retained.len(), MAX_PEER_STATE_SNAPSHOTS);
         assert!(!retained.iter().any(|item| item.peer == "peer-000"));
         assert!(retained.iter().any(|item| item.peer == "peer-064"));
-        assert!(
-            retained
-                .windows(2)
-                .all(|items| items[0].peer <= items[1].peer)
-        );
+        assert!(retained
+            .windows(2)
+            .all(|items| items[0].peer <= items[1].peer));
     }
 
     #[test]

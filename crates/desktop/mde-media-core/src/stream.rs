@@ -87,21 +87,21 @@ impl UrlKind {
 ///
 /// Pure + dependency-free — no network, no mpv. The rules, per scheme:
 ///
-/// - empty / whitespace → [`UrlKind::Invalid`].
+/// - empty / whitespace or embedded control characters → [`UrlKind::Invalid`].
 /// - no URL scheme (a bare path like `/media/clip.mkv` or `./rel.mp4`) →
 ///   [`UrlKind::LocalFile`].
 /// - `file:` or a single-letter drive scheme (`C:\…`) → [`UrlKind::LocalFile`].
-/// - an explicit streaming scheme ([`DIRECT_STREAM_SCHEMES`]) →
-///   [`UrlKind::DirectStream`].
+/// - an explicit streaming scheme ([`DIRECT_STREAM_SCHEMES`]) with an
+///   unambiguous, credential-free network authority → [`UrlKind::DirectStream`].
 /// - `http`/`https` → [`UrlKind::DirectStream`] when the path ends in a known media
 ///   extension ([`MEDIA_EXTENSIONS`]), else [`UrlKind::WebPage`] (resolve via
-///   `yt-dlp`).
+///   `yt-dlp`); malformed and credential-bearing authorities are refused.
 /// - any other scheme (`ftp:`, `mailto:`, …) → [`UrlKind::Invalid`] (we do not
 ///   pretend to play it — §7).
 #[must_use]
 pub fn classify_url(input: &str) -> UrlKind {
     let trimmed = input.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
         return UrlKind::Invalid;
     }
     // No recognizable scheme → treat it as a filesystem path.
@@ -109,19 +109,57 @@ pub fn classify_url(input: &str) -> UrlKind {
         return UrlKind::LocalFile;
     };
     let scheme = scheme.to_ascii_lowercase();
-    if scheme == "file" || scheme.len() == 1 {
+    if scheme == "file"
+        || (scheme.len() == 1
+            && trimmed
+                .as_bytes()
+                .get(2)
+                .is_some_and(|separator| matches!(separator, b'/' | b'\\')))
+    {
         // `file://…`, or a single-letter Windows drive (`C:\Users\…`).
         UrlKind::LocalFile
     } else if DIRECT_STREAM_SCHEMES.iter().any(|&s| s == scheme) {
-        UrlKind::DirectStream
+        if has_safe_network_authority(trimmed, &scheme) {
+            UrlKind::DirectStream
+        } else {
+            UrlKind::Invalid
+        }
     } else if scheme == "http" || scheme == "https" {
-        if is_media_url(trimmed) {
+        if !has_safe_network_authority(trimmed, &scheme) {
+            UrlKind::Invalid
+        } else if is_media_url(trimmed) {
             UrlKind::DirectStream
         } else {
             UrlKind::WebPage
         }
     } else {
         UrlKind::Invalid
+    }
+}
+
+/// Require one unambiguous network authority before handing a target to another
+/// URL parser. Credential-bearing authorities are refused so a display-looking
+/// host cannot differ from the host mpv, ffmpeg, or `yt-dlp` actually contacts.
+fn has_safe_network_authority(url: &str, scheme: &str) -> bool {
+    let Some((_, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+
+    if authority.is_empty()
+        || authority.contains('\\')
+        || authority.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+
+    // ffmpeg's UDP listen syntax intentionally starts its authority with `@`.
+    // No other admitted transport needs user-info, and a second `@` is never
+    // part of that UDP marker.
+    if scheme == "udp" && authority.starts_with('@') {
+        !authority[1..].is_empty() && !authority[1..].contains('@')
+    } else {
+        !authority.contains('@')
     }
 }
 
@@ -241,6 +279,24 @@ mod tests {
         ] {
             assert_eq!(classify_url(url), UrlKind::Invalid, "{url:?}");
         }
+    }
+
+    #[test]
+    fn ambiguous_network_authority_cannot_substitute_the_playback_source() {
+        for url in [
+            "https://trusted.mesh@attacker.example/clip.mp4",
+            "rtsp://camera.mesh@attacker.example/live",
+            "https:///clip.mp4",
+            "https:trusted.mesh/clip.mp4",
+            "https://trusted.mesh\\@attacker.example/clip.mp4",
+            "hls://edge.mesh/line\nfeed",
+            "x:https://attacker.example/clip.mp4",
+        ] {
+            assert_eq!(classify_url(url), UrlKind::Invalid, "{url:?}");
+        }
+
+        assert_eq!(classify_url("udp://@239.0.0.1:1234"), UrlKind::DirectStream);
+        assert_eq!(classify_url(r"C:\media\clip.mp4"), UrlKind::LocalFile);
     }
 
     #[test]

@@ -97,6 +97,7 @@ POLICY_LINTS=(
   lint-brand-identity.sh
   lint-shared-substrate.sh
   lint-doc-supersession.sh
+  verify-mackesd-process-boundary.py
   verify-release-gate-matrix.py
   lint-workload-authority.sh
   lint-worklist.sh
@@ -108,6 +109,7 @@ POLICY_SELF_TESTS=(
   lint-layered-tiers.sh
   lint-brand-identity.sh
   lint-doc-supersession.sh
+  verify-mackesd-process-boundary.py
   verify-release-gate-matrix.py
   lint-workload-authority.sh
   lint-worklist.sh
@@ -124,6 +126,20 @@ ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 say() { echo "==> ci-gate: $*"; }
 json_escape() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 file_sha256() { sha256sum -- "$1" | awk '{print $1}'; }
+
+# A green gate names one immutable Git revision.  xcp-build's normal cargo path
+# intentionally syncs working-tree bytes, so accepting a dirty checkout here
+# would let uncommitted or untracked source pass while the status artifact names
+# only HEAD.  Check this at every farm-command boundary as well as at run start.
+source_tree_matches_revision() {
+  local repo="$1" revision="$2" actual dirty
+  [[ "$revision" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || return 1
+  actual="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  [ "$actual" = "$revision" ] || return 1
+  dirty="$(git -C "$repo" status --porcelain=v1 --untracked-files=all \
+    --ignore-submodules=none 2>/dev/null)" || return 1
+  [ -z "$dirty" ]
+}
 
 # A timer-driven gate has no GitHub run number or queue record. Keep that case
 # traceable by deriving a stable identity from the gated revision and farm slot;
@@ -195,10 +211,19 @@ publish_toast() {
 # run_cargo <stage-label> <cargo-args...> — sync + run one cargo invocation on the
 # farm via xcp-build.sh, tee to the run log, return the REMOTE cargo exit code.
 run_cargo() {
-  local label="$1"; shift
+  local label="$1" rc; shift
+  source_tree_matches_revision "$REPO" "$SHA" || {
+    echo "ci-gate: source tree no longer matches authoritative revision $SHA" >&2
+    return 1
+  }
   { echo; echo "─────────── stage: $label ───────────  ($(ts))  cargo $*"; } | tee -a "$LOG"
   "$XCP" cargo "$@" 2>&1 | tee -a "$LOG"
-  return "${PIPESTATUS[0]}"
+  rc="${PIPESTATUS[0]}"
+  source_tree_matches_revision "$REPO" "$SHA" || {
+    echo "ci-gate: source tree changed while $label ran" >&2
+    return 1
+  }
+  return "$rc"
 }
 
 # run_policy_check <label> <lint> [args...] — run one local repository policy
@@ -206,7 +231,11 @@ run_cargo() {
 run_policy_check() {
   local label="$1" lint="$2"; shift 2
   { echo; echo "─────────── stage: $label ───────────  ($(ts))  $lint $*"; } | tee -a "$LOG"
-  "$POLICY_ROOT/$lint" "$@" 2>&1 | tee -a "$LOG"
+  if [ "$lint" = "verify-mackesd-process-boundary.py" ]; then
+    python3 "$POLICY_ROOT/$lint" "$@" 2>&1 | tee -a "$LOG"
+  else
+    "$POLICY_ROOT/$lint" "$@" 2>&1 | tee -a "$LOG"
+  fi
   return "${PIPESTATUS[0]}"
 }
 
@@ -261,9 +290,19 @@ run_test_stage() {
 # tool/component and executes install-helpers/coverage-command.sh. Keeping the
 # command there makes this gate's denominator identical to hosted CI's.
 run_coverage_stage() {
+  local rc
+  source_tree_matches_revision "$REPO" "$SHA" || {
+    echo "ci-gate: source tree no longer matches authoritative revision $SHA" >&2
+    return 1
+  }
   { echo; echo "─────────── stage: coverage ───────────  ($(ts))  canonical llvm-cov floor"; } | tee -a "$LOG"
   "$XCP" coverage 2>&1 | tee -a "$LOG"
-  return "${PIPESTATUS[0]}"
+  rc="${PIPESTATUS[0]}"
+  source_tree_matches_revision "$REPO" "$SHA" || {
+    echo "ci-gate: source tree changed while coverage ran" >&2
+    return 1
+  }
+  return "$rc"
 }
 
 # finish — record the structured result to state and publish it to the Bus.
@@ -327,8 +366,12 @@ JSON
 # cmd_run — gate the current checkout. Fail-fast across stages so a policy or
 # formatting failure does not burn an hour of farm test time.
 cmd_run() {
-  SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
-  SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+  SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || true)"
+  source_tree_matches_revision "$REPO" "$SHA" || {
+    echo "ci-gate: refusing authoritative gate for a dirty, untracked, or unresolved source tree" >&2
+    return 1
+  }
   JOB_ID="$(derive_job_id)"
   STARTED="$(ts)"
   : > "$LOG"
@@ -359,6 +402,11 @@ cmd_run() {
     STAGE_POLICY="fail"; FAILED_STAGE="policy"
   fi
 
+  if ! source_tree_matches_revision "$REPO" "$SHA"; then
+    echo "ci-gate: source tree changed during the gate; refusing a green result" | tee -a "$LOG" >&2
+    FAILED_STAGE="source"
+  fi
+
   finish
   [ "$OVERALL" = green ]   # rc reflects the gate result for CLI/manual use
 }
@@ -379,6 +427,7 @@ cmd_bind_release() {
   local input status input_size canonical revision job_id build_host build_slot
   local recorded_revision recorded_job recorded_host recorded_slot status_dir log
   local binding binding_line binding_count status_before log_before staging proposed_digest
+  local input_fd input_fd_path input_identity path_identity input_digest
   local rc=0
   [ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
     echo "ci-gate: bind-release requires INPUT and accepts one optional STATUS path" >&2
@@ -390,14 +439,36 @@ cmd_bind_release() {
     echo "ci-gate: release binding input is not a regular, non-symlink file: $input" >&2
     return 1
   }
-  input_size="$(stat -c '%s' -- "$input" 2>/dev/null || true)"
+  # Every structural and canonical read must consume one opened inode.  Reading
+  # the caller pathname once for validation and again for canonicalization lets
+  # a replacement swap in a different, still-valid artifact set at the exact
+  # seam that becomes authenticated by the gate log.
+  exec {input_fd}<"$input" || {
+    echo "ci-gate: could not open release binding input: $input" >&2
+    return 1
+  }
+  input_fd_path="/proc/$BASHPID/fd/$input_fd"
+  input_identity="$(stat -Lc '%d:%i' -- "$input_fd_path" 2>/dev/null || true)"
+  path_identity="$(stat -Lc '%d:%i' -- "$input" 2>/dev/null || true)"
+  if [ -z "$input_identity" ] || [ "$input_identity" != "$path_identity" ]; then
+    echo "ci-gate: release binding pathname changed while it was opened: $input" >&2
+    exec {input_fd}<&-
+    return 1
+  fi
+  input_size="$(stat -Lc '%s' -- "$input_fd_path" 2>/dev/null || true)"
   [[ "$input_size" =~ ^[0-9]+$ ]] && [ "$input_size" -gt 0 ] \
     && [ "$input_size" -le "$MAX_RELEASE_BINDING_BYTES" ] || {
       echo "ci-gate: release binding input must be 1..$MAX_RELEASE_BINDING_BYTES bytes: $input" >&2
+      exec {input_fd}<&-
       return 1
     }
   command -v jq >/dev/null 2>&1 || {
     echo "ci-gate: bind-release requires jq" >&2
+    exec {input_fd}<&-
+    return 1
+  }
+  input_digest="$(file_sha256 "$input_fd_path")" || {
+    exec {input_fd}<&-
     return 1
   }
   jq -e '
@@ -423,11 +494,24 @@ cmd_bind_release() {
       (.job_id | identity) and
       (.build_host | identity) and
       (.build_slot | identity))
-  ' "$input" >/dev/null 2>&1 || {
+  ' "$input_fd_path" >/dev/null 2>&1 || {
     echo "ci-gate: malformed, incomplete, unsorted, or duplicate release binding input: $input" >&2
+    exec {input_fd}<&-
     return 1
   }
-  canonical="$(jq -cS . "$input")" || return 1
+  canonical="$(jq -cS . "$input_fd_path")" || {
+    exec {input_fd}<&-
+    return 1
+  }
+  path_identity="$(stat -Lc '%d:%i' -- "$input" 2>/dev/null || true)"
+  if [ "$path_identity" != "$input_identity" ] \
+    || [ "$(file_sha256 "$input_fd_path" 2>/dev/null || true)" != "$input_digest" ] \
+    || [ "$(file_sha256 "$input" 2>/dev/null || true)" != "$input_digest" ]; then
+    echo "ci-gate: release binding input changed while it was canonicalized: $input" >&2
+    exec {input_fd}<&-
+    return 1
+  fi
+  exec {input_fd}<&-
   revision="$(jq -r '.source_commit' <<<"$canonical")"
   job_id="$(jq -r '.farm.job_id' <<<"$canonical")"
   build_host="$(jq -r '.farm.build_host' <<<"$canonical")"
@@ -479,7 +563,9 @@ cmd_bind_release() {
   fi
   if [ "$rc" -eq 0 ]; then
     [ "$(file_sha256 "$status")" = "$status_before" ] \
-      && [ "$(file_sha256 "$log")" = "$log_before" ] || {
+      && [ "$(file_sha256 "$log")" = "$log_before" ] \
+      && [ "$(stat -Lc '%d:%i' -- "$input" 2>/dev/null || true)" = "$input_identity" ] \
+      && [ "$(file_sha256 "$input" 2>/dev/null || true)" = "$input_digest" ] || {
         echo "ci-gate: gate evidence changed while release binding was prepared" >&2
         rc=1
       }
@@ -514,11 +600,12 @@ cmd_bind_release() {
 # stricter than liveness, which reports stale or red results without rejecting
 # them; callers using this command are asking whether the result is usable as a
 # required-check input.
-verify_status() {
+verify_status() (
   local file expected_revision="" expected_job_id="" expected_build_host="" expected_build_slot=""
   local log expected actual sha_prefix sha file_dir log_name test_summary
   local log_passed log_failed stage recorded_short_sha recorded_job_id recorded_host recorded_slot
   local identity_line identity_count test_summary_count binding_count binding_valid_count
+  local log_fd log_fd_path log_identity current_log_fd current_log_fd_path current_log_identity
   [ "$#" -ge 1 ] || {
     echo "ci-gate: verify requires a status artifact path" >&2
     return 1
@@ -607,7 +694,19 @@ verify_status() {
     echo "ci-gate: referenced gate log is not a regular, non-symlink file: $log" >&2
     return 1
   }
-  actual="$(file_sha256 "$log")" || return 1
+  # Hash and interpret one opened evidence inode.  Reopening the pathname after
+  # its digest was authenticated would let a same-content replacement become
+  # the promotion-facing artifact without ever being the artifact we verified.
+  exec {log_fd}<"$log" || return 1
+  log_fd_path="/proc/$BASHPID/fd/$log_fd"
+  log_identity="$(stat -Lc '%d:%i' -- "$log_fd_path" 2>/dev/null || true)"
+  current_log_identity="$(stat -Lc '%d:%i' -- "$log" 2>/dev/null || true)"
+  [ -n "$log_identity" ] && [ ! -L "$log" ] \
+    && [ "$current_log_identity" = "$log_identity" ] || {
+    echo "ci-gate: referenced gate log pathname changed while it was opened: $log" >&2
+    return 1
+  }
+  actual="$(file_sha256 "$log_fd_path")" || return 1
   [ "$actual" = "$expected" ] || {
     echo "ci-gate: referenced gate log digest does not match status artifact: $log" >&2
     return 1
@@ -629,37 +728,37 @@ verify_status() {
     return 1
   fi
   identity_line="  sha=$recorded_short_sha  revision=$sha  job_id=$recorded_job_id  host=$recorded_host (slot=$recorded_slot)"
-  identity_count="$(grep -Fxc -- "$identity_line" "$log" || true)"
+  identity_count="$(grep -Fxc -- "$identity_line" "$log_fd_path" || true)"
   [ "$identity_count" -eq 1 ] || {
     echo "ci-gate: gate log must contain exactly one identity line bound to the recorded revision, job, host, and slot" >&2
     return 1
   }
-  binding_count="$(grep -Ec '^  release-evidence-binding([[:space:]]|$)' "$log" || true)"
-  binding_valid_count="$(grep -Ec '^  release-evidence-binding sha256=[0-9a-f]{64}$' "$log" || true)"
+  binding_count="$(grep -Ec '^  release-evidence-binding([[:space:]]|$)' "$log_fd_path" || true)"
+  binding_valid_count="$(grep -Ec '^  release-evidence-binding sha256=[0-9a-f]{64}$' "$log_fd_path" || true)"
   [ "$binding_count" -eq "$binding_valid_count" ] && [ "$binding_valid_count" -le 1 ] || {
     echo "ci-gate: gate log contains malformed or duplicate release binding input" >&2
     return 1
   }
-  [ "$(grep -Ec '^=== CI GATE SUMMARY .+ → green ===$' "$log" || true)" -eq 1 ] || {
+  [ "$(grep -Ec '^=== CI GATE SUMMARY .+ → green ===$' "$log_fd_path" || true)" -eq 1 ] || {
     echo "ci-gate: gate log has no completed green summary" >&2
     return 1
   }
-  if grep -Eq '^=== CI GATE SUMMARY .+ → RED ===$|^  (policy|fmt|clippy|test|coverage)[[:space:]]+fail([[:space:]]|$)' "$log"; then
+  if grep -Eq '^=== CI GATE SUMMARY .+ → RED ===$|^  (policy|fmt|clippy|test|coverage)[[:space:]]+fail([[:space:]]|$)' "$log_fd_path"; then
     echo "ci-gate: gate log contains a contradictory failed result" >&2
     return 1
   fi
   for stage in policy fmt clippy coverage; do
-    [ "$(grep -Ec "^  ${stage}[[:space:]]+pass$" "$log" || true)" -eq 1 ] || {
+    [ "$(grep -Ec "^  ${stage}[[:space:]]+pass$" "$log_fd_path" || true)" -eq 1 ] || {
       echo "ci-gate: gate log is missing the completed pass record for $stage" >&2
       return 1
     }
   done
-  test_summary_count="$(grep -Ec '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log" || true)"
+  test_summary_count="$(grep -Ec '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log_fd_path" || true)"
   [ "$test_summary_count" -eq 1 ] || {
     echo "ci-gate: gate log must contain exactly one completed test pass record" >&2
     return 1
   }
-  test_summary="$(grep -E '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log")"
+  test_summary="$(grep -E '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log_fd_path")"
   if [[ "$test_summary" =~ ^[[:space:]]+test[[:space:]]+pass[[:space:]]+\(([0-9]+)[[:space:]]+passed,[[:space:]]+([0-9]+)[[:space:]]+failed\)$ ]]; then
     log_passed="${BASH_REMATCH[1]}"
     log_failed="${BASH_REMATCH[2]}"
@@ -675,8 +774,26 @@ verify_status() {
     echo "ci-gate: gate log failure count does not match status artifact" >&2
     return 1
   }
+  # The caller-visible sibling must still name the exact inode just checked,
+  # and that inode must remain byte-identical through the semantic pass.
+  [ "$(file_sha256 "$log_fd_path" 2>/dev/null || true)" = "$expected" ] || {
+    echo "ci-gate: referenced gate log changed during verification: $log" >&2
+    return 1
+  }
+  [ ! -L "$log" ] || {
+    echo "ci-gate: referenced gate log became a symlink during verification: $log" >&2
+    return 1
+  }
+  exec {current_log_fd}<"$log" || return 1
+  current_log_fd_path="/proc/$BASHPID/fd/$current_log_fd"
+  current_log_identity="$(stat -Lc '%d:%i' -- "$current_log_fd_path" 2>/dev/null || true)"
+  [ ! -L "$log" ] && [ "$current_log_identity" = "$log_identity" ] \
+    && [ "$(file_sha256 "$current_log_fd_path" 2>/dev/null || true)" = "$expected" ] || {
+      echo "ci-gate: referenced gate log pathname changed during verification: $log" >&2
+      return 1
+    }
   echo "ci-gate: verified green status for $(jq -r '.sha' "$file") on $(jq -r '.build_host' "$file")/$(jq -r '.build_slot' "$file")"
-}
+)
 
 # cmd_self_test — prove the policy-stage aggregator returns failure when any
 # constituent check fails and success only when all checks pass. Coreutils
@@ -687,11 +804,78 @@ cmd_self_test() {
   local missing_input malformed_input symlink_input oversized_input duplicate_input
   local unsorted_input incomplete_input malformed_descriptor_input hostile
   local mismatch_revision mismatch_job mismatch_host mismatch_slot
+  local boundary_fixture boundary_policy_root boundary_verifier
+  local replacement_input replacement_original replacement_bin replacement_marker real_jq
+  local mutation_input mutation_bin mutation_marker
+  local verify_replacement_bin verify_replacement_source verify_replacement_marker real_sha256
+  local dirty_repo dirty_revision
   local -a hostile_inputs=()
   work="$(mktemp -d "${TMPDIR:-/tmp}/ci-gate-self-test.XXXXXX")"
   trap 'rm -rf -- "$work"' RETURN
   LOG="$work/policy.log"
   : > "$LOG"
+
+  # A farm sync consumes working-tree bytes, so one uncommitted source change
+  # must prevent those bytes from being reported as authoritative for HEAD.
+  dirty_repo="$work/dirty-source"
+  git init -q "$dirty_repo"
+  git -C "$dirty_repo" config user.name ci-gate-self-test
+  git -C "$dirty_repo" config user.email ci-gate-self-test@example.invalid
+  printf 'committed source\n' >"$dirty_repo/source.txt"
+  git -C "$dirty_repo" add source.txt
+  git -C "$dirty_repo" commit -q -m baseline
+  dirty_revision="$(git -C "$dirty_repo" rev-parse HEAD)"
+  printf 'uncommitted substitution\n' >>"$dirty_repo/source.txt"
+  if source_tree_matches_revision "$dirty_repo" "$dirty_revision"; then
+    echo "ci-gate.sh: SELF-TEST FAILED — dirty source was accepted as its committed revision" >&2
+    return 1
+  fi
+
+  # Exercise the production process-boundary verifier through this gate's own
+  # policy-stage aggregator.  The clean package fixture must pass; adding one
+  # peer BindsTo= edge must make the acceptance stage fail closed.
+  boundary_fixture="$work/process-boundary-fixture"
+  mkdir -p -- "$boundary_fixture/packaging"
+  cp -a -- "$REPO/packaging/systemd" "$boundary_fixture/packaging/systemd"
+  cp -a -- "$REPO/packaging/bootc" "$boundary_fixture/packaging/bootc"
+  boundary_verifier="$HERE/verify-mackesd-process-boundary.py"
+  boundary_policy_root="$work/process-boundary-policy"
+  mkdir -p -- "$boundary_policy_root"
+  cat >"$boundary_policy_root/verify-mackesd-process-boundary.py" <<'EOF'
+import os
+import subprocess
+import sys
+
+raise SystemExit(subprocess.call([
+    sys.executable,
+    os.environ["MCNF_SELF_TEST_BOUNDARY_VERIFIER"],
+    "--repo-root",
+    os.environ["MCNF_SELF_TEST_BOUNDARY_ROOT"],
+]))
+EOF
+  POLICY_ROOT="$boundary_policy_root"
+  POLICY_SELF_TESTS=()
+  POLICY_LINTS=(verify-mackesd-process-boundary.py)
+  MCNF_SELF_TEST_BOUNDARY_VERIFIER="$boundary_verifier" \
+    MCNF_SELF_TEST_BOUNDARY_ROOT="$boundary_fixture" \
+    run_policy_stage >/dev/null 2>&1 || {
+      echo "ci-gate.sh: SELF-TEST FAILED — valid process-boundary fixture was rejected" >&2
+      return 1
+    }
+  sed -i '/^PartOf=mackesd.target$/a BindsTo=mackesd-compute.service' \
+    "$boundary_fixture/packaging/systemd/mackesd-actions.service"
+  grep -Fqx 'BindsTo=mackesd-compute.service' \
+    "$boundary_fixture/packaging/systemd/mackesd-actions.service" || {
+      echo "ci-gate.sh: SELF-TEST FAILED — process-boundary violation was not planted" >&2
+      return 1
+    }
+  MCNF_SELF_TEST_BOUNDARY_VERIFIER="$boundary_verifier" \
+    MCNF_SELF_TEST_BOUNDARY_ROOT="$boundary_fixture" \
+    run_policy_stage >/dev/null 2>&1 && {
+      echo "ci-gate.sh: SELF-TEST FAILED — process-boundary violation was accepted" >&2
+      return 1
+    }
+
   POLICY_ROOT=/bin
   POLICY_SELF_TESTS=()
   POLICY_LINTS=(true false true)
@@ -727,6 +911,42 @@ EOF
     echo "ci-gate.sh: SELF-TEST FAILED — valid green status was rejected" >&2
     return 1
   }
+
+  # Replacing the authenticated log pathname with a byte-identical inode after
+  # its digest is read must not substitute the artifact presented to GitHub.
+  verify_replacement_bin="$work/verify-replacement-bin"
+  verify_replacement_source="$work/byte-identical-ci-gate.log"
+  verify_replacement_marker="$work/verify-replacement-fired"
+  real_sha256="$(command -v sha256sum)"
+  cp -- "$log" "$verify_replacement_source"
+  mkdir -p -- "$verify_replacement_bin"
+  cat >"$verify_replacement_bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+candidate="${@: -1}"
+if [ ! -e "$MCNF_VERIFY_REPLACEMENT_MARKER" ] \
+  && [ "$(readlink -f -- "$candidate" 2>/dev/null || true)" = "$MCNF_VERIFY_REPLACEMENT_TARGET" ]; then
+  : >"$MCNF_VERIFY_REPLACEMENT_MARKER"
+  mv -- "$MCNF_VERIFY_REPLACEMENT_SOURCE" "$MCNF_VERIFY_REPLACEMENT_TARGET"
+fi
+exec "$MCNF_VERIFY_REAL_SHA256" "$@"
+EOF
+  chmod +x -- "$verify_replacement_bin/sha256sum"
+  set +e
+  PATH="$verify_replacement_bin:$PATH" \
+    MCNF_VERIFY_REAL_SHA256="$real_sha256" \
+    MCNF_VERIFY_REPLACEMENT_MARKER="$verify_replacement_marker" \
+    MCNF_VERIFY_REPLACEMENT_SOURCE="$verify_replacement_source" \
+    MCNF_VERIFY_REPLACEMENT_TARGET="$log" \
+    verify_status "$status" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$verify_replacement_marker" ] \
+    && [ "$(file_sha256 "$log")" = "$log_digest" ] || {
+      echo "ci-gate.sh: SELF-TEST FAILED — replaced GitHub candidate log inode was accepted" >&2
+      return 1
+    }
+
   set +e
   verify_status "$status" --expected-revision different-source-revision >/dev/null 2>&1
   rc=$?
@@ -934,6 +1154,84 @@ EOF
         return 1
       }
   done
+
+  # A binding pathname may be replaced with another schema-valid payload after
+  # the first jq validation.  The production seam must keep reading the inode
+  # it opened and refuse publication when the caller-visible pathname changes.
+  replacement_input="$work/replacement-binding.json"
+  replacement_original="$work/original-binding.json"
+  replacement_bin="$work/replacement-bin"
+  replacement_marker="$work/replacement-fired"
+  cp -- "$binding_input" "$replacement_original"
+  jq '.artifacts[0].sha256 = ("c" * 64)' \
+    "$binding_input" >"$replacement_input"
+  mkdir -p -- "$replacement_bin"
+  real_jq="$(command -v jq)"
+  cat >"$replacement_bin/jq" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ ! -e "$MCNF_BIND_REPLACEMENT_MARKER" ]; then
+  : >"$MCNF_BIND_REPLACEMENT_MARKER"
+  mv -- "$MCNF_BIND_REPLACEMENT_SOURCE" "$MCNF_BIND_REPLACEMENT_TARGET"
+fi
+exec "$MCNF_BIND_REAL_JQ" "$@"
+EOF
+  chmod +x -- "$replacement_bin/jq"
+  set +e
+  PATH="$replacement_bin:$PATH" \
+    MCNF_BIND_REAL_JQ="$real_jq" \
+    MCNF_BIND_REPLACEMENT_MARKER="$replacement_marker" \
+    MCNF_BIND_REPLACEMENT_SOURCE="$replacement_input" \
+    MCNF_BIND_REPLACEMENT_TARGET="$binding_input" \
+    cmd_bind_release "$binding_input" "$status" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] \
+    && [ -e "$replacement_marker" ] \
+    && [ "$(file_sha256 "$status")" = "$before_status" ] \
+    && [ "$(file_sha256 "$log")" = "$before_log" ] || {
+      echo "ci-gate.sh: SELF-TEST FAILED — replaced binding pathname was authenticated" >&2
+      return 1
+    }
+  cp -- "$replacement_original" "$binding_input"
+
+  # Rewriting the already-open inode is distinct from pathname replacement.
+  # Mutation after the pre-read digest but before jq canonicalization must also
+  # leave status/log untouched.
+  mutation_input="$work/mutated-binding.json"
+  mutation_bin="$work/mutation-bin"
+  mutation_marker="$work/mutation-fired"
+  jq '.artifacts[0].sha256 = ("d" * 64)' \
+    "$binding_input" >"$mutation_input"
+  mkdir -p -- "$mutation_bin"
+  cat >"$mutation_bin/jq" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ ! -e "$MCNF_BIND_MUTATION_MARKER" ]; then
+  : >"$MCNF_BIND_MUTATION_MARKER"
+  cp -- "$MCNF_BIND_MUTATION_SOURCE" "$MCNF_BIND_MUTATION_TARGET"
+fi
+exec "$MCNF_BIND_REAL_JQ" "$@"
+EOF
+  chmod +x -- "$mutation_bin/jq"
+  set +e
+  PATH="$mutation_bin:$PATH" \
+    MCNF_BIND_REAL_JQ="$real_jq" \
+    MCNF_BIND_MUTATION_MARKER="$mutation_marker" \
+    MCNF_BIND_MUTATION_SOURCE="$mutation_input" \
+    MCNF_BIND_MUTATION_TARGET="$binding_input" \
+    cmd_bind_release "$binding_input" "$status" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] \
+    && [ -e "$mutation_marker" ] \
+    && [ "$(file_sha256 "$status")" = "$before_status" ] \
+    && [ "$(file_sha256 "$log")" = "$before_log" ] || {
+      echo "ci-gate.sh: SELF-TEST FAILED — mutated binding inode was authenticated" >&2
+      return 1
+    }
+  cp -- "$replacement_original" "$binding_input"
+
   set +e
   cmd_bind_release >/dev/null 2>&1
   rc=$?

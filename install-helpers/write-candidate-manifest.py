@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -207,23 +208,84 @@ def source_receipt(
     }
 
 
-def atomic_write(path: Path, raw: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() or path.is_symlink():
-        fail(f"refusing to overwrite output: {path}")
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def open_output_directory(path: Path) -> int:
+    absolute = path.absolute()
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, path)
-    finally:
+        for component in absolute.parts[1:]:
+            try:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    child = os.open(
+                        component,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    fail(
+                        "output directory is unavailable without symlink traversal: "
+                        f"{path}: {exc}"
+                    )
+            except OSError as exc:
+                fail(f"output directory is unavailable without symlink traversal: {path}: {exc}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def atomic_write(path: Path, raw: bytes) -> None:
+    directory = open_output_directory(path.parent)
+    temporary = f".{path.name}.{secrets.token_hex(16)}"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory,
+        )
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail(f"output write made no progress: {path}")
+            view = view[written:]
+        os.fchmod(descriptor, 0o644)
+        os.fsync(descriptor)
         try:
-            os.unlink(temporary)
+            os.link(
+                temporary,
+                path.name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            fail(f"refusing to overwrite output: {path}")
+        os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
+    except OSError as exc:
+        fail(f"could not publish output without replacing authority: {path}: {exc}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory)
         except FileNotFoundError:
             pass
+        os.close(directory)
 
 
 def verify_checkout(repo: Path, revision: str) -> None:
@@ -351,9 +413,21 @@ def self_test(repo: Path) -> None:
             pass
         else:
             fail("checkout with an untracked file was accepted")
+        redirected_output = root / "redirected-output"
+        outside = root / "outside"
+        outside.mkdir()
+        redirected_output.symlink_to(outside, target_is_directory=True)
+        try:
+            atomic_write(redirected_output / "candidate-manifest.json", b"hostile\n")
+        except CandidateError:
+            pass
+        else:
+            fail("symlinked output parent redirected candidate authority")
+        if (outside / "candidate-manifest.json").exists():
+            fail("symlinked output parent received candidate authority")
     print(
         "write-candidate-manifest: self-test passed "
-        "(revision width, clean checkout, full immutable snapshot, unique receipt fields, exact collector schema)"
+        "(revision width, clean checkout, full immutable snapshot, unique receipt fields, exact collector schema, output-parent authority)"
     )
 
 

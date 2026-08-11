@@ -29,7 +29,14 @@
 //! ship as a separate BUS-2.8.watcher follow-on once the data
 //! schema is locked.
 
+use std::io::{self, Read as _};
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+
+/// DND is a tiny operator-state document. A cap keeps a replaced restart file
+/// from turning state admission into an unbounded allocation.
+const MAX_DND_FILE_BYTES: usize = 64 * 1024;
 
 /// Mesh-wide DND state. Single bool per the design lock —
 /// per-topic mute is handled by the `subs.yaml` manifest (per
@@ -210,15 +217,109 @@ pub fn is_suppressed(
     is_quiet_hour(now_local_seconds, topic_hours)
 }
 
+/// Read one stable DND authority inode without following a replacement link.
+fn read_dnd_file(path: &Path) -> io::Result<Vec<u8>> {
+    let byte_cap = u64::try_from(MAX_DND_FILE_BYTES).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "DND state size cap overflows u64")
+    })?;
+    let validate = |metadata: &std::fs::Metadata| -> io::Result<()> {
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DND state is not a regular file",
+            ));
+        }
+        if metadata.len() > byte_cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DND state exceeds its bounded authority size",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DND state has an external hard-link authority",
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    let path_before = std::fs::symlink_metadata(path)?;
+    validate(&path_before)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+    }
+
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    validate(&opened)?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .unwrap_or(MAX_DND_FILE_BYTES)
+            .min(MAX_DND_FILE_BYTES)
+            .saturating_add(1),
+    );
+    (&mut file)
+        .take(byte_cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_DND_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DND state grew beyond its bounded authority size",
+        ));
+    }
+
+    let opened_after = file.metadata()?;
+    validate(&opened_after)?;
+    if opened.len() != opened_after.len()
+        || opened_after.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DND state changed while being read",
+        ));
+    }
+
+    let path_after = std::fs::symlink_metadata(path)?;
+    validate(&path_after)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if opened.dev() != path_after.dev() || opened.ino() != path_after.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DND authority path was replaced while being read",
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
 /// Load the mesh-wide DND state from the GFS-replicated YAML
-/// file at `<bus_root>/dnd.yaml`. Returns `DndState::default()`
-/// (DND off) when the file is missing or unparseable — DND off
-/// is the safe default so a corrupted file doesn't silently
-/// suppress every notification.
+/// file at `<bus_root>/dnd.yaml`. The read is bound to one bounded,
+/// single-link regular-file descriptor. Returns `DndState::default()`
+/// (DND off) when the file is missing, replaced, or unparseable — DND off
+/// is the safe default so hostile restart state cannot silently suppress
+/// Clock alarms or other notifications.
 #[must_use]
 pub fn load_default(bus_root: &std::path::Path) -> DndState {
     let path = bus_root.join("dnd.yaml");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = read_dnd_file(&path) else {
         return DndState::default();
     };
     serde_yaml::from_slice(&bytes).unwrap_or_default()
@@ -362,7 +463,7 @@ impl DndWatcher {
         if !advanced {
             return DndTickOutcome::Idle;
         }
-        let bytes = match std::fs::read(&self.file_path) {
+        let bytes = match read_dnd_file(&self.file_path) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -422,6 +523,39 @@ mod tests {
         assert!(!s.active);
         assert_eq!(s.since_unix_ms, 0);
         assert!(s.set_by_peer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restarted_dnd_reader_cannot_adopt_replaced_clock_suppression_authority() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let replacement = root.path().join("replacement.yaml");
+        let hostile = DndState {
+            active: true,
+            since_unix_ms: 1_000,
+            set_by_peer: "replacement-peer".to_string(),
+            snoozes: vec![TopicSnooze {
+                topic: "event/notify/clock/#".to_string(),
+                until_unix_ms: i64::MAX,
+                set_by_peer: "replacement-peer".to_string(),
+            }],
+        };
+        std::fs::write(&replacement, serde_yaml::to_string(&hostile).unwrap()).unwrap();
+        symlink(&replacement, root.path().join("dnd.yaml")).unwrap();
+
+        let restarted = DndWatcher::new(root.path().to_path_buf());
+        let admitted = restarted.current();
+        assert!(!admitted.active, "replacement DND toggle must fail open");
+        assert!(
+            !is_snoozed(
+                &admitted.snoozes,
+                "event/notify/clock/seat-1",
+                2_000
+            ),
+            "replacement state must not gain Clock suppression authority"
+        );
     }
 
     // ── BUS-6.7 snooze helper tests ─────────────────────────────────

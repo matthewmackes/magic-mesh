@@ -5,7 +5,10 @@
 //! workgroup uses, replicated by `mesh-storage`). The daemon refuses to
 //! start without them, pointing the operator at the first-run flow.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +31,7 @@ pub const SOURCES_PATH_ENV: &str = "MDE_AIRSONIC_SOURCES";
 /// Maximum number of primary plus additional source credentials admitted.
 pub const MAX_CONFIGURED_SOURCES: usize = 4;
 const SOURCES_SCHEMA_VERSION: u16 = 1;
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 64 * 1024;
 
 /// The log line shown when creds are missing (AIR-4 acceptance).
 pub const MISSING_HINT: &str =
@@ -153,17 +157,10 @@ fn passwd_home_from(uid: u32, passwd: &str) -> Option<PathBuf> {
 /// # Errors
 /// [`CredsError::Missing`] when absent, `Io`/`Parse` otherwise.
 pub fn load_from(path: &Path) -> Result<Creds, CredsError> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let creds: Creds = serde_json::from_str(&s).map_err(CredsError::Parse)?;
-            validate(&creds)?;
-            Ok(creds)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(CredsError::Missing(path.to_path_buf()))
-        }
-        Err(e) => Err(CredsError::Io(e)),
-    }
+    let raw = read_credential_file(path)?;
+    let creds: Creds = serde_json::from_str(&raw).map_err(CredsError::Parse)?;
+    validate(&creds)?;
+    Ok(creds)
 }
 
 /// Load creds from the [`default_path`].
@@ -192,7 +189,7 @@ pub fn sources_path() -> PathBuf {
 /// source-only deployment.  Duplicate URL/user pairs are admitted once.
 pub fn load_all() -> Result<Vec<Creds>, CredsError> {
     let primary = load();
-    let extra = match std::fs::read_to_string(sources_path()) {
+    let extra = match read_credential_file(&sources_path()) {
         Ok(raw) => {
             let file: SourcesFile = serde_json::from_str(&raw).map_err(CredsError::Parse)?;
             if file.schema_version != SOURCES_SCHEMA_VERSION
@@ -207,8 +204,8 @@ pub fn load_all() -> Result<Vec<Creds>, CredsError> {
             }
             file.sources
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(CredsError::Io(error)),
+        Err(CredsError::Missing(_)) => Vec::new(),
+        Err(error) => return Err(error),
     };
 
     let mut sources = Vec::with_capacity(MAX_CONFIGURED_SOURCES);
@@ -230,6 +227,61 @@ pub fn load_all() -> Result<Vec<Creds>, CredsError> {
         return Err(primary.expect_err("primary load result must exist"));
     }
     Ok(sources)
+}
+
+/// Open credential material without following a replacement symlink, then
+/// bound the read before parsing secrets into daemon state.
+fn read_credential_file(path: &Path) -> Result<String, CredsError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CredsError::Invalid(
+                "credential path must not be a symbolic link".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CredsError::Missing(path.to_path_buf()));
+        }
+        Err(error) => return Err(CredsError::Io(error)),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    }
+
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CredsError::Missing(path.to_path_buf()));
+        }
+        Err(error) => return Err(CredsError::Io(error)),
+    };
+    let metadata = file.metadata().map_err(CredsError::Io)?;
+    if !metadata.is_file() {
+        return Err(CredsError::Invalid(
+            "credential path must name one regular file".into(),
+        ));
+    }
+    if metadata.len() > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(CredsError::Invalid(format!(
+            "credential file exceeds the {MAX_CREDENTIAL_FILE_BYTES}-byte limit"
+        )));
+    }
+
+    let mut raw = String::new();
+    file.take(MAX_CREDENTIAL_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(CredsError::Io)?;
+    if raw.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(CredsError::Invalid(format!(
+            "credential file exceeds the {MAX_CREDENTIAL_FILE_BYTES}-byte limit"
+        )));
+    }
+    Ok(raw)
 }
 
 /// Whether a candidate server URL + username are well-formed enough to
@@ -356,6 +408,26 @@ mod tests {
         f.write_all(serde_json::to_string_pretty(&creds).unwrap().as_bytes())
             .unwrap();
         assert_eq!(load_from(&p).unwrap(), creds);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cannot_substitute_credentials_after_restart() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let planted = dir.path().join("attacker-creds.json");
+        let configured = dir.path().join("airsonic-creds.json");
+        let attacker = Creds {
+            server_url: "https://attacker.example".into(),
+            username: "victim".into(),
+            password: "stolen-session-anchor".into(),
+        };
+        std::fs::write(&planted, serde_json::to_vec(&attacker).unwrap()).unwrap();
+        symlink(&planted, &configured).unwrap();
+
+        assert!(load_from(&configured).is_err());
+        assert_ne!(load_from(&configured).ok(), Some(attacker));
     }
 
     #[test]

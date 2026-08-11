@@ -225,6 +225,25 @@ pub enum SessionError {
         /// The bounded reason for refusing the replay.
         reason: &'static str,
     },
+    /// A repeated Browser VM open tried to retarget an already admitted
+    /// session. Browser reconnects reuse the stable session id, so changing the
+    /// serving/client peer or transport under that id would silently redirect
+    /// focused input and credentials.
+    ConflictingBrowserSession {
+        /// The stable session identity being protected.
+        id: SessionId,
+        /// The bounded reason for refusing the replay.
+        reason: &'static str,
+    },
+    /// A repeated generic desktop open tried to reuse an admitted session id
+    /// for a different workload or route. The id is the authority lifetime;
+    /// replacing its binding could present and control the wrong workload.
+    ConflictingSession {
+        /// The stable session identity being protected.
+        id: SessionId,
+        /// The bounded reason for refusing the replay.
+        reason: &'static str,
+    },
     /// An App VM open carried a target identity that cannot safely cross the
     /// session/Workloads boundary.  Reject it before it enters the roster so
     /// the later actuator cannot interpret a path-like or control-bearing
@@ -258,6 +277,12 @@ impl std::fmt::Display for SessionError {
             }
             Self::ConflictingAppSession { id, reason } => {
                 write!(f, "conflicting App VM session `{id}`: {reason}")
+            }
+            Self::ConflictingBrowserSession { id, reason } => {
+                write!(f, "conflicting Browser VM session `{id}`: {reason}")
+            }
+            Self::ConflictingSession { id, reason } => {
+                write!(f, "conflicting desktop session `{id}`: {reason}")
             }
             Self::InvalidAppVmTarget { field } => {
                 write!(f, "invalid App VM target identity: {field}")
@@ -405,16 +430,17 @@ pub fn close_session(session: &VdiSession, now_ms: u64) -> VdiSession {
 
 /// Apply one drained [`SessionRequest`] to the in-memory `roster` (latest-wins by
 /// id — the incremental fold the worker runs per drained message, the session
-/// analogue of `scheduler`'s `fold_capacity`). Repeated `OpenApp` requests for
-/// one admitted identity are idempotent and preserve readiness; a replay cannot
-/// retarget the session to another VM or serving/client peer.
+/// analogue of `scheduler`'s `fold_capacity`). Repeated open requests for one
+/// admitted identity are idempotent and preserve live state; a replay cannot
+/// retarget the session to another VM, transport, or serving/client peer.
 ///
 /// # Errors
 /// [`SessionError::UnknownSession`] when a transition op names an absent id,
 /// [`SessionError::IllegalTransition`] when the transition is forbidden, or
-/// [`SessionError::ConflictingAppSession`] when an App VM replay would retarget
-/// an admitted session. Plain `Open` retains its legacy replace behavior;
-/// `OpenApp` is identity-bound and does not overwrite an existing session.
+/// [`SessionError::ConflictingSession`],
+/// [`SessionError::ConflictingBrowserSession`], or
+/// [`SessionError::ConflictingAppSession`] when a typed VM replay would retarget
+/// an admitted session. Generic, Browser, and App VM opens are identity-bound.
 pub fn apply_request(
     roster: &mut BTreeMap<SessionId, VdiSession>,
     req: SessionRequest,
@@ -441,6 +467,47 @@ pub fn apply_request(
                 profile,
                 now_ms,
             );
+            if session.vm_id == BROWSER_VM_WORKLOAD_ID {
+                if let Some(existing) = roster.get(&id) {
+                    if existing.vm_id != session.vm_id
+                        || existing.serving_peer != session.serving_peer
+                        || existing.client_peer != session.client_peer
+                        || existing.profile != session.profile
+                    {
+                        return Err(SessionError::ConflictingBrowserSession {
+                            id,
+                            reason: "session id is already bound to a different VM route or transport",
+                        });
+                    }
+                    if existing.state.is_terminal() {
+                        return Err(SessionError::ConflictingBrowserSession {
+                            id,
+                            reason: "the existing Browser VM session is closed; use a new session id",
+                        });
+                    }
+                    return Ok(());
+                }
+            }
+            if let Some(existing) = roster.get(&id) {
+                if existing.app.is_some()
+                    || existing.vm_id != session.vm_id
+                    || existing.serving_peer != session.serving_peer
+                    || existing.client_peer != session.client_peer
+                    || existing.profile != session.profile
+                {
+                    return Err(SessionError::ConflictingSession {
+                        id,
+                        reason: "session id is already bound to a different workload or route",
+                    });
+                }
+                if existing.state.is_terminal() {
+                    return Err(SessionError::ConflictingSession {
+                        id,
+                        reason: "the existing session is closed; use a new session id",
+                    });
+                }
+                return Ok(());
+            }
             roster.insert(id, session);
             Ok(())
         }
@@ -515,15 +582,17 @@ pub fn apply_request(
                     reason: "app identity, guest profile, or session identity changed",
                 });
             }
-            // A retry may refresh catalog/capability/resume intent, but it must
-            // retain the already observed VDI and guest lifecycle states. This
-            // is the key property that makes reconnect/retry converge on one
-            // guest instead of briefly advertising a false cold launch.
+            // The session id is also the authority lifetime boundary. A replay
+            // may reuse the already-running guest only when its complete signed
+            // declaration is byte-for-byte equivalent; changing catalog
+            // provenance, capabilities, or resume intent under a live id would
+            // attach new authority to runtime evidence produced by the old
+            // guest. Callers must mint a new session id for changed intent.
             if existing_app != requested_app {
-                let mut refreshed = existing;
-                refreshed.app = session.app;
-                refreshed.updated_at_ms = now_ms;
-                roster.insert(id, refreshed);
+                return Err(SessionError::ConflictingAppSession {
+                    id,
+                    reason: "catalog revision, capabilities, or resume intent changed",
+                });
             }
             Ok(())
         }
@@ -1362,6 +1431,36 @@ fn drain(
     Ok(requests)
 }
 
+/// Fail closed after rebuilding the roster from the durable action history.
+///
+/// An `Active` row only proves that a desktop transport connected before the
+/// daemon restart, and an App VM `Connected` row proves only that the guest was
+/// ready before that restart. Replaying either historical transition must not
+/// renew an etcd lease (or overwrite the file-backed roaming plane) as though
+/// the presentation and guest were still live. Demote them once, before the
+/// first convergence; current, forward-generation evidence may reconnect them.
+fn invalidate_recovered_active_sessions(
+    roster: &mut BTreeMap<SessionId, VdiSession>,
+    recovered_at_ms: u64,
+) {
+    for session in roster.values_mut() {
+        let mut invalidated = false;
+        if session.state == SessionState::Active {
+            session.state = SessionState::Disconnected;
+            invalidated = true;
+        }
+        if session.app_state == Some(AppVmLifecycleState::Connected) {
+            session.app_state = Some(AppVmLifecycleState::Reconnecting);
+            session.app_state_reason =
+                Some("guest readiness must be re-established after broker restart".into());
+            invalidated = true;
+        }
+        if invalidated {
+            session.updated_at_ms = recovered_at_ms;
+        }
+    }
+}
+
 /// Read guest runtime observations from the replicated state topic. Malformed,
 /// oversized, or invalid records advance the cursor but never reach the session
 /// roster. Identity matching happens separately against the admitted session.
@@ -1745,6 +1844,7 @@ impl Worker for SessionBrokerWorker {
         let mut cursor: Option<String> = None;
         let mut runtime_cursor: Option<String> = None;
         let mut roster: BTreeMap<SessionId, VdiSession> = BTreeMap::new();
+        let mut startup_recovery_pending = true;
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
@@ -1778,6 +1878,10 @@ impl Worker for SessionBrokerWorker {
                     ) {
                         tracing::debug!(%error, "session_broker: Bus unavailable; convergence deferred");
                         continue;
+                    }
+                    if startup_recovery_pending {
+                        invalidate_recovered_active_sessions(&mut roster, now_ms());
+                        startup_recovery_pending = false;
                     }
                     if let Some(signer) = self.app_state_signer.as_ref() {
                         for session in roster.values().filter(|session| {
@@ -1991,6 +2095,105 @@ mod tests {
     }
 
     #[test]
+    fn browser_reconnect_replay_preserves_live_route_and_transport() {
+        let mut roster = BTreeMap::new();
+        let open = SessionRequest::Open {
+            id: "browser-reconnect".into(),
+            serving_peer: "peer:dell".into(),
+            vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+            client_peer: "peer:surface".into(),
+            profile: Some(DesktopSessionProfile::BrowserVmRdp),
+        };
+        apply_request(&mut roster, open.clone(), 10).expect("initial Browser VM open");
+        apply_request(
+            &mut roster,
+            SessionRequest::Active {
+                id: "browser-reconnect".into(),
+            },
+            20,
+        )
+        .expect("Browser VM active");
+
+        apply_request(&mut roster, open, 30).expect("exact reconnect replay");
+        let preserved = roster
+            .get("browser-reconnect")
+            .expect("admitted Browser VM session")
+            .clone();
+        assert_eq!(preserved.state, SessionState::Active);
+        assert_eq!(preserved.opened_at_ms, 10);
+        assert_eq!(preserved.updated_at_ms, 20);
+        assert_eq!(preserved.profile, Some(DesktopSessionProfile::BrowserVmRdp));
+
+        let retarget = apply_request(
+            &mut roster,
+            SessionRequest::Open {
+                id: "browser-reconnect".into(),
+                serving_peer: "peer:attacker".into(),
+                vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+                client_peer: "peer:surface".into(),
+                profile: Some(DesktopSessionProfile::BrowserVm),
+            },
+            40,
+        );
+        assert!(matches!(
+            retarget,
+            Err(SessionError::ConflictingBrowserSession { .. })
+        ));
+        assert_eq!(
+            roster["browser-reconnect"], preserved,
+            "a conflicting replay must not alter the live Browser route"
+        );
+    }
+
+    #[test]
+    fn generic_session_id_cannot_retarget_an_active_workload_or_route() {
+        let mut roster = BTreeMap::new();
+        let open = SessionRequest::Open {
+            id: "desktop-authority".into(),
+            serving_peer: "peer:host-a".into(),
+            vm_id: "workload-a".into(),
+            client_peer: "peer:seat-a".into(),
+            profile: None,
+        };
+        apply_request(&mut roster, open.clone(), 10).expect("initial desktop open");
+        apply_request(
+            &mut roster,
+            SessionRequest::Active {
+                id: "desktop-authority".into(),
+            },
+            20,
+        )
+        .expect("desktop became active");
+        let admitted = roster["desktop-authority"].clone();
+
+        apply_request(&mut roster, open, 30).expect("exact retry is idempotent");
+        assert_eq!(
+            roster["desktop-authority"], admitted,
+            "an exact retry must preserve active lifecycle evidence"
+        );
+
+        let retarget = apply_request(
+            &mut roster,
+            SessionRequest::Open {
+                id: "desktop-authority".into(),
+                serving_peer: "peer:host-b".into(),
+                vm_id: "workload-b".into(),
+                client_peer: "peer:seat-a".into(),
+                profile: None,
+            },
+            40,
+        );
+        assert!(matches!(
+            retarget,
+            Err(SessionError::ConflictingSession { .. })
+        ));
+        assert_eq!(
+            roster["desktop-authority"], admitted,
+            "session-id reuse must not attach the active presentation to another workload"
+        );
+    }
+
+    #[test]
     fn browser_profile_cannot_retarget_an_arbitrary_vm() {
         let mut roster = BTreeMap::new();
         let result = apply_request(
@@ -2091,20 +2294,27 @@ mod tests {
     }
 
     #[test]
-    fn repeated_app_open_preserves_guest_readiness_and_refreshes_intent() {
+    fn repeated_app_open_reuses_only_the_exact_bound_declaration() {
         let mut roster = BTreeMap::new();
-        let open = |catalog_revision: &str, resume: bool| SessionRequest::OpenApp {
-            id: "app-s".into(),
-            serving_peer: "peer:host".into(),
-            vm_id: "app-vm".into(),
-            client_peer: "peer:seat".into(),
-            app_id: "org.example.Editor".into(),
-            catalog_revision: catalog_revision.into(),
-            guest_profile: "wayland-standard".into(),
-            requested_capabilities: vec!["audio".into()],
-            resume,
+        let open = |catalog_revision: &str, capabilities: Vec<String>, resume: bool| {
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: catalog_revision.into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: capabilities,
+                resume,
+            }
         };
-        apply_request(&mut roster, open("catalog-1", false), 42).expect("initial open");
+        apply_request(
+            &mut roster,
+            open("catalog-1", vec!["audio".into()], false),
+            42,
+        )
+        .expect("initial open");
         apply_request(
             &mut roster,
             SessionRequest::AppState {
@@ -2139,18 +2349,37 @@ mod tests {
         )
         .expect("app start");
 
-        apply_request(&mut roster, open("catalog-2", true), 44).expect("idempotent retry");
-        let session = &roster["app-s"];
-        assert_eq!(session.state, SessionState::Requested);
-        assert_eq!(session.app_state, Some(AppVmLifecycleState::StartingApp));
+        let admitted = roster.clone();
+        apply_request(
+            &mut roster,
+            open("catalog-1", vec!["audio".into()], false),
+            44,
+        )
+        .expect("exact duplicate reuses the session");
         assert_eq!(
-            session.app_state_reason.as_deref(),
-            Some("compositor ready")
+            roster, admitted,
+            "exact replay preserves lifecycle and timestamps"
         );
-        assert_eq!(session.updated_at_ms, 44);
-        let app = session.app.as_ref().expect("app declaration");
-        assert_eq!(app.catalog_revision, "catalog-2");
-        assert!(app.resume, "retry carries the new resume intent");
+
+        for conflicting in [
+            open("catalog-2", vec!["audio".into()], false),
+            open(
+                "catalog-1",
+                vec!["audio".into(), "clipboard".into()],
+                false,
+            ),
+            open("catalog-1", vec!["audio".into()], true),
+        ] {
+            assert!(matches!(
+                apply_request(&mut roster, conflicting, 45),
+                Err(SessionError::ConflictingAppSession { reason, .. })
+                    if reason.contains("catalog revision")
+            ));
+            assert_eq!(
+                roster, admitted,
+                "changed authority must not mutate or restart the live session"
+            );
+        }
     }
 
     #[test]
@@ -2540,6 +2769,132 @@ mod tests {
         // Observed already byte-identical ⇒ no action (no needless write).
         let converged = roster_of(&[sess("s1", SessionState::Active)]);
         assert!(reconcile(&desired, &converged).is_empty());
+    }
+
+    #[test]
+    fn restart_recovery_refuses_to_republish_historical_active_session_as_ready() {
+        // The durable action fold and the surviving shared-plane lease both say
+        // Active, but neither is proof that the presentation survived mackesd.
+        let stale_active = sess("recovered", SessionState::Active);
+        let observed = roster_of(std::slice::from_ref(&stale_active));
+        let mut recovered = roster_of(&[stale_active]);
+
+        invalidate_recovered_active_sessions(&mut recovered, 900);
+
+        let disconnected = recovered
+            .get("recovered")
+            .expect("recovered session remains reconnectable");
+        assert_eq!(disconnected.state, SessionState::Disconnected);
+        assert_eq!(disconnected.updated_at_ms, 900);
+        assert_eq!(
+            reconcile(&recovered.values().cloned().collect::<Vec<_>>(), &observed),
+            vec![SessionAction::Publish(disconnected.clone())],
+            "the first post-restart convergence must replace stale ready state"
+        );
+
+        apply_request(
+            &mut recovered,
+            SessionRequest::Active {
+                id: "recovered".into(),
+            },
+            901,
+        )
+        .expect("a forward authorized connect may restore readiness");
+        assert_eq!(recovered["recovered"].state, SessionState::Active);
+        assert_eq!(recovered["recovered"].updated_at_ms, 901);
+    }
+
+    #[test]
+    fn recovered_app_vm_cannot_republish_historical_connected_readiness() {
+        let mut recovered = BTreeMap::new();
+        apply_request(
+            &mut recovered,
+            SessionRequest::OpenApp {
+                id: "recovered-app".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: true,
+            },
+            10,
+        )
+        .expect("admit App VM");
+        for (generation, state) in [
+            (5, AppVmLifecycleState::StartingGuest),
+            (6, AppVmLifecycleState::StartingApp),
+            (7, AppVmLifecycleState::Connected),
+        ] {
+            apply_request(
+                &mut recovered,
+                SessionRequest::AppState {
+                    id: "recovered-app".into(),
+                    generation,
+                    state,
+                    reason: None,
+                },
+                generation,
+            )
+            .expect("advance guest readiness");
+        }
+        apply_request(
+            &mut recovered,
+            SessionRequest::Active {
+                id: "recovered-app".into(),
+            },
+            20,
+        )
+        .expect("connect presentation");
+        let observed = recovered.clone();
+
+        invalidate_recovered_active_sessions(&mut recovered, 900);
+
+        let invalidated = &recovered["recovered-app"];
+        assert_eq!(invalidated.state, SessionState::Disconnected);
+        assert_eq!(
+            invalidated.app_state,
+            Some(AppVmLifecycleState::Reconnecting),
+            "historical guest readiness is not current post-restart evidence"
+        );
+        assert_eq!(invalidated.app_state_generation, 7);
+        assert_eq!(
+            reconcile(
+                &recovered.values().cloned().collect::<Vec<_>>(),
+                &observed,
+            ),
+            vec![SessionAction::Publish(invalidated.clone())]
+        );
+        assert_eq!(
+            apply_request(
+                &mut recovered,
+                SessionRequest::AppState {
+                    id: "recovered-app".into(),
+                    generation: 7,
+                    state: AppVmLifecycleState::Connected,
+                    reason: Some("replayed pre-restart readiness".into()),
+                },
+                901,
+            ),
+            Err(SessionError::StaleAppState { generation: 7 })
+        );
+        apply_request(
+            &mut recovered,
+            SessionRequest::AppState {
+                id: "recovered-app".into(),
+                generation: 8,
+                state: AppVmLifecycleState::Connected,
+                reason: Some("current guest generation ready".into()),
+            },
+            902,
+        )
+        .expect("forward guest generation re-establishes readiness");
+        assert_eq!(
+            recovered["recovered-app"].app_state,
+            Some(AppVmLifecycleState::Connected)
+        );
     }
 
     #[test]

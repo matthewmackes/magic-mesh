@@ -342,6 +342,28 @@ impl ChooserPrefsStore {
             .join(format!("{}.json", sanitize(seat)))
     }
 
+    /// Read one record only when its declared roaming identity and seat resolve
+    /// back to the exact path that supplied it. Syncthing leaves are untrusted
+    /// input: accepting the JSON body alone would let a file copied into another
+    /// identity directory, or renamed to impersonate another seat, acquire LWW
+    /// authority over taskbar pins after the shell restarts.
+    fn admitted_record(
+        &self,
+        path: &Path,
+        identity: &str,
+        exact_seat: Option<&str>,
+    ) -> Option<SeatPrefs> {
+        let data = read_bounded_prefs_record(path)?;
+        let record = serde_json::from_str::<SeatPrefs>(&data).ok()?;
+        if record.identity != identity
+            || exact_seat.is_some_and(|seat| record.seat != seat)
+            || self.seat_path(identity, &record.seat) != path
+        {
+            return None;
+        }
+        Some(record)
+    }
+
     /// Publish `rec` into this seat's file (atomic temp + rename). A silent no-op
     /// when the root is not provisioned ([`is_ready`](Self::is_ready)).
     ///
@@ -386,10 +408,8 @@ impl ChooserPrefsStore {
             {
                 continue; // an in-flight atomic-write temp file
             }
-            if let Some(data) = read_bounded_prefs_record(&path) {
-                if let Ok(rec) = serde_json::from_str::<SeatPrefs>(&data) {
-                    out.push(rec);
-                }
+            if let Some(record) = self.admitted_record(&path, identity, None) {
+                out.push(record);
             }
         }
         out.sort_by(|a, b| a.seat.cmp(&b.seat));
@@ -400,8 +420,8 @@ impl ChooserPrefsStore {
     /// resume a seat's tombstones on start-up).
     #[must_use]
     fn seat_record(&self, identity: &str, seat: &str) -> Option<SeatPrefs> {
-        let data = read_bounded_prefs_record(&self.seat_path(identity, seat))?;
-        serde_json::from_str::<SeatPrefs>(&data).ok()
+        let path = self.seat_path(identity, seat);
+        self.admitted_record(&path, identity, Some(seat))
     }
 }
 
@@ -942,6 +962,62 @@ mod tests {
         let records = store.records("matthew");
         assert_eq!(records, vec![valid], "hostile leaves are skipped fail-soft");
         assert_eq!(store.seat_record("matthew", "seat-a"), Some(seat("seat-a")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restarted_taskbar_pins_cannot_adopt_foreign_identity_or_misbound_seat_record() {
+        let dir = temp_root("taskbar-pin-authority");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let store = ChooserPrefsStore::new(dir.clone());
+
+        let mut admitted = seat("seat-a");
+        admitted.favorites.push(FavoriteEntry {
+            id: "peer:oak".to_owned(),
+            pinned: true,
+            updated_ms: 10,
+        });
+        store.publish(&admitted).expect("publish admitted pin");
+
+        let identity_dir = store.identity_dir("matthew");
+        let mut foreign = seat("seat-b");
+        foreign.identity = "mallory".to_owned();
+        foreign.favorites.push(FavoriteEntry {
+            id: "peer:hostile".to_owned(),
+            pinned: true,
+            updated_ms: u64::MAX,
+        });
+        std::fs::write(
+            identity_dir.join("seat-b.json"),
+            serde_json::to_vec(&foreign).expect("serialize foreign record"),
+        )
+        .expect("substitute foreign identity record");
+
+        let mut renamed = seat("seat-z");
+        renamed.favorites.push(FavoriteEntry {
+            id: "peer:oak".to_owned(),
+            pinned: false,
+            updated_ms: u64::MAX,
+        });
+        std::fs::write(
+            identity_dir.join("seat-c.json"),
+            serde_json::to_vec(&renamed).expect("serialize misbound seat record"),
+        )
+        .expect("substitute misbound seat record");
+
+        // A fresh controller is the restart boundary: neither a foreign body
+        // copied under this identity nor a body renamed over this seat's own
+        // leaf may join the LWW fold or seed the resumed local record.
+        let restarted = ChooserPrefs::new(store, "matthew", "seat-c");
+        let pins = restarted.merged().favorites;
+        assert_eq!(
+            pins,
+            std::iter::once("peer:oak".to_owned()).collect(),
+            "only the path-bound identity/seat record may restore taskbar pins"
+        );
+        assert_eq!(restarted.local.identity, "matthew");
+        assert_eq!(restarted.local.seat, "seat-c");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

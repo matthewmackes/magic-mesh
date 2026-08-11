@@ -247,6 +247,23 @@ pub enum WorkspaceState {
 }
 
 impl WorkspaceState {
+    /// Canonical operator-facing language for this condition.
+    ///
+    /// This label is owned by the shared component rather than its caller so a
+    /// stale or confused surface cannot make (for example) an offline panel
+    /// read as healthy to either a sighted operator or assistive technology.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Loading => "Loading",
+            Self::Empty => "Empty",
+            Self::Stale => "Stale",
+            Self::Offline => "Offline",
+            Self::Error => "Error",
+            Self::Destructive => "Confirmation required",
+        }
+    }
+
     fn icon(self) -> &'static str {
         match self {
             Self::Loading => "process-stop",
@@ -299,7 +316,10 @@ impl<'a> WorkspaceStatePanel<'a> {
         let title_tone = Style::resolve_color(ui.ctx(), Style::TEXT_STRONG);
         let detail_tone = Style::resolve_color(ui.ctx(), Style::TEXT_DIM);
         let state_tone = Style::resolve_color(ui.ctx(), self.state.tone());
-        ui.vertical_centered(|ui| {
+        let state = self.state;
+        let title = self.title;
+        let detail = self.detail;
+        let response = ui.vertical_centered(|ui| {
             ui.add_space(Style::SP_XL);
             card()
                 .fill(surface)
@@ -312,11 +332,19 @@ impl<'a> WorkspaceStatePanel<'a> {
                             Sense::hover(),
                         );
                         let _ =
-                            paint_carbon(ui.painter(), icon_rect, self.state.icon(), state_tone);
+                            paint_carbon(ui.painter(), icon_rect, state.icon(), state_tone);
                         ui.add_space(Style::SP_S);
+                        ui.label(
+                            Style::typography_text(
+                                state.label().to_uppercase(),
+                                TypographyRole::Caption,
+                            )
+                            .color(state_tone),
+                        );
+                        ui.add_space(Style::SP_XS);
                         ui.add(
                             egui::Label::new(
-                                Style::typography_text(self.title, TypographyRole::Headline)
+                                Style::typography_text(title, TypographyRole::Headline)
                                     .color(title_tone),
                             )
                             .wrap(),
@@ -324,7 +352,7 @@ impl<'a> WorkspaceStatePanel<'a> {
                         ui.add_space(Style::SP_XS);
                         ui.add(
                             egui::Label::new(
-                                Style::typography_text(self.detail, TypographyRole::Body)
+                                Style::typography_text(detail, TypographyRole::Body)
                                     .color(detail_tone),
                             )
                             .wrap(),
@@ -335,7 +363,15 @@ impl<'a> WorkspaceStatePanel<'a> {
                     .inner
                 })
                 .inner
-        })
+        });
+        response.response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                true,
+                format!("{}: {title}. {detail}", state.label()),
+            )
+        });
+        response
     }
 }
 
@@ -645,6 +681,33 @@ mod tests {
                     && *color == Style::QUAZAR_LIGHT_TEXT_DIM
             }),
             "state detail must use the installed Light palette: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hostile_caller_copy_cannot_erase_canonical_workspace_state_language() {
+        let state = WorkspaceState::Offline;
+        assert_eq!(state.label(), "Offline");
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                WorkspaceStatePanel::new(
+                    state,
+                    "Connected and healthy",
+                    "All live services are available.",
+                )
+                .show(ui, |_| ());
+            });
+        });
+        let text = painted_text(&out.shapes);
+
+        assert!(
+            text.iter().any(|(value, color)| {
+                value == "OFFLINE" && *color == Style::DANGER
+            }),
+            "caller-controlled copy must not erase the shared visible state: {text:?}"
         );
     }
 

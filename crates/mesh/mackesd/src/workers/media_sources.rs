@@ -144,6 +144,16 @@ pub fn peer_reachability(health: &str, stale: bool) -> (Reachability, Option<Str
     }
 }
 
+/// Reject peer heartbeat evidence that cannot establish current source
+/// authority. `PeerRecord::is_stale` uses saturating wall-clock arithmetic, so
+/// a retained row stamped in the future would otherwise look freshly observed
+/// after restart and republish its media endpoints as reachable.
+fn peer_record_is_stale_at(rec: &PeerRecord, observed_now_ms: u64) -> bool {
+    rec.last_seen_ms == 0
+        || rec.last_seen_ms > observed_now_ms
+        || observed_now_ms.saturating_sub(rec.last_seen_ms) > PEER_STALE_MS
+}
+
 /// The address clients dial for a peer: its overlay IP, else `<node>.mesh`.
 #[must_use]
 fn peer_host(rec: &PeerRecord) -> String {
@@ -179,7 +189,8 @@ pub fn media_sources_from_peer(rec: &PeerRecord, self_node: &str) -> Vec<MediaSo
         return Vec::new(); // a pre-PD-2 writer advertises nothing
     };
     let host = peer_host(rec);
-    let (reachability, reason) = peer_reachability(&rec.health, rec.is_stale(PEER_STALE_MS));
+    let (reachability, reason) =
+        peer_reachability(&rec.health, peer_record_is_stale_at(rec, now_ms()));
 
     let mut out = Vec::new();
     for svc in &desc.media {
@@ -958,6 +969,30 @@ mod tests {
         let out = media_sources_from_peer(&rec, "elm");
         assert_eq!(out[0].reachability, Reachability::Unreachable);
         assert_eq!(out[0].reason.as_deref(), Some("peer heartbeat stale"));
+    }
+
+    #[test]
+    fn retained_impossible_heartbeat_cannot_reauthorize_media_source_after_restart() {
+        let observed_now_ms = now_ms();
+        let mut rec = peer(
+            "oak",
+            "healthy",
+            Some("10.42.0.7"),
+            vec![("jellyfin", 8096)],
+            false,
+        );
+
+        rec.last_seen_ms = observed_now_ms.saturating_add(60_000);
+        let future = media_sources_from_peer(&rec, "elm");
+        assert_eq!(future.len(), 1);
+        assert_eq!(future[0].reachability, Reachability::Unreachable);
+        assert_eq!(future[0].reason.as_deref(), Some("peer heartbeat stale"));
+
+        rec.last_seen_ms = 0;
+        let absent = media_sources_from_peer(&rec, "elm");
+        assert_eq!(absent.len(), 1);
+        assert_eq!(absent[0].reachability, Reachability::Unreachable);
+        assert_eq!(absent[0].reason.as_deref(), Some("peer heartbeat stale"));
     }
 
     // ── lane 2: the mDNS fold ──

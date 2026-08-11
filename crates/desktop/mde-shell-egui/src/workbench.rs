@@ -222,6 +222,39 @@ pub fn show(
     surface_handoff
 }
 
+/// Render one Workbench plane as a Workers catalog leaf. This intentionally
+/// omits the Workbench menu, plane rail, and Action Console: those controls are
+/// owned by the flat Workers catalog now.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn show_catalog_plane(
+    ui: &mut egui::Ui,
+    plane: Plane,
+    datacenter: &mut crate::datacenter::DatacenterState,
+    thisnode: &mut crate::thisnode::ThisNodeState,
+    system: &mut crate::system::SystemState,
+    surface_card: &mut crate::surface_card::SurfaceCardState,
+    network: &crate::network::NetworkState,
+    provisioning: &crate::provisioning::ProvisioningState,
+    spawn_lighthouse: &mut crate::spawn_lighthouse_flow::SpawnLighthouseFlowState,
+) -> Option<crate::surface_card::SurfaceCardHandoff> {
+    match plane {
+        Plane::ThisNode => {
+            thisnode.show_with_system(ui, Some(system));
+            surface_card.is_surface().then(|| surface_card.show(ui)).flatten()
+        }
+        Plane::Network => { network.show(ui); None }
+        Plane::Fleet => { datacenter.show(ui); None }
+        Plane::Provisioning => { provisioning.show(ui); spawn_lighthouse.show(ui); None }
+    }
+}
+
+/// The Action Console is a first-class Workers destination, not a child of a
+/// Workbench plane. Its typed preview/authorization/commit state remains in the
+/// same egui-owned state slot and therefore survives catalog selection.
+pub(crate) fn show_action_console(ui: &mut egui::Ui) {
+    action_console::show(ui);
+}
+
 /// WL-ARCH-009 S5 — the production Workers Action Console slice. State lives in
 /// egui's context store so the already-mounted Workbench remains the sole route;
 /// no shell-root field or duplicate surface is introduced.

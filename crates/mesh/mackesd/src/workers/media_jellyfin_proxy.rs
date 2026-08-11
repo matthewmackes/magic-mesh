@@ -276,6 +276,25 @@ async fn handle_conn(
         }
     };
 
+    // Credential lookup is deliberately outside the replicated source plane and
+    // can span a Bus replacement.  Do not let an in-flight request retain the
+    // old endpoint/credential binding after that declaration has been revoked,
+    // degraded, or corrected forward.
+    let current_sources: Vec<JellyfinGatewaySource> =
+        read_jellyfin_gateway_sources_from_plane(&workgroup_root)
+            .into_iter()
+            .filter(|source| source_matches_gateway_alias(source, &gateway_aliases))
+            .collect();
+    if !route_matches_current_authority(&request.target, &route, &current_sources) {
+        let _ = write_text_response(
+            &mut stream,
+            503,
+            "jellyfin gateway source authority changed",
+        )
+        .await;
+        return;
+    }
+
     if let Err((status, message)) =
         proxy_request(&mut stream, &http, request, route, credential).await
     {
@@ -524,6 +543,15 @@ fn resolve_gateway_route(
         upstream_url,
         credential_ref: source.credential_ref.clone(),
     })
+}
+
+fn route_matches_current_authority(
+    target: &str,
+    resolved: &GatewayRoute,
+    current_sources: &[JellyfinGatewaySource],
+) -> bool {
+    resolve_gateway_route(target, current_sources)
+        .is_ok_and(|current| current == *resolved)
 }
 
 fn join_upstream_url(base: &str, suffix: &str) -> Option<String> {
@@ -921,6 +949,40 @@ mod tests {
                 .0,
             404
         );
+    }
+
+    #[test]
+    fn bus_replacement_revokes_inflight_route_until_exact_corrected_forward_authority() {
+        let initial = source(
+            "seat-15",
+            "http://jellyfin.lan:8096",
+            GatewayHealth::Healthy,
+        );
+        let target = format!("/mde/jellyfin/{}/Users/u/Items", initial.id);
+        let resolved = resolve_gateway_route(&target, std::slice::from_ref(&initial)).unwrap();
+
+        let mut rotated_credential = initial.clone();
+        rotated_credential.credential_ref = "media/jellyfin/rotated-readonly".to_string();
+        assert!(!route_matches_current_authority(
+            &target,
+            &resolved,
+            &[rotated_credential]
+        ));
+
+        let mut degraded = initial.clone();
+        degraded.health = GatewayHealth::Degraded;
+        assert!(!route_matches_current_authority(
+            &target,
+            &resolved,
+            &[degraded]
+        ));
+        assert!(!route_matches_current_authority(&target, &resolved, &[]));
+
+        assert!(route_matches_current_authority(
+            &target,
+            &resolved,
+            &[initial]
+        ));
     }
 
     #[test]

@@ -58,7 +58,13 @@ impl ResumeEntry {
     /// the end tail of a known duration — see the [module docs](self)).
     #[must_use]
     pub fn resume_position(&self) -> Option<f64> {
-        if self.completed || self.position_secs <= RESUME_MIN_SECS {
+        if self.completed
+            || !self.position_secs.is_finite()
+            || self
+                .duration_secs
+                .is_some_and(|duration| !duration.is_finite())
+            || self.position_secs <= RESUME_MIN_SECS
+        {
             return None;
         }
         if is_near_end(self.position_secs, self.duration_secs) {
@@ -165,6 +171,9 @@ impl ResumeState {
     /// when known) and mark it most recently touched. Crossing into the end tail sets
     /// `completed`; stepping back out of it clears `completed` again.
     pub fn record_position(&mut self, key: &str, position: f64, duration: Option<f64>) {
+        if !position.is_finite() || duration.is_some_and(|value| !value.is_finite()) {
+            return;
+        }
         let touch = self.touch();
         let completed = is_near_end(position, duration);
         let entry = self.entry_mut(key);
@@ -179,6 +188,9 @@ impl ResumeState {
     /// Mark `key` watched to its end (position → `duration`, `completed`), so it will
     /// not offer a resume next time. Called when a title reaches its natural EOF.
     pub fn mark_completed(&mut self, key: &str, duration: Option<f64>) {
+        if duration.is_some_and(|value| !value.is_finite()) {
+            return;
+        }
         let touch = self.touch();
         let entry = self.entry_mut(key);
         if let Some(d) = duration {
@@ -398,5 +410,34 @@ mod tests {
         assert_eq!(rs, back);
         assert_eq!(back.resume_position("a"), Some(40.0));
         assert_eq!(back.recents(10), rs.recents(10));
+    }
+
+    #[test]
+    fn non_finite_samples_cannot_poison_valid_resume_across_restart() {
+        let mut rs = ResumeState::new();
+        rs.record_position("movie", 40.0, Some(100.0));
+
+        rs.record_position("movie", f64::INFINITY, Some(100.0));
+        rs.record_position("movie", 50.0, Some(f64::NAN));
+        rs.mark_completed("movie", Some(f64::INFINITY));
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mde-media-resume-non-finite-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        rs.save(&path)
+            .expect("non-finite input must not poison persistence");
+        let back = ResumeState::load(&path).expect("restart must load the valid resume state");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back.resume_position("movie"), Some(40.0));
+        assert_eq!(back.get("movie").expect("movie").duration_secs, Some(100.0));
+        assert!(!back.get("movie").expect("movie").completed);
     }
 }

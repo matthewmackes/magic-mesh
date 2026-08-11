@@ -426,6 +426,20 @@ impl State {
     }
 
     fn from_prefs(prefs: NavBarPrefs) -> Self {
+        // A newer writer may assign different meaning to placement or pin
+        // keys.  Treating those bytes as this schema can restore a left rail
+        // or launch targets the user did not configure under this build.  Keep
+        // legacy (zero/older) migrations, but fail closed on future schemas.
+        if prefs.schema_version > NAV_PREFS_SCHEMA_VERSION {
+            return Self {
+                mode: DockMode::Floating,
+                transition: None,
+                pinned_surfaces: Vec::new(),
+                profile_state: ProfileState::Configured,
+                peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
+                pin_selector: PinSelectorState::default(),
+            };
+        }
         let pinned_surfaces = decode_pinned_surfaces(&prefs.pinned_surfaces);
         let pin_selector = PinSelectorState {
             query: String::new(),
@@ -1681,8 +1695,27 @@ fn docked_content_bottom(screen: egui::Rect) -> f32 {
     screen.bottom() - Style::SP_S
 }
 
-fn docked_control_fits(screen: egui::Rect, cursor_y: f32) -> bool {
-    cursor_y + CONTROL_EDGE <= docked_content_bottom(screen)
+fn docked_pin_rect(screen: egui::Rect, outer: egui::Rect) -> Option<egui::Rect> {
+    let y = docked_content_bottom(screen) - CONTROL_EDGE;
+    let first_control_y = screen.top() + STATUS_BAR_H + Style::SP_S;
+    (y >= first_control_y).then(|| {
+        egui::Rect::from_min_size(
+            egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, y),
+            egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+        )
+    })
+}
+
+fn docked_control_fits_before_pin(
+    screen: egui::Rect,
+    cursor_y: f32,
+    pin_rect: Option<egui::Rect>,
+) -> bool {
+    let content_bottom = pin_rect.map_or_else(
+        || docked_content_bottom(screen),
+        |pin| pin.top() - Style::SP_XS,
+    );
+    cursor_y + CONTROL_EDGE <= content_bottom
 }
 
 fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
@@ -1711,6 +1744,10 @@ fn docked_geometry_for_catalog_with_sessions(
         pinned_count,
         surfaces.len() + connected_sessions.len(),
     ));
+    // Placement is the escape hatch from a persisted Left rail. Reserve it at
+    // the physical bottom edge before admitting any other controls so a short
+    // remote viewport cannot strand the profile in Left mode after restart.
+    let pin_rect = docked_pin_rect(screen, outer);
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
     for (kind, surface) in [
         (ControlKind::Start, None),
@@ -1723,7 +1760,7 @@ fn docked_geometry_for_catalog_with_sessions(
         // fixed cluster. Admit controls one at a time so the Left rail never
         // paints a hit target outside its owned display rect; the remaining
         // catalog is handled by the bounded More path below.
-        if !docked_control_fits(screen, cursor_y) {
+        if !docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
             break;
         }
         controls.push(Control {
@@ -1740,18 +1777,19 @@ fn docked_geometry_for_catalog_with_sessions(
     cursor_y += Style::SP_S - Style::SP_XS;
     let mut available_slots: usize = 0;
     let mut slot_y = cursor_y;
-    while docked_control_fits(screen, slot_y) {
+    while docked_control_fits_before_pin(screen, slot_y, pin_rect) {
         available_slots += 1;
         slot_y += CONTROL_EDGE + Style::SP_XS;
     }
-    // Keep the placement control available when the rail has room for it.
+    // Editor consumes one of the remaining pre-placement slots. Placement was
+    // already reserved outside this budget.
     let (surface_count, session_count, pinned_count, overflow) = catalog_selection_with_sessions(
         surfaces,
         connected_sessions.len(),
         pinned_count,
-        available_slots.saturating_sub(2),
+        available_slots.saturating_sub(1),
     );
-    if docked_control_fits(screen, cursor_y) {
+    if docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
         controls.push(Control {
             kind: ControlKind::Editor,
             rect: egui::Rect::from_min_size(
@@ -1764,7 +1802,7 @@ fn docked_geometry_for_catalog_with_sessions(
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
     for surface in surfaces.iter().copied().take(surface_count) {
-        if !docked_control_fits(screen, cursor_y) {
+        if !docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
             break;
         }
         controls.push(Control {
@@ -1791,7 +1829,7 @@ fn docked_geometry_for_catalog_with_sessions(
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
     for source_index in 0..pinned_count {
-        if !docked_control_fits(screen, cursor_y) {
+        if !docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
             break;
         }
         controls.push(Control {
@@ -1805,7 +1843,7 @@ fn docked_geometry_for_catalog_with_sessions(
         });
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
-    if overflow.is_some() && docked_control_fits(screen, cursor_y) {
+    if overflow.is_some() && docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
         controls.push(Control {
             kind: ControlKind::Overflow,
             rect: egui::Rect::from_min_size(
@@ -1815,15 +1853,11 @@ fn docked_geometry_for_catalog_with_sessions(
             surface: None,
             source_index: None,
         });
-        cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
-    if docked_control_fits(screen, cursor_y) {
+    if let Some(rect) = pin_rect {
         controls.push(Control {
             kind: ControlKind::Pin,
-            rect: egui::Rect::from_min_size(
-                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
-                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
-            ),
+            rect,
             surface: None,
             source_index: None,
         });
@@ -2822,6 +2856,48 @@ mod tests {
     }
 
     #[test]
+    fn persisted_left_rail_keeps_placement_escape_on_hostile_short_restart() {
+        let state = State::from_prefs(NavBarPrefs {
+            schema_version: NAV_PREFS_SCHEMA_VERSION,
+            mode: DockMode::Docked,
+            pinned_surfaces: PIN_CATALOG
+                .iter()
+                .map(|surface| surface_key(*surface).to_owned())
+                .collect(),
+            profile_state: ProfileState::Configured,
+            ..NavBarPrefs::default()
+        });
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
+        let geometry = state.geometry_for_with_sessions(
+            screen,
+            Instant::now(),
+            MAX_PINNED_SOURCES,
+            &[SessionRailEntry::with_session_id(
+                "restart-session",
+                "Restart desktop",
+                "LIVE",
+            )],
+        );
+
+        let placement = geometry
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Pin)
+            .copied()
+            .expect("persisted Left placement must retain its Bottom escape target");
+        assert_eq!(control_action(placement, &[], &[]), Action::ToggleDock);
+        assert!(geometry.outer.contains_rect(placement.rect));
+        assert_eq!(
+            placement.rect.bottom(),
+            screen.bottom() - Style::SP_S,
+            "placement must stay anchored to the bounded rail bottom"
+        );
+        assert!(geometry.controls.iter().all(|control| {
+            control.kind == ControlKind::Pin || !control.rect.intersects(placement.rect)
+        }));
+    }
+
+    #[test]
     fn focused_taskbar_marker_is_one_centered_18_by_3_accent_with_bottom_gap() {
         let target = egui::Rect::from_min_size(egui::pos2(120.0, 752.0), egui::vec2(40.0, 40.0));
         let marker = focus_underline_rect(target);
@@ -3337,6 +3413,22 @@ mod tests {
             decode_pinned_surfaces(&decoded.pinned_surfaces),
             vec![Surface::Browser, Surface::MapsLocation]
         );
+    }
+
+    #[test]
+    fn future_preference_schema_cannot_restore_untrusted_placement_or_pins() {
+        let state = State::from_prefs(NavBarPrefs {
+            schema_version: NAV_PREFS_SCHEMA_VERSION + 1,
+            mode: DockMode::Docked,
+            pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
+            profile_state: ProfileState::New,
+            ..NavBarPrefs::default()
+        });
+
+        assert_eq!(state.mode, DockMode::Floating);
+        assert!(state.pinned_surfaces().is_empty());
+        assert!(!state.is_new_profile());
+        assert!(state.peer_app_favorites().entries().is_empty());
     }
 
     #[test]

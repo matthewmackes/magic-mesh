@@ -631,9 +631,11 @@ pub const WORKSPACE_STATE_TOPIC: &str = "state/music/workspace";
 const WORKSPACE_REVISION_FILE: &str = "music-workspace-revision";
 /// Typed mutation topic for the complete Music workspace contract.
 pub const WORKSPACE_ACTION_VERB: &str = "workspace";
-const WORKSPACE_LEDGER_SCHEMA_VERSION: u16 = 1;
+const WORKSPACE_LEDGER_SCHEMA_VERSION: u16 = 3;
+const LEGACY_WORKSPACE_LEDGER_SCHEMA_VERSIONS: [u16; 2] = [1, 2];
 const MAX_WORKSPACE_LEDGER_RECORDS: usize = 1024;
 const WORKSPACE_LEDGER_FILE: &str = "music-workspace-action-ledger.json";
+const WORKSPACE_LEDGER_RETENTION_MS: u64 = 6 * 60 * 60 * 1_000;
 const DOWNLOAD_STORE_SCHEMA_VERSION: u16 = 1;
 const DOWNLOAD_STORE_FILE: &str = "music-downloads-v1.json";
 const CATALOG_STORE_SCHEMA_VERSION: u16 = 1;
@@ -744,6 +746,15 @@ impl Default for CatalogStoreFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceLedgerRecord {
     request_id: String,
+    /// Digest of the parsed action with one-use authorization material omitted.
+    /// Legacy schema-v1 rows have no digest and therefore fail closed if their
+    /// request id is presented again after an upgrade.
+    #[serde(default)]
+    request_sha256: Option<String>,
+    /// Admission time for the fleet-wide six-hour history epoch. Legacy rows
+    /// have no trustworthy timestamp and are expired during upgrade.
+    #[serde(default)]
+    admitted_at_ms: u64,
     result: MusicActionResultV1,
 }
 
@@ -758,6 +769,13 @@ struct WorkspaceActionLedger {
     records: Vec<WorkspaceLedgerRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceReservation {
+    Reserved,
+    Duplicate,
+    Full,
+}
+
 impl WorkspaceActionLedger {
     fn contains(&self, request_id: &str) -> bool {
         self.records
@@ -765,18 +783,51 @@ impl WorkspaceActionLedger {
             .any(|record| record.request_id == request_id)
     }
 
-    fn reserve(&mut self, request_id: &str, revision: u64) -> bool {
+    fn replay_result(&self, request_id: &str, request_sha256: &str) -> Option<MusicActionResultV1> {
+        self.records
+            .iter()
+            .find(|record| record.request_id == request_id)
+            .map(|record| {
+                if record.request_sha256.as_deref() == Some(request_sha256) {
+                    record.result.clone()
+                } else {
+                    typed_result(
+                        request_id,
+                        false,
+                        record.result.revision,
+                        Some("conflicting_request_id"),
+                    )
+                }
+            })
+    }
+
+    fn reserve(
+        &mut self,
+        request_id: &str,
+        request_sha256: String,
+        revision: u64,
+        admitted_at_ms: u64,
+    ) -> WorkspaceReservation {
+        self.records.retain(|record| {
+            admitted_at_ms.saturating_sub(record.admitted_at_ms)
+                <= WORKSPACE_LEDGER_RETENTION_MS
+        });
         if self.contains(request_id) {
-            return false;
+            return WorkspaceReservation::Duplicate;
         }
-        if self.records.len() == MAX_WORKSPACE_LEDGER_RECORDS {
-            self.records.remove(0);
+        if self.records.len() >= MAX_WORKSPACE_LEDGER_RECORDS {
+            // Never evict a still-live request identity to make room. Doing so
+            // would let its one-use signed action execute again inside the
+            // six-hour privacy/replay epoch. Saturation is safer than replay.
+            return WorkspaceReservation::Full;
         }
         self.records.push(WorkspaceLedgerRecord {
             request_id: request_id.to_string(),
+            request_sha256: Some(request_sha256),
+            admitted_at_ms,
             result: typed_result(request_id, false, revision, Some("in_flight")),
         });
-        true
+        WorkspaceReservation::Reserved
     }
 
     fn finish(&mut self, request_id: &str, result: MusicActionResultV1) {
@@ -793,6 +844,11 @@ impl WorkspaceActionLedger {
         self.records
             .retain(|record| record.request_id != request_id);
     }
+}
+
+fn workspace_request_sha256(request: &MusicActionRequestV1) -> Result<String, serde_json::Error> {
+    serde_json::to_vec(request)
+        .map(|bytes| music_action_auth::hex_encode(&music_action_auth::sha256(&bytes)))
 }
 
 fn workspace_ledger_path(dir: &Path) -> PathBuf {
@@ -873,7 +929,7 @@ fn persist_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<
     result
 }
 
-fn load_workspace_ledger(dir: &Path) -> std::io::Result<WorkspaceActionLedger> {
+fn load_workspace_ledger_at(dir: &Path, now_ms: u64) -> std::io::Result<WorkspaceActionLedger> {
     let path = workspace_ledger_path(dir);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Ok(WorkspaceActionLedger::default());
@@ -885,13 +941,23 @@ fn load_workspace_ledger(dir: &Path) -> std::io::Result<WorkspaceActionLedger> {
         )
     })?;
     let mut request_ids = HashSet::with_capacity(file.records.len());
-    let invalid = file.schema_version != WORKSPACE_LEDGER_SCHEMA_VERSION
+    let legacy_schema = LEGACY_WORKSPACE_LEDGER_SCHEMA_VERSIONS.contains(&file.schema_version);
+    let invalid = (!legacy_schema && file.schema_version != WORKSPACE_LEDGER_SCHEMA_VERSION)
         || file.records.len() > MAX_WORKSPACE_LEDGER_RECORDS
         || file.records.iter().any(|record| {
             record.request_id.is_empty()
                 || record.request_id.len() > crate::domain::MAX_REQUEST_ID_BYTES
                 || record.request_id.chars().any(char::is_control)
                 || record.result.request_id != record.request_id
+                || record.request_sha256.as_deref().is_some_and(|digest| {
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                || (!legacy_schema && record.request_sha256.is_none())
+                || (!legacy_schema
+                    && (record.admitted_at_ms == 0 || record.admitted_at_ms > now_ms))
                 || !request_ids.insert(record.request_id.clone())
         });
     if invalid {
@@ -900,9 +966,31 @@ fn load_workspace_ledger(dir: &Path) -> std::io::Result<WorkspaceActionLedger> {
             "music action ledger has an unsupported schema or bound violation",
         ));
     }
-    Ok(WorkspaceActionLedger {
-        records: file.records,
-    })
+    let original_len = file.records.len();
+    let records = if legacy_schema {
+        // Pre-v3 rows have no timestamp, so their age cannot be proven inside
+        // the fleet-wide privacy epoch. Expire them all instead of preserving
+        // unbounded action history through an upgrade.
+        Vec::new()
+    } else {
+        file.records
+            .into_iter()
+            .filter(|record| {
+                now_ms.saturating_sub(record.admitted_at_ms) <= WORKSPACE_LEDGER_RETENTION_MS
+            })
+            .collect()
+    };
+    let ledger = WorkspaceActionLedger { records };
+    if legacy_schema || ledger.records.len() != original_len {
+        // Rewrite immediately so an idle daemon does not leave expired history
+        // on disk until the next user action.
+        persist_workspace_ledger(dir, &ledger)?;
+    }
+    Ok(ledger)
+}
+
+fn load_workspace_ledger(dir: &Path) -> std::io::Result<WorkspaceActionLedger> {
+    load_workspace_ledger_at(dir, state::now_ms())
 }
 
 fn persist_workspace_ledger(dir: &Path, ledger: &WorkspaceActionLedger) -> std::io::Result<()> {
@@ -3844,7 +3932,7 @@ fn poll_workspace_with_authorizer(
                     queue::revision(&queue),
                     Some(error_code),
                 )
-            } else {
+            } else if let Ok(request_sha256) = workspace_request_sha256(&request) {
                 let Some(action_ledger) = ledger.as_mut() else {
                     // A corrupt/unreadable retained ledger disables typed
                     // mutations for this process; reads and legacy lanes keep
@@ -3864,95 +3952,111 @@ fn poll_workspace_with_authorizer(
                     );
                     continue;
                 };
-                if action_ledger.contains(&request.request_id) {
-                    action_ledger
-                        .records
-                        .iter()
-                        .find(|record| record.request_id == request.request_id)
-                        .map(|record| record.result.clone())
-                        .unwrap_or_else(|| {
-                            typed_result(
-                                &request.request_id,
-                                false,
-                                queue::revision(&queue),
-                                Some("replayed_request"),
-                            )
-                        })
+                if let Some(result) =
+                    action_ledger.replay_result(&request.request_id, &request_sha256)
+                {
+                    result
                 } else {
                     let revision = queue::revision(&queue);
-                    if !action_ledger.reserve(&request.request_id, revision) {
-                        typed_result(
+                    match action_ledger.reserve(
+                        &request.request_id,
+                        request_sha256,
+                        revision,
+                        state::now_ms(),
+                    ) {
+                        WorkspaceReservation::Duplicate => typed_result(
                             &request.request_id,
                             false,
                             revision,
                             Some("replayed_request"),
-                        )
-                    } else if persist_workspace_ledger(&data_dir, action_ledger).is_err() {
-                        action_ledger.release(&request.request_id);
-                        typed_result(
+                        ),
+                        WorkspaceReservation::Full => typed_result(
                             &request.request_id,
                             false,
                             revision,
-                            Some("ledger_unavailable"),
-                        )
-                    } else if request
-                        .expected_queue_revision
-                        .is_some_and(|expected| expected != revision)
-                    {
-                        let result = typed_result(
-                            &request.request_id,
-                            false,
-                            revision,
-                            Some("stale_queue_revision"),
-                        );
-                        action_ledger.finish(&request.request_id, result.clone());
-                        let _ = persist_workspace_ledger(&data_dir, action_ledger);
-                        result
-                    } else {
-                        let previous_queue = queue.clone();
-                        let coordination_dir = state::coordination_dir();
-                        let result = match apply_workspace_action_with_clients_and_coordination(
-                            &request,
-                            &mut queue,
-                            engine,
-                            clients,
-                            rt,
-                            &data_dir,
-                            &coordination_dir,
-                        ) {
-                            Ok(mutated) => {
-                                if mutated && queue::write_to(queue_path, &queue).is_err() {
-                                    queue = previous_queue;
-                                    typed_result(
+                            Some("ledger_full"),
+                        ),
+                        WorkspaceReservation::Reserved => {
+                            if persist_workspace_ledger(&data_dir, action_ledger).is_err() {
+                                action_ledger.release(&request.request_id);
+                                typed_result(
+                                    &request.request_id,
+                                    false,
+                                    revision,
+                                    Some("ledger_unavailable"),
+                                )
+                            } else if request
+                                .expected_queue_revision
+                                .is_some_and(|expected| expected != revision)
+                            {
+                                let result = typed_result(
+                                    &request.request_id,
+                                    false,
+                                    revision,
+                                    Some("stale_queue_revision"),
+                                );
+                                action_ledger.finish(&request.request_id, result.clone());
+                                let _ = persist_workspace_ledger(&data_dir, action_ledger);
+                                result
+                            } else {
+                                let previous_queue = queue.clone();
+                                let coordination_dir = state::coordination_dir();
+                                let result = match apply_workspace_action_with_clients_and_coordination(
+                                    &request,
+                                    &mut queue,
+                                    engine,
+                                    clients,
+                                    rt,
+                                    &data_dir,
+                                    &coordination_dir,
+                                ) {
+                                    Ok(mutated) => {
+                                        if mutated && queue::write_to(queue_path, &queue).is_err() {
+                                            queue = previous_queue;
+                                            typed_result(
+                                                &request.request_id,
+                                                false,
+                                                revision,
+                                                Some("state_persist_failed"),
+                                            )
+                                        } else {
+                                            typed_result(
+                                                &request.request_id,
+                                                true,
+                                                queue::revision(&queue),
+                                                None,
+                                            )
+                                        }
+                                    }
+                                    Err(error_code) => typed_result(
                                         &request.request_id,
                                         false,
                                         revision,
-                                        Some("state_persist_failed"),
-                                    )
-                                } else {
-                                    typed_result(
-                                        &request.request_id,
-                                        true,
-                                        queue::revision(&queue),
-                                        None,
-                                    )
+                                        Some(error_code),
+                                    ),
+                                };
+                                action_ledger.finish(&request.request_id, result.clone());
+                                if let Err(error) =
+                                    persist_workspace_ledger(&data_dir, action_ledger)
+                                {
+                                    tracing::error!(
+                                        request_id = %request.request_id,
+                                        error = %error,
+                                        "music action ledger finalization failed"
+                                    );
                                 }
+                                result
                             }
-                            Err(error_code) => {
-                                typed_result(&request.request_id, false, revision, Some(error_code))
-                            }
-                        };
-                        action_ledger.finish(&request.request_id, result.clone());
-                        if let Err(error) = persist_workspace_ledger(&data_dir, action_ledger) {
-                            tracing::error!(
-                                request_id = %request.request_id,
-                                error = %error,
-                                "music action ledger finalization failed"
-                            );
                         }
-                        result
                     }
                 }
+            } else {
+                typed_result(
+                    &request.request_id,
+                    false,
+                    queue::revision(&queue),
+                    Some("invalid_request"),
+                )
             }
         };
         let reply = typed_reply(&reply);
@@ -6268,19 +6372,21 @@ fn poll_once_with_authorizer(
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let body = msg.body.as_deref().unwrap_or("");
-            let d = match authorize_music_mutation(authorizer, verb, body) {
+            let previous_queue = q.clone();
+            let mut d = match authorize_music_mutation(authorizer, verb, body) {
                 Err(error) => error_reply(&format!("{verb}: authorization refused: {error}")),
                 Ok(()) => dispatch_queue_action(verb, body, &mut q),
             };
+            if d.mutated && queue::write_to(queue_path, &q).is_err() {
+                q = previous_queue;
+                d = error_reply(&format!("{verb}: queue persistence failed"));
+            }
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
                 None,
                 Some(&d.reply_json),
             );
-            if d.mutated {
-                let _ = queue::write_to(queue_path, &q);
-            }
         }
     }
 }
@@ -7200,6 +7306,84 @@ mod tests {
     }
 
     #[test]
+    fn failed_queue_persistence_cannot_publish_success_or_leak_mutation_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().join("bus")).unwrap();
+        let queue_path = dir.path().join("queue.json");
+        std::fs::create_dir(&queue_path).unwrap();
+        let authorizer = test_authorizer(dir.path());
+        let failed_body = armed_test_body(
+            r#"{"schema_version":1,"song_id":"must-not-leak"}"#,
+            "enqueue",
+            "queue",
+            "music-nonce-persist-failure",
+        );
+        let failed = persist
+            .write(
+                "action/music/enqueue",
+                Priority::Default,
+                None,
+                Some(&failed_body),
+            )
+            .unwrap();
+        let observed = persist
+            .write(
+                "action/music/get-queue",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .unwrap();
+
+        let mut cursors = HashMap::new();
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
+
+        let failed_reply = persist
+            .list_since(&reply_topic(&failed.ulid), None)
+            .unwrap();
+        assert_eq!(failed_reply.len(), 1);
+        assert!(failed_reply[0]
+            .body
+            .as_deref()
+            .unwrap_or("")
+            .contains(r#""ok":false"#));
+        let observed_reply = persist
+            .list_since(&reply_topic(&observed.ulid), None)
+            .unwrap();
+        assert_eq!(observed_reply.len(), 1);
+        assert!(observed_reply[0]
+            .body
+            .as_deref()
+            .unwrap_or("")
+            .contains(r#""songs":[]"#));
+
+        std::fs::remove_dir(&queue_path).unwrap();
+        let corrected_body = armed_test_body(
+            r#"{"schema_version":1,"song_id":"corrected-forward"}"#,
+            "enqueue",
+            "queue",
+            "music-nonce-corrected-forward",
+        );
+        let corrected = persist
+            .write(
+                "action/music/enqueue",
+                Priority::Default,
+                None,
+                Some(&corrected_body),
+            )
+            .unwrap();
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
+        assert_eq!(queue::read_from(&queue_path).songs, vec!["corrected-forward"]);
+        assert!(persist
+            .list_since(&reply_topic(&corrected.ulid), None)
+            .unwrap()[0]
+            .body
+            .as_deref()
+            .unwrap_or("")
+            .contains(r#""ok":true"#));
+    }
+
+    #[test]
     fn queue_action_recovery_reads_a_bounded_page_and_advances_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let persist = Persist::open(dir.path().join("bus")).unwrap();
@@ -7778,28 +7962,160 @@ mod tests {
     fn workspace_ledger_is_bounded_and_replays_without_side_effect() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = WorkspaceActionLedger::default();
-        assert!(ledger.reserve("request-0", 7));
+        let now_ms = state::now_ms();
+        assert_eq!(
+            ledger.reserve("request-0", "0".repeat(64), 7, now_ms),
+            WorkspaceReservation::Reserved
+        );
         ledger.finish("request-0", typed_result("request-0", true, 8, None));
-        assert!(!ledger.reserve("request-0", 9));
+        assert_eq!(
+            ledger.reserve("request-0", "0".repeat(64), 9, now_ms),
+            WorkspaceReservation::Duplicate
+        );
 
-        for index in 1..=MAX_WORKSPACE_LEDGER_RECORDS {
-            assert!(ledger.reserve(&format!("request-{index}"), index as u64));
+        for index in 1..MAX_WORKSPACE_LEDGER_RECORDS {
+            assert_eq!(
+                ledger.reserve(
+                    &format!("request-{index}"),
+                    format!("{index:064x}"),
+                    index as u64,
+                    now_ms,
+                ),
+                WorkspaceReservation::Reserved
+            );
         }
         assert_eq!(ledger.records.len(), MAX_WORKSPACE_LEDGER_RECORDS);
-        assert!(!ledger.contains("request-0"));
-        assert!(ledger.contains("request-1024"));
+        assert!(ledger.contains("request-0"));
+        assert!(ledger.contains("request-1023"));
 
         persist_workspace_ledger(dir.path(), &ledger).unwrap();
         let restored = load_workspace_ledger(dir.path()).unwrap();
         assert_eq!(restored.records.len(), MAX_WORKSPACE_LEDGER_RECORDS);
-        assert!(restored.contains("request-1024"));
+        assert!(restored.contains("request-0"));
+    }
+
+    #[test]
+    fn saturated_workspace_ledger_cannot_reenable_consumed_request_inside_privacy_epoch() {
+        let now_ms = 10 * WORKSPACE_LEDGER_RETENTION_MS;
+        let mut ledger = WorkspaceActionLedger::default();
+        for index in 0..MAX_WORKSPACE_LEDGER_RECORDS {
+            assert_eq!(
+                ledger.reserve(
+                    &format!("request-{index}"),
+                    format!("{index:064x}"),
+                    index as u64,
+                    now_ms,
+                ),
+                WorkspaceReservation::Reserved
+            );
+        }
+
+        assert_eq!(
+            ledger.reserve("new-request", "f".repeat(64), 2_000, now_ms),
+            WorkspaceReservation::Full
+        );
+        assert_eq!(ledger.records.len(), MAX_WORKSPACE_LEDGER_RECORDS);
+        assert!(ledger.replay_result("request-0", &"0".repeat(64)).is_some());
+        assert_eq!(
+            ledger.reserve("request-0", "0".repeat(64), 2_001, now_ms),
+            WorkspaceReservation::Duplicate
+        );
+    }
+
+    #[test]
+    fn workspace_ledger_rejects_conflicting_request_id_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let play: MusicActionRequestV1 = serde_json::from_value(json!({
+            "schema_version": MUSIC_CONTRACT_VERSION,
+            "request_id": "durable-id",
+            "action": "play"
+        }))
+        .unwrap();
+        let pause: MusicActionRequestV1 = serde_json::from_value(json!({
+            "schema_version": MUSIC_CONTRACT_VERSION,
+            "request_id": "durable-id",
+            "action": "pause"
+        }))
+        .unwrap();
+        let play_sha256 = workspace_request_sha256(&play).unwrap();
+        let pause_sha256 = workspace_request_sha256(&pause).unwrap();
+        assert_ne!(play_sha256, pause_sha256);
+
+        let mut ledger = WorkspaceActionLedger::default();
+        assert_eq!(
+            ledger.reserve("durable-id", play_sha256.clone(), 11, state::now_ms(),),
+            WorkspaceReservation::Reserved
+        );
+        ledger.finish("durable-id", typed_result("durable-id", true, 12, None));
+        persist_workspace_ledger(dir.path(), &ledger).unwrap();
+
+        let restored = load_workspace_ledger(dir.path()).unwrap();
+        let exact_replay = restored.replay_result("durable-id", &play_sha256).unwrap();
+        assert!(exact_replay.accepted);
+        assert_eq!(exact_replay.revision, 12);
+
+        let conflicting_replay = restored.replay_result("durable-id", &pause_sha256).unwrap();
+        assert!(!conflicting_replay.accepted);
+        assert_eq!(
+            conflicting_replay.error_code.as_deref(),
+            Some("conflicting_request_id")
+        );
+    }
+
+    #[test]
+    fn workspace_ledger_restart_enforces_six_hour_privacy_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let now_ms = 10 * WORKSPACE_LEDGER_RETENTION_MS;
+        let mut ledger = WorkspaceActionLedger::default();
+        assert_eq!(
+            ledger.reserve(
+                "expired",
+                "a".repeat(64),
+                1,
+                now_ms - WORKSPACE_LEDGER_RETENTION_MS - 1,
+            ),
+            WorkspaceReservation::Reserved
+        );
+        assert_eq!(
+            ledger.reserve(
+                "boundary",
+                "b".repeat(64),
+                2,
+                now_ms - WORKSPACE_LEDGER_RETENTION_MS,
+            ),
+            WorkspaceReservation::Reserved
+        );
+        persist_workspace_ledger(dir.path(), &ledger).unwrap();
+
+        let restored = load_workspace_ledger_at(dir.path(), now_ms).unwrap();
+        assert!(!restored.contains("expired"));
+        assert!(restored.contains("boundary"));
+        let rewritten: WorkspaceLedgerFile =
+            serde_json::from_slice(&std::fs::read(workspace_ledger_path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(rewritten.schema_version, WORKSPACE_LEDGER_SCHEMA_VERSION);
+        assert_eq!(rewritten.records.len(), 1);
+        assert_eq!(rewritten.records[0].request_id, "boundary");
+
+        let mut future = restored;
+        assert_eq!(
+            future.reserve("future", "c".repeat(64), 3, now_ms + 1),
+            WorkspaceReservation::Reserved
+        );
+        persist_workspace_ledger(dir.path(), &future).unwrap();
+        let error = load_workspace_ledger_at(dir.path(), now_ms)
+            .expect_err("future-dated retained action history must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn retained_music_json_is_private_and_leaves_no_temporary_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = WorkspaceActionLedger::default();
-        assert!(ledger.reserve("private-state", 1));
+        assert_eq!(
+            ledger.reserve("private-state", "0".repeat(64), 1, state::now_ms(),),
+            WorkspaceReservation::Reserved
+        );
         persist_workspace_ledger(dir.path(), &ledger).unwrap();
         persist_workspace_ledger(dir.path(), &ledger).unwrap();
 
@@ -8404,12 +8720,9 @@ mod tests {
             "ftp://stream.test/live",
             "https:///missing-host",
         ] {
-            let content = ContentRef::new(
-                "airsonic:http://radio.test",
-                remote_id,
-                ContentKind::Radio,
-            )
-            .expect("test content identity");
+            let content =
+                ContentRef::new("airsonic:http://radio.test", remote_id, ContentKind::Radio)
+                    .expect("test content identity");
             assert_eq!(
                 direct_radio_stream_url(&content),
                 None,
@@ -8423,7 +8736,10 @@ mod tests {
             ContentKind::Radio,
         )
         .expect("test content identity");
-        assert_eq!(direct_radio_stream_url(&safe), Some(safe.remote_id.as_str()));
+        assert_eq!(
+            direct_radio_stream_url(&safe),
+            Some(safe.remote_id.as_str())
+        );
     }
 
     #[test]

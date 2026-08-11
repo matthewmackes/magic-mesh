@@ -19,24 +19,25 @@ use std::{
 };
 
 use mackes_mesh_types::media_sources::{
-    JELLYFIN_GATEWAY_USER_SENTINEL, MediaKind as MeshMediaKind, MediaSource as MeshMediaSource,
-    MediaSourcesState, Reachability as MeshReachability, SourceOrigin as MeshSourceOrigin,
+    MediaKind as MeshMediaKind, MediaSource as MeshMediaSource, MediaSourcesState,
+    Reachability as MeshReachability, SourceOrigin as MeshSourceOrigin,
+    JELLYFIN_GATEWAY_USER_SENTINEL,
 };
 use mde_jellyfin::{
-    BaseItemDto, CacheEntry, CacheRequest, ClientCapabilities, HttpTransport, ItemsQuery,
-    JellyfinAccessPolicy, JellyfinClient, JellyfinError, MediaSourceInfo, MetadataCache,
-    OfflineCache, PlaybackDecision, PlaybackMethod, PlaybackReport, ServerAuth, ServerConfig,
-    ServerStore, StreamMediaType, build_playback_decision, direct_play_url,
+    build_playback_decision, direct_play_url, BaseItemDto, CacheEntry, CacheRequest,
+    ClientCapabilities, HttpTransport, ItemsQuery, JellyfinAccessPolicy, JellyfinClient,
+    JellyfinError, MediaSourceInfo, MetadataCache, OfflineCache, PlaybackDecision, PlaybackMethod,
+    PlaybackReport, ServerAuth, ServerConfig, ServerStore, StreamMediaType,
 };
 use mde_media_core::{
-    AbLoop, AudioConfig, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
-    CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget, Caster, ChromecastProbe, EqBand,
-    JoinOutcome, Library, LibraryItem, LoginOutcome, LoudnessNorm, MediaEngine, MediaKind, MeshRoster,
-    MpvCapabilities, NetworkCaster, PartyPoll, PartySession, PlaybackControls, Player, PlayerEvent,
-    PlayerState, Playlist, PlaylistItem, PollOutcome, RendererDiscovery, RepeatMode,
-    ReplayGainMode, RoamingSession, ScreenshotMode, SortKey, SsdpProbe, SyncCommand, Track,
-    TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError, YtDlpResolver, classify_url,
-    discover_all, unix_millis,
+    classify_url, discover_all, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice,
+    CaptureEnumerator, CaptureError, CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget,
+    Caster, ChromecastProbe, EqBand, JoinOutcome, Library, LibraryItem, LoginOutcome, LoudnessNorm,
+    MediaEngine, MediaKind, MeshRoster, MpvCapabilities, NetworkCaster, PartyPoll, PartySession,
+    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, PollOutcome,
+    RendererDiscovery, RepeatMode, ReplayGainMode, RoamingSession, ScreenshotMode, SortKey,
+    SsdpProbe, SyncCommand, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
+    YtDlpResolver,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -412,6 +413,10 @@ pub struct JellyfinState {
     /// separate from [`ServerStore`]: gateway rows are visible before credential
     /// materialization exists, but they do not become local saved-token servers.
     mesh_sources: Option<MediaSourcesState>,
+    /// Highest media-source publication admitted during this controller lifetime.
+    /// Retained separately from `mesh_sources` so an explicit withdrawal cannot
+    /// later be undone by an out-of-order Bus record.
+    mesh_sources_published_at_ms: Option<u64>,
     /// User-preferred mesh Jellyfin source id. The active route uses this only
     /// while the roster says it is reachable, otherwise it fails over honestly.
     selected_mesh_source: Option<String>,
@@ -428,6 +433,7 @@ impl Default for JellyfinState {
             cache: OfflineCache::new(),
             metadata_cache: MetadataCache::new(),
             mesh_sources: None,
+            mesh_sources_published_at_ms: None,
             selected_mesh_source: None,
         }
     }
@@ -1140,24 +1146,18 @@ impl<E: MediaEngine> MediaController<E> {
         });
     }
 
-    fn start_cast_discovery_with<F>(
-        &mut self,
-        now: Instant,
-        discover: F,
-    ) -> bool
+    fn start_cast_discovery_with<F>(&mut self, now: Instant, discover: F) -> bool
     where
         F: FnOnce() -> Vec<CastTarget> + Send + 'static,
     {
         if self.cast_discovery_worker.is_some() {
-            self.ui.status = Some(
-                "Cast discovery is already running; showing the last results.".to_owned(),
-            );
+            self.ui.status =
+                Some("Cast discovery is already running; showing the last results.".to_owned());
             return false;
         }
         if !cast_discovery_is_due(self.last_cast_discovery, now) {
-            self.ui.status = Some(
-                "Cast discovery is cooling down; showing the last results.".to_owned(),
-            );
+            self.ui.status =
+                Some("Cast discovery is cooling down; showing the last results.".to_owned());
             return false;
         }
         let (sender, results) = std::sync::mpsc::channel();
@@ -1194,14 +1194,12 @@ impl<E: MediaEngine> MediaController<E> {
                 self.ui.status = Some("Cast discovery ended without a result.".to_owned());
             }
             Err(std::sync::mpsc::TryRecvError::Empty)
-                if now.saturating_duration_since(worker.started_at)
-                    >= CAST_DISCOVERY_DEADLINE =>
+                if now.saturating_duration_since(worker.started_at) >= CAST_DISCOVERY_DEADLINE =>
             {
                 self.cast_discovery_worker = None;
                 self.cast.probed = true;
-                self.ui.status = Some(
-                    "Cast discovery timed out; showing the last results.".to_owned(),
-                );
+                self.ui.status =
+                    Some("Cast discovery timed out; showing the last results.".to_owned());
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -1701,9 +1699,22 @@ impl<E: MediaEngine> MediaController<E> {
     ///
     /// This is a pure state seam. The live Bus reader lands outside the local
     /// server token store and feeds this method with the decoded
-    /// `state/media/sources` record.
+    /// `state/media/sources` record. Out-of-order publications are ignored so an
+    /// older reachable roster cannot restore authority revoked by a newer one.
     pub fn set_mesh_media_sources(&mut self, state: Option<MediaSourcesState>) {
-        self.jellyfin.mesh_sources = state;
+        let Some(state) = state else {
+            self.jellyfin.mesh_sources = None;
+            return;
+        };
+        if self
+            .jellyfin
+            .mesh_sources_published_at_ms
+            .is_some_and(|current| state.published_at_ms < current)
+        {
+            return;
+        }
+        self.jellyfin.mesh_sources_published_at_ms = Some(state.published_at_ms);
+        self.jellyfin.mesh_sources = Some(state);
     }
 
     /// Select a mesh-published Jellyfin source as this user's preference.
@@ -2226,9 +2237,7 @@ fn cast_err(kind: CastKind, error: &CastError) -> String {
 /// Whether another live cast discovery may start at `now`.
 #[must_use]
 fn cast_discovery_is_due(last: Option<Instant>, now: Instant) -> bool {
-    last.is_none_or(|last| {
-        now.saturating_duration_since(last) >= CAST_DISCOVERY_REFRESH_INTERVAL
-    })
+    last.is_none_or(|last| now.saturating_duration_since(last) >= CAST_DISCOVERY_REFRESH_INTERVAL)
 }
 
 /// The display title of a Jellyfin item — its name, else its id (never empty).
@@ -2812,13 +2821,12 @@ mod tests {
             MediaTab::Player,
             "resume jumps to the Player view"
         );
-        assert!(
-            b.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("followed you")
-        );
+        assert!(b
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("followed you"));
         b.pump(); // Loading → Playing, then the pending resume seek lands
         assert_eq!(b.player().state(), PlayerState::Paused);
         assert!((b.player().position() - 30.0).abs() < f64::EPSILON);
@@ -2828,13 +2836,12 @@ mod tests {
         assert_eq!(a.player().state(), PlayerState::Playing);
         a.poll_roaming();
         assert_eq!(a.player().state(), PlayerState::Paused);
-        assert!(
-            a.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("another seat")
-        );
+        assert!(a
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("another seat"));
         // B still owns on its own poll.
         b.poll_roaming();
         assert_eq!(
@@ -2851,7 +2858,7 @@ mod tests {
         let mut c = loaded();
         assert!(!c.roaming_enabled());
         c.poll_roaming(); // no-op, no panic
-        // Enabling over an unprovisioned root is honest offline — no resume, no status.
+                          // Enabling over an unprovisioned root is honest offline — no resume, no status.
         let outcome = c.enable_roaming(RoamingSession::new(
             mde_media_core::RoamingStore::new(std::path::PathBuf::from("/no/such/mesh/root")),
             "matthew",
@@ -2916,13 +2923,12 @@ mod tests {
             (b.player().position() - 45.0).abs() < 1.0,
             "B seeked in sync"
         );
-        assert!(
-            b.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("another seat")
-        );
+        assert!(b
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("another seat"));
 
         // Leaving drops the seat from the party membership.
         b.leave_party();
@@ -2941,13 +2947,12 @@ mod tests {
             "seat-a",
         ));
         assert_eq!(outcome, JoinOutcome::Offline);
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("mesh volume")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mesh volume"));
     }
 
     /// A canned discovery + a scripted caster, so the cast picker + throw are exercised
@@ -3051,13 +3056,12 @@ mod tests {
         assert_eq!(c.cast().targets().len(), 1);
 
         c.cast_to("tv-1", &FakeCaster(Ok(())));
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Casting to Living Room TV")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Casting to Living Room TV"));
     }
 
     #[test]
@@ -3067,13 +3071,12 @@ mod tests {
         c.refresh_cast_targets(&FakeDiscovery(vec![]));
         assert!(c.cast().probed());
         assert!(c.cast().targets().is_empty());
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("No cast renderer")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No cast renderer"));
 
         // A typed gate from the caster is surfaced with what it needs (never faked).
         c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
@@ -3084,13 +3087,12 @@ mod tests {
                 needs: "the CASTV2 launch handshake",
             })),
         );
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("CASTV2")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CASTV2"));
     }
 
     #[test]
@@ -3098,13 +3100,12 @@ mod tests {
         let mut c = controller(); // nothing loaded
         c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
         c.cast_to("tv-1", &FakeCaster(Ok(())));
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Load something to cast")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Load something to cast"));
     }
 
     // ── network streams + yt-dlp (MEDIA-12) ──────────────────────────────────────
@@ -3222,13 +3223,12 @@ mod tests {
         // Nothing loaded, the field is kept so the operator can retry.
         assert_eq!(c.player().state(), PlayerState::Idle);
         assert_eq!(c.player().media(), None);
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("yt-dlp")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("yt-dlp"));
     }
 
     #[test]
@@ -3424,12 +3424,11 @@ mod tests {
         let mut c = loaded();
         c.dispatch(TransportAction::SetSpeed(2.0));
         assert!((c.player().controls().speed - 2.0).abs() < f64::EPSILON);
-        assert!(
-            c.player()
-                .engine()
-                .applied_control_properties()
-                .contains(&("speed".to_owned(), "2".to_owned()))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_control_properties()
+            .contains(&("speed".to_owned(), "2".to_owned())));
     }
 
     #[test]
@@ -3445,12 +3444,11 @@ mod tests {
             c.player().controls().ab_loop,
             AbLoop::Range { a: 10.0, b: 30.0 }
         );
-        assert!(
-            c.player()
-                .engine()
-                .applied_control_properties()
-                .contains(&("ab-loop-a".to_owned(), "10".to_owned()))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_control_properties()
+            .contains(&("ab-loop-a".to_owned(), "10".to_owned())));
         // Clearing folds Off back to the engine.
         c.dispatch(TransportAction::ClearAbLoop);
         assert_eq!(c.player().controls().ab_loop, AbLoop::Off);
@@ -3472,12 +3470,11 @@ mod tests {
     fn select_track_folds_the_sid_to_the_engine() {
         let mut c = loaded();
         c.dispatch(TransportAction::SelectTrack(TrackKind::Subtitle, 1));
-        assert!(
-            c.player()
-                .engine()
-                .applied_track_properties()
-                .contains(&("sid".to_owned(), "1".to_owned()))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_track_properties()
+            .contains(&("sid".to_owned(), "1".to_owned())));
     }
 
     // ── queue glue ───────────────────────────────────────────────────────────────
@@ -3589,46 +3586,41 @@ mod tests {
     fn loudness_and_replaygain_and_gapless_fold_to_engine_properties() {
         let mut c = controller();
         // Default: PipeWire ao pinned first, null fallback available, gapless on.
-        assert!(
-            c.audio_config()
-                .properties()
-                .contains(&("ao".to_owned(), "pipewire,null".to_owned()))
-        );
+        assert!(c
+            .audio_config()
+            .properties()
+            .contains(&("ao".to_owned(), "pipewire,null".to_owned())));
 
         c.dispatch(TransportAction::SetLoudness(EBU_R128_DEFAULT));
         assert_eq!(c.audio_config().loudness, EBU_R128_DEFAULT);
-        assert!(
-            c.player()
-                .engine()
-                .applied_af()
-                .is_some_and(|af| af.contains("loudnorm=I=-16"))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_af()
+            .is_some_and(|af| af.contains("loudnorm=I=-16")));
 
         c.dispatch(TransportAction::SetLoudness(LoudnessNorm::Dynamic));
-        assert!(
-            c.player()
-                .engine()
-                .applied_af()
-                .is_some_and(|af| af.contains("dynaudnorm"))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_af()
+            .is_some_and(|af| af.contains("dynaudnorm")));
 
         c.dispatch(TransportAction::SetReplayGain(ReplayGainMode::Album));
-        assert!(
-            c.player()
-                .engine()
-                .applied_properties()
-                .contains(&("replaygain".to_owned(), "album".to_owned()))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_properties()
+            .contains(&("replaygain".to_owned(), "album".to_owned())));
 
         assert!(c.audio_config().gapless);
         c.dispatch(TransportAction::ToggleGapless);
         assert!(!c.audio_config().gapless);
-        assert!(
-            c.player()
-                .engine()
-                .applied_properties()
-                .contains(&("gapless-audio".to_owned(), "no".to_owned()))
-        );
+        assert!(c
+            .player()
+            .engine()
+            .applied_properties()
+            .contains(&("gapless-audio".to_owned(), "no".to_owned())));
     }
 
     // ── library browse fold ──────────────────────────────────────────────────────
@@ -4101,11 +4093,9 @@ mod tests {
             .sources[0]
             .endpoint = "https://gateway-a.mesh:8097/mde/jellyfin/unsafe-only\n".to_string();
         assert!(blocked.mesh_jellyfin_sources().is_empty());
-        assert!(
-            blocked
-                .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
-                .is_err()
-        );
+        assert!(blocked
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .is_err());
     }
 
     #[test]
@@ -4254,6 +4244,59 @@ mod tests {
         assert!(!c.select_mesh_jellyfin_source("missing"));
     }
 
+    #[test]
+    fn stale_mesh_roster_cannot_restore_revoked_gateway_authority() {
+        let mut c = controller();
+        let reachable = mesh_jellyfin_source(
+            "gateway",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        let mut admitted = mesh_jellyfin_state(vec![reachable.clone()]);
+        admitted.published_at_ms = 10;
+        c.set_mesh_media_sources(Some(admitted));
+        assert!(c
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .is_ok());
+
+        let mut withdrawn = reachable.clone();
+        withdrawn.reachability = MeshReachability::Unreachable;
+        withdrawn.reason = Some("gateway readiness lost".to_string());
+        let mut newer = mesh_jellyfin_state(vec![withdrawn]);
+        newer.published_at_ms = 20;
+        c.set_mesh_media_sources(Some(newer));
+        assert!(
+            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+                .is_err(),
+            "the newer withdrawal must revoke gateway use"
+        );
+
+        let mut stale = mesh_jellyfin_state(vec![reachable.clone()]);
+        stale.published_at_ms = 11;
+        c.set_mesh_media_sources(Some(stale));
+        assert_eq!(
+            c.jellyfin()
+                .mesh_sources()
+                .expect("newer withdrawal retained")
+                .published_at_ms,
+            20
+        );
+        assert!(
+            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+                .is_err(),
+            "an out-of-order reachable roster must not restore revoked authority"
+        );
+
+        let mut corrected = mesh_jellyfin_state(vec![reachable]);
+        corrected.published_at_ms = 21;
+        c.set_mesh_media_sources(Some(corrected));
+        assert!(
+            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+                .is_ok(),
+            "corrected-forward publication restores authority"
+        );
+    }
+
     #[derive(Debug)]
     struct MeshGatewayStub;
     impl HttpTransport for MeshGatewayStub {
@@ -4282,8 +4325,8 @@ mod tests {
     }
 
     #[test]
-    fn mesh_gateway_jellyfin_client_uses_gateway_playback_role_without_server_store_materialization()
-     {
+    fn mesh_gateway_jellyfin_client_uses_gateway_playback_role_without_server_store_materialization(
+    ) {
         let mut c = controller();
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
             "gateway",
@@ -4323,11 +4366,10 @@ mod tests {
         );
         direct.mesh_default = None;
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![direct])));
-        assert!(
-            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
-                .expect_err("direct is not a gateway")
-                .contains("not a gateway")
-        );
+        assert!(c
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .expect_err("direct is not a gateway")
+            .contains("not a gateway"));
 
         let mut missing_credential = mesh_jellyfin_source(
             "gateway",
@@ -4336,11 +4378,10 @@ mod tests {
         );
         missing_credential.credential_ref = None;
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![missing_credential])));
-        assert!(
-            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
-                .expect_err("credential ref is required")
-                .contains("missing a sealed credential")
-        );
+        assert!(c
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .expect_err("credential ref is required")
+            .contains("missing a sealed credential"));
     }
 
     #[derive(Debug)]
@@ -4614,21 +4655,19 @@ mod tests {
         assert!(row.signed_in);
         assert_eq!(row.active_profile.as_deref(), Some("matthew"));
         assert_eq!(row.profiles.len(), 2);
-        assert!(
-            row.profiles
-                .iter()
-                .any(|p| p.user_id == "user-a" && p.active)
-        );
+        assert!(row
+            .profiles
+            .iter()
+            .any(|p| p.user_id == "user-a" && p.active));
 
         // Switching flips the active profile — and the selected server's token.
         assert!(c.switch_jellyfin_profile("srv", "user-b"));
         let row = &c.jellyfin_sources()[0];
         assert_eq!(row.active_profile.as_deref(), Some("guest"));
-        assert!(
-            row.profiles
-                .iter()
-                .any(|p| p.user_id == "user-b" && p.active)
-        );
+        assert!(row
+            .profiles
+            .iter()
+            .any(|p| p.user_id == "user-b" && p.active));
         let active_token = c
             .jellyfin()
             .selected_server()
@@ -4638,13 +4677,12 @@ mod tests {
 
         // Switching to an unknown profile is refused honestly.
         assert!(!c.switch_jellyfin_profile("srv", "nobody"));
-        assert!(
-            c.ui()
-                .status
-                .as_deref()
-                .unwrap()
-                .contains("No such profile")
-        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("No such profile"));
     }
 
     #[test]

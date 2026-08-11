@@ -78,15 +78,7 @@ impl AndroidVdiSource {
             return Err(CuttlefishContractError::InvalidGeneration);
         }
         validate_identity("session_id", &self.session_id)?;
-        if self.mesh_host.len() > MAX_ID_BYTES
-            || !self.mesh_host.ends_with(".mesh")
-            || self.mesh_host.split('.').any(|label| {
-                label.is_empty()
-                    || !label
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
-            })
-        {
+        if !is_valid_mesh_host(&self.mesh_host) {
             return Err(CuttlefishContractError::InvalidField("mesh_host"));
         }
         if self.observed_at_unix_ms == 0
@@ -968,6 +960,21 @@ fn is_valid_sha256_digest(value: &str) -> bool {
         && hex.bytes().any(|byte| byte != b'0')
 }
 
+fn is_valid_mesh_host(value: &str) -> bool {
+    value.len() <= MAX_ID_BYTES
+        && value.ends_with(".mesh")
+        && value.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,6 +1066,37 @@ mod tests {
             ),
             Err(CuttlefishContractError::InvalidField("image_id"))
         );
+    }
+
+    #[test]
+    fn hostile_vdi_host_alias_cannot_cross_the_canonical_mesh_authority_boundary() {
+        let source = |mesh_host: &str| AndroidVdiSource {
+            schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+            workload_id: target().vm_id.as_str().to_owned(),
+            image_provenance: image(),
+            catalog_digest: DIGEST.to_owned(),
+            generation: 7,
+            protocol: AndroidVdiProtocol::WebRtc,
+            mesh_host: mesh_host.to_owned(),
+            port: 8443,
+            session_id: "guest-session-7".to_owned(),
+            observed_at_unix_ms: 1_786_000_000_000,
+            expires_at_unix_ms: 1_786_000_060_000,
+        };
+
+        assert_eq!(source("android-01.workstation.mesh").validate(), Ok(()));
+        for hostile_host in [
+            "Android-01.workstation.mesh",
+            "-android-01.workstation.mesh",
+            "android-01-.workstation.mesh",
+            "android-01.workstation.mesh.evil",
+        ] {
+            assert_eq!(
+                source(hostile_host).validate(),
+                Err(CuttlefishContractError::InvalidField("mesh_host")),
+                "host alias must fail closed: {hostile_host}"
+            );
+        }
     }
 
     #[test]

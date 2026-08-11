@@ -223,6 +223,13 @@ fn run(
                 }
                 Command::SelectServer(seat) => {
                     if let Some(index) = connections.iter().position(|c| c.server.seat == seat) {
+                        if revoke_track_for_server_change(active, index, &mut track_loaded, || {
+                            if let Some(eng) = engine.as_ref() {
+                                eng.stop();
+                            }
+                        }) {
+                            let _ = updates.send(Update::Stopped);
+                        }
                         active = index;
                         pending_failover = None;
                         let _ = updates
@@ -231,6 +238,13 @@ fn run(
                 }
                 Command::ApproveFailover => {
                     if let Some(index) = pending_failover.take() {
+                        if revoke_track_for_server_change(active, index, &mut track_loaded, || {
+                            if let Some(eng) = engine.as_ref() {
+                                eng.stop();
+                            }
+                        }) {
+                            let _ = updates.send(Update::Stopped);
+                        }
                         active = index;
                         let _ = updates
                             .send(Update::ServerSelected(connections[active].server.clone()));
@@ -283,6 +297,23 @@ fn run(
 /// both cases reporting `Playing` would invent playback authority.
 fn transport_update(playing: bool, engine_present: bool, track_loaded: bool) -> Option<Update> {
     (engine_present && track_loaded).then_some(Update::Playing(playing))
+}
+
+/// Revoke playback owned by the old provider before publishing a different
+/// selected server. Without this boundary, the UI could identify the new seat
+/// as authoritative while audio and progress continued from the old seat.
+fn revoke_track_for_server_change(
+    active: usize,
+    target: usize,
+    track_loaded: &mut bool,
+    stop: impl FnOnce(),
+) -> bool {
+    if active == target || !*track_loaded {
+        return false;
+    }
+    stop();
+    *track_loaded = false;
+    true
 }
 
 fn propose_failover(
@@ -403,5 +434,32 @@ mod tests {
             transport_update(false, true, true),
             Some(Update::Playing(false))
         ));
+    }
+
+    #[test]
+    fn server_generation_change_revokes_old_playback_before_new_authority() {
+        let mut track_loaded = true;
+        let mut stopped = false;
+
+        assert!(revoke_track_for_server_change(
+            0,
+            1,
+            &mut track_loaded,
+            || stopped = true,
+        ));
+        assert!(stopped, "the old provider must be stopped");
+        assert!(!track_loaded, "old progress must lose worker authority");
+
+        stopped = false;
+        assert!(!revoke_track_for_server_change(
+            1,
+            1,
+            &mut track_loaded,
+            || stopped = true,
+        ));
+        assert!(
+            !stopped,
+            "reselecting the same generation is not a revocation"
+        );
     }
 }

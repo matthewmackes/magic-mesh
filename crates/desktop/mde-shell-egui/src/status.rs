@@ -162,8 +162,31 @@ fn read_segments(persist: &Persist) -> StatusSegments {
 }
 
 fn latest_rollup(persist: &Persist, segment: StatusSegment) -> Option<SegmentRollup> {
-    let msg = persist.list_since(&segment.topic(), None).ok()?.pop()?;
-    serde_json::from_str(msg.body.as_deref()?).ok()
+    let mut latest = None;
+    for msg in persist.list_since(&segment.topic(), None).ok()? {
+        let Some(body) = msg.body.as_deref() else {
+            continue;
+        };
+        let Ok(candidate) = serde_json::from_str::<SegmentRollup>(body) else {
+            continue;
+        };
+        // Bus append order is transport history, not event authority. A
+        // delayed/replayed row must not resurrect an older health state after
+        // a newer publisher observation resolved it. Also bind the embedded
+        // segment to the topic being folded so a cross-lane payload cannot
+        // acquire another segment's presentation authority.
+        if candidate.segment != segment.key()
+            || latest
+                .as_ref()
+                .is_some_and(|current: &SegmentRollup| {
+                    candidate.ts_unix_ms <= current.ts_unix_ms
+                })
+        {
+            continue;
+        }
+        latest = Some(candidate);
+    }
+    latest
 }
 
 /// Map a daemon severity to the shared support-token palette.
@@ -442,5 +465,47 @@ mod tests {
         assert!(!cue.take_became_visible());
         cue.acknowledge();
         assert!(!cue.visible());
+    }
+
+    #[test]
+    fn hostile_history_append_cannot_reactivate_resolved_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let topic = StatusSegment::Alerts.topic();
+        let body = |severity: &str, ts_unix_ms: i64| {
+            serde_json::json!({
+                "segment": "alerts",
+                "severity": severity,
+                "source": "health",
+                "summary": severity,
+                "host": "eagle",
+                "critical_policy": CRITICAL_POLICY_OWN_SEAT,
+                "ts_unix_ms": ts_unix_ms,
+            })
+            .to_string()
+        };
+
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body("success", 200)),
+            )
+            .unwrap();
+        // A hostile delayed replay lands later in transport history but names
+        // an older event. It cannot regain current-status authority.
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body("critical", 100)),
+            )
+            .unwrap();
+
+        let current = latest_rollup(&persist, StatusSegment::Alerts).unwrap();
+        assert_eq!(current.severity, "success");
+        assert_eq!(current.ts_unix_ms, 200);
     }
 }

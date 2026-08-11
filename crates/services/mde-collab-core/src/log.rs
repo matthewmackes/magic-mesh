@@ -7,9 +7,10 @@
 //! keeps the boundary injectable: the real [`FileActorLog`] appends JSON lines
 //! to a replicable file; tests use the in-memory [`MemoryActorLog`].
 //!
-//! Append is **idempotent by [`EventId`]**: re-appending an event already in the
-//! log is a no-op that returns `false`, so a crash between "sign" and "append",
-//! or a replayed batch, never duplicates a line.
+//! Append is **idempotent for an exact signed event**: re-appending one already
+//! in the log is a no-op that returns `false`, so a crash between "sign" and
+//! "append", or a replayed batch, never duplicates a line. Reusing an
+//! [`EventId`] with different contents fails closed.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -17,15 +18,16 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use mde_collab_types::ids::{EventId, SpaceId};
-use mde_collab_types::{ActorId, CollabEventEnvelope};
+use mde_collab_types::{ActorId, CollabEventEnvelope, SCHEMA_VERSION};
 
-use crate::error::Result;
+use crate::error::{CollabError, Result};
 
 /// An append-only log of one actor's signed events in one space.
 pub trait ActorLog {
     /// Append `envelope` if its [`EventId`] is not already present. Returns
     /// `true` if it was newly appended, `false` if it was already there
-    /// (idempotent). Errors only on an I/O/serialization failure.
+    /// (idempotent). Reusing an id with different contents is an error, as are
+    /// I/O and serialization failures.
     fn append(&mut self, envelope: &CollabEventEnvelope) -> Result<bool>;
 
     /// Every envelope in the log, in append order.
@@ -60,8 +62,12 @@ impl MemoryActorLog {
 
 impl ActorLog for MemoryActorLog {
     fn append(&mut self, envelope: &CollabEventEnvelope) -> Result<bool> {
-        if self.events.contains_key(&envelope.event_id) {
-            return Ok(false);
+        if let Some(existing) = self.events.get(&envelope.event_id) {
+            return if existing == envelope {
+                Ok(false)
+            } else {
+                Err(CollabError::ConflictingEventId(envelope.event_id))
+            };
         }
         self.order.push(envelope.event_id);
         self.events.insert(envelope.event_id, envelope.clone());
@@ -88,8 +94,11 @@ impl ActorLog for MemoryActorLog {
 #[derive(Debug)]
 pub struct FileActorLog {
     path: PathBuf,
-    // Ids already on disk — the idempotency guard, loaded on open.
-    seen: std::collections::HashSet<EventId>,
+    // The pathname is durable authority for exactly one (space, actor) pair.
+    // Keep that declaration independently of the serialized envelopes so a
+    // misplaced or hostile row cannot silently change log ownership.
+    space: SpaceId,
+    actor: ActorId,
     // Append order as loaded/written, so `read_all` matches disk order.
     order: Vec<EventId>,
     envelopes: BTreeMap<EventId, CollabEventEnvelope>,
@@ -114,7 +123,7 @@ impl FileActorLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut log = Self::empty(path);
+        let mut log = Self::empty(path, space, actor.clone());
         log.load()?;
         Ok(log)
     }
@@ -132,13 +141,14 @@ impl FileActorLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self::empty(path))
+        Ok(Self::empty(path, space, actor.clone()))
     }
 
-    fn empty(path: PathBuf) -> Self {
+    fn empty(path: PathBuf, space: SpaceId, actor: ActorId) -> Self {
         Self {
             path,
-            seen: std::collections::HashSet::new(),
+            space,
+            actor,
             order: Vec::new(),
             envelopes: BTreeMap::new(),
             rejected_lines: 0,
@@ -164,10 +174,30 @@ impl FileActorLog {
                 self.rejected_lines = self.rejected_lines.saturating_add(1);
                 continue;
             };
-            if self.seen.insert(env.event_id) {
-                self.order.push(env.event_id);
-                self.envelopes.insert(env.event_id, env);
+            self.validate_log_identity(&env)?;
+            if let Some(existing) = self.envelopes.get(&env.event_id) {
+                if existing != &env {
+                    return Err(CollabError::ConflictingEventId(env.event_id));
+                }
+                continue;
             }
+            Self::validate_envelope_authenticity(&env)?;
+            self.order.push(env.event_id);
+            self.envelopes.insert(env.event_id, env);
+        }
+        Ok(())
+    }
+
+    fn validate_log_identity(&self, envelope: &CollabEventEnvelope) -> Result<()> {
+        if envelope.space_id != self.space || envelope.actor != self.actor {
+            return Err(CollabError::InvalidEvent(envelope.event_id));
+        }
+        Ok(())
+    }
+
+    fn validate_envelope_authenticity(envelope: &CollabEventEnvelope) -> Result<()> {
+        if envelope.schema_version != SCHEMA_VERSION || !envelope.verify() {
+            return Err(CollabError::InvalidEvent(envelope.event_id));
         }
         Ok(())
     }
@@ -205,9 +235,15 @@ impl FileActorLog {
 
 impl ActorLog for FileActorLog {
     fn append(&mut self, envelope: &CollabEventEnvelope) -> Result<bool> {
-        if self.seen.contains(&envelope.event_id) {
-            return Ok(false);
+        self.validate_log_identity(envelope)?;
+        if let Some(existing) = self.envelopes.get(&envelope.event_id) {
+            return if existing == envelope {
+                Ok(false)
+            } else {
+                Err(CollabError::ConflictingEventId(envelope.event_id))
+            };
         }
+        Self::validate_envelope_authenticity(envelope)?;
         self.ensure_append_boundary()?;
         let mut line = serde_json::to_string(envelope)?;
         line.push('\n');
@@ -219,7 +255,6 @@ impl ActorLog for FileActorLog {
             .open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.flush()?;
-        self.seen.insert(envelope.event_id);
         self.order.push(envelope.event_id);
         self.envelopes.insert(envelope.event_id, envelope.clone());
         Ok(true)
@@ -241,6 +276,7 @@ impl ActorLog for FileActorLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use mde_collab_types::{ActorClock, CollabEventKind, SpaceKind};
 
     fn event(id: u128, space: SpaceId) -> CollabEventEnvelope {
@@ -258,6 +294,7 @@ mod tests {
                 name: "System · seat-15".into(),
             },
         )
+        .signed(&SigningKey::from_bytes(&[7_u8; 32]))
     }
 
     #[test]
@@ -331,5 +368,109 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![event(10, space).event_id, event(11, space).event_id]
         );
+    }
+
+    #[test]
+    fn file_actor_log_refuses_conflicting_event_id_across_restart() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(11));
+        let actor = ActorId::new("seat-15");
+        let original = event(12, space);
+        let mut conflict = original.clone();
+        conflict.kind = CollabEventKind::SpaceCreated {
+            kind: SpaceKind::Project,
+            name: "hostile replacement".into(),
+        };
+
+        let mut initial = FileActorLog::open(root.path(), space, &actor).expect("open initial");
+        assert!(initial.append(&original).expect("append original"));
+        drop(initial);
+
+        let mut reopened = FileActorLog::open(root.path(), space, &actor).expect("reopen");
+        let error = reopened
+            .append(&conflict)
+            .expect_err("conflicting signed contents must not become a duplicate");
+        assert!(matches!(
+            error,
+            CollabError::ConflictingEventId(id) if id == original.event_id
+        ));
+        assert_eq!(reopened.read_all().expect("read durable log"), vec![original]);
+    }
+
+    #[test]
+    fn actor_log_path_identity_rejects_misplaced_events_live_and_after_restart() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(13));
+        let other_space = SpaceId::from_uuid(uuid::Uuid::from_u128(14));
+        let actor = ActorId::new("seat-15");
+        let path = FileActorLog::path_for(root.path(), space, &actor);
+        let mut log = FileActorLog::open_append_only(root.path(), space, &actor)
+            .expect("open production append-only log");
+
+        let wrong_space = event(15, other_space);
+        assert!(matches!(
+            log.append(&wrong_space),
+            Err(CollabError::InvalidEvent(id)) if id == wrong_space.event_id
+        ));
+
+        let mut wrong_actor = event(16, space);
+        wrong_actor.actor = ActorId::new("hostile-peer");
+        assert!(matches!(
+            log.append(&wrong_actor),
+            Err(CollabError::InvalidEvent(id)) if id == wrong_actor.event_id
+        ));
+        assert!(!path.exists(), "rejected live events must not create the log");
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&wrong_actor).expect("serialize hostile row")
+            ),
+        )
+        .expect("install misplaced durable row");
+        assert!(matches!(
+            FileActorLog::open(root.path(), space, &actor),
+            Err(CollabError::InvalidEvent(id)) if id == wrong_actor.event_id
+        ));
+    }
+
+    #[test]
+    fn unsigned_or_future_schema_event_cannot_enter_the_durable_actor_log() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(17));
+        let actor = ActorId::new("seat-15");
+        let path = FileActorLog::path_for(root.path(), space, &actor);
+        let mut log = FileActorLog::open_append_only(root.path(), space, &actor)
+            .expect("open production append-only log");
+
+        let mut unsigned = event(18, space);
+        unsigned.signature = None;
+        assert!(matches!(
+            log.append(&unsigned),
+            Err(CollabError::InvalidEvent(id)) if id == unsigned.event_id
+        ));
+
+        let mut future_schema = event(19, space);
+        future_schema.schema_version = SCHEMA_VERSION.saturating_add(1);
+        future_schema.sign(&SigningKey::from_bytes(&[7_u8; 32]));
+        assert!(matches!(
+            log.append(&future_schema),
+            Err(CollabError::InvalidEvent(id)) if id == future_schema.event_id
+        ));
+        assert!(!path.exists(), "rejected envelopes must not create the log");
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&unsigned).expect("serialize hostile row")
+            ),
+        )
+        .expect("install hostile durable row");
+        assert!(matches!(
+            FileActorLog::open(root.path(), space, &actor),
+            Err(CollabError::InvalidEvent(id)) if id == unsigned.event_id
+        ));
     }
 }

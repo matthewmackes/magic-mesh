@@ -344,6 +344,9 @@ struct Shared {
     decode_done: AtomicBool,
     /// Device frames actually emitted (drives the playhead).
     frames_played: AtomicU64,
+    /// Monotonic count of frames physically handed to the renderer. Unlike
+    /// `frames_played`, seeks never rewrite this authority witness.
+    rendered_frames: AtomicU64,
     /// AIR-2.c — total device frames the decode thread has pushed into the ring
     /// across the whole track list. Used (with [`track_starts`]) to map the
     /// audible playhead back to a track index so the queue cursor auto-advances
@@ -389,10 +392,18 @@ impl Shared {
     /// toward [`frames_enqueued`], so the track-boundary map stays accurate.
     fn push_samples(&self, samples: &[f32]) {
         let channels = usize::from(self.device_channels.max(1));
-        self.ring
+        let mut ring = self
+            .ring
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(samples.iter().copied());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Renderer revocation and ring publication share this lock. A decoder
+        // may already have passed its outer stop check when cpal reports device
+        // loss; refusing the write here prevents that retired generation from
+        // repopulating the ring after `mark_renderer_failed` cleared it.
+        if self.renderer_failed.load(Ordering::Acquire) {
+            return;
+        }
+        ring.extend(samples.iter().copied());
         self.frames_enqueued
             .fetch_add((samples.len() / channels) as u64, Ordering::Relaxed);
     }
@@ -442,6 +453,42 @@ impl Shared {
             self.frames_played.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+    }
+
+    /// Withdraw samples buffered by a source that failed before reaching the
+    /// renderer, while preserving any still-queued tail of the preceding
+    /// logical track. Returns `false` once even one frame from this source has
+    /// become audible, because a byte-zero fallback would then replay audio.
+    fn discard_inaudible_candidate(
+        &self,
+        candidate_start: u64,
+        rendered_before: u64,
+    ) -> bool {
+        let mut ring = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let played = self.frames_played.load(Ordering::Relaxed);
+        if played > candidate_start
+            && self.rendered_frames.load(Ordering::Relaxed) > rendered_before
+        {
+            return false;
+        }
+
+        let channels = usize::from(self.device_channels.max(1));
+        let preceding_frames = candidate_start.saturating_sub(played);
+        let preceding_samples = usize::try_from(preceding_frames)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(channels);
+        ring.truncate(preceding_samples);
+        if played > candidate_start {
+            // A seek can move the logical position without rendering a frame.
+            // Revoke that unproven jump before admitting a byte-zero fallback.
+            self.frames_played.store(candidate_start, Ordering::Relaxed);
+        }
+        self.frames_enqueued
+            .store(candidate_start, Ordering::Relaxed);
+        true
     }
 }
 
@@ -503,6 +550,7 @@ impl Engine {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(true),
             frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
             frames_enqueued: AtomicU64::new(0),
             track_starts: Mutex::new(Vec::new()),
             seek_ms: AtomicI64::new(-1),
@@ -711,34 +759,71 @@ impl EngineHandle {
                         }
                         shared.seekable.store(false, Ordering::Relaxed);
                         let frames_before = shared.frames_enqueued.load(Ordering::Relaxed);
+                        let rendered_before = shared.rendered_frames.load(Ordering::Relaxed);
                         match decode_track(&url, codec, &shared) {
                             Ok(()) => {
-                                played = true;
-                                break;
+                                // A provider can return a syntactically valid
+                                // container that reaches clean EOF without one
+                                // decodable frame.  That provider has not
+                                // acquired audible authority, so treating the
+                                // clean return as success would suppress the
+                                // next admitted source and silently end the
+                                // logical queue track.  Fail over only while
+                                // doing so cannot replay already-emitted audio.
+                                let emitted_audio = shared
+                                    .frames_enqueued
+                                    .load(Ordering::Relaxed)
+                                    > frames_before;
+                                if emitted_audio {
+                                    played = true;
+                                    break;
+                                }
+                                tracing::warn!(
+                                    "source completed without audio; trying next admitted source"
+                                );
                             }
                             Err(error) => {
                                 let emitted_audio = shared.frames_enqueued.load(Ordering::Relaxed)
                                     > frames_before;
-                                if !should_try_fallback(emitted_audio) {
-                                    // A fallback starts at position zero. For a
-                                    // Subsonic stream, reconnect at the audible
-                                    // playhead instead; arbitrary live URLs cannot
-                                    // prove a resumable offset and remain fail-closed.
-                                    if reconnect_after_loss(&url, codec, &shared) {
-                                        played = true;
-                                        break;
-                                    }
+                                if should_try_fallback(emitted_audio) {
                                     tracing::warn!(
                                         error = %error,
-                                        "source failed after audio started; bounded resume unavailable; advancing without replaying fallback"
+                                        "source failed before audio started; trying next admitted source"
                                     );
+                                    continue;
+                                }
+
+                                // Decoding into the ring does not grant audible
+                                // authority. If the renderer has not crossed this
+                                // candidate's boundary, remove only its buffered
+                                // samples and retain the preceding track's tail;
+                                // the next admitted source can still start at the
+                                // same logical boundary without replaying audio.
+                                if shared.discard_inaudible_candidate(
+                                    frames_before,
+                                    rendered_before,
+                                ) {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "source failed while buffered but inaudible; trying next admitted source"
+                                    );
+                                    continue;
+                                }
+
+                                // Once this source became audible, a fallback
+                                // would replay from byte zero. A Subsonic stream
+                                // may instead resume at the audible playhead;
+                                // arbitrary live URLs remain fail-closed.
+                                if reconnect_after_loss(&url, codec, &shared) {
                                     played = true;
                                     break;
                                 }
                                 tracing::warn!(
                                     error = %error,
-                                    "source failed before audio started; trying next admitted source"
+                                    "source failed after audio started; bounded resume unavailable; advancing without replaying fallback"
                                 );
+                                played = true;
+                                break;
                             }
                         }
                     }
@@ -996,10 +1081,16 @@ where
                         None => *slot = T::from_sample(0.0),
                     }
                 }
+                // Keep consumption and its audible-frame authority update in
+                // the same critical section. Candidate-failure rollback takes
+                // this lock before deciding whether byte-zero fallback is safe.
+                shared
+                    .frames_played
+                    .fetch_add((real / channels) as u64, Ordering::Relaxed);
+                shared
+                    .rendered_frames
+                    .fetch_add((real / channels) as u64, Ordering::Relaxed);
             }
-            shared
-                .frames_played
-                .fetch_add((real / channels) as u64, Ordering::Relaxed);
         },
         {
             move |err| {
@@ -1349,11 +1440,12 @@ fn resume_stream_url(url: &str, position_ms: u64) -> Option<String> {
 /// bounded and interruptible so stop/shutdown remains responsive.
 fn reconnect_after_loss(url: &str, codec: SourceCodec, shared: &Shared) -> bool {
     if resume_stream_url(url, shared.position_ms()).is_none() {
-        // A direct/radio URL cannot prove a position-continuous retry. Fail
-        // closed by dropping decoded-but-not-yet-audible samples; otherwise a
-        // later resume could emit stale audio and keep the engine active after
-        // the provider has already been lost.
-        shared.discard_buffered_tail();
+        // A direct/radio URL cannot prove a position-continuous retry, so it
+        // must not restart from byte zero. Once this source has acquired
+        // audible authority, however, its already-decoded tail remains the
+        // authoritative continuation. Preserve that tail so the renderer can
+        // drain it and the next logical track starts at the true enqueue
+        // boundary instead of cutting playback at the provider-loss instant.
         return false;
     }
     for attempt in 0..MAX_MIDTRACK_RECONNECTS {
@@ -1582,6 +1674,7 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
             frames_enqueued: AtomicU64::new(0),
             track_starts: Mutex::new(vec![0]),
             seek_ms: AtomicI64::new(-1),
@@ -1625,6 +1718,7 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             frames_played: AtomicU64::new(2),
+            rendered_frames: AtomicU64::new(2),
             frames_enqueued: AtomicU64::new(4),
             track_starts: Mutex::new(vec![0]),
             seek_ms: AtomicI64::new(-1),
@@ -1672,6 +1766,50 @@ mod tests {
             0,
         ));
         assert!(!handle.is_playing());
+    }
+
+    #[test]
+    fn revoked_renderer_generation_cannot_republish_inflight_audio() {
+        let shared = Shared {
+            ring: Mutex::new(VecDeque::from([0.25, -0.25])),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            frames_played: AtomicU64::new(1),
+            rendered_frames: AtomicU64::new(1),
+            frames_enqueued: AtomicU64::new(2),
+            track_starts: Mutex::new(vec![0]),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(true),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
+        };
+
+        mark_renderer_failed(&shared);
+        // Model a decoder that passed its loop-level stop check immediately
+        // before cpal revoked this renderer generation.
+        shared.push_samples(&[0.9, -0.9, 0.8, -0.8]);
+
+        assert!(
+            shared
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a retired decoder generation must not repopulate revoked audio"
+        );
+        assert_eq!(
+            shared.frames_enqueued.load(Ordering::Relaxed),
+            shared.frames_played.load(Ordering::Relaxed),
+            "rejected stale audio must not advance the queue boundary"
+        );
     }
 
     #[test]
@@ -1802,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn unresumable_provider_loss_discards_buffered_audio() {
+    fn audible_live_provider_loss_preserves_queued_tail_until_track_handoff() {
         let shared = Arc::new(Shared {
             ring: Mutex::new(VecDeque::from([0.75, -0.75, 0.5, -0.5])),
             volume: AtomicU32::new(1.0_f32.to_bits()),
@@ -1810,7 +1948,8 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             frames_played: AtomicU64::new(2_400),
-            frames_enqueued: AtomicU64::new(4_800),
+            rendered_frames: AtomicU64::new(2_400),
+            frames_enqueued: AtomicU64::new(2_402),
             track_starts: Mutex::new(vec![0]),
             seek_ms: AtomicI64::new(-1),
             seekable: AtomicBool::new(false),
@@ -1829,18 +1968,82 @@ mod tests {
             SourceCodec::Mp3,
             &shared
         ));
-        assert!(
+        assert_eq!(
             shared
                 .ring
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "unresumable loss must not leave stale decoded samples"
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.75, -0.75, 0.5, -0.5],
+            "provider loss must not cut the authoritative source's decoded tail"
         );
         assert_eq!(
             shared.frames_enqueued.load(Ordering::Relaxed),
-            2_400,
-            "the buffered-frame boundary must rewind to the audible playhead"
+            2_402,
+            "the enqueue boundary must retain the two frames still due to render"
+        );
+        assert_eq!(shared.frames_played.load(Ordering::Relaxed), 2_400);
+
+        shared.begin_track();
+        assert_eq!(
+            *shared
+                .track_starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![0, 2_402],
+            "the next track must begin after the retained live tail"
+        );
+    }
+
+    #[test]
+    fn buffered_but_inaudible_source_loss_cannot_suppress_admitted_fallback() {
+        // Frames 8..10 are the still-queued tail of the preceding track;
+        // frames 10..12 belong to a failed replacement candidate. None of the
+        // candidate reached the renderer, so its samples must be withdrawn
+        // without discarding the preceding track or suppressing fallback.
+        let shared = Shared {
+            ring: Mutex::new(VecDeque::from([
+                0.1, -0.1, 0.2, -0.2, 0.8, -0.8, 0.9, -0.9,
+            ])),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            frames_played: AtomicU64::new(8),
+            rendered_frames: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(12),
+            track_starts: Mutex::new(vec![0, 10]),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
+        };
+
+        assert!(shared.discard_inaudible_candidate(10, 0));
+        assert_eq!(
+            shared
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.1, -0.1, 0.2, -0.2],
+            "only the failed candidate's unheard samples may be withdrawn"
+        );
+        assert_eq!(shared.frames_enqueued.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            shared.frames_played.load(Ordering::Relaxed),
+            8,
+            "preserved preceding audio must not be counted before it is rendered"
         );
     }
 
@@ -1868,6 +2071,7 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(true),
             frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
             frames_enqueued: AtomicU64::new(0),
             track_starts: Mutex::new(Vec::new()),
             seek_ms: AtomicI64::new(-1),
@@ -2037,6 +2241,7 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(true),
             frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
             frames_enqueued: AtomicU64::new(0),
             track_starts: Mutex::new(Vec::new()),
             seek_ms: AtomicI64::new(-1),
@@ -2095,6 +2300,106 @@ mod tests {
             server.join().expect("catalog fixture completed"),
             vec!["/catalog-a", "/catalog-b"]
         );
+    }
+
+    #[test]
+    fn zero_audio_provider_cannot_suppress_healthy_admitted_fallback() {
+        use std::thread;
+
+        fn wav_fixture(frames: u32, sample: i16) -> Vec<u8> {
+            let channels = 2_u16;
+            let sample_rate = 48_000_u32;
+            let bits = 16_u16;
+            let block_align = channels * (bits / 8);
+            let data_len = frames * u32::from(block_align);
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16_u32.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&channels.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+            wav.extend_from_slice(&block_align.to_le_bytes());
+            wav.extend_from_slice(&bits.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for _ in 0..frames {
+                wav.extend_from_slice(&sample.to_le_bytes());
+                wav.extend_from_slice(&(-sample).to_le_bytes());
+            }
+            wav
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty-provider.wav");
+        let healthy = dir.path().join("healthy-provider.wav");
+        std::fs::write(&empty, wav_fixture(0, 0)).unwrap();
+        std::fs::write(&healthy, wav_fixture(1_000, 12_000)).unwrap();
+
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::new()),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(true),
+            frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(Vec::new()),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 1_000_000,
+            play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
+        });
+        let handle = EngineHandle {
+            shared: shared.clone(),
+            decode: Arc::new(Mutex::new(None)),
+        };
+        handle.play_from_candidates(
+            vec![PlaybackTrack {
+                candidates: vec![
+                    (local_file_stream_url(&empty).unwrap(), SourceCodec::Wav),
+                    (local_file_stream_url(&healthy).unwrap(), SourceCodec::Wav),
+                ],
+            }],
+            0,
+        );
+
+        for _ in 0..200 {
+            if shared.decode_done.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shared.decode_done.load(Ordering::Relaxed));
+        assert_eq!(
+            shared
+                .track_starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[0],
+            "provider failover must retain one logical queue boundary"
+        );
+        assert_eq!(shared.frames_enqueued.load(Ordering::Relaxed), 1_000);
+        assert!(
+            shared
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|sample| sample.abs() > 0.3),
+            "the healthy fallback must become audible"
+        );
+        handle.stop();
     }
 
     #[test]
@@ -2200,6 +2505,7 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(false),
             frames_played: AtomicU64::new(2_400),
+            rendered_frames: AtomicU64::new(2_400),
             frames_enqueued: AtomicU64::new(0),
             track_starts: Mutex::new(Vec::new()),
             seek_ms: AtomicI64::new(-1),
@@ -2323,6 +2629,7 @@ mod tests {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(true),
             frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
             frames_enqueued: AtomicU64::new(0),
             track_starts: Mutex::new(Vec::new()),
             seek_ms: AtomicI64::new(-1),

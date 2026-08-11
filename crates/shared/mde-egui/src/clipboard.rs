@@ -240,7 +240,17 @@ impl LocalClipboardAuthority {
             .focused_owner
             .clone()
             .ok_or(LocalClipboardError::InvalidOwner)?;
-        validate_offers(&offers)?;
+        if let Err(error) = validate_offers(&offers) {
+            // A provider replacement is an ownership event even when its rich
+            // representations are malformed. Keeping the previous generation
+            // selectable would let a restarted or compromised provider revoke
+            // its bytes on one side of the boundary while the DRM seat keeps
+            // publishing them on the other. Fail closed, and advance the local
+            // generation so corrected-forward recovery cannot alias the stale
+            // selection.
+            self.release_current();
+            return Err(error);
+        }
         let generation = self.take_generation();
         self.current = Some(LocalClipboardOffer {
             owner,
@@ -535,6 +545,47 @@ mod tests {
             .replace(vec![text_offer("browser text").expect("text offer")])
             .expect("browser offer");
         assert!(authority.current().expect("current").generation() > first_generation);
+    }
+
+    #[test]
+    fn restarted_native_provider_invalid_replacement_cannot_retain_prior_offer_authority() {
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("files").expect("focus files");
+        authority
+            .replace(vec![text_offer("prior rich clipboard").expect("text offer")])
+            .expect("initial provider offer");
+        let stale_selection = authority
+            .selection(ClipboardMimeKind::TextPlain)
+            .expect("initial selection");
+
+        let mut substituted = text_offer("replacement").expect("replacement offer");
+        substituted.content_sha256_hex = Some("0".repeat(64));
+        assert_eq!(
+            authority.replace(vec![substituted]),
+            Err(LocalClipboardError::Denied(
+                ClipboardDenialReasonV2::InvalidPayload
+            )),
+            "a restarted provider's digest substitution must fail admission"
+        );
+        assert!(
+            authority.current().is_none(),
+            "rejected replacement must revoke the prior offer generation"
+        );
+        assert_eq!(
+            authority.select(&stale_selection),
+            Err(ClipboardDenialReasonV2::Stale),
+            "the prior exact selection must not survive provider replacement"
+        );
+
+        let recovered = authority
+            .replace(vec![text_offer("corrected forward").expect("corrected offer")])
+            .expect("corrected provider offer");
+        assert!(recovered.generation() > stale_selection.generation);
+        assert_eq!(
+            authority.select_text(),
+            Ok("corrected forward"),
+            "a valid newer provider generation must restore clipboard authority"
+        );
     }
 
     #[test]

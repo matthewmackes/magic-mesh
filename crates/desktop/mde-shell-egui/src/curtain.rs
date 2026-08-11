@@ -124,11 +124,25 @@ impl Verifier for NotWired {
 /// the player) so the seam stays render-agnostic and the tests can script it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NowPlaying {
+    /// Exact player media identity this snapshot authorizes. Kept private to the
+    /// transport seam: paths and credential-bearing URLs must never be painted.
+    authority: String,
     /// The loaded track's display title (the media surface's own now-playing
     /// title fold — a file stem or a stream title, never invented).
     title: String,
     /// Whether the engine is actively playing (paused/idle reads `false`).
     playing: bool,
+}
+
+/// A transport verb issued from one rendered locked-screen snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockTransport {
+    /// Toggle play/pause.
+    TogglePlay,
+    /// Advance to the next queued item.
+    Next,
+    /// Return to the previous queued item.
+    Prev,
 }
 
 /// The **media transport seam** (design lock 3/7): the curtain drives whichever
@@ -141,12 +155,9 @@ pub(crate) trait LockMedia {
     /// The active track, or `None` when nothing is loaded (the honest "nothing
     /// playing" state — the strip then shows no dead controls).
     fn now_playing(&self) -> Option<NowPlaying>;
-    /// Toggle play/pause on the live player.
-    fn toggle_play(&mut self);
-    /// Advance to the next queued track.
-    fn next(&mut self);
-    /// Step back to the previous queued track.
-    fn prev(&mut self);
+    /// Apply `action` only while the loaded media still has the exact identity
+    /// carried by the rendered snapshot. Returns `false` after replacement.
+    fn dispatch_if_current(&mut self, expected_authority: &str, action: LockTransport) -> bool;
 }
 
 /// The live wiring: the shell's production media surface drives the strip
@@ -156,22 +167,23 @@ impl LockMedia for MediaSurface {
     fn now_playing(&self) -> Option<NowPlaying> {
         // `media()` is `Some` only while a track is loaded (a Stop unloads it),
         // so this is the honest "something is playing/paused" gate.
-        self.player().media().map(|_| NowPlaying {
+        self.player().media().map(|authority| NowPlaying {
+            authority: authority.to_owned(),
             title: mde_media_egui::model::now_playing_title(self.player()),
             playing: self.is_playing(),
         })
     }
 
-    fn toggle_play(&mut self) {
-        self.dispatch(TransportAction::TogglePlay);
-    }
-
-    fn next(&mut self) {
-        self.dispatch(TransportAction::Next);
-    }
-
-    fn prev(&mut self) {
-        self.dispatch(TransportAction::Prev);
+    fn dispatch_if_current(&mut self, expected_authority: &str, action: LockTransport) -> bool {
+        if self.player().media() != Some(expected_authority) {
+            return false;
+        }
+        self.dispatch(match action {
+            LockTransport::TogglePlay => TransportAction::TogglePlay,
+            LockTransport::Next => TransportAction::Next,
+            LockTransport::Prev => TransportAction::Prev,
+        });
+        true
     }
 }
 
@@ -1133,6 +1145,7 @@ fn now_playing_strip(ui: &mut egui::Ui, media: &mut dyn LockMedia) {
         return;
     };
     let playing = np.playing;
+    let authority = np.authority;
     // PLATFORM-INTERFACES Q25: title on the ramp's body rung, its state word
     // on the caption rung (glanceable, not prompt).
     ui.label(
@@ -1148,13 +1161,13 @@ fn now_playing_strip(ui: &mut egui::Ui, media: &mut dyn LockMedia) {
     ui.add_space(Style::SP_XS);
     ui.horizontal(|ui| {
         if ui.button("Prev").clicked() {
-            media.prev();
+            media.dispatch_if_current(&authority, LockTransport::Prev);
         }
         if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
-            media.toggle_play();
+            media.dispatch_if_current(&authority, LockTransport::TogglePlay);
         }
         if ui.button("Next").clicked() {
-            media.next();
+            media.dispatch_if_current(&authority, LockTransport::Next);
         }
     });
 }
@@ -1412,6 +1425,7 @@ mod tests {
         fn playing(title: &str) -> Self {
             Self {
                 np: Some(NowPlaying {
+                    authority: title.to_owned(),
                     title: title.to_owned(),
                     playing: true,
                 }),
@@ -1424,14 +1438,20 @@ mod tests {
         fn now_playing(&self) -> Option<NowPlaying> {
             self.np.clone()
         }
-        fn toggle_play(&mut self) {
-            self.toggles += 1;
-        }
-        fn next(&mut self) {
-            self.nexts += 1;
-        }
-        fn prev(&mut self) {
-            self.prevs += 1;
+        fn dispatch_if_current(
+            &mut self,
+            expected_authority: &str,
+            action: LockTransport,
+        ) -> bool {
+            if self.np.as_ref().map(|np| np.authority.as_str()) != Some(expected_authority) {
+                return false;
+            }
+            match action {
+                LockTransport::TogglePlay => self.toggles += 1,
+                LockTransport::Next => self.nexts += 1,
+                LockTransport::Prev => self.prevs += 1,
+            }
+            true
         }
     }
 
@@ -2084,11 +2104,38 @@ mod tests {
 
         // The transport verbs reach the real player; a Stop unloads it, so the
         // strip honestly falls back to "nothing playing" (no dead controls).
-        LockMedia::toggle_play(&mut media);
+        assert!(LockMedia::dispatch_if_current(
+            &mut media,
+            &np.authority,
+            LockTransport::TogglePlay,
+        ));
         media.dispatch(TransportAction::Stop);
         assert!(
             LockMedia::now_playing(&media).is_none(),
             "Stop unloads the transport — the honest empty state (§7)"
+        );
+    }
+
+    #[test]
+    fn retained_locked_strip_cannot_control_replacement_media() {
+        let mut media = RecordingMedia::playing("old-generation");
+        let retained = media
+            .now_playing()
+            .expect("the old generation produced the retained locked-screen snapshot");
+
+        media.np = Some(NowPlaying {
+            authority: "replacement-generation".to_owned(),
+            title: "Replacement".to_owned(),
+            playing: true,
+        });
+
+        assert!(
+            !media.dispatch_if_current(&retained.authority, LockTransport::Next),
+            "a retained control must lose authority when playback is replaced"
+        );
+        assert_eq!(
+            media.nexts, 0,
+            "the stale locked-screen action reached the replacement player"
         );
     }
 

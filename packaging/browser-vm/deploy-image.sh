@@ -83,24 +83,60 @@ ssh_args() {
 target_label() { printf '%s@%s' "$USER_NAME" "$TARGET"; }
 
 local_image_digest() {
-    sha256sum -- "$IMAGE" | awk '{print "sha256:" $1}'
+    sha256sum -- "$IMAGE_AUTH_PATH" | awk '{print "sha256:" $1}'
+}
+
+bind_local_image() {
+    [[ -f "$IMAGE" && ! -L "$IMAGE" ]] || fail "image must be a regular non-symlink file: $IMAGE"
+    exec {IMAGE_FD}<"$IMAGE" || fail "cannot open image: $IMAGE"
+    IMAGE_AUTH_PATH="/proc/$$/fd/$IMAGE_FD"
+    local path_identity descriptor_identity file_type link_count
+    path_identity=$(stat -Lc '%d:%i' -- "$IMAGE") || {
+        exec {IMAGE_FD}<&-
+        fail "cannot stat image path: $IMAGE"
+        return 1
+    }
+    descriptor_identity=$(stat -Lc '%d:%i' -- "$IMAGE_AUTH_PATH") || {
+        exec {IMAGE_FD}<&-
+        fail "cannot stat opened image: $IMAGE"
+        return 1
+    }
+    file_type=$(stat -Lc '%F' -- "$IMAGE_AUTH_PATH")
+    link_count=$(stat -Lc '%h' -- "$IMAGE_AUTH_PATH")
+    if [[ "$file_type" != 'regular file' || "$link_count" != 1 || \
+        "$path_identity" != "$descriptor_identity" ]]; then
+        exec {IMAGE_FD}<&-
+        fail "image must resolve to one stable, single-link regular inode: $IMAGE"
+        return 1
+    fi
+    IMAGE_IDENTITY=$descriptor_identity
+}
+
+revalidate_local_image() {
+    local path_identity descriptor_identity
+    path_identity=$(stat -Lc '%d:%i' -- "$IMAGE") || fail "image path disappeared after validation: $IMAGE"
+    descriptor_identity=$(stat -Lc '%d:%i' -- "$IMAGE_AUTH_PATH") || fail "validated image descriptor was lost: $IMAGE"
+    [[ "$path_identity" == "$IMAGE_IDENTITY" && "$descriptor_identity" == "$IMAGE_IDENTITY" ]] || \
+        fail "image path was replaced after validation: $IMAGE"
 }
 
 local_image_check() {
     require_command qemu-img
     require_command sha256sum
     require_command python3
-    [[ -f "$IMAGE" && ! -L "$IMAGE" ]] || fail "image must be a regular non-symlink file: $IMAGE"
+    require_command stat
+    bind_local_image
     local info format virtual backing digest
-    info=$(qemu-img info --force-share --output=json -- "$IMAGE") || fail "qemu-img info failed"
+    info=$(qemu-img info --force-share --output=json -- "$IMAGE_AUTH_PATH") || fail "qemu-img info failed"
     read -r format virtual backing < <(python3 -c 'import json,sys; x=json.load(sys.stdin); print(x.get("format",""),x.get("virtual-size",0),"yes" if x.get("backing-filename") else "no")' <<<"$info")
     [[ "$format" == qcow2 ]] || fail "image format is not qcow2"
     [[ "$virtual" =~ ^[0-9]+$ && "$virtual" -ge "$MIN_VIRTUAL_BYTES" ]] || fail "image virtual size is below 64 GiB"
     [[ "$backing" == no ]] || fail "image has an external backing file"
-    qemu-img check --force-share -- "$IMAGE" >/dev/null 2>&1 || fail "qemu-img check failed"
+    qemu-img check --force-share -- "$IMAGE_AUTH_PATH" >/dev/null 2>&1 || fail "qemu-img check failed"
     digest=$(local_image_digest)
     [[ -z "$EXPECTED_DIGEST" || "$EXPECTED_DIGEST" == "$digest" ]] || fail "image digest mismatch: expected $EXPECTED_DIGEST, got $digest"
-    printf '%s\n' "$digest"
+    revalidate_local_image
+    LOCAL_IMAGE_DIGEST=$digest
 }
 
 remote_preflight() {
@@ -308,7 +344,8 @@ run_action() {
         fail "--apply is only valid with the publish action"
     fi
     local digest
-    digest=$(local_image_check)
+    local_image_check
+    digest=$LOCAL_IMAGE_DIGEST
     remote_preflight
     printf 'Browser VM image preflight passed\nimage=%s\ndigest=%s\ntarget=%s\nremote_image=%s\n' \
         "$IMAGE" "$digest" "$(target_label)" "$REMOTE_IMAGE"
@@ -320,7 +357,8 @@ run_action() {
     remote_tmp="${REMOTE_STAGING}.${digest#sha256:}"
     backup="${REMOTE_IMAGE}.backup.$(date -u +%Y%m%dT%H%M%SZ)"
     printf -v rsync_ssh '%q ' "${SSH_ARGS[@]}"
-    rsync -az --partial --chmod=F600 -e "$rsync_ssh" -- "$IMAGE" "$destination:$remote_tmp"
+    revalidate_local_image
+    rsync -azL --partial --chmod=F600 -e "$rsync_ssh" -- "$IMAGE_AUTH_PATH" "$destination:$remote_tmp"
     "${SSH_ARGS[@]}" -- "$destination" "
         set -eu
         cleanup_publish() {
@@ -407,6 +445,13 @@ self_test() {
         /var/lib/libvirt/images/browser-vm-r1-overlay.qcow2 \
         /var/lib/libvirt/images/browser-vm-chromium.qcow2 \
         /var/lib/libvirt/images/browser-vm-chromium.qcow2 qcow2 qcow2 2
+
+    # A second pathname must not be able to retain or substitute publication
+    # authority for the qcow2 selected by the operator.
+    printf 'hostile image bytes\n' > "$fixture/image.qcow2"
+    ln "$fixture/image.qcow2" "$fixture/retained-image.qcow2"
+    IMAGE="$fixture/image.qcow2"
+    expect_reject bind_local_image
 
     # Exercise the embedded receipt writer as executable Python, not merely as
     # shell heredoc text. This pins the operator-visible artifact to the same

@@ -385,6 +385,19 @@ impl RemoteSessionsModel {
                 let request_id = receipt.invocation.request_id.clone();
                 let resource_id = receipt.invocation.resource_id.clone();
                 let cancels_request_id = receipt.invocation.cancels_request_id.clone();
+                // The authority may finish after the catalog changed while the
+                // request was in flight.  Its downstream effect is owned by
+                // the daemon, but this browser must not present that stale
+                // result as belonging to the newly admitted generation or
+                // retain a cancellation handle for it.
+                if !self.invocation_matches_current_catalog(&receipt.invocation) {
+                    self.action_feedback = Some(
+                        "Action reply refused: the admitted resource generation changed."
+                            .to_owned(),
+                    );
+                    self.action_pending = None;
+                    return;
+                }
                 if matches!(kind, PendingActionKind::Cancel)
                     && self
                         .cancellable_actions
@@ -440,6 +453,15 @@ impl RemoteSessionsModel {
             }
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    fn invocation_matches_current_catalog(&self, invocation: &ResourceActionInvocation) -> bool {
+        matches!(self.feed_state, FeedState::Ready)
+            && self.projection.as_ref().is_some_and(|projection| {
+                projection.revision == invocation.catalog_revision
+                    && projection.catalog_content_digest.as_deref()
+                        == Some(invocation.catalog_content_digest.as_str())
+            })
     }
 }
 
@@ -1480,6 +1502,40 @@ mod tests {
         );
         assert!(model.android_starts.is_empty());
         assert!(model.cancellable_actions.is_empty());
+    }
+
+    #[test]
+    fn delayed_action_reply_after_catalog_replacement_is_not_adopted() {
+        let receipt = accepted_workload_receipt();
+        let resource_id = receipt.invocation.resource_id.clone();
+        let mut model = RemoteSessionsModel::default();
+        model
+            .install_projection(projection("revision-workload-9", 'a'))
+            .expect("request generation admitted");
+
+        let (sender, receiver) = mpsc::channel();
+        model.action_pending = Some(PendingResourceAction {
+            kind: PendingActionKind::Start,
+            receiver,
+        });
+
+        let mut replacement = projection("revision-workload-10", 'd');
+        replacement.generated_at_ms = NOW + 1;
+        model
+            .install_projection(replacement)
+            .expect("corrected-forward catalog admitted while action is in flight");
+        sender
+            .send(Ok(receipt))
+            .expect("deliver delayed accepted authority reply");
+
+        model.poll_action();
+
+        assert!(model.action_pending.is_none());
+        assert!(!model.cancellable_actions.contains_key(&resource_id));
+        assert!(model
+            .action_feedback
+            .as_deref()
+            .is_some_and(|message| message.contains("generation changed")));
     }
 
     #[test]

@@ -34,12 +34,16 @@ use mackes_mesh_types::android_apps::{
     AndroidAppContractError, AndroidAppInventory, AndroidGuestBoundaryError,
     AndroidGuestInventoryRequest, AndroidGuestInventoryResponse, AndroidGuestLaunchOutcome,
     AndroidGuestLaunchRequest, AndroidGuestRequest, AndroidGuestResponse, AndroidImageManifest,
+    AndroidImagePackageManifest, AndroidSignedCatalog,
 };
 use mackes_mesh_types::android_provider::AndroidVdiSource;
-use mackes_mesh_types::cloud::{CloudReply, DeliveryType, WorkloadSpec};
+use mackes_mesh_types::cloud::{CloudReply, DeliveryType, HealthState, WorkloadSpec};
 
-use super::super::reconcile;
+use super::super::android_provider::{
+    configured_image_path, preflight, AndroidHostProbe, AndroidPreflightInput,
+};
 use super::super::CloudWorker;
+use super::super::{reconcile, runner};
 use super::CloudActionBody;
 
 #[path = "cuttlefish.rs"]
@@ -61,7 +65,28 @@ const CUTTLEFISH_MIN_DISK_GB: u32 = 80;
 
 /// Handle one `action/cloud/android-provision` request → a typed [`CloudReply`].
 pub(super) fn handle(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -> CloudReply {
-    build_reply(&w.state_root, verb_name, body)
+    let now_ms = now_unix_ms();
+    let catalog = match crate::workers::android_catalog::load_admitted_catalog(&w.host, now_ms) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return refusal(
+                verb_name,
+                format!("Android release admission is unavailable: {error}"),
+            )
+        }
+    };
+    let artifact = configured_image_path();
+    let provider_healthy = w.runner.probe_tool(runner::TOOL_LIBVIRT).state == HealthState::Up;
+    build_reply(
+        &w.state_root,
+        verb_name,
+        body,
+        &catalog,
+        artifact.as_deref(),
+        w.android_host_probe.as_ref(),
+        provider_healthy,
+        now_ms,
+    )
 }
 
 pub(super) fn authorization_target(body: &CloudActionBody) -> String {
@@ -666,13 +691,11 @@ fn persistence_error(path: &Path, error: impl std::fmt::Display) -> AndroidInven
 /// Admit a supplied Android image manifest and bind its immutable provenance to
 /// the outer Android workload declaration.
 ///
-/// This is deliberately pure: it validates the closed Android catalog and the
-/// manifest's image identity/digest, then copies only the admitted identity and
-/// digest into the existing [`WorkloadSpec`] fields. It does not inspect a
-/// catalog store, start a VM, contact Cuttlefish, or claim package installation.
-/// The current [`CloudActionBody`] carries only an optional `image_digest`, not
-/// an [`AndroidImageManifest`], so `android-provision` remains the honest
-/// default-image desired-state path until that wire contract grows.
+/// This is deliberately pure: it validates the closed image manifest, then
+/// copies only its immutable identity and digest into the existing
+/// [`WorkloadSpec`] fields. The production `android-provision` path supplies the
+/// manifest from the re-verified durable signed catalog; request fields never
+/// select or override it.
 pub(super) fn android_spec_from_manifest(
     node: &str,
     name: &str,
@@ -685,29 +708,95 @@ pub(super) fn android_spec_from_manifest(
     Ok(spec)
 }
 
-/// Construct the Cuttlefish [`WorkloadSpec`] and route it through the normal
-/// set-desired seam (`reconcile::write_desired_doc`), exactly as `set-desired`
-/// does. Pure over the desired-doc `state_root` so it is tested without a live
-/// backend.
-fn build_reply(state_root: &Path, verb_name: &str, body: &CloudActionBody) -> CloudReply {
+/// Construct and persist a Cuttlefish desired definition only after the signed
+/// release catalog, immutable artifact bytes, package manifest, host capacity,
+/// and provider have formed one ready admission.
+#[allow(clippy::too_many_arguments)]
+fn build_reply(
+    state_root: &Path,
+    verb_name: &str,
+    body: &CloudActionBody,
+    catalog: &AndroidSignedCatalog,
+    artifact: Option<&Path>,
+    host_probe: &dyn AndroidHostProbe,
+    provider_healthy: bool,
+    now_ms: u64,
+) -> CloudReply {
     let node = body.node.trim();
     if node.is_empty() {
-        return CloudReply {
-            ok: false,
-            verb: verb_name.to_string(),
-            error: Some(format!(
-                "`{verb_name}` requires a placement `node` for the Cuttlefish Android VM"
-            )),
-            ..Default::default()
-        };
+        return refusal(
+            verb_name,
+            format!("`{verb_name}` requires a placement `node` for the Cuttlefish Android VM"),
+        );
     }
     let name = workload_name(body, node);
-    let spec = android_spec(node, &name);
+    let mut spec =
+        match android_spec_from_manifest(node, &name, catalog.payload.image_manifest.clone()) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return refusal(
+                    verb_name,
+                    format!("signed Android image manifest is invalid: {error:?}"),
+                )
+            }
+        };
+    for policy in &catalog.payload.app_policies {
+        spec.vcpu = spec.vcpu.max(u16::from(policy.resources.vcpus));
+        spec.memory_mb = spec.memory_mb.max(policy.resources.memory_mib);
+        spec.disk_gb = spec
+            .disk_gb
+            .max(policy.resources.disk_mib.saturating_add(1023) / 1024);
+    }
+    let package_manifest = &catalog.payload.package_manifest;
+    let admission = preflight(
+        AndroidPreflightInput {
+            workload: &spec,
+            catalog: Some(catalog),
+            package_manifest: Some(package_manifest),
+            artifact,
+            provider_healthy,
+            now_unix_ms: now_ms,
+        },
+        host_probe,
+    );
+    if !admission.is_ready() {
+        return refusal(
+            verb_name,
+            format!(
+                "Android desired-state admission refused: {:?}",
+                admission.refusal
+            ),
+        );
+    }
 
-    // Route the Cuttlefish L1-VM through the normal set-desired path: persist this
-    // node's desired slice for the typed Workload row operation.
-    // A persist failure is an honest error — the spec is still echoed, never a fake
-    // success.
+    let existing = match reconcile::read_desired_doc_strict(state_root, node, &name) {
+        Ok(existing) => existing,
+        Err(error) => {
+            return refusal(
+                verb_name,
+                format!("could not inspect existing Android desired state: {error}"),
+            )
+        }
+    };
+    if existing.as_ref().is_some_and(|existing| existing != &spec) {
+        return refusal(
+            verb_name,
+            format!(
+                "Android workload `{name}` already has a different desired-state definition; provenance replacement requires an explicit lifecycle transition"
+            ),
+        );
+    }
+
+    // Stage the exact package manifest first. If the desired write then fails,
+    // the orphaned manifest authorizes nothing; the inverse ordering could leave
+    // a startable desired row without its signed release provenance.
+    if let Err(error) = persist_package_manifest(state_root, &name, package_manifest) {
+        return refusal(
+            verb_name,
+            format!("could not persist admitted Android package provenance: {error}"),
+        );
+    }
+
     match reconcile::write_desired_doc(state_root, &spec) {
         Ok(()) => CloudReply {
             ok: true,
@@ -726,6 +815,107 @@ fn build_reply(state_root: &Path, verb_name: &str, body: &CloudActionBody) -> Cl
             ..Default::default()
         },
     }
+}
+
+const ANDROID_PACKAGE_MANIFEST_MAX_BYTES: usize = 64 * 1024;
+
+fn persist_package_manifest(
+    state_root: &Path,
+    workload_id: &str,
+    manifest: &AndroidImagePackageManifest,
+) -> Result<(), String> {
+    manifest
+        .validate()
+        .map_err(|error| format!("invalid package manifest: {error:?}"))?;
+    let stem = super::super::path_key::file_stem("workload", workload_id, ".json")?;
+    let parent = state_root.join("mcnf/cloud/android-manifests");
+    ensure_directory_chain_nofollow(&parent)?;
+    fs::create_dir_all(&parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    ensure_directory_chain_nofollow(&parent)?;
+
+    let body = serde_json::to_vec(manifest)
+        .map_err(|error| format!("encode Android package manifest: {error}"))?;
+    if body.is_empty() || body.len() > ANDROID_PACKAGE_MANIFEST_MAX_BYTES {
+        return Err(format!(
+            "Android package manifest exceeds the {ANDROID_PACKAGE_MANIFEST_MAX_BYTES}-byte bound"
+        ));
+    }
+    let destination = parent.join(format!("{stem}.json"));
+    if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!(
+            "Android package manifest path {} is a symlink",
+            destination.display()
+        ));
+    }
+    let temporary = parent.join(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Linux O_NOFOLLOW; keep this crate free of a direct libc edge.
+            options.mode(0o600).custom_flags(0o400000);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+        file.write_all(&body)
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, &destination).map_err(|error| {
+            format!(
+                "replace Android package manifest {}: {error}",
+                destination.display()
+            )
+        })?;
+        File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn ensure_directory_chain_nofollow(path: &Path) -> Result<(), String> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "Android package manifest parent {} is not a real directory",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refusal(verb_name: &str, error: impl Into<String>) -> CloudReply {
+    CloudReply {
+        ok: false,
+        verb: verb_name.to_owned(),
+        error: Some(error.into()),
+        ..Default::default()
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The workload name — the request's `name`, else a stable `android-<node>` default.
@@ -762,14 +952,21 @@ pub(super) fn android_spec(node: &str, name: &str) -> WorkloadSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workers::cloud::android_provider::AndroidHostFacts;
+    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
-        AndroidAppAvailability, AndroidAppReadiness, AndroidGuestBootState,
-        AndroidGuestInventoryResponse, AndroidImageProvenance, AndroidLaunchReadiness,
-        AndroidLauncherResolvability, AndroidPackageVersion, AospStarterApp, AospStarterCatalog,
+        AndroidAppAvailability, AndroidAppCapability, AndroidAppPermission, AndroidAppReadiness,
+        AndroidCatalogAppPolicy, AndroidCatalogGuestReadiness, AndroidCatalogPayload,
+        AndroidGuestBootState, AndroidGuestInventoryResponse, AndroidImagePackage,
+        AndroidImageProvenance, AndroidLaunchReadiness, AndroidLauncherResolvability,
+        AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterApp,
+        AospStarterCatalog, ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
     };
+    use std::io;
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    const NOW: u64 = 1_800_000_000_000;
     const ANDROID_IMAGE_DIGEST: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -784,6 +981,84 @@ mod tests {
             AospStarterCatalog::v1(),
         )
         .expect("valid Android image manifest")
+    }
+
+    fn admitted_catalog() -> AndroidSignedCatalog {
+        let image_manifest = valid_android_image_manifest();
+        let image_provenance =
+            AndroidImageProvenance::from_manifest(&image_manifest).expect("valid image provenance");
+        let package_manifest = AndroidImagePackageManifest::new(
+            image_provenance,
+            AospStarterApp::ALL
+                .into_iter()
+                .map(|app| {
+                    AndroidImagePackage::for_app(
+                        app,
+                        AndroidPackageVersion::new("2026.08.11", 1).expect("valid package version"),
+                    )
+                })
+                .collect(),
+        )
+        .expect("valid package manifest");
+        let app_policies = AospStarterApp::ALL
+            .into_iter()
+            .map(|app| AndroidCatalogAppPolicy {
+                app,
+                permissions: vec![AndroidAppPermission::Network],
+                capabilities: vec![AndroidAppCapability::VdiDisplay],
+                resources: AndroidResourceProfile {
+                    class: AndroidResourceClass::Standard,
+                    vcpus: 4,
+                    memory_mib: 8_192,
+                    disk_mib: 80 * 1_024,
+                },
+                guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
+            })
+            .collect();
+        let key = SigningKey::from_bytes(&[19; 32]);
+        AndroidSignedCatalog::sign(
+            "android-release-v1",
+            AndroidCatalogPayload {
+                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+                catalog_id: "android-production".into(),
+                revision: 7,
+                issued_at_unix_ms: NOW - 1_000,
+                expires_at_unix_ms: NOW + 60_000,
+                image_manifest,
+                package_manifest,
+                app_policies,
+            },
+            &key,
+        )
+        .expect("signed catalog")
+        .admit("android-release-v1", &key.verifying_key(), NOW)
+        .expect("admitted signed catalog")
+    }
+
+    struct ReadyProbe {
+        digest: String,
+    }
+
+    impl AndroidHostProbe for ReadyProbe {
+        fn facts(&self, _artifact: Option<&Path>) -> AndroidHostFacts {
+            AndroidHostFacts {
+                kvm_available: true,
+                nested_virtualization: true,
+                available_vcpus: 16,
+                available_memory_mib: 32 * 1_024,
+                available_disk_mib: 256 * 1_024,
+            }
+        }
+
+        fn image_digest(&self, _artifact: &Path) -> io::Result<String> {
+            Ok(self.digest.clone())
+        }
+    }
+
+    fn ready_probe() -> ReadyProbe {
+        ReadyProbe {
+            digest: ANDROID_IMAGE_DIGEST.into(),
+        }
     }
 
     fn inventory_request(request_id: &str, workload_id: &str) -> AndroidGuestInventoryRequest {
@@ -896,37 +1171,94 @@ mod tests {
     #[test]
     fn a_request_without_a_placement_node_is_honestly_rejected() {
         let tmp = tempdir().unwrap();
-        let reply = build_reply(tmp.path(), "android-provision", &body("", None));
+        let catalog = admitted_catalog();
+        let reply = build_reply(
+            tmp.path(),
+            "android-provision",
+            &body("", None),
+            &catalog,
+            Some(Path::new("/android.img")),
+            &ready_probe(),
+            true,
+            NOW,
+        );
         assert!(!reply.ok);
         assert!(reply.desired.is_none());
         assert!(reply.error.unwrap().contains("placement `node`"));
     }
 
     #[test]
-    fn android_provision_persists_and_echoes_the_cuttlefish_desired_slice() {
+    fn signed_release_provenance_gates_the_persisted_android_definition() {
         let tmp = tempdir().unwrap();
+        let catalog = admitted_catalog();
         let reply = build_reply(
             tmp.path(),
             "android-provision",
             &body("eagle", Some("droid")),
+            &catalog,
+            Some(Path::new("/android.img")),
+            &ready_probe(),
+            true,
+            NOW,
         );
         assert!(reply.ok, "err: {:?}", reply.error);
-        // The constructed AndroidVm spec is echoed …
         let desired = reply.desired.expect("echoed spec");
         assert_eq!(desired.len(), 1);
         assert_eq!(desired[0].name, "droid");
         assert_eq!(desired[0].delivery_type, DeliveryType::AndroidVm);
-        // … and actually persisted to this node's desired slice.
+        assert_eq!(
+            desired[0].image.as_deref(),
+            Some(catalog.payload.image_manifest.image_id.as_str())
+        );
+        assert_eq!(
+            desired[0].image_digest.as_deref(),
+            Some(catalog.payload.image_manifest.image_digest.as_str())
+        );
         let slice = reconcile::read_desired_slice(tmp.path(), "eagle");
         assert_eq!(slice.len(), 1);
-        assert_eq!(slice[0].name, "droid");
-        assert_eq!(slice[0].delivery_type, DeliveryType::AndroidVm);
+        assert_eq!(slice[0], desired[0]);
+        let manifest: AndroidImagePackageManifest = serde_json::from_slice(
+            &fs::read(tmp.path().join("mcnf/cloud/android-manifests/droid.json"))
+                .expect("persisted package manifest"),
+        )
+        .expect("valid persisted package manifest");
+        assert_eq!(manifest, catalog.payload.package_manifest);
+
+        let wrong_artifact = ReadyProbe {
+            digest: format!("sha256:{}", "f".repeat(64)),
+        };
+        let refused = build_reply(
+            tmp.path(),
+            "android-provision",
+            &body("eagle", Some("untrusted")),
+            &catalog,
+            Some(Path::new("/substituted.img")),
+            &wrong_artifact,
+            true,
+            NOW,
+        );
+        assert!(!refused.ok);
+        assert!(
+            reconcile::read_desired_doc_strict(tmp.path(), "eagle", "untrusted")
+                .expect("strict desired read")
+                .is_none()
+        );
     }
 
     #[test]
     fn a_default_named_request_uses_the_stable_android_node_name() {
         let tmp = tempdir().unwrap();
-        let reply = build_reply(tmp.path(), "android-provision", &body("eagle", None));
+        let catalog = admitted_catalog();
+        let reply = build_reply(
+            tmp.path(),
+            "android-provision",
+            &body("eagle", None),
+            &catalog,
+            Some(Path::new("/android.img")),
+            &ready_probe(),
+            true,
+            NOW,
+        );
         assert!(reply.ok, "err: {:?}", reply.error);
         let desired = reply.desired.expect("echoed spec");
         assert_eq!(desired[0].name, "android-eagle", "default name");

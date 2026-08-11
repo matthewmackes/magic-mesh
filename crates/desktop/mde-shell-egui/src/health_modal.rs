@@ -1,12 +1,13 @@
 //! Centered System and Mesh Health modal.
 
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::health::{
-    format_health_duration_ms, HealthAction, HealthActionRequest, HealthComponent, HealthCondition,
-    HealthScope, HealthSeverity, NodeGrade, SystemMeshHealthSnapshot, ACTION_TOPIC,
-    HEALTH_SCHEMA_VERSION,
+    action_result_topic, format_health_duration_ms, HealthAction, HealthActionOutcome,
+    HealthActionRequest, HealthActionResult, HealthComponent, HealthCondition, HealthScope,
+    HealthSeverity, NodeGrade, SystemMeshHealthSnapshot, ACTION_TOPIC, HEALTH_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -35,6 +36,11 @@ const SUPPORT_BUNDLE_MAX_FACTS: usize = 8;
 const SUPPORT_BUNDLE_MAX_TEXT_BYTES: usize = 192;
 const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
 const HISTORY_FILTER_STATE_ID: &str = "health-history-severity-filter";
+const SNAPSHOT_AUTHORITY_STATE_ID: &str = "health-snapshot-authority";
+const ACTION_PROGRESS_STATE_ID: &str = "health-action-result-progress";
+const ACTION_RESULT_TAIL_BOUND: usize = 8;
+const ACTION_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+static ACTION_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum HistorySeverityFilter {
@@ -107,6 +113,8 @@ fn show(
     chrome: &mut ConstructChrome,
     snapshot: Option<&SystemMeshHealthSnapshot>,
 ) {
+    let admitted_snapshot = admit_modal_snapshot(ui.ctx(), snapshot);
+    let snapshot = admitted_snapshot.as_ref();
     stabilize_selection(chrome, snapshot);
     let active = active_condition_count(snapshot);
     let issue_text = format!(
@@ -170,6 +178,10 @@ fn show(
         ui.colored_label(Style::SUPPORT_ERROR, error.presentable());
         ui.add_space(Style::SP_XS);
     }
+    if let Some(progress) = refresh_action_progress(ui.ctx(), snapshot) {
+        render_action_progress(ui, &progress);
+        ui.add_space(Style::SP_XS);
+    }
 
     let narrow = ui.available_width() < 760.0;
     if narrow {
@@ -214,6 +226,34 @@ fn show(
             );
         });
     }
+}
+
+/// Retain the newest snapshot rendered by this shell so a delayed or replaced
+/// projection cannot regain modal authority merely by carrying fresh wall-clock
+/// timestamps. Equal generations are immutable; forward generations must also
+/// advance publication time. A rejected live update leaves the last admitted
+/// snapshot visible until its own freshness expires.
+fn admit_modal_snapshot(
+    ctx: &egui::Context,
+    candidate: Option<&SystemMeshHealthSnapshot>,
+) -> Option<SystemMeshHealthSnapshot> {
+    let candidate = candidate?;
+    let id = egui::Id::new(SNAPSHOT_AUTHORITY_STATE_ID);
+    let retained = ctx.data(|data| data.get_temp::<SystemMeshHealthSnapshot>(id));
+    let admitted = match retained {
+        None => candidate.clone(),
+        Some(retained) if retained == *candidate => retained,
+        Some(retained)
+            if retained.observer == candidate.observer
+                && retained.generation < candidate.generation
+                && retained.generated_at_ms < candidate.generated_at_ms =>
+        {
+            candidate.clone()
+        }
+        Some(retained) => return Some(retained),
+    };
+    ctx.data_mut(|data| data.insert_temp(id, admitted.clone()));
+    Some(admitted)
 }
 
 /// Establish the default detail target once, then preserve it across live
@@ -443,14 +483,14 @@ fn detail(
                 ui.colored_label(Style::SUPPORT_SUCCESS, "0 active issues");
             }
             for condition in conditions {
-                condition_card(ui, chrome, snapshot, condition, "");
+                condition_card(ui, chrome, snapshot, condition, MESH_SELECTION);
             }
         } else {
             ui.label("The health provider has not published a current mesh summary.");
         }
         return;
     }
-    ui.heading(&node);
+    ui.heading(redact_support_text(&node));
     let grade = snapshot.and_then(|snapshot| {
         snapshot
             .current_node_grades
@@ -504,7 +544,7 @@ fn detail(
         ui.separator();
         ui.strong("Information");
         for condition in information {
-            ui.label(&condition.evidence.summary);
+            ui.label(redact_support_text(&condition.evidence.summary));
         }
     }
 
@@ -544,7 +584,7 @@ fn detail(
                 };
                 ui.label(format!(
                     "{} · occurred {recurrence_copy} · resolved {} · duration {}",
-                    condition.evidence.summary,
+                    redact_support_text(&condition.evidence.summary),
                     condition
                         .resolved_at_ms
                         .map_or_else(|| "—".into(), format_timestamp),
@@ -570,11 +610,11 @@ fn condition_card(
     };
     mde_egui::card().show(ui, |ui| {
         ui.colored_label(tone, format!("{:?}", condition.severity));
-        ui.strong(&condition.evidence.summary);
+        ui.strong(redact_support_text(&condition.evidence.summary));
         ui.label(Style::typography_text(
             format!(
                 "{} · observed {}",
-                condition.evidence.provider,
+                redact_support_text(&condition.evidence.provider),
                 format_timestamp(condition.last_observed_ms)
             ),
             TypographyRole::Caption,
@@ -582,8 +622,13 @@ fn condition_card(
         let local = crate::explorer::local_hostname();
         let actionable_here =
             matches!(&condition.scope, HealthScope::Node { node: target } if target == &local);
+        let recovery_in_flight = action_progress_is_pending(ui.ctx(), snapshot);
         ui.horizontal_wrapped(|ui| {
-            if actionable_here && ui.small_button("Acknowledge").clicked() {
+            if actionable_here
+                && ui
+                    .add_enabled(!recovery_in_flight, egui::Button::new("Acknowledge").small())
+                    .clicked()
+            {
                 publish_action_for_ui(
                     ui.ctx(),
                     chrome,
@@ -594,7 +639,14 @@ fn condition_card(
                     false,
                 );
             }
-            if actionable_here && ui.small_button("Snooze 1 hour").clicked() {
+            if actionable_here
+                && ui
+                    .add_enabled(
+                        !recovery_in_flight,
+                        egui::Button::new("Snooze 1 hour").small(),
+                    )
+                    .clicked()
+            {
                 publish_action_for_ui(
                     ui.ctx(),
                     chrome,
@@ -628,13 +680,19 @@ fn condition_card(
                 continue;
             }
             ui.separator();
-            ui.label(&action.impact);
+            ui.label(redact_support_text(&action.impact));
             let label = action_label(action.action);
             if action.confirmation_required {
-                if ui.button(label).clicked() {
+                if ui
+                    .add_enabled(!recovery_in_flight, egui::Button::new(label))
+                    .clicked()
+                {
                     chrome.health_pending_action = Some((condition.id.clone(), action.action));
                 }
-            } else if ui.button(label).clicked() {
+            } else if ui
+                .add_enabled(!recovery_in_flight, egui::Button::new(label))
+                .clicked()
+            {
                 publish_action_for_ui(
                     ui.ctx(),
                     chrome,
@@ -655,7 +713,13 @@ fn condition_card(
                     "Confirm this guided action after reviewing its expected impact.",
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("Confirm action").clicked() {
+                    if ui
+                        .add_enabled(
+                            !recovery_in_flight,
+                            egui::Button::new("Confirm action"),
+                        )
+                        .clicked()
+                    {
                         publish_action_for_ui(
                             ui.ctx(),
                             chrome,
@@ -1213,6 +1277,11 @@ fn bound_support_text(value: &str) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActionPublishFailure {
+    StaleSnapshot,
+    ConditionNotCurrent,
+    TargetMismatch,
+    ActionNotAuthorized,
+    ConfirmationRequired,
     BusRootUnavailable,
     PersistOpen,
     Serialization,
@@ -1222,6 +1291,21 @@ enum ActionPublishFailure {
 impl ActionPublishFailure {
     const fn presentable(self) -> &'static str {
         match self {
+            Self::StaleSnapshot => {
+                "Couldn’t send the health action because this health snapshot is stale. Refresh Health and try again."
+            }
+            Self::ConditionNotCurrent => {
+                "Couldn’t send the health action because this issue is no longer current. Refresh Health and review the latest state."
+            }
+            Self::TargetMismatch => {
+                "Couldn’t send the health action because its target no longer matches this issue. Refresh Health before retrying."
+            }
+            Self::ActionNotAuthorized => {
+                "Couldn’t send the health action because the current issue does not authorize it. Refresh Health and review the offered actions."
+            }
+            Self::ConfirmationRequired => {
+                "Couldn’t send the health action because the current recovery authority requires explicit confirmation."
+            }
             Self::BusRootUnavailable => {
                 "Couldn’t send the health action because the local Mesh Bus is unavailable. Retry when it returns."
             }
@@ -1238,14 +1322,52 @@ impl ActionPublishFailure {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ActionPublishOutcome {
-    Published,
+    Published(HealthActionRequest),
     Failed(ActionPublishFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingHealthAction {
+    request: HealthActionRequest,
+    result: Option<HealthActionResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionResultPollIssue {
+    BusUnavailable,
+    UnverifiedResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActionResultPoll {
+    Waiting,
+    Matched(HealthActionResult),
+    Blocked(ActionResultPollIssue),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionProgressTone {
+    Neutral,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActionProgressPresentation {
+    tone: ActionProgressTone,
+    title: String,
+    detail: String,
 }
 
 fn action_error_id() -> egui::Id {
     egui::Id::new(ACTION_ERROR_STATE_ID)
+}
+
+fn action_progress_id() -> egui::Id {
+    egui::Id::new(ACTION_PROGRESS_STATE_ID)
 }
 
 fn action_error(ctx: &egui::Context) -> Option<ActionPublishFailure> {
@@ -1261,6 +1383,14 @@ fn clear_action_error(ctx: &egui::Context) {
     });
 }
 
+fn pending_health_action(ctx: &egui::Context) -> Option<PendingHealthAction> {
+    ctx.data(|data| data.get_temp::<PendingHealthAction>(action_progress_id()))
+}
+
+fn set_pending_health_action(ctx: &egui::Context, pending: PendingHealthAction) {
+    ctx.data_mut(|data| data.insert_temp(action_progress_id(), pending));
+}
+
 fn apply_action_outcome(
     ctx: &egui::Context,
     chrome: &mut ConstructChrome,
@@ -1268,8 +1398,15 @@ fn apply_action_outcome(
     outcome: ActionPublishOutcome,
 ) {
     match outcome {
-        ActionPublishOutcome::Published => {
+        ActionPublishOutcome::Published(request) => {
             clear_action_error(ctx);
+            set_pending_health_action(
+                ctx,
+                PendingHealthAction {
+                    request,
+                    result: None,
+                },
+            );
             if clear_confirmation_on_success {
                 chrome.health_pending_action = None;
             }
@@ -1278,6 +1415,229 @@ fn apply_action_outcome(
             ctx.data_mut(|data| data.insert_temp(action_error_id(), Some(error)));
         }
     }
+}
+
+fn action_progress_is_pending(
+    ctx: &egui::Context,
+    snapshot: &SystemMeshHealthSnapshot,
+) -> bool {
+    pending_health_action(ctx).is_some_and(|pending| match pending.result {
+        None => true,
+        Some(result) => {
+            result.outcome == HealthActionOutcome::Applied
+                && snapshot.generation < result.snapshot_generation
+        }
+    })
+}
+
+fn refresh_action_progress(
+    ctx: &egui::Context,
+    snapshot: Option<&SystemMeshHealthSnapshot>,
+) -> Option<ActionProgressPresentation> {
+    let mut pending = pending_health_action(ctx)?;
+    let mut poll_issue = None;
+    if pending.result.is_none() {
+        match poll_action_result(mde_bus::client_data_dir(), &pending.request) {
+            ActionResultPoll::Waiting => {}
+            ActionResultPoll::Matched(result) => {
+                pending.result = Some(result);
+                set_pending_health_action(ctx, pending.clone());
+            }
+            ActionResultPoll::Blocked(issue) => poll_issue = Some(issue),
+        }
+    }
+    let presentation = action_progress_presentation(&pending, snapshot, poll_issue);
+    if pending.result.is_none()
+        || pending.result.as_ref().is_some_and(|result| {
+            result.outcome == HealthActionOutcome::Applied
+                && snapshot.is_none_or(|snapshot| snapshot.generation < result.snapshot_generation)
+        })
+    {
+        ctx.request_repaint_after(ACTION_RESULT_POLL_INTERVAL);
+    }
+    Some(presentation)
+}
+
+fn poll_action_result(root: Option<PathBuf>, request: &HealthActionRequest) -> ActionResultPoll {
+    let Some(root) = root else {
+        return ActionResultPoll::Blocked(ActionResultPollIssue::BusUnavailable);
+    };
+    let Ok(persist) = Persist::open(root) else {
+        return ActionResultPoll::Blocked(ActionResultPollIssue::BusUnavailable);
+    };
+    let topic = action_result_topic(&request.request_id);
+    let Ok(rows) = persist.read_tail(&topic, ACTION_RESULT_TAIL_BOUND) else {
+        return ActionResultPoll::Blocked(ActionResultPollIssue::BusUnavailable);
+    };
+    if rows.is_empty() {
+        return ActionResultPoll::Waiting;
+    }
+
+    let now = now_ms();
+    let mut matched: Option<HealthActionResult> = None;
+    for row in rows {
+        let Some(body) = row.body.as_deref() else {
+            continue;
+        };
+        let Ok(result) = serde_json::from_str::<HealthActionResult>(body) else {
+            continue;
+        };
+        if result.validate_at(now).is_err() {
+            continue;
+        }
+        if !result_is_bound_to_request(&result, request, now) {
+            continue;
+        }
+        if matched.as_ref().is_some_and(|prior| prior != &result) {
+            return ActionResultPoll::Blocked(ActionResultPollIssue::UnverifiedResult);
+        }
+        matched = Some(result);
+    }
+    matched.map_or(
+        ActionResultPoll::Blocked(ActionResultPollIssue::UnverifiedResult),
+        ActionResultPoll::Matched,
+    )
+}
+
+/// The result contract does not repeat `target`; bind it transitively to the
+/// exact request using the worker's node-qualified audit identity. Node actions
+/// additionally require the local requester to be the target; mesh actions bind
+/// the publisher to that local requester. A guessed result topic therefore
+/// cannot complete another node's request.
+fn result_is_bound_to_request(
+    result: &HealthActionResult,
+    request: &HealthActionRequest,
+    now_ms: u64,
+) -> bool {
+    let result_publisher = match &request.target {
+        HealthScope::Node { node } if node == &request.requester => node,
+        HealthScope::Node { .. } => return false,
+        HealthScope::Mesh => &request.requester,
+    };
+    let audit_prefix = format!("health:{result_publisher}:");
+    let source = result.audit_id.strip_prefix(&audit_prefix);
+    result.schema_version == HEALTH_SCHEMA_VERSION
+        && result.request_id == request.request_id
+        && result.condition_id == request.condition_id
+        && result.action == request.action
+        && result.snapshot_generation >= request.expected_snapshot_generation
+        && result.completed_at_ms >= request.requested_at_ms
+        && result.completed_at_ms <= now_ms
+        && source.is_some_and(|source| {
+            source.len() == 26
+                && source
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        })
+}
+
+fn action_progress_presentation(
+    pending: &PendingHealthAction,
+    snapshot: Option<&SystemMeshHealthSnapshot>,
+    poll_issue: Option<ActionResultPollIssue>,
+) -> ActionProgressPresentation {
+    let action = action_label(pending.request.action);
+    let target = match &pending.request.target {
+        HealthScope::Node { node } => node.as_str(),
+        HealthScope::Mesh => "the mesh",
+    };
+    let base = format!("{action} · {target}");
+    let Some(result) = pending.result.as_ref() else {
+        return match poll_issue {
+            None => ActionProgressPresentation {
+                tone: ActionProgressTone::Neutral,
+                title: format!("{base} requested"),
+                detail: "Waiting for the governed health worker to report a result.".into(),
+            },
+            Some(ActionResultPollIssue::BusUnavailable) => ActionProgressPresentation {
+                tone: ActionProgressTone::Warning,
+                title: format!("{base} result unavailable"),
+                detail: "The local Mesh Bus cannot currently be read. The action remains pending; no outcome is being inferred.".into(),
+            },
+            Some(ActionResultPollIssue::UnverifiedResult) => ActionProgressPresentation {
+                tone: ActionProgressTone::Warning,
+                title: format!("{base} result not verified"),
+                detail: "A result row did not match this request’s identity, generation, action, and target. The action remains pending.".into(),
+            },
+        };
+    };
+
+    let result_detail = bound_support_text(&result.detail);
+    match result.outcome {
+        HealthActionOutcome::Applied => {
+            let Some(snapshot) = snapshot.filter(|snapshot| {
+                snapshot.is_fresh(now_ms()) && snapshot.generation >= result.snapshot_generation
+            }) else {
+                return ActionProgressPresentation {
+                    tone: ActionProgressTone::Neutral,
+                    title: format!("{base} ran; refreshing health"),
+                    detail: format!("{result_detail} Current health evidence has not reached result generation {} yet.", result.snapshot_generation),
+                };
+            };
+            let still_active = snapshot.active_conditions.iter().find(|condition| {
+                condition.is_active()
+                    && condition.id == pending.request.condition_id
+                    && condition.scope == pending.request.target
+            });
+            if let Some(condition) = still_active {
+                ActionProgressPresentation {
+                    tone: ActionProgressTone::Warning,
+                    title: format!("{base} completed with the issue still active"),
+                    detail: format!(
+                        "{result_detail} Current evidence: {}",
+                        bound_support_text(&condition.evidence.summary)
+                    ),
+                }
+            } else if snapshot.active_conditions.iter().any(|condition| {
+                condition.is_active() && condition.id == pending.request.condition_id
+            }) {
+                ActionProgressPresentation {
+                    tone: ActionProgressTone::Warning,
+                    title: format!("{base} result needs refreshed target evidence"),
+                    detail: "The condition identity now belongs to a different target, so this result is not being used to report recovery.".into(),
+                }
+            } else {
+                ActionProgressPresentation {
+                    tone: ActionProgressTone::Success,
+                    title: format!("{base} completed"),
+                    detail: format!("{result_detail} Current health no longer reports this issue."),
+                }
+            }
+        }
+        HealthActionOutcome::Refused => ActionProgressPresentation {
+            tone: ActionProgressTone::Error,
+            title: format!("{base} was refused"),
+            detail: result_detail,
+        },
+        HealthActionOutcome::StaleGeneration => ActionProgressPresentation {
+            tone: ActionProgressTone::Warning,
+            title: format!("{base} was not run against stale health"),
+            detail: result_detail,
+        },
+        HealthActionOutcome::NotApplicable => ActionProgressPresentation {
+            tone: ActionProgressTone::Warning,
+            title: format!("{base} was not applicable"),
+            detail: result_detail,
+        },
+        HealthActionOutcome::Failed => ActionProgressPresentation {
+            tone: ActionProgressTone::Error,
+            title: format!("{base} failed"),
+            detail: result_detail,
+        },
+    }
+}
+
+fn render_action_progress(ui: &mut egui::Ui, progress: &ActionProgressPresentation) {
+    let tone = match progress.tone {
+        ActionProgressTone::Neutral => Style::TEXT_DIM,
+        ActionProgressTone::Success => Style::SUPPORT_SUCCESS,
+        ActionProgressTone::Warning => Style::SUPPORT_WARNING,
+        ActionProgressTone::Error => Style::SUPPORT_ERROR,
+    };
+    mde_egui::card().show(ui, |ui| {
+        ui.colored_label(tone, &progress.title);
+        ui.label(&progress.detail);
+    });
 }
 
 fn publish_action_for_ui(
@@ -1319,12 +1679,19 @@ fn publish_action_to(
     confirmed: bool,
 ) -> ActionPublishOutcome {
     let now = now_ms();
+    let target = match authorize_modal_action(snapshot, condition, node, action, confirmed, now) {
+        Ok(target) => target,
+        Err(error) => return ActionPublishOutcome::Failed(error),
+    };
     let request = HealthActionRequest {
         schema_version: HEALTH_SCHEMA_VERSION,
-        request_id: format!("health-{now}-{}", condition.id.replace(':', "-")),
+        request_id: format!(
+            "health-{now:016x}-{:016x}",
+            ACTION_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ),
         condition_id: condition.id.clone(),
         action,
-        target: HealthScope::Node { node: node.into() },
+        target,
         expected_snapshot_generation: snapshot.generation,
         requester: crate::explorer::local_hostname(),
         authorization: "local-seat".into(),
@@ -1341,9 +1708,67 @@ fn publish_action_to(
         return ActionPublishOutcome::Failed(ActionPublishFailure::Serialization);
     };
     match persist.write(ACTION_TOPIC, Priority::Default, None, Some(&body)) {
-        Ok(_) => ActionPublishOutcome::Published,
+        Ok(_) => ActionPublishOutcome::Published(request),
         Err(_) => ActionPublishOutcome::Failed(ActionPublishFailure::PersistWrite),
     }
+}
+
+/// Re-check the complete recovery authority at the final UI-to-Bus boundary.
+/// Paint-time visibility is not authorization: the snapshot may have expired,
+/// the selected row may have changed, or a stale callback may carry a condition
+/// that is no longer in the canonical active lane. Mutation actions additionally
+/// bind to exactly one generation- and target-matched remediation descriptor.
+fn authorize_modal_action(
+    snapshot: &SystemMeshHealthSnapshot,
+    condition: &HealthCondition,
+    node: &str,
+    action: HealthAction,
+    confirmed: bool,
+    now_ms: u64,
+) -> Result<HealthScope, ActionPublishFailure> {
+    if !snapshot.is_fresh(now_ms) {
+        return Err(ActionPublishFailure::StaleSnapshot);
+    }
+    if !condition.is_active()
+        || !snapshot
+            .active_conditions
+            .iter()
+            .any(|current| current == condition)
+    {
+        return Err(ActionPublishFailure::ConditionNotCurrent);
+    }
+
+    let target = condition.scope.clone();
+    let caller_matches_scope = match &target {
+        HealthScope::Node { node: target_node } => target_node == node,
+        HealthScope::Mesh => node == MESH_SELECTION,
+    };
+    if !caller_matches_scope {
+        return Err(ActionPublishFailure::TargetMismatch);
+    }
+
+    let mut offered = condition
+        .remediation
+        .iter()
+        .filter(|remediation| remediation.action == action);
+    let descriptor = offered.next();
+    if offered.next().is_some() {
+        return Err(ActionPublishFailure::ActionNotAuthorized);
+    }
+    if let Some(descriptor) = descriptor {
+        if descriptor.target != target
+            || descriptor.expected_snapshot_generation != snapshot.generation
+        {
+            return Err(ActionPublishFailure::ActionNotAuthorized);
+        }
+        if descriptor.confirmation_required && !confirmed {
+            return Err(ActionPublishFailure::ConfirmationRequired);
+        }
+    } else if !matches!(action, HealthAction::Acknowledge | HealthAction::SnoozeOneHour) {
+        return Err(ActionPublishFailure::ActionNotAuthorized);
+    }
+
+    Ok(target)
 }
 
 const fn action_label(action: HealthAction) -> &'static str {
@@ -2033,6 +2458,39 @@ mod tests {
     }
 
     #[test]
+    fn lower_generation_live_update_cannot_replace_admitted_health_authority() {
+        let ctx = egui::Context::default();
+        let trusted = fixture_snapshot(true, true);
+        assert_eq!(
+            admit_modal_snapshot(&ctx, Some(&trusted)),
+            Some(trusted.clone())
+        );
+
+        let mut rollback = trusted.clone();
+        rollback.generation = rollback.generation.saturating_sub(1);
+        rollback.generated_at_ms = trusted.generated_at_ms.saturating_add(1);
+        rollback.fresh_until_ms = rollback.generated_at_ms.saturating_add(60_000);
+        rollback.active_conditions.clear();
+        rollback.mesh_summary.active_warnings = 0;
+        rollback.mesh_summary.active_critical = 0;
+        assert_eq!(
+            admit_modal_snapshot(&ctx, Some(&rollback)),
+            Some(trusted.clone()),
+            "a fresh-looking rollback cannot erase the last admitted outage"
+        );
+
+        let mut forward = trusted;
+        forward.generation = forward.generation.saturating_add(1);
+        forward.generated_at_ms = forward.generated_at_ms.saturating_add(1);
+        forward.fresh_until_ms = forward.generated_at_ms.saturating_add(60_000);
+        assert_eq!(
+            admit_modal_snapshot(&ctx, Some(&forward)),
+            Some(forward),
+            "only a timestamp-advancing generation can replace modal authority"
+        );
+    }
+
+    #[test]
     fn history_materialization_is_node_scoped_and_hard_bounded() {
         let mut conditions = Vec::new();
         for index in 0..64 {
@@ -2276,9 +2734,80 @@ mod tests {
     }
 
     #[test]
+    fn hostile_health_projection_cannot_render_secret_or_path_material() {
+        let local = crate::explorer::local_hostname();
+        let mut snapshot = fixture_snapshot(false, true);
+        snapshot.current_node_grades.clear();
+
+        let mut active = condition(
+            "hostile-active",
+            &local,
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        active.evidence.summary = "token=active-secret".into();
+        active.evidence.provider = "/etc/shadow".into();
+        active.remediation[0].impact = "Authorization: Bearer recovery-secret".into();
+
+        let mut expected_absence = condition(
+            "hostile-expected-absence",
+            &local,
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        expected_absence.requirement = RequirementClass::Informational;
+        expected_absence.evidence.summary = "password=expected-state-secret".into();
+        expected_absence.remediation.clear();
+
+        let mut history = condition(
+            "hostile-history",
+            &local,
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        history.evidence.summary = "private_key=history-secret".into();
+        history.active_since_ms = snapshot.generated_at_ms.saturating_sub(2_000);
+        history.last_observed_ms = snapshot.generated_at_ms.saturating_sub(1_000);
+        history.evidence.observed_at_ms = history.last_observed_ms;
+        history.resolved_at_ms = Some(snapshot.generated_at_ms);
+        history.remediation.clear();
+
+        snapshot.active_conditions = vec![active, expected_absence];
+        snapshot.resolved_conditions = vec![history];
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut chrome = ConstructChrome::default();
+        chrome.health_selected_node = Some(local);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                detail(ui, &mut chrome, Some(&snapshot));
+            });
+        });
+        let text = painted_text(&output.shapes).join(" | ");
+
+        for forbidden in [
+            "active-secret",
+            "/etc/shadow",
+            "recovery-secret",
+            "expected-state-secret",
+            "history-secret",
+        ] {
+            assert!(!text.contains(forbidden), "render leaked {forbidden:?}: {text}");
+        }
+        assert!(
+            text.matches("[redacted]").count() >= 5,
+            "every hostile active, expected-state, history, provider, and recovery string fails closed: {text}"
+        );
+    }
+
+    #[test]
     fn action_publication_reports_hostile_failures_and_preserves_bound_success() {
         let snapshot = fixture_snapshot(true, true);
         let condition = &snapshot.active_conditions[0];
+        let HealthScope::Node { node } = &condition.scope else {
+            panic!("fixture condition must be node-scoped")
+        };
         let pending = (condition.id.clone(), HealthAction::RefreshProvider);
         let ctx = egui::Context::default();
         let mut chrome = ConstructChrome::default();
@@ -2288,7 +2817,7 @@ mod tests {
             None,
             &snapshot,
             condition,
-            "bound-target",
+            node,
             HealthAction::RefreshProvider,
             true,
         );
@@ -2311,7 +2840,7 @@ mod tests {
             Some(blocked_root.path().to_path_buf()),
             &snapshot,
             condition,
-            "bound-target",
+            node,
             HealthAction::RefreshProvider,
             true,
         );
@@ -2328,11 +2857,11 @@ mod tests {
             Some(live_root.path().to_path_buf()),
             &snapshot,
             condition,
-            "bound-target",
+            node,
             HealthAction::RefreshProvider,
             true,
         );
-        assert_eq!(published, ActionPublishOutcome::Published);
+        assert!(matches!(&published, ActionPublishOutcome::Published(_)));
         let persist = Persist::open(live_root.path().to_path_buf()).expect("reopen Bus");
         let messages = persist
             .list_since(ACTION_TOPIC, None)
@@ -2344,7 +2873,7 @@ mod tests {
         assert_eq!(
             request.target,
             HealthScope::Node {
-                node: "bound-target".into()
+                node: node.clone()
             }
         );
         assert_eq!(request.expected_snapshot_generation, snapshot.generation);
@@ -2354,6 +2883,386 @@ mod tests {
         apply_action_outcome(&ctx, &mut chrome, true, published);
         assert_eq!(chrome.health_pending_action, None);
         assert_eq!(action_error(&ctx), None);
+    }
+
+    #[test]
+    fn governed_action_publication_requires_current_exact_generation_bound_authority() {
+        let mut snapshot = fixture_snapshot(true, true);
+        let mut mesh_condition = snapshot.active_conditions[0].clone();
+        mesh_condition.id = "mesh:canonical-recovery".into();
+        mesh_condition.scope = HealthScope::Mesh;
+        mesh_condition.remediation[0].target = HealthScope::Mesh;
+        snapshot.active_conditions.push(mesh_condition);
+        let condition = &snapshot.active_conditions[0];
+        let HealthScope::Node { node } = &condition.scope else {
+            panic!("fixture condition must be node-scoped")
+        };
+        let root = tempfile::tempdir().expect("governed action Bus fixture");
+        let persist = Persist::open(root.path().to_path_buf()).expect("initialize Bus fixture");
+
+        assert_eq!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                condition,
+                "different-node",
+                HealthAction::RefreshProvider,
+                true,
+            ),
+            ActionPublishOutcome::Failed(ActionPublishFailure::TargetMismatch),
+            "a caller-selected node cannot replace canonical condition scope"
+        );
+
+        let mut forged = condition.clone();
+        forged.source = "forged-source".into();
+        assert_eq!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                &forged,
+                node,
+                HealthAction::RefreshProvider,
+                true,
+            ),
+            ActionPublishOutcome::Failed(ActionPublishFailure::ConditionNotCurrent),
+            "authority must come from the exact canonical active record"
+        );
+
+        let mut stale = snapshot.clone();
+        stale.fresh_until_ms = 0;
+        assert_eq!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &stale,
+                &stale.active_conditions[0],
+                node,
+                HealthAction::RefreshProvider,
+                true,
+            ),
+            ActionPublishOutcome::Failed(ActionPublishFailure::StaleSnapshot),
+            "expired modal state cannot authorize a recovery"
+        );
+
+        assert_eq!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                condition,
+                node,
+                HealthAction::RefreshProvider,
+                false,
+            ),
+            ActionPublishOutcome::Failed(ActionPublishFailure::ConfirmationRequired),
+            "a generation-bound descriptor retains its confirmation policy"
+        );
+        assert_eq!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                condition,
+                node,
+                HealthAction::RestartNebula,
+                true,
+            ),
+            ActionPublishOutcome::Failed(ActionPublishFailure::ActionNotAuthorized),
+            "an allowlisted enum is not authority unless this condition offers it"
+        );
+        assert!(
+            persist
+                .list_since(ACTION_TOPIC, None)
+                .expect("inspect refused publication lane")
+                .is_empty(),
+            "every refused request must fail before a Bus side effect"
+        );
+
+        assert!(matches!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                condition,
+                node,
+                HealthAction::RefreshProvider,
+                true,
+            ),
+            ActionPublishOutcome::Published(_)
+        ));
+        let messages = persist
+            .list_since(ACTION_TOPIC, None)
+            .expect("read authorized publication");
+        assert_eq!(messages.len(), 1);
+        let request: HealthActionRequest = serde_json::from_str(
+            messages[0]
+                .body
+                .as_deref()
+                .expect("authorized action has a body"),
+        )
+        .expect("decode authorized action");
+        assert_eq!(request.target, condition.scope);
+        assert_eq!(request.expected_snapshot_generation, snapshot.generation);
+        assert_eq!(request.confirmation.as_deref(), Some("CONFIRM"));
+
+        let mesh_condition = snapshot
+            .active_conditions
+            .last()
+            .expect("mesh authority fixture");
+        assert_eq!(mesh_condition.scope, HealthScope::Mesh);
+        assert!(matches!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                mesh_condition,
+                MESH_SELECTION,
+                HealthAction::RefreshProvider,
+                true,
+            ),
+            ActionPublishOutcome::Published(_)
+        ), "mesh authority derives a Mesh target only through the explicit mesh selection convention");
+        let messages = persist
+            .list_since(ACTION_TOPIC, None)
+            .expect("read node and mesh publications");
+        assert_eq!(messages.len(), 2);
+        let mesh_request: HealthActionRequest = serde_json::from_str(
+            messages[1]
+                .body
+                .as_deref()
+                .expect("mesh action has a body"),
+        )
+        .expect("decode mesh action");
+        assert_eq!(mesh_request.target, HealthScope::Mesh);
+    }
+
+    #[test]
+    fn action_result_progress_binds_identity_generation_target_and_reports_partial_failure() {
+        let mut snapshot = fixture_snapshot(true, true);
+        let local = crate::explorer::local_hostname();
+        let mut condition = snapshot.active_conditions[0].clone();
+        condition.id = format!("{local}:result-progress");
+        condition.scope = HealthScope::Node {
+            node: local.clone(),
+        };
+        condition.remediation[0].target = condition.scope.clone();
+        snapshot.active_conditions[0] = condition.clone();
+        let HealthScope::Node { node } = &condition.scope else {
+            panic!("fixture condition must be node-scoped")
+        };
+        let root = tempfile::tempdir().expect("action-result Bus fixture");
+        let outcome = publish_action_to(
+            Some(root.path().to_path_buf()),
+            &snapshot,
+            &condition,
+            node,
+            HealthAction::RefreshProvider,
+            true,
+        );
+        let ActionPublishOutcome::Published(request) = outcome.clone() else {
+            panic!("governed request must publish")
+        };
+        let ctx = egui::Context::default();
+        let mut chrome = ConstructChrome::default();
+        chrome.health_pending_action = Some((condition.id.clone(), request.action));
+        apply_action_outcome(&ctx, &mut chrome, true, outcome);
+        assert_eq!(chrome.health_pending_action, None);
+        assert_eq!(
+            pending_health_action(&ctx),
+            Some(PendingHealthAction {
+                request: request.clone(),
+                result: None,
+            }),
+            "durable publication starts an exact result-tracked request"
+        );
+
+        let persist = Persist::open(root.path().to_path_buf()).expect("open result fixture");
+        let topic = action_result_topic(&request.request_id);
+        let write_result = |result: &HealthActionResult| {
+            persist
+                .write(
+                    &topic,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(result).expect("encode result fixture")),
+                )
+                .expect("publish result fixture");
+        };
+        let valid_shape = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            condition_id: request.condition_id.clone(),
+            action: request.action,
+            outcome: HealthActionOutcome::Failed,
+            detail: "governed result detail".into(),
+            audit_id: format!("health:{node}:01J00000000000000000000009"),
+            completed_at_ms: now_ms(),
+            snapshot_generation: request.expected_snapshot_generation,
+            refreshed_evidence: None,
+        };
+        let oversized = HealthActionResult {
+            detail: "x".repeat(mackes_mesh_types::health::MAX_HEALTH_TEXT_BYTES + 1),
+            ..valid_shape.clone()
+        };
+        write_result(&oversized);
+        let mut unknown = serde_json::to_value(&valid_shape).expect("encode hostile result");
+        unknown
+            .as_object_mut()
+            .expect("result object")
+            .insert("untrusted_extension".into(), serde_json::json!(true));
+        persist
+            .write(
+                &topic,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&unknown).expect("encode unknown-field result")),
+            )
+            .expect("publish unknown-field fixture");
+        persist
+            .write(
+                &topic,
+                Priority::Default,
+                None,
+                Some("{\"schema_version\":1,\"request_id\":false}"),
+            )
+            .expect("publish malformed fixture");
+        assert_eq!(
+            poll_action_result(Some(root.path().to_path_buf()), &request),
+            ActionResultPoll::Blocked(ActionResultPollIssue::UnverifiedResult),
+            "malformed, oversized, and unknown-field rows cannot be presented"
+        );
+        let completed_at_ms = now_ms();
+        let unrelated_target = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            condition_id: request.condition_id.clone(),
+            action: request.action,
+            outcome: HealthActionOutcome::Failed,
+            detail: "unrelated target failed".into(),
+            audit_id: "health:different-node:01J00000000000000000000000".into(),
+            completed_at_ms,
+            snapshot_generation: request.expected_snapshot_generation,
+            refreshed_evidence: None,
+        };
+        write_result(&unrelated_target);
+        let stale_generation = HealthActionResult {
+            audit_id: format!("health:{node}:01J00000000000000000000000"),
+            snapshot_generation: request.expected_snapshot_generation.saturating_sub(1),
+            detail: "stale result".into(),
+            ..unrelated_target.clone()
+        };
+        write_result(&stale_generation);
+        assert_eq!(
+            poll_action_result(Some(root.path().to_path_buf()), &request),
+            ActionResultPoll::Blocked(ActionResultPollIssue::UnverifiedResult),
+            "wrong-target and stale-generation rows cannot complete the pending request"
+        );
+        assert_eq!(
+            pending_health_action(&ctx)
+                .expect("request remains tracked")
+                .result,
+            None
+        );
+
+        let applied = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            condition_id: request.condition_id.clone(),
+            action: request.action,
+            outcome: HealthActionOutcome::Applied,
+            detail: "provider refresh completed".into(),
+            audit_id: format!("health:{node}:01J00000000000000000000001"),
+            completed_at_ms: now_ms(),
+            snapshot_generation: request.expected_snapshot_generation + 1,
+            refreshed_evidence: Some(condition.evidence.clone()),
+        };
+        write_result(&applied);
+        assert_eq!(
+            poll_action_result(Some(root.path().to_path_buf()), &request),
+            ActionResultPoll::Matched(applied.clone()),
+            "only the exact identity-, generation-, action-, and target-bound result is admitted"
+        );
+
+        let mut pending = pending_health_action(&ctx).expect("pending request state");
+        pending.result = Some(applied.clone());
+        set_pending_health_action(&ctx, pending.clone());
+        snapshot.generation = applied.snapshot_generation;
+        snapshot.generated_at_ms = now_ms();
+        snapshot.fresh_until_ms = snapshot.generated_at_ms.saturating_add(60_000);
+        let presentation = action_progress_presentation(&pending, Some(&snapshot), None);
+        assert_eq!(presentation.tone, ActionProgressTone::Warning);
+        assert!(presentation.title.contains("issue still active"));
+        assert!(presentation.detail.contains("Current evidence:"));
+        assert!(
+            !action_progress_is_pending(&ctx, &snapshot),
+            "an exact terminal result ends progress without erasing its truthful partial-failure presentation"
+        );
+        assert_eq!(
+            pending_health_action(&ctx)
+                .expect("terminal presentation remains available")
+                .result,
+            Some(applied.clone()),
+            "unrelated rows never clear or replace the admitted result"
+        );
+
+        let mut cross_node_request = request.clone();
+        cross_node_request.requester = "different-requester".into();
+        assert!(
+            !result_is_bound_to_request(&applied, &cross_node_request, now_ms()),
+            "a node result requires the local requester and target to be the same node"
+        );
+
+        let mut mesh_snapshot = fixture_snapshot(true, true);
+        let mut mesh_condition = mesh_snapshot.active_conditions[0].clone();
+        mesh_condition.id = "mesh:genuine-result".into();
+        mesh_condition.scope = HealthScope::Mesh;
+        mesh_condition.remediation[0].target = HealthScope::Mesh;
+        mesh_snapshot.active_conditions.push(mesh_condition.clone());
+        let mesh_outcome = publish_action_to(
+            Some(root.path().to_path_buf()),
+            &mesh_snapshot,
+            &mesh_condition,
+            MESH_SELECTION,
+            HealthAction::RefreshProvider,
+            true,
+        );
+        let ActionPublishOutcome::Published(mesh_request) = mesh_outcome else {
+            panic!("governed mesh request must publish")
+        };
+        let false_mesh_publisher = HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: mesh_request.request_id.clone(),
+            condition_id: mesh_request.condition_id.clone(),
+            action: mesh_request.action,
+            outcome: HealthActionOutcome::Refused,
+            detail: "mesh action was refused".into(),
+            audit_id: "health:mesh:01J00000000000000000000002".into(),
+            completed_at_ms: now_ms(),
+            snapshot_generation: mesh_request.expected_snapshot_generation,
+            refreshed_evidence: None,
+        };
+        assert!(
+            !result_is_bound_to_request(&false_mesh_publisher, &mesh_request, now_ms()),
+            "mesh is a scope, not a result publisher identity"
+        );
+        let genuine_mesh_result = HealthActionResult {
+            audit_id: format!(
+                "health:{}:01J00000000000000000000003",
+                mesh_request.requester
+            ),
+            ..false_mesh_publisher
+        };
+        persist
+            .write(
+                &action_result_topic(&mesh_request.request_id),
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&genuine_mesh_result)
+                        .expect("encode genuine mesh result"),
+                ),
+            )
+            .expect("publish genuine mesh result");
+        assert_eq!(
+            poll_action_result(Some(root.path().to_path_buf()), &mesh_request),
+            ActionResultPoll::Matched(genuine_mesh_result),
+            "a genuine mesh-scoped result binds to the local requester's node-qualified worker audit"
+        );
     }
 
     #[test]

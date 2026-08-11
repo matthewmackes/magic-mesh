@@ -36,8 +36,10 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt as _;
 use mackes_mesh_types::device_inventory::{
     category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceResources, DeviceStatus,
     HostSummary, ToolAvailability,
@@ -604,15 +606,12 @@ pub fn usb_devices(roots: &SysfsRoots, ids: &IdsDb) -> BTreeMap<String, Vec<Devi
 #[must_use]
 pub fn block_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
     let mut out = Vec::new();
-    for dir in sorted_children(&roots.sys.join("block")) {
+    for dir in physical_block_children_bounded(&roots.sys.join("block")) {
         let name = dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        if is_virtual_block(&name) {
-            continue;
-        }
         let model = read_trim(&dir.join("device").join("model"));
         let vendor = read_trim(&dir.join("device").join("vendor"));
         let size_bytes = read_trim(&dir.join("size"))
@@ -638,6 +637,39 @@ pub fn block_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
         });
     }
     out
+}
+
+/// Maximum physical disks published by one inventory generation.
+///
+/// `/sys/block` is kernel-owned in production, but the resulting inventory is
+/// replicated fleet-wide and rendered by every Workers client. Keep that state
+/// bounded even when a malformed sysfs mount exposes an excessive number of
+/// entries. Virtual block devices are rejected before admission so an attacker
+/// cannot hide physical disks by filling the lexicographically earliest rows
+/// with `loop*`/`dm-*` names.
+const MAX_BLOCK_DEVICES: usize = 256;
+
+fn physical_block_children_bounded(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = BTreeSet::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_virtual_block(name) {
+            continue;
+        }
+        out.insert(path);
+        if out.len() > MAX_BLOCK_DEVICES {
+            if let Some(last) = out.iter().next_back().cloned() {
+                out.remove(&last);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Whether a `/sys/block` name is a virtual (non-hardware) device.
@@ -1163,6 +1195,56 @@ fn add(buckets: &mut BTreeMap<String, Vec<DeviceRecord>>, key: &str, recs: Vec<D
     }
 }
 
+/// Reconcile independently enumerated sysfs views before publication.
+///
+/// Linux exposes one hardware object through several class and bus trees.  If
+/// two paths resolve to the same kernel object, an exact duplicate is harmless,
+/// but different category/body claims are equivocation: choosing whichever
+/// provider happened to run first would publish unsupported state.  Suppress
+/// only that stable identity while retaining unrelated devices.
+fn suppress_conflicting_sysfs_identities(
+    buckets: &mut BTreeMap<String, Vec<DeviceRecord>>,
+) {
+    let mut admitted: BTreeMap<PathBuf, (String, DeviceRecord)> = BTreeMap::new();
+    let mut conflicted = BTreeSet::new();
+
+    for (category, records) in buckets.iter() {
+        for record in records {
+            let Some(identity) = stable_sysfs_identity(record) else {
+                continue;
+            };
+            let mut body = record.clone();
+            body.sysfs_path = None;
+            match admitted.get(&identity) {
+                Some((admitted_category, admitted_body))
+                    if admitted_category != category || admitted_body != &body =>
+                {
+                    conflicted.insert(identity);
+                }
+                Some(_) => {}
+                None => {
+                    admitted.insert(identity, (category.clone(), body));
+                }
+            }
+        }
+    }
+
+    let mut published = BTreeSet::new();
+    for records in buckets.values_mut() {
+        records.retain(|record| {
+            let Some(identity) = stable_sysfs_identity(record) else {
+                return true;
+            };
+            !conflicted.contains(&identity) && published.insert(identity)
+        });
+    }
+}
+
+fn stable_sysfs_identity(record: &DeviceRecord) -> Option<PathBuf> {
+    let path = Path::new(record.sysfs_path.as_deref()?);
+    std::fs::canonicalize(path).ok().or_else(|| Some(path.to_path_buf()))
+}
+
 /// Build the full [`DeviceInventory`] for `hostname` from the injected roots +
 /// databases + a captured dmesg buffer.
 ///
@@ -1198,6 +1280,8 @@ pub fn enumerate(
     add(&mut buckets, category::SENSORS, sensors(roots));
     add(&mut buckets, category::BLUETOOTH, bluetooth(roots));
     add(&mut buckets, category::POWER, power_supplies(roots));
+
+    suppress_conflicting_sysfs_identities(&mut buckets);
 
     // Emit in the canonical order, dropping empties (#22).
     let categories = category::ORDER
@@ -1248,11 +1332,15 @@ pub fn capture_dmesg() -> Vec<String> {
 /// # Errors
 /// Directory-create / write / rename / serialization failures.
 pub fn publish_system(workgroup_root: &Path, hostname: &str) -> std::io::Result<PathBuf> {
+    // Bind this generation to when its probe began. A slow pre-restart census
+    // must not acquire a newer generation merely because it finished last.
+    let probe_started_at_ms = now_ms();
     let roots = SysfsRoots::system();
     let ids = IdsDb::load();
     let tools = tool_availability(&ids);
     let dmesg = capture_dmesg();
-    let inv = enumerate(&roots, &ids, tools, hostname, &dmesg);
+    let mut inv = enumerate(&roots, &ids, tools, hostname, &dmesg);
+    inv.published_at_ms = probe_started_at_ms;
     write_inventory(workgroup_root, &inv)
 }
 
@@ -1265,11 +1353,81 @@ pub fn write_inventory(workgroup_root: &Path, inv: &DeviceInventory) -> std::io:
     let dir = mackes_mesh_types::device_inventory::inventory_dir(workgroup_root);
     std::fs::create_dir_all(&dir)?;
     let path = mackes_mesh_types::device_inventory::inventory_path(workgroup_root, &inv.host);
+    let lock_path = dir.join(format!(".{}.lock", inv.host));
+    let lock = open_inventory_lock(&lock_path)?;
+    lock.lock_exclusive()?;
+
+    if let Some(current) = mackes_mesh_types::device_inventory::read_inventory(
+        workgroup_root,
+        &inv.host,
+    ) {
+        if current.published_at_ms > inv.published_at_ms
+            || (current.published_at_ms == inv.published_at_ms && current != *inv)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing stale or equivocated device inventory generation {} behind {}",
+                    inv.published_at_ms, current.published_at_ms
+                ),
+            ));
+        }
+    }
+
     let body = serde_json::to_string_pretty(inv)?;
     let tmp = dir.join(format!(".{}.json.tmp", inv.host));
-    std::fs::write(&tmp, body)?;
+    write_inventory_temp(&tmp, body.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
+}
+
+/// Replace the fixed per-host staging row without following a pre-planted
+/// symlink. The host lock makes reuse of this deterministic path safe, while
+/// an exclusive descriptor open keeps publication confined to the inventory
+/// directory even if stale or hostile substrate state occupies the temp name.
+/// Only an unlinked, single-link regular residue may be reclaimed.
+fn write_inventory_temp(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use rustix::fs::{Mode, OFlags};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 => {
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "inventory staging row is not a private regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let fd = rustix::fs::open(
+        path,
+        OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::WRONLY
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    let mut file = File::from(fd);
+    file.write_all(body)
+}
+
+/// Open the stable per-host publication lock without following a substituted
+/// final symlink. The lock serializes the generation check with the rename.
+fn open_inventory_lock(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    Ok(fd.into())
 }
 
 #[cfg(test)]
@@ -1657,6 +1815,35 @@ mod tests {
     }
 
     #[test]
+    fn physical_block_provider_is_bounded_after_virtual_device_filtering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let block = roots.sys.join("block");
+
+        // These sort before the physical rows but must not consume the physical
+        // provider's budget.
+        for index in 0..(MAX_BLOCK_DEVICES + 32) {
+            fs::create_dir_all(block.join(format!("loop{index:04}"))).unwrap();
+        }
+        for index in 0..(MAX_BLOCK_DEVICES + 8) {
+            let disk = block.join(format!("nvme{index:04}"));
+            put(&disk.join("device").join("model"), &format!("Disk {index:04}\n"));
+            put(&disk.join("size"), "2048\n");
+        }
+
+        let records = block_devices(&roots);
+        assert_eq!(records.len(), MAX_BLOCK_DEVICES);
+        assert_eq!(records.first().unwrap().model.as_deref(), Some("Disk 0000"));
+        assert_eq!(records.last().unwrap().model.as_deref(), Some("Disk 0255"));
+        assert!(records.iter().all(|record| {
+            record
+                .sysfs_path
+                .as_deref()
+                .is_some_and(|path| !path.contains("loop"))
+        }));
+    }
+
+    #[test]
     fn physical_network_interfaces_are_bounded_sourced_and_credential_free() {
         let tmp = tempfile::tempdir().unwrap();
         let roots = SysfsRoots::under(tmp.path());
@@ -1787,6 +1974,82 @@ mod tests {
         assert!(inv.summary.kernel.as_deref().unwrap().contains("fc44"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn conflicting_sysfs_sources_suppress_only_the_equivocated_hardware_identity() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let physical = roots.sys.join("devices/pci0000:00/0000:00:1f.6");
+        put(&physical.join("vendor"), "0x8086\n");
+        put(&physical.join("device"), "0x15d8\n");
+        put(&physical.join("class"), "0x020000\n");
+        put(&physical.join("operstate"), "up\n");
+        put(&physical.join("carrier"), "1\n");
+
+        let pci_view = roots.sys.join("bus/pci/devices/0000:00:1f.6");
+        let net_view = roots.sys.join("class/net/eno1");
+        fs::create_dir_all(pci_view.parent().unwrap()).unwrap();
+        fs::create_dir_all(net_view.parent().unwrap()).unwrap();
+        symlink(&physical, &pci_view).unwrap();
+        symlink(&physical, &net_view).unwrap();
+
+        // A distinct interface must survive even though the aliased physical
+        // object above produces incompatible PCI and class-net bodies.
+        let unrelated = roots.sys.join("class/net/eno2");
+        put(&unrelated.join("operstate"), "up\n");
+        put(&unrelated.join("carrier"), "1\n");
+        fs::create_dir_all(unrelated.join("device")).unwrap();
+
+        let inv = enumerate(
+            &roots,
+            &IdsDb::default(),
+            ToolAvailability::default(),
+            "test-box",
+            &[],
+        );
+        let network = inv
+            .categories
+            .iter()
+            .find(|candidate| candidate.key == category::NETWORK_ADAPTERS)
+            .expect("unrelated network hardware remains published");
+        assert_eq!(network.devices.len(), 1);
+        assert!(network.devices[0].name.contains("eno2"));
+        let published = serde_json::to_string(&inv).unwrap();
+        assert!(!published.contains("eno1"));
+        assert!(!published.contains("0000:00:1f.6"));
+
+        // The other side of the admission rule is equally important: two
+        // independently enumerated paths carrying the exact same declaration
+        // for one kernel object collapse instead of suppressing that object.
+        let exact_physical = roots.sys.join("devices/platform/exact0");
+        fs::create_dir_all(&exact_physical).unwrap();
+        let exact_alias_a = roots.sys.join("fixture-aliases/exact-a");
+        let exact_alias_b = roots.sys.join("fixture-aliases/exact-b");
+        fs::create_dir_all(exact_alias_a.parent().unwrap()).unwrap();
+        symlink(&exact_physical, &exact_alias_a).unwrap();
+        symlink(&exact_physical, &exact_alias_b).unwrap();
+
+        let exact_record = DeviceRecord {
+            sysfs_path: Some(exact_alias_a.to_string_lossy().into_owned()),
+            ..DeviceRecord::new("Exact device", DeviceStatus::Ok)
+        };
+        let mut exact_alias_record = exact_record.clone();
+        exact_alias_record.sysfs_path = Some(exact_alias_b.to_string_lossy().into_owned());
+        let mut exact_buckets = BTreeMap::from([(
+            category::INPUT.to_string(),
+            vec![exact_record, exact_alias_record],
+        )]);
+
+        suppress_conflicting_sysfs_identities(&mut exact_buckets);
+        assert_eq!(
+            exact_buckets[category::INPUT].len(),
+            1,
+            "exact aliases must deduplicate without suppressing their identity"
+        );
+    }
+
     #[test]
     fn publish_writes_to_the_substrate_path_and_reads_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1810,6 +2073,56 @@ mod tests {
             .path()
             .join("device-inventory")
             .join(".test-box.json.tmp")
+            .exists());
+    }
+
+    #[test]
+    fn delayed_pre_restart_inventory_cannot_replace_a_newer_hardware_generation() {
+        let store = tempfile::tempdir().unwrap();
+        let mut current = DeviceInventory::fixture();
+        current.host = "restart-host".into();
+        current.published_at_ms = 2;
+        write_inventory(store.path(), &current).unwrap();
+
+        // This census began before restart and observed an empty/healthy-looking
+        // provider tree, but did not finish until the replacement worker had
+        // already committed generation 2.
+        let mut delayed = current.clone();
+        delayed.published_at_ms = 1;
+        delayed.categories.clear();
+        let error = write_inventory(store.path(), &delayed)
+            .expect_err("a delayed census must lose generation arbitration");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            mackes_mesh_types::device_inventory::read_inventory(
+                store.path(),
+                "restart-host"
+            ),
+            Some(current)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_publish_cannot_follow_a_substituted_staging_row() {
+        use std::os::unix::fs::symlink;
+
+        let store = tempfile::tempdir().unwrap();
+        let dir = mackes_mesh_types::device_inventory::inventory_dir(store.path());
+        fs::create_dir_all(&dir).unwrap();
+        let outside = store.path().join("outside-authority");
+        fs::write(&outside, "operator-owned\n").unwrap();
+        symlink(&outside, dir.join(".host-a.json.tmp")).unwrap();
+
+        let mut inv = DeviceInventory::fixture();
+        inv.host = "host-a".into();
+        let error = write_inventory(store.path(), &inv)
+            .expect_err("a substituted staging row must fail closed");
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "operator-owned\n");
+        assert!(!mackes_mesh_types::device_inventory::inventory_path(store.path(), "host-a")
             .exists());
     }
 

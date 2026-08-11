@@ -142,9 +142,10 @@ impl AndroidCatalogWorker {
                     continue;
                 }
             };
-            if current.as_ref().is_some_and(|existing| {
-                candidate.payload.catalog_id != existing.payload.catalog_id
-            }) {
+            if current
+                .as_ref()
+                .is_some_and(|existing| candidate.payload.catalog_id != existing.payload.catalog_id)
+            {
                 tracing::warn!(
                     target: "mackesd::android_catalog",
                     catalog_id = %candidate.payload.catalog_id,
@@ -175,6 +176,7 @@ impl AndroidCatalogWorker {
         persist: &mut Persist,
         state: &mut ImportState,
         identity: BusIdentity,
+        now_ms: u64,
     ) -> io::Result<()> {
         if state.bus_identity == Some(identity) {
             return Ok(());
@@ -186,8 +188,19 @@ impl AndroidCatalogWorker {
         let mut staged = state.clone();
         staged.cursor = None;
         staged.published_replay = false;
-        if let Some(catalog) = staged.current.as_ref() {
-            publish_admitted(persist, &self.host, catalog)?;
+        if let (Some(config), Some(catalog)) = (self.config.as_ref(), staged.current.as_ref()) {
+            match catalog
+                .clone()
+                .admit(&config.signer_id, &config.verifying_key, now_ms)
+            {
+                Ok(catalog) => publish_admitted(persist, &self.host, &catalog)?,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::android_catalog",
+                    ?error,
+                    revision = catalog.payload.revision,
+                    "refused stale or invalid Android catalog replay on replacement Bus"
+                ),
+            }
         }
         staged.published_replay = true;
         staged.bus_identity = Some(identity);
@@ -202,11 +215,42 @@ impl AndroidCatalogWorker {
         state: &mut ImportState,
         now_ms: u64,
     ) -> io::Result<()> {
+        persist.reopen_if_index_changed();
         let identity = bus_identity(bus_root)?;
-        self.activate_bus(persist, state, identity)?;
-        self.process_once(persist, &mut state.cursor, &mut state.current, now_ms)?;
+        verify_bus_identity(persist, bus_root, identity)?;
+
+        // Do not acknowledge replay/import progress until every effect is known
+        // to have reached the same Bus generation this pass opened. A path swap
+        // can otherwise strand publication on the retired SQLite inode while
+        // advancing the replacement generation's cursor in memory.
+        let mut staged = state.clone();
+        self.activate_bus(persist, &mut staged, identity, now_ms)?;
+        self.process_once(
+            persist,
+            &mut staged.cursor,
+            &mut staged.current,
+            now_ms,
+        )?;
+        verify_bus_identity(persist, bus_root, identity)?;
+        *state = staged;
         Ok(())
     }
+}
+
+/// Load the host's durable last-good catalog under the same trust policy used
+/// by the importer.
+///
+/// Mutation consumers use the durable cache instead of trusting an arbitrary
+/// publication on the shared Bus.  Loading re-checks the pinned signer,
+/// Ed25519 signature, complete payload contract, and validity window, so a
+/// catalog that has expired since import cannot authorize new desired state.
+pub(crate) fn load_admitted_catalog(host: &str, now_ms: u64) -> io::Result<AndroidSignedCatalog> {
+    let config = load_environment_config(host)?;
+    load_last_good(&config, now_ms)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "no admitted Android release catalog is cached for `{host}`"
+        ))
+    })
 }
 
 fn resolve_bus_root(configured: Option<PathBuf>, user: Option<PathBuf>) -> PathBuf {
@@ -235,6 +279,25 @@ fn bus_identity(bus_root: &Path) -> io::Result<BusIdentity> {
     }
 }
 
+fn verify_bus_identity(
+    persist: &Persist,
+    bus_root: &Path,
+    expected: BusIdentity,
+) -> io::Result<()> {
+    if bus_identity(bus_root)? != expected {
+        return Err(io::Error::other(
+            "Android catalog Bus generation changed during transaction",
+        ));
+    }
+    #[cfg(unix)]
+    if persist.index_inode() != Some(expected.inode) {
+        return Err(io::Error::other(
+            "Android catalog Bus handle does not match the live generation",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Worker for AndroidCatalogWorker {
     fn name(&self) -> &'static str {
@@ -251,14 +314,34 @@ impl Worker for AndroidCatalogWorker {
             shutdown.wait().await;
             return Ok(());
         }
-        let mut state = ImportState {
-            current: self
-                .config
-                .as_ref()
-                .and_then(|config| load_last_good(config, now_unix_ms()).ok().flatten()),
-            ..ImportState::default()
-        };
+        let mut state = ImportState::default();
+        let mut durable_state_loaded = false;
         loop {
+            if !durable_state_loaded {
+                match load_last_good(
+                    self.config
+                        .as_ref()
+                        .expect("configured Android catalog worker"),
+                    now_unix_ms(),
+                ) {
+                    Ok(current) => {
+                        state.current = current;
+                        durable_state_loaded = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "mackesd::android_catalog",
+                            %error,
+                            "Android catalog durable authority is invalid; importer remains fail-closed"
+                        );
+                        tokio::select! {
+                            () = shutdown.wait() => break,
+                            () = tokio::time::sleep(self.poll) => {}
+                        }
+                        continue;
+                    }
+                }
+            }
             let root = self.resolved_bus_root();
             match Persist::open(root.clone()) {
                 Ok(mut persist) => {
@@ -321,9 +404,12 @@ fn load_verifying_key(path: &Path) -> io::Result<VerifyingKey> {
 }
 
 fn load_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<AndroidSignedCatalog>> {
-    ensure_directory_chain_nofollow(config.state_file.parent().ok_or_else(|| {
-        io::Error::other("Android catalog state path has no parent")
-    })?)?;
+    ensure_directory_chain_nofollow(
+        config
+            .state_file
+            .parent()
+            .ok_or_else(|| io::Error::other("Android catalog state path has no parent"))?,
+    )?;
     if !config.state_file.exists() {
         return Ok(None);
     }
@@ -736,10 +822,7 @@ mod tests {
             state_file: real_path,
             ..worker.config.as_ref().unwrap().clone()
         };
-        assert_eq!(
-            load_last_good(&real_config, NOW).unwrap(),
-            Some(catalog)
-        );
+        assert_eq!(load_last_good(&real_config, NOW).unwrap(), Some(catalog));
     }
 
     #[test]
@@ -843,6 +926,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expired_catalog_cannot_replay_into_replaced_bus() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let bus_root = temp.path().join("replacement-bus");
+        let mut persist = Persist::open(bus_root.clone()).unwrap();
+        let expired = signed_catalog(&key, 7);
+        let mut state = ImportState {
+            current: Some(expired.clone()),
+            ..ImportState::default()
+        };
+        let after_expiry = expired.payload.expires_at_unix_ms + 1;
+
+        worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, after_expiry)
+            .unwrap();
+
+        assert!(
+            persist
+                .read_latest(&android_catalog_state_topic("node-01").unwrap())
+                .unwrap()
+                .is_none(),
+            "replacement Bus must not receive an expired catalog replay"
+        );
+        assert_eq!(
+            state.current.as_ref().unwrap().payload.revision,
+            7,
+            "expired authority remains only as the anti-rollback revision anchor"
+        );
+
+        import(&persist, &signed_catalog_at(&key, 8, after_expiry));
+        worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, after_expiry)
+            .unwrap();
+        assert_eq!(
+            state.current.as_ref().unwrap().payload.revision,
+            8,
+            "a freshly admitted successor must restore publication authority"
+        );
+    }
+
+    #[test]
+    fn replacement_after_open_cannot_strand_catalog_replay_on_retired_index() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let bus_root = temp.path().join("bus");
+        let mut retired = Persist::open(bus_root.clone()).unwrap();
+        let catalog = signed_catalog(&key, 7);
+        let mut state = ImportState {
+            current: Some(catalog),
+            ..ImportState::default()
+        };
+
+        let replacement_root = temp.path().join("replacement-bus");
+        drop(Persist::open(replacement_root.clone()).unwrap());
+        fs::rename(
+            replacement_root.join("index.sqlite"),
+            bus_root.join("index.sqlite"),
+        )
+        .unwrap();
+
+        worker
+            .process_bus_pass(&mut retired, &bus_root, &mut state, NOW)
+            .unwrap();
+
+        let replacement = Persist::open(bus_root).unwrap();
+        assert!(
+            replacement
+                .read_latest(&android_catalog_state_topic("node-01").unwrap())
+                .unwrap()
+                .is_some(),
+            "catalog replay must follow the replacement index opened after the stale handle"
+        );
+    }
+
     async fn wait_for_revision(bus_root: &Path, revision: u64) {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -918,6 +1078,71 @@ mod tests {
             resolve_bus_root(None, None),
             PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_restart_cache_cannot_erase_catalog_identity_authority() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let wall_now = now_unix_ms();
+        let bus_root = temp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        import(
+            &persist,
+            &signed_catalog_at_with_id(&key, 8, wall_now, "aosp-hostile-alternate"),
+        );
+        drop(persist);
+
+        let mut worker = worker(&temp, &key).with_poll(Duration::from_millis(10));
+        worker.bus_root = Some(bus_root.clone());
+        let state_file = worker.config.as_ref().unwrap().state_file.clone();
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        fs::write(&state_file, b"corrupt durable authority").unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        assert!(
+            persist
+                .read_latest(&android_catalog_state_topic("node-01").unwrap())
+                .unwrap()
+                .is_none(),
+            "invalid durable authority must block signed Bus replay"
+        );
+        assert_eq!(
+            fs::read(&state_file).unwrap(),
+            b"corrupt durable authority",
+            "fail-closed startup must not replace the identity anchor from Bus history"
+        );
+
+        let baseline = signed_catalog_at(&key, 7, wall_now);
+        store_last_good(&state_file, &baseline).unwrap();
+        wait_for_revision(&bus_root, 7).await;
+        assert_eq!(
+            load_last_good(
+                &CatalogConfig {
+                    signer_id: "android-release-v1".into(),
+                    verifying_key: key.verifying_key(),
+                    state_file,
+                },
+                wall_now,
+            )
+            .unwrap(),
+            Some(baseline),
+            "repair restores the original identity; the signed alternate stays refused"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker shutdown timeout")
+            .expect("worker task joins")
+            .expect("worker shutdown succeeds");
     }
 
     #[tokio::test]

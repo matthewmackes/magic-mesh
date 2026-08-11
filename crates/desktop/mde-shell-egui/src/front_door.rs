@@ -12,6 +12,7 @@ use mde_egui::{Motion, MotionPreset, Style, TypographyRole};
 use mde_files_egui::model::FileSearchTarget;
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::console::ConsoleSearchHit;
 use crate::datacenter::{FrontDoorLifecycleCandidate, FrontDoorLifecycleKind};
@@ -1210,21 +1211,39 @@ pub(crate) fn peer_app_search_items_with_favorites(
     rank_offset: usize,
     favorites: &FrontDoorPeerAppFavorites,
 ) -> Vec<SearchItem<FrontDoorTarget>> {
-    let mut candidates = apps
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, app)| {
-            let node = app.node.trim();
-            let name = app.name.trim();
-            let id = app.id.trim();
-            if node.is_empty() || name.is_empty() || id.is_empty() {
-                return None;
-            }
-            // Catalog data is untrusted. A malformed Flatpak identity is
-            // omitted before it can become a Front Door launch target.
-            app.flatpak_id().ok()?;
-            Some((idx, app))
-        })
+    // A serving peer and app ID name one launch authority. Never let ranking,
+    // favorites, or source order choose between two different declarations for
+    // that identity. Exact catalog duplicates are harmless and collapse to the
+    // first row; any disagreement withholds the identity entirely.
+    let mut declarations = HashMap::<(String, String), (usize, Option<FrontDoorPeerApp>)>::new();
+    for (idx, app) in apps.into_iter().enumerate() {
+        let node = app.node.trim();
+        let name = app.name.trim();
+        let id = app.id.trim();
+        if node.is_empty() || name.is_empty() || id.is_empty() {
+            continue;
+        }
+        // Catalog data is untrusted. A malformed Flatpak identity is
+        // omitted before it can become a Front Door launch target.
+        if app.flatpak_id().is_err() {
+            continue;
+        }
+        let identity = (node.to_owned(), id.to_owned());
+        declarations
+            .entry(identity)
+            .and_modify(|(_, admitted)| {
+                if admitted
+                    .as_ref()
+                    .is_some_and(|current| !peer_app_declaration_matches(current, &app))
+                {
+                    *admitted = None;
+                }
+            })
+            .or_insert((idx, Some(app)));
+    }
+    let mut candidates = declarations
+        .into_values()
+        .filter_map(|(idx, app)| app.map(|app| (idx, app)))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(idx, app)| (!favorites.contains(app), *idx));
 
@@ -1281,6 +1300,20 @@ pub(crate) fn peer_app_search_items_with_favorites(
             .with_source_rank(rank_offset + display_idx)
         })
         .collect()
+}
+
+fn peer_app_declaration_matches(left: &FrontDoorPeerApp, right: &FrontDoorPeerApp) -> bool {
+    left.node.trim() == right.node.trim()
+        && left.id.trim() == right.id.trim()
+        && left.name.trim() == right.name.trim()
+        && left.source.trim().eq_ignore_ascii_case(right.source.trim())
+        && left.icon.trim() == right.icon.trim()
+        && left.state.trim().eq_ignore_ascii_case(right.state.trim())
+        && left.catalog_revision.as_deref().map(str::trim)
+            == right.catalog_revision.as_deref().map(str::trim)
+        && left.guest_profile.as_deref().map(str::trim)
+            == right.guest_profile.as_deref().map(str::trim)
+        && left.requested_capabilities == right.requested_capabilities
 }
 
 fn peer_app_source_label(source: &str) -> &'static str {
@@ -2788,7 +2821,7 @@ pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(S
     if target.launch_blocked_reason.is_some() {
         return None;
     }
-    let node = target.node.trim();
+    let node = bounded_peer_app_node(&target.node)?;
     let app_id = target.app_id.trim();
     let source = target.source.trim().to_ascii_lowercase();
     let mode = match source.as_str() {
@@ -2803,7 +2836,7 @@ pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(S
         }
         _ => return None,
     };
-    if node.is_empty() || app_id.is_empty() || !safe_peer_app_id(app_id) {
+    if app_id.is_empty() || !safe_peer_app_id(app_id) {
         return None;
     }
     let body = serde_json::json!({
@@ -2824,11 +2857,22 @@ pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(S
 pub(crate) fn peer_app_provision_wire(
     target: &FrontDoorPeerAppTarget,
 ) -> Result<(String, String), String> {
-    peer_app_provision_wire_with(target, crate::iac::authorize_root_mutation_body)
+    let client_peer = crate::discovery::local_peer();
+    if client_peer == "localhost" {
+        return Err(
+            "Flatpak App VM launch requires an enrolled local mesh peer identity.".to_owned(),
+        );
+    }
+    peer_app_provision_wire_with(
+        target,
+        &client_peer,
+        crate::iac::authorize_root_mutation_body,
+    )
 }
 
 fn peer_app_provision_wire_with(
     target: &FrontDoorPeerAppTarget,
+    client_peer: &str,
     authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
 ) -> Result<(String, String), String> {
     if let Some(reason) = target.launch_blocked_reason.as_deref() {
@@ -2851,6 +2895,9 @@ fn peer_app_provision_wire_with(
     {
         return Err("Flatpak App VM placement node is incomplete or unsafe.".to_owned());
     }
+    let client_peer = client_peer.trim();
+    mackes_mesh_types::workloads::WorkloadId::new(client_peer)
+        .map_err(|_| "Flatpak App VM initiating client peer is incomplete or unsafe.".to_owned())?;
     let app_id = FlatpakAppId::parse(target.app_id.trim())
         .map_err(|error| format!("Flatpak App VM identity is invalid: {error}"))?;
     let (name, session_id) = target
@@ -2889,6 +2936,7 @@ fn peer_app_provision_wire_with(
         "guest_profile": request.guest_profile,
         "requested_capabilities": request.requested_capabilities,
         "session_id": request.session_id,
+        "client_peer": client_peer,
         "resume": request.resume,
     })
     .to_string();
@@ -6907,6 +6955,60 @@ mod tests {
         assert_eq!(items[0].title, "Good");
     }
 
+    #[test]
+    fn conflicting_peer_app_declarations_never_become_launch_targets() {
+        let exact = admitted_peer_app("org.example.Exact", "Exact", "oak");
+        let mut exact_replay = exact.clone();
+        exact_replay.health = "reconnecting".to_owned();
+
+        let revision = admitted_peer_app("org.example.Revision", "Revision", "oak");
+        let mut conflicting_revision = revision.clone();
+        conflicting_revision.catalog_revision = Some("catalog-replaced".to_owned());
+
+        let capability = admitted_peer_app("org.example.Capability", "Capability", "oak");
+        let mut conflicting_capability = capability.clone();
+        conflicting_capability.requested_capabilities = vec!["clipboard".to_owned()];
+
+        let source = admitted_peer_app("org.example.Source", "Source", "oak");
+        let mut conflicting_source = source.clone();
+        conflicting_source.source = "xdg".to_owned();
+        conflicting_source.catalog_revision = None;
+        conflicting_source.guest_profile = None;
+
+        let unrelated = admitted_peer_app("org.example.Unrelated", "Unrelated", "pine");
+        let items = peer_app_search_items(
+            [
+                exact,
+                revision,
+                capability,
+                source,
+                unrelated,
+                exact_replay,
+                conflicting_revision,
+                conflicting_capability,
+                conflicting_source,
+            ],
+            0,
+        );
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Exact", "Unrelated"]
+        );
+        for item in &items {
+            let FrontDoorTarget::PeerApp(target) = &item.payload else {
+                panic!("peer app projection manufactured a different target type");
+            };
+            assert!(peer_app_provision_wire_with(target, "seat-a", |body, _, _, _| {
+                Ok(body.to_owned())
+            })
+            .is_ok());
+        }
+    }
+
     fn admitted_peer_app(id: &str, name: &str, node: &str) -> FrontDoorPeerApp {
         FrontDoorPeerApp {
             id: id.to_owned(),
@@ -7028,6 +7130,24 @@ mod tests {
     }
 
     #[test]
+    fn peer_app_launch_wire_rejects_unsafe_serving_route_before_bus() {
+        let mut target = FrontDoorPeerAppTarget {
+            node: "../retired-peer".to_owned(),
+            app_id: "org.example.Editor".to_owned(),
+            name: "Editor".to_owned(),
+            source: "xdg".to_owned(),
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            launch_blocked_reason: None,
+        };
+
+        assert!(peer_app_launch_wire(&target).is_none());
+        target.node = "oak\naction/cloud/app-provision".to_owned();
+        assert!(peer_app_launch_wire(&target).is_none());
+    }
+
+    #[test]
     fn blocked_flatpak_state_cannot_reach_app_vm_authorization() {
         let mut target = FrontDoorPeerAppTarget {
             node: "oak".to_owned(),
@@ -7041,7 +7161,7 @@ mod tests {
         };
         let authorization_called = std::cell::Cell::new(false);
 
-        let error = peer_app_provision_wire_with(&target, |_, _, _, _| {
+        let error = peer_app_provision_wire_with(&target, "seat-a", |_, _, _, _| {
             authorization_called.set(true);
             Ok("must not authorize".to_owned())
         })
@@ -7051,12 +7171,51 @@ mod tests {
         assert!(!authorization_called.get());
 
         target.launch_blocked_reason = Some("  ".to_owned());
-        let error = peer_app_provision_wire_with(&target, |_, _, _, _| {
+        let error = peer_app_provision_wire_with(&target, "seat-a", |_, _, _, _| {
             authorization_called.set(true);
             Ok("must not authorize".to_owned())
         })
         .expect_err("an empty blocked marker must remain fail closed");
         assert!(error.contains("unspecified admission refusal"), "{error}");
+        assert!(!authorization_called.get());
+    }
+
+    #[test]
+    fn app_provision_authenticates_initiating_client_peer_fail_closed() {
+        let target = FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.example.Editor".to_owned(),
+            name: "Editor".to_owned(),
+            source: "flatpak".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: vec!["clipboard".to_owned()],
+            launch_blocked_reason: None,
+        };
+        let (_, body) = peer_app_provision_wire_with(
+            &target,
+            "peer:seat-a",
+            crate::iac::authorize_root_mutation_body,
+        )
+        .expect("authorized App VM provision wire");
+        let document: serde_json::Value = serde_json::from_str(&body).expect("wire JSON");
+        assert_eq!(document["client_peer"], "peer:seat-a");
+        let token = document["armed_token"]
+            .as_str()
+            .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
+            .expect("armed App VM token");
+        assert_eq!(
+            token.request_sha256,
+            mackes_mesh_types::cloud::cloud_request_digest(&body).expect("signed body digest")
+        );
+
+        let authorization_called = std::cell::Cell::new(false);
+        let error = peer_app_provision_wire_with(&target, "../seat-a", |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("unsafe client identity must fail before authorization");
+        assert!(error.contains("client peer"), "{error}");
         assert!(!authorization_called.get());
     }
 
@@ -7074,7 +7233,7 @@ mod tests {
         };
         let authorization_called = std::cell::Cell::new(false);
 
-        let error = peer_app_provision_wire_with(&target, |_, _, _, _| {
+        let error = peer_app_provision_wire_with(&target, "seat-a", |_, _, _, _| {
             authorization_called.set(true);
             Ok("must not authorize".to_owned())
         })
