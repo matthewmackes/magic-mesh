@@ -512,6 +512,14 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
                 record.update(status="failed", reason="not-regular-file")
                 entries.append(record)
                 continue
+            # A hard link can give a credential-bearing inode an innocuous
+            # portable name (for example, ``report.pdf``).  The filename
+            # denylist cannot distinguish that alias from a real download, so
+            # refuse multiply-linked sources before reading any bytes.
+            if metadata.st_nlink != 1:
+                record.update(status="failed", reason="hardlink-rejected")
+                entries.append(record)
+                continue
             size = metadata.st_size
             initial_identity = (
                 metadata.st_dev,
@@ -643,6 +651,21 @@ def self_test() -> None:
         assert first["counts"]["failed"] == 0
         assert not any("SECRET" in path.read_text(errors="ignore") for path in output.rglob("*") if path.is_file())
         assert (output / "payload" / "downloads" / "report.pdf").read_bytes() == b"download"
+
+        hardlink_secret = Path(raw) / "hardlink-secret"
+        hardlink_secret.write_text("SECRET-HARDLINK", encoding="utf-8")
+        hardlink_downloads = Path(raw) / "hardlink-downloads"
+        hardlink_downloads.mkdir()
+        try:
+            (hardlink_downloads / "report.pdf").hardlink_to(hardlink_secret)
+        except OSError as error:
+            raise AssertionError(f"self-test filesystem must support hard links: {error}") from error
+        try:
+            migrate([(hardlink_downloads, "downloads")], Path(raw) / "hardlink-bundle")
+        except MigrationError as error:
+            assert "failed source entries" in str(error)
+        else:
+            raise AssertionError("hard-linked portable source was accepted")
 
         unrelated = Path(raw) / "unrelated-output"
         unrelated.mkdir()
