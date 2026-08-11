@@ -18,6 +18,11 @@ DEFAULT_MATRIX = ROOT / "install-helpers" / "release-gate-matrix.json"
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 EVIDENCE_RE = re.compile(r"docs/platform/release-evidence/[0-9a-f]{40}/[a-z0-9][a-z0-9.-]*\.json")
+# Gate commands are recorded as one bounded command line and may contain
+# parameter expansion (the canonical matrix uses ${MCNF_*}), but they must not
+# carry shell control syntax that could turn an evidence claim into a second
+# command when a downstream runner evaluates the field.
+COMMAND_CONTROL_RE = re.compile(r"[;&|<>`]|$\(")
 
 TOP_KEYS = {
     "schema_version", "kind", "source_revision", "required_gate_ids",
@@ -196,7 +201,12 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
             require_string(gate[field], f"{label}.{field}")
         if not ID_RE.fullmatch(gate["owner"]):
             fail(f"{label}.owner must be a canonical identifier")
-        if "\n" in gate["command"] or len(gate["command"]) > 2048:
+        if (
+            "\n" in gate["command"]
+            or "\r" in gate["command"]
+            or len(gate["command"]) > 2048
+            or COMMAND_CONTROL_RE.search(gate["command"])
+        ):
             fail(f"{label}.command must be one bounded command line")
         if scope_kind == "seat":
             command = gate["command"]
@@ -296,6 +306,12 @@ def self_test() -> None:
     case("unknown implied gate", lambda value: value["gates"][0].__setitem__("scope_id", "invented"))
     case("missing owner", lambda value: value["gates"][0].__setitem__("owner", ""))
     case("missing command", lambda value: value["gates"][0].__setitem__("command", ""))
+    case(
+        "shell control command",
+        lambda value: value["gates"][0].__setitem__(
+            "command", "self-test --gate github-required; touch /tmp/forged"
+        ),
+    )
     case("missing evidence", lambda value: value["gates"][0].__setitem__("evidence_filename", ""))
     case(
         "reused evidence claim",

@@ -220,10 +220,17 @@ impl ClipboardFilesMaterializer {
         // failure cannot turn the same approval into another read attempt.
         self.authorizations.insert(
             request.authorization_id.clone(),
-            request.lease_expires_at_ms,
+            request
+                .lease_expires_at_ms
+                .min(request.envelope_expires_at_ms),
         );
         self.commands
-            .insert(command_key, request.lease_expires_at_ms);
+            .insert(
+                command_key,
+                request
+                    .lease_expires_at_ms
+                    .min(request.envelope_expires_at_ms),
+            );
 
         let object = request
             .files_reference
@@ -567,6 +574,12 @@ mod tests {
             request_body.len()
         );
         endpoint.drain(now_ms + 1);
+        assert_eq!(
+            endpoint.authorizations.get(&request.authorization_id),
+            Some(&(now_ms + 30_000)),
+            "one-use authority follows the earlier envelope expiry"
+        );
+        assert_eq!(endpoint.commands.len(), 1);
         let mut response_bytes = [0_u8; MAX_VDI_CLIPBOARD_FILES_MATERIALIZATION_PACKET_BYTES];
         let mut iov = [IoSliceMut::new(&mut response_bytes)];
         let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
@@ -610,5 +623,8 @@ mod tests {
                 reason: VdiClipboardFilesMaterializationErrorV1::Replayed,
             }
         );
+        endpoint.drain(now_ms + 30_000);
+        assert!(endpoint.authorizations.is_empty());
+        assert!(endpoint.commands.is_empty());
     }
 }

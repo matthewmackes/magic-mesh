@@ -776,6 +776,8 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Future VDI envelope admission (2026-08-11):** future-dated clipboard envelopes are rejected before replay admission; `.90` passed the exact regression:
   `docs/platform/evidence/WL-FUNC-016-2026-08-11-vdi-future-envelope-r216.md`.
+- **Materialization envelope expiry (2026-08-11):** one-use descriptor authority expires at the earlier lease or envelope deadline; BigBoy passed the exact regression:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-11-envelope-expiry-r219.md`.
 - **VDI replay expiry:** `.90` passed bounded expired-session cleanup before fresh clipboard admission:
   `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-expiry-r182.md`.
 - **VDI replay retention:** `.90` passed refusal of an older replay after a newer
@@ -910,10 +912,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
 - **Basemap cache reload:** `.90` passed atomic replacement: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-cache-revalidation-r215.md`.
 - **Weather cache identity checkpoint (2026-08-09):** restart recovery now
-  binds nested current/forecast snapshots to exact host, location generation,
-  point, and timezone; mismatches publish typed unavailable state. Machine 194 passed the exact hostile-cache test:
+  binds nested current/forecast snapshots to exact host, location generation, point, and timezone; mismatches publish typed unavailable state. Machine 194 passed:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
 - **Malformed weather cache (2026-08-10):** `.90` passed recovery evidence: `docs/platform/evidence/WL-FUNC-017-2026-08-10-weather-cache-recovery-r204.md`.
+- **Future cache fallback (2026-08-11):** `.50` passed: `docs/platform/evidence/WL-FUNC-017-2026-08-11-future-cache-fallback-r219.md`.
 - **Navigation action retry checkpoint (2026-08-09):** route, progress, and
   cancellation cursors now acknowledge only after governed effects succeed;
   interrupted calculations roll back their replay reservation, while final
@@ -1927,6 +1929,10 @@ behavioral evidence is not completion.
 - **Release gate identity bounds (2026-08-10):** oversized authenticated farm
   identities are rejected; the `.90` CI-gate self-test passed:
   `docs/platform/evidence/WL-CRIT-006-2026-08-10-release-identity-bound-r211.md`.
+- **Gate command-control boundary (2026-08-11):** shell control syntax is
+  rejected in bounded release commands while safe parameter expansion remains
+  allowed; `.50` passed 18 hostile fixtures:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-11-command-control-boundary-r219.md`.
 - **Release-32 native-F44 three-seat checkpoint (2026-08-10):** an F42 candidate was rejected before install; the corrected signed F44 artifact then passed integrity,
   transaction, package, grouped-runtime, and Dell Browser-VM preservation on exactly Dell, seat 15, and Surface:
   `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.

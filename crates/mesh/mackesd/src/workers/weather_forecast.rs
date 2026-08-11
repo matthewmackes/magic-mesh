@@ -1137,6 +1137,11 @@ fn cached_current(
         return None;
     }
     let observed_at_ms = snapshot.conditions.as_ref()?.observed_at_ms;
+    // Provider snapshots may tolerate a bounded clock-skew window, but a
+    // durable cache must never turn a future observation into usable data.
+    if observed_at_ms > now_ms {
+        return None;
+    }
     let age = now_ms.saturating_sub(observed_at_ms).max(0);
     if age > MAX_CACHE_AGE_MS {
         return None;
@@ -1168,6 +1173,9 @@ fn cached_forecast(
         || snapshot.location_point.as_ref() != Some(&location.point)
         || snapshot.time_zone != location.time_zone
     {
+        return None;
+    }
+    if snapshot.producer_at_ms > now_ms {
         return None;
     }
     let age = now_ms.saturating_sub(snapshot.producer_at_ms).max(0);
@@ -2191,6 +2199,61 @@ mod tests {
             latest(&root, &weather_forecast_state_topic("workstation-1"));
         assert_eq!(current.location_generation, 7);
         assert_eq!(forecast.location_generation, 7);
+        assert!(matches!(
+            current.availability,
+            WeatherAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
+            forecast.availability,
+            WeatherAvailability::Unavailable { .. }
+        ));
+        assert!(current.conditions.is_none());
+        assert!(forecast.hourly.is_empty() && forecast.daily.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_refuses_future_dated_cache_snapshots_during_provider_outage() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        let authority = location(7, -71.0589);
+        write_location(&root, &authority);
+
+        let initial = worker(&temp, fixture_probe(24));
+        initial
+            .refresh_once(authority.clone(), true, true)
+            .await
+            .expect("initial refresh");
+        let mut cache = load_cache(&initial.cache_path)
+            .expect("load cache")
+            .expect("cache exists");
+        cache
+            .current
+            .as_mut()
+            .expect("cached current")
+            .conditions
+            .as_mut()
+            .expect("cached conditions")
+            .observed_at_ms = NOW + 1_000;
+        cache
+            .forecast
+            .as_mut()
+            .expect("cached forecast")
+            .producer_at_ms = NOW + 1_000;
+        store_cache(&initial.cache_path, &cache).expect("store future cache");
+
+        let mut restarted = worker(&temp, fixture_probe(24));
+        restarted.probe = None;
+        let outcome = restarted
+            .refresh_once(authority, true, true)
+            .await
+            .expect("provider outage should publish bounded unavailable state");
+        assert_eq!(outcome.current_fresh, Some(false));
+        assert_eq!(outcome.forecast_fresh, Some(false));
+
+        let current: CurrentWeatherSnapshot =
+            latest(&root, &weather_current_state_topic("workstation-1"));
+        let forecast: WeatherForecastSnapshot =
+            latest(&root, &weather_forecast_state_topic("workstation-1"));
         assert!(matches!(
             current.availability,
             WeatherAvailability::Unavailable { .. }
