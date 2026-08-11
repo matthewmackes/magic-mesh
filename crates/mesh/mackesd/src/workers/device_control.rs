@@ -339,21 +339,48 @@ impl DeviceControlExecWorker {
     /// substituting another category, display name, or kernel module. A host that
     /// has published no inventory yet refuses everything (conservative +
     /// self-healing once it publishes).
-    fn offered(&self, target: &DeviceTarget, expected_published_at_ms: u64) -> bool {
+    fn offered(
+        &self,
+        target: &DeviceTarget,
+        expected_published_at_ms: u64,
+    ) -> Option<device_inventory::DeviceRecord> {
         let Some(inv) = device_inventory::read_inventory(&self.workgroup_root, &self.self_hostname)
         else {
-            return false;
+            return None;
         };
-        expected_published_at_ms != 0
-            && inv.published_at_ms == expected_published_at_ms
-            && inv.categories.iter().any(|category| {
-                category.key == target.category
-                    && category.devices.iter().any(|device| {
-                        device.name == target.name
-                            && device.sysfs_path == target.sysfs_path
-                            && device.driver == target.driver
-                    })
+        if expected_published_at_ms == 0 || inv.published_at_ms != expected_published_at_ms {
+            return None;
+        }
+        inv.categories
+            .iter()
+            .filter(|category| category.key == target.category)
+            .flat_map(|category| category.devices.iter())
+            .find(|device| {
+                device.name == target.name
+                    && device.sysfs_path == target.sysfs_path
+                    && device.driver == target.driver
             })
+            .cloned()
+    }
+
+    /// A provider-owned record with no resolved state or explanatory evidence is
+    /// not safe to mutate. Keep known operational states (for example a network
+    /// link explicitly reported `down`) actionable, while refusing an absent
+    /// driver/unknown device whose provider could not establish availability.
+    fn admit_control_state(
+        op: DeviceControlOp,
+        device: &device_inventory::DeviceRecord,
+    ) -> Result<(), String> {
+        if matches!(op, DeviceControlOp::Enable | DeviceControlOp::Disable)
+            && device.status == device_inventory::DeviceStatus::Unknown
+            && device.problem.is_none()
+        {
+            return Err(format!(
+                "{}: provider state for `{}` is unavailable — refused before mutation",
+                op.as_str(), device.name
+            ));
+        }
+        Ok(())
     }
 
     /// Handle one request: gate → plan → execute. Returns the typed result WITHOUT
@@ -369,7 +396,7 @@ impl DeviceControlExecWorker {
                 ),
             );
         }
-        if !self.offered(&req.target, req.expected_inventory_published_at_ms) {
+        let Some(device) = self.offered(&req.target, req.expected_inventory_published_at_ms) else {
             return DeviceControlResult::failed(
                 &req.id,
                 format!(
@@ -379,6 +406,9 @@ impl DeviceControlExecWorker {
                     req.expected_inventory_published_at_ms,
                 ),
             );
+        };
+        if let Err(reason) = Self::admit_control_state(req.op, &device) {
+            return DeviceControlResult::failed(&req.id, reason);
         }
         let steps = match command_plan(req.op, &req.target) {
             Ok(s) => s,
@@ -1018,6 +1048,58 @@ mod tests {
         assert!(
             persist.list_since(NOTIFY_TOPIC, None).unwrap().is_empty(),
             "a successful op raises no failure notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_state_cannot_reach_the_mutation_seam() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+        write_inventory(
+            tmp.path(),
+            "edge-2",
+            vec![DeviceRecord {
+                sysfs_path: Some(sysfs_path.clone()),
+                status: DeviceStatus::Unknown,
+                problem: None,
+                ..DeviceRecord::new("Unavailable USB device", DeviceStatus::Unknown)
+            }],
+        );
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_authorizer(test_authorizer(tmp.path()));
+        let request = authorize_request(
+            &DeviceControlRequest {
+                schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+                armed_token: None,
+                id: "01UNAVAILABLE".into(),
+                op: DeviceControlOp::Disable,
+                target: DeviceTarget {
+                    name: "Unavailable USB device".into(),
+                    category: category::NETWORK_ADAPTERS.into(),
+                    sysfs_path: Some(sysfs_path),
+                    driver: None,
+                },
+                target_host: "edge-2".into(),
+                expected_inventory_published_at_ms: 1,
+                from: "peer:laptop-mm".into(),
+            },
+            "unavailable-provider-state",
+        );
+
+        let result = worker.handle_request(&request).await;
+        assert!(!result.ok, "unavailable provider state must refuse mutation");
+        assert!(result.error.contains("provider state"), "{}", result.error);
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "unavailable state must be refused before the sysfs seam"
         );
     }
 
