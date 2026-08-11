@@ -51,9 +51,9 @@ pub struct ProbeInput {
 ///    IP if the node has one).
 /// 2. **Probe** rows attest the same `(host, kind)` and OVERWRITE the endpoint with
 ///    the richer `ip:port` (a probe knows the wire port a directory token can't).
-/// 3. **Enrichment** applies the offline `service → openable-action` map: a record
-///    whose kind maps to a launch verb gains that `action` AND an `Enrichment`
-///    attestation (the Explorer's third-source label).
+/// 3. **Enrichment** applies the offline `service → openable-action` map only to
+///    a fresh, probe-confirmed record. A merely advertised or stale service stays
+///    visible for diagnosis, but cannot advertise an actionable verb.
 ///
 /// Then health + **TTL age-out**: a record fresher than `ttl_ms` is [`Up`] when a
 /// probe confirmed it, else [`Unknown`] (published-only = advertised-unconfirmed).
@@ -98,16 +98,9 @@ pub fn aggregate(
         rec.last_seen_ms = rec.last_seen_ms.max(pr.last_seen_ms);
     }
 
-    // (3) Enrichment + health + TTL age-out.
+    // (3) Health + TTL age-out + action enrichment.
     let mut out = Vec::with_capacity(by_key.len());
     for (_key, mut rec) in by_key {
-        // Enrichment (the Explorer's offline service→action map): a mapped kind
-        // gains its openable-action verb + an Enrichment attestation.
-        if let Some(action) = service_action(&rec.kind) {
-            rec.action = Some(action.to_string());
-            rec.attest(ServiceProvenance::Enrichment);
-        }
-
         let fresh = now_ms.saturating_sub(rec.last_seen_ms) <= ttl_ms;
         let has_probe = rec.attested_by(ServiceProvenance::Probe);
         let has_published = rec.attested_by(ServiceProvenance::Published);
@@ -124,6 +117,17 @@ pub fn aggregate(
         } else {
             ServiceHealth::Unknown
         };
+
+        // The offline map identifies a possible client, not authority to expose
+        // one. Only a fresh probe has established that the endpoint is currently
+        // reachable; advertised-only and stale records remain inspectable but do
+        // not gain an actionable verb.
+        if rec.health == ServiceHealth::Up {
+            if let Some(action) = service_action(&rec.kind) {
+                rec.action = Some(action.to_string());
+                rec.attest(ServiceProvenance::Enrichment);
+            }
+        }
         out.push(rec);
     }
     out.sort_by(|a, b| a.key().cmp(&b.key()));
@@ -245,6 +249,49 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].health, ServiceHealth::Stale);
         assert!(out[0].attested_by(ServiceProvenance::Published));
+    }
+
+    #[test]
+    fn mapped_actions_require_a_fresh_probe_confirmation() {
+        // A directory claim is useful diagnostic state, but it cannot advertise
+        // an open action until a current probe confirms the endpoint. The same is
+        // true after that claim has gone stale.
+        let now = 1_000_000;
+        let published = vec![
+            published("advertised", Some("10.42.0.10"), &["ssh"], now - 1_000),
+            published(
+                "stale",
+                Some("10.42.0.11"),
+                &["ssh"],
+                now - (TTL + 1),
+            ),
+        ];
+        let probes = vec![probe("confirmed", "10.42.0.12", 22, "ssh", now - 1_000)];
+
+        let out = aggregate(&published, &probes, now, TTL);
+        let advertised = out
+            .iter()
+            .find(|record| record.host == "advertised")
+            .expect("advertised record remains visible");
+        assert_eq!(advertised.health, ServiceHealth::Unknown);
+        assert!(advertised.action.is_none());
+        assert!(!advertised.attested_by(ServiceProvenance::Enrichment));
+
+        let stale = out
+            .iter()
+            .find(|record| record.host == "stale")
+            .expect("stale record remains visible");
+        assert_eq!(stale.health, ServiceHealth::Stale);
+        assert!(stale.action.is_none());
+        assert!(!stale.attested_by(ServiceProvenance::Enrichment));
+
+        let confirmed = out
+            .iter()
+            .find(|record| record.host == "confirmed")
+            .expect("fresh probe record survives");
+        assert_eq!(confirmed.health, ServiceHealth::Up);
+        assert_eq!(confirmed.action.as_deref(), Some("open-ssh"));
+        assert!(confirmed.attested_by(ServiceProvenance::Enrichment));
     }
 
     #[test]

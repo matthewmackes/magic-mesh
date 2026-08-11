@@ -1219,7 +1219,10 @@ behavioral evidence is not completion.
   exposes typed Open/Start/Resume/Transfer actions; and never launches an untrusted or ambiguous resource.
 - Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
   fixtures, responsive captures, and live recovery proof remain.
-- Remaining work: **Service-action admission checkpoint (2026-08-10):** ready service actions fail closed when authentication, target identity,
+- Remaining work:
+- **Fresh-probe action projection (2026-08-11):** advertised-only and stale service rows expose no action; only fresh probe-confirmed rows receive one; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-11-service-action-fresh-probe-r217.md`.
+- **Service-action admission checkpoint (2026-08-10):** ready service actions fail closed when authentication, target identity,
   issuance, expiry, or ambiguity checks do not hold;
   seat 50 passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-action-admission-r159.md`.
