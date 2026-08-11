@@ -765,6 +765,17 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
     }
 
     fn cleanup(&self, request_id: &str, generation: u64) -> bool {
+        // Cleanup is still a destructive lifecycle operation. Do not let a
+        // delayed request from an older generation reach the provider after
+        // the workload has been replaced.
+        let generation_matches = self
+            .observation
+            .lock()
+            .map(|observation| observation.generation == generation)
+            .unwrap_or(false);
+        if generation == 0 || !generation_matches {
+            return false;
+        }
         self.client
             .cleanup(request_id, &self.target, &self.package_manifest, generation)
             .is_ok()
@@ -894,6 +905,7 @@ mod tests {
         observe_calls: Arc<AtomicUsize>,
         inventory_calls: Arc<AtomicUsize>,
         launch_calls: Arc<AtomicUsize>,
+        cleanup_calls: Arc<AtomicUsize>,
         observe_result:
             Arc<Mutex<Option<Result<CuttlefishVmObservation, CuttlefishProviderError>>>>,
         launch_result:
@@ -907,6 +919,7 @@ mod tests {
                 observe_calls: Arc::new(AtomicUsize::new(0)),
                 inventory_calls: Arc::new(AtomicUsize::new(0)),
                 launch_calls: Arc::new(AtomicUsize::new(0)),
+                cleanup_calls: Arc::new(AtomicUsize::new(0)),
                 observe_result: Arc::new(Mutex::new(Some(observe_result))),
                 launch_result: Arc::new(Mutex::new(Some(Ok(AndroidGuestLaunchOutcome::Started)))),
                 vdi_source_result: Arc::new(Mutex::new(None)),
@@ -938,6 +951,17 @@ mod tests {
                 .expect("launch result lock")
                 .take()
                 .expect("one launch call")
+        }
+
+        fn cleanup(
+            &self,
+            _request_id: &str,
+            _target: &CuttlefishVmTarget,
+            _package_manifest: &AndroidImagePackageManifest,
+            _generation: u64,
+        ) -> Result<(), CuttlefishProviderError> {
+            self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         fn inventory_at(
@@ -1245,6 +1269,28 @@ mod tests {
         );
         assert_eq!(inventory_calls.load(Ordering::Relaxed), 0);
         assert_eq!(launch_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_reach_the_provider() {
+        let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
+        let client = FakeClient::new(Ok(initial.clone()));
+        let cleanup_calls = client.cleanup_calls.clone();
+        let adapter = CuttlefishProviderAdapter::new(
+            "android-t480",
+            target(),
+            package_manifest(),
+            initial,
+            client,
+        )
+        .expect("adapter");
+
+        assert!(!adapter.cleanup("cleanup-stale-generation", 6));
+        assert!(!adapter.cleanup("cleanup-zero-generation", 0));
+        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 0);
+
+        assert!(adapter.cleanup("cleanup-current-generation", 7));
+        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
