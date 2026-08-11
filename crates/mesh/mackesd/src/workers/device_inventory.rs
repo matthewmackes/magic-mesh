@@ -81,6 +81,10 @@ impl SysfsRoots {
 /// Keep even an unusually large host bounded before materializing it.
 const MAX_READ_TRIM_BYTES: usize = 256 * 1024;
 
+/// The vendor databases are larger than individual sysfs attributes, but
+/// remain bounded static inputs rather than untrusted unbounded streams.
+const MAX_IDS_DATABASE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Read a small sysfs/procfs file, trimmed; `None` when absent/empty/unreadable.
 fn read_trim(path: &Path) -> Option<String> {
     use std::io::Read as _;
@@ -239,7 +243,7 @@ impl IdsDb {
         ];
         let first = |paths: &[&str]| -> IdsMap {
             for p in paths {
-                if let Ok(text) = std::fs::read_to_string(p) {
+                if let Ok(text) = read_ids_database(Path::new(p)) {
                     return parse_ids(&text);
                 }
             }
@@ -281,6 +285,29 @@ impl IdsDb {
     pub fn usb_name(&self, vendor: u16, product: u16) -> (Option<String>, Option<String>) {
         Self::name(&self.usb, vendor, product)
     }
+}
+
+fn read_ids_database(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_IDS_DATABASE_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hardware ID database is not a bounded regular file",
+        ));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take((MAX_IDS_DATABASE_BYTES + 1) as u64)
+        .read_to_string(&mut text)?;
+    if text.len() > MAX_IDS_DATABASE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hardware ID database exceeds its byte bound",
+        ));
+    }
+    Ok(text)
 }
 
 // ── PCI class → category + resource parsing ──────────────────────────────────
@@ -1351,6 +1378,15 @@ mod tests {
             ),
             usb: parse_ids("046d  Logitech, Inc.\n\tc52b  Unifying Receiver\n1d6b  Linux Foundation\n\t0002  2.0 root hub\n"),
         }
+    }
+
+    #[test]
+    fn oversized_ids_database_is_rejected_before_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pci.ids");
+        std::fs::write(&path, vec![b'x'; MAX_IDS_DATABASE_BYTES + 1]).unwrap();
+        let error = read_ids_database(&path).expect_err("oversized ID database must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

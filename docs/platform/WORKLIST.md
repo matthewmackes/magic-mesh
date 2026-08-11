@@ -419,8 +419,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
 - **Bounded job input (2026-08-11):** signed playbooks cap at 1 MiB before digest/apply; BigBoy: `evidence/WL-ARCH-009-2026-08-11-job-playbook-bound-r226.md`.
-- Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip rather than burst after a blocking snapshot; evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
+- **Bounded mesh-DNS directory (2026-08-11):** over-12-peer directories fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-mesh-dns-directory-bound-r229.md`.
+- Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip bursts; evidence: `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
 - **HTTPS policy (r159):** fallback rejects unsafe configuration; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
 - **HTTPS policy source-parent integrity (2026-08-10):** `.90` passed symlinked-ancestor refusal: `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-parent-r214.md`.
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
@@ -2092,6 +2092,8 @@ behavioral evidence is not completion.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.
+- **Bounded boot command output (2026-08-11):** `systemctl` readiness output is capped at 4096 bytes and oversized producers are killed; BigBoy passed 1/1:
+  `evidence/WL-CRIT-007-2026-08-11-boot-command-output-bound-r229.md`.
 - **Release-32 corrected-forward checkpoint (2026-08-10):** Dell, seat 15, and Surface returned from the signed F44 upgrade with exact package bytes, Nebula, Construct,
   target, and all six groups active; Surface root-key access is now direct:
   `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
@@ -2377,6 +2379,8 @@ behavioral evidence is not completion.
   entities are capped at 64 in deterministic lexical order; `.50` passed the
   oversized fixture:
   `docs/platform/evidence/WL-UX-011-2026-08-11-power-supply-bound-r220.md`.
+- **Bounded hardware ID databases (2026-08-11):** `pci.ids`/`usb.ids` reads cap at 16 MiB before parsing; BigBoy passed 1/1:
+  `evidence/WL-UX-011-2026-08-11-ids-database-bound-r229.md`.
 - **Device-control cancellation checkpoint (2026-08-09):** a signed cancellation
   can atomically claim only the exact still-pending request; late/refused
   cancellation cannot replace its eventual execution result, and the shell

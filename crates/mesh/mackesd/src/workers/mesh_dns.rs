@@ -45,6 +45,11 @@ pub const MUSIC_FQDN: &str = "music.mesh";
 /// so writes do not split across per-instance SQLite databases.
 pub const MUSIC_WRITER_FQDN: &str = "music-writer.mesh";
 
+/// The supported workgroup envelope is three lighthouses plus nine peers.
+/// Refuse an oversized replicated directory rather than allowing its records
+/// to grow the generated hosts block without bound.
+pub const MAX_DIRECTORY_PEERS: usize = 12;
+
 /// `/etc/hosts` managed-block markers (the resolvectl-absent path).
 pub const HOSTS_BEGIN: &str = "# >>> mde mesh-dns (managed) >>>";
 /// Closing sentinel for the managed `/etc/hosts` block.
@@ -320,10 +325,14 @@ fn which(bin: &str) -> bool {
 /// both read the directory snapshot the same way.
 #[must_use]
 pub fn directory_records(dir: &serde_json::Value) -> Vec<(String, String)> {
-    dir["peers"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let Some(peers) = dir["peers"].as_array() else {
+        return Vec::new();
+    };
+    if peers.len() > MAX_DIRECTORY_PEERS {
+        return Vec::new();
+    }
+    peers
+        .iter()
         .filter_map(|p| {
             Some((
                 p["hostname"].as_str()?.to_string(),
@@ -466,6 +475,19 @@ mod tests {
         ]});
         let ips = media_overlay_ips(&dir);
         assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn oversized_directory_fails_closed_without_mesh_records() {
+        let peers: Vec<serde_json::Value> = (0..=MAX_DIRECTORY_PEERS)
+            .map(|i| serde_json::json!({
+                "hostname": format!("peer-{i}"),
+                "overlay_ip": format!("10.42.0.{}", i + 1),
+            }))
+            .collect();
+        let dir = serde_json::json!({ "peers": peers });
+
+        assert!(directory_records(&dir).is_empty());
     }
 
     #[test]

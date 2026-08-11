@@ -15,7 +15,9 @@
 
 #![cfg(feature = "async-services")]
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use mde_bus::hooks::config::Priority;
@@ -493,11 +495,43 @@ fn services_probe_failed(services: &[ServiceProbe]) -> bool {
 
 /// `systemctl is-active <unit>` ⇒ true iff the unit is active.
 fn systemctl_active(unit: &str) -> bool {
-    std::process::Command::new("systemctl")
-        .args(["is-active", unit])
-        .output()
-        .map(|o| o.stdout.starts_with(b"active"))
+    let mut command = std::process::Command::new("systemctl");
+    command.args(["is-active", unit]);
+    bounded_command_stdout(
+        &mut command,
+        MAX_SYSTEMCTL_STDOUT_BYTES,
+    )
+        .map(|stdout| stdout.starts_with(b"active"))
         .unwrap_or(false)
+}
+
+const MAX_SYSTEMCTL_STDOUT_BYTES: usize = 4096;
+
+/// Read a command's stdout with a hard cap. An oversized producer is killed
+/// and treated as a failed probe, so host-command output cannot grow without
+/// bound in the readiness worker.
+fn bounded_command_stdout(
+    command: &mut std::process::Command,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut bytes = Vec::new();
+    let read_result = stdout
+        .by_ref()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes);
+    if read_result.is_err() || bytes.len() > max_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    child.wait().ok()?;
+    Some(bytes)
 }
 
 /// A bounded TCP connect probe (300 ms) — `true` if `addr` accepts a connection.
@@ -912,5 +946,13 @@ mod tests {
         let out2 = "PING 10.42.0.9: 56 data bytes\n--- 10.42.0.9 ping statistics ---\n1 packets transmitted, 0 received";
         assert_eq!(parse_ping_rtt(out2), None);
         assert_eq!(parse_ping_rtt(""), None);
+    }
+
+    #[test]
+    fn oversized_host_command_output_fails_closed() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf '%05000d' 0"]);
+        let output = bounded_command_stdout(&mut command, MAX_SYSTEMCTL_STDOUT_BYTES);
+        assert_eq!(output, None);
     }
 }
