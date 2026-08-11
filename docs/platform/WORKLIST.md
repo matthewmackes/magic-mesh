@@ -1759,6 +1759,9 @@ behavioral evidence is not completion.
 - **Exact peer schedule convergence (2026-08-10):** same-revision Clock
   schedules require exact payload equality; `.90` passed:
   `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-schedule-convergence-r198.md`.
+- **Peer stopwatch conflict repair (2026-08-10):** newer conflicting payloads
+  trigger repair; `.90` passed:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-stopwatch-repair-r211.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Clock documentation/package hard-cut checkpoint (2026-08-09):** the visible
@@ -1910,6 +1913,9 @@ behavioral evidence is not completion.
 - **Evidence identity binding (2026-08-10):** the release verifier rejects
   cross-wired seat evidence filenames; `.90` passed 1 valid and 16 hostile
   fixtures: `docs/platform/evidence/WL-CRIT-006-2026-08-10-evidence-identity-r177.md`.
+- **Release gate identity bounds (2026-08-10):** oversized authenticated farm
+  identities are rejected; the `.90` CI-gate self-test passed:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-10-release-identity-bound-r211.md`.
 - **Release-32 native-F44 three-seat checkpoint (2026-08-10):** an F42 candidate was rejected before install; the corrected signed F44 artifact then passed integrity,
   transaction, package, grouped-runtime, and Dell Browser-VM preservation on exactly Dell, seat 15, and Surface:
   `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
