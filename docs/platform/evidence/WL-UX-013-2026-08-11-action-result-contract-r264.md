@@ -13,9 +13,10 @@
   mde-shell-egui
   health_modal::tests::action_result_progress_binds_identity_generation_target_and_reports_partial_failure
   -- --exact --nocapture`.
-- Result: **NOT RUN** for this contract extension. At assignment time `.50` was
-  2/2 occupied and every free host was below the governed 8 GiB reserve; no
-  reserve bypass was attempted. Earlier action-progress behavior remains proven
-  separately in `WL-UX-013-2026-08-11-action-result-progress-r262.md`.
-- Remaining proof: run the exact contract-aware regression on a warmed safe
-  slot, then physical-seat suspend/loss/return and three-seat acceptance.
+- Result: **PASS**. Farm `.90`, slot `ux013-action-result`, ran the exact
+  contract-aware regression after a full test-profile compilation: 1 passed,
+  0 failed, 1,577 filtered. Farm `.90`, slot `ux013-clippy-bin`, ran
+  `cargo clippy -p mde-shell-egui --bin mde-shell-egui` to completion with
+  warnings only (1,339 warnings). The earlier `--lib` probe was invalid because
+  this package exposes a binary target only and is not counted as a gate.
+- Remaining proof: physical-seat suspend/loss/return and three-seat acceptance.

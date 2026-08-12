@@ -9,9 +9,9 @@
   leaking the differing locator.
 - Regression:
   `media_raw_stable_id_equivocation_is_visible_before_redacted_card_deduplication`.
-- Result: **NOT RUN**. BigBoy slot 3 had 17 GiB free, but the shared dirty tree's
-  concurrently edited Android lifecycle file failed compilation before this
-  exact test executed. Targeted `git diff --check` passed; no result is inferred.
-- Remaining proof: rerun the exact adapter regression once the Android compile
-  dependency stabilizes, then retain the epic's live signed publisher/recovery
-  acceptance.
+- Result: **PASS**. Farm `.90`, slot `func019-media-equivocation`, ran the exact
+  regression after a clean full test-profile compilation: 1 passed, 0 failed,
+  4,923 filtered. Farm `.90`, slot `func019-clippy`, ran
+  `cargo clippy -p mackesd --features async-services --lib` to completion with
+  warnings only (3,442 warnings).
+- Remaining proof: retain the epic's live signed publisher/recovery acceptance.
