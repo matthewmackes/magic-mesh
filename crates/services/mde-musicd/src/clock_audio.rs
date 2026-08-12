@@ -723,7 +723,10 @@ impl ClockAudioAuthority {
             }
             return;
         }
-        if self.latest.len() == MAX_CLOCK_AUDIO_LEDGER_RECORDS {
+        // Treat an already-corrupt or recovered oversized vector as full too;
+        // equality alone would allow one more occurrence identity to escape
+        // the authority's bounded replay state.
+        while self.latest.len() > MAX_CLOCK_AUDIO_LEDGER_RECORDS - 1 {
             self.latest.remove(0);
         }
         self.latest.push(key);
@@ -1532,5 +1535,29 @@ mod tests {
             ),
             Err("clock_alarm_active")
         );
+    }
+
+    #[test]
+    fn occurrence_index_remains_bounded_after_oversized_recovery_state() {
+        let mut authority = ClockAudioAuthority::default();
+        authority.latest = (0..=MAX_CLOCK_AUDIO_LEDGER_RECORDS)
+            .map(|generation| OccurrenceKey {
+                occurrence_id: format!("occurrence-{generation}"),
+                global_event_id: format!("event-{generation}"),
+                generation: generation as u64,
+            })
+            .collect();
+
+        authority.note_latest(OccurrenceKey {
+            occurrence_id: "new-occurrence".into(),
+            global_event_id: "new-event".into(),
+            generation: 1,
+        });
+
+        assert_eq!(authority.latest.len(), MAX_CLOCK_AUDIO_LEDGER_RECORDS);
+        assert!(authority
+            .latest
+            .iter()
+            .any(|key| key.occurrence_id == "new-occurrence"));
     }
 }
