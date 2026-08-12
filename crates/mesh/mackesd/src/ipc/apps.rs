@@ -1004,7 +1004,11 @@ pub fn read_local_workload_state(node_id: &str) -> serde_json::Value {
     let Ok(snapshot) = serde_json::from_value::<WorkloadStateSnapshot>(value) else {
         return json!({});
     };
-    if snapshot.node != node_id {
+    if snapshot.node != node_id
+        || snapshot
+            .validate(u64::try_from(mde_bus::retention::current_unix_ms()).unwrap_or(0))
+            .is_err()
+    {
         return json!({});
     }
     serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}))
