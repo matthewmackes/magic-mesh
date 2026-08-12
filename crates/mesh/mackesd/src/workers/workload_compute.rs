@@ -3382,13 +3382,15 @@ impl WorkloadComputeWorker {
             );
             return;
         };
-        if target_request.action == WorkloadOperationAction::Cancel
-            || target_request.workload_id != request.workload_id
-            || target_request.target_node != request.target_node
-            || target_request.backend != request.backend
-            || target_status.resources != request.resources
-            || target_status.generation != request.expected_generation
-        {
+        let target_generation_matches =
+            target_status.generation == request.expected_generation;
+        let target_matches = target_request.action != WorkloadOperationAction::Cancel
+            && target_request.workload_id == request.workload_id
+            && target_request.target_node == request.target_node
+            && target_request.backend == request.backend
+            && target_status.resources == request.resources
+            && target_generation_matches;
+        if !target_matches {
             self.fail(
                 ledger,
                 &request,
