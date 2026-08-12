@@ -1539,14 +1539,16 @@ mod tests {
 
     #[test]
     fn occurrence_index_remains_bounded_after_oversized_recovery_state() {
-        let mut authority = ClockAudioAuthority::default();
-        authority.latest = (0..=MAX_CLOCK_AUDIO_LEDGER_RECORDS)
-            .map(|generation| OccurrenceKey {
-                occurrence_id: format!("occurrence-{generation}"),
-                global_event_id: format!("event-{generation}"),
-                generation: generation as u64,
-            })
-            .collect();
+        let mut authority = ClockAudioAuthority {
+            latest: (0..=MAX_CLOCK_AUDIO_LEDGER_RECORDS)
+                .map(|generation| OccurrenceKey {
+                    occurrence_id: format!("occurrence-{generation}"),
+                    global_event_id: format!("event-{generation}"),
+                    generation: generation as u64,
+                })
+                .collect(),
+            ..ClockAudioAuthority::default()
+        };
 
         authority.note_latest(OccurrenceKey {
             occurrence_id: "new-occurrence".into(),
