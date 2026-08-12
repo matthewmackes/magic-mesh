@@ -15,6 +15,7 @@
 //! connect.
 
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,7 +47,7 @@ const RECV_BUF_BYTES: usize = 16 * 1024;
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -72,6 +73,11 @@ impl UdpDiscovery {
     /// peer's loopback address.
     ///
     /// [`with_broadcast_dest`]: Self::with_broadcast_dest
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the UDP socket cannot be bound or broadcast mode
+    /// cannot be enabled.
     pub async fn bind(listen: SocketAddr, local: Announce) -> Result<Self, HostError> {
         let socket = UdpSocket::bind(listen).await?;
         socket.set_broadcast(true)?;
@@ -99,6 +105,10 @@ impl UdpDiscovery {
     /// looked up in a shared registry handle. `None` until the peer has been heard
     /// from. Free fn over the handle so the transport (which holds only the handle,
     /// not the `UdpDiscovery`) can resolve addresses after `run` is spawned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared registry mutex has been poisoned.
     #[must_use]
     pub fn peer_addr_in(
         registry: &Arc<Mutex<DiscoveryRegistry>>,
@@ -113,24 +123,32 @@ impl UdpDiscovery {
     /// Override the broadcast destination. Production uses the default LAN
     /// broadcast; tests unicast to a peer's loopback address.
     #[must_use]
-    pub fn with_broadcast_dest(mut self, dest: SocketAddr) -> Self {
+    pub const fn with_broadcast_dest(mut self, dest: SocketAddr) -> Self {
         self.broadcast_dest = dest;
         self
     }
 
     /// Override the re-announce cadence (tests use a short interval).
     #[must_use]
-    pub fn with_announce_interval(mut self, interval: Duration) -> Self {
+    pub const fn with_announce_interval(mut self, interval: Duration) -> Self {
         self.announce_interval = interval;
         self
     }
 
     /// The address the socket is actually bound to (resolves an ephemeral `:0`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying socket error if its local address cannot be read.
     pub fn local_addr(&self) -> Result<SocketAddr, HostError> {
         Ok(self.socket.local_addr()?)
     }
 
     /// Broadcast our identity once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding or sending the announcement fails.
     pub async fn announce(&self) -> Result<(), HostError> {
         let datagram = encode_announce_datagram(&self.local, now_ms())
             .map_err(|e| HostError::Transport(format!("encode announce: {e}")))?;
@@ -145,6 +163,10 @@ impl UdpDiscovery {
     /// `PeerLost`). Datagrams that don't decode as a `kdeconnect.identity` announce
     /// — the port also sees unrelated LAN traffic — are silently dropped; a
     /// socket-level receive error ends the loop after emitting `TransportError`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared registry mutex has been poisoned.
     pub async fn run(self, sink: EventSink, mut shutdown: oneshot::Receiver<()>) {
         // The address cache is the shared registry (so a transport holding a
         // `shared_registry` handle sees the same announces). Locked briefly per

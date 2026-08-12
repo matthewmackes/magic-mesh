@@ -42,9 +42,9 @@ pub struct EventStream(mpsc::UnboundedReceiver<HostEvent>);
 impl EventStream {
     /// Create a fresh `(sink, stream)` pair.
     #[must_use]
-    pub fn channel() -> (EventSink, EventStream) {
+    pub fn channel() -> (EventSink, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (tx, EventStream(rx))
+        (tx, Self(rx))
     }
 
     /// Await the next host event. Returns `None` only once *every* sink clone is

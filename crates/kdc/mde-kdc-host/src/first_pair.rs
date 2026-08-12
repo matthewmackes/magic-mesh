@@ -10,6 +10,7 @@
 //! path. RSA-4096 identity stays as locked (Q23): the TLS identity
 //! cert is issued over the host's RSA-4096 key.
 
+use std::convert::TryFrom;
 use std::net::SocketAddr;
 
 use mde_kdc_proto::crypto::generate_session_key;
@@ -72,7 +73,7 @@ pub async fn first_pair(
     // 4. The pin write — the moment trust-on-first-use becomes trust.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
     store.pair(DeviceRecord {
         device_id: device_id.to_string(),
         device_name: device_name.to_string(),
