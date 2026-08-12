@@ -810,7 +810,7 @@ fn adapt_media_body(
         unavailable(adapted, ResourceAdapterAvailability::Malformed);
         return;
     }
-    let stale = now_ms.saturating_sub(state.published_at_ms) >= SOURCE_TTL_MS;
+    let is_stale = now_ms.saturating_sub(state.published_at_ms) >= SOURCE_TTL_MS;
     let expires = state.published_at_ms.saturating_add(SOURCE_TTL_MS);
     let conflicts = conflicting_media_keys(&state.sources);
     let mut media_cards = Vec::new();
@@ -819,7 +819,7 @@ fn adapt_media_body(
         if conflicts.contains(&media_resource_key(source)) {
             continue;
         }
-        let (health, reason) = media_health(source.reachability, stale);
+        let (health, reason) = media_health(source.reachability, is_stale);
         let class = if source.kind == MediaKind::FileShare {
             ResourceClass::FileShare
         } else {

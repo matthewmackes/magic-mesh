@@ -219,7 +219,7 @@ pub fn sweep_once<W: DnsWriter>(
     if !cfg.enabled {
         return 0;
     }
-    let mut writes = 0;
+    let mut change_count = 0;
     for record in &cfg.record {
         let state = resolve_source(spawn, &record.source, vpn_cfg, wan);
         let prev = last.get(&record.name).map(String::as_str);
@@ -227,7 +227,7 @@ pub fn sweep_once<W: DnsWriter>(
             Ok(new_last) => {
                 // A change is a (prev → new_last) transition; count it for logging.
                 if new_last.as_deref() != prev {
-                    writes += 1;
+                    change_count += 1;
                 }
                 match new_last {
                     Some(v) => {
@@ -243,7 +243,7 @@ pub fn sweep_once<W: DnsWriter>(
             }
         }
     }
-    writes
+    change_count
 }
 
 /// Run the DDNS reconcile worker until `should_stop`. Tails the VPN-GW event lane
@@ -310,9 +310,9 @@ fn run_sweep(
     // comparison all reuse it). Only when the tools can spawn.
     let wan = if spawn { vpn_health::wan_ip() } else { None };
     let writer = DoDnsWriter::resolve(workgroup_root, &cfg.token_ref, spawn);
-    let writes = sweep_once(&writer, &cfg, node, &vpn_cfg, wan.as_deref(), spawn, last);
-    if writes > 0 {
-        tracing::info!(writes, "ddns reconcile: published record changes");
+    let change_count = sweep_once(&writer, &cfg, node, &vpn_cfg, wan.as_deref(), spawn, last);
+    if change_count > 0 {
+        tracing::info!(writes = change_count, "ddns reconcile: published record changes");
     }
 }
 

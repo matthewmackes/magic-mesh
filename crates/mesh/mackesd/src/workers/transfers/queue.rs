@@ -249,8 +249,8 @@ impl TransferQueue {
         }
         match outcome {
             LaneOutcome::Done if job.policy.verify => match verifier(&job) {
-                Ok(verified) => {
-                    job.integrity = Some(verified);
+                Ok(verification) => {
+                    job.integrity = Some(verification);
                     job.progress = Some(100);
                     job.set_state(TransferState::Done);
                 }

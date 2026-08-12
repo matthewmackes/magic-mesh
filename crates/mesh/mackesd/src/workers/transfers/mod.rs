@@ -813,7 +813,7 @@ fn verify_content_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(0o400000);
+        options.custom_flags(0o400_000);
     }
     let mut file = options
         .open(path)
@@ -1535,7 +1535,7 @@ fn persist_v2_runtime_job(ledger: &V2Ledger, job: &TransferJobV2) -> std::io::Re
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(0o400000);
+        options.mode(0o600).custom_flags(0o400_000);
     }
     let mut file = options.open(&temporary)?;
     let write_result = (|| {
@@ -2338,7 +2338,7 @@ fn atomic_write_file(path: &Path, body: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(0o400000);
+        options.mode(0o600).custom_flags(0o400_000);
     }
     let mut file = options.open(&temporary)?;
     let result = (|| {

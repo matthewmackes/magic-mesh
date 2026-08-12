@@ -660,7 +660,7 @@ fn verify_canonical_object(
         use std::os::unix::fs::OpenOptionsExt as _;
         OpenOptions::new()
             .read(true)
-            .custom_flags(0o400000)
+            .custom_flags(0o400_000)
             .open(&path)
             .map_err(|_| ClipboardMeshRefusal::CasMismatch)?
     };

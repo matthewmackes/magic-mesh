@@ -26,7 +26,6 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::ipc::secret_store::{self, SecretStore};
 use crate::mesh_media::{
     self, read_airsonic_gateway_sources_from_plane, AirsonicGatewaySource, GatewayHealth,
-    AIRSONIC_PORT,
 };
 
 use super::{ShutdownToken, Worker};

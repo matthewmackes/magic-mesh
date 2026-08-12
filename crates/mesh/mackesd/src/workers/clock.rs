@@ -2118,17 +2118,17 @@ fn acknowledgement_wins(
     candidate: &ClockAcknowledgementV1,
     current: &ClockAcknowledgementV1,
 ) -> bool {
-    candidate.actor_clock > current.actor_clock
-        || (candidate.actor_clock == current.actor_clock
-            && (candidate.stop && !current.stop
-                || (candidate.stop == current.stop
-                    && (
-                        candidate.actor_node_id.as_str(),
-                        candidate.acknowledgement_id.as_str(),
-                    ) > (
-                        current.actor_node_id.as_str(),
-                        current.acknowledgement_id.as_str(),
-                    ))))
+    (
+        candidate.actor_clock,
+        candidate.stop,
+        candidate.actor_node_id.as_str(),
+        candidate.acknowledgement_id.as_str(),
+    ) > (
+        current.actor_clock,
+        current.stop,
+        current.actor_node_id.as_str(),
+        current.acknowledgement_id.as_str(),
+    )
 }
 
 fn upsert_stopwatch(stopwatches: &mut Vec<ClockStopwatchV1>, stopwatch: ClockStopwatchV1) {

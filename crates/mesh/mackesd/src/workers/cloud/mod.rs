@@ -1357,8 +1357,8 @@ impl CloudWorker {
                 }
             };
             match self.admit_android_inventory_response(&request, response) {
-                Ok(AndroidInventoryLedgerAdmission::Inserted)
-                | Ok(AndroidInventoryLedgerAdmission::Replaced) => changed = true,
+                Ok(AndroidInventoryLedgerAdmission::Inserted
+                    | AndroidInventoryLedgerAdmission::Replaced) => changed = true,
                 Ok(AndroidInventoryLedgerAdmission::Unchanged) => {}
                 Err(error) => {
                     tracing::warn!(

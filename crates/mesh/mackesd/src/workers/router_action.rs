@@ -38,7 +38,7 @@ use std::time::Duration;
 
 // The shared contract.
 use mackes_mesh_types::router_action::{
-    action_dir, audit_log_path, clamp_confirm_min, read_audit, AuditRecord, RouterActionRequest,
+    action_dir, audit_log_path, clamp_confirm_min, AuditRecord, RouterActionRequest,
     RouterActionResult,
 };
 

@@ -1255,7 +1255,7 @@ mod worker {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use mackes_mesh_types::surface_hardware::{
-        SurfaceActionHeader, SurfaceCameraProofOutcome, SurfaceCameraProofRefusal,
+        SurfaceCameraProofOutcome, SurfaceCameraProofRefusal,
         SurfaceCameraProofRequest, SurfaceCameraProofResult, SurfaceCameraProofUnavailable,
         SurfaceModelIdentity, SurfaceProGeneration, SURFACE_CAMERA_PROOF_ARM_TOKEN,
         SURFACE_HARDWARE_SCHEMA_VERSION,

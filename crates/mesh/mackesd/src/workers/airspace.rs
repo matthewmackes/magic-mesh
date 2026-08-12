@@ -37,10 +37,10 @@ const MAX_INITIAL_PHASE: Duration = Duration::from_millis(250);
 /// seat still launches its first root-SSH/`iw` probe together after a restart.
 #[must_use]
 fn initial_phase_for(host: &str, cap: Duration) -> Duration {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in host.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     Duration::from_millis(
         (hash % (MAX_INITIAL_PHASE.as_millis() as u64 + 1)).min(cap.as_millis() as u64),

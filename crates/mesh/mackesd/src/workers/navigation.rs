@@ -233,7 +233,7 @@ fn load_provider_authority(
         ));
     }
     let mut options = OpenOptions::new();
-    options.read(true).custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    options.read(true).custom_flags(0o400_000 | 0o2_000_000); // O_NOFOLLOW | O_CLOEXEC
     let file = options.open(path)?;
     let opened = file.metadata()?;
     if !opened.is_file()

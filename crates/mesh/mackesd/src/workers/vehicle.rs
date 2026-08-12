@@ -122,14 +122,14 @@ const ACTION_JOURNAL_SCHEMA_VERSION: u16 = 1;
 const ACTION_JOURNAL_MAX_BYTES: u64 = 256 * 1024;
 const ACTION_JOURNAL_MAX_ENTRIES: usize = 32;
 const ACTION_JOURNAL_MAX_REPLY_BYTES: usize = 64 * 1024;
-const ACTION_JOURNAL_NOFOLLOW_FLAG: i32 = 0o400000;
+const ACTION_JOURNAL_NOFOLLOW_FLAG: i32 = 0o400_000;
 static ACTION_JOURNAL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Linux's `O_NOFOLLOW`: the final password-file path component must not be a
 /// symlink. This worker is a Linux system service; keep the flag local rather
 /// than adding a libc dependency just for the open boundary.
 #[cfg(target_os = "linux")]
-const ROOT_PASSWORD_NOFOLLOW_FLAG: i32 = 0o400000;
+const ROOT_PASSWORD_NOFOLLOW_FLAG: i32 = 0o400_000;
 
 /// Optional env: local UDP port receiving the MG90 JSON Status Broadcast.
 pub const STATUS_PORT_ENV: &str = "MDE_VEHICLE_STATUS_PORT";
@@ -206,10 +206,10 @@ const MAX_INITIAL_PHASE: Duration = Duration::from_millis(250);
 /// configured seat from opening its expensive root-SSH/HTTP path together.
 #[must_use]
 fn initial_phase_for(host: &str, cap: Duration) -> Duration {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in host.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     Duration::from_millis(
         (hash % (MAX_INITIAL_PHASE.as_millis() as u64 + 1)).min(cap.as_millis() as u64),
@@ -2359,16 +2359,16 @@ impl VehicleRuntimeSnapshot {
         if let Some(beacon) = self.beacon_gps.clone() {
             gps = merge_beacon_gps(gps, beacon);
         }
-        let mut gaps = Vec::with_capacity(
+        let mut diagnostics = Vec::with_capacity(
             self.current_gaps.len()
                 + self.gps_gaps.len()
                 + self.wan_gaps.len()
                 + self.obd_gaps.len(),
         );
-        gaps.extend(self.current_gaps.iter().cloned());
-        gaps.extend(self.gps_gaps.iter().cloned());
-        gaps.extend(self.wan_gaps.iter().cloned());
-        gaps.extend(self.obd_gaps.iter().cloned());
+        diagnostics.extend(self.current_gaps.iter().cloned());
+        diagnostics.extend(self.gps_gaps.iter().cloned());
+        diagnostics.extend(self.wan_gaps.iter().cloned());
+        diagnostics.extend(self.obd_gaps.iter().cloned());
         VehicleState {
             host: self.host.clone(),
             model: self.model.clone().unwrap_or_default(),
@@ -2387,7 +2387,7 @@ impl VehicleRuntimeSnapshot {
                 obd_probe_status: self.obd_probe_status.clone(),
                 ..Default::default()
             },
-            gaps,
+            gaps: diagnostics,
             published_at_ms: self.observed_at_ms,
         }
     }
@@ -3348,7 +3348,7 @@ impl VehicleWorker {
             .unwrap_or_else(|| parse_ignition_state(&general_text, &mut gaps));
 
         // ── GNSS/IMU over SSH ──
-        let (mut gps, imu) = match probe.read_gps_nmea() {
+        let (mut ssh_gps, imu) = match probe.read_gps_nmea() {
             Ok(nmea) => parse_gps_imu(&nmea, &mut gaps),
             Err(e) => {
                 gaps.push(format!("gps/imu unavailable (ssh): {e}"));
@@ -3359,7 +3359,7 @@ impl VehicleWorker {
             .as_ref()
             .and_then(|beacon| status_beacon_gps(beacon, &mut gaps))
         {
-            gps = merge_beacon_gps(gps, beacon_gps);
+            ssh_gps = merge_beacon_gps(ssh_gps, beacon_gps);
         }
 
         // ── WAN status over HTTP ──
@@ -3425,7 +3425,7 @@ impl VehicleWorker {
             battery_v,
             internal_temp_c,
             ignition_on,
-            moving: gps.speed_mph > 0.5,
+            moving: ssh_gps.speed_mph > 0.5,
             obd_present: obd_probe_status.is_supported(),
             obd_probe_status,
             ..Default::default()
@@ -3437,7 +3437,7 @@ impl VehicleWorker {
             esn,
             mgos_version,
             online: true,
-            gps,
+            gps: ssh_gps,
             imu,
             wan,
             telem,
@@ -4841,7 +4841,7 @@ fn merge_beacon_gps(mut nmea: GpsFix, beacon: GpsFix) -> GpsFix {
 /// Parse the GNSS `$GPGGA` + IMU `$PSIWMMPU` lines out of an oMG NMEA blob. GPS via
 /// the pure [`parse_gpgga`]; IMU best-effort (a missing line ⇒ `None` + a gap).
 fn parse_gps_imu(nmea: &str, gaps: &mut Vec<String>) -> (GpsFix, Option<ImuSample>) {
-    let gps = nmea
+    let parsed_gps = nmea
         .lines()
         .find(|l| l.contains("GGA,"))
         .and_then(parse_gpgga)
@@ -4856,7 +4856,7 @@ fn parse_gps_imu(nmea: &str, gaps: &mut Vec<String>) -> (GpsFix, Option<ImuSampl
     if imu.is_none() {
         gaps.push("no $PSIWMMPU IMU line in the gateway NMEA".to_string());
     }
-    (gps, imu)
+    (parsed_gps, imu)
 }
 
 /// Parse an oMG `$PSIWMMPU,<t>,<ax>,<ay>,<az>,<gx>,<gy>,<gz>` line into an

@@ -26,7 +26,6 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::ipc::secret_store::{self, SecretStore};
 use crate::mesh_media::{
     self, read_jellyfin_gateway_sources_from_plane, GatewayHealth, JellyfinGatewaySource,
-    JELLYFIN_GATEWAY_PROXY_PORT,
 };
 
 use super::{ShutdownToken, Worker};

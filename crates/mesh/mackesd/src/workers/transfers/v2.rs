@@ -892,7 +892,7 @@ fn claim_staging_file(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(0o400000);
+            options.mode(0o600).custom_flags(0o400_000);
         }
         match options.open(&temporary) {
             Ok(file) => return Ok((temporary, file)),
@@ -975,7 +975,7 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(0o400000);
+        options.custom_flags(0o400_000);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {

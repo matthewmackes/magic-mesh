@@ -881,10 +881,10 @@ fn backoff_retry(current: Duration, poll: Duration) -> Duration {
 /// while different hosts normally choose different offsets without adding a
 /// new source of entropy or making the retry behavior untestable.
 fn retry_phase(host: &str) -> Duration {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in host.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3_u64);
+        hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
     }
     Duration::from_millis(hash % RETRY_PHASE_MAX.as_millis() as u64)
 }

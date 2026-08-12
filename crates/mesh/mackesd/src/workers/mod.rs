@@ -1187,7 +1187,7 @@ fn acquire_group_owner_lease(
         // be replaced after that check, so make the kernel reject a final
         // symlink at the actual lease open as well.  A process-group lease
         // must never follow an attacker-controlled path into another inode.
-        .custom_flags(0o400000 | 0o2000000) // Linux O_NOFOLLOW | O_CLOEXEC
+        .custom_flags(0o400_000 | 0o2_000_000) // Linux O_NOFOLLOW | O_CLOEXEC
         .open(&path)
         .with_context(|| format!("opening worker group lease {}", path.display()))?;
     fs2::FileExt::try_lock_exclusive(&file)

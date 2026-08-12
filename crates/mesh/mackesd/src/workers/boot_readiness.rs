@@ -468,7 +468,7 @@ const MAX_OVERLAY_MARKER_BYTES: u64 = 64;
 /// treated as a different overlay generation, even when the text is unchanged.
 fn read_overlay_generation(path: &std::path::Path) -> Option<OverlayGeneration> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+    options.read(true).custom_flags(0o400_000 | 0o2_000_000); // O_NOFOLLOW | O_CLOEXEC
     let mut file = options.open(path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.file_type().is_file() || metadata.len() > MAX_OVERLAY_MARKER_BYTES {

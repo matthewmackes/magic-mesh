@@ -889,7 +889,7 @@ fn persist_package_manifest(
         {
             use std::os::unix::fs::OpenOptionsExt;
             // Linux O_NOFOLLOW; keep this crate free of a direct libc edge.
-            options.mode(0o600).custom_flags(0o400000);
+            options.mode(0o600).custom_flags(0o400_000);
         }
         let mut file = options
             .open(&temporary)

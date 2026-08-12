@@ -926,7 +926,7 @@ impl Display1AttachmentSink {
                 true
             }
             Some(Ok(Display1PresentationPoll::Pending)) | None => false,
-            Some(Ok(Display1PresentationPoll::Disconnected)) | Some(Err(_)) => {
+            Some(Ok(Display1PresentationPoll::Disconnected) | Err(_)) => {
                 // Before presentation acknowledgement, poll_input deliberately
                 // admits nothing. Therefore this is the only production path
                 // that can observe a shell which received the DMA-BUF and then

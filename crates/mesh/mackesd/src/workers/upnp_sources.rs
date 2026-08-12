@@ -1412,10 +1412,10 @@ impl Worker for UpnpSourcesWorker {
 /// seat's cadence predictable while distributing a fleet's first prune.
 #[must_use]
 pub fn initial_phase_for(node: &str) -> Duration {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in node.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3_u64);
+        hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
     }
     let cap_ms = u64::try_from(MAX_HOST_PHASE.as_millis()).unwrap_or(0);
     let phase_ms = if cap_ms == 0 { 0 } else { hash % (cap_ms + 1) };

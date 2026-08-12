@@ -363,10 +363,10 @@ pub struct SpawnLauncher;
 
 impl AppLauncher for SpawnLauncher {
     fn launch(&self, argv: &[String]) -> std::io::Result<()> {
-        let (bin, args) = argv
+        let (binary, args) = argv
             .split_first()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"))?;
-        Command::new(bin)
+        Command::new(binary)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

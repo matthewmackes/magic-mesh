@@ -2204,7 +2204,7 @@ fn read_new_requests(
         let body = msg.body.as_deref().unwrap_or("");
         match parse_request(body) {
             Ok(request) => {
-                let authorized = match &request {
+                let authorization = match &request {
                     VirtualStorageRequest::Refresh => Ok(()),
                     VirtualStorageRequest::Apply { armed_target, .. } => authorizer.authorize(
                         body,
@@ -2215,7 +2215,7 @@ fn read_new_requests(
                         },
                     ),
                 };
-                match authorized {
+                match authorization {
                     Ok(()) => out.push(request),
                     Err(error) => tracing::warn!(
                         target: "mackesd::virtual_storage",
