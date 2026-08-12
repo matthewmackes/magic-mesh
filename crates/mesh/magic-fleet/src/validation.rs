@@ -37,8 +37,10 @@ pub enum RunKind {
     RunNow,
 }
 
-/// A validation run manifest (`validation/runs/<run-id>/run.json`): who
-/// should report and why, with the participant list resolved at mint time
+/// A validation run manifest (`validation/runs/<run-id>/run.json`): who should
+/// report and why.
+///
+/// The participant list is resolved at mint time
 /// (the directory snapshot — so a late joiner doesn't retroactively fail
 /// an older run).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,9 +114,9 @@ fn open_validation_record(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // Linux uapi values: O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC.
-    const O_NONBLOCK: i32 = 0o0004000;
-    const O_NOFOLLOW: i32 = 0o00400000;
-    const O_CLOEXEC: i32 = 0o02000000;
+    const O_NONBLOCK: i32 = 0o0_004_000;
+    const O_NOFOLLOW: i32 = 0o00_400_000;
+    const O_CLOEXEC: i32 = 0o02_000_000;
 
     OpenOptions::new()
         .read(true)

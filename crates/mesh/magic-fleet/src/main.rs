@@ -91,8 +91,8 @@ enum Cmd {
     /// FPG-8: elect the head of the Syncthing-replicated revision log, converge to
     /// it host-local, write the apply-ack.
     Reconcile {
-        /// Replicated workgroup root (defaults to $MDE_WORKGROUP_ROOT
-        /// or $QNM_SHARED_ROOT).
+        /// Replicated workgroup root (defaults to `$MDE_WORKGROUP_ROOT`
+        /// or `$QNM_SHARED_ROOT`).
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// Override this node's hostname in the apply-ack.
@@ -216,7 +216,7 @@ fn open_cli_input(path: &Path) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        options.custom_flags(0o400_000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 

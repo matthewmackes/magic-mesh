@@ -3,7 +3,7 @@
 //! Networking is desired-state the same way packages/services are: a
 //! node carries a [`NetState`] in its fleet baseline ([`crate::BaselineSpec`],
 //! W67) and converges to it locally. The model is an **nmstate** subset
-//! (W65) applied through NetworkManager (W66) — interfaces with their
+//! (W65) applied through `NetworkManager` (W66) — interfaces with their
 //! IP config, static routes, and the resolver — because nmstate is the
 //! Red-Hat-native declarative network layer and it already has the one
 //! safety primitive a remote network change MUST have: a **rollback
@@ -49,9 +49,9 @@ impl LinkState {
     #[must_use]
     pub const fn as_nmstate(self) -> &'static str {
         match self {
-            LinkState::Up => "up",
-            LinkState::Down => "down",
-            LinkState::Absent => "absent",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Absent => "absent",
         }
     }
 }
@@ -133,15 +133,17 @@ pub struct DnsConfig {
 impl DnsConfig {
     /// Nothing to manage.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.server.is_empty() && self.search.is_empty()
     }
 }
 
 /// A node's full network desired-state — the nmstate subset the fleet
-/// baseline carries (W67). Every section defaults empty: a baseline
-/// declares only the interfaces/routes/DNS it manages, leaving the rest
-/// to NetworkManager's own state.
+/// baseline carries (W67).
+///
+/// Every section defaults empty: a baseline declares only the
+/// interfaces/routes/DNS it manages, leaving the rest to `NetworkManager`'s
+/// own state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetState {
@@ -156,7 +158,7 @@ pub struct NetState {
 impl NetState {
     /// Nothing declared — the engine is then a no-op on this node.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.interfaces.is_empty() && self.routes.is_empty() && self.dns.is_empty()
     }
 
@@ -250,6 +252,7 @@ impl NetState {
     /// it survives nmstate version drift. This is what [`SystemNetOps`]
     /// reads to diff desired-vs-actual on a real box.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn from_nmstate_show(yaml: &str) -> Self {
         let Ok(v) = serde_yaml::from_str::<serde_json::Value>(yaml) else {
             return Self::default();
@@ -374,7 +377,7 @@ impl NetState {
     /// fields the model manages, keyed by interface name / route
     /// destination / the resolver as a whole.
     #[must_use]
-    pub fn diff(&self, actual: &NetState) -> Vec<NetChange> {
+    pub fn diff(&self, actual: &Self) -> Vec<NetChange> {
         let mut out = Vec::new();
 
         // Interfaces, by name.
@@ -614,7 +617,9 @@ pub fn apply_with_self_test(
     }
 }
 
-/// The real [`NetOps`] over `nmstatectl` + an overlay ping. Each method
+/// The real [`NetOps`] over `nmstatectl` + an overlay ping.
+///
+/// Each method
 /// is best-effort against the host tools; on a box without `nmstatectl`
 /// the apply errors cleanly (and so rolls back to no-op) rather than
 /// half-applying.

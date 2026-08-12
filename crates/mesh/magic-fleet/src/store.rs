@@ -4,7 +4,7 @@
 //! `<workgroup-root>/fleet/revisions/<version>.yaml` on the
 //! replicated volume: **replication is the gossip transport** and the
 //! directory is the authoritative, append-only log (no SQL truth —
-//! any SQLite copy is a per-node read mirror). Filenames zero-pad the
+//! any `SQLite` copy is a per-node read mirror). Filenames zero-pad the
 //! `u64` version to 20 digits so lexical order == numeric order.
 //!
 //! Every node can mint (leaderless, FPG-3): `next_version` derives
@@ -60,7 +60,7 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000); // O_NOFOLLOW
+        options.custom_flags(0o400_000); // O_NOFOLLOW
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100); // O_NOFOLLOW
 
@@ -111,8 +111,9 @@ pub fn next_version(dir: &Path) -> u64 {
         .map_or(1, |v| v.saturating_add(1))
 }
 
-/// Append a revision to the log (atomic temp + rename; creates the
-/// directory). **Append-only:** refuses to replace an existing file
+/// Append a revision to the log (atomic temp + rename; creates the directory).
+///
+/// **Append-only:** refuses to replace an existing file
 /// for the same version — history is immutable; rollback mints a
 /// higher version carrying the old spec (FPG-4 / Q6).
 ///
@@ -170,9 +171,10 @@ pub fn write_revision(dir: &Path, revision: &Revision) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Read every parseable revision in the log, sorted ascending by
-/// version. Tolerant: unparsable / foreign files are skipped (a
-/// half-replicated write from a peer must not poison the log read) —
+/// Read every parseable revision in the log, sorted ascending by version.
+///
+/// Tolerant: unparsable / foreign files are skipped (a half-replicated write
+/// from a peer must not poison the log read) —
 /// the next replication pass completes them.
 #[must_use]
 pub fn read_revisions(dir: &Path) -> Vec<Revision> {
@@ -313,6 +315,9 @@ pub fn write_nudge(workgroup_root: &Path, hostname: &str) -> io::Result<PathBuf>
 /// the destination worker verify the exact Bus capability before it starts a
 /// reconcile. Legacy callers may use [`write_nudge`] and will be rejected by
 /// an authenticated consumer until they are migrated.
+///
+/// # Errors
+/// Returns an I/O error if the nudge directory cannot be created or written.
 pub fn write_nudge_payload(
     workgroup_root: &Path,
     hostname: &str,

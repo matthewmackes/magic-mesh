@@ -35,7 +35,7 @@ fn read_bounded_event(path: &Path) -> Option<String> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        options.custom_flags(0o400_000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 
@@ -430,7 +430,7 @@ pub struct BaselineSpec {
     /// Network desired-state (PLANES-15 / W67): the nmstate subset the
     /// node converges via the checkpoint-guarded netstate engine, NOT via
     /// Ansible — [`to_playbook`] skips it the same way it skips `settings`.
-    /// A node applying this needs `nmstatectl` (NetworkManager). Default
+    /// A node applying this needs `nmstatectl` (`NetworkManager`). Default
     /// empty: a baseline manages networking only when it declares it.
     #[serde(skip_serializing_if = "netstate::NetState::is_empty")]
     pub netstate: netstate::NetState,
@@ -633,6 +633,9 @@ impl Revision {
     /// a canonical, printable node identity. Cryptographic origin remains a
     /// transport/enrollment concern; this check prevents malformed or
     /// path-shaped replicated documents from becoming authority by accident.
+    ///
+    /// # Errors
+    /// Returns an error when the revision version or author is invalid.
     pub fn validate(&self) -> Result<(), String> {
         if self.version == 0 {
             return Err("revision version must be greater than zero".to_string());

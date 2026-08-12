@@ -69,7 +69,7 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        options.custom_flags(0o400_000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 
@@ -165,7 +165,6 @@ fn level_rank(level: &str) -> u8 {
     match level.to_ascii_lowercase().as_str() {
         "error" => 4,
         "warn" | "warning" => 3,
-        "info" => 2,
         "debug" => 1,
         "trace" => 0,
         _ => 2,

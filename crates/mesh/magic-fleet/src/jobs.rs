@@ -45,7 +45,7 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        options.custom_flags(0o400_000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 
@@ -162,10 +162,19 @@ pub fn templates_dir(root: &Path) -> PathBuf {
 }
 
 /// Normalize a replicated playbook reference to the only execution namespace
-/// accepted by the job worker. Bare references are kept compatible with the
+/// accepted by the job worker.
+///
+/// Bare references are kept compatible with the
 /// original CLI and become `playbooks/<ref>`; explicit `playbooks/` references
+///
 /// are preserved. Absolute paths, parent traversal, and dot components are
 /// refused before a path is ever handed to a backend.
+///
+/// The normalized value is always relative to the replicated playbooks
+/// directory.
+///
+/// # Errors
+/// Returns an error for empty, absolute, traversal-containing, or directory references.
 pub fn normalize_playbook_ref(raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -203,6 +212,9 @@ pub fn normalize_playbook_ref(raw: &str) -> Result<String, String> {
 /// Resolve a normalized playbook reference below the replicated playbooks
 /// directory. The worker additionally canonicalizes the result to reject a
 /// symlink that escapes that directory.
+///
+/// # Errors
+/// Returns the same validation errors as [`normalize_playbook_ref`].
 pub fn resolve_playbook_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
     let normalized = normalize_playbook_ref(raw)?;
     Ok(root.join(normalized))
@@ -249,9 +261,11 @@ pub fn read_templates(root: &Path) -> Vec<JobTemplate> {
 /// where, and the resolved target list at launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRun {
-    /// Unique run identifier (UUIDv4 or similar); doubles as the subdirectory name under `runs/`.
+    /// Unique run identifier (`UUIDv4` or similar); doubles as the subdirectory
+    /// name under `runs/`.
     pub run_id: String,
-    /// Playbook path executed by every target (relative to the replicated `playbooks/` dir).
+    /// Playbook path executed by every target (relative to the replicated
+    /// `playbooks/` directory).
     pub playbook: String,
     /// SHA-256 of the playbook bytes observed by the privileged launcher.
     /// Legacy or unsigned runs leave this empty and are refused by executors.
