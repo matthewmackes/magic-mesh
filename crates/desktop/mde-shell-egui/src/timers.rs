@@ -429,7 +429,15 @@ impl ClockState {
 
     fn validate_banner_action(&self, action: ClockBannerAction) -> Result<ClockUiAction, String> {
         let now_ms = now_unix_ms()?;
-        if now_ms > action.valid_until_utc_ms {
+        self.validate_banner_action_at(action, now_ms)
+    }
+
+    fn validate_banner_action_at(
+        &self,
+        action: ClockBannerAction,
+        now_ms: i64,
+    ) -> Result<ClockUiAction, String> {
+        if now_ms >= action.valid_until_utc_ms {
             return Err("the retained Clock action expired".to_owned());
         }
         let snapshot = self
@@ -1510,6 +1518,25 @@ mod tests {
         assert!(state
             .validate_banner_action(banners[0].actions[1].clone())
             .is_err());
+    }
+
+    #[test]
+    fn retained_clock_action_expires_at_the_deadline() {
+        let snapshot = ringing_snapshot();
+        let ctx = egui::Context::default();
+        publish_clock_banner_projection(&ctx, &snapshot);
+        let mut action = clock_banner_projection(&ctx)[0].actions[0].clone();
+        let mut state = ClockState::with_bus_root(None, "node-a".into());
+        state.snapshot = Some(snapshot.clone());
+        action.valid_until_utc_ms = snapshot.produced_at_utc_ms + 1_000;
+
+        assert!(state
+            .validate_banner_action_at(action.clone(), action.valid_until_utc_ms - 1)
+            .is_ok());
+        assert_eq!(
+            state.validate_banner_action_at(action.clone(), action.valid_until_utc_ms),
+            Err("the retained Clock action expired".to_owned())
+        );
     }
 
     #[test]
