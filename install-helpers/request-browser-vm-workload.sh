@@ -74,9 +74,11 @@ ATTACHMENT = "qemu_display1_dmabuf"
 # Keep one hardware thread available to Dom0 on the four-thread Dell seat.
 # Three guest cores preserve interactive parallelism without letting QEMU
 # contend for every host thread during shell, sync, and Bus activity.
-BROWSER_VCPU = 3
-BROWSER_MEMORY_MB = 8192
-BROWSER_DISK_GB = 64
+# Match the typed WorkloadProfile::Small contract so a four-thread host keeps
+# its reserved CPU available and can still exercise the live attachment path.
+BROWSER_VCPU = 2
+BROWSER_MEMORY_MB = 4096
+BROWSER_DISK_GB = 32
 TOKEN_TTL_MS = 25_000
 OPERATION_TIMEOUT_SECONDS = 330.0
 BUS_COMMAND_TIMEOUT_SECONDS = 8.0
@@ -442,7 +444,7 @@ def self_test():
     assert request["action"] == DEFAULT_ACTION
     assert request["preferred_attachment"] == ATTACHMENT
     assert request["backend"] == BACKEND
-    assert request["resources"] == {"vcpu": 3, "memory_mb": 8192, "disk_gb": 64}
+    assert request["resources"] == {"vcpu": 2, "memory_mb": 4096, "disk_gb": 32}
     assert request["armed_token"].split("|")[3:6] == [ACTION_VERB, node, "workload:vm:seat15:browser-vm"]
     assert "armed_token" not in canonical_json({key: value for key, value in request.items() if key != "armed_token"})
     assert generation_from_snapshot(None, node) == 0
