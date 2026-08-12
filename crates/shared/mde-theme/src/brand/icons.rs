@@ -461,6 +461,8 @@ impl IconId {
     /// 0 64 64` for the mark); the wordmark alone is a `0 0 320 184` text
     /// lockup.
     #[must_use]
+    #[expect(clippy::too_many_lines, reason = "the exhaustive icon-to-asset mapping is intentionally grouped here")]
+    #[expect(clippy::match_same_arms, reason = "asset macros intentionally retain distinct enum identities")]
     pub const fn svg(self) -> &'static str {
         match self {
             Self::Mark => construct_svg!("mark.svg"),
@@ -491,7 +493,7 @@ impl IconId {
             Self::Keyboard => yamis_svg!("apps/16/preferences-desktop-keyboard.svg"),
             Self::Wallpaper => yamis_svg!("apps/16/preferences-desktop-wallpaper.svg"),
             Self::Appearance => yamis_svg!("apps/16/preferences-appearance.svg"),
-            Self::Bluetooth => yamis_svg!("status/scalable/bluetooth-active.svg"),
+            Self::Bluetooth | Self::BluetoothSmall => yamis_svg!("status/scalable/bluetooth-active.svg"),
             Self::PowerBattery => yamis_svg!("apps/16/preferences-power-and-battery.svg"),
             Self::NetworkSettings => yamis_svg!("apps/16/preferences-system-network.svg"),
             Self::HealthStatus => yamis_svg!("preferences/scalable/preferences-smart-status.svg"),
@@ -510,8 +512,7 @@ impl IconId {
             Self::Print => yamis_svg!("devices/scalable/printer.svg"),
             Self::History => yamis_svg!("actions/16/document-open-recent.svg"),
             Self::Tabs => yamis_svg!("preferences/scalable/preferences-tabs.svg"),
-            Self::NewTab => yamis_svg!("actions/16/list-add.svg"),
-            Self::Add => yamis_svg!("actions/16/list-add.svg"),
+            Self::NewTab | Self::Add => yamis_svg!("actions/16/list-add.svg"),
             Self::Remove => yamis_svg!("actions/16/list-remove.svg"),
             Self::ZoomIn => yamis_svg!("actions/16/zoom-in.svg"),
             Self::ZoomOut => yamis_svg!("actions/16/zoom-out.svg"),
@@ -558,7 +559,6 @@ impl IconId {
             Self::ChevronUp => yamis_svg!("actions/16/arrow-up.svg"),
             Self::Volume => yamis_svg!("status/scalable/audio-volume-medium.svg"),
             Self::VolumeMuted => yamis_svg!("status/scalable/audio-volume-muted.svg"),
-            Self::BluetoothSmall => yamis_svg!("status/scalable/bluetooth-active.svg"),
             Self::BatteryEmpty => yamis_svg!("status/scalable/battery-000.svg"),
             Self::BatteryQuarter => yamis_svg!("status/scalable/battery-020.svg"),
             Self::BatteryHalf => yamis_svg!("status/scalable/battery-050.svg"),
@@ -585,6 +585,7 @@ impl IconId {
     /// `"surface-terminal"`) — handy as an egui texture debug-name and for
     /// packaging scripts that resolve the on-disk asset.
     #[must_use]
+    #[expect(clippy::too_many_lines, reason = "the exhaustive icon-to-name mapping is intentionally grouped here")]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Mark => "mark",
