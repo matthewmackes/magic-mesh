@@ -1696,7 +1696,7 @@ mod tests {
         std::fs::create_dir_all(&peer_dir).unwrap();
         std::fs::write(
             peer_dir.join("apps-installed.json"),
-            r#"{"hostname":"anvil","entries":[{"id":"gimp.desktop","name":"GIMP","kind":"app","source":"flatpak","node":"anvil","exec":"gimp"}]}"#,
+            r#"{"hostname":"anvil","entries":[{"id":"gimp.desktop","name":"GIMP","kind":"app","source":"peer","node":"anvil","exec":"gimp"}]}"#,
         )
         .unwrap();
         let svc = AppsService::new(root, "me", &home);
