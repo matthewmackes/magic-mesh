@@ -2901,6 +2901,15 @@ fn peer_app_provision_wire_with(
         return Err("Flatpak App VM placement node is incomplete or unsafe.".to_owned());
     }
     let client_peer = client_peer.trim();
+    if client_peer.len() > 255
+        || client_peer.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '|')
+        })
+    {
+        return Err("Flatpak App VM initiating client peer is incomplete or unsafe.".to_owned());
+    }
     mackes_mesh_types::workloads::WorkloadId::new(client_peer)
         .map_err(|_| "Flatpak App VM initiating client peer is incomplete or unsafe.".to_owned())?;
     let app_id = FlatpakAppId::parse(target.app_id.trim())
@@ -7220,6 +7229,23 @@ mod tests {
             Ok("must not authorize".to_owned())
         })
         .expect_err("unsafe client identity must fail before authorization");
+        assert!(error.contains("client peer"), "{error}");
+        assert!(!authorization_called.get());
+
+        let oversized = "p".repeat(256);
+        let error = peer_app_provision_wire_with(&target, &oversized, |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("oversized client identity must fail before authorization");
+        assert!(error.contains("client peer"), "{error}");
+        assert!(!authorization_called.get());
+
+        let error = peer_app_provision_wire_with(&target, "peer:seat-a\nroute", |_, _, _, _| {
+            authorization_called.set(true);
+            Ok("must not authorize".to_owned())
+        })
+        .expect_err("control-bearing client identity must fail before authorization");
         assert!(error.contains("client peer"), "{error}");
         assert!(!authorization_called.get());
     }
