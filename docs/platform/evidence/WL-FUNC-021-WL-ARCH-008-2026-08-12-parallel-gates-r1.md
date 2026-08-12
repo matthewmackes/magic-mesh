@@ -13,6 +13,7 @@ Command: `MCNF_BUILD_HOST=172.20.0.90 MCNF_BUILD_SLOT=func021-music-20260812 MCN
 - Focused farm regressions passed: `read_all_peer_states_collects_and_sorts_snapshots`, `typed_workspace_queue_actions_use_the_shared_queue_authority`, and `workspace_targets_project_fresh_idle_and_refused_peer_heartbeats` (1/1 each).
 - Serial full farm gate (`-- --test-threads=1`): 263 passed, 5 failed, 268 total. The remaining five are provider-admission mutation assertions; the same bookmark path passes in isolation, so they remain a separate provider-test blocker.
 - Additional isolated farm checks passed: `typed_star_actions_use_admitted_provider_and_refuse_other_sources` and `typed_source_curation_uses_the_selected_admitted_provider` (1/1 each on independent `.90` slots). The remaining provider failures therefore do not reproduce in isolated execution and are retained as test-fixture interference, not accepted as a production green suite.
+- The remaining three provider checks also passed in isolated `.90` slots: `typed_bookmark_uses_the_selected_admitted_provider`, `typed_playlist_mutation_uses_the_selected_admitted_provider`, and `typed_playlist_actions_use_the_admitted_provider` (1/1 each). All five provider failures are therefore isolated-only fixture interaction.
 - Farm clippy: `cargo clippy -p mde-musicd --locked --lib` passed with warnings only (253).
 
 ## WL-ARCH-008
