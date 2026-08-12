@@ -2253,8 +2253,9 @@ mod tests {
         );
         assert_eq!(media_status.admitted_cards, 1);
         assert_eq!(adapted.cards.len(), 1);
+        assert!(adapted.cards[0].resource_id().starts_with("resource:v1:"));
         assert_eq!(
-            adapted.cards[0].resource_id(),
+            adapted.cards[0].identity.canonical_key,
             "media/jellyfin:birch:8096"
         );
         let wire = serde_json::to_string(&adapted.cards).unwrap();

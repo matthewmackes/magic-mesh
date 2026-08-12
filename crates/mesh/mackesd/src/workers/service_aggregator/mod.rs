@@ -1099,7 +1099,7 @@ mod tests {
                 thumbnail_ref: None,
             }],
             lanes: vec![],
-            published_at_ms: 1_700_000_000_000,
+            published_at_ms: u64::try_from(now_ms()).expect("current time"),
         }
     }
 
@@ -1158,7 +1158,7 @@ mod tests {
                 observed_at_ms: 1_700_000_000_000,
                 expires_at_ms: 1_700_000_120_000,
             }],
-            published_at_ms: 1_700_000_000_000,
+            published_at_ms: u64::try_from(now_ms()).expect("current time"),
         };
         let body = serde_json::to_string(&state).expect("UPnP state JSON");
         persist
