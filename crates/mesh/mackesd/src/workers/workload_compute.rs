@@ -3292,7 +3292,12 @@ impl WorkloadComputeWorker {
                 None => return,
             };
         }
-        if status.phase == WorkloadOperationPhase::Validating {
+        if status.phase == WorkloadOperationPhase::Validating
+            && !matches!(
+                request.action,
+                WorkloadOperationAction::Stop | WorkloadOperationAction::Destroy
+            )
+        {
             // The request is already journaled while it is being validated.
             // Do not count that same request as an existing reservation or an
             // exact-fit admission is rejected before it can reach the
