@@ -2,6 +2,7 @@
 //!
 //! Port of `mackesd/src/https_fallback.rs`'s `HttpsFallbackState`
 //! + `FailureWindow` into the new tunnel crate. The original
+//!
 //! module stays in mackesd until NF-4.5 retires it; both
 //! implementations are kept identical (same locks, same test
 //! surface) so the eventual switchover is a one-line
@@ -71,7 +72,7 @@ impl FailureWindow {
     /// direct field-init; we expose it as a constructor so
     /// the field can stay private.
     #[must_use]
-    pub fn from_consecutive_failures(n: u32) -> Self {
+    pub const fn from_consecutive_failures(n: u32) -> Self {
         Self {
             consecutive_failures: n,
         }
@@ -79,7 +80,7 @@ impl FailureWindow {
 
     /// Feed one probe-pair outcome. Returns the new failure
     /// count.
-    pub fn observe(&mut self, outcome: ProbePairOutcome) -> u32 {
+    pub const fn observe(&mut self, outcome: ProbePairOutcome) -> u32 {
         match outcome {
             ProbePairOutcome::BothUdpFailed => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -93,7 +94,7 @@ impl FailureWindow {
 
     /// Current consecutive failure count.
     #[must_use]
-    pub fn consecutive_failures(&self) -> u32 {
+    pub const fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
 
@@ -101,7 +102,7 @@ impl FailureWindow {
     /// [`FAILURE_THRESHOLD`] — caller should activate the
     /// HTTPS-tunnel transport.
     #[must_use]
-    pub fn threshold_met(&self) -> bool {
+    pub const fn threshold_met(&self) -> bool {
         self.consecutive_failures >= FAILURE_THRESHOLD
     }
 }
@@ -132,14 +133,14 @@ impl HttpsFallbackState {
     /// `true` when the routing layer should send packets over
     /// the HTTPS tunnel.
     #[must_use]
-    pub fn is_active(self) -> bool {
+    pub const fn is_active(self) -> bool {
         matches!(self, Self::Active)
     }
 
     /// `true` when the UI should surface the "connecting via
     /// HTTPS…" toast.
     #[must_use]
-    pub fn is_activating(self) -> bool {
+    pub const fn is_activating(self) -> bool {
         matches!(self, Self::Activating)
     }
 }
@@ -204,7 +205,10 @@ pub fn transition(
 
         // From Active — revert on UDP recovery; flip to Failing
         // on tunnel loss.
-        (HttpsFallbackState::Active, TransitionInput::Probe(ProbePairOutcome::AnyUdpSucceeded)) => {
+        (
+            HttpsFallbackState::Active | HttpsFallbackState::Failing,
+            TransitionInput::Probe(ProbePairOutcome::AnyUdpSucceeded),
+        ) => {
             *window = FailureWindow::new();
             HttpsFallbackState::Inactive
         }
@@ -213,13 +217,6 @@ pub fn transition(
 
         // From Failing — recovery → Inactive; re-threshold →
         // Activating (retry).
-        (
-            HttpsFallbackState::Failing,
-            TransitionInput::Probe(ProbePairOutcome::AnyUdpSucceeded),
-        ) => {
-            *window = FailureWindow::new();
-            HttpsFallbackState::Inactive
-        }
         (HttpsFallbackState::Failing, TransitionInput::Probe(ProbePairOutcome::BothUdpFailed)) => {
             window.observe(ProbePairOutcome::BothUdpFailed);
             if window.threshold_met() {

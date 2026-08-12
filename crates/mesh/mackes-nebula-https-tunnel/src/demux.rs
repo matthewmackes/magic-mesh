@@ -35,8 +35,8 @@ use crate::framing::{decode_frame, encode_frame, FrameError, MAX_FRAME_SIZE};
 use crate::tls::TunnelStream;
 
 /// Read buffer size for the TLS side. One UDP packet's worth +
-/// framing header; growing the buffer beyond MAX_FRAME_SIZE +
-/// HEADER_LEN wastes memory.
+/// framing header; growing the buffer beyond `MAX_FRAME_SIZE` +
+/// `HEADER_LEN` wastes memory.
 const TLS_READ_CHUNK: usize = MAX_FRAME_SIZE + 32;
 
 /// Default forwarding target — `127.0.0.1:4242` is where the
@@ -104,7 +104,7 @@ impl DemuxConfig {
     /// useful for tests + non-standard deployments where Nebula
     /// listens on something other than 4242.
     #[must_use]
-    pub fn with_nebula_addr(mut self, addr: SocketAddr) -> Self {
+    pub const fn with_nebula_addr(mut self, addr: SocketAddr) -> Self {
         self.nebula_addr = addr;
         self
     }
@@ -112,7 +112,7 @@ impl DemuxConfig {
     /// Override the idle timeout. Tests use small values to
     /// avoid 120 s waits.
     #[must_use]
-    pub fn with_idle_timeout(mut self, t: Duration) -> Self {
+    pub const fn with_idle_timeout(mut self, t: Duration) -> Self {
         self.idle_timeout = t;
         self
     }

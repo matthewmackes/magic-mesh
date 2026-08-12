@@ -36,7 +36,9 @@ pub enum FrameError {
     Oversized(usize),
 }
 
-/// Encode a single frame onto the output buffer. Returns the
+/// Encode a single frame onto the output buffer.
+///
+/// Returns the
 /// number of bytes appended (always `HEADER_LEN + payload.len()`
 /// on success). Caller-side guard against pathological payload
 /// sizes — anything Nebula would emit is well under
@@ -46,12 +48,16 @@ pub enum FrameError {
 /// # Errors
 /// Returns [`FrameError::Oversized`] when `payload.len() >
 /// MAX_FRAME_SIZE`.
+///
+/// # Panics
+/// Panics only if the compile-time `MAX_FRAME_SIZE` exceeds the
+/// representable range of the frame length header.
 pub fn encode_frame(payload: &[u8], out: &mut BytesMut) -> Result<usize, FrameError> {
     if payload.len() > MAX_FRAME_SIZE {
         return Err(FrameError::Oversized(payload.len()));
     }
     out.reserve(HEADER_LEN + payload.len());
-    out.put_u32(payload.len() as u32);
+    out.put_u32(u32::try_from(payload.len()).expect("MAX_FRAME_SIZE fits in u32"));
     out.put_slice(payload);
     Ok(HEADER_LEN + payload.len())
 }

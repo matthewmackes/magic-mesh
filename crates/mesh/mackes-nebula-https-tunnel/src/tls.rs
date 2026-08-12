@@ -65,7 +65,9 @@ pub type TunnelStream = ServerTlsStream<TcpStream>;
 /// [`TunnelStream`]. Returned by [`dial`].
 pub type TunnelClientStream = ClientTlsStream<TcpStream>;
 
-/// Tunnel errors. Each variant maps to a specific operator-
+/// Tunnel errors.
+///
+/// Each variant maps to a specific operator-
 /// actionable failure so the activation state machine can
 /// distinguish "broken socket" (Failing) from "bad cert"
 /// (Failing + log) from "ALPN mismatch" (Failing + log + the
@@ -142,9 +144,10 @@ fn build_server_config(
 /// surface).
 fn build_client_config(ca_bundle: Option<&Path>) -> Result<Arc<ClientConfig>, TunnelError> {
     let mut roots = RootCertStore::empty();
-    let bundle_path = ca_bundle
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("/etc/ssl/certs/ca-certificates.crt"));
+    let bundle_path = ca_bundle.map_or_else(
+        || std::path::PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+        Path::to_path_buf,
+    );
     let pem = std::fs::read(&bundle_path).map_err(|e| {
         TunnelError::CertIo(format!("read CA bundle {}: {e}", bundle_path.display()))
     })?;
@@ -258,7 +261,7 @@ impl TunnelListener {
     /// Local socket the listener bound to. Useful for tests
     /// that bind port 0 and need to discover the assigned
     /// port.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
+    pub const fn local_addr(&self) -> Option<SocketAddr> {
         Some(self.local_addr)
     }
 }
@@ -270,6 +273,7 @@ impl Drop for TunnelListener {
 }
 
 /// Dial `addr` and complete a TLS 1.3 handshake against `sni`.
+///
 /// `ca_bundle` is the path to a PEM bundle the dialer trusts
 /// (or `None` to use the system trust store under
 /// /etc/ssl/certs/ca-certificates.crt).

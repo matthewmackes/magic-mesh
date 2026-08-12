@@ -46,7 +46,7 @@
 //!
 //! Bench test `tests/acceptance/test_nebula_fabric.py` runs
 //! the localhost throughput test and asserts ≥ 5 Mbps on
-//! x86_64 Fedora 44 CI per the Q10 covert-path floor.
+//! `x86_64` Fedora 44 CI per the Q10 covert-path floor.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
