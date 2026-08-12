@@ -9,7 +9,7 @@
 //! pure (no clock, no I/O — the send time is read from the payload or defaults),
 //! so it is exhaustively unit-tested against realistic Bus JSON shapes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -103,17 +103,19 @@ fn parse_action_kind(v: &serde_json::Value) -> AlertActionKind {
     v.get("kind")
         .and_then(serde_json::Value::as_str)
         .or_else(|| v.get("type").and_then(serde_json::Value::as_str))
-        .map(|s| match s.trim().to_ascii_lowercase().as_str() {
-            "destructive" | "danger" | "armed" => AlertActionKind::Destructive,
-            "ack" | "acknowledge" => AlertActionKind::Ack,
-            "snooze" => AlertActionKind::Snooze,
-            _ => AlertActionKind::Safe,
+        .map_or(AlertActionKind::Safe, |s| {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "destructive" | "danger" | "armed" => AlertActionKind::Destructive,
+                "ack" | "acknowledge" => AlertActionKind::Ack,
+                "snooze" => AlertActionKind::Snooze,
+                _ => AlertActionKind::Safe,
+            }
         })
-        .unwrap_or(AlertActionKind::Safe)
 }
 
 fn parse_actions(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec<AlertAction> {
     let mut actions = Vec::new();
+    let mut seen_ids = BTreeSet::new();
     if let Some(values) = obj
         .and_then(|o| o.get("actions"))
         .and_then(serde_json::Value::as_array)
@@ -135,6 +137,12 @@ fn parse_actions(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> Ve
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map_or_else(|| format!("action-{idx}"), str::to_string);
+            // Action IDs are the lookup/signing identity. Keep the first
+            // occurrence so a replay or hostile payload cannot create an
+            // ambiguous button that resolves differently by renderer/order.
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
             let verb = action
                 .get("verb")
                 .and_then(serde_json::Value::as_str)
@@ -344,6 +352,27 @@ mod tests {
         assert_eq!(actions[2].kind, AlertActionKind::Ack);
         assert_eq!(actions[3].kind, AlertActionKind::Snooze);
         assert!(!fields.contains_key("actions"));
+    }
+
+    #[test]
+    fn folds_only_the_first_duplicate_action_id() {
+        let payload = r#"{
+            "actions": [
+                {"id":"restart","label":"Restart","verb":"action/systemd/restart"},
+                {"id":"restart","label":"Power Off","verb":"action/power/off"},
+                {"label":"Fallback"},
+                {"label":"Fallback"}
+            ]
+        }"#;
+        let msg = fold_alert("event/system/service", payload, "eagle");
+        let MessageKind::Alert { actions, .. } = msg.kind else {
+            unreachable!("expected Alert");
+        };
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].label, "Restart");
+        assert_eq!(actions[0].verb.as_deref(), Some("action/systemd/restart"));
+        assert_eq!(actions[1].id, "action-2");
+        assert_eq!(actions[2].id, "action-3");
     }
 
     #[test]
