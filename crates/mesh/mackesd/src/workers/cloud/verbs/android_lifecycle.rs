@@ -102,6 +102,9 @@ fn parse(raw: &str) -> Result<Request, String> {
     if request.operation == Operation::Stop && request.expected_generation == 0 {
         return Err("stop requires a non-zero expected workload generation".to_owned());
     }
+    if request.operation == Operation::Start && request.expected_generation != 0 {
+        return Err("start requires a zero expected workload generation".to_owned());
+    }
     if matches!(request.operation, Operation::Stop | Operation::Cancel) && request.app.is_some() {
         return Err("stop/cancel must not carry an app".to_owned());
     }
@@ -626,5 +629,23 @@ mod tests {
 
         let refusal = parse(&document.to_string()).expect_err("zero-generation Stop must refuse");
         assert!(refusal.contains("non-zero expected workload generation"));
+    }
+
+    #[test]
+    fn start_rejects_a_nonzero_expected_generation_before_any_backend_effect() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "node": "node-a",
+            "workload_id": "android-one",
+            "request_id": "android-start-stale",
+            "expected_generation": 41,
+            "operation": "start",
+            "app": "browser"
+        })
+        .to_string();
+
+        let refusal = parse(&raw).expect_err("stale Start generation must be refused");
+
+        assert!(refusal.contains("start requires a zero expected workload generation"));
     }
 }

@@ -377,7 +377,7 @@ impl FsBlobStore {
             // Linux fcntl.h: O_NOFOLLOW == 00400000 (octal).
             return OpenOptions::new()
                 .read(true)
-                .custom_flags(0o400000)
+                .custom_flags(0o400_000)
                 .open(path);
         }
 
@@ -963,9 +963,7 @@ mod tests {
             .expect("canonical metadata")
             .permissions()
             .readonly());
-        let mutation = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&canonical);
+        let mutation = std::fs::OpenOptions::new().write(true).open(&canonical);
         assert!(matches!(
             mutation,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied

@@ -1797,7 +1797,7 @@ pub fn specs_for_group(group: WorkerGroup) -> impl Iterator<Item = &'static Work
 /// they must never become an uncensused seventh process surface.
 #[must_use]
 pub fn belongs_to_group(worker: &str, group: WorkerGroup) -> bool {
-    spec(worker).is_some_and(|worker| worker.group == group)
+    runtime_spec(worker).is_some_and(|worker| worker.group == group)
 }
 
 /// Apply the canonical registry's startup-time configuration predicate.
@@ -2813,6 +2813,14 @@ mod tests {
         assert!(runtime_spec("mesh-router-shadow").is_none());
         assert!(runtime_spec("mesh_router_shadow").is_none());
         assert!(runtime_spec("nebula--supervisor").is_none());
+    }
+
+    #[test]
+    fn admitted_runtime_aliases_preserve_process_group_ownership() {
+        let canonical = spec("mesh_router").expect("canonical worker must be registered");
+        assert!(belongs_to_group("mesh-router", canonical.group));
+        assert!(!belongs_to_group("mesh-router", WorkerGroup::Control));
+        assert!(!belongs_to_group("mesh-router-extra", canonical.group));
     }
 
     #[test]

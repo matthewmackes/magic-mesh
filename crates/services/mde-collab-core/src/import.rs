@@ -51,6 +51,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +89,8 @@ const MAX_RING_MESSAGES: usize = 500;
 /// one space every imported editor document is linked into).
 const EDITOR_SPACE_KEY: &str = "__editor_documents__";
 
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 // ───────────────────────────── durable idempotency map ─────────────────────
 
 /// The durable source → target map that makes a re-import a no-op.
@@ -114,7 +117,7 @@ pub struct ImportMap {
 impl ImportMap {
     /// A fresh, empty map at the current [`IMPORT_MAP_VERSION`].
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             version: IMPORT_MAP_VERSION,
             imported: BTreeMap::new(),
@@ -172,7 +175,6 @@ impl ImportMap {
         // Allocate a private, create_new file instead, then atomically replace
         // the final name. The counter is process-local; create_new closes the
         // remaining collision window with stale files or another process.
-        static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (tmp, mut file) = (0..16)
             .find_map(|attempt| {
                 let serial = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -301,7 +303,9 @@ impl EventSink for MemorySink {
 /// The production sink: the Syncthing-replicable [`FileActorLog`] tree at
 /// `<root>/<space>/<actor>.jsonl` — exactly the actor-log root the collab worker
 /// reads on boot (`backfill_logs`), so an imported log converges + projects like
-/// any replicated peer log. Opens (and caches) one log per `(space, actor)` on
+/// any replicated peer log.
+///
+/// Opens (and caches) one log per `(space, actor)` on
 /// demand; the log's own idempotent append makes a re-import a no-op.
 #[derive(Debug)]
 pub struct LogSink {
@@ -327,14 +331,13 @@ impl EventSink for LogSink {
         // Open-and-cache on the miss path only; the borrow from the hit path does
         // not escape the match (its value is the `append` `Result`), so re-using
         // `self.logs` on the miss path is sound.
-        match self.logs.get_mut(&key) {
-            Some(log) => log.append(env),
-            None => {
-                let mut log = FileActorLog::open(&self.root, env.space_id, &env.actor)?;
-                let appended = log.append(env);
-                self.logs.insert(key, log);
-                appended
-            }
+        if let Some(log) = self.logs.get_mut(&key) {
+            log.append(env)
+        } else {
+            let mut log = FileActorLog::open(&self.root, env.space_id, &env.actor)?;
+            let appended = log.append(env);
+            self.logs.insert(key, log);
+            appended
         }
     }
 }
@@ -1029,7 +1032,7 @@ fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<Option<
         // checked leaf instead of following a symlink planted after metadata.
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0o400000)
+            .custom_flags(0o400_000)
             .open(path)?
     };
     #[cfg(not(target_os = "linux"))]
@@ -1057,7 +1060,10 @@ fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<Option<
         }
     }
 
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    let capacity = usize::try_from(opened.len()).map_err(|_| {
+        CollabError::Serde(format!("{label} is too large for this platform"))
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(CollabError::Serde(format!(

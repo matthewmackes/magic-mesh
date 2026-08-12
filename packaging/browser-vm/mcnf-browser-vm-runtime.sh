@@ -107,7 +107,7 @@ case "$transport" in
         exit 1
         ;;
 esac
-runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+runtime_dir=/run/mcnf-browser
 install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
 

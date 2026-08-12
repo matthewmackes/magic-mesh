@@ -87,7 +87,7 @@ start_session_owned_services() {
         command -v "$daemon" >/dev/null 2>&1 || return 1
     done
 
-    runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    runtime_dir=/run/mcnf-browser
     [ -d "$runtime_dir" ] || return 1
     lock_file=$runtime_dir/mcnf-browser-audio.lock
     exec 9>"$lock_file"

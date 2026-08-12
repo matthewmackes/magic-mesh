@@ -1,12 +1,14 @@
 //! The folded **domain aggregate** — the authoritative facts
-//! [`apply_command`](crate::apply_command) validates against (membership, roles,
-//! message authorship + age + tombstone, entity existence, alert action kinds).
+//! [`apply_command`](crate::apply_command) validates against membership, roles,
+//! message authorship, age, tombstones, entity existence, and alert action kinds.
 //!
 //! It is a pure fold of the signed event set in the **canonical convergent
-//! order** — `(clock.wall_ms, clock.counter, event_id)`. Folding the same set
+//! order** — `(clock.wall_ms, clock.counter, event_id)`.
+//!
+//! Folding the same set
 //! in canonical order on every node yields the same aggregate, so a validation
 //! decision is deterministic across the mesh. This aggregate carries only what
-//! validation needs; the rendered read-models are the SQLite projection's job.
+//! validation needs; the rendered read-models are the `SQLite` projection's job.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,13 +22,13 @@ use mde_collab_types::{ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
 /// The total, deterministic sort key that orders a merged multi-node log:
 /// causal clock first, then the opaque [`EventId`] as a stable tiebreak.
 #[must_use]
-pub fn sort_key(env: &CollabEventEnvelope) -> (u64, u32, EventId) {
+pub const fn sort_key(env: &CollabEventEnvelope) -> (u64, u32, EventId) {
     (env.clock.wall_ms, env.clock.counter, env.event_id)
 }
 
 /// Sort `events` into the canonical convergent order in place.
 pub fn canonical_sort(events: &mut [CollabEventEnvelope]) {
-    events.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    events.sort_by_key(sort_key);
 }
 
 /// A member's standing in a space.
@@ -176,6 +178,11 @@ impl DomainState {
     }
 
     /// Fold one already-canonically-ordered event into the aggregate.
+    #[expect(
+        clippy::match_same_arms,
+        clippy::too_many_lines,
+        reason = "the exhaustive event fold intentionally keeps no-op variants explicit beside their stateful peers"
+    )]
     fn apply(&mut self, env: &CollabEventEnvelope) {
         let space_id = env.space_id;
         match &env.kind {
@@ -189,7 +196,7 @@ impl DomainState {
             }
             CollabEventKind::SpaceRenamed { name } => {
                 if let Some(s) = self.spaces.get_mut(&space_id) {
-                    s.name = name.clone();
+                    s.name.clone_from(name);
                 }
             }
             CollabEventKind::SpaceArchived => {}

@@ -58,7 +58,7 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000); // O_NOFOLLOW
+        options.custom_flags(0o400_000); // O_NOFOLLOW
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100); // O_NOFOLLOW
 

@@ -142,7 +142,7 @@ impl PayloadRefs {
                 CollabEventKind::MessageDeleted { target } => {
                     let e = deletes
                         .entry(*target)
-                        .or_insert((ActorClock::zero(), env.actor.clone()));
+                        .or_insert_with(|| (ActorClock::zero(), env.actor.clone()));
                     if env.clock > e.0 {
                         *e = (env.clock, env.actor.clone());
                     }
@@ -167,11 +167,11 @@ impl PayloadRefs {
         for (id, (sha, author)) in &msg_payload {
             let Some(sha) = sha else { continue };
             // A delete only tombstones when authored by the message's author.
-            let deleted = match deletes.get(id) {
-                Some((clk, deleter)) if deleter == author => Some(*clk),
+            let deletion_clock = match deletes.get(id) {
+                Some((clk, deleting_actor)) if deleting_actor == author => Some(*clk),
                 _ => None,
             };
-            match deleted {
+            match deletion_clock {
                 Some(clk) => {
                     let e = tombstoned.entry(sha.clone()).or_insert(clk);
                     if clk > *e {

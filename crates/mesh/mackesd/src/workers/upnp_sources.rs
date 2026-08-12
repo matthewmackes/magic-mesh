@@ -567,6 +567,13 @@ fn valid_upnp_source_id(source_id: &str) -> bool {
         )
 }
 
+fn stable_upnp_media_id(source_id: &str) -> Option<&str> {
+    source_id
+        .strip_prefix("upnp/")?
+        .split_once('/')
+        .map(|(uuid, _)| uuid)
+}
+
 fn valid_uuid(value: &str) -> bool {
     value.len() == 36
         && value.as_bytes().iter().enumerate().all(|(index, byte)| {
@@ -1266,6 +1273,27 @@ impl UpnpRoster {
         record
             .validate()
             .map_err(UpnpDiscoveryError::InvalidRecord)?;
+        let stable_id = stable_upnp_media_id(&record.source_id).ok_or_else(|| {
+            UpnpDiscoveryError::InvalidRecord(ResourceValidationError::InvalidField(
+                "upnp.source_id",
+            ))
+        })?;
+        if let Some(existing) = self
+            .records
+            .values()
+            .find(|existing| stable_upnp_media_id(&existing.source_id) == Some(stable_id))
+        {
+            let same_identity = existing.source_id == record.source_id
+                && existing.kind == record.kind
+                && existing.interface == record.interface
+                && existing.source_ip == record.source_ip
+                && existing.location == record.location;
+            if !same_identity {
+                return Err(UpnpDiscoveryError::ConflictingIdentity {
+                    source_id: record.source_id,
+                });
+            }
+        }
         if let Some(existing) = self.records.get(&record.source_id) {
             let same_identity = existing.kind == record.kind
                 && existing.interface == record.interface
@@ -1572,6 +1600,34 @@ SERVER: Linux/6.1 UPnP/1.0 MCNF/1.0\r\n\r\n"
 
         roster.prune_expired(NOW + 11_000);
         assert_eq!(roster.snapshot().len(), 0);
+    }
+
+    #[test]
+    fn one_stable_media_id_cannot_change_resource_family() {
+        let adapter = UpnpDiscoveryAdapter::new(policy());
+        let first = adapter
+            .admit_packet(&media_server_packet("max-age=120"), &context(NOW))
+            .unwrap();
+        let mut renderer_packet = media_server_packet("max-age=120");
+        renderer_packet = String::from_utf8(renderer_packet)
+            .unwrap()
+            .replace(
+                "urn:schemas-upnp-org:device:MediaServer:1",
+                "urn:schemas-upnp-org:device:MediaRenderer:1",
+            )
+            .into_bytes();
+        let second = adapter
+            .admit_packet(&renderer_packet, &context(NOW + 1))
+            .unwrap();
+        assert_ne!(first.source_id, second.source_id);
+
+        let mut roster = UpnpRoster::new(2).unwrap();
+        roster.admit(first).unwrap();
+        assert!(matches!(
+            roster.admit(second),
+            Err(UpnpDiscoveryError::ConflictingIdentity { .. })
+        ));
+        assert_eq!(roster.snapshot().len(), 1);
     }
 
     #[test]

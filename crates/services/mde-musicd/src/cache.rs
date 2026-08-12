@@ -77,10 +77,13 @@ pub fn artwork_filename(cover_id: &str) -> String {
 #[must_use]
 pub fn read_shared_artwork(cover_id: &str) -> Option<Vec<u8>> {
     let path = artwork_dir()?.join(artwork_filename(cover_id));
-    let file = std::fs::File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    // Do not follow a peer-controlled replacement symlink out of the shared
+    // artwork directory.  The size bound below is not sufficient if opening
+    // the cache entry can first redirect to an unrelated file.
+    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
         return None;
     }
+    let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take((MAX_SHARED_ARTWORK_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -102,8 +105,18 @@ pub fn write_shared_artwork(cover_id: &str, bytes: &[u8]) {
     let Some(dir) = artwork_dir() else { return };
     let name = artwork_filename(cover_id);
     let tmp = dir.join(format!(".{name}.tmp"));
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, dir.join(name));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, dir.join(name))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
     }
 }
 
@@ -626,6 +639,30 @@ mod tests {
         assert_eq!(read_shared_artwork("oversized"), None);
         write_shared_artwork("too-large", &vec![b'y'; MAX_SHARED_ARTWORK_BYTES + 1]);
         assert!(!dir.path().join(artwork_filename("too-large")).exists());
+        std::env::remove_var(super::ARTWORK_DIR_ENV);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_artwork_refuses_symlink_reads_and_replacements() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("secret");
+        std::fs::write(&target, b"outside").unwrap();
+        std::env::set_var(super::ARTWORK_DIR_ENV, dir.path());
+
+        let entry = dir.path().join(artwork_filename("linked"));
+        symlink(&target, &entry).unwrap();
+        assert_eq!(read_shared_artwork("linked"), None);
+
+        let temporary = dir.path().join(".replacement.tmp");
+        symlink(&target, &temporary).unwrap();
+        write_shared_artwork("replacement", b"safe");
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+        assert!(!dir.path().join(artwork_filename("replacement")).exists());
+
         std::env::remove_var(super::ARTWORK_DIR_ENV);
     }
 

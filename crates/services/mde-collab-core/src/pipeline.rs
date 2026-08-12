@@ -89,7 +89,14 @@ pub struct RegisteredFile {
 /// commit guard remains armed across command application: authorization or
 /// projection failure rolls back only an inode installed by this operation,
 /// while an exact pre-existing/concurrent blob is never removed.
+///
+/// # Errors
+///
+/// Returns an error if staging, authorization, projection, or event persistence
+/// fails. A newly-installed blob is rolled back when later command processing
+/// fails.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value)] // Public API owns the caller's `FileRef`.
 pub fn ingest_and_register_file<R: Read, S: EventSigner, I: IdSource>(
     engine: &mut CollabEngine,
     blobs: &FsBlobStore,
@@ -159,7 +166,9 @@ pub fn ingest_and_register_file<R: Read, S: EventSigner, I: IdSource>(
 
 /// The injected authoring context for [`apply_command`]. Carries the local
 /// actor, the injected wall time, the actor's running HLC (advanced per emitted
-/// event), and the signer + id source. Generic (not `dyn`) so a hot path stays
+/// event), and the signer + id source.
+///
+/// Generic (not `dyn`) so a hot path stays
 /// monomorphized.
 pub struct ApplyCtx<'a, S: EventSigner, I: IdSource> {
     /// The local actor authoring the command.
@@ -196,7 +205,7 @@ impl<'a, S: EventSigner, I: IdSource> ApplyCtx<'a, S, I> {
 
     /// Resume from an existing actor clock (the engine's stored high-water).
     #[must_use]
-    pub fn with_clock(mut self, clock: ActorClock) -> Self {
+    pub const fn with_clock(mut self, clock: ActorClock) -> Self {
         self.clock = clock;
         self
     }
@@ -243,6 +252,11 @@ impl<'a, S: EventSigner, I: IdSource> ApplyCtx<'a, S, I> {
 /// the worker once the model answers — [`RequestAiSuggestion`](CollabCommand::RequestAiSuggestion)).
 /// These still validate (membership/existence) and are documented Phase-1
 /// follow-ups where a Phase-0 event class does not yet carry the fact.
+///
+/// # Errors
+///
+/// Returns a typed error when command validation, signing, or ID generation
+/// cannot produce an accepted event sequence.
 #[allow(clippy::too_many_lines)]
 pub fn apply_command<S: EventSigner, I: IdSource>(
     state: &DomainState,
@@ -1061,12 +1075,12 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             let others_connected = state
                 .calls
                 .get(call)
-                .map(|c| {
+                .is_some_and(|c| {
                     c.participants.iter().any(|(a, s)| {
                         a != &ctx.actor && matches!(s, CallParticipantState::Connected)
                     })
                 })
-                .unwrap_or(false);
+                ;
             if !others_connected {
                 events.push(ctx.emit(
                     space,
@@ -1147,17 +1161,17 @@ fn is_nonzero_lower_sha256(value: &str) -> bool {
 /// command boundary. Queued transfers may only be canceled; active transfers
 /// may be paused/canceled; paused transfers may be resumed/canceled; terminal
 /// states carry no controls.
-fn next_transfer_state(
+const fn next_transfer_state(
     transfer: mde_collab_types::ids::TransferId,
     state: TransferState,
     control: TransferControl,
 ) -> Result<TransferState> {
     let next = match (state, control) {
-        (TransferState::Queued, TransferControl::Cancel) => TransferState::Canceled,
         (TransferState::Active, TransferControl::Pause) => TransferState::Paused,
-        (TransferState::Active, TransferControl::Cancel) => TransferState::Canceled,
         (TransferState::Paused, TransferControl::Resume) => TransferState::Active,
-        (TransferState::Paused, TransferControl::Cancel) => TransferState::Canceled,
+        (TransferState::Queued, TransferControl::Cancel)
+        | (TransferState::Active, TransferControl::Cancel)
+        | (TransferState::Paused, TransferControl::Cancel) => TransferState::Canceled,
         _ => {
             return Err(CollabError::InvalidTransferControl {
                 transfer,
@@ -1335,7 +1349,7 @@ fn require_call(state: &DomainState, call: mde_collab_types::ids::CallId) -> Res
 
 /// An AI request may only target content already known to belong to the request
 /// space. This is the core admission boundary for the "bounded context only"
-/// DigitalOcean lock: a stale/cross-space event id cannot be smuggled into a
+/// `DigitalOcean` lock: a stale/cross-space event id cannot be smuggled into a
 /// future provider prompt.
 fn require_ai_target_in_space(state: &DomainState, space: SpaceId, target: EventId) -> Result<()> {
     if state
@@ -1406,7 +1420,7 @@ fn require_alert_action_id(action_id: &str) -> Result<()> {
 /// `telephone-event`: 0-9, `*`, `#`, and the A-D row. Lower-case A-D is
 /// accepted so provider adapters can normalize without losing a valid keypad
 /// event.
-fn require_dtmf_digit(digit: char) -> Result<()> {
+const fn require_dtmf_digit(digit: char) -> Result<()> {
     if matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D' | 'a'..='d') {
         Ok(())
     } else {
@@ -1440,7 +1454,7 @@ fn require_active_call_participant(
 }
 
 /// The author edit/delete window guard.
-fn enforce_window(
+const fn enforce_window(
     target: mde_collab_types::ids::EventId,
     created_ms: i64,
     now_ms: i64,
@@ -1459,13 +1473,10 @@ fn enforce_window(
 
 /// Whether removing/demoting `actor` from `space` would leave it Owner-less.
 fn would_orphan(state: &DomainState, space: SpaceId, actor: &mde_collab_types::ActorId) -> bool {
-    match state.space(space) {
-        Some(s) => {
+    state.space(space).map_or(false, |s| {
             matches!(state.role(space, actor), Some(SpaceRole::Owner))
                 && s.present_owner_count() <= 1
-        }
-        None => false,
-    }
+    })
 }
 
 #[cfg(test)]

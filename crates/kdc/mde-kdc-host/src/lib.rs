@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 //! Host layer for the MDE KDE Connect stack.
 //!
 //! `mde-kdc-proto` is the pure protocol layer (codec, crypto, discovery,
@@ -90,12 +92,12 @@ impl std::fmt::Display for PeerId {
 
 impl From<String> for PeerId {
     fn from(s: String) -> Self {
-        PeerId(s)
+        Self(s)
     }
 }
 
 impl From<&str> for PeerId {
     fn from(s: &str) -> Self {
-        PeerId(s.to_string())
+        Self(s.to_string())
     }
 }

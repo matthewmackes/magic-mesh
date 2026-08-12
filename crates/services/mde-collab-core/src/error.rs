@@ -1,6 +1,7 @@
-//! The one typed error the core returns. Every rejected command surfaces a
-//! specific, human-legible variant — a denied action is *visible* (an `Err`),
-//! never a silent no-op (the epic's "denied actions stay visible" rule).
+//! The one typed error the core returns.
+//!
+//! Every rejected command surfaces a specific, human-legible variant — a denied
+//! action is *visible* (an `Err`), never a silent no-op.
 
 use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
@@ -241,7 +242,7 @@ pub enum CollabError {
     /// authority violation and must never be hidden as a duplicate.
     #[error("actor log event {0} conflicts with the durable signed event")]
     ConflictingEventId(EventId),
-    /// A SQLite projection failure.
+    /// A `SQLite` projection failure.
     #[error("projection sql error: {0}")]
     Sql(String),
     /// A filesystem failure in the actor log or fs blob store.

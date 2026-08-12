@@ -43,6 +43,33 @@ active_code_contains() {
     ' "$path"
 }
 
+active_line_count() {
+    local path=$1 expected=$2
+    awk -v expected="$expected" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == expected) count++
+        }
+        END { print count + 0 }
+    ' "$path"
+}
+
+active_assignment_count() {
+    local path=$1 prefix=$2
+    awk -v prefix="$prefix" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (index(line, prefix) == 1) count++
+        }
+        END { print count + 0 }
+    ' "$path"
+}
+
 verify_foreground_bootstrap() {
     local runtime=$1
     local first='if /usr/bin/dbus-run-session -- \'
@@ -146,12 +173,18 @@ verify_desktop_chain() {
 
     has_active_line "$runtime" 'PATH=/usr/sbin:/usr/bin' \
         || fail "runtime does not pin executable lookup to the immutable guest image"
-    has_active_line "$runtime" 'export PATH' \
-        || fail "runtime does not export its image-owned executable lookup path"
-    has_active_line "$runtime" 'unset MCNF_BROWSER_VM_INPUT_ROOT' \
-        || fail "runtime accepts an xrdp-selected identity directory"
-    has_active_line "$runtime" 'input_root=/etc/mcnf-browser-vm' \
-        || fail "runtime does not use the canonical guest identity directory"
+    [ "$(active_assignment_count "$runtime" 'PATH=')" -eq 1 ] \
+        || fail "runtime must assign the immutable guest executable path exactly once"
+    [ "$(active_line_count "$runtime" 'export PATH')" -eq 1 ] \
+        || fail "runtime must export its image-owned executable lookup path exactly once"
+    [ "$(active_line_count "$runtime" 'unset MCNF_BROWSER_VM_INPUT_ROOT')" -eq 1 ] \
+        || fail "runtime must clear xrdp-selected identity input exactly once"
+    [ "$(active_line_count "$runtime" 'input_root=/etc/mcnf-browser-vm')" -eq 1 ] \
+        || fail "runtime must assign the canonical guest identity directory exactly once"
+    [ "$(active_line_count "$runtime" 'runtime_dir=/run/mcnf-browser')" -eq 1 ] \
+        || fail "runtime must assign the service-owned runtime directory exactly once"
+    [ "$(active_line_count "$session" 'runtime_dir=/run/mcnf-browser')" -eq 1 ] \
+        || fail "session must assign the service-owned runtime directory exactly once"
     if active_code_contains "$runtime" 'input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-'; then
         fail "runtime still permits an environment-directed identity directory"
     fi
@@ -513,6 +546,27 @@ self_test() {
     sed -i 's#^PATH=/usr/sbin:/usr/bin$#PATH=/tmp/host-browser-bin:/usr/sbin:/usr/bin#' \
         "$source_fixture/mcnf-browser-vm-runtime.sh"
     expect_rejected 'runtime with a host-directed executable search path' \
+        verify_source "$source_fixture"
+
+    cp "$script_dir/mcnf-browser-vm-runtime.sh" \
+        "$source_fixture/mcnf-browser-vm-runtime.sh"
+    sed -i '/^PATH=\/usr\/sbin:\/usr\/bin$/a PATH=/tmp/late-host-browser-bin' \
+        "$source_fixture/mcnf-browser-vm-runtime.sh"
+    expect_rejected 'runtime with a duplicate late executable search path' \
+        verify_source "$source_fixture"
+
+    cp "$script_dir/mcnf-browser-vm-runtime.sh" \
+        "$source_fixture/mcnf-browser-vm-runtime.sh"
+    sed -i 's#^runtime_dir=/run/mcnf-browser$#runtime_dir=${XDG_RUNTIME_DIR:-/tmp/host-runtime}#' \
+        "$source_fixture/mcnf-browser-vm-runtime.sh"
+    expect_rejected 'runtime with an xrdp-directed runtime directory' \
+        verify_source "$source_fixture"
+
+    cp "$script_dir/mcnf-browser-vm-session.sh" \
+        "$source_fixture/mcnf-browser-vm-session.sh"
+    sed -i 's#^    runtime_dir=/run/mcnf-browser$#    runtime_dir=${XDG_RUNTIME_DIR:-/tmp/host-runtime}#' \
+        "$source_fixture/mcnf-browser-vm-session.sh"
+    expect_rejected 'session with an xrdp-directed runtime directory' \
         verify_source "$source_fixture"
 
     cp "$script_dir/mcnf-browser-vm-runtime.sh" \

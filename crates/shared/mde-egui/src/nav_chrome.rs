@@ -177,12 +177,16 @@ pub fn sidebar_row_height(density: Density) -> f32 {
     Style::CONTROL_H_L.max(density.min_hit_target())
 }
 
-/// Shared activation test for the chrome buttons: a pointer click, or Enter
-/// while the widget holds keyboard focus (consumed so no other reader re-fires
-/// it) — every bar affordance is keyboard-activatable (WCAG 2.1.1).
+/// Shared activation test for the chrome buttons: a pointer click, or Enter /
+/// Space while the widget holds keyboard focus (consumed so no other reader
+/// re-fires it) — every bar affordance is keyboard-activatable (WCAG 2.1.1).
 fn activated(ui: &Ui, response: &Response) -> bool {
     response.clicked()
-        || (response.has_focus() && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)))
+        || (response.has_focus()
+            && ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Enter)
+                    || i.consume_key(Modifiers::NONE, Key::Space)
+            }))
 }
 
 /// The translucent hover wash for a chrome affordance: [`Style::SURFACE_HI`]
@@ -1105,6 +1109,31 @@ mod tests {
             last.as_ref().unwrap().activated,
             Some(1),
             "the clicked trailing action must report its combined index"
+        );
+    }
+
+    #[test]
+    fn focused_toolbar_action_activates_with_space() {
+        let ctx = test_context();
+        let items = [ToolbarItem::icon("download", "Download")];
+        let mut last: Option<ToolbarResponse> = None;
+        let run = |input: RawInput, last: &mut Option<ToolbarResponse>| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *last = Some(Toolbar::new().trailing(&items).show(ui));
+                });
+            })
+        };
+
+        let _ = run(RawInput::default(), &mut last);
+        let action = last.as_ref().expect("toolbar response").items[0].clone();
+        ctx.memory_mut(|memory| memory.request_focus(action.id));
+
+        let _ = run(key_press(Key::Space), &mut last);
+        assert_eq!(
+            last.as_ref().expect("toolbar response").activated,
+            Some(0),
+            "a focused icon action must activate on Space"
         );
     }
 

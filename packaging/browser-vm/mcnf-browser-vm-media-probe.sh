@@ -20,7 +20,7 @@ fail_closed() {
 [ -n "$chromium_bin" ] || { fail_closed; exit 0; }
 [ -x "$chromium_bin" ] || { fail_closed; exit 0; }
 
-probe_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mcnf-browser-media-probe
+probe_dir=/run/mcnf-browser/mcnf-browser-media-probe
 mkdir -p "$probe_dir"
 chmod 0700 "$probe_dir"
 dom="$probe_dir/dom.html"

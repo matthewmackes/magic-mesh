@@ -486,4 +486,17 @@ mod tests {
         let local_action = state.prepare_action("seat-1", NOW + 3).unwrap();
         assert_eq!(local_action.topic, navigation_cancel_action_topic("seat-1"));
     }
+
+    #[test]
+    fn progress_before_route_calculation_is_refused_without_losing_idle_state() {
+        let mut state = NavigationConsumer::default();
+        let mut phase = active_phase("req-1");
+        if let NavigationPhase::Active { progress, .. } = &mut phase {
+            progress.observed_at_ms = NOW - 1;
+        }
+
+        assert!(!state.fold("seat-1", snapshot("seat-1", 1, phase), NOW));
+        assert_eq!(state.status(), &NavigationRouteStatus::Idle);
+        assert_eq!(state.route(), None);
+    }
 }

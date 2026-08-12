@@ -1,6 +1,7 @@
-//! [`CollabEngine`] — the ergonomic tie of the whole core: it holds the local
-//! actor + its HLC, the in-memory canonical event set (for validation + merge
-//! dedup), the folded [`DomainState`], the SQLite [`Projection`], and the
+//! [`CollabEngine`] holds the local actor and its HLC alongside the canonical
+//! event set used for validation and merge deduplication.
+//!
+//! It also owns the folded [`DomainState`], `SQLite` [`Projection`], and
 //! tombstone [`PurgeGate`].
 //!
 //! The two entry points mirror the spec's data flow:
@@ -58,9 +59,10 @@ pub struct MergeRejection {
     pub reason: MergeRejectionReason,
 }
 
-/// The outcome of a [`merge`](CollabEngine::merge): how many incoming events
-/// were newly accepted, rejected for validation, or already held. Rejections
-/// are retained as bounded per-event diagnostics so a replication worker can
+/// The outcome of a [`merge`](CollabEngine::merge): accepted, rejected, and
+/// duplicate incoming events.
+///
+/// Rejections retain bounded per-event diagnostics so a replication worker can
 /// report or schedule a resync without guessing from an aggregate count.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MergeOutcome {
@@ -99,13 +101,17 @@ impl CollabEngine {
     }
 
     /// Build an engine backed by an in-memory projection (tests, transient).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the in-memory projection cannot be initialized.
     pub fn in_memory(actor: impl Into<ActorId>) -> Result<Self> {
         Ok(Self::new(actor, Projection::open_in_memory()?))
     }
 
     /// The local actor.
     #[must_use]
-    pub fn actor(&self) -> &ActorId {
+    pub const fn actor(&self) -> &ActorId {
         &self.actor
     }
 
@@ -143,6 +149,10 @@ impl CollabEngine {
 
     /// Validate `cmd`, mint + sign the resulting event(s), ingest them, and
     /// return them. A rejected command returns a typed error and mutates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when command validation, signing, or ingestion fails.
     pub fn apply<S: EventSigner, I: IdSource>(
         &mut self,
         cmd: &CollabCommand,
@@ -172,6 +182,10 @@ impl CollabEngine {
     /// truthful external Bus lane. Mirrors [`apply`](Self::apply)'s clock-advance +
     /// ingest, but skips command validation (the caller vouches for the local
     /// fact); the resulting event replicates + converges like any other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authored event cannot be ingested.
     pub fn author<S: EventSigner, I: IdSource>(
         &mut self,
         space: SpaceId,
@@ -195,6 +209,11 @@ impl CollabEngine {
 
     /// Merge replicated events from a peer: signature-check (drop invalid),
     /// dedup, and ingest the rest. Order-independent + idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized batches or when accepted events cannot be
+    /// ingested.
     pub fn merge(&mut self, incoming: Vec<CollabEventEnvelope>) -> Result<MergeOutcome> {
         if incoming.len() > MAX_MERGE_BATCH_EVENTS {
             return Err(CollabError::Serde(format!(
@@ -368,7 +387,7 @@ mod tests {
 
         let outcome = engine.merge(batch).expect("boundary-sized merge");
 
-        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.accepted, 1);
         assert_eq!(outcome.duplicates, 0);
         assert_eq!(outcome.dropped_invalid, MAX_MERGE_BATCH_EVENTS - 1);
         assert_eq!(engine.all_events(), vec![event]);
@@ -388,7 +407,7 @@ mod tests {
             .merge(vec![unsupported, unsigned])
             .expect("invalid events are reported, not fatal to the batch");
 
-        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.duplicates, 0);
         assert_eq!(outcome.dropped_invalid, 2);
         assert_eq!(

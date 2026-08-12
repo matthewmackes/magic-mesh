@@ -1849,6 +1849,7 @@ fn filtered_recurrence_history<'a>(
             && !condition.is_active()
             && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
                 (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
+                    && resolved_at_ms >= condition.last_observed_ms
             })
     };
     let mut resolved: Vec<HistoryRecurrence<'a>> = Vec::with_capacity(HISTORY_PAGE_SIZE);
@@ -2622,6 +2623,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["node:resolved"],
             "history must contain only inactive lifecycle rows"
+        );
+    }
+
+    #[test]
+    fn history_excludes_resolutions_before_the_last_observation() {
+        let mut contradictory = condition(
+            "node:contradictory-resolution",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        contradictory.last_observed_ms = 3_000;
+        contradictory.resolved_at_ms = Some(2_000);
+
+        assert!(
+            recurrence_history(&[contradictory], "node", 3_000).is_empty(),
+            "a resolution cannot precede the condition's final observation"
         );
     }
 

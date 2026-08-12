@@ -1434,7 +1434,7 @@ impl ClockWorker {
                     .iter()
                     .find(|candidate| candidate.global_event_id == occurrence.global_event_id)
                     .and_then(|candidate| candidate.acknowledgement.as_ref())
-                    .is_some_and(|current| !acknowledgement_wins(acknowledgement, current));
+                    .is_some_and(|current| peer_acknowledgement_is_converged(current, acknowledgement));
                 if converged {
                     continue;
                 }
@@ -1668,6 +1668,13 @@ fn peer_schedule_is_converged(candidate: &ClockScheduleV1, desired: &ClockSchedu
 
 fn peer_stopwatch_is_converged(candidate: &ClockStopwatchV1, desired: &ClockStopwatchV1) -> bool {
     candidate == desired
+}
+
+fn peer_acknowledgement_is_converged(
+    current: &ClockAcknowledgementV1,
+    desired: &ClockAcknowledgementV1,
+) -> bool {
+    current == desired || !acknowledgement_wins(desired, current)
 }
 
 fn weekday_due_now_or_before(
@@ -5835,6 +5842,23 @@ mod tests {
             panic!("peer repair must carry the stopwatch payload");
         };
         assert_eq!(stopwatch, desired);
+    }
+
+    #[test]
+    fn peer_acknowledgement_convergence_accepts_exact_replay() {
+        let acknowledgement = ClockAcknowledgementV1 {
+            acknowledgement_id: "ack-1".into(),
+            global_event_id: "event-1".into(),
+            actor_node_id: "seat-1".into(),
+            actor_clock: 7,
+            acknowledged_at_utc_ms: NOW,
+            stop: true,
+        };
+
+        assert!(peer_acknowledgement_is_converged(
+            &acknowledgement,
+            &acknowledgement
+        ));
     }
 
     #[test]

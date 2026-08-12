@@ -2,7 +2,7 @@
 //!
 //! The core never owns an RNG or a key: the caller hands it an [`EventSigner`]
 //! (the real one wraps an `ed25519-dalek` `SigningKey`; a test one signs with a
-//! deterministic key) and an [`IdSource`] (the real one mints random UUIDv4
+//! deterministic key) and an [`IdSource`] (the real one mints random `UUIDv4`
 //! ids; a test one mints a deterministic sequence). Keeping both injectable is
 //! what makes the pipeline replay identically under test.
 
@@ -54,14 +54,14 @@ impl EventSigner for Ed25519Signer {
     }
 }
 
-/// Mints fresh [`EventId`]s. A real caller uses [`RandomIds`] (UUIDv4); a test
+/// Mints fresh [`EventId`]s. A real caller uses [`RandomIds`] (`UUIDv4`); a test
 /// injects a deterministic sequence so a replay is byte-stable.
 pub trait IdSource {
     /// Mint the next event id.
     fn next_event_id(&mut self) -> EventId;
 }
 
-/// The production id source — a fresh random UUIDv4 per event.
+/// The production id source — a fresh random `UUIDv4` per event.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RandomIds;
 

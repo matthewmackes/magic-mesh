@@ -1,9 +1,9 @@
 //! RSA-4096 keypair + self-signed identity-cert generation (host increment 3b).
 //!
-//! `mde-kdc-proto` deliberately ships NO RSA keygen — ring 0.17.x does not expose
-//! a stable RSA generator. The host owns it here with the pure-Rust `rsa` crate
-//! (one-shot, first-launch only); the hot sign/verify path stays on ring via
-//! `mde_kdc_proto::crypto::PairingKeyPair`.
+//! `mde-kdc-proto` deliberately ships NO RSA keygen — ring 0.17.x does not
+//! expose a stable RSA generator. The host owns it here with the pure-Rust
+//! `rsa` crate (one-shot, first-launch only); the hot sign/verify path stays on
+//! ring via `mde_kdc_proto::crypto::PairingKeyPair`.
 //!
 //! Output of [`generate_pkcs8`] is PKCS#8 DER bytes — the same format
 //! `PairingKeyPair::from_pkcs8` accepts. [`issue_identity_cert`] binds a
@@ -21,9 +21,11 @@ use rand::rngs::OsRng;
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::RsaPrivateKey;
 
-/// RSA modulus size in bits. **E11.8 max-crypto: RSA-4096** — the strongest RSA
-/// the KDE-Connect-compatible protocol interops with. *Lower* would break
-/// stock-client interop, but *higher* does not (the proto verifier accepts
+/// RSA modulus size in bits.
+///
+/// **E11.8 max-crypto: RSA-4096** — the strongest RSA the KDE-Connect-
+/// compatible protocol interops with. *Lower* would break stock-client
+/// interop, but *higher* does not (the proto verifier accepts
 /// `RSA_PKCS1_2048_8192_SHA256`, and peers pin by cert fingerprint, not key
 /// size). The earlier 2048 was chosen to avoid "waste"; the operator's
 /// maximum-crypto directive supersedes that.
@@ -45,18 +47,24 @@ pub enum KeygenError {
 impl std::fmt::Display for KeygenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KeygenError::RsaGenFailed => write!(f, "rsa_gen_failed"),
-            KeygenError::Pkcs8EncodeFailed => write!(f, "pkcs8_encode_failed"),
-            KeygenError::CertIssueFailed(msg) => write!(f, "cert_issue_failed: {msg}"),
+            Self::RsaGenFailed => write!(f, "rsa_gen_failed"),
+            Self::Pkcs8EncodeFailed => write!(f, "pkcs8_encode_failed"),
+            Self::CertIssueFailed(msg) => write!(f, "cert_issue_failed: {msg}"),
         }
     }
 }
 
 impl std::error::Error for KeygenError {}
 
-/// Generate a fresh RSA-4096 keypair and return its PKCS#8 DER encoding. Feed the
-/// bytes into [`PairingKeyPair::from_pkcs8`](mde_kdc_proto::crypto::PairingKeyPair::from_pkcs8)
+/// Generate a fresh RSA-4096 keypair and return its PKCS#8 DER encoding.
+///
+/// Feed the bytes into
+/// [`PairingKeyPair::from_pkcs8`](mde_kdc_proto::crypto::PairingKeyPair::from_pkcs8)
 /// to get a signable handle backed by ring.
+///
+/// # Errors
+///
+/// Returns an error if key generation or PKCS#8 encoding fails.
 pub fn generate_pkcs8() -> Result<Vec<u8>, KeygenError> {
     let mut rng = OsRng;
     let key =
@@ -67,15 +75,22 @@ pub fn generate_pkcs8() -> Result<Vec<u8>, KeygenError> {
     Ok(pkcs8.as_bytes().to_vec())
 }
 
-/// Issue a self-signed X.509 cert from an existing PKCS#8 RSA keypair. CN =
-/// `device_id`; the SHA-256 fingerprint of this cert is the stable identity peers
-/// pin in their pairing store. Self-signed + long-lived (100 years) — KDE
-/// Connect's model is "the cert IS the identity"; trust is established by
-/// fingerprint pinning at first pair, not a CA chain. Returns the cert as DER.
+/// Issue a self-signed X.509 cert from an existing PKCS#8 RSA keypair.
+///
+/// CN = `device_id`; the SHA-256 fingerprint of this cert is the stable
+/// identity peers pin in their pairing store. Self-signed + long-lived (100
+/// years) — KDE Connect's model is "the cert IS the identity"; trust is
+/// established by fingerprint pinning at first pair, not a CA chain. Returns
+/// the cert as DER.
 ///
 /// rcgen 0.13 re-creates the keypair from our PKCS#8 (via a PEM round-trip, the
-/// more version-stable path), so the cert binds to the same RSA-4096 keypair the
-/// handshake signs with.
+/// more version-stable path), so the cert binds to the same RSA-4096 keypair
+/// the handshake signs with.
+///
+/// # Errors
+///
+/// Returns an error if the key cannot be decoded or the certificate cannot be
+/// issued.
 pub fn issue_identity_cert(pkcs8_der: &[u8], device_id: &str) -> Result<Vec<u8>, KeygenError> {
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_RSA_SHA256};
 

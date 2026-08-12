@@ -28,9 +28,18 @@ pub trait ActorLog {
     /// `true` if it was newly appended, `false` if it was already there
     /// (idempotent). Reusing an id with different contents is an error, as are
     /// I/O and serialization failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the append cannot be durably recorded or would
+    /// conflict with an existing event identity.
     fn append(&mut self, envelope: &CollabEventEnvelope) -> Result<bool>;
 
     /// Every envelope in the log, in append order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable log contents cannot be read or decoded.
     fn read_all(&self) -> Result<Vec<CollabEventEnvelope>>;
 
     /// How many distinct events the log holds.
@@ -87,17 +96,18 @@ impl ActorLog for MemoryActorLog {
     }
 }
 
-/// A Syncthing-replicable file actor log: one append-only JSON-lines file per
-/// (space, actor) at `<root>/<space_id>/<actor>.jsonl`. Each line is one signed
-/// [`CollabEventEnvelope`]; the directory tree is exactly what Syncthing mirrors
-/// to peers.
+/// A Syncthing-replicable file actor log: one append-only JSON-lines file.
+///
+/// The `(space, actor)` log lives at `<root>/<space_id>/<actor>.jsonl`. Each
+/// line is one signed [`CollabEventEnvelope`]; the directory tree is exactly
+/// what Syncthing mirrors to peers.
 #[derive(Debug)]
 pub struct FileActorLog {
     path: PathBuf,
     // The pathname is durable authority for exactly one (space, actor) pair.
     // Keep that declaration independently of the serialized envelopes so a
     // misplaced or hostile row cannot silently change log ownership.
-    space: SpaceId,
+    space_id: SpaceId,
     actor: ActorId,
     // Append order as loaded/written, so `read_all` matches disk order.
     order: Vec<EventId>,
@@ -118,6 +128,11 @@ impl FileActorLog {
     /// Open (creating parent dirs) the log for `(space, actor)` under `root`,
     /// loading any already-persisted envelopes so appends stay idempotent and
     /// `read_all` returns the full history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when directories cannot be created or existing log
+    /// contents fail validation.
     pub fn open(root: &Path, space: SpaceId, actor: &ActorId) -> Result<Self> {
         let path = Self::path_for(root, space, actor);
         if let Some(parent) = path.parent() {
@@ -131,11 +146,15 @@ impl FileActorLog {
     /// Open an append-only handle without materializing the existing history.
     ///
     /// This is for an author that already guarantees fresh event IDs (the live
-    /// collaboration worker uses UUIDv4 IDs and never replays command lanes).
+    /// collaboration worker uses `UUIDv4` IDs and never replays command lanes).
     /// Durable replay remains the source of truth and uses [`Self::open`] when
     /// callers need the complete idempotency index or [`ActorLog::read_all`].
     /// Avoiding a full historical load keeps a hot actor log writable while a
     /// separate incremental projector catches up after restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when parent directories cannot be created.
     pub fn open_append_only(root: &Path, space: SpaceId, actor: &ActorId) -> Result<Self> {
         let path = Self::path_for(root, space, actor);
         if let Some(parent) = path.parent() {
@@ -144,10 +163,10 @@ impl FileActorLog {
         Ok(Self::empty(path, space, actor.clone()))
     }
 
-    fn empty(path: PathBuf, space: SpaceId, actor: ActorId) -> Self {
+    const fn empty(path: PathBuf, space: SpaceId, actor: ActorId) -> Self {
         Self {
             path,
-            space,
+            space_id: space,
             actor,
             order: Vec::new(),
             envelopes: BTreeMap::new(),
@@ -189,7 +208,7 @@ impl FileActorLog {
     }
 
     fn validate_log_identity(&self, envelope: &CollabEventEnvelope) -> Result<()> {
-        if envelope.space_id != self.space || envelope.actor != self.actor {
+        if envelope.space_id != self.space_id || envelope.actor != self.actor {
             return Err(CollabError::InvalidEvent(envelope.event_id));
         }
         Ok(())

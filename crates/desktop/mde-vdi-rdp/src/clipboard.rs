@@ -236,7 +236,10 @@ impl ClipboardBridge {
         } else if state.local_html.is_some() {
             vec![html_format()]
         } else if state.local_dib.is_some() {
-            vec![DIBV5_FORMAT, DIB_FORMAT]
+            // The stored payload is specifically CF_DIBV5.  Advertising the
+            // classic CF_DIB ID as an alias would let a peer request a
+            // different wire format and receive bytes validated only for V5.
+            vec![DIBV5_FORMAT]
         } else {
             Vec::new()
         }
@@ -264,7 +267,7 @@ impl ClipboardBridge {
                 Some(html) => OwnedFormatDataResponse::new_data(html.clone()),
                 None => OwnedFormatDataResponse::new_error(),
             }
-        } else if request.format == DIBV5_FORMAT.id() || request.format == DIB_FORMAT.id() {
+        } else if request.format == DIBV5_FORMAT.id() {
             match state.local_dib.as_ref() {
                 Some(dib) => OwnedFormatDataResponse::new_data(dib.clone()),
                 None => OwnedFormatDataResponse::new_error(),
@@ -1110,6 +1113,26 @@ mod tests {
             bridge.take_remote_format_request(),
             Some(DIBV5_FORMAT.id()),
             "prefer the stronger V5 representation independent of offer order"
+        );
+    }
+
+    #[test]
+    fn host_dibv5_offer_cannot_be_requested_as_classic_dib() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        bridge
+            .offer_host_dibv5(one_pixel_dibv5())
+            .expect("valid V5 offer");
+        assert_eq!(bridge.advertised_formats(), vec![DIBV5_FORMAT]);
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: DIB_FORMAT.id(),
+        });
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("refusal response")
+                .is_error(),
+            "a V5 payload must never be served under the classic DIB format"
         );
     }
 

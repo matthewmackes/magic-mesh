@@ -27,10 +27,12 @@ pub fn services_dir(workgroup_root: &Path) -> PathBuf {
     workgroup_root.join("kdc-services")
 }
 
-/// The stable service tokens a node may advertise. Kept as `&'static str`
-/// constants (not an enum) so the published set is an open, forward-compatible
-/// string list — a newer node advertising a token an older reader doesn't know is
-/// gracefully ignored, never a parse failure (§6 forward-compat).
+/// The stable service tokens a node may advertise.
+///
+/// These are `&'static str` constants rather than an enum, keeping the
+/// published set open and forward-compatible. A newer node can advertise a
+/// token an older reader does not know; it is ignored rather than rejected
+/// during parsing (§6 forward-compat).
 pub mod service {
     /// Two-way file transfer + the shared-roots browse (design #11).
     pub const FILES: &str = "files";
@@ -48,9 +50,11 @@ pub mod service {
     pub const SFTP: &str = "sftp";
 }
 
-/// A node's shared root as published in the directory: the browseable root plus a
-/// shallow snapshot of its top-level entries, so a phone/hub browses the first
-/// level straight off the substrate (a deeper browse reaches the owning node).
+/// A node's shared root as published in the directory.
+///
+/// This contains the browseable root and a shallow snapshot of its top-level
+/// entries, so a phone/hub browses the first level straight off the substrate.
+/// A deeper browse reaches the owning node.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedRoot {
     /// The browseable root (label + absolute path).
@@ -145,7 +149,7 @@ fn read_bounded_service_directory_row(path: &Path) -> Option<String> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        options.custom_flags(0o400_000 | 0o4000 | 0o2_000_000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 
@@ -194,10 +198,11 @@ fn read_bounded_service_directory_row(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Read every node's published service set (own row + neighbors) — the whole mesh
-/// directory a phone/hub browses to pick a node. Junk / half-replicated files are
-/// skipped, like every other replicated reader. Sorted by hostname for a
-/// deterministic listing.
+/// Read every node's published service set (own row and neighbors).
+///
+/// This is the whole mesh directory a phone/hub browses to pick a node. Junk or
+/// half-replicated files are skipped, like every other replicated reader. Rows
+/// are sorted by hostname for a deterministic listing.
 #[must_use]
 pub fn collect_all_services(workgroup_root: &Path) -> Vec<NodeServices> {
     let Ok(entries) = std::fs::read_dir(services_dir(workgroup_root)) else {
@@ -220,9 +225,10 @@ pub fn collect_all_services(workgroup_root: &Path) -> Vec<NodeServices> {
     out
 }
 
-/// Select one node from the directory by its hostname **or** its KDC device id —
-/// the "pick the node" step (#7). Returns `None` when no such node is published
-/// (an honest miss — the node hasn't synced its directory row yet).
+/// Select one node from the directory by hostname or KDC device id.
+///
+/// This is the "pick the node" step (#7). Returns `None` when no such node is
+/// published (an honest miss because the node has not synced its directory row).
 #[must_use]
 pub fn select_node<'a>(all: &'a [NodeServices], node: &str) -> Option<&'a NodeServices> {
     all.iter()

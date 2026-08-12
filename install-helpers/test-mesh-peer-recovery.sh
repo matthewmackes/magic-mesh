@@ -105,6 +105,9 @@ case "$1" in
     start)
         if [ "${2:-}" = mcnf-xdg-bind-recovery.service ]; then
             printf '%s\n' xdg-binds >>"$state/mutations"
+            if [ -f "$state/drop-after-xdg" ]; then
+                rm -f "$state/drop-after-xdg" "$state/online"
+            fi
         elif [ "${2:-}" = etcd.service ] || [ "${2:-}" = syncthing.service ]; then
             unit=$2
             printf '%s\n' "$unit" >>"$state/mutations"
@@ -451,10 +454,29 @@ grep -Fq 'status=already-recovered' "$STATE/notifies"
 : >"$STATE/active-mde-shell-egui.service"
 echo 'PASS missing-session fixture: healthy substrate restores only the Workstation shell'
 
+# The XDG repair can finish after the grouped-readiness network attestation.
+# If the physical link disappears during that mutation, recovery must not
+# start a fresh desktop shell against stale peer-return admission.
+rm -f "$STATE/active-mde-shell-egui.service"
+: >"$STATE/online"
+: >"$STATE/drop-after-xdg"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+cat >"$STATE/expected-mutations" <<'EOF'
+xdg-binds
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=offline-after-workstation-xdg' "$STATE/notifies"
+echo 'PASS desktop boundary fixture: link loss after XDG repair prevents shell mutation'
+rm -f "$STATE/drop-after-xdg"
+: >"$STATE/active-mde-shell-egui.service"
+
 # An inactive unit can still leave an orphaned shell process behind after a
 # crash or interrupted stop. Recovery must refuse to start a second session
 # until that stale process is removed.
 rm -f "$STATE/active-mde-shell-egui.service"
+: >"$STATE/online"
 : >"$STATE/stale-mde-shell-egui"
 : >"$STATE/mutations"
 : >"$STATE/notifies"

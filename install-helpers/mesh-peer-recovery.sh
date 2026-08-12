@@ -186,6 +186,13 @@ restore_role_desktop_state() {
         publish "failed-workstation-xdg-binds"
         return 1
     fi
+    # XDG repair runs outside this process and can outlive the attestation that
+    # admitted the desktop phase. Do not start a new shell/session authority
+    # after the physical link has disappeared during that mutation.
+    if ! physical_network_online; then
+        publish "offline-after-workstation-xdg"
+        return 0
+    fi
     restore_workstation_session
 }
 

@@ -5,7 +5,7 @@
 //! It builds **on** the [`mde_collab_types`] Phase-0 contracts (never redefining
 //! them) and is a pure library — no egui, no provider HTTP, no long-running I/O
 //! loop (those are Phase 2 + the mackesd collab worker). Every I/O boundary is a
-//! trait a test can back with memory, and all time, ids, and signing are
+//! trait a test can back with memory, and all time, IDs, and signing are
 //! caller-injected, so the same command/event stream replays deterministically.
 //!
 //! # The pieces
