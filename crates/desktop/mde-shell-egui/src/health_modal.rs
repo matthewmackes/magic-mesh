@@ -34,6 +34,7 @@ const SUPPORT_BUNDLE_MAX_ACTIVE: usize = 32;
 const SUPPORT_BUNDLE_MAX_RESOLVED: usize = 32;
 const SUPPORT_BUNDLE_MAX_FACTS: usize = 8;
 const SUPPORT_BUNDLE_MAX_TEXT_BYTES: usize = 192;
+const MAX_REDACTION_SCAN_BYTES: usize = 16 * 1024;
 const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
 const HISTORY_FILTER_STATE_ID: &str = "health-history-severity-filter";
 const SNAPSHOT_AUTHORITY_STATE_ID: &str = "health-snapshot-authority";
@@ -1217,7 +1218,10 @@ fn support_condition_value(condition: &HealthCondition) -> serde_json::Value {
 }
 
 fn redact_support_text(value: &str) -> String {
-    if credential_shaped(value) || unsafe_path_shaped(value) {
+    if value.len() > MAX_REDACTION_SCAN_BYTES
+        || credential_shaped(value)
+        || unsafe_path_shaped(value)
+    {
         "[redacted]".into()
     } else {
         bound_support_text(value)
@@ -3541,6 +3545,13 @@ mod tests {
         };
         assert!(!message.is_empty());
         assert!(message.len() <= SUPPORT_BUNDLE_MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn redaction_fails_closed_before_scanning_oversized_evidence() {
+        let oversized = "safe-looking ".repeat(MAX_REDACTION_SCAN_BYTES);
+        assert_eq!(redact_support_text(&oversized), "[redacted]");
+        assert_eq!(redact_support_text("safe summary"), "safe summary");
     }
 
     #[test]
