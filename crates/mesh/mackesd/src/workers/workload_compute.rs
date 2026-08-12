@@ -3292,27 +3292,27 @@ impl WorkloadComputeWorker {
                 None => return,
             };
         }
-        if status.phase == WorkloadOperationPhase::Validating
-            && !matches!(
+        if status.phase == WorkloadOperationPhase::Validating {
+            if !matches!(
                 request.action,
                 WorkloadOperationAction::Stop | WorkloadOperationAction::Destroy
-            )
-        {
-            // The request is already journaled while it is being validated.
-            // Do not count that same request as an existing reservation or an
-            // exact-fit admission is rejected before it can reach the
-            // backend. Other non-terminal operations remain accounted for.
-            let (host, storage) = self.capacities(
-                ledger
-                    .statuses()
-                    .filter(|candidate| candidate.request_id != request.request_id),
-            );
-            let admission =
-                admit_workload_for_backend(request.resources, request.backend, host, storage);
-            if !admission.admitted {
-                let (reason, remediation) = admission_message(admission);
-                self.fail(ledger, &request, status, reason, remediation, false, now_ms);
-                return;
+            ) {
+                // The request is already journaled while it is being validated.
+                // Do not count that same request as an existing reservation or an
+                // exact-fit admission is rejected before it can reach the
+                // backend. Other non-terminal operations remain accounted for.
+                let (host, storage) = self.capacities(
+                    ledger
+                        .statuses()
+                        .filter(|candidate| candidate.request_id != request.request_id),
+                );
+                let admission =
+                    admit_workload_for_backend(request.resources, request.backend, host, storage);
+                if !admission.admitted {
+                    let (reason, remediation) = admission_message(admission);
+                    self.fail(ledger, &request, status, reason, remediation, false, now_ms);
+                    return;
+                }
             }
             status =
                 match self.advance_phase(ledger, status, WorkloadOperationPhase::Admitting, now_ms)
@@ -7903,6 +7903,38 @@ mod tests {
             }));
 
         worker.reconcile_inflight(&mut ledger, now_ms());
+
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert_eq!(
+            ledger.status("op-1").expect("status").phase,
+            WorkloadOperationPhase::WaitingForGuest
+        );
+    }
+
+    #[test]
+    fn destroy_crosses_validation_without_capacity_admission() {
+        let temp = tempfile::tempdir().expect("temp");
+        let calls = Arc::new(Mutex::new(0));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(HostCapacity {
+                logical_cpus: 1,
+                memory_mb: 1,
+                allocated_vcpu: 1,
+                allocated_memory_mb: 1,
+                storage_gb: 1,
+                allocated_storage_gb: 1,
+            })
+            .with_actuator(Box::new(FakeActuator {
+                calls: calls.clone(),
+            }));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        let mut request = request();
+        request.action = WorkloadOperationAction::Destroy;
+        let raw = serde_json::to_string(&request).expect("wire");
+
+        worker.handle_request(&mut ledger, &raw, request, now_ms());
 
         assert_eq!(*calls.lock().expect("calls"), 1);
         assert_eq!(
