@@ -247,7 +247,20 @@ write_files:
       port_up() { netstat -tln 2>/dev/null | grep -q ":\$1 "; }
       SPICE=none
       if command -v Xspice >/dev/null 2>&1; then
-        Xspice --port ${SPICE_PORT} --disable-ticketing :1 >/var/log/xspice.log 2>&1 &
+        # Launch Xspice's own vdagent/vdagentd pair.  The live SPICE worker
+        # requests the guest monitor size during connect; without the agent
+        # the endpoint accepts TCP but cannot satisfy that real protocol
+        # operation and is not a valid SPICE acceptance guest.
+        # Alpine's Xspice wrapper references temp_dir before assigning it
+        # whenever --vdagent is enabled; initialize that wrapper local.
+        sed -i '/^if args.vdagent_enabled:/i temp_dir = None' /usr/bin/Xspice 2>/dev/null || true
+        mkdir -p /run/testvm-spice
+        rm -f /run/testvm-spice/vdagent.{udcs,virtio,uinput}
+        Xspice --port ${SPICE_PORT} --disable-ticketing --vdagent \
+          --vdagent-udcs-path /run/testvm-spice/vdagent.udcs \
+          --vdagent-virtio-path /run/testvm-spice/vdagent.virtio \
+          --vdagent-uinput-path /run/testvm-spice/vdagent.uinput \
+          :1 >/var/log/xspice.log 2>&1 &
         for i in \$(seq 1 15); do port_up ${SPICE_PORT} && SPICE=Xspice && break; sleep 1; done
       fi
       if [ "\$SPICE" = none ]; then
@@ -271,7 +284,8 @@ runcmd:
   - ping -c 3 ${HOST} || true
   - grep -q '/community\$' /etc/apk/repositories || sed -n 's|/main\$|/community|p' /etc/apk/repositories >> /etc/apk/repositories
   - apk update
-  - apk add --no-progress xvfb x11vnc xterm xsetroot font-misc-misc xe-guest-utilities xspice xorg-server xf86-video-qxl || true
+  - apk add --no-progress xvfb x11vnc xterm xsetroot font-misc-misc xe-guest-utilities xspice spice-vdagent xorg-server xf86-video-qxl || true
+  - sed -i '/^if args.vdagent_enabled:/i temp_dir = None' /usr/bin/Xspice 2>/dev/null || true
   - apk add --no-progress qemu-system-x86_64 qemu-ui-spice-core qemu-hw-display-qxl || true
   - rc-update add local default || true
   - rc-service xe-guest-utilities start 2>/dev/null || rc-update add xe-guest-utilities default || true
@@ -325,18 +339,27 @@ d0 "$HOST" "xe vm-start uuid=$VM"
 # ---------------------------------------- 6. discover IP + verify ports -----
 log "waiting for a DHCP lease (fixed MAC $VM_MAC)…"
 IP=""
+port_open() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 for _ in $(seq 1 60); do   # ~5 min
-  IP=$(d0 "$HOST" "xe vm-param-get uuid=$VM param-name=networks 2>/dev/null" \
-       | grep -o '0/ip: [0-9.]*' | awk '{print $2}' || true)
-  [ -n "$IP" ] && break
-  IP=$(d0 "$HOST" "ip neigh | grep -i $VM_MAC | awk '{print \$1}' | head -1" || true)
-  [ -n "$IP" ] && break
+  CANDIDATES=$( {
+    d0 "$HOST" "xe vm-param-get uuid=$VM param-name=networks 2>/dev/null" \
+      | grep -o '0/ip: [0-9.]*' | awk '{print $2}' || true
+    d0 "$HOST" "ip neigh | grep -i $VM_MAC | awk '{print \$1}'" || true
+  } | awk 'NF && !seen[$0]++')
+  while read -r candidate; do
+    [ -n "$candidate" ] || continue
+    # A stale neighbor entry can survive teardown and reuse the fixed MAC.
+    # Require the guest's SSH service before accepting the candidate, so the
+    # result names the live guest rather than an old lease.
+    if port_open "$candidate" 22; then
+      IP="$candidate"
+      break 2
+    fi
+  done <<< "$CANDIDATES"
   sleep 5
 done
 [ -n "$IP" ] || die "no IP discovered for $VM_NAME after 5 min — check 'xe console' on $HOST / the EdgeOS DHCP pool"
 log "$VM_NAME is at $IP"
-
-port_open() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 if [ "$MODE" = rdp ]; then
   log "waiting for the RDP endpoint (apk installs run over the LAN — allow ~5-10 min)…"
