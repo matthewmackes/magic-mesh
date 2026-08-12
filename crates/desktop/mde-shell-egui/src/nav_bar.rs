@@ -1756,13 +1756,24 @@ fn docked_geometry_for_catalog_with_sessions(
     // remote viewport cannot strand the profile in Left mode after restart.
     let pin_rect = docked_pin_rect(screen, outer);
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
-    for (kind, surface) in [
-        (ControlKind::Start, None),
-        (ControlKind::Search, None),
-        (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
-        (ControlKind::Back, None),
-        (ControlKind::Home, None),
-    ] {
+    let fixed_controls = if screen.height() <= 400.0 {
+        [
+            (ControlKind::Start, None),
+            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
+            (ControlKind::Back, None),
+            (ControlKind::Search, None),
+            (ControlKind::Home, None),
+        ]
+    } else {
+        [
+            (ControlKind::Start, None),
+            (ControlKind::Search, None),
+            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
+            (ControlKind::Back, None),
+            (ControlKind::Home, None),
+        ]
+    };
+    for (kind, surface) in fixed_controls {
         // A short portrait/remote viewport may not have room for the complete
         // fixed cluster. Admit controls one at a time so the Left rail never
         // paints a hit target outside its owned display rect; the remaining

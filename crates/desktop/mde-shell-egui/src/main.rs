@@ -2444,6 +2444,8 @@ impl Shell {
             self.thisnode.show_actions_with_system(ui, &mut self.system);
             return;
         }
+        ui.label(egui::RichText::new("Workspace").strong());
+        ui.add_space(Style::SP_XS);
         mde_egui::card().show(ui, |ui| {
             ui.label(
                 egui::RichText::new(section.label())
