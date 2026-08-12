@@ -39,3 +39,16 @@ Result: `verify-music-live-seat: PASS`. The explicit play probe reached its
 process; service, Bus, and RPM checks passed again. This proves bounded daemon
 playback initiation and cleanup, but does not claim audible/rendered playback
 without a direct audio capture.
+
+## VDI discovery limitation
+
+The bounded inventory command:
+
+```text
+python3 install-helpers/verify-vdi-live-proof.py discover --seat seat15=172.20.0.15 --seat dell=172.20.146.225 --seat eagle=172.20.146.88
+```
+
+reported seat 15 and Dell reachable but with empty endpoint lists, and Eagle
+unavailable. Therefore no framebuffer/input/reconnect proof is claimed. The
+remaining CRIT-006 live criterion is an approved VDI endpoint (or an operator
+supplied live session receipt) for the selected seat.
