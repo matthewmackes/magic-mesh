@@ -11,8 +11,8 @@
   one ringing occurrence, and one pending audio outbox row are already durable,
   then restores Bus storage and verifies exactly one publication/effect.
 - Intended farm command: `cargo test -p mackesd --features async-services workers::clock::tests::deadline_publish_failure_reloads_durable_occurrence_before_replay -- --exact --nocapture`.
-- Result: **NOT RUN**. `.90` had adequate storage but both slots were occupied;
-  all other free slots were below the governed 8 GiB reserve. No reserve bypass
-  was attempted. Formatting and targeted `git diff --check` passed.
-- Remaining proof: run the exact gate once a safe warmed slot opens, then retain
-  the epic's multi-peer/live restart acceptance.
+- Result: **PASS**. Farm `.130`, slot `func022-deadline-r3`, ran the exact
+  regression after a clean full test-profile compilation: 1 passed, 0 failed;
+  all other test binaries were filtered. Warnings were emitted, but no build or
+  test error occurred.
+- Remaining proof: retain the epic's multi-peer/live restart acceptance.
