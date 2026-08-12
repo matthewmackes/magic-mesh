@@ -40,6 +40,7 @@ use crate::metrics::{write_textfile, Counter, Histogram};
 /// scrape interval — writing faster than the collector reads wastes
 /// I/O, slower leaves the scrape reading a stale snapshot.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
+const MIN_TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Worker handle. The SQLite handle is opened lazily inside
 /// `tick_once` so a transient store-open failure doesn't pin the
@@ -189,6 +190,7 @@ impl Worker for MetricsExporterWorker {
 /// that turns a delayed SQLite/filesystem pass into immediate repeated work
 /// and can amplify CPU and I/O pressure during recovery.
 fn export_interval(tick: Duration) -> tokio::time::Interval {
+    let tick = tick.max(MIN_TICK_INTERVAL);
     // Do not perform an immediate startup export: a daemon restart after a
     // slow scrape should wait for the next normal cadence, not join a burst
     // with the collector's just-written snapshot.
@@ -610,10 +612,22 @@ mod tests {
         // A slow export must not cause the four missed periods to fire as a
         // burst; the next pass is scheduled one full cadence later.
         tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(tokio::time::timeout(Duration::from_millis(1), interval.tick())
+        assert!(tokio::time::timeout(Duration::from_nanos(1), interval.tick())
             .await
             .is_err());
         tokio::time::advance(Duration::from_millis(500)).await;
+        interval.tick().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exporter_interval_clamps_zero_cadence() {
+        let mut interval = export_interval(Duration::ZERO);
+        interval.tick().await;
+        tokio::time::advance(Duration::from_micros(999)).await;
+        assert!(tokio::time::timeout(Duration::from_nanos(1), interval.tick())
+            .await
+            .is_err());
+        tokio::time::advance(Duration::from_micros(1)).await;
         interval.tick().await;
     }
 
