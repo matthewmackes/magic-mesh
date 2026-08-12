@@ -93,7 +93,9 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
-- Current state: typed authority exists; KMS/EGL and live proof remain.
+- Current state: typed authority exists; the shell functional gate is green
+  (farm build plus 1,612 tests passed, 0 failed, 2 ignored); KMS/EGL live proof
+  and repository-wide strict clippy remain.
 - **Native DRM/PRIME + shell wiring (2026-08-11):** native gates passed 3/3;
   DRM shell build and VDI module passed 33/33. Live KMS/Display1 remains:
   `evidence/WL-ARCH-010-2026-08-11-native-drm-prime-boundary-r474.md`,
