@@ -73,9 +73,10 @@ impl std::fmt::Display for BrowseError {
 
 impl std::error::Error for BrowseError {}
 
-/// Shallow-list one directory into sorted [`FileEntry`] rows (dirs first, then
-/// files, each alphabetical). Pure over the filesystem — no recursion, no
-/// following into subdirectories. Used both for the live browse and for the
+/// Shallow-list one directory into sorted [`FileEntry`] rows.
+///
+/// Directories come first, followed by files, each alphabetical. This operation
+/// does not recurse into subdirectories and serves live browsing plus the
 /// service-directory snapshot of a shared root's top level.
 ///
 /// # Errors

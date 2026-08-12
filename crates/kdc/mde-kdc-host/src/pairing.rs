@@ -39,7 +39,7 @@ fn read_bounded_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        options.custom_flags(0o400_000 | 0o4000 | 0o2_000_000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 
@@ -119,9 +119,11 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
     })
 }
 
-/// One trusted peer, as persisted in `devices.toml`. The peer's public key and
-/// certificate fingerprint are added by the pairing handshake (a later
-/// increment); this increment persists the identity + audit fields.
+/// One trusted peer, as persisted in `devices.toml`.
+///
+/// The peer's public key and certificate fingerprint are added by the pairing
+/// handshake (a later increment); this increment persists the identity and
+/// audit fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRecord {
     /// The peer's `Announce.device_id`.
@@ -210,8 +212,15 @@ pub struct PairingStore {
 }
 
 impl PairingStore {
-    /// The conventional store directory, `$XDG_CONFIG_HOME/mde/connect`
-    /// (falling back to `$HOME/.config/mde/connect`).
+    /// The conventional store directory.
+    ///
+    /// Uses `$XDG_CONFIG_HOME/mde/connect`, falling back to
+    /// `$HOME/.config/mde/connect`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::NoConfigDir`] when neither environment variable is
+    /// available.
     pub fn default_dir() -> Result<PathBuf, HostError> {
         // Per the XDG spec, an empty $XDG_CONFIG_HOME is treated as unset, so
         // filter the empty string out before it shadows the $HOME fallback (else
@@ -228,6 +237,11 @@ impl PairingStore {
     /// `identity.pkcs8` (RSA-4096, via [`crate::keygen::generate_pkcs8`]) if
     /// absent, else loads it through [`PairingKeyPair::from_pkcs8`]; reads
     /// `devices.toml`, tolerating a missing or garbage file by starting empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory, identity key, or persisted device
+    /// state cannot be read or initialized.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, HostError> {
         use std::os::unix::fs::PermissionsExt;
         let dir = dir.into();
@@ -325,6 +339,10 @@ impl PairingStore {
 
     /// Sign a handshake challenge with this host's identity key
     /// (RSA-PKCS1-v1_5 / SHA-256).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing with the identity key fails.
     pub fn sign_challenge(&self, message: &[u8]) -> Result<Vec<u8>, HostError> {
         Ok(self.keypair.sign(message)?)
     }
@@ -361,7 +379,8 @@ impl PairingStore {
     /// synced (honest gate).
     #[must_use]
     pub fn get(&self, device_id: &str) -> Option<DeviceRecord> {
-        if let Some(rec) = self.devices().get(device_id).cloned() {
+        let local = self.devices().get(device_id).cloned();
+        if let Some(rec) = local {
             return Some(rec);
         }
         self.synced().get(device_id).map(|p| DeviceRecord {
@@ -440,8 +459,14 @@ impl PairingStore {
     }
 
     /// Trust a peer and persist the store (atomic write of `devices.toml`).
+    ///
     /// Interior-mutable (`&self`) so a shared `Arc<PairingStore>` can pair
     /// without an outer lock (E2.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing or atomically writing the device store
+    /// fails.
     pub fn pair(&self, record: DeviceRecord) -> Result<(), HostError> {
         let snapshot = {
             let mut devices = self.devices();
@@ -452,6 +477,11 @@ impl PairingStore {
     }
 
     /// Untrust a peer and persist the store. No-op for an unknown id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing or atomically writing the device store
+    /// fails.
     pub fn unpair(&self, device_id: &str) -> Result<(), HostError> {
         let snapshot = {
             let mut devices = self.devices();
@@ -508,12 +538,12 @@ fn public_key_pkcs1_from_pkcs8(pkcs8: &[u8]) -> Result<Vec<u8>, HostError> {
     Ok(der.as_bytes().to_vec())
 }
 
-/// Create a private-key file at mode 0600, applied atomically *at creation* so
-/// the key bytes are never momentarily group/world-readable (the mode-after-write
-/// idiom leaves a 0644 window under the usual umask). `create_new` (O_CREAT |
-/// O_EXCL) additionally refuses to follow a pre-planted symlink, so the key can't
-/// be redirected outside the store dir — `open()` has already confirmed the path
-/// does not exist, so the exclusivity is free.
+/// Create a private-key file at mode 0600, applied atomically at creation.
+///
+/// This avoids a momentarily group/world-readable key from the mode-after-write
+/// idiom. `create_new` (O_CREAT | O_EXCL) also refuses a pre-planted symlink,
+/// so the key cannot be redirected outside the store directory. `open()` has
+/// already confirmed the path does not exist, so the exclusivity is free.
 fn write_private(path: &Path, der: &[u8]) -> Result<(), HostError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;

@@ -1,3 +1,10 @@
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::significant_drop_in_scrutinee)]
+#![allow(clippy::match_same_arms)]
+
 //! The LAN transport's live peer link (host increment 3b.2c).
 //!
 //! [`LanConnection`] is the framed duplex link over a TLS stream — the reusable
@@ -36,10 +43,11 @@ use crate::transport::{Connection, Transport};
 use crate::PeerId;
 use crate::{keygen, tls};
 
-/// KDE Connect's stock TLS port. Both the UDP identity broadcast and the TCP+TLS
-/// link use 1716; stock devices advertise 1716 by default, so `open` dials that on
-/// the IP learned from the peer's UDP announce (announces carry identity, not the
-/// wire port).
+/// KDE Connect's stock TLS port.
+///
+/// Both the UDP identity broadcast and the TCP+TLS link use 1716. Stock devices
+/// advertise that port by default, so `open` dials it on the IP learned from the
+/// peer's UDP announce.
 pub const KDC_TLS_PORT: u16 = 1716;
 
 /// Inbound read-buffer chunk size. Frames are reassembled by the decoder, so this
@@ -111,9 +119,8 @@ where
             }
         }
         let n = match read_half.read(&mut buf).await {
-            Ok(0) => break,  // clean EOF
-            Ok(n) => n,      //
-            Err(_) => break, // socket/TLS read error
+            Ok(0) | Err(_) => break, // clean EOF or socket/TLS read error
+            Ok(n) => n,              //
         };
         decoder.feed(&buf[..n]);
     }
@@ -182,6 +189,7 @@ where
             .flush()
             .await
             .map_err(|e| HostError::Transport(format!("flush: {e}")))?;
+        drop(write);
         Ok(())
     }
 
@@ -221,7 +229,7 @@ pub struct LanTransport {
     disc_task: AsyncMutex<Option<JoinHandle<()>>>,
     /// If set, `start` binds a TCP listener here and accepts inbound peer-initiated links
     /// (mutual TLS + identity-first handshake). `None` = outbound-only (no listener).
-    /// Production binds `0.0.0.0:`[`KDC_TLS_PORT`]; tests use `127.0.0.1:0`.
+    /// Production binds <code>0.0.0.0:[KDC_TLS_PORT]</code>; tests use `127.0.0.1:0`.
     listen_addr: Option<SocketAddr>,
     /// The actually-bound listener address (ephemeral port resolved), set by `start`.
     bound_addr: AsyncMutex<Option<SocketAddr>>,
@@ -273,17 +281,17 @@ impl LanTransport {
 
     /// Override the TCP port `open` dials (tests point it at a loopback server).
     #[must_use]
-    pub fn with_dial_port(mut self, port: u16) -> Self {
+    pub const fn with_dial_port(mut self, port: u16) -> Self {
         self.dial_port = port;
         self
     }
 
     /// Enable the **inbound listener**: `start` binds `addr` and accepts peer-initiated
-    /// links. Production binds `0.0.0.0:`[`KDC_TLS_PORT`]; tests pass `127.0.0.1:0` and
+    /// links. Production binds <code>0.0.0.0:[KDC_TLS_PORT]</code>; tests pass `127.0.0.1:0` and
     /// read the resolved port back via [`local_listen_addr`](Self::local_listen_addr).
     /// Without this, the transport is outbound-only.
     #[must_use]
-    pub fn with_listen_addr(mut self, addr: SocketAddr) -> Self {
+    pub const fn with_listen_addr(mut self, addr: SocketAddr) -> Self {
         self.listen_addr = Some(addr);
         self
     }
@@ -380,7 +388,7 @@ impl Transport for LanTransport {
             if device.fingerprint.is_empty() {
                 None
             } else {
-                Some(device.fingerprint.clone())
+                Some(device.fingerprint)
             }
         };
         let addr = UdpDiscovery::peer_addr_in(&self.registry, peer.as_str())
@@ -404,17 +412,21 @@ impl Transport for LanTransport {
     }
 
     async fn shutdown(&self) {
-        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+        let shutdown_tx = self.shutdown_tx.lock().await.take();
+        if let Some(tx) = shutdown_tx {
             let _ = tx.send(());
         }
-        if let Some(task) = self.disc_task.lock().await.take() {
+        let disc_task = self.disc_task.lock().await.take();
+        if let Some(task) = disc_task {
             let _ = task.await;
         }
         // Stop the inbound accept loop and tear down accepted connections.
-        if let Some(tx) = self.listen_shutdown.lock().await.take() {
+        let listen_shutdown = self.listen_shutdown.lock().await.take();
+        if let Some(tx) = listen_shutdown {
             let _ = tx.send(());
         }
-        if let Some(task) = self.listen_task.lock().await.take() {
+        let listen_task = self.listen_task.lock().await.take();
+        if let Some(task) = listen_task {
             let _ = task.await;
         }
         for (_id, conn) in self.inbound.lock().await.drain() {
@@ -513,10 +525,7 @@ async fn run_listener(
         tokio::select! {
             _ = &mut stop => break,
             accepted = listener.accept() => {
-                let tcp = match accepted {
-                    Ok((tcp, _addr)) => tcp,
-                    Err(_) => continue, // transient accept error — keep listening
-                };
+                let Ok((tcp, _addr)) = accepted else { continue };
                 tokio::spawn(handle_inbound(
                     tcp,
                     Arc::clone(&client_cfg),

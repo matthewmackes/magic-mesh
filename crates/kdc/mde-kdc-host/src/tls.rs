@@ -1,3 +1,7 @@
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+
 //! TLS layer with fingerprint pinning (host increment 3b).
 //!
 //! KDE Connect's identity model bypasses the conventional CA chain: peers
@@ -55,19 +59,20 @@ fn identity_sig_schemes() -> Vec<SignatureScheme> {
     ]
 }
 
-/// Compute the KDE-Connect-style cert fingerprint: SHA-256 of the DER bytes,
-/// upper-case hex with `:` between every byte. Pure + deterministic. Used both at
-/// pair-time (to record the fingerprint) and at handshake-time (to compare against
-/// the pinned value).
+/// Compute the KDE-Connect-style certificate fingerprint.
+///
+/// The result is the SHA-256 digest of the DER bytes as upper-case hexadecimal,
+/// with `:` between bytes. It is used during pairing and handshake verification.
 #[must_use]
 pub fn compute_fingerprint(cert_der: &[u8]) -> String {
+    use std::fmt::Write;
     let digest = Sha256::digest(cert_der);
     let mut out = String::with_capacity(95); // 32 bytes × 3 chars - 1 separator
     for (i, b) in digest.iter().enumerate() {
         if i > 0 {
             out.push(':');
         }
-        out.push_str(&format!("{b:02X}"));
+        write!(&mut out, "{b:02X}").expect("writing to a String cannot fail");
     }
     out
 }
@@ -179,7 +184,9 @@ impl ServerCertVerifier for FirstPairVerifier {
     }
 }
 
-/// A rustls `ClientCertVerifier` for the **inbound** (listener) side. KDE Connect's
+/// A rustls `ClientCertVerifier` for the **inbound** (listener) side.
+///
+/// KDE Connect's
 /// modern protocol is mutual-TLS: a peer connecting to us presents its identity cert.
 /// This verifier *requires* a client cert (so it lands in `peer_certificates()`) but
 /// accepts ANY cert at the TLS layer — the binding to a paired device's pinned
@@ -236,7 +243,9 @@ impl ClientCertVerifier for AcceptAnyClientCert {
     }
 }
 
-/// Build a rustls `ClientConfig` for the pinning model. The ring crypto provider
+/// Build a rustls `ClientConfig` for the pinning model.
+///
+/// The ring crypto provider
 /// is wired explicitly so the audit closure agrees with `mde-kdc-proto`'s ring
 /// usage. `None` → [`FirstPairVerifier`]; `Some` → [`PinnedFingerprintVerifier`].
 #[must_use]
@@ -256,7 +265,9 @@ pub fn build_client_config(pinned_fingerprint: Option<String>) -> rustls::Client
         .with_no_client_auth()
 }
 
-/// Build a rustls `ServerConfig` presenting our own identity cert + key, for the
+/// Build a rustls `ServerConfig` presenting our own identity cert + key.
+///
+/// This is for the
 /// inbound side of the LAN transport (a peer connecting to us). KDE Connect's TLS
 /// is mutual self-signed, but client-cert verification is done out-of-band by
 /// fingerprint at the pairing layer, so the server side uses `no_client_auth` here
@@ -279,7 +290,9 @@ pub fn build_server_config(cert_der: &[u8], pkcs8_der: &[u8]) -> Option<rustls::
         .ok()
 }
 
-/// Build a rustls `ServerConfig` for the **inbound listener** that, unlike
+/// Build a rustls `ServerConfig` for the **inbound listener**.
+///
+/// Unlike
 /// [`build_server_config`], *requests and requires* a client cert ([`AcceptAnyClientCert`])
 /// so the peer's presented identity cert is available in `peer_certificates()` after the
 /// handshake. The listener then binds that cert's fingerprint to the paired device's
@@ -319,17 +332,19 @@ pub enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::Tcp(e) => write!(f, "tcp: {e}"),
-            ConnectError::Tls(e) => write!(f, "tls: {e}"),
-            ConnectError::BadPeerName(s) => write!(f, "bad_peer_name: {s}"),
-            ConnectError::BadIdentity(s) => write!(f, "bad_identity: {s}"),
+            Self::Tcp(e) => write!(f, "tcp: {e}"),
+            Self::Tls(e) => write!(f, "tls: {e}"),
+            Self::BadPeerName(s) => write!(f, "bad_peer_name: {s}"),
+            Self::BadIdentity(s) => write!(f, "bad_identity: {s}"),
         }
     }
 }
 
 impl std::error::Error for ConnectError {}
 
-/// Open a TLS-wrapped TCP connection to `addr`, presenting `server_name` in the
+/// Open a TLS-wrapped TCP connection to `addr`.
+///
+/// This presents `server_name` in the
 /// ClientHello, with the cert pinned to `pinned_fingerprint` (`None` = first-pair /
 /// accept any). Returns a `tokio_rustls::client::TlsStream<TcpStream>` the router
 /// wraps with the codec framer + payload-channel handshake.
@@ -357,7 +372,9 @@ pub async fn connect_pinned_tls(
         .map_err(ConnectError::Tls)
 }
 
-/// Like [`build_client_config`] but the client **presents its own identity cert + key**
+/// Like [`build_client_config`], but the client **presents its own identity cert + key**.
+///
+/// This is
 /// (mutual TLS), required to connect to a listener that requests a client cert (our
 /// [`build_server_config_with_client_auth`], and modern KDE Connect devices).
 /// `pinned_fingerprint`: `None` = first-pair / accept any server cert, `Some` = pin the
@@ -387,7 +404,9 @@ pub fn build_client_config_with_identity(
         .ok()
 }
 
-/// Open a **mutual-TLS** connection to `addr` presenting our identity cert (so a peer
+/// Open a **mutual-TLS** connection to `addr`.
+///
+/// This presents our identity cert so a peer
 /// whose listener requests a client cert accepts us), pinning the server's cert to
 /// `pinned_fingerprint` (`None` = first-pair). Mirrors [`connect_pinned_tls`] but with
 /// client auth — used to drive the inbound listener and available for the mutual

@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 //! The `Transport` abstraction and an in-process loopback implementation.
 //!
 //! A [`Transport`] is the per-platform plug-in point of the host layer — the LAN
@@ -57,11 +59,12 @@ pub trait Connection: Send + Sync {
     async fn close(&self);
 }
 
-/// An in-process loopback transport for tests and headless development: `open`
-/// hands back a connection whose `send` echoes the packet straight back onto the
-/// event stream as a `HostEvent::Packet`, round-tripping through the real frame
-/// codec ([`codec::encode_frame`] + [`codec::FrameDecoder`]). It needs no
-/// sockets, so the whole host/router stack can be exercised on `#[tokio::test]`.
+/// An in-process loopback transport for tests and headless development.
+///
+/// `open` hands back a connection whose `send` echoes the packet onto the event
+/// stream as a `HostEvent::Packet`, round-tripping through the real frame codec
+/// ([`codec::encode_frame`] + [`codec::FrameDecoder`]). It needs no sockets, so
+/// the host/router stack can be exercised on `#[tokio::test]`.
 pub struct LoopbackTransport {
     announce: Announce,
     sink: Mutex<Option<EventSink>>,
@@ -70,7 +73,7 @@ pub struct LoopbackTransport {
 impl LoopbackTransport {
     /// A loopback transport advertising `announce`.
     #[must_use]
-    pub fn new(announce: Announce) -> Self {
+    pub const fn new(announce: Announce) -> Self {
         Self {
             announce,
             sink: Mutex::new(None),
