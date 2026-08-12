@@ -300,10 +300,11 @@ impl EventSink for MemorySink {
     }
 }
 
-/// The production sink: the Syncthing-replicable [`FileActorLog`] tree at
-/// `<root>/<space>/<actor>.jsonl` — exactly the actor-log root the collab worker
-/// reads on boot (`backfill_logs`), so an imported log converges + projects like
-/// any replicated peer log.
+/// The production sink: the Syncthing-replicable [`FileActorLog`] tree.
+///
+/// It lives at `<root>/<space>/<actor>.jsonl`, exactly the actor-log root the
+/// collab worker reads on boot (`backfill_logs`), so an imported log converges
+/// and projects like any replicated peer log.
 ///
 /// Opens (and caches) one log per `(space, actor)` on
 /// demand; the log's own idempotent append makes a re-import a no-op.
@@ -700,7 +701,7 @@ const fn clamp_ms(ms: i64) -> u64 {
     if ms < 0 {
         0
     } else {
-        ms as u64
+        ms.unsigned_abs()
     }
 }
 
@@ -1060,9 +1061,8 @@ fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<Option<
         }
     }
 
-    let capacity = usize::try_from(opened.len()).map_err(|_| {
-        CollabError::Serde(format!("{label} is too large for this platform"))
-    })?;
+    let capacity = usize::try_from(opened.len())
+        .map_err(|_| CollabError::Serde(format!("{label} is too large for this platform")))?;
     let mut bytes = Vec::with_capacity(capacity);
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {

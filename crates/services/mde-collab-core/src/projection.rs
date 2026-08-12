@@ -1,4 +1,4 @@
-//! The transactional, idempotent, convergent **SQLite projection**.
+//! The transactional, idempotent, convergent **`SQLite` projection**.
 //!
 //! [`Projection::project`] folds a batch of signed events into the materialized
 //! read tables that back the [`CollabReadModel`] shapes. It is:
@@ -106,19 +106,27 @@ const SPACE_TABLES: &[&str] = &[
     "calls",
 ];
 
-/// The transactional read-side projection over a SQLite connection.
+/// The transactional read-side projection over a `SQLite` connection.
 pub struct Projection {
     conn: Connection,
 }
 
 impl Projection {
     /// Open an in-memory projection (tests, transient).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection schema cannot be initialized.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::init(conn)
     }
 
     /// Open (creating) an on-disk projection at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory, database, or schema cannot be initialized.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -142,6 +150,10 @@ impl Projection {
     /// Fold a batch of signed events into the projection. Idempotent + rebuilds
     /// every touched space (and the global presence board) from the canonical
     /// event order, all in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid envelopes or when the projection transaction fails.
     pub fn project(&mut self, events: &[CollabEventEnvelope]) -> Result<()> {
         // `Projection` is a public read-side boundary, so do not rely solely on
         // `CollabEngine::merge` to have checked its inputs.  Without this gate a
@@ -198,6 +210,10 @@ impl Projection {
     // ---- Read-side reconstruction --------------------------------------
 
     /// The rail directory of spaces `viewer` is a present member of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn space_directory(&self, viewer: &ActorId) -> Result<SpaceDirectory> {
         let mut stmt = self.conn.prepare(
             "SELECT s.space_id, s.kind, s.name, s.last_clock_wall, s.last_clock_counter, m.role, \
@@ -236,6 +252,10 @@ impl Projection {
     }
 
     /// A conversation timeline (main timeline when `thread` is `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn conversation_timeline(
         &self,
         space: SpaceId,
@@ -250,6 +270,10 @@ impl Projection {
     }
 
     /// The currently pinned messages for one space.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows are invalid or exceed the read-model limit.
     pub fn message_pins(&self, space: SpaceId) -> Result<MessagePins> {
         let limit = MAX_MESSAGE_PINS + 1;
         let mut stmt = self.conn.prepare(&format!(
@@ -273,6 +297,10 @@ impl Projection {
     }
 
     /// The private saved-message projection for `actor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows are invalid or exceed the read-model limit.
     pub fn saved_messages(&self, actor: &ActorId) -> Result<SavedMessages> {
         let limit = MAX_SAVED_MESSAGES + 1;
         let mut stmt = self.conn.prepare(&format!(
@@ -308,6 +336,10 @@ impl Projection {
     }
 
     /// A thread's root message + ordered replies + resolved flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the thread or its messages are absent, invalid, or unreadable.
     pub fn thread_timeline(&self, space: SpaceId, thread: ThreadId) -> Result<ThreadTimeline> {
         let (root_event_id, resolved): (String, i64) = self
             .conn
@@ -334,6 +366,10 @@ impl Projection {
     }
 
     /// A space's basic channel tasks/action items.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows are invalid or exceed the read-model limit.
     pub fn channel_tasks(&self, space: SpaceId) -> Result<ChannelTasks> {
         let limit = MAX_CHANNEL_TASKS + 1;
         let mut stmt = self.conn.prepare(&format!(
@@ -392,6 +428,10 @@ impl Projection {
     }
 
     /// The global alert inbox, newest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows are invalid or exceed the inbox byte limit.
     pub fn alert_inbox(&self) -> Result<AlertInbox> {
         let row_limit = i64::try_from(MAX_ALERT_INBOX_ENTRIES).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
@@ -467,6 +507,10 @@ impl Projection {
     }
 
     /// A space's clipboard lane, newest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn clipboard_lane(&self, space: SpaceId) -> Result<ClipboardLane> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, kind, preview, sha256_hex, source, at_ms, pinned \
@@ -501,6 +545,10 @@ impl Projection {
     }
 
     /// The global presence board.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn presence_board(&self) -> Result<PresenceBoard> {
         let mut stmt = self
             .conn
@@ -526,6 +574,10 @@ impl Projection {
     }
 
     /// A space's linked file references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn file_references(&self, space: SpaceId) -> Result<FileReferences> {
         let mut stmt = self.conn.prepare(
             "SELECT file_ref_id, name, size, sha256_hex, mime, linked_by, linked_ms \
@@ -562,6 +614,10 @@ impl Projection {
     }
 
     /// All transfer jobs (the read-side mirror).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn transfer_jobs(&self) -> Result<TransferJobs> {
         let mut stmt = self.conn.prepare(
             "SELECT transfer_id, file_ref_id, method, direction, state, moved, total \
@@ -595,6 +651,10 @@ impl Projection {
     }
 
     /// The active/ended calls (optionally scoped to one space).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn call_state(&self, space: Option<SpaceId>) -> Result<CallState> {
         let (sql, want) = match space {
             Some(s) => (
@@ -621,13 +681,10 @@ impl Projection {
                 r.get::<_, i64>(5)?,
             ))
         };
-        let collected: Vec<_> = if let Some(w) = want {
-            stmt.query_map(params![w], map)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map([], map)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let params = want.map_or_else(Vec::new, |w| vec![w]);
+        let collected: Vec<_> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut active = Vec::new();
         for (call, space_id, kind, _initiator, started, ended) in collected {
             if ended != 0 {
@@ -725,20 +782,23 @@ impl Projection {
     }
 
     /// The live document sessions (optionally scoped to one space).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows are invalid or exceed read-model limits.
     pub fn document_sessions(&self, space: Option<SpaceId>) -> Result<DocumentSessions> {
         let base = "SELECT space_id, document_id, title, participants_json FROM documents";
+        let document_session_limit = MAX_DOCUMENT_SESSIONS + 1;
         let (sql, want) = match space {
             Some(s) => (
                 format!(
-                    "{base} WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, document_id LIMIT {}",
-                    MAX_DOCUMENT_SESSIONS + 1
+                    "{base} WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, document_id LIMIT {document_session_limit}"
                 ),
                 Some(s.to_string()),
             ),
             None => (
                 format!(
-                    "{base} ORDER BY clock_wall, clock_counter, document_id LIMIT {}",
-                    MAX_DOCUMENT_SESSIONS + 1
+                    "{base} ORDER BY clock_wall, clock_counter, document_id LIMIT {document_session_limit}"
                 ),
                 None,
             ),
@@ -752,17 +812,13 @@ impl Projection {
                 r.get::<_, String>(3)?,
             ))
         };
-        let collected: Vec<_> = if let Some(w) = want {
-            stmt.query_map(params![w], map)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map([], map)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let params = want.map_or_else(Vec::new, |w| vec![w]);
+        let collected: Vec<_> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         if collected.len() > MAX_DOCUMENT_SESSIONS {
             return Err(CollabError::Serde(format!(
-                "document session read model exceeds {} rows",
-                MAX_DOCUMENT_SESSIONS
+                "document session read model exceeds {MAX_DOCUMENT_SESSIONS} rows"
             )));
         }
         let mut sessions = Vec::new();
@@ -771,8 +827,7 @@ impl Projection {
             let names: Vec<String> = serde_json::from_str(&participants_json)?;
             if names.len() > MAX_DOCUMENT_PARTICIPANTS {
                 return Err(CollabError::Serde(format!(
-                    "document session participant list exceeds {} entries",
-                    MAX_DOCUMENT_PARTICIPANTS
+                    "document session participant list exceeds {MAX_DOCUMENT_PARTICIPANTS} entries"
                 )));
             }
             for name in &names {
@@ -790,6 +845,10 @@ impl Projection {
     }
 
     /// A space's chronological Activity feed (newest-last).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored rows cannot be read or decoded.
     pub fn activity_feed(&self, space: SpaceId) -> Result<ActivityFeed> {
         let row_limit = i64::try_from(MAX_ACTIVITY_ENTRIES).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
@@ -859,7 +918,7 @@ impl Projection {
              WHERE call_id = ?1 AND state = ?2 ORDER BY actor LIMIT {limit}"
         ))?;
         let rows = stmt.query_map(params![call.to_string(), connected], |r| {
-            Ok(r.get::<_, String>(0)?)
+            r.get::<_, String>(0)
         })?;
         let actors = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         if actors.len() > MAX_MEDIA_READINESS_PARTICIPANTS {
@@ -1002,6 +1061,10 @@ impl Projection {
     /// Serialize every materialized table (rows sorted by primary key) into one
     /// canonical string — the byte-for-byte convergence fingerprint. Two nodes
     /// that accepted the same event set produce the identical dump.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a table cannot be read or exceeds the dump-size limit.
     pub fn dump_tables(&self) -> Result<String> {
         let mut out = String::new();
         for table in SPACE_TABLES {
@@ -1089,7 +1152,7 @@ fn rebuild_space(tx: &rusqlite::Transaction<'_>, space: SpaceId) -> Result<()> {
 
     // Load the space's full log in canonical order.
     let mut events = load_space_events(tx, space)?;
-    events.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    events.sort_by_key(sort_key);
 
     let mut fold = SpaceFold::default();
     for env in &events {
@@ -1282,7 +1345,7 @@ impl SpaceFold {
             }
             CollabEventKind::SpaceRenamed { name } => {
                 if let Some(s) = self.space.as_mut() {
-                    s.name = name.clone();
+                    s.name.clone_from(name);
                 }
             }
             CollabEventKind::SpaceDeleted => {
@@ -1298,7 +1361,7 @@ impl SpaceFold {
                     }
                 }
             }
-            CollabEventKind::SpaceArchived => {}
+            CollabEventKind::SpaceArchived | CollabEventKind::PresenceChanged { .. } => {}
             CollabEventKind::MemberJoined { actor, role } => {
                 // `JoinSpace` is self-authored, while `AddMember` is owner-
                 // authored.  A valid signature alone must not let a non-owner
@@ -1323,7 +1386,6 @@ impl SpaceFold {
                     m.0 = *role;
                 }
             }
-            CollabEventKind::PresenceChanged { .. } => {}
             CollabEventKind::MessagePosted { body, thread } => {
                 self.messages.insert(
                     env.event_id,
@@ -1343,7 +1405,7 @@ impl SpaceFold {
                 if let Some(m) = self.messages.get_mut(target) {
                     // Only the author's edits count; ascending order → last wins.
                     if m.author == env.actor && !m.deleted {
-                        m.body = body.0.clone();
+                        m.body.clone_from(&body.0);
                         m.edited = true;
                     }
                 }
@@ -1573,7 +1635,7 @@ impl SpaceFold {
             CollabEventKind::DocumentUpdated { document, change } => {
                 if let Some(d) = self.documents.get_mut(document) {
                     if change.summary.is_some() {
-                        d.latest_summary = change.summary.clone();
+                        d.latest_summary.clone_from(&change.summary);
                     }
                     d.participants.insert(env.actor.0.clone());
                 }
@@ -1942,6 +2004,7 @@ impl SpaceFold {
 
 // ---- small helpers --------------------------------------------------------
 
+#[allow(clippy::cast_possible_wrap)] // The preceding range check makes this cast lossless.
 const fn cw(c: ActorClock) -> i64 {
     // wall_ms fits i64 for any realistic epoch-ms; saturate defensively.
     if c.wall_ms > i64::MAX as u64 {

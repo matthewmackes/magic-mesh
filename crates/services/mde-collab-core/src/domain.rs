@@ -1,6 +1,8 @@
-//! The folded **domain aggregate** — the authoritative facts
-//! [`apply_command`](crate::apply_command) validates against membership, roles,
-//! message authorship, age, tombstones, entity existence, and alert action kinds.
+//! The folded **domain aggregate**.
+//!
+//! These are the authoritative facts [`apply_command`](crate::apply_command)
+//! validates against: membership, roles, message authorship, age, tombstones,
+//! entity existence, and alert action kinds.
 //!
 //! It is a pure fold of the signed event set in the **canonical convergent
 //! order** — `(clock.wall_ms, clock.counter, event_id)`.
@@ -539,9 +541,7 @@ mod tests {
     use mde_collab_types::event::CollabEventKind;
     use mde_collab_types::ids::{CallId, EventId, SpaceId};
     use mde_collab_types::value::{CallKind, CallParticipantState};
-    use mde_collab_types::{
-        ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole,
-    };
+    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
     use uuid::Uuid;
 
     fn event_id(value: u128) -> EventId {

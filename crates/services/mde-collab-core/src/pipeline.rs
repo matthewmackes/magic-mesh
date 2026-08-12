@@ -48,12 +48,12 @@ pub const MAX_TASK_TITLE_BYTES: usize = 512;
 /// review comments stored in the collaboration read model.
 pub const MAX_DOCUMENT_TEXT_BYTES: usize = 64 * 1024;
 
-/// The maximum number of tombstones one `ClearClipboard` command may author.
+/// Maximum tombstones a `ClearClipboard` command may author.
 ///
-/// The mesh clipboard history already retains at most 50 unpinned entries, so
-/// this keeps the command boundary aligned with the existing history contract
-/// while preventing a malformed or legacy aggregate from creating an
-/// unbounded event batch.
+/// The mesh clipboard history already retains at most 50 unpinned entries.
+/// This keeps the command boundary aligned with the existing history contract
+/// while preventing a malformed or legacy aggregate from creating an unbounded
+/// event batch.
 const MAX_CLEAR_CLIPBOARD_EVENTS: usize = 50;
 
 /// The largest accepted AI sidecar request id.
@@ -1072,15 +1072,11 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             );
             let mut events = vec![left];
             // If no other participant remains Connected, the call ends.
-            let others_connected = state
-                .calls
-                .get(call)
-                .is_some_and(|c| {
-                    c.participants.iter().any(|(a, s)| {
-                        a != &ctx.actor && matches!(s, CallParticipantState::Connected)
-                    })
-                })
-                ;
+            let others_connected = state.calls.get(call).is_some_and(|c| {
+                c.participants
+                    .iter()
+                    .any(|(a, s)| a != &ctx.actor && matches!(s, CallParticipantState::Connected))
+            });
             if !others_connected {
                 events.push(ctx.emit(
                     space,
@@ -1169,9 +1165,10 @@ const fn next_transfer_state(
     let next = match (state, control) {
         (TransferState::Active, TransferControl::Pause) => TransferState::Paused,
         (TransferState::Paused, TransferControl::Resume) => TransferState::Active,
-        (TransferState::Queued, TransferControl::Cancel)
-        | (TransferState::Active, TransferControl::Cancel)
-        | (TransferState::Paused, TransferControl::Cancel) => TransferState::Canceled,
+        (
+            TransferState::Queued | TransferState::Active | TransferState::Paused,
+            TransferControl::Cancel,
+        ) => TransferState::Canceled,
         _ => {
             return Err(CollabError::InvalidTransferControl {
                 transfer,
@@ -1473,9 +1470,8 @@ const fn enforce_window(
 
 /// Whether removing/demoting `actor` from `space` would leave it Owner-less.
 fn would_orphan(state: &DomainState, space: SpaceId, actor: &mde_collab_types::ActorId) -> bool {
-    state.space(space).map_or(false, |s| {
-            matches!(state.role(space, actor), Some(SpaceRole::Owner))
-                && s.present_owner_count() <= 1
+    state.space(space).is_some_and(|s| {
+        matches!(state.role(space, actor), Some(SpaceRole::Owner)) && s.present_owner_count() <= 1
     })
 }
 

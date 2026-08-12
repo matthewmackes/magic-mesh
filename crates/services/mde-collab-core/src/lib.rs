@@ -17,7 +17,7 @@
 //!   no-op.
 //! * [`ActorLog`] ([`MemoryActorLog`], [`FileActorLog`]) — the durable,
 //!   idempotent, per-space actor log (the Syncthing-replicable unit).
-//! * [`Projection`] — the transactional, idempotent, convergent SQLite
+//! * [`Projection`] — the transactional, idempotent, convergent `SQLite`
 //!   projection backing the [`CollabReadModel`](mde_collab_types::CollabReadModel)
 //!   shapes.
 //! * [`CollabEngine`] — ties the pipeline, the domain fold, the projection, and
