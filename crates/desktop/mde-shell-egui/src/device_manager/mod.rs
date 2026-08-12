@@ -2176,8 +2176,8 @@ impl DeviceManagerState {
             ));
         } else {
             entries.push(Entry::Caption(
-                "Remote inventory is read-only \u{2014} device controls are available only on \
-                 This Node."
+                "Remote inventory is read-only \u{2014} device controls apply to mesh nodes only; \
+                 this host runs no mesh device-control worker."
                     .to_string(),
             ));
         }
@@ -2440,9 +2440,13 @@ impl DeviceManagerState {
             target_host,
             typed: _,
         } = arming;
-        // This Node authority gate: remote inventory is read-only even when the
-        // peer runs a device-control worker. Non-PC targets are also refused.
-        if !self.selected_controllable() || target_host != self.local_host {
+        // Mesh-node authority gate: route only to a freshly published selected
+        // node whose worker owns the inventory snapshot. Unpublished/stale
+        // remote projections remain read-only at this backstop.
+        if !self.selected_kind().controllable()
+            || target_host != self.selected_host
+            || self.selected_host_freshness() != HostFreshness::Fresh
+        {
             raise_toast(
                 "warning",
                 &format!(
