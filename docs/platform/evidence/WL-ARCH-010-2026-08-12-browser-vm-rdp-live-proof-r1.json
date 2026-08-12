@@ -1,0 +1,24 @@
+{
+  "frame": {
+    "fnv1a64": "0x8d85cde11939f325",
+    "height": 768,
+    "width": 1024
+  },
+  "image_digest": "sha256:b5916e99a346c4f6ef31298522595492e01d267273eb962e37f23f021e7edc56",
+  "input_observation": "echoed",
+  "probe": {
+    "log_sha256": "77274592225c797b6a497eb3a9cc43002249b0b066bace6090fe3973c6b49108",
+    "returncode": 0,
+    "source": "mde-vdi-rdp ignored live integration test"
+  },
+  "protocol": "rdp",
+  "reconnect_observation": "tier-reconnected",
+  "recorded_at": "2026-08-12T11:03:41.639800Z",
+  "schema_version": 1,
+  "source_commit": "6c2884dbb9d9cd8bff50fec8b85e623b1a837b37",
+  "status": "observed",
+  "target": {
+    "host": "127.0.0.1",
+    "port": 13389
+  }
+}

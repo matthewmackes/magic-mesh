@@ -93,7 +93,7 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
-- Current state: typed authority exists; KMS/EGL and live proof remain. Evidence: `evidence/WL-ARCH-010-2026-08-11-running-reservation-restart-r458.md`.
+- Current state: typed authority exists; KMS/EGL remains. Seat 15 now has a rebuilt, receipt-bound Browser VM with real RDP framebuffer/input/tier-reconnect proof: `evidence/WL-ARCH-010-2026-08-12-browser-vm-rdp-live-proof-r1.json`. Evidence: `evidence/WL-ARCH-010-2026-08-11-running-reservation-restart-r458.md`.
 - **Native DRM/PRIME + shell wiring (2026-08-11):** native gates passed 3/3;
   DRM shell build and VDI module passed 33/33. Live KMS/Display1 remains:
   `evidence/WL-ARCH-010-2026-08-11-native-drm-prime-boundary-r474.md`,
