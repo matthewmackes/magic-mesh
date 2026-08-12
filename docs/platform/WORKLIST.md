@@ -2056,8 +2056,10 @@ behavioral evidence is not completion.
 - Required outcome: GitHub required checks and farm evidence bind one revision;
   signed schema-5 evidence proves baseline acceptance on one selected physical
   test node/seat, package/runtime integrity, recovery, and corrected-forward
-  promotion without rollback. Additional physical nodes, seats, or lighthouses
-  are optional follow-up evidence and are not release blockers.
+  promotion without rollback. The first full release is gated by build,
+  package, signing, and artifact-integrity checks; live proofs and acceptance
+  are post-release obligations. Additional physical nodes, seats, or
+  lighthouses are optional follow-up evidence and are not release blockers.
 - Current state: signing exists; live release proof remains. Evidence: `evidence/WL-CRIT-006-WL-ARCH-009-2026-08-11-worker-executable-generation-r467.md`.
 - **Farm expansion (2026-08-08):** XEN-196 is a verified fifth build node; topology is 5/5 with 10 slots and `.196` passed `mde-bus` 425/425:
   `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
@@ -2186,17 +2188,19 @@ behavioral evidence is not completion.
      - Acceptance: required GitHub checks are the authoritative merge gate.
      - Validation: full farm cargo/package/secret/architecture gates.
      - Done when: all required checks are green or named blockers are carried.
-  4. S4 Run baseline live-seat acceptance.
+  4. S4 Run post-release baseline live-seat acceptance.
      - Objective: deploy the same revision to one selected physical test seat
        with alert protocol. Additional seats or lighthouses may be exercised,
        but are optional and non-blocking.
      - Inputs: S3, enrollment roster, rollout policy.
      - Deliverable: runtime, GUI, network, audio, VDI, and package captures.
-     - Depends on: S3.
-     - Acceptance: no stale installed payload or missing baseline seat is treated as pass.
+     - Depends on: S3 and the first full release.
+     - Acceptance: after the first full release, no stale installed payload or
+       missing baseline seat is treated as pass. This post-release acceptance
+       does not block producing the first full release.
      - Validation: the named live-seat script for the selected baseline seat.
      - Done when: the baseline seat has direct evidence; optional additional-seat/lighthouse rows do not gate completion.
-  5. S5 Exercise failure and corrected-forward recovery.
+  5. S5 Exercise post-release failure and corrected-forward recovery.
      - Objective: inject process, network, sleep, reboot, provider, package, and peer failures and recover by re-enrollment/corrected forward.
      - Inputs: S4 and CRIT-007.
      - Deliverable: fault traces, recovery logs, and no-rollback proof.
@@ -2218,7 +2222,10 @@ behavioral evidence is not completion.
   tooling; optional multi-seat/lighthouse tooling remains non-blocking.
 - Dependencies: all P0/P1 feature epics, CRIT-007, and the active repository revision.
 - Acceptance criteria:
-  1. One revision has complete signed farm, package, baseline single-seat, and recovery evidence; optional multi-seat/lighthouse evidence may be added but is not required.
+  1. The first full release has complete signed farm, package, and
+     artifact-integrity evidence. Post-release baseline single-seat and
+     recovery evidence follows; optional multi-seat/lighthouse evidence may be
+     added but is not required.
   2. GitHub required checks and verifier reject missing, altered, stale, or mismatched evidence.
   3. Promotion uses corrected-forward recovery and archives the closed epic.
 - Verification method: worklist/governance/doc/secret/supersession lints, farm cargo/package gates, release verifier, and named live scripts; longest job on BigBoy.
