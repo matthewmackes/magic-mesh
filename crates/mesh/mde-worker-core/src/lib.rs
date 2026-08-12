@@ -21,7 +21,9 @@
 
 use tokio::sync::watch;
 
-/// Shutdown signal handed to every worker. Workers should `select!`
+/// Shutdown signal handed to every worker.
+///
+/// Workers should `select!`
 /// on the underlying `watch::Receiver` so they exit promptly when
 /// the supervisor requests stop. Cloning is cheap (it's a watch
 /// receiver under the hood).
@@ -38,7 +40,7 @@ impl ShutdownToken {
     /// and lets sibling worker modules build one from a freshly-paired
     /// sender/receiver pair in their unit tests.
     #[must_use]
-    pub fn from_receiver(rx: watch::Receiver<bool>) -> Self {
+    pub const fn from_receiver(rx: watch::Receiver<bool>) -> Self {
         Self { rx }
     }
 
