@@ -476,7 +476,7 @@ fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(0o400000); // Linux O_NOFOLLOW
+        options.mode(0o600).custom_flags(0o400_000); // Linux O_NOFOLLOW
     }
     let mut file = options.open(&temp)?;
     let result = (|| {
@@ -521,7 +521,7 @@ fn open_regular_nofollow(path: &Path, max_bytes: u64) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0o400000); // Linux O_NOFOLLOW
+        options.custom_flags(0o400_000); // Linux O_NOFOLLOW
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;

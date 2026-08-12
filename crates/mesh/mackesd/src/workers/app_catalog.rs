@@ -766,7 +766,7 @@ fn store_last_good(config: &CatalogConfig, catalog: &SignedFlatpakAppCatalog) ->
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(0o400000); // Linux O_NOFOLLOW
+        options.mode(0o600).custom_flags(0o400_000); // Linux O_NOFOLLOW
     }
     let mut file = options.open(&temp)?;
     let result = (|| {
@@ -848,7 +848,7 @@ fn store_cursor(config: &CatalogConfig, cursor: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(0o400000); // Linux O_NOFOLLOW
+        options.mode(0o600).custom_flags(0o400_000); // Linux O_NOFOLLOW
     }
     let mut file = options.open(&temp)?;
     let result = (|| {
@@ -892,7 +892,7 @@ fn open_secure_regular_nofollow(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0o400000); // Linux O_NOFOLLOW
+        options.custom_flags(0o400_000); // Linux O_NOFOLLOW
     }
     let file = options.open(path)?;
     validate_open_metadata(&file, max_bytes, required_owner_uid)?;
