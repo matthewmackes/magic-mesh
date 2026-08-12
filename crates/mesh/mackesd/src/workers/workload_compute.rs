@@ -6130,10 +6130,15 @@ mod tests {
             WorkloadOperationPhase::Completed,
         ] {
             status.phase = phase;
-            if phase == WorkloadOperationPhase::Completed {
+            if matches!(
+                phase,
+                WorkloadOperationPhase::Ready | WorkloadOperationPhase::Completed
+            ) {
                 status.power = WorkloadPowerState::Running;
                 status.readiness = WorkloadReadiness::Ready;
                 status.signals = WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
+            }
+            if phase == WorkloadOperationPhase::Completed {
                 status.attachment = Some(lease.clone());
             }
             status = ledger

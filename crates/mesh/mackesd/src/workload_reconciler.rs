@@ -131,9 +131,19 @@ impl WorkloadOperationLedger {
             // A historical status can contain an expired attachment lease; the
             // lease is revalidated at publication time, not while replaying the
             // journal after a restart.
+            // Replay validates the lease shape without treating a historical
+            // expiry as an invalid live publication.  Anchoring at one
+            // millisecond before its expiry keeps the bounded-window check
+            // meaningful while allowing leases that expired before restart.
+            let status_validation_now = record
+                .status
+                .attachment
+                .as_ref()
+                .map(|lease| lease.expires_at_ms.saturating_sub(1))
+                .unwrap_or(0);
             record
                 .status
-                .validate(0)
+                .validate(status_validation_now)
                 .map_err(WorkloadLedgerError::Contract)?;
             if operations.insert(request_id, record).is_some() {
                 return Err(WorkloadLedgerError::Malformed);
