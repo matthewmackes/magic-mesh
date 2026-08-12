@@ -709,6 +709,8 @@ fn has_local_gateway_source(workgroup_root: &Path, aliases: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::mesh_media::AIRSONIC_PORT;
+
     use super::*;
     use crate::mesh_media::{AirsonicGatewayRegistration, GatewayHealth};
     use std::collections::HashMap;

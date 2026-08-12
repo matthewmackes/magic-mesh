@@ -1612,7 +1612,8 @@ mod worker {
         use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
         use mackes_mesh_types::surface_hardware::{
-            SurfaceCameraProofFailure, SurfaceCameraProofOutcome, SurfaceCameraProofRequest,
+            SurfaceActionHeader, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
+            SurfaceCameraProofRequest,
             SurfaceCameraProofResult, SurfaceCameraProofUnavailable, SurfaceFleetSummary,
             SurfaceProGeneration, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
         };

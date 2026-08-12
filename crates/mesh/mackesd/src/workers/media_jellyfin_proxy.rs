@@ -791,6 +791,8 @@ fn has_local_gateway_source(workgroup_root: &Path, aliases: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::mesh_media::JELLYFIN_GATEWAY_PROXY_PORT;
+
     use super::*;
     use crate::mesh_media::{GatewayHealth, JellyfinGatewayRegistration};
     use std::collections::HashMap;

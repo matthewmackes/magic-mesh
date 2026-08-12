@@ -865,7 +865,7 @@ impl Worker for RouterActionWorker {
 mod tests {
     use super::*;
     use mackes_mesh_types::router_action::{
-        write_request, FirewallEdit, FirewallEditOp, FirewallLeaf,
+        audit_log_path, read_audit, write_request, FirewallEdit, FirewallEditOp, FirewallLeaf,
     };
 
     fn edit() -> FirewallEdit {
