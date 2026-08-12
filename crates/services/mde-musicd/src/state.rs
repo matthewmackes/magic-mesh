@@ -220,7 +220,9 @@ fn admit_state_revision(path: &Path, candidate: &MusicState) -> std::io::Result<
     };
 
     if candidate.updated_ms < current.updated_ms
-        || (candidate.updated_ms == current.updated_ms && candidate != &current)
+        || (candidate.updated_ms == current.updated_ms
+            && candidate.peer == current.peer
+            && candidate != &current)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -499,13 +501,21 @@ pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
     // A daemon recovering stale in-memory state must not roll either durable
     // projection backward. Check both records before committing authority so a
     // rejected roster replay cannot leave a half-admitted ownership update.
-    admit_state_revision(&state_path(dir), state)?;
     admit_state_revision(&bp, state)?;
+    let publish_authority = match read_state(dir) {
+        Some(current) if current.peer != state.peer && state.updated_ms < current.updated_ms => false,
+        _ => {
+            admit_state_revision(&state_path(dir), state)?;
+            true
+        }
+    };
     // These two records are independently atomic, not a filesystem transaction.
     // Commit authority first: if the derived snapshot then fails, remote roster
     // readers remain safely stale instead of observing state this owner never
     // committed.
-    write_record_atomically(&state_path(dir), json.as_bytes())?;
+    if publish_authority {
+        write_record_atomically(&state_path(dir), json.as_bytes())?;
+    }
     write_record_atomically(&bp, json.as_bytes())
 }
 

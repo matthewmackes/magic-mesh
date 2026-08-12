@@ -8,10 +8,11 @@
 
 Command: `MCNF_BUILD_HOST=172.20.0.90 MCNF_BUILD_SLOT=func021-music-20260812 MCNF_BUILD_SHAPE=small install-helpers/xcp-build.sh cargo test -p mde-musicd --locked`
 
-- Result: 260 passed, 8 failed, 0 ignored, 268 total.
-- Failures are durable revision/order regressions in provider mutations, workspace queue actions, and peer-state reads; the exact error is `music state revision ... conflicts with durable revision ...` or its propagated mutation error.
-- A follow-up rerun after a monotonic-clock experiment still failed 259 passed / 9 failed, including fixed-revision peer fixtures. The experiment was reverted; no unverified production change was retained.
-- Status: blocker remains; no acceptance claim is made.
+- Initial result: 260 passed, 8 failed, 0 ignored, 268 total. The failures exposed that cross-peer stale roster snapshots were incorrectly rejected by the global authority check.
+- Implemented the bounded fix in `crates/services/mde-musicd/src/state.rs`: same-peer stale/equivocal revisions remain refused; a stale snapshot for another peer updates only that peer's roster file and cannot replace newer global authority.
+- Focused farm regressions passed: `read_all_peer_states_collects_and_sorts_snapshots`, `typed_workspace_queue_actions_use_the_shared_queue_authority`, and `workspace_targets_project_fresh_idle_and_refused_peer_heartbeats` (1/1 each).
+- Serial full farm gate (`-- --test-threads=1`): 263 passed, 5 failed, 268 total. The remaining five are provider-admission mutation assertions; the same bookmark path passes in isolation, so they remain a separate provider-test blocker.
+- Farm clippy: `cargo clippy -p mde-musicd --locked --lib` passed with warnings only (253).
 
 ## WL-ARCH-008
 
