@@ -15,6 +15,9 @@ surfaces.
 
 - `.90`, `frontdoor-favorite-regression`: focused regression passed 1/1:
   `cargo test -p mde-shell-egui --bin mde-shell-egui front_door::tests::peer_app_favorites_round_trip_and_rank_without_host_surface_conversion -- --nocapture`.
+- `.170`, `func018-frontdoor-tests`: Front Door module suite passed 72/72,
+  including stale/non-launchable presentation and typed App-VM launch action
+  coverage.
 - `.170`, `frontdoor-build`: `cargo build -p mde-shell-egui` passed; dev profile
   finished in 6m54s.
 - `.170`, `frontdoor-clippy-final`: `cargo clippy -p mde-shell-egui --bin

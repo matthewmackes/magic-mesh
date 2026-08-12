@@ -7293,7 +7293,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].target,
-            "Guest Flatpak · on oak · not launchable: stale"
+            "Guest Flatpak · org.example.Editor · on oak · not launchable: stale"
         );
         let FrontDoorTarget::PeerApp(target) = &items[0].payload else {
             panic!("guest state should remain a peer-app result");
@@ -7416,7 +7416,10 @@ mod tests {
         assert_eq!(body["name"], "Firefox");
         assert_eq!(body["source"], "flatpak");
         assert_eq!(body["mode"], "guest-app-vm");
-        assert_eq!(items[0].target, "Guest Flatpak · on oak");
+        assert_eq!(
+            items[0].target,
+            "Guest Flatpak · org.mozilla.Firefox.desktop · on oak"
+        );
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
