@@ -20,6 +20,10 @@ use crate::domain::ContentRef;
 /// Version of the durable queue envelope. Legacy bare `Queue` JSON is still
 /// read and rewritten into this envelope without dropping usable entries.
 pub const QUEUE_SCHEMA_VERSION: u16 = 1;
+/// Maximum queue entries accepted by the daemon's durable playback authority.
+pub const MAX_QUEUE_ENTRIES: usize = 512;
+/// Maximum UTF-8 bytes in one provider-owned song identity.
+pub const MAX_SONG_ID_BYTES: usize = 256;
 
 /// An ordered playback queue with a current-track cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,19 +52,34 @@ struct QueueFileV1 {
 }
 
 impl Queue {
+    fn admitted_song_id(song_id: impl Into<String>) -> Option<String> {
+        let song_id = song_id.into();
+        (!song_id.trim().is_empty() && song_id.len() <= MAX_SONG_ID_BYTES).then_some(song_id)
+    }
+
     /// Append a track to the end.
     pub fn enqueue(&mut self, song_id: impl Into<String>) {
-        self.songs.push(song_id.into());
+        if self.songs.len() < MAX_QUEUE_ENTRIES {
+            if let Some(song_id) = Self::admitted_song_id(song_id) {
+                self.songs.push(song_id);
+            }
+        }
     }
 
     /// Insert a track immediately after the current one ("Play Next").
     /// On an empty queue it just appends.
     pub fn enqueue_after_current(&mut self, song_id: impl Into<String>) {
+        let Some(song_id) = Self::admitted_song_id(song_id) else {
+            return;
+        };
+        if self.songs.len() >= MAX_QUEUE_ENTRIES {
+            return;
+        }
         if self.songs.is_empty() {
-            self.songs.push(song_id.into());
+            self.songs.push(song_id);
         } else {
             let at = (self.current + 1).min(self.songs.len());
-            self.songs.insert(at, song_id.into());
+            self.songs.insert(at, song_id);
         }
     }
 
@@ -70,7 +89,9 @@ impl Queue {
     /// callers cannot mutate the cursor and list independently, and the
     /// returned flag tells the caller whether the durable queue changed.
     pub fn select_or_enqueue(&mut self, song_id: impl Into<String>) -> bool {
-        let song_id = song_id.into();
+        let Some(song_id) = Self::admitted_song_id(song_id) else {
+            return false;
+        };
         if let Some(index) = self.songs.iter().position(|entry| entry == &song_id) {
             let changed = self.current != index;
             self.current = index;
@@ -79,6 +100,9 @@ impl Queue {
             }
             changed
         } else {
+            if self.songs.len() >= MAX_QUEUE_ENTRIES {
+                return false;
+            }
             self.songs.push(song_id);
             self.current = self.songs.len() - 1;
             self.preferred_source = None;
@@ -456,6 +480,25 @@ mod tests {
         q.enqueue("b");
         assert_eq!(q.current(), Some("a"));
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn queue_mutations_refuse_empty_oversized_and_over_capacity_ids() {
+        let mut queue = Queue::default();
+        queue.enqueue("   ");
+        queue.enqueue("x".repeat(MAX_SONG_ID_BYTES + 1));
+        assert!(queue.is_empty());
+        assert!(!queue.select_or_enqueue(""));
+
+        queue.songs = (0..MAX_QUEUE_ENTRIES)
+            .map(|i| format!("song-{i}"))
+            .collect();
+        queue.current = 0;
+        queue.enqueue("overflow");
+        assert_eq!(queue.len(), MAX_QUEUE_ENTRIES);
+        assert!(!queue.select_or_enqueue("new-song"));
+        queue.enqueue_after_current("another-song");
+        assert_eq!(queue.len(), MAX_QUEUE_ENTRIES);
     }
 
     #[test]
