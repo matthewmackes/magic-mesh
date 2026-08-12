@@ -25,6 +25,17 @@ Observed checks:
 - installed `magic-mesh-12.1.6-33.x86_64` matched declared platform/RPM
   release `12.1.6/33` and verified both payloads.
 
-The play probe was intentionally disabled for this bounded baseline command;
-this evidence therefore claims service, Bus, package, and payload integrity,
-not audible/rendered playback acceptance.
+## Bounded playback probe
+
+After catalog discovery returned Warrant album `1701`, song `23427` (“Blood
+Moon Prelude”), the same bounded gate was rerun with:
+
+```text
+MUSIC_LIVE_HOST=172.20.0.15 MUSIC_LIVE_SSH_KEY=/root/.ssh/mackes_mesh_ed25519 MUSIC_LIVE_PLAY_TIMEOUT_SECONDS=15 install-helpers/verify-music-live-seat.sh --play-probe 23427
+```
+
+Result: `verify-music-live-seat: PASS`. The explicit play probe reached its
+15-second bound with the accepted timeout result (`rc=124`) and left no client
+process; service, Bus, and RPM checks passed again. This proves bounded daemon
+playback initiation and cleanup, but does not claim audible/rendered playback
+without a direct audio capture.
