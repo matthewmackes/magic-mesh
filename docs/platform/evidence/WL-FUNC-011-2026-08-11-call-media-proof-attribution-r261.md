@@ -11,8 +11,11 @@
   --features async-services
   workers::collab_media::tests::verifier_refuses_misattributed_or_vacuous_provider_evidence
   -- --exact --nocapture`.
-- Result: **NOT RUN**. Every farm host was below the governed 8 GiB `/home`
-  reserve, so no host/slot was selected or synced and no safety bypass was used.
-- Remaining proof: run the exact regression from a warmed/safe slot. No
-  production call-media provider exists yet; future providers must supply fresh,
-  session-bound sampling evidence and live call proof.
+- Result: **PASS**. Farm `.90`, slot `func011-call-media`, ran the exact
+  regression after full test-profile compilation: 1 passed, 0 failed, 4,923
+  filtered. Farm `.90`, slot `func011-clippy2`, ran
+  `cargo clippy -p mackesd --features async-services --lib` to completion with
+  warnings only (3,442 warnings).
+- Remaining proof: no production call-media provider exists yet; future
+  providers must supply fresh, session-bound sampling evidence and live call
+  proof.

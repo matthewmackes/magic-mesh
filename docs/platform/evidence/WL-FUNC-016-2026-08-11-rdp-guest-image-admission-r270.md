@@ -13,8 +13,14 @@
   `FilesProviderUnavailable`; raw DIB bytes are dropped and never published,
   written through a guessed path, or assigned a fabricated Files identity.
 - Intended farm command: `cargo test -p mde-vdi-rdp --features live-connect guest_ -- --nocapture` plus the shell's exact refusal regression.
-- Result: **NOT RUN**. `.90` was unavailable and every reachable free slot was
-  below the 8 GiB reserve. `git diff --check` passed.
+- Result: **TARGET PASS / SUITE MIXED**. Farm `.90`, slot `func016-rdp-image`,
+  ran the guest-image suite: 6 passed, 1 failed. The targeted
+  `guest_dib_and_dibv5_are_admitted_as_typed_one_use_images` regression passed;
+  the unrelated `bridge_bounds_host_text_and_decodes_guest_unicode` test
+  failed. Farm `.90`, slot `func016-clippy`, ran
+  `cargo clippy -p mde-vdi-rdp --features live-connect --lib` to completion with
+  warnings only (97 warnings).
 - Remaining work: the guest-to-host image gap is not closed. It requires a
   daemon-owned bounded descriptor-ingest/CAS authority followed by the existing
-  one-use permission and typed rich-message publication.
+  one-use permission and typed rich-message publication. The unrelated host-text
+  decoding failure remains a separate follow-up.
