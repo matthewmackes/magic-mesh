@@ -857,7 +857,7 @@ fn adapt_media_body(
             }
         }
     }
-    let current_availability = if stale {
+    let current_availability = if is_stale {
         ResourceAdapterAvailability::Stale
     } else {
         ResourceAdapterAvailability::Available
