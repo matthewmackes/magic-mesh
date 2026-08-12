@@ -347,6 +347,9 @@ struct ReplayMark {
     source_seat: String,
     source_session: String,
     sequence: u64,
+    /// Lease-bound VDI sequence marks survive renewal of the lease so the
+    /// same source sequence cannot be replayed under fresh authority.
+    lease_id: String,
     /// The high-water mark is useful only while the authority that admitted
     /// its sequence could still be live. Keeping it longer can permanently
     /// strand a restarted source/session that legitimately resets sequencing.
@@ -538,6 +541,7 @@ impl ClipboardPermissionModel {
             source_seat: metadata.source_seat.clone(),
             source_session: metadata.source_session.clone(),
             sequence: metadata.sequence,
+            lease_id: metadata.lease_id.clone(),
             expires_at_ms: metadata.expires_at_ms,
         };
         let requires_approval = (metadata.cross_boundary
@@ -743,8 +747,9 @@ impl ClipboardPermissionModel {
         // arbitrary eviction while quiet sources can remain blocked forever.
         // Expire marks at their admitting envelope/lease boundary before
         // comparing sequence high-water marks.
-        self.replay_marks
-            .retain(|mark| now_ms < mark.expires_at_ms);
+        self.replay_marks.retain(|mark| {
+            !mark.lease_id.is_empty() || now_ms < mark.expires_at_ms
+        });
         self.replay_marks.iter().any(|mark| {
             mark.source_node == metadata.source_node
                 && mark.source_seat == metadata.source_seat
