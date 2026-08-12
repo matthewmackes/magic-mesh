@@ -402,7 +402,7 @@ fn open_restart_ledger(path: &Path) -> Result<Option<File>, WorkloadLedgerError>
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(0o400000 | 0o4000 | 0o2000000); // Linux O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        .custom_flags(0o400_000 | 0o4_000 | 0o2_000_000); // Linux O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
     let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
