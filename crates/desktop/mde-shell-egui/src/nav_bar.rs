@@ -298,7 +298,10 @@ fn taskbar_surface_search_terms(surface: Surface) -> &'static str {
 }
 
 fn filtered_pin_catalog(query: &str) -> Vec<Surface> {
-    let query = query.trim().to_ascii_lowercase().replace('-', " ");
+    let query = bounded_pin_selector_query(query)
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', " ");
     PIN_CATALOG
         .into_iter()
         .filter(|surface| pin_catalog_surface(*surface))
@@ -311,6 +314,10 @@ fn filtered_pin_catalog(query: &str) -> Vec<Surface> {
                 || taskbar_surface_search_terms(*surface).contains(&query)
         })
         .collect()
+}
+
+fn bounded_pin_selector_query(query: &str) -> String {
+    query.chars().take(MAX_PIN_SELECTOR_QUERY_CHARS).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -986,8 +993,7 @@ impl State {
     fn mount_first_boot_selector(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         let card = first_boot_selector_rect(screen);
-        let mut query = self.pin_selector.query.clone();
-        query = query.chars().take(MAX_PIN_SELECTOR_QUERY_CHARS).collect();
+        let mut query = bounded_pin_selector_query(&self.pin_selector.query);
         let selected = self.pin_selector.selected.clone();
         let mut toggled = None;
         let mut complete = false;
@@ -1123,7 +1129,7 @@ impl State {
                 });
             });
         ctx.move_to_top(area.response.layer_id);
-        self.pin_selector.query = query;
+        self.pin_selector.query = bounded_pin_selector_query(&query);
         if let Some(surface) = toggled {
             self.toggle_pin_selector_surface(surface);
         }
@@ -3210,6 +3216,21 @@ mod tests {
         assert_eq!(filtered_pin_catalog("fleet & mesh"), Vec::<Surface>::new());
         assert_eq!(filtered_pin_catalog("workloads"), Vec::<Surface>::new());
         assert_eq!(filtered_pin_catalog("infra-code"), Vec::<Surface>::new());
+    }
+
+    #[test]
+    fn pin_selector_query_is_utf8_safe_and_bounded_at_every_boundary() {
+        let query = format!("{}🌐", "x".repeat(MAX_PIN_SELECTOR_QUERY_CHARS));
+        let bounded = bounded_pin_selector_query(&query);
+        assert_eq!(bounded.chars().count(), MAX_PIN_SELECTOR_QUERY_CHARS);
+        assert!(bounded.is_char_boundary(bounded.len()));
+
+        let mut state = State::new_profile(DockMode::Floating);
+        state.pin_selector.query = query.clone();
+        let rendered_query = bounded_pin_selector_query(&state.pin_selector.query);
+        state.pin_selector.query = rendered_query.clone();
+        assert_eq!(state.pin_selector.query, "x".repeat(MAX_PIN_SELECTOR_QUERY_CHARS));
+        assert_eq!(filtered_pin_catalog(&query), filtered_pin_catalog(&rendered_query));
     }
 
     #[test]
