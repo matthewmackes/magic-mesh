@@ -225,7 +225,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     for chunk in padded.chunks_exact(64) {
         let mut words = [0_u32; 64];
         for (index, word) in words[..16].iter_mut().enumerate() {
-            *word = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());
+            let mut bytes = [0_u8; 4];
+            bytes.copy_from_slice(&chunk[index * 4..index * 4 + 4]);
+            *word = u32::from_be_bytes(bytes);
         }
         for index in 16..64 {
             let a = words[index - 15].rotate_right(7)
