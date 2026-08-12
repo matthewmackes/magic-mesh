@@ -2196,7 +2196,7 @@ fn linking_a_picked_file_emits_link_file_with_the_true_content_address() {
 
     let mut sink = CommandSink::new();
     surface
-        .link_file_from_path(&mut sink, space, &path)
+        .link_file_from_path_at_root(&mut sink, space, &path, dir.path())
         .expect("link the temp file");
 
     let linked = sink.queued().iter().find_map(|c| match c {

@@ -654,6 +654,22 @@ impl CommunicationsSurface {
         let workgroup_root = std::env::var_os("MDE_WORKGROUP_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"));
+        self.link_file_from_path_at_root(sink, space, path, &workgroup_root)
+    }
+
+    /// Link a picked file under an explicitly supplied workgroup root.
+    ///
+    /// Production callers should use [`Self::link_file_from_path`], which
+    /// resolves the governed workgroup root. This seam keeps the same
+    /// materialization and command path available to non-live tests without
+    /// requiring a farm seat to own the production mount.
+    pub(crate) fn link_file_from_path_at_root(
+        &mut self,
+        sink: &mut CommandSink,
+        space: SpaceId,
+        path: &Path,
+        workgroup_root: &Path,
+    ) -> std::io::Result<()> {
         let content_root = workgroup_root.join("collab").join("content");
         let (file, reference) = link_file_at_content_root(path, &content_root)?;
         sink.emit(CollabCommand::LinkFile {
