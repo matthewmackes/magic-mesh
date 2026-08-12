@@ -4053,14 +4053,13 @@ impl WorkloadComputeWorker {
                         now_ms,
                     );
                     continue;
-                } else {
-                    status.power = outcome.power;
-                    status.readiness = outcome.readiness;
-                    status.retryable = outcome.retryable;
-                    status.reason = outcome.reason;
-                    status.remediation = outcome.remediation;
-                    status.attachment = Some(lease.clone());
                 }
+                status.power = outcome.power;
+                status.readiness = outcome.readiness;
+                status.retryable = outcome.retryable;
+                status.reason = outcome.reason;
+                status.remediation = outcome.remediation;
+                status.attachment = Some(lease.clone());
             } else {
                 status.power = outcome.power;
                 status.readiness = outcome.readiness;
