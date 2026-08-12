@@ -9062,7 +9062,7 @@ mod tests {
 
     #[test]
     fn connectivity_absence_and_partial_facts_render_honest_states() {
-        let absent = NodeStatus::project(&connectivity_snapshot(r#"{}"#), "fallback");
+        let absent = NodeStatus::project(&connectivity_snapshot(r"{}"), "fallback");
         assert!(matches!(
             absent.connectivity_availability(),
             ConnectivityAvailability::Unavailable(_)

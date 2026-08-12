@@ -621,14 +621,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn exporter_interval_clamps_zero_cadence() {
-        let mut interval = export_interval(Duration::ZERO);
-        interval.tick().await;
-        tokio::time::advance(Duration::from_micros(999)).await;
-        assert!(tokio::time::timeout(Duration::from_nanos(1), interval.tick())
-            .await
-            .is_err());
-        tokio::time::advance(Duration::from_micros(1)).await;
-        interval.tick().await;
+        let interval = export_interval(Duration::ZERO);
+        assert_eq!(interval.period(), MIN_TICK_INTERVAL);
     }
 
     #[test]

@@ -475,7 +475,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn publish_open_writes_a_session_targeted_capability() {
         let bus = tempfile::tempdir().unwrap();
         let mut last_error = None;

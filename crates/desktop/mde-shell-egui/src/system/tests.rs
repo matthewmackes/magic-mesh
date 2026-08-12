@@ -1244,7 +1244,7 @@ fn a_sidebar_pick_routes_the_detail_pane_through_the_nav_seam() {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 1600.0))),
         ..Default::default()
     };
-    let mut frame = |raw: egui::RawInput, nav: &mut SettingsNav, filter: &mut String| {
+    let frame = |raw: egui::RawInput, nav: &mut SettingsNav, filter: &mut String| {
         ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| settings_rail(ui, nav, filter));
         })
