@@ -457,6 +457,7 @@ impl ModesetSeam for HeadlessModeset {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "drm"), allow(dead_code))]
 pub(crate) struct RunnerModesetRequest {
     pub request_id: u64,
     pub mode: PanelMode,
@@ -485,6 +486,7 @@ pub fn runner_panel_info() -> Option<PanelInfo> {
     runner_panel_state().lock().ok()?.clone()
 }
 
+#[cfg_attr(not(feature = "drm"), allow(dead_code))]
 pub(crate) fn publish_runner_panel(panel: PanelInfo) {
     if let Ok(mut current) = runner_panel_state().lock() {
         *current = Some(panel);
@@ -521,10 +523,12 @@ impl ModesetSeam for RunnerModeset {
     }
 }
 
+#[cfg_attr(not(feature = "drm"), allow(dead_code))]
 pub(crate) fn take_runner_modeset_request() -> Option<RunnerModesetRequest> {
     runner_modeset_state().lock().ok()?.request.take()
 }
 
+#[cfg_attr(not(feature = "drm"), allow(dead_code))]
 pub(crate) fn acknowledge_runner_modeset(
     request: RunnerModesetRequest,
     result: Result<(), String>,

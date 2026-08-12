@@ -48,7 +48,7 @@ impl std::error::Error for CaptureError {}
 /// wgpu requires buffer copy rows to be a multiple of this many bytes.
 const ROW_ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
-fn align_up(value: u32, align: u32) -> u32 {
+const fn align_up(value: u32, align: u32) -> u32 {
     value.div_ceil(align) * align
 }
 
@@ -131,7 +131,7 @@ pub fn capture_ui_png(
     let padded_bytes_per_row = align_up(width * 4, ROW_ALIGN);
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("mde-egui-capture-readback"),
-        size: (padded_bytes_per_row * height) as u64,
+        size: u64::from(padded_bytes_per_row * height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -172,7 +172,7 @@ pub fn capture_ui_png(
 
     let clear = Style::CAPTURE_CLEAR;
     let srgb_to_linear = |c: u8| {
-        let c = c as f64 / 255.0;
+        let c = f64::from(c) / 255.0;
         if c <= 0.04045 {
             c / 12.92
         } else {

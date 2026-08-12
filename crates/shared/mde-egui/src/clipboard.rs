@@ -97,6 +97,7 @@ fn drm_clipboard_focus_id() -> egui::Id {
 }
 
 /// Set the application/surface that owns clipboard output for this egui frame.
+///
 /// Passing `None` explicitly releases ownership. The DRM runner consumes this
 /// marker after rendering, before admitting the frame's copy output.
 pub fn set_drm_clipboard_owner(ctx: &egui::Context, owner: Option<&str>) {
@@ -409,6 +410,7 @@ fn validate_offers(offers: &[ClipboardMimeOfferV2]) -> Result<(), LocalClipboard
 }
 
 /// Build one exact, bounded plain-text V2 offer for egui compatibility.
+#[must_use]
 pub fn text_offer(text: &str) -> Option<ClipboardMimeOfferV2> {
     let text = normalize_and_bound_text(text, MAX_CLIPBOARD_TEXT_BYTES);
     (!text.is_empty())
@@ -606,7 +608,9 @@ mod tests {
         );
 
         let recovered = authority
-            .replace(vec![text_offer("corrected forward").expect("corrected offer")])
+            .replace(vec![
+                text_offer("corrected forward").expect("corrected offer")
+            ])
             .expect("corrected provider offer");
         assert!(recovered.generation() > stale_selection.generation);
         assert_eq!(

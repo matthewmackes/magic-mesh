@@ -111,15 +111,15 @@ pub struct FontSelection {
     pub monospace: PlatformFont,
 }
 
-fn default_interface_font() -> PlatformFont {
+const fn default_interface_font() -> PlatformFont {
     PlatformFont::MozillaHeadline
 }
 
-fn default_display_font() -> PlatformFont {
+const fn default_display_font() -> PlatformFont {
     PlatformFont::MozillaHeadline
 }
 
-fn default_monospace_font() -> PlatformFont {
+const fn default_monospace_font() -> PlatformFont {
     PlatformFont::IntelOneMono
 }
 
@@ -176,7 +176,7 @@ fn definitions(selection: FontSelection) -> FontDefinitions {
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let mut builtin_fallbacks = builtin_proportional.clone();
+    let mut builtin_fallbacks = builtin_proportional;
     if let Some(builtin_mono) = fonts.families.get(&FontFamily::Monospace) {
         append_unique(&mut builtin_fallbacks, builtin_mono);
     }
@@ -236,7 +236,7 @@ fn definitions(selection: FontSelection) -> FontDefinitions {
     fonts.families.insert(FontFamily::Monospace, monospace);
     fonts
         .families
-        .insert(FontFamily::Name(Arc::from(HEADING_FAMILY)), display.clone());
+        .insert(FontFamily::Name(Arc::from(HEADING_FAMILY)), display);
     fonts
         .families
         .insert(FontFamily::Name(Arc::from(NAV_FAMILY)), interface.clone());

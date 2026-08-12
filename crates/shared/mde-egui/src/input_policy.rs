@@ -136,7 +136,7 @@ pub fn input_policy() -> InputPolicy {
 /// Map a Linux input button code into egui's button model, applying left-handed
 /// swapping for primary/secondary buttons.
 #[must_use]
-pub fn pointer_button(raw_button: u32, left_handed: bool) -> Option<egui::PointerButton> {
+pub const fn pointer_button(raw_button: u32, left_handed: bool) -> Option<egui::PointerButton> {
     match raw_button {
         BTN_LEFT if left_handed => Some(egui::PointerButton::Secondary),
         BTN_LEFT => Some(egui::PointerButton::Primary),

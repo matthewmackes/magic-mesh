@@ -162,7 +162,7 @@ pub fn muted_note(ui: &mut Ui, msg: impl Into<String>) -> Response {
 /// target. Tables and palettes therefore remain scannable without creating
 /// separate per-workspace row metrics.
 #[must_use]
-pub fn dense_row_height(density: crate::Density) -> f32 {
+pub const fn dense_row_height(density: crate::Density) -> f32 {
     Style::CONTROL_H_M.max(density.min_hit_target())
 }
 
@@ -177,7 +177,7 @@ pub fn striped_row<R>(
     index: usize,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> InnerResponse<R> {
-    let fill = if index.is_multiple_of(2) {
+    let fill = if index % 2 == 0 {
         Style::resolve_color(ui.ctx(), Style::SURFACE)
     } else {
         Style::resolve_color(ui.ctx(), Style::SURFACE_HI).gamma_multiply(0.45)
@@ -264,7 +264,7 @@ impl WorkspaceState {
         }
     }
 
-    fn icon(self) -> &'static str {
+    const fn icon(self) -> &'static str {
         match self {
             Self::Loading => "process-stop",
             Self::Empty => "text-x-generic",
@@ -274,7 +274,7 @@ impl WorkspaceState {
         }
     }
 
-    fn tone(self) -> Color32 {
+    const fn tone(self) -> Color32 {
         match self {
             Self::Loading | Self::Empty | Self::Stale => Style::TEXT_DIM,
             Self::Offline | Self::Error | Self::Destructive => Style::DANGER,
@@ -309,8 +309,12 @@ impl<'a> WorkspaceStatePanel<'a> {
         // the content lane; otherwise the shared empty/offline/error surface is
         // wider than its viewport on narrow and largest-text layouts.
         let outer_width = ui.available_width().min(Style::SP_XL * 16.0);
-        let content_width =
-            (outer_width - 2.0 * Style::SP_M - 2.0 * Style::STROKE_HAIRLINE).max(1.0);
+        let content_width = 2.0f32
+            .mul_add(
+                -Style::STROKE_HAIRLINE,
+                2.0f32.mul_add(-Style::SP_M, outer_width),
+            )
+            .max(1.0);
         let surface = Style::resolve_color(ui.ctx(), Style::SURFACE);
         let border = Style::resolve_color(ui.ctx(), Style::BORDER);
         let title_tone = Style::resolve_color(ui.ctx(), Style::TEXT_STRONG);
@@ -331,8 +335,7 @@ impl<'a> WorkspaceStatePanel<'a> {
                             egui::vec2(Style::ICON_XL, Style::ICON_XL),
                             Sense::hover(),
                         );
-                        let _ =
-                            paint_carbon(ui.painter(), icon_rect, state.icon(), state_tone);
+                        let _ = paint_carbon(ui.painter(), icon_rect, state.icon(), state_tone);
                         ui.add_space(Style::SP_S);
                         ui.label(
                             Style::typography_text(
@@ -704,9 +707,8 @@ mod tests {
         let text = painted_text(&out.shapes);
 
         assert!(
-            text.iter().any(|(value, color)| {
-                value == "OFFLINE" && *color == Style::DANGER
-            }),
+            text.iter()
+                .any(|(value, color)| { value == "OFFLINE" && *color == Style::DANGER }),
             "caller-controlled copy must not erase the shared visible state: {text:?}"
         );
     }

@@ -97,7 +97,7 @@ pub enum Display1FramePoll {
     Idle,
     /// One authenticated, bounded DMA-BUF frame ready for direct KMS import.
     Frame {
-        /// Owned descriptor transferred by the local SCM_RIGHTS broker.
+        /// Owned descriptor transferred by the local `SCM_RIGHTS` broker.
         fd: OwnedFd,
         /// Metadata validated by the broker/client before import.
         metadata: ExternalDmaBufFrame,
@@ -123,7 +123,7 @@ pub enum Display1FramePoll {
 /// The DRM seat produces these directly from libinput. Implementations bind
 /// them to the authenticated attachment lease before transport; host-reserved
 /// keys never enter this type.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Display1Input {
     /// Explicitly acquire or relinquish guest input focus.
     Focus(bool),
@@ -1137,7 +1137,7 @@ fn clear_rgba(color: egui::Color32) -> [f32; 4] {
 /// The loop is **event-driven**: it blocks in `poll(2)` on the libinput fd until input
 /// arrives, egui's requested repaint deadline expires, or a periodic task (accelerometer
 /// sample / touch long-press tick) is due — then renders *only* when there is something
-/// to show. This mirrors eframe's winit contract (`ControlFlow` Wait vs WaitUntil vs
+/// to show. This mirrors eframe's winit contract (`ControlFlow` Wait vs `WaitUntil` vs
 /// Poll, decided from egui's [`egui::ViewportOutput::repaint_delay`]): a `Duration::MAX`
 /// delay means "idle — sleep until an fd wakes us" and drops the CPU to ~0, a
 /// `Duration::ZERO` delay means "repaint continuously" (a streaming VDI session, a
@@ -1692,12 +1692,16 @@ pub fn run_drm_with_clipboard_and_display1(
                 rollback = None;
             }
             Err(error) if applying.is_some() && !startup_committed => {
-                let (request, previous) = applying.take().expect("guarded above");
+                let Some((request, previous)) = applying.take() else {
+                    return Err(error);
+                };
                 requested_mode = Some(previous);
                 rollback = Some((request, error.to_string()));
             }
             Err(error) if rollback.is_some() && !startup_committed => {
-                let (request, apply_error) = rollback.take().expect("guarded above");
+                let Some((request, apply_error)) = rollback.take() else {
+                    return Err(error);
+                };
                 crate::display::acknowledge_runner_modeset(
                     request,
                     Err(format!(
@@ -2159,7 +2163,7 @@ fn run_drm_session(
         // (libinput's epoll fd, live for the loop). poll only reads `events` and writes
         // `revents`, and blocks up to `timeout` ms. Its result is advisory — every wake
         // reason is re-derived below — so an error/EINTR wake is harmless (one idle pass).
-        let _ = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout) };
+        let _ = unsafe { libc::poll(&raw mut pfd, 1, timeout) };
 
         // A seat-side state change this iteration that the shell must see promptly even
         // though it produced no egui input event — a display rotation (scanout changed),

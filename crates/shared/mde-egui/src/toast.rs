@@ -847,7 +847,9 @@ const AI_ALERT_BLOCKER_ID: &str = "kiron-ai-alert-blocker";
 /// screen, `1` rests it top-center ([`BANNER_MARGIN`] below the edge), and a
 /// spring's overshoot past `1` reads as the drop's bounce.
 fn banner_rect(screen: Rect, t: f32) -> Rect {
-    let w = (screen.width() - 2.0 * Style::SP_L).clamp(0.0, BANNER_MAX_W);
+    let w = 2.0f32
+        .mul_add(-Style::SP_L, screen.width())
+        .clamp(0.0, BANNER_MAX_W);
     let h = if w < BANNER_STACKED_BREAKPOINT {
         BANNER_STACKED_H
     } else {
@@ -878,9 +880,7 @@ fn banner_control_rect(card: Rect) -> Rect {
 fn banner_text_right(card: Rect, has_action: bool) -> f32 {
     let button_count = if has_action { 2.0 } else { 1.0 };
     let button_gaps = if has_action { Style::SP_S } else { 0.0 };
-    card.right()
-        - Style::SP_M
-        - BANNER_BUTTON_W * button_count
+    BANNER_BUTTON_W.mul_add(-button_count, card.right() - Style::SP_M)
         - button_gaps
         - Style::SP_S
         - BANNER_META_W
@@ -890,10 +890,10 @@ fn banner_text_right(card: Rect, has_action: bool) -> f32 {
 /// Centered constrained alert geometry. Motion is a restrained scale/fade from
 /// 96% to full size; the card never changes center or exceeds the safe margins.
 fn ai_alert_rect(screen: Rect, t: f32) -> Rect {
-    let available_w = (screen.width() - 2.0 * AI_ALERT_MARGIN).max(1.0);
-    let available_h = (screen.height() - 2.0 * AI_ALERT_MARGIN).max(1.0);
+    let available_w = 2.0f32.mul_add(-AI_ALERT_MARGIN, screen.width()).max(1.0);
+    let available_h = 2.0f32.mul_add(-AI_ALERT_MARGIN, screen.height()).max(1.0);
     let base = vec2(AI_ALERT_MAX_W.min(available_w), AI_ALERT_H.min(available_h));
-    let scale = 0.96 + 0.04 * t.clamp(0.0, 1.0);
+    let scale = 0.04f32.mul_add(t.clamp(0.0, 1.0), 0.96);
     Rect::from_center_size(screen.center(), base * scale)
 }
 
@@ -920,7 +920,7 @@ fn banner_detail_font() -> FontId {
 /// The lower-third close control follows the alert's lifecycle authority, not
 /// its visual severity. Health grades E and F are both Critical (and therefore
 /// both preempt), but only F carries [`Dwell::UntilAck`].
-fn close_control(toast: &Toast) -> (&'static str, bool) {
+const fn close_control(toast: &Toast) -> (&'static str, bool) {
     if matches!(toast.dwell, Dwell::UntilAck) {
         ("Acknowledge", true)
     } else {
@@ -932,8 +932,8 @@ fn close_control(toast: &Toast) -> (&'static str, bool) {
 ///
 /// Presentation ONLY (U13): the queue, dedup, dwell, hover-pause, and
 /// Critical-ack semantics all live in [`ToastHost`] untouched — this reads a
-/// [`Toast`] and draws the Q14 banner (RADIUS_L card, Overlay elevation, Carbon
-/// severity glyph, TYPE_BODY title + TYPE_FOOTNOTE detail).
+/// [`Toast`] and draws the Q14 banner (`RADIUS_L` card, Overlay elevation, Carbon
+/// severity glyph, `TYPE_BODY` title + `TYPE_FOOTNOTE` detail).
 fn paint_banner(
     ui: &mut Ui,
     toast: &Toast,
@@ -1105,7 +1105,7 @@ fn paint_ai_generated_alert(
         muted_white,
     );
 
-    let headline_width = (card.width() - 2.0 * Style::SP_XL).max(1.0);
+    let headline_width = 2.0f32.mul_add(-Style::SP_XL, card.width()).max(1.0);
     let mut headline = LayoutJob::single_section(
         toast.headline.clone(),
         TextFormat::simple(
@@ -1153,7 +1153,7 @@ fn paint_ai_generated_alert(
     let (label, requires_acknowledgement) = close_control(toast);
     let button_count = if toast.action.is_some() { 2 } else { 1 };
     let gap = Style::SP_S;
-    let total_w = AI_ALERT_BUTTON_W * button_count as f32 + gap * (button_count - 1) as f32;
+    let total_w = AI_ALERT_BUTTON_W.mul_add(button_count as f32, gap * (button_count - 1) as f32);
     let mut x = card.center().x - total_w * 0.5;
     let button_y = card.bottom() - Style::SP_M - AI_ALERT_BUTTON_H;
     let mut out = BandOutcome::default();

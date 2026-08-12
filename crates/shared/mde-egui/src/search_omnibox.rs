@@ -194,7 +194,7 @@ pub fn ranked_hits<T: Clone + Eq>(
         .trim()
         .chars()
         .take(MAX_QUERY_CHARS)
-        .flat_map(|character| character.to_lowercase())
+        .flat_map(char::to_lowercase)
         .collect::<String>();
     let cap = cap.min(MAX_RANKED_HITS);
     if q.is_empty() || cap == 0 {
@@ -209,8 +209,7 @@ pub fn ranked_hits<T: Clone + Eq>(
     // Keep the first-seen vector so equal-ranked results retain source order;
     // the map only locates an authority's slot.
     let mut authority_slots: HashMap<(SearchDomain, String), usize> = HashMap::new();
-    let mut authorities: Vec<Option<(T, Option<ScoredItem<T>>)>> =
-        Vec::with_capacity(cap.min(64));
+    let mut authorities: Vec<Option<(T, Option<ScoredItem<T>>)>> = Vec::with_capacity(cap.min(64));
     for item in items {
         let authority = (
             item.domain,
@@ -233,12 +232,10 @@ pub fn ranked_hits<T: Clone + Eq>(
         if let Some(&slot) = authority_slots.get(&authority) {
             let conflicts = authorities[slot]
                 .as_ref()
-                .map_or(false, |(admitted_payload, _)| admitted_payload != &payload);
+                .is_some_and(|(admitted_payload, _)| admitted_payload != &payload);
             if conflicts {
                 authorities[slot] = None;
-            } else if let (Some((_, best)), Some(candidate)) =
-                (&mut authorities[slot], candidate)
-            {
+            } else if let (Some((_, best)), Some(candidate)) = (&mut authorities[slot], candidate) {
                 let improves_rank = match best.as_ref() {
                     Some(existing) => compare_scored(&candidate, existing).is_lt(),
                     None => true,
@@ -299,7 +296,7 @@ fn lowercase_bounded(value: &str) -> String {
     value
         .chars()
         .take(MAX_SEARCH_FIELD_CHARS)
-        .flat_map(|character| character.to_lowercase())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 

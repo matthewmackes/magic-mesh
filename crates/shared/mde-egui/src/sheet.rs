@@ -102,16 +102,16 @@ pub fn sheet_rect(
             )
         }
         SheetPresentation::Form => {
-            let w = FORM_SHEET_W.min((screen.width() - 2.0 * Style::SP_XL).max(0.0));
-            let h =
-                (top_detent * screen.height()).min((screen.height() - 2.0 * Style::SP_XL).max(0.0));
+            let w = FORM_SHEET_W.min(2.0f32.mul_add(-Style::SP_XL, screen.width()).max(0.0));
+            let h = (top_detent * screen.height())
+                .min(2.0f32.mul_add(-Style::SP_XL, screen.height()).max(0.0));
             let progress = if top_detent > f32::EPSILON {
                 fraction / top_detent
             } else {
                 0.0
             };
             let start_y = screen.bottom() + h * 0.5;
-            let center_y = start_y + (screen.center().y - start_y) * progress;
+            let center_y = (screen.center().y - start_y).mul_add(progress, start_y);
             Rect::from_center_size(pos2(screen.center().x, center_y), vec2(w, h))
         }
     }
@@ -168,12 +168,12 @@ impl SheetState {
 
     /// Present the sheet. A fresh open rises to the **lowest** detent; a sheet
     /// already targeting a detent keeps it.
-    pub fn open(&mut self) {
+    pub const fn open(&mut self) {
         self.open = true;
     }
 
     /// Present the sheet at (the detent nearest to) `fraction`.
-    pub fn open_at(&mut self, fraction: f32) {
+    pub const fn open_at(&mut self, fraction: f32) {
         self.open = true;
         self.target = fraction.clamp(0.0, 1.0);
     }
@@ -181,7 +181,7 @@ impl SheetState {
     /// Dismiss the sheet: it springs closed ([`Spring::SHEET`]) and stops
     /// painting once settled. PLATFORM-INTERFACES Q20/P5 — every dismissal path
     /// (Escape, scrim click, downward fling, programmatic) funnels here.
-    pub fn dismiss(&mut self) {
+    pub const fn dismiss(&mut self) {
         self.open = false;
         self.target = 0.0;
     }
@@ -383,8 +383,8 @@ impl<'a> Sheet<'a> {
         let shown = modal.show(ctx, |ui| {
             ui.set_clip_rect(rect);
             let inner_size = vec2(
-                (rect.width() - 2.0 * Style::SP_M).max(0.0),
-                (rect.height() - 2.0 * Style::SP_S).max(0.0),
+                2.0f32.mul_add(-Style::SP_M, rect.width()).max(0.0),
+                2.0f32.mul_add(-Style::SP_S, rect.height()).max(0.0),
             );
             ui.set_min_size(inner_size);
             fling_dismissed = self.drag_handle(ui, state, screen.height(), top, detents);
@@ -488,7 +488,7 @@ fn sheet_frame(presentation: SheetPresentation) -> Frame {
 
 /// Q23 — the sheet corner geometry off the U04 radii ladder.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn sheet_corner(presentation: SheetPresentation) -> CornerRadius {
+const fn sheet_corner(presentation: SheetPresentation) -> CornerRadius {
     let xl = Style::RADIUS_XL as u8;
     match presentation {
         SheetPresentation::Bottom => CornerRadius {
@@ -503,7 +503,7 @@ fn sheet_corner(presentation: SheetPresentation) -> CornerRadius {
 
 /// The sheet's inner padding on the spacing grid.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn sheet_margin() -> Margin {
+const fn sheet_margin() -> Margin {
     Margin::symmetric(Style::SP_M as i8, Style::SP_S as i8)
 }
 
@@ -521,7 +521,7 @@ pub enum PopoverSide {
 }
 
 /// Where a popover lands relative to its anchor — the pure placement result.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PopoverPlacement {
     /// The chosen side.
     pub side: PopoverSide,
@@ -552,7 +552,9 @@ pub fn popover_placement(anchor: Rect, size: Vec2, screen: Rect) -> PopoverPlace
         )
     };
     let min_x = screen.left() + margin;
-    let x = (anchor.center().x - size.x * 0.5)
+    let x = size
+        .x
+        .mul_add(-0.5, anchor.center().x)
         .clamp(min_x, (screen.right() - margin - size.x).max(min_x));
     let rect = Rect::from_min_size(pos2(x, y), size);
     let arrow_tip = match side {
@@ -734,15 +736,15 @@ mod tests {
         ] {
             let mut state = SheetState::closed();
             state.open_at(0.9);
-            let response = Sheet::new("hostile-detents", detents).show(
-                &ctx,
-                &mut state,
-                |_| content_called.set(true),
-            );
+            let response = Sheet::new("hostile-detents", detents)
+                .show(&ctx, &mut state, |_| content_called.set(true));
 
             assert!(response.is_none(), "invalid detents must fail closed");
             assert_eq!(state, SheetState::closed());
-            assert!(!content_called.get(), "untrusted modal content must not run");
+            assert!(
+                !content_called.get(),
+                "untrusted modal content must not run"
+            );
         }
     }
 

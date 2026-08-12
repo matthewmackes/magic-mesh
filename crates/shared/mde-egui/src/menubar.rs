@@ -566,7 +566,7 @@ fn title_header(ui: &mut Ui, title: &str, accent: Color32) {
         Sense::hover(),
     );
     ui.painter().galley(
-        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        egui::pos2(rect.left(), galley.size().y.mul_add(-0.5, rect.center().y)),
         galley,
         accent,
     );

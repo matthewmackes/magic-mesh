@@ -27,9 +27,10 @@ pub struct Motion;
 
 /// Runtime motion policy for every shared animation helper.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MotionMode {
     /// Full movement and the normal preset timings.
+    #[default]
     Normal = 0,
     /// Shortened/faded motion for vestibular comfort.
     Reduced = 1,
@@ -37,15 +38,9 @@ pub enum MotionMode {
     Disabled = 2,
 }
 
-impl Default for MotionMode {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 impl MotionMode {
     #[must_use]
-    fn from_u8(raw: u8) -> Self {
+    const fn from_u8(raw: u8) -> Self {
         match raw {
             1 => Self::Reduced,
             2 => Self::Disabled,
@@ -56,7 +51,7 @@ impl MotionMode {
     /// Whether this mode should report `Motion::reduce_motion() == true` for
     /// backwards-compatible callers that only understand the old boolean.
     #[must_use]
-    pub fn is_reduced(self) -> bool {
+    pub const fn is_reduced(self) -> bool {
         !matches!(self, Self::Normal)
     }
 }
@@ -106,7 +101,7 @@ impl MotionEasing {
         let t = t.clamp(0.0, 1.0);
         match self {
             Self::Linear => t,
-            Self::SmoothStep => t * t * (3.0 - 2.0 * t),
+            Self::SmoothStep => t * t * 2.0f32.mul_add(-t, 3.0),
         }
     }
 }
@@ -193,7 +188,7 @@ impl MotionSpec {
 
     /// Duration in seconds for a runtime mode.
     #[must_use]
-    pub fn duration_for(self, mode: MotionMode) -> f32 {
+    pub const fn duration_for(self, mode: MotionMode) -> f32 {
         match mode {
             MotionMode::Normal => self.normal_secs,
             MotionMode::Reduced => self.reduced_secs,
@@ -231,7 +226,7 @@ impl Phase {
     /// Derive the next phase from the desired visible state and whether the
     /// animation has reached its target.
     #[must_use]
-    pub fn resolve(want_visible: bool, settled: bool) -> Self {
+    pub const fn resolve(want_visible: bool, settled: bool) -> Self {
         match (want_visible, settled) {
             (false, true) => Self::Hidden,
             (false, false) => Self::Exiting,
@@ -242,14 +237,14 @@ impl Phase {
 
     /// Whether a surface in this phase should still be painted.
     #[must_use]
-    pub fn is_painted(self) -> bool {
+    pub const fn is_painted(self) -> bool {
         !matches!(self, Self::Hidden)
     }
 
     /// Whether background interaction should remain blocked by a modal in this
     /// phase. Exiting remains blocking until the surface is actually hidden.
     #[must_use]
-    pub fn modal_blocks_background(self) -> bool {
+    pub const fn modal_blocks_background(self) -> bool {
         self.is_painted()
     }
 }
@@ -306,8 +301,8 @@ impl Spring {
     #[must_use]
     pub fn step(self, pos: f32, vel: f32, target: f32, dt: f32) -> (f32, f32) {
         let dt = dt.clamp(0.0, 1.0 / 30.0);
-        let accel = self.stiffness * (target - pos) - self.damping * vel;
-        let vel = vel + accel * dt;
+        let accel = self.stiffness.mul_add(target - pos, -(self.damping * vel));
+        let vel = accel.mul_add(dt, vel);
         let pos = pos + vel * dt;
         (pos, vel)
     }
@@ -344,7 +339,7 @@ pub trait MotionValue: Copy + PartialEq + Send + Sync + 'static {
 }
 
 impl MotionValue for f32 {
-    const EPSILON: f32 = 0.001;
+    const EPSILON: Self = 0.001;
 
     fn lerp(self, target: Self, t: f32) -> Self {
         lerp_f32(self, target, t)
@@ -355,7 +350,7 @@ impl MotionValue for f32 {
     }
 
     fn is_finite(self) -> bool {
-        f32::is_finite(self)
+        Self::is_finite(self)
     }
 
     fn fail_closed_value() -> Self {
@@ -440,7 +435,7 @@ impl MotionValue for Color32 {
         let t = t.clamp(0.0, 1.0);
         let [sr, sg, sb, sa] = self.to_array();
         let [tr, tg, tb, ta] = target.to_array();
-        Color32::from_rgba_premultiplied(
+        Self::from_rgba_premultiplied(
             lerp_u8(sr, tr, t),
             lerp_u8(sg, tg, t),
             lerp_u8(sb, tb, t),
@@ -451,11 +446,13 @@ impl MotionValue for Color32 {
     fn distance(self, target: Self) -> f32 {
         let [sr, sg, sb, sa] = self.to_array();
         let [tr, tg, tb, ta] = target.to_array();
-        (i16::from(sr) - i16::from(tr))
-            .abs()
-            .max((i16::from(sg) - i16::from(tg)).abs())
-            .max((i16::from(sb) - i16::from(tb)).abs())
-            .max((i16::from(sa) - i16::from(ta)).abs()) as f32
+        f32::from(
+            (i16::from(sr) - i16::from(tr))
+                .abs()
+                .max((i16::from(sg) - i16::from(tg)).abs())
+                .max((i16::from(sb) - i16::from(tb)).abs())
+                .max((i16::from(sa) - i16::from(ta)).abs()),
+        )
     }
 
     fn is_finite(self) -> bool {
@@ -476,7 +473,7 @@ fn lerp_u8(start: u8, target: u8, t: f32) -> u8 {
 
 #[must_use]
 fn lerp_f32(start: f32, target: f32, t: f32) -> f32 {
-    start + (target - start) * t.clamp(0.0, 1.0)
+    (target - start).mul_add(t.clamp(0.0, 1.0), start)
 }
 
 /// A clamped opacity value (`0.0..=1.0`) for typed opacity animation.
@@ -486,13 +483,13 @@ pub struct MotionOpacity(pub f32);
 impl MotionOpacity {
     /// Construct opacity, clamped to `0.0..=1.0`.
     #[must_use]
-    pub fn new(value: f32) -> Self {
+    pub const fn new(value: f32) -> Self {
         Self(value.clamp(0.0, 1.0))
     }
 
     /// Return the clamped opacity value.
     #[must_use]
-    pub fn value(self) -> f32 {
+    pub const fn value(self) -> f32 {
         self.0
     }
 }
@@ -524,13 +521,13 @@ pub struct MotionScale(pub f32);
 impl MotionScale {
     /// Construct scale, clamped to `>= 0.0`.
     #[must_use]
-    pub fn new(value: f32) -> Self {
+    pub const fn new(value: f32) -> Self {
         Self(value.max(0.0))
     }
 
     /// Return the non-negative scale value.
     #[must_use]
-    pub fn value(self) -> f32 {
+    pub const fn value(self) -> f32 {
         self.0
     }
 }
@@ -676,37 +673,37 @@ impl<T: MotionValue> Animated<T> {
 
     #[must_use]
     /// Current visual value.
-    pub fn value(self) -> T {
+    pub const fn value(self) -> T {
         self.value
     }
 
     #[must_use]
     /// Current target value.
-    pub fn target(self) -> T {
+    pub const fn target(self) -> T {
         self.target
     }
 
     #[must_use]
     /// Eased progress toward the current target, `0.0..=1.0`.
-    pub fn progress(self) -> f32 {
+    pub const fn progress(self) -> f32 {
         self.progress
     }
 
     #[must_use]
     /// Elapsed seconds accumulated toward the current target.
-    pub fn elapsed(self) -> f32 {
+    pub const fn elapsed(self) -> f32 {
         self.elapsed
     }
 
     #[must_use]
     /// Active duration in seconds after resolving the current mode.
-    pub fn duration(self) -> f32 {
+    pub const fn duration(self) -> f32 {
         self.duration
     }
 
     #[must_use]
     /// Presentation phase implied by this animated value.
-    pub fn phase(self) -> Phase {
+    pub const fn phase(self) -> Phase {
         self.phase
     }
 
@@ -750,7 +747,7 @@ impl Motion {
 
     /// Resolve one semantic preset into its concrete timing/spring table.
     #[must_use]
-    pub fn spec(preset: MotionPreset) -> MotionSpec {
+    pub const fn spec(preset: MotionPreset) -> MotionSpec {
         MotionSpec::for_preset(preset)
     }
 
@@ -1116,7 +1113,7 @@ impl Motion {
     #[must_use]
     fn smoothstep(t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
+        t * t * 2.0f32.mul_add(-t, 3.0)
     }
 
     /// **Hover-lift** factor for a `t`∈`0..=1` hover progress → a bounded `0..=1`
@@ -1132,7 +1129,7 @@ impl Motion {
     /// `[0.97, 1.0]` (a subtle squash on press; `1.0` at rest).
     #[must_use]
     pub fn press_scale(t: f32) -> f32 {
-        1.0 - 0.03 * t.clamp(0.0, 1.0)
+        0.03f32.mul_add(-t.clamp(0.0, 1.0), 1.0)
     }
 
     /// **Focus-glow** factor `0..=1` for a `t`∈`0..=1` focus progress → the focus

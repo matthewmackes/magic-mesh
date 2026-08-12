@@ -1195,7 +1195,7 @@ impl Style {
     /// full alpha (unlike [`Color32::gamma_multiply`], which scales alpha too).
     #[must_use]
     fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
-        let mix = |x: u8, y: u8| (f32::from(x) * (1.0 - t) + f32::from(y) * t).round() as u8;
+        let mix = |x: u8, y: u8| f32::from(x).mul_add(1.0 - t, f32::from(y) * t).round() as u8;
         Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
     }
 
@@ -1614,7 +1614,7 @@ impl Elevation {
     /// superseding the per-surface `card_shadow()` helper that was copy-pasted
     /// across several shell surfaces.
     #[must_use]
-    pub fn egui_shadow(self) -> egui::epaint::Shadow {
+    pub const fn egui_shadow(self) -> egui::epaint::Shadow {
         self.shadow().to_shadow()
     }
 }
@@ -1626,7 +1626,7 @@ impl ShadowToken {
     /// into a `Frame` instead of re-typing the field mapping by hand.
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub fn to_shadow(self) -> egui::epaint::Shadow {
+    pub const fn to_shadow(self) -> egui::epaint::Shadow {
         egui::epaint::Shadow {
             offset: [self.offset[0] as i8, self.offset[1] as i8],
             blur: self.blur as u8,

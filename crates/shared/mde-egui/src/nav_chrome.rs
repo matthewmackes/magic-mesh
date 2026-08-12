@@ -4,7 +4,7 @@
 //! (§6 glue; the navigation sibling of [`crate::widgets`]).
 //!
 //! PLATFORM-INTERFACES Q19: navigation is SHARED components in `mde-egui` —
-//! NavigationBar / Toolbar / Sidebar land here first and the 17 surfaces adopt
+//! `NavigationBar` / Toolbar / Sidebar land here first and the 17 surfaces adopt
 //! them, so the platform's wayfinding reads as ONE system (back affordance,
 //! title placement, action slots, and the Settings/Files-style section list all
 //! come from a single source instead of seventeen near-copies).
@@ -152,7 +152,7 @@ pub struct AppFrameResponse {
 /// when the density's hit target plus a scaled gutter no longer fits.
 #[must_use]
 pub fn nav_bar_height(density: Density) -> f32 {
-    NAV_STRIP_H.max(density.min_hit_target() + Style::SP_S * density.spacing_scale())
+    NAV_STRIP_H.max(Style::SP_S.mul_add(density.spacing_scale(), density.min_hit_target()))
 }
 
 /// [`NavigationBar`] height for the `large_title` scroll-top variant: the
@@ -167,13 +167,13 @@ pub fn nav_bar_large_height(density: Density) -> f32 {
 /// grown to fit the density's hit target under touch.
 #[must_use]
 pub fn toolbar_height(density: Density) -> f32 {
-    TOOLBAR_BASE_H.max(density.min_hit_target() + Style::SP_XS * density.spacing_scale())
+    TOOLBAR_BASE_H.max(Style::SP_XS.mul_add(density.spacing_scale(), density.min_hit_target()))
 }
 
 /// [`Sidebar`] row height for `density` — the large control rung
 /// ([`Style::CONTROL_H_L`]), grown to the density's hit-target floor.
 #[must_use]
-pub fn sidebar_row_height(density: Density) -> f32 {
+pub const fn sidebar_row_height(density: Density) -> f32 {
     Style::CONTROL_H_L.max(density.min_hit_target())
 }
 
@@ -338,7 +338,7 @@ impl<'a> NavigationBar<'a> {
             .rect_filled(rect, 0.0, Style::resolve_color(ui.ctx(), Style::SURFACE));
         ui.painter().hline(
             rect.x_range(),
-            rect.bottom() - Style::STROKE_HAIRLINE * 0.5,
+            Style::STROKE_HAIRLINE.mul_add(-0.5, rect.bottom()),
             Style::hairline(),
         );
 
@@ -360,7 +360,10 @@ impl<'a> NavigationBar<'a> {
             );
             let width = Style::SP_S + Style::ICON_L + Style::SP_XS + galley.size().x + Style::SP_S;
             let back_rect = Rect::from_min_size(
-                egui::pos2(strip.left() + Style::SP_S, strip.center().y - hit * 0.5),
+                egui::pos2(
+                    strip.left() + Style::SP_S,
+                    hit.mul_add(-0.5, strip.center().y),
+                ),
                 Vec2::new(width, hit),
             );
             let id = ui.id().with("mde-nav-back");
@@ -389,7 +392,7 @@ impl<'a> NavigationBar<'a> {
             let side = Style::ICON_L * Motion::press_scale(press);
             let chevron = Rect::from_center_size(
                 egui::pos2(
-                    back_rect.left() + Style::SP_S + Style::ICON_L * 0.5,
+                    Style::ICON_L.mul_add(0.5, back_rect.left() + Style::SP_S),
                     back_rect.center().y,
                 ),
                 Vec2::splat(side),
@@ -398,7 +401,7 @@ impl<'a> NavigationBar<'a> {
             ui.painter().galley(
                 egui::pos2(
                     back_rect.left() + Style::SP_S + Style::ICON_L + Style::SP_XS,
-                    back_rect.center().y - galley.size().y * 0.5,
+                    galley.size().y.mul_add(-0.5, back_rect.center().y),
                 ),
                 galley,
                 accent,
@@ -414,7 +417,7 @@ impl<'a> NavigationBar<'a> {
         let tint = Style::resolve_color(ui.ctx(), Style::TEXT);
         for (index, action) in self.actions.iter().enumerate() {
             let slot = Rect::from_center_size(
-                egui::pos2(right - hit * 0.5, strip.center().y),
+                egui::pos2(hit.mul_add(-0.5, right), strip.center().y),
                 Vec2::splat(hit),
             );
             let id = ui.id().with(("mde-nav-action", index));
@@ -572,9 +575,9 @@ impl<'a> Toolbar<'a> {
         ui.painter()
             .rect_filled(rect, 0.0, Style::resolve_color(ui.ctx(), Style::SURFACE));
         let edge_y = if self.at_top {
-            rect.bottom() - Style::STROKE_HAIRLINE * 0.5
+            Style::STROKE_HAIRLINE.mul_add(-0.5, rect.bottom())
         } else {
-            rect.top() + Style::STROKE_HAIRLINE * 0.5
+            Style::STROKE_HAIRLINE.mul_add(0.5, rect.top())
         };
         ui.painter()
             .hline(rect.x_range(), edge_y, Style::hairline());
@@ -584,12 +587,12 @@ impl<'a> Toolbar<'a> {
         let gap = Style::SP_XS * sp;
 
         // Leading group, left-to-right from the leading edge.
-        let mut x = rect.left() + Style::SP_S * sp;
+        let mut x = Style::SP_S.mul_add(sp, rect.left());
         let mut index = 0usize;
         for item in self.leading {
             let width = self.item_width(ui, item, hit, sp);
             let slot = Rect::from_min_size(
-                egui::pos2(x, rect.center().y - hit * 0.5),
+                egui::pos2(x, hit.mul_add(-0.5, rect.center().y)),
                 Vec2::new(width, hit),
             );
             self.show_item(ui, slot, index, item, accent, &mut out);
@@ -604,11 +607,14 @@ impl<'a> Toolbar<'a> {
             .iter()
             .map(|item| self.item_width(ui, item, hit, sp))
             .collect();
-        let group: f32 = widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32;
-        let mut x = rect.right() - Style::SP_S * sp - group;
+        let group: f32 = gap.mul_add(
+            (widths.len().saturating_sub(1)) as f32,
+            widths.iter().sum::<f32>(),
+        );
+        let mut x = Style::SP_S.mul_add(-sp, rect.right()) - group;
         for (item, width) in self.trailing.iter().zip(widths) {
             let slot = Rect::from_min_size(
-                egui::pos2(x, rect.center().y - hit * 0.5),
+                egui::pos2(x, hit.mul_add(-0.5, rect.center().y)),
                 Vec2::new(width, hit),
             );
             self.show_item(ui, slot, index, item, accent, &mut out);
@@ -630,7 +636,7 @@ impl<'a> Toolbar<'a> {
                 Style::typography_font(TypographyRole::Label),
                 Color32::PLACEHOLDER,
             );
-            galley.size().x + 2.0 * Style::SP_S * sp
+            (2.0 * Style::SP_S).mul_add(sp, galley.size().x)
         }
     }
 
@@ -781,7 +787,7 @@ impl Sidebar {
         // once more from the newly-focused row).
         let focused_row = ui
             .ctx()
-            .memory(|m| m.focused())
+            .memory(egui::Memory::focused)
             .and_then(|focus| (0..total).find(|&i| Self::row_id(id_salt, i) == focus));
         let mut out: Option<Id> = None;
         if let Some(row) = focused_row {
@@ -813,12 +819,15 @@ impl Sidebar {
         let mut index = 0usize;
         for section in sections {
             if let Some(header) = section.header {
-                let head_h = Style::TYPE_FOOTNOTE + Style::SP_S * sp;
+                let head_h = Style::SP_S.mul_add(sp, Style::TYPE_FOOTNOTE);
                 let (head, _) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), head_h), Sense::hover());
                 if ui.is_rect_visible(head) {
                     ui.painter().text(
-                        egui::pos2(head.left() + Style::SP_S, head.bottom() - Style::SP_XS * sp),
+                        egui::pos2(
+                            head.left() + Style::SP_S,
+                            Style::SP_XS.mul_add(-sp, head.bottom()),
+                        ),
                         Align2::LEFT_BOTTOM,
                         header,
                         Style::typography_font(TypographyRole::Caption),
@@ -881,7 +890,7 @@ impl Sidebar {
             let mut text_x = plate.left() + Style::SP_S;
             if let Some(icon) = row.icon {
                 let glyph = Rect::from_center_size(
-                    egui::pos2(text_x + Style::ICON_M * 0.5, plate.center().y),
+                    egui::pos2(Style::ICON_M.mul_add(0.5, text_x), plate.center().y),
                     Vec2::splat(Style::ICON_M),
                 );
                 let tint = Style::resolve_color(
@@ -915,7 +924,7 @@ impl Sidebar {
             job.wrap.max_rows = 1;
             let galley = ui.fonts(|fonts| fonts.layout_job(job));
             ui.painter().galley(
-                egui::pos2(text_x, plate.center().y - galley.size().y * 0.5),
+                egui::pos2(text_x, galley.size().y.mul_add(-0.5, plate.center().y)),
                 galley,
                 color,
             );
