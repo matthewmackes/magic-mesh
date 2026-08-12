@@ -19,6 +19,7 @@ Command: `MCNF_BUILD_HOST=172.20.0.90 MCNF_BUILD_SLOT=func021-music-20260812 MCN
 
 Command: `MCNF_BUILD_HOST=172.20.0.50 MCNF_BUILD_SLOT=arch008-browser-control-20260812 MCNF_BUILD_SHAPE=small install-helpers/xcp-build.sh cargo test --manifest-path install-helpers/browser-vm-production-control/Cargo.toml --locked`
 
-- Result: helper cargo test could not start cleanly because Cargo attempted to update the standalone helper lockfile while `--locked` forbade it; the workspace compile then proceeded but the command is not accepted as a green locked gate.
-- Independent local boundary self-test: `install-helpers/lint-browser-vm-boundary.sh --self-test` passed.
-- Status: locked standalone helper gate needs a lockfile synchronization decision before it can be accepted.
+- The standalone helper lockfile was refreshed on `.90` with `cargo generate-lockfile` and committed with the current compatible dependency graph.
+- Locked farm test: `cargo test --manifest-path install-helpers/browser-vm-production-control/Cargo.toml --locked` passed: 30 library tests, 0 failures; all binary/doc-test targets also passed.
+- Locked farm clippy: `cargo clippy --manifest-path install-helpers/browser-vm-production-control/Cargo.toml --locked --all-targets` passed with existing warnings only.
+- Independent boundary self-test: `install-helpers/lint-browser-vm-boundary.sh --self-test` passed.
