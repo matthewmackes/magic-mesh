@@ -22,6 +22,8 @@ pub const MAX_CLIPBOARD_OWNER_BYTES: usize = 128;
 /// producer remains responsible for its existing content-id, source, timestamp,
 /// and echo/dedup semantics.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+/// Aggregate inline bytes admitted in one local rich clipboard generation.
+pub const MAX_CLIPBOARD_INLINE_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 
 /// One nonblocking update returned by a clipboard transport client.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -383,6 +385,7 @@ fn validate_offers(offers: &[ClipboardMimeOfferV2]) -> Result<(), LocalClipboard
         ));
     }
     let mut seen = Vec::with_capacity(offers.len());
+    let mut inline_bytes = 0usize;
     for offer in offers {
         offer
             .validate()
@@ -391,6 +394,14 @@ fn validate_offers(offers: &[ClipboardMimeOfferV2]) -> Result<(), LocalClipboard
             return Err(LocalClipboardError::Denied(
                 ClipboardDenialReasonV2::InvalidPayload,
             ));
+        }
+        if let ClipboardPayloadV2::InlineText { text } = &offer.payload {
+            inline_bytes = inline_bytes.saturating_add(text.len());
+            if inline_bytes > MAX_CLIPBOARD_INLINE_TOTAL_BYTES {
+                return Err(LocalClipboardError::Denied(
+                    ClipboardDenialReasonV2::Oversized,
+                ));
+            }
         }
         seen.push(offer.mime);
     }
@@ -656,6 +667,29 @@ mod tests {
 
         let oversized = "x".repeat(MAX_CLIPBOARD_INLINE_TEXT_BYTES + 1);
         assert!(ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextHtml, oversized).is_err());
+        assert!(authority.current().is_none());
+    }
+
+    #[test]
+    fn aggregate_inline_payload_bound_rejects_valid_individual_offers() {
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        let chunk = "x".repeat(MAX_CLIPBOARD_INLINE_TEXT_BYTES);
+        let first = ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextPlain, chunk.clone())
+            .expect("first bounded offer");
+        let second = ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextHtml, chunk)
+            .expect("second bounded offer");
+        let third = ClipboardMimeOfferV2::inline_text(
+            ClipboardMimeKind::TextRtf,
+            "x".repeat(MAX_CLIPBOARD_INLINE_TEXT_BYTES),
+        )
+        .expect("third bounded offer");
+        assert_eq!(
+            authority.replace(vec![first, second, third]),
+            Err(LocalClipboardError::Denied(
+                ClipboardDenialReasonV2::Oversized
+            ))
+        );
         assert!(authority.current().is_none());
     }
 
