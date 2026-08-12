@@ -1122,7 +1122,19 @@ fn badge(ui: &mut egui::Ui, text: &str) {
 }
 
 fn bounded_detail(detail: String) -> String {
-    detail.chars().take(256).collect()
+    const MAX_DETAIL_BYTES: usize = 256;
+    if detail.len() <= MAX_DETAIL_BYTES {
+        return detail;
+    }
+    let mut bounded = String::with_capacity(MAX_DETAIL_BYTES);
+    for character in detail.chars() {
+        if bounded.len().saturating_add(character.len_utf8()) > MAX_DETAIL_BYTES - 3 {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded.push_str("...");
+    bounded
 }
 
 fn unix_now_ms() -> u64 {
@@ -1459,6 +1471,14 @@ mod tests {
         assert!(error.contains("conflicting"));
         assert!(matches!(model.feed_state, FeedState::Conflict(_)));
         assert_eq!(model.visible_entries(NOW).len(), 2);
+    }
+
+    #[test]
+    fn reconnect_detail_is_utf8_safe_and_byte_bounded() {
+        let detail = bounded_detail("界".repeat(256));
+        assert!(detail.len() <= 256);
+        assert!(detail.is_char_boundary(detail.len()));
+        assert!(detail.ends_with("..."));
     }
 
     #[test]
