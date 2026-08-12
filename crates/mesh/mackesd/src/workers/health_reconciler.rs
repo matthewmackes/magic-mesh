@@ -1177,7 +1177,14 @@ fn clear_invalid_health_projection(
     let path = health_projection_path(workgroup_root, publisher);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return;
+        }
         Err(_) => {
             report.projection_failures += 1;
             return;
