@@ -1378,6 +1378,13 @@ pub fn write_inventory(workgroup_root: &Path, inv: &DeviceInventory) -> std::io:
     let tmp = dir.join(format!(".{}.json.tmp", inv.host));
     write_inventory_temp(&tmp, body.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
+    // The rename makes the row visible atomically, but durability also needs
+    // the staged file and its containing directory flushed before reporting
+    // publication success. Otherwise a crash can lose the new generation
+    // while callers already hold a successful result.
+    let published = File::open(&path)?;
+    published.sync_all()?;
+    File::open(&dir)?.sync_all()?;
     Ok(path)
 }
 
@@ -1414,7 +1421,8 @@ fn write_inventory_temp(path: &Path, body: &[u8]) -> std::io::Result<()> {
         Mode::RUSR | Mode::WUSR,
     )?;
     let mut file = File::from(fd);
-    file.write_all(body)
+    file.write_all(body)?;
+    file.sync_all()
 }
 
 /// Open the stable per-host publication lock without following a substituted

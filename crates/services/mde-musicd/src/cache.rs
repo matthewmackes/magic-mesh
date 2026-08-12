@@ -83,7 +83,10 @@ pub fn read_shared_artwork(cover_id: &str) -> Option<Vec<u8>> {
     if !std::fs::symlink_metadata(&path).ok()?.is_file() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_artwork_nofollow(&path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::new();
     file.take((MAX_SHARED_ARTWORK_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -92,6 +95,25 @@ pub fn read_shared_artwork(cover_id: &str) -> Option<Vec<u8>> {
         return None;
     }
     (!bytes.is_empty()).then_some(bytes)
+}
+
+fn open_artwork_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        return std::fs::OpenOptions::new()
+            .read(true)
+            // Linux's O_NOFOLLOW is stable; keep this service free of a
+            // direct libc dependency for one open flag.
+            .custom_flags(0o400000)
+            .open(path);
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
 }
 
 /// Write pulled-down cover-art bytes to the communal mesh cache (best-effort; a
