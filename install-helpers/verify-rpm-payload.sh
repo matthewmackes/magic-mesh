@@ -226,7 +226,16 @@ check_grouped_mackesd_assets() {
     '/usr/lib/systemd/system/mackesd.service' \
     'systemctl enable mackesd.target' \
     'systemctl start mackesd.target'; do
-    if grep -Fq "$lifecycle_token" "$CARGO_TOML"; then
+    if [[ "$lifecycle_token" == 'systemctl enable mackesd.target' ]]; then
+      # The post-install script may enable mackesd.target in the same
+      # systemctl invocation as the other boot units; require the target as
+      # an enabled argument, not an exact three-token command.
+      if grep -Eq 'systemctl enable([^#]*[[:space:]])mackesd\.target([[:space:]]|$)' "$CARGO_TOML"; then
+        ok "upgrade lifecycle contains: $lifecycle_token"
+      else
+        fail "upgrade lifecycle MISSING: $lifecycle_token"
+      fi
+    elif grep -Fq "$lifecycle_token" "$CARGO_TOML"; then
       ok "upgrade lifecycle contains: $lifecycle_token"
     else
       fail "upgrade lifecycle MISSING: $lifecycle_token"
