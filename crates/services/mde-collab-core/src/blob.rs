@@ -58,7 +58,7 @@ pub struct FsBlobCommit {
 impl FsBlobStage {
     /// The exact digest and length verified while streaming into this stage.
     #[must_use]
-    pub fn reference(&self) -> &PayloadRef {
+    pub const fn reference(&self) -> &PayloadRef {
         &self.reference
     }
 
@@ -67,6 +67,16 @@ impl FsBlobStage {
     /// A hard link is the portable no-replace primitive here: the staging file
     /// and canonical file are siblings on one filesystem, and `hard_link`
     /// fails with `AlreadyExists` instead of overwriting a concurrent writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage cannot be linked, verified, sealed, or
+    /// synchronized.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internally validated staging path is unexpectedly
+    /// absent.
     pub fn commit(mut self) -> Result<FsBlobCommit> {
         let commit_file = self.file.try_clone()?;
         let path = self.path.as_ref().expect("live staging path");
@@ -144,6 +154,10 @@ impl FsBlobStage {
     }
 
     /// Explicitly discard this private stage. Drop provides the same cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the private staging file cannot be removed.
     pub fn abort(mut self) -> Result<()> {
         self.remove_stage()
     }
@@ -172,14 +186,14 @@ impl Drop for FsBlobStage {
 impl FsBlobCommit {
     /// The exact digest and length installed or found in canonical CAS.
     #[must_use]
-    pub fn reference(&self) -> &PayloadRef {
+    pub const fn reference(&self) -> &PayloadRef {
         &self.reference
     }
 
     /// Whether this token, rather than a concurrent idempotent writer,
     /// installed the canonical inode.
     #[must_use]
-    pub fn owns_install(&self) -> bool {
+    pub const fn owns_install(&self) -> bool {
         self.owns_install
     }
 
@@ -193,6 +207,11 @@ impl FsBlobCommit {
 
     /// Roll back this token's canonical installation, if it is still the same
     /// inode. An idempotent token which found another writer's blob is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a still-owned canonical file cannot be removed or
+    /// its directory cannot be synchronized.
     pub fn abort(mut self) -> Result<()> {
         self.cleanup_install()
     }
@@ -220,6 +239,11 @@ impl Drop for FsBlobCommit {
 
 /// Verify that `bytes` match `reference` (both digest and length). The single
 /// integrity gate every fetch funnels through.
+///
+/// # Errors
+///
+/// Returns a size- or hash-mismatch error when `bytes` do not match
+/// `reference`.
 pub fn verify_bytes(bytes: &[u8], reference: &PayloadRef) -> Result<()> {
     let actual_len = bytes.len() as u64;
     if actual_len != reference.len {
@@ -243,11 +267,20 @@ pub trait BlobStore {
     /// Store `bytes`, returning the content-addressed [`PayloadRef`] (digest +
     /// length) the caller then puts on an event. Storing the same bytes twice is
     /// idempotent (same digest, same location).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot materialize the blob.
     fn put(&mut self, bytes: &[u8]) -> Result<PayloadRef>;
 
     /// Fetch and **verify** the bytes for `reference`. Errors with
     /// [`CollabError::BlobNotFound`] if absent, or a hash/size-mismatch error if
     /// the stored bytes do not match the reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the blob is absent, unreadable, or fails integrity
+    /// verification.
     fn get(&self, reference: &PayloadRef) -> Result<Vec<u8>>;
 
     /// Whether a blob with this lower-hex SHA-256 digest is present (no verify).
@@ -256,6 +289,11 @@ pub trait BlobStore {
     /// Remove the blob with this digest. Returns `true` if it existed. Callers
     /// gate this on the tombstone purge rule (all known members acked) — the
     /// store itself imposes no policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing blob cannot be safely verified or
+    /// removed.
     fn purge(&mut self, sha256_hex: &str) -> Result<bool>;
 }
 
@@ -300,8 +338,10 @@ impl BlobStore for MemoryBlobStore {
     }
 }
 
-/// A filesystem content-addressed store under a root (`<root>/<ab>/<digest>`,
-/// sharded by the first digest byte to keep directories shallow). The real
+/// A filesystem content-addressed store under a root.
+///
+/// It uses `<root>/<ab>/<digest>`, sharded by the first digest byte to keep
+/// directories shallow. The real
 /// per-user store; see [`default_root`] for the MDE data-root default.
 #[derive(Debug, Clone)]
 pub struct FsBlobStore {
@@ -375,10 +415,10 @@ impl FsBlobStore {
             use std::os::unix::fs::OpenOptionsExt;
 
             // Linux fcntl.h: O_NOFOLLOW == 00400000 (octal).
-            return OpenOptions::new()
+            OpenOptions::new()
                 .read(true)
                 .custom_flags(0o400_000)
-                .open(path);
+                .open(path)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -397,6 +437,15 @@ impl FsBlobStore {
     /// Stream a blob into a private create-new file while enforcing the exact
     /// caller-provided length and SHA-256. No unverified bytes become visible
     /// at the canonical content address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expected reference is invalid, the stage cannot
+    /// be created or synchronized, or the reader's bytes do not match it.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally constructed canonical path has no parent.
     pub fn stage<R: Read>(&self, mut reader: R, expected: &PayloadRef) -> Result<FsBlobStage> {
         if expected.len > MAX_BLOB_BYTES {
             return Err(oversized_blob_error(expected.len));
@@ -429,7 +478,7 @@ impl FsBlobStore {
 
         let mut hasher = Sha256::new();
         let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = [0_u8; 16 * 1024];
         loop {
             let remaining = expected.len.saturating_add(1).saturating_sub(total);
             if remaining == 0 {
@@ -485,7 +534,7 @@ fn create_private_stage(parent: &Path, digest: &str) -> std::io::Result<(PathBuf
         }
         match options.open(&path) {
             Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
@@ -507,7 +556,10 @@ fn verify_file_at_path(path: &Path, reference: &PayloadRef) -> Result<File> {
             actual: metadata.len(),
         });
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        CollabError::Io("blob is too large to materialize on this platform".to_owned())
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
     (&mut file)
         .take(MAX_BLOB_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -525,7 +577,7 @@ fn verify_open_file_digest(file: &mut File, expected_digest: &str) -> Result<()>
     }
 
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; 16 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -637,7 +689,10 @@ impl BlobStore for FsBlobStore {
                 actual: metadata.len(),
             });
         }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let capacity = usize::try_from(metadata.len()).map_err(|_| {
+            CollabError::Io("blob is too large to materialize on this platform".to_owned())
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
         file.take(MAX_BLOB_BYTES.saturating_add(1))
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_BLOB_BYTES {
