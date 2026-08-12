@@ -1271,8 +1271,9 @@ pub(crate) fn peer_app_search_items_with_favorites(
                 .map(|reason| format!(" · {reason}"))
                 .unwrap_or_default();
             let target_line = format!(
-                "Guest {} · on {}{}",
+                "Guest {} · {} · on {}{}",
                 peer_app_source_label(&app.source),
+                id,
                 node,
                 status
             );
@@ -1281,6 +1282,7 @@ pub(crate) fn peer_app_search_items_with_favorites(
                 "remote app".to_owned(),
                 node.to_owned(),
                 id.to_owned(),
+                name.to_owned(),
                 app.source,
                 app.icon,
             ];
