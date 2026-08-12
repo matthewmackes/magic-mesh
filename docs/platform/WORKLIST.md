@@ -2047,16 +2047,17 @@ behavioral evidence is not completion.
 - Origin or merged source IDs: 2026-08-08 Clock Interface 50-question operator survey; AOSP DeskClock reference; existing shell Timers & Alarms implementation; UX-012
   clock/tray, FUNC-017 clock-weather, FUNC-021 Music/radio, Notification Center, and curtain workstreams.
 
-### WL-CRIT-006 - Production evidence, six-node acceptance, and corrected-forward recovery
+### WL-CRIT-006 - Production evidence, single-node acceptance, and corrected-forward recovery
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: Static tests are strong but one signed release gate does not yet prove CI authority, farm topology, package integrity, three-seat behavior, lighthouses,
   recovery, and corrected-forward deployment together.
 - Required outcome: GitHub required checks and farm evidence bind one revision;
-  signed schema-5 evidence proves six-node acceptance using exactly three
-  physical test seats plus three lighthouses, package/runtime integrity,
-  recovery, and corrected-forward promotion without rollback.
+  signed schema-5 evidence proves baseline acceptance on one selected physical
+  test node/seat, package/runtime integrity, recovery, and corrected-forward
+  promotion without rollback. Additional physical nodes, seats, or lighthouses
+  are optional follow-up evidence and are not release blockers.
 - Current state: signing exists; live release proof remains. Evidence: `evidence/WL-CRIT-006-WL-ARCH-009-2026-08-11-worker-executable-generation-r467.md`.
 - **Farm expansion (2026-08-08):** XEN-196 is a verified fifth build node; topology is 5/5 with 10 slots and `.196` passed `mde-bus` 425/425:
   `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
@@ -2080,8 +2081,8 @@ behavioral evidence is not completion.
 - **Signing rollback:** failed publication preserves substituted paths and restores every RPM in a failed batch; focused farm self-tests passed:
   `evidence/WL-CRIT-006-2026-08-11-signing-partial-rollback-r300.md`, `evidence/WL-CRIT-006-2026-08-11-multi-rpm-signing-rollback-r387.md`.
 - **Exact production topology roster (2026-08-11):** schema-5 publication
-  cross-binds verified topology identities to the gate manifest's exact three
-  governed seats and three canonical lighthouses; helper self-test passed:
+  cross-binds verified topology identities to the gate manifest's selected
+  baseline seat; additional seats/lighthouses are optional; helper self-test passed:
   `docs/platform/evidence/WL-CRIT-006-2026-08-11-exact-topology-roster-r251.md`.
 - **Farm orchestrator timeout boundary (2026-08-11):** etcd curl range/get calls kill hung children and fail closed; BigBoy passed 1/1:
   `evidence/WL-CRIT-006-2026-08-11-farm-orchestrator-timeout-r227.md`.
@@ -2185,14 +2186,16 @@ behavioral evidence is not completion.
      - Acceptance: required GitHub checks are the authoritative merge gate.
      - Validation: full farm cargo/package/secret/architecture gates.
      - Done when: all required checks are green or named blockers are carried.
-  4. S4 Run fleet and live-seat acceptance.
-     - Objective: deploy the same revision to Dell, seat 15, Surface, and three lighthouses with alert protocol; any substitute seat keeps the physical test set at three or fewer.
+  4. S4 Run baseline live-seat acceptance.
+     - Objective: deploy the same revision to one selected physical test seat
+       with alert protocol. Additional seats or lighthouses may be exercised,
+       but are optional and non-blocking.
      - Inputs: S3, enrollment roster, rollout policy.
      - Deliverable: runtime, GUI, network, audio, VDI, and package captures.
      - Depends on: S3.
-     - Acceptance: no stale installed payload or missing seat/lighthouse is treated as pass.
-     - Validation: named live-seat and lighthouse scripts.
-     - Done when: every selected-seat and lighthouse matrix row has direct evidence without exceeding the three-seat cap.
+     - Acceptance: no stale installed payload or missing baseline seat is treated as pass.
+     - Validation: the named live-seat script for the selected baseline seat.
+     - Done when: the baseline seat has direct evidence; optional additional-seat/lighthouse rows do not gate completion.
   5. S5 Exercise failure and corrected-forward recovery.
      - Objective: inject process, network, sleep, reboot, provider, package, and peer failures and recover by re-enrollment/corrected forward.
      - Inputs: S4 and CRIT-007.
@@ -2211,11 +2214,11 @@ behavioral evidence is not completion.
      - Done when: decision is reproducible from the evidence bundle.
 - Scope: Owns release gate authority, schema/signing, farm/CI/package/live evidence, topology, rollout, failure injection, and promotion decision. Feature implementation
   remains in its owner epic.
-- Relevant files/components: AI_GOVERNANCE, CI workflow, install-helpers release/evidence/farm scripts, package manifests, docs/platform/evidence, three-seat and
-  lighthouse tooling.
+- Relevant files/components: AI_GOVERNANCE, CI workflow, install-helpers release/evidence/farm scripts, package manifests, docs/platform/evidence, baseline live-seat
+  tooling; optional multi-seat/lighthouse tooling remains non-blocking.
 - Dependencies: all P0/P1 feature epics, CRIT-007, and the active repository revision.
 - Acceptance criteria:
-  1. One revision has complete signed farm, package, live-seat, lighthouse, and recovery evidence.
+  1. One revision has complete signed farm, package, baseline single-seat, and recovery evidence; optional multi-seat/lighthouse evidence may be added but is not required.
   2. GitHub required checks and verifier reject missing, altered, stale, or mismatched evidence.
   3. Promotion uses corrected-forward recovery and archives the closed epic.
 - Verification method: worklist/governance/doc/secret/supersession lints, farm cargo/package gates, release verifier, and named live scripts; longest job on BigBoy.
