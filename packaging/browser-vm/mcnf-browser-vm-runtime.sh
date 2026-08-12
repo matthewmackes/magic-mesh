@@ -30,8 +30,25 @@ if : >> "$runtime_log" 2>/dev/null; then
     chmod 0600 "$runtime_log"
     exec 2>>"$runtime_log"
 fi
+# Keep a bounded, non-secret startup trace available to the host acceptance
+# collector.  The private runtime log above remains the detailed guest record;
+# this projection contains only the phase/status lines emitted below.
+diagnostic_log=/var/tmp/mcnf-browser-runtime-diagnostic.log
+if : >> "$diagnostic_log" 2>/dev/null; then
+    chmod 0644 "$diagnostic_log"
+    diagnostic_size=$(wc -c <"$diagnostic_log")
+    case "$diagnostic_size" in
+        ''|*[!0-9]*) diagnostic_size=0 ;;
+    esac
+    if [ "$diagnostic_size" -gt 65536 ]; then
+        : >"$diagnostic_log"
+    fi
+fi
 log() {
     printf 'mcnf-browser-vm-runtime: %s\n' "$*"
+    if [ -w "$diagnostic_log" ]; then
+        printf '%s mcnf-browser-vm-runtime: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$diagnostic_log"
+    fi
 }
 trap 'status=$?; log "exited status=$status"' EXIT
 
