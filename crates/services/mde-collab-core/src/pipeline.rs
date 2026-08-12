@@ -63,6 +63,7 @@ const MAX_CLEAR_CLIPBOARD_EVENTS: usize = 50;
 pub const MAX_AI_REQUEST_ID_BYTES: usize = 128;
 
 /// The largest accepted inline alert action id. Action ids are signed into
+///
 /// invocation events and may be consumed by downstream verb/topic adapters;
 /// keep them bounded and token-shaped at the authority boundary.
 pub const MAX_ALERT_ACTION_ID_BYTES: usize = 128;

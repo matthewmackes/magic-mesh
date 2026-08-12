@@ -656,20 +656,20 @@ impl Projection {
     ///
     /// Returns an error if the stored rows cannot be read or decoded.
     pub fn call_state(&self, space: Option<SpaceId>) -> Result<CallState> {
-        let (sql, want) = match space {
-            Some(s) => (
-                "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
-                 WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, call_id"
-                    .to_string(),
-                Some(s.to_string()),
-            ),
-            None => (
+        let (sql, want) = space.map_or_else(
+            || (
                 "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
                  ORDER BY clock_wall, clock_counter, call_id"
                     .to_string(),
                 None,
             ),
-        };
+            |s| (
+                "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
+                 WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, call_id"
+                    .to_string(),
+                Some(s.to_string()),
+            ),
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row<'_>| {
             Ok((
@@ -707,6 +707,10 @@ impl Projection {
     /// This projects only signed call state: non-ended calls where `local_actor`
     /// is a connected participant. It does **not** open media, select a route,
     /// or claim WebRTC/SIP/LiveKit success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored call or participant rows cannot be read or decoded.
     pub fn call_media_readiness(
         &self,
         local_actor: &ActorId,
@@ -789,20 +793,20 @@ impl Projection {
     pub fn document_sessions(&self, space: Option<SpaceId>) -> Result<DocumentSessions> {
         let base = "SELECT space_id, document_id, title, participants_json FROM documents";
         let document_session_limit = MAX_DOCUMENT_SESSIONS + 1;
-        let (sql, want) = match space {
-            Some(s) => (
-                format!(
-                    "{base} WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, document_id LIMIT {document_session_limit}"
-                ),
-                Some(s.to_string()),
-            ),
-            None => (
+        let (sql, want) = space.map_or_else(
+            || (
                 format!(
                     "{base} ORDER BY clock_wall, clock_counter, document_id LIMIT {document_session_limit}"
                 ),
                 None,
             ),
-        };
+            |s| (
+                format!(
+                    "{base} WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, document_id LIMIT {document_session_limit}"
+                ),
+                Some(s.to_string()),
+            ),
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row<'_>| {
             Ok((
@@ -1328,6 +1332,10 @@ struct CallRow {
 
 impl SpaceFold {
     #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "separate no-op event families document which signed events do not alter this projection"
+    )]
     fn apply(&mut self, space: SpaceId, env: &CollabEventEnvelope) {
         let _ = space;
         let previous_last_clock = self.last_clock;
