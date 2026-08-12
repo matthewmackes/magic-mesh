@@ -3607,7 +3607,7 @@ mod tests {
             schema_version: RESOURCE_CONTRACT_VERSION,
             revision: "rev-42".into(),
             publisher: "seat-15".into(),
-            generated_at_ms: NOW + 1_000,
+            generated_at_ms: NOW,
             content_digest: None,
             cards: vec![valid_card()],
         }
