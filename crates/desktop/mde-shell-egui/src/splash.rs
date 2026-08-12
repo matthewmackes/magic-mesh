@@ -342,7 +342,10 @@ impl Splash {
     /// shell on an optional status helper.
     pub(crate) fn services_settled(&self) -> bool {
         boot_services().iter().all(|service| {
-            if matches!(service.unit.as_str(), "mesh-health.service" | "mesh-status.service") {
+            if matches!(
+                service.unit.as_str(),
+                "mesh-health.service" | "mesh-status.service"
+            ) {
                 return true;
             }
             matches!(

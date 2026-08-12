@@ -38,8 +38,8 @@ use serde::Deserialize;
 use mde_bus::persist::Persist;
 
 use mackes_mesh_types::workloads::{
-    WorkloadBackend, WorkloadOperationAction, WorkloadOperationStatus,
-    WorkloadPowerState, WorkloadProfile, WorkloadStateSnapshot, WORKLOAD_OPERATION_TOPIC,
+    WorkloadBackend, WorkloadOperationAction, WorkloadOperationStatus, WorkloadPowerState,
+    WorkloadProfile, WorkloadStateSnapshot, WORKLOAD_OPERATION_TOPIC,
 };
 
 use crate::bus_reader::BusReader;
@@ -380,9 +380,7 @@ fn power_label(power: WorkloadPowerState) -> &'static str {
     }
 }
 
-fn workload_rows(
-    snapshot: &WorkloadStateSnapshot,
-) -> (Vec<Instance>, Vec<Container>) {
+fn workload_rows(snapshot: &WorkloadStateSnapshot) -> (Vec<Instance>, Vec<Container>) {
     let mut instances = Vec::new();
     let mut containers = Vec::new();
     for status in &snapshot.workloads {
@@ -509,7 +507,7 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, action: &Li
     let (host, name, operation) = match action {
         Lifecycle::Start { host, name } => (host, name, WorkloadOperationAction::Start),
         Lifecycle::Stop { host, name, .. } => (host, name, WorkloadOperationAction::Stop),
-            Lifecycle::Create => {
+        Lifecycle::Create => {
             *last_error = Some(
                 "VM creation is managed by Workloads — open Workloads → New workload to continue."
                     .into(),
@@ -593,7 +591,7 @@ impl CreateForm {
     }
 }
 
-    /// The Fleet plane's live datacenter state: the projected per-node view plus the
+/// The Fleet plane's live datacenter state: the projected per-node view plus the
 /// small IO/form context to refresh it and drive lifecycle.
 pub(crate) struct DatacenterState {
     /// Desktop-client Bus spool (resolved once). `None` on a box with no Bus dir
@@ -1402,8 +1400,16 @@ mod tests {
         } else {
             "stopped"
         };
-        let phase = if state == "running" { "ready" } else { "completed" };
-        let readiness = if state == "running" { "ready" } else { "unknown" };
+        let phase = if state == "running" {
+            "ready"
+        } else {
+            "completed"
+        };
+        let readiness = if state == "running" {
+            "ready"
+        } else {
+            "unknown"
+        };
         let mut value = serde_json::json!({
             "schema_version": 1,
             "request_id": format!("test-{kind}-{name}"),
@@ -2090,10 +2096,14 @@ mod tests {
     #[test]
     fn publish_without_a_bus_root_records_an_error() {
         let mut err = None;
-        publish(None, &mut err, &Lifecycle::Start {
-            host: "n".to_string(),
-            name: "v".to_string(),
-        });
+        publish(
+            None,
+            &mut err,
+            &Lifecycle::Start {
+                host: "n".to_string(),
+                name: "v".to_string(),
+            },
+        );
         assert!(err.is_some(), "a missing bus dir is surfaced, not panicked");
     }
 
@@ -2115,11 +2125,9 @@ mod tests {
         let messages = persist.list_since(WORKLOAD_OPERATION_TOPIC, None).unwrap();
         assert_eq!(messages.len(), 1);
         let body = messages[0].body.as_deref().unwrap();
-        let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
-            body,
-            unix_millis(),
-        )
-        .expect("typed request");
+        let request =
+            mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(body, unix_millis())
+                .expect("typed request");
         assert_eq!(request.target_node, "node-a");
         assert_eq!(request.workload_id.as_str(), "vm:node-a:web1");
         assert_eq!(request.action, WorkloadOperationAction::Stop);

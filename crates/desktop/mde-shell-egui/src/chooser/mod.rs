@@ -54,9 +54,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mackes_mesh_types::workloads::{
-    WorkloadBackend, WorkloadOperationAction, WorkloadProfile,
-};
+use mackes_mesh_types::workloads::{WorkloadBackend, WorkloadOperationAction, WorkloadProfile};
 use mde_egui::egui::{
     self, FontId, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
 };
@@ -585,11 +583,12 @@ fn authoritative_workload_generation(
 ) -> Result<u64, String> {
     let persist = mde_bus::persist::Persist::open(root.to_path_buf())
         .map_err(|error| format!("authoritative Workload projection unavailable: {error}"))?;
-    let status = crate::workload_api::read_status(&persist, node, workload_id).ok_or_else(|| {
-        format!(
-            "authoritative Workload projection has no current row for {workload_id} on {node}"
-        )
-    })?;
+    let status =
+        crate::workload_api::read_status(&persist, node, workload_id).ok_or_else(|| {
+            format!(
+                "authoritative Workload projection has no current row for {workload_id} on {node}"
+            )
+        })?;
     if status.backend != WorkloadBackend::LibvirtVirtqemud {
         return Err(format!(
             "authoritative Workload row for {workload_id} is not a VM"

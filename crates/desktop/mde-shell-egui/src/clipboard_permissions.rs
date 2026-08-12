@@ -747,9 +747,8 @@ impl ClipboardPermissionModel {
         // arbitrary eviction while quiet sources can remain blocked forever.
         // Expire marks at their admitting envelope/lease boundary before
         // comparing sequence high-water marks.
-        self.replay_marks.retain(|mark| {
-            !mark.lease_id.is_empty() || now_ms < mark.expires_at_ms
-        });
+        self.replay_marks
+            .retain(|mark| !mark.lease_id.is_empty() || now_ms < mark.expires_at_ms);
         self.replay_marks.iter().any(|mark| {
             mark.source_node == metadata.source_node
                 && mark.source_seat == metadata.source_seat
@@ -1830,7 +1829,9 @@ mod tests {
             )
             .expect("first authority window")
             .expect("approval token");
-        model.deny(NOW + 1).expect("terminal decision records replay");
+        model
+            .deny(NOW + 1)
+            .expect("terminal decision records replay");
 
         let renewed = envelope(40, "text/html");
         assert_eq!(

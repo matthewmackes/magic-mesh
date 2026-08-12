@@ -423,7 +423,7 @@ fn read_bounded_session_record(path: &Path) -> Option<String> {
         use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        options.custom_flags(0o400_000 | 0o4000 | 0o2_000_000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
 
@@ -469,8 +469,7 @@ fn read_bounded_session_record_file(file: &fs::File, before: &fs::Metadata) -> O
         .min(MAX_SESSION_RECORD_BYTES)
         .saturating_add(1);
     let mut bytes = Vec::with_capacity(capacity);
-    (&*file)
-        .take((MAX_SESSION_RECORD_BYTES as u64).saturating_add(1))
+    file.take((MAX_SESSION_RECORD_BYTES as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
     let after = file.metadata().ok()?;
@@ -781,9 +780,10 @@ impl RoamingSession {
     /// owner. A missing, replaced, or otherwise invalid row is a yielded lease;
     /// treating it as ownership would let a seat reassert after replication loss.
     fn holds_current_lease(&self) -> bool {
+        let held_generation = self.held_gen;
         self.store
             .current(&self.identity)
-            .is_some_and(|record| record.seat == self.seat && record.lease_gen == self.held_gen)
+            .is_some_and(|record| record.seat == self.seat && record.lease_gen == held_generation)
     }
 }
 

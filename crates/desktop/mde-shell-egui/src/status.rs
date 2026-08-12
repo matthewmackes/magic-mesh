@@ -178,9 +178,7 @@ fn latest_rollup(persist: &Persist, segment: StatusSegment) -> Option<SegmentRol
         if candidate.segment != segment.key()
             || latest
                 .as_ref()
-                .is_some_and(|current: &SegmentRollup| {
-                    candidate.ts_unix_ms <= current.ts_unix_ms
-                })
+                .is_some_and(|current: &SegmentRollup| candidate.ts_unix_ms <= current.ts_unix_ms)
         {
             continue;
         }

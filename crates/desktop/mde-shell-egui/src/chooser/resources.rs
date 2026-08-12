@@ -1452,9 +1452,7 @@ fn current_resource_action_count(
 ) -> usize {
     card.actions
         .iter()
-        .filter(|action| {
-            action.verb == verb && service_action_is_admitted(action, true, now_ms)
-        })
+        .filter(|action| action.verb == verb && service_action_is_admitted(action, true, now_ms))
         .count()
 }
 
@@ -2236,7 +2234,10 @@ mod tests {
         assert_eq!(state.catalog.as_ref(), Some(&admitted.catalog));
         assert!(state.authenticated_catalog.is_none());
         assert!(state.take_vdi_handoff().is_none());
-        assert!(state.error.as_deref().is_some_and(|error| error.contains("does not match")));
+        assert!(state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not match")));
 
         state.apply_refresh_result(Ok(admitted));
         assert!(state.authenticated_catalog.is_some());

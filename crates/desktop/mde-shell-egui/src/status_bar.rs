@@ -45,8 +45,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use mackes_mesh_types::health::{
-    GradeLetter, HEALTH_SCHEMA_VERSION, HealthSeverity, MAX_HEALTH_ID_BYTES,
-    MAX_NODE_HEALTH_CONDITIONS, NodeGrade, RequirementClass, SystemMeshHealthSnapshot,
+    GradeLetter, HealthSeverity, NodeGrade, RequirementClass, SystemMeshHealthSnapshot,
+    HEALTH_SCHEMA_VERSION, MAX_HEALTH_ID_BYTES, MAX_NODE_HEALTH_CONDITIONS,
 };
 use mde_egui::egui;
 use mde_egui::{Motion, Style, TypographyRole};
@@ -55,7 +55,7 @@ use mde_theme::brand::icons::IconId;
 use crate::chrome::HealthStatus;
 use crate::construct::ConstructChrome;
 use crate::status::StatusSegments;
-use crate::surfaces::{Surface, TOOL_TRAY_SURFACES, icon_texture};
+use crate::surfaces::{icon_texture, Surface, TOOL_TRAY_SURFACES};
 
 /// The locked strip height (Q12: "~24px").
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
@@ -1902,36 +1902,32 @@ mod tests {
         assert_eq!(status.percent, 73);
         assert_eq!(status.state, mde_seat::BatteryState::Charging);
         assert_eq!(status.icon(), IconId::BatteryBolt);
-        assert!(
-            LiveBatteryStatus::from_batteries(&[battery(
-                7.0,
-                mde_seat::BatteryState::Discharging,
-                false,
-            )])
-            .is_none()
-        );
-        assert!(
-            LiveBatteryStatus::from_batteries(&[battery(
-                f64::NAN,
-                mde_seat::BatteryState::Unknown,
-                true,
-            )])
-            .is_none()
-        );
+        assert!(LiveBatteryStatus::from_batteries(&[battery(
+            7.0,
+            mde_seat::BatteryState::Discharging,
+            false,
+        )])
+        .is_none());
+        assert!(LiveBatteryStatus::from_batteries(&[battery(
+            f64::NAN,
+            mde_seat::BatteryState::Unknown,
+            true,
+        )])
+        .is_none());
     }
 
     #[test]
     fn weather_projection_is_generation_scoped_fresh_or_explicitly_stale() {
         use mackes_mesh_types::location::{
             EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
-            EffectiveWeatherLocation, WEATHER_LOCATION_SCHEMA_VERSION, WeatherCoverage,
-            WeatherLocationMode,
+            EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
+            WEATHER_LOCATION_SCHEMA_VERSION,
         };
         use mackes_mesh_types::nws_alert::GeoPoint;
         use mackes_mesh_types::weather::{
             CurrentConditions, CurrentWeatherSnapshot, Temperature, TemperatureUnit,
-            WEATHER_CONTRACT_SCHEMA_VERSION, WeatherAttribution, WeatherAvailability,
-            WeatherConditionKind, WeatherProvider, WeatherStaleReason,
+            WeatherAttribution, WeatherAvailability, WeatherConditionKind, WeatherProvider,
+            WeatherStaleReason, WEATHER_CONTRACT_SCHEMA_VERSION,
         };
 
         const NOW: i64 = 1_800_000_000_000;

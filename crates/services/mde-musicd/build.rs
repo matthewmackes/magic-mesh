@@ -1,17 +1,17 @@
 //! E0.14 — link-search shim for the vendored Opus archive.
 //!
 //! `mde-musicd` pulls `opus 0.3` → `audiopus_sys 0.2.2`, which vendors and
-//! CMake-builds libopus. On Fedora, CMake's GNUInstallDirs installs the
-//! archive to `<out>/lib64`, but audiopus_sys's build script hardcodes the
+//! CMake-builds libopus. On Fedora, `CMake`'s `GNUInstallDirs` installs the
+//! archive to `<out>/lib64`, but `audiopus_sys`'s build script hardcodes the
 //! rustc link-search path as `{dir}/lib` (audiopus_sys-0.2.2 build.rs
 //! `link_opus`, the `{}/lib` format) — it never adds `lib64`. The result:
 //! `cargo check` passes (no link) but linking any binary that pulls the
 //! audio chain fails with `rust-lld: unable to find library -lopus`, so the
 //! audio chain's tests silently never run (a link failure prints no
-//! `test result:` line) and DoD §3 verification is skipped.
+//! `test result:` line) and `DoD` §3 verification is skipped.
 //!
 //! The designed path is `opus-devel` (the unversioned system `libopus.so` +
-//! pkg-config `.pc`, which makes audiopus_sys use the system lib and skip
+//! pkg-config `.pc`, which makes `audiopus_sys` use the system lib and skip
 //! vendoring). This shim is the durable fallback for dev/CI boxes that do
 //! NOT have opus-devel: it adds every sibling `audiopus_sys-*/out/lib64`
 //! (which holds the vendored `libopus.a`) to the link search path.

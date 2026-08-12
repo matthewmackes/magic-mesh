@@ -1526,7 +1526,10 @@ mod tests {
             1,
         );
 
-        assert_eq!(result, Err("only a ringing alarm can be snoozed".to_owned()));
+        assert_eq!(
+            result,
+            Err("only a ringing alarm can be snoozed".to_owned())
+        );
     }
 
     #[test]

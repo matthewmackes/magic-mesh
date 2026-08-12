@@ -41,18 +41,66 @@ fn page_label(page: PageEntry) -> &'static str {
 /// index remains the source of truth. The result is sorted by visible label.
 pub(crate) fn catalog() -> Vec<CatalogEntry> {
     let mut entries = vec![
-        CatalogEntry { id: "workers/action-console", label: "Action Console", destination: WorkersDestination::ActionConsole },
-        CatalogEntry { id: "workers/discovery", label: "Discovery", destination: WorkersDestination::Discovery },
-        CatalogEntry { id: "workers/fleet", label: "Fleet", destination: WorkersDestination::Fleet },
-        CatalogEntry { id: "workers/mesh-map", label: "Mesh Map", destination: WorkersDestination::MeshMap },
-        CatalogEntry { id: "workers/network", label: "Network", destination: WorkersDestination::Network },
-        CatalogEntry { id: "workers/phone-commands", label: "Commands", destination: WorkersDestination::PhoneCommands },
-        CatalogEntry { id: "workers/phone-files", label: "Files", destination: WorkersDestination::PhoneFiles },
-        CatalogEntry { id: "workers/phone-pair", label: "Pair", destination: WorkersDestination::PhonePair },
-        CatalogEntry { id: "workers/phone-services", label: "Services", destination: WorkersDestination::PhoneServices },
-        CatalogEntry { id: "workers/phones", label: "Phones", destination: WorkersDestination::Phones },
-        CatalogEntry { id: "workers/provisioning", label: "Provisioning", destination: WorkersDestination::Provisioning },
-        CatalogEntry { id: "workers/this-node", label: "This Node", destination: WorkersDestination::ThisNode },
+        CatalogEntry {
+            id: "workers/action-console",
+            label: "Action Console",
+            destination: WorkersDestination::ActionConsole,
+        },
+        CatalogEntry {
+            id: "workers/discovery",
+            label: "Discovery",
+            destination: WorkersDestination::Discovery,
+        },
+        CatalogEntry {
+            id: "workers/fleet",
+            label: "Fleet",
+            destination: WorkersDestination::Fleet,
+        },
+        CatalogEntry {
+            id: "workers/mesh-map",
+            label: "Mesh Map",
+            destination: WorkersDestination::MeshMap,
+        },
+        CatalogEntry {
+            id: "workers/network",
+            label: "Network",
+            destination: WorkersDestination::Network,
+        },
+        CatalogEntry {
+            id: "workers/phone-commands",
+            label: "Commands",
+            destination: WorkersDestination::PhoneCommands,
+        },
+        CatalogEntry {
+            id: "workers/phone-files",
+            label: "Files",
+            destination: WorkersDestination::PhoneFiles,
+        },
+        CatalogEntry {
+            id: "workers/phone-pair",
+            label: "Pair",
+            destination: WorkersDestination::PhonePair,
+        },
+        CatalogEntry {
+            id: "workers/phone-services",
+            label: "Services",
+            destination: WorkersDestination::PhoneServices,
+        },
+        CatalogEntry {
+            id: "workers/phones",
+            label: "Phones",
+            destination: WorkersDestination::Phones,
+        },
+        CatalogEntry {
+            id: "workers/provisioning",
+            label: "Provisioning",
+            destination: WorkersDestination::Provisioning,
+        },
+        CatalogEntry {
+            id: "workers/this-node",
+            label: "This Node",
+            destination: WorkersDestination::ThisNode,
+        },
     ];
     entries.extend(page_index().iter().map(|page| CatalogEntry {
         id: page.route,
@@ -96,6 +144,8 @@ mod tests {
             (pair[0].label.to_ascii_lowercase(), pair[0].id)
                 <= (pair[1].label.to_ascii_lowercase(), pair[1].id)
         }));
-        assert!(entries.iter().any(|entry| entry.destination == WorkersDestination::ThisNode));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.destination == WorkersDestination::ThisNode));
     }
 }

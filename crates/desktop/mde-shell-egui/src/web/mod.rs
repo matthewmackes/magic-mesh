@@ -567,13 +567,10 @@ impl WebState {
             bus_root.ok_or_else(|| "the local mesh Bus directory is unavailable".to_owned())?;
         let persist = Persist::open(root.to_path_buf())
             .map_err(|error| format!("the local mesh Bus could not be opened: {error}"))?;
-        let expected_generation = crate::workload_api::read_status(
-            &persist,
-            &intent.serving_peer,
-            &intent.workload,
-        )
-        .map(|status| status.generation)
-        .unwrap_or(0);
+        let expected_generation =
+            crate::workload_api::read_status(&persist, &intent.serving_peer, &intent.workload)
+                .map(|status| status.generation)
+                .unwrap_or(0);
         let request = crate::workload_api::request(
             &intent.workload,
             &intent.serving_peer,
@@ -587,7 +584,12 @@ impl WebState {
         let body = serde_json::to_string(&request)
             .map_err(|error| format!("Workload request could not be encoded: {error}"))?;
         persist
-            .write(WORKLOAD_OPERATION_TOPIC, Priority::Default, None, Some(&body))
+            .write(
+                WORKLOAD_OPERATION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
             .map_err(|error| format!("Workload operation rejected by the local Bus: {error}"))?;
         Ok(BrowserVmLifecyclePending {
             intent: intent.clone(),
@@ -611,11 +613,9 @@ impl WebState {
         let (intent, request_id, bus_root, published_at) = snapshot;
         let elapsed = now.saturating_duration_since(published_at);
         if let Ok(persist) = Persist::open(bus_root.clone()) {
-            if let Some(status) = crate::workload_api::read_status(
-                &persist,
-                &intent.serving_peer,
-                &intent.workload,
-            ) {
+            if let Some(status) =
+                crate::workload_api::read_status(&persist, &intent.serving_peer, &intent.workload)
+            {
                 // The state projection is keyed by workload, not operation.
                 // Ignore a terminal row from an older or foreign operation;
                 // otherwise a stale completion could make this one-shot

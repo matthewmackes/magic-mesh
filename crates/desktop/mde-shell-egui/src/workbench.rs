@@ -240,11 +240,24 @@ pub(crate) fn show_catalog_plane(
     match plane {
         Plane::ThisNode => {
             thisnode.show_with_system(ui, Some(system));
-            surface_card.is_surface().then(|| surface_card.show(ui)).flatten()
+            surface_card
+                .is_surface()
+                .then(|| surface_card.show(ui))
+                .flatten()
         }
-        Plane::Network => { network.show(ui); None }
-        Plane::Fleet => { datacenter.show(ui); None }
-        Plane::Provisioning => { provisioning.show(ui); spawn_lighthouse.show(ui); None }
+        Plane::Network => {
+            network.show(ui);
+            None
+        }
+        Plane::Fleet => {
+            datacenter.show(ui);
+            None
+        }
+        Plane::Provisioning => {
+            provisioning.show(ui);
+            spawn_lighthouse.show(ui);
+            None
+        }
     }
 }
 

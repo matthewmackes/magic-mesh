@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mackes_mesh_types::clock::CLOCK_COMMAND_PREFIX;
+use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mackes_mesh_types::vdi_clipboard::{
     ClipboardMaterialization, CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS,
     CLIPBOARD_MATERIALIZATION_TOPIC,
@@ -906,14 +906,13 @@ impl LiveCollabData {
         }
         let transfer_jobs =
             read_state::<TransferJobs>(&persist, &topics::state_topic(proj::TRANSFER_JOBS));
-        let alert_inbox = read_state::<AlertInbox>(
-            &persist,
-            &topics::state_topic(proj::ALERT_INBOX),
-        )
-        .map(|mut inbox| {
-            strip_retained_clock_command_authority(&mut inbox);
-            inbox
-        });
+        let alert_inbox =
+            read_state::<AlertInbox>(&persist, &topics::state_topic(proj::ALERT_INBOX)).map(
+                |mut inbox| {
+                    strip_retained_clock_command_authority(&mut inbox);
+                    inbox
+                },
+            );
         self.activity = activity;
         self.conversations = conversations;
         self.message_pins = message_pins;
@@ -1710,7 +1709,11 @@ mod tests {
         let mut restarted = LiveCollabData::new(Some(dir.path().to_path_buf()));
         restarted.refresh();
         let inbox = restarted.alert_inbox().expect("retained inbox");
-        assert_eq!(inbox.alerts.len(), 1, "notification history remains visible");
+        assert_eq!(
+            inbox.alerts.len(),
+            1,
+            "notification history remains visible"
+        );
         assert_eq!(inbox.alerts[0].alert.headline, "Retained ringing alarm");
         assert_eq!(inbox.alerts[0].alert.goto.as_deref(), Some("clock"));
         assert_eq!(

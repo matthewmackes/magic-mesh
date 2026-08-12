@@ -91,8 +91,9 @@ impl Scancode {
     }
 }
 
-/// Set-1 scancodes for the three core modifier keys the session synthesises from
-/// egui's `Modifiers` snapshot. Left-hand variants — the identity RDP and SPICE
+/// Set-1 scancodes for the three core modifier keys the session synthesises.
+///
+/// These derive from egui's `Modifiers` snapshot. Left-hand variants — the identity RDP and SPICE
 /// both send. Also reachable via [`ModKey::scancode`].
 pub const SHIFT_SCANCODE: Scancode = Scancode::plain(0x2A); // left shift
 /// Set-1 scancode for left Ctrl.

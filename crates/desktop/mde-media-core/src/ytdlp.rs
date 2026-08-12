@@ -160,7 +160,7 @@ fn push_url(urls: &mut Vec<String>, value: Option<&Value>) {
 /// entering `yt-dlp` and provider-controlled direct URLs leaving it cross this
 /// boundary before any subprocess or player can contact them.
 fn is_safe_http_url(url: &str) -> bool {
-    if url.is_empty() || url.trim() != url || url.chars().any(|character| character.is_control()) {
+    if url.is_empty() || url.trim() != url || url.chars().any(char::is_control) {
         return false;
     }
     let Some((scheme, remainder)) = url.split_once("://") else {

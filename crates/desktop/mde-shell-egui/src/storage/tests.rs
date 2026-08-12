@@ -908,9 +908,7 @@ mod menubar_coverage {
     /// The ONE recorded decision per routed `Surface` (exhaustive on purpose).
     const fn coverage(surface: Surface) -> Coverage {
         match surface {
-            Surface::Workers => Coverage::Covered {
-                title: "Workers",
-            },
+            Surface::Workers => Coverage::Covered { title: "Workers" },
             // ── covered: the MENUBAR-ALL / MENUBAR-SWEEP bars ──
             Surface::FleetMesh => Coverage::Covered {
                 title: "Fleet & Mesh",

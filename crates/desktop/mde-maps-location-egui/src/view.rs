@@ -514,6 +514,7 @@ fn safe_width(ui: &egui::Ui) -> f32 {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct DriveHudOverlayGeometry {
     health_rail: Rect,
     fab_lane: Rect,
@@ -4160,6 +4161,7 @@ fn active_live_overlay_count(map: &MapViewState) -> usize {
 /// preferences remain next to their owning feed so turning a feed off cannot
 /// leave a detached preference control in the main toolbar.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct MapLayersLayout {
     button: Rect,
     popup: Rect,

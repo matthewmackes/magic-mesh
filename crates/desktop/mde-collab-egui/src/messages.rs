@@ -1102,11 +1102,7 @@ fn composer_enter_state_for(enter: bool, modifiers: egui::Modifiers) -> (bool, b
 }
 
 fn newline_count(value: &str) -> usize {
-    value
-        .as_bytes()
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
+    value.matches('\n').count()
 }
 
 fn insert_newline_if_text_edit_did_not(

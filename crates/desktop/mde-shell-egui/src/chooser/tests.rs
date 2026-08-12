@@ -1416,10 +1416,9 @@ fn power_publish_mints_an_exact_body_bound_direct_libvirt_capability() {
     let body = messages[0].body.as_deref().unwrap();
     let value: mackes_mesh_types::workloads::WorkloadOperationRequest =
         serde_json::from_str(body).unwrap();
-    let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
-        value.armed_token.as_deref().unwrap(),
-    )
-    .unwrap();
+    let token =
+        mackes_mesh_types::cloud::CloudArmedToken::parse(value.armed_token.as_deref().unwrap())
+            .unwrap();
     assert_eq!(token.verb, "workload-operation");
     assert_eq!(token.node, "elm");
     assert_eq!(token.target, "workload:vm:elm:dev");

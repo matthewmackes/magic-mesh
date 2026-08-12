@@ -338,9 +338,7 @@ fn admitted_transcoding_url(
 
     let path = url.split('?').next().unwrap_or_default();
     let expected = format!("/{}/{item_id}/", media_type.segment());
-    let Some(prefix) = path.get(..expected.len()) else {
-        return None;
-    };
+    let prefix = path.get(..expected.len())?;
     let endpoint = &path[expected.len()..];
     if !prefix.eq_ignore_ascii_case(&expected)
         || endpoint.is_empty()

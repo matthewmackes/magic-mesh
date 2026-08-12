@@ -51,7 +51,7 @@ pub(crate) struct ActivityRow<'a> {
     severity: Option<Severity>,
 }
 
-impl<'a> ActivityRow<'a> {
+impl ActivityRow<'_> {
     #[cfg(test)]
     pub(crate) fn entry(&self) -> &'a ActivityEntry {
         self.entry

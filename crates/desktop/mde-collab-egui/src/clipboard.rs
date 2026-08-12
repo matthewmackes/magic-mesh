@@ -362,6 +362,7 @@ impl CommunicationsSurface {
 /// itself unsupported, and both are rejected before clipboard item hashing or
 /// command emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum VdiClipboardCapability {
     /// Both host-to-guest and guest-to-host lanes have real protocol channels.
     Bidirectional,

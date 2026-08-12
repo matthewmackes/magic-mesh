@@ -39,7 +39,7 @@ use serde::Deserialize;
 use crate::notification_center::NotificationRing;
 use crate::surfaces::Surface;
 use crate::timers::{
-    ClockBannerKind, ClockBannerProjection, clock_banner_projection, request_clock_banner_action,
+    clock_banner_projection, request_clock_banner_action, ClockBannerKind, ClockBannerProjection,
 };
 use crate::workbench::Plane;
 
@@ -1038,14 +1038,13 @@ mod tests {
 
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
-    use mde_egui::egui::{self, Rect, pos2, vec2};
+    use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::{Style, Tier, Toast, ToastHost};
 
     use super::{
-        Chime, ChimeBackend, Navigate, Severity, Suppress, TOAST_TOPIC, ToastBridge,
         alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
         pulse_server_from_runtime_dir, resolve_action, surface_by_name, try_chime_backends,
-        unread_count,
+        unread_count, Chime, ChimeBackend, Navigate, Severity, Suppress, ToastBridge, TOAST_TOPIC,
     };
     use crate::surfaces::Surface;
     use crate::workbench::Plane;
@@ -1386,15 +1385,24 @@ mod tests {
 
         let grade_a = decode(&health_kiron_body(GradeLetter::A)).expect("grade A admitted");
         assert_eq!(grade_a.tier, Tier::Alert(Severity::Info));
-        assert_eq!(grade_a.dwell, mde_egui::Dwell::For(std::time::Duration::from_secs(3)));
+        assert_eq!(
+            grade_a.dwell,
+            mde_egui::Dwell::For(std::time::Duration::from_secs(3))
+        );
 
         let grade_b = decode(&health_kiron_body(GradeLetter::B)).expect("grade B admitted");
         assert_eq!(grade_b.tier, Tier::Alert(Severity::Info));
-        assert_eq!(grade_b.dwell, mde_egui::Dwell::For(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            grade_b.dwell,
+            mde_egui::Dwell::For(std::time::Duration::from_secs(5))
+        );
 
         let grade_c = decode(&health_kiron_body(GradeLetter::C)).expect("grade C admitted");
         assert_eq!(grade_c.tier, Tier::Alert(Severity::Warning));
-        assert_eq!(grade_c.dwell, mde_egui::Dwell::For(std::time::Duration::from_secs(6)));
+        assert_eq!(
+            grade_c.dwell,
+            mde_egui::Dwell::For(std::time::Duration::from_secs(6))
+        );
 
         let grade_d = decode(&health_kiron_body(GradeLetter::D)).expect("grade D admitted");
         assert_eq!(grade_d.tier, Tier::Alert(Severity::Warning));
@@ -1433,7 +1441,8 @@ mod tests {
                 .expect("valid stale recovery body");
         stale_recovery["snapshot_generation"] = serde_json::json!(41);
         stale_recovery["headline"] = serde_json::json!("Host recovered in stale snapshot");
-        let stale_recovery = decode(&stale_recovery.to_string()).expect("stale body is well-formed");
+        let stale_recovery =
+            decode(&stale_recovery.to_string()).expect("stale body is well-formed");
 
         let mut conflicting_replay: serde_json::Value =
             serde_json::from_str(&health_kiron_body(GradeLetter::E))
@@ -1468,13 +1477,12 @@ mod tests {
     #[test]
     fn typed_health_marker_rejects_future_dated_lower_thirds() {
         let now_ms = 1_000_000;
-        let mut value: serde_json::Value =
-            serde_json::from_str(&health_kiron_body_at(
-                mackes_mesh_types::health::GradeLetter::D,
-                now_ms - 10_000,
-                now_ms - 1_000,
-            ))
-            .expect("valid health body");
+        let mut value: serde_json::Value = serde_json::from_str(&health_kiron_body_at(
+            mackes_mesh_types::health::GradeLetter::D,
+            now_ms - 10_000,
+            now_ms - 1_000,
+        ))
+        .expect("valid health body");
         value["observed_at_ms"] = serde_json::json!(now_ms + 1);
         assert!(
             super::decode_at(&value.to_string(), now_ms).is_none(),

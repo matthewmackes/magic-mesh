@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 //! `mde-shell-egui` — the single MCNF E12 "Construct" egui shell (E12-3).
 //!
 //! One eframe app on the `mde-egui` harness. Construct chrome is a persistent
@@ -1729,7 +1731,10 @@ impl Shell {
             }
             Surface::System => {
                 self.workers_tab = WorkersTab::LocalNode;
-                self.workers_destination = WorkersDestination::ThisNodePage(this_node_catalog::page_for_route("this-node/overview").unwrap_or(this_node_catalog::page_index()[0]));
+                self.workers_destination = WorkersDestination::ThisNodePage(
+                    this_node_catalog::page_for_route("this-node/overview")
+                        .unwrap_or(this_node_catalog::page_index()[0]),
+                );
                 self.this_node_tab = ThisNodeTab::System;
                 self.this_node_section = this_node_catalog::Section::Overview;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/overview")
@@ -1738,7 +1743,10 @@ impl Shell {
             }
             Surface::Storage => {
                 self.workers_tab = WorkersTab::LocalNode;
-                self.workers_destination = WorkersDestination::ThisNodePage(this_node_catalog::page_for_route("this-node/storage").unwrap_or(this_node_catalog::page_index()[0]));
+                self.workers_destination = WorkersDestination::ThisNodePage(
+                    this_node_catalog::page_for_route("this-node/storage")
+                        .unwrap_or(this_node_catalog::page_index()[0]),
+                );
                 self.this_node_tab = ThisNodeTab::Storage;
                 self.this_node_section = this_node_catalog::Section::Hardware;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/storage")
@@ -1747,7 +1755,10 @@ impl Shell {
             }
             Surface::About => {
                 self.workers_tab = WorkersTab::LocalNode;
-                self.workers_destination = WorkersDestination::ThisNodePage(this_node_catalog::page_for_route("this-node/hardware").unwrap_or(this_node_catalog::page_index()[0]));
+                self.workers_destination = WorkersDestination::ThisNodePage(
+                    this_node_catalog::page_for_route("this-node/hardware")
+                        .unwrap_or(this_node_catalog::page_index()[0]),
+                );
                 self.this_node_tab = ThisNodeTab::About;
                 self.this_node_section = this_node_catalog::Section::Hardware;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/hardware")
@@ -2197,7 +2208,9 @@ impl Shell {
             ui.add_space(Style::SP_S);
             let narrow = ui.available_width() < 900.0 || ui.ctx().zoom_factor() > 1.1;
             if narrow {
-                egui::ScrollArea::horizontal().show(ui, |ui| self.show_workers_catalog(ui, &entries, &mut destination));
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    self.show_workers_catalog(ui, &entries, &mut destination)
+                });
                 ui.separator();
             } else {
                 ui.horizontal_top(|ui| {
@@ -2213,22 +2226,43 @@ impl Shell {
         self.workers_destination = destination;
     }
 
-    fn show_workers_catalog(&mut self, ui: &mut egui::Ui, entries: &[CatalogEntry], selected: &mut WorkersDestination) {
+    fn show_workers_catalog(
+        &mut self,
+        ui: &mut egui::Ui,
+        entries: &[CatalogEntry],
+        selected: &mut WorkersDestination,
+    ) {
         ui.set_min_width(Style::SP_XL * 8.0);
         for entry in entries {
-            if ui.selectable_label(*selected == entry.destination, entry.label).clicked() {
+            if ui
+                .selectable_label(*selected == entry.destination, entry.label)
+                .clicked()
+            {
                 *selected = entry.destination;
             }
         }
     }
 
     fn show_workers_destination(&mut self, ui: &mut egui::Ui, destination: WorkersDestination) {
-        let title = workers_catalog::catalog().into_iter().find(|entry| entry.destination == destination).map_or("This Node", |entry| entry.label);
+        let title = workers_catalog::catalog()
+            .into_iter()
+            .find(|entry| entry.destination == destination)
+            .map_or("This Node", |entry| entry.label);
         let _ = AppFrame::new(title).show(ui);
         ui.add_space(Style::SP_S);
         match destination {
             WorkersDestination::ThisNode => {
-                if let Some(handoff) = workbench::show_catalog_plane(ui, Plane::ThisNode, &mut self.datacenter, &mut self.thisnode, &mut self.system, &mut self.surface_card, &self.network, &self.provisioning, &mut self.spawn_lighthouse) {
+                if let Some(handoff) = workbench::show_catalog_plane(
+                    ui,
+                    Plane::ThisNode,
+                    &mut self.datacenter,
+                    &mut self.thisnode,
+                    &mut self.system,
+                    &mut self.surface_card,
+                    &self.network,
+                    &self.provisioning,
+                    &mut self.spawn_lighthouse,
+                ) {
                     self.apply_surface_card_handoff(handoff);
                 }
             }
@@ -2242,7 +2276,11 @@ impl Shell {
             }
             WorkersDestination::MeshMap => self.show_mesh_map(ui),
             WorkersDestination::Discovery => self.show_explorer(ui),
-            WorkersDestination::Phones | WorkersDestination::PhoneFiles | WorkersDestination::PhoneServices | WorkersDestination::PhoneCommands | WorkersDestination::PhonePair => {
+            WorkersDestination::Phones
+            | WorkersDestination::PhoneFiles
+            | WorkersDestination::PhoneServices
+            | WorkersDestination::PhoneCommands
+            | WorkersDestination::PhonePair => {
                 let tab = match destination {
                     WorkersDestination::Phones => "Phones",
                     WorkersDestination::PhoneFiles => "Files",
@@ -2254,8 +2292,20 @@ impl Shell {
                 self.phones_hub.show_catalog(ui, tab);
             }
             WorkersDestination::ActionConsole => workbench::show_action_console(ui),
-            plane @ (WorkersDestination::Network | WorkersDestination::Fleet | WorkersDestination::Provisioning) => {
-                workbench::show_catalog_plane(ui, workers_catalog::plane(plane).expect("catalog plane"), &mut self.datacenter, &mut self.thisnode, &mut self.system, &mut self.surface_card, &self.network, &self.provisioning, &mut self.spawn_lighthouse);
+            plane @ (WorkersDestination::Network
+            | WorkersDestination::Fleet
+            | WorkersDestination::Provisioning) => {
+                workbench::show_catalog_plane(
+                    ui,
+                    workers_catalog::plane(plane).expect("catalog plane"),
+                    &mut self.datacenter,
+                    &mut self.thisnode,
+                    &mut self.system,
+                    &mut self.surface_card,
+                    &self.network,
+                    &self.provisioning,
+                    &mut self.spawn_lighthouse,
+                );
             }
         }
     }
@@ -3288,9 +3338,7 @@ impl Shell {
         self.pump_shell_models(ctx);
         let utc_now = crate::timers::now_unix();
         let projection_now_ms = utc_now.saturating_mul(1_000);
-        let health_now_ms = u64::try_from(utc_now)
-            .unwrap_or(0)
-            .saturating_mul(1_000);
+        let health_now_ms = u64::try_from(utc_now).unwrap_or(0).saturating_mul(1_000);
         let health_open_blocked = self.curtain.engaged()
             || self.immersive_vdi()
             || self.construct.switcher_open

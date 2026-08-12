@@ -1512,7 +1512,7 @@ fn run_command_query(query: &str) -> Option<&str> {
     (!command.is_empty()
         && command.chars().count() <= MAX_QUERY_CHARS
         && !command.chars().any(char::is_control))
-        .then_some(command)
+    .then_some(command)
 }
 
 fn run_command_mode(query: &str) -> bool {
@@ -2668,10 +2668,9 @@ fn cloud_instance_lifecycle_wire_with(
     if node.is_empty() {
         return Err("Workload lifecycle requires an explicit placement node.".to_string());
     }
-    let workload_id = mackes_mesh_types::workloads::WorkloadId::new(format!(
-        "vm:{node}:{instance}"
-    ))
-    .map_err(|error| format!("invalid Workload identity: {error}"))?;
+    let workload_id =
+        mackes_mesh_types::workloads::WorkloadId::new(format!("vm:{node}:{instance}"))
+            .map_err(|error| format!("invalid Workload identity: {error}"))?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -2702,10 +2701,8 @@ fn cloud_instance_lifecycle_wire_with(
     let body = serde_json::to_string(&request)
         .map_err(|error| format!("serialize Workload request: {error}"))?;
     let body = authorize(&body, EXEC_AUTH_VERB, node, &capability_target)?;
-    let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
-        &body, now_ms,
-    )
-    .map_err(|error| format!("authorized Workload request was rejected: {error}"))?;
+    let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(&body, now_ms)
+        .map_err(|error| format!("authorized Workload request was rejected: {error}"))?;
     let body = serde_json::to_string(&request)
         .map_err(|error| format!("serialize authorized Workload request: {error}"))?;
     Ok((EXEC_ACTION_TOPIC.to_owned(), body))
@@ -3082,8 +3079,7 @@ fn install_instance_lifecycle_action_accessibility(
         });
         node.set_value(format!(
             "Workload lifecycle: {}; instance {}",
-            EXEC_ACTION_TOPIC,
-            target.instance
+            EXEC_ACTION_TOPIC, target.instance
         ));
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
@@ -5448,8 +5444,12 @@ mod tests {
         )
         .expect("Workload instance lifecycle wire");
 
-        assert_eq!(topic, mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC);
-        let body: serde_json::Value = serde_json::from_str(&body).expect("authorized Workload body");
+        assert_eq!(
+            topic,
+            mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&body).expect("authorized Workload body");
         assert_eq!(
             body["schema_version"],
             mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
@@ -5717,7 +5717,11 @@ mod tests {
 
     #[test]
     fn front_door_run_command_rejects_control_separators_and_oversize_input() {
-        for query in ["> echo first\nsecond", "> echo first\rsecond", "> echo\tfirst"] {
+        for query in [
+            "> echo first\nsecond",
+            "> echo first\rsecond",
+            "> echo\tfirst",
+        ] {
             assert_eq!(
                 run_command_query(query),
                 None,
@@ -7016,10 +7020,12 @@ mod tests {
             let FrontDoorTarget::PeerApp(target) = &item.payload else {
                 panic!("peer app projection manufactured a different target type");
             };
-            assert!(peer_app_provision_wire_with(target, "seat-a", |body, _, _, _| {
-                Ok(body.to_owned())
-            })
-            .is_ok());
+            assert!(
+                peer_app_provision_wire_with(target, "seat-a", |body, _, _, _| {
+                    Ok(body.to_owned())
+                })
+                .is_ok()
+            );
         }
     }
 
@@ -7565,8 +7571,7 @@ mod tests {
             assert!(value.contains(r#""target_node":"peer:oak""#), "{value}");
             assert!(value.contains(r#""backend":"quadlet_systemd""#), "{value}");
             assert!(
-                value.contains(r#""action":"stop""#)
-                    || value.contains(r#""action":"restart""#),
+                value.contains(r#""action":"stop""#) || value.contains(r#""action":"restart""#),
                 "{value}"
             );
             assert!(

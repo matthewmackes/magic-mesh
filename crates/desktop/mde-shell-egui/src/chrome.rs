@@ -202,7 +202,9 @@ fn admit_health_snapshot(
         || candidate.generation == 0
         || !candidate.is_fresh(now_ms)
     {
-        return current.filter(|snapshot| snapshot.is_fresh(now_ms)).cloned();
+        return current
+            .filter(|snapshot| snapshot.is_fresh(now_ms))
+            .cloned();
     }
 
     if let Some(current) = current {
@@ -228,7 +230,9 @@ fn read_health(
         (Some(expected_observer), Some(candidate)) => {
             admit_health_snapshot(current, candidate, expected_observer, now_ms)
         }
-        _ => current.filter(|snapshot| snapshot.is_fresh(now_ms)).cloned(),
+        _ => current
+            .filter(|snapshot| snapshot.is_fresh(now_ms))
+            .cloned(),
     };
     HealthStatus {
         snapshot,

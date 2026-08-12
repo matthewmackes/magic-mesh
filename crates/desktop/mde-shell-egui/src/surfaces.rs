@@ -711,9 +711,7 @@ mod tests {
         for surface in Surface::ALL {
             assert_eq!(
                 projected.iter().filter(|item| **item == surface).count(),
-                usize::from(
-                    !is_tool_tray_surface(surface) && !matches!(surface, Surface::Files)
-                ),
+                usize::from(!is_tool_tray_surface(surface) && !matches!(surface, Surface::Files)),
                 "{surface:?} has the wrong central-launcher membership"
             );
         }

@@ -313,7 +313,7 @@ fn read_bounded_temperature(path: &Path) -> Option<i32> {
 
 fn parse_bounded_temperature(value: &str) -> Option<i32> {
     let value = value.parse::<i32>().ok()?;
-    (value >= -100_000 && value <= 200_000).then_some(value)
+    (-100_000..=200_000).contains(&value).then_some(value)
 }
 
 fn read_profile(path: &str) -> Option<String> {

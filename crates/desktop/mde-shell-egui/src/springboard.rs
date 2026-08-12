@@ -227,11 +227,8 @@ pub(crate) fn show(ui: &mut egui::Ui, overlay_above: bool) {
     // the same authority even without an overlay: revoke both the in-flight
     // gesture and any retained action before mount can replay it after focus
     // moved away from Home.
-    let foreign_focus = ctx.memory(|memory| {
-        memory
-            .focused()
-            .is_some_and(|focused| focused != home_id)
-    });
+    let foreign_focus =
+        ctx.memory(|memory| memory.focused().is_some_and(|focused| focused != home_id));
     if overlay_above || foreign_focus {
         state.gesture = None;
         state.actions.clear();
@@ -641,7 +638,10 @@ mod tests {
             .data_mut(|data| data.get_temp::<SpringboardState>(state_key))
             .expect("springboard state remains mounted");
         assert!(state.gesture.is_none(), "foreign focus cancels the pull");
-        assert!(state.actions.is_empty(), "foreign focus drains stale authority");
+        assert!(
+            state.actions.is_empty(),
+            "foreign focus drains stale authority"
+        );
     }
 
     // --- the collapsed base layer paints honestly -----------------------------------

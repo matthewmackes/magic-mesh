@@ -841,7 +841,7 @@ impl Manager {
                 "parent": parent,
                 "order_key": order_key,
                 "url": url,
-                "title": title.clone(),
+                "title": title,
                 "tags": [],
                 "notes": "",
                 "source": "manual",
@@ -870,7 +870,7 @@ impl Manager {
                 "id": id,
                 "parent": parent,
                 "order_key": order_key,
-                "name": name.clone(),
+                "name": name,
             }),
         );
         if let Some(p) = parent {
@@ -933,10 +933,7 @@ impl Manager {
                     id,
                     name: name.clone(),
                 });
-                self.enqueue_daemon_action(
-                    "rename",
-                    serde_json::json!({ "id": id, "name": name.clone() }),
-                );
+                self.enqueue_daemon_action("rename", serde_json::json!({ "id": id, "name": name }));
             }
             Some(Item::Bookmark(_)) => {
                 self.commit(OpKind::EditBookmark {
@@ -947,10 +944,7 @@ impl Manager {
                     tags: None,
                     notes: None,
                 });
-                self.enqueue_daemon_action(
-                    "edit",
-                    serde_json::json!({ "id": id, "title": name.clone() }),
-                );
+                self.enqueue_daemon_action("edit", serde_json::json!({ "id": id, "title": name }));
             }
             None => {}
         }

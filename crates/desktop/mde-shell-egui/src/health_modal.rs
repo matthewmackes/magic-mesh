@@ -627,7 +627,10 @@ fn condition_card(
         ui.horizontal_wrapped(|ui| {
             if actionable_here
                 && ui
-                    .add_enabled(!recovery_in_flight, egui::Button::new("Acknowledge").small())
+                    .add_enabled(
+                        !recovery_in_flight,
+                        egui::Button::new("Acknowledge").small(),
+                    )
                     .clicked()
             {
                 publish_action_for_ui(
@@ -715,10 +718,7 @@ fn condition_card(
                 );
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(
-                            !recovery_in_flight,
-                            egui::Button::new("Confirm action"),
-                        )
+                        .add_enabled(!recovery_in_flight, egui::Button::new("Confirm action"))
                         .clicked()
                     {
                         publish_action_for_ui(
@@ -1421,10 +1421,7 @@ fn apply_action_outcome(
     }
 }
 
-fn action_progress_is_pending(
-    ctx: &egui::Context,
-    snapshot: &SystemMeshHealthSnapshot,
-) -> bool {
+fn action_progress_is_pending(ctx: &egui::Context, snapshot: &SystemMeshHealthSnapshot) -> bool {
     pending_health_action(ctx).is_some_and(|pending| match pending.result {
         None => true,
         Some(result) => {
@@ -1768,7 +1765,10 @@ fn authorize_modal_action(
         if descriptor.confirmation_required && !confirmed {
             return Err(ActionPublishFailure::ConfirmationRequired);
         }
-    } else if !matches!(action, HealthAction::Acknowledge | HealthAction::SnoozeOneHour) {
+    } else if !matches!(
+        action,
+        HealthAction::Acknowledge | HealthAction::SnoozeOneHour
+    ) {
         return Err(ActionPublishFailure::ActionNotAuthorized);
     }
 
@@ -2841,7 +2841,10 @@ mod tests {
             "expected-state-secret",
             "history-secret",
         ] {
-            assert!(!text.contains(forbidden), "render leaked {forbidden:?}: {text}");
+            assert!(
+                !text.contains(forbidden),
+                "render leaked {forbidden:?}: {text}"
+            );
         }
         assert!(
             text.matches("[redacted]").count() >= 5,
@@ -2918,12 +2921,7 @@ mod tests {
         let request: HealthActionRequest =
             serde_json::from_str(messages[0].body.as_deref().expect("action request body"))
                 .expect("decode action request");
-        assert_eq!(
-            request.target,
-            HealthScope::Node {
-                node: node.clone()
-            }
-        );
+        assert_eq!(request.target, HealthScope::Node { node: node.clone() });
         assert_eq!(request.expected_snapshot_generation, snapshot.generation);
         assert_eq!(request.condition_id, condition.id);
         assert_eq!(request.confirmation.as_deref(), Some("CONFIRM"));
@@ -3069,13 +3067,9 @@ mod tests {
             .list_since(ACTION_TOPIC, None)
             .expect("read node and mesh publications");
         assert_eq!(messages.len(), 2);
-        let mesh_request: HealthActionRequest = serde_json::from_str(
-            messages[1]
-                .body
-                .as_deref()
-                .expect("mesh action has a body"),
-        )
-        .expect("decode mesh action");
+        let mesh_request: HealthActionRequest =
+            serde_json::from_str(messages[1].body.as_deref().expect("mesh action has a body"))
+                .expect("decode mesh action");
         assert_eq!(mesh_request.target, HealthScope::Mesh);
     }
 

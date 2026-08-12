@@ -3229,8 +3229,14 @@ mod tests {
         state.pin_selector.query = query.clone();
         let rendered_query = bounded_pin_selector_query(&state.pin_selector.query);
         state.pin_selector.query = rendered_query.clone();
-        assert_eq!(state.pin_selector.query, "x".repeat(MAX_PIN_SELECTOR_QUERY_CHARS));
-        assert_eq!(filtered_pin_catalog(&query), filtered_pin_catalog(&rendered_query));
+        assert_eq!(
+            state.pin_selector.query,
+            "x".repeat(MAX_PIN_SELECTOR_QUERY_CHARS)
+        );
+        assert_eq!(
+            filtered_pin_catalog(&query),
+            filtered_pin_catalog(&rendered_query)
+        );
     }
 
     #[test]

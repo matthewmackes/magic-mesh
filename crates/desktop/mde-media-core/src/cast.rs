@@ -501,9 +501,7 @@ fn chromecast_target(info: &ServiceInfo) -> Option<CastTarget> {
     } else {
         format!("{address}:{}", info.get_port())
     };
-    if parse_endpoint(&location).is_none() {
-        return None;
-    }
+    parse_endpoint(&location)?;
     let name = info
         .get_property_val_str("fn")
         .map(str::trim)
@@ -789,7 +787,7 @@ fn http_response_complete(response: &str) -> bool {
         content_length = Some(length);
     }
 
-    content_length.map_or(true, |expected| body.len() == expected)
+    content_length.is_none_or(|expected| body.len() == expected)
 }
 
 // ── the pure HTTP / SOAP builders + parsers (fixture-tested) ─────────────────────
@@ -986,9 +984,7 @@ pub fn dlna_control_url(xml: &str, base: &Endpoint) -> Option<String> {
         };
         format!("http://{host}:{}{path}", base.port)
     };
-    if parse_endpoint(&resolved).is_none() {
-        return None;
-    };
+    parse_endpoint(&resolved)?;
     Some(resolved)
 }
 

@@ -1438,11 +1438,7 @@ mod tests {
         fn now_playing(&self) -> Option<NowPlaying> {
             self.np.clone()
         }
-        fn dispatch_if_current(
-            &mut self,
-            expected_authority: &str,
-            action: LockTransport,
-        ) -> bool {
+        fn dispatch_if_current(&mut self, expected_authority: &str, action: LockTransport) -> bool {
             if self.np.as_ref().map(|np| np.authority.as_str()) != Some(expected_authority) {
                 return false;
             }
