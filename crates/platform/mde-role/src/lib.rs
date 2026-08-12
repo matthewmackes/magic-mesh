@@ -28,7 +28,9 @@ use std::str::FromStr;
 /// becoming an unbounded allocation before the fail-closed parser sees it.
 const MAX_ROLE_FILE_BYTES: usize = 64 * 1024;
 
-/// A deployment role — the install-time identity, rank-ordered for the
+/// A deployment role.
+///
+/// The install-time identity, rank-ordered for the
 /// upgrade-only invariant ([`Role::rank`]): **Lighthouse** (the always-on
 /// relay / control plane) · **Workstation** (the full Construct egui thin
 /// client). "Headless" is not a role — a headless box is a `Workstation`
@@ -74,7 +76,9 @@ impl Role {
     }
 }
 
-/// Retired media capability marker kept only so older `role.toml` files remain
+/// Retired media capability marker.
+///
+/// It is kept only so older `role.toml` files remain
 /// parseable. New lighthouse pins must stay thin; this marker is never accepted
 /// or activated. Media and file-sharing duties belong on non-lighthouse hosts.
 ///
@@ -258,6 +262,11 @@ impl std::error::Error for LoadError {
 }
 
 /// Read the pinned role from [`default_role_path`]. See [`load_from`].
+///
+/// # Errors
+///
+/// Returns [`LoadError::NotPinned`] when no role is pinned, [`LoadError::Io`]
+/// for read failures, or [`LoadError::Malformed`] for invalid role data.
 pub fn load() -> Result<Role, LoadError> {
     load_from(&default_role_path())
 }
@@ -298,6 +307,11 @@ pub fn load_class_from(path: &Path) -> Result<RoleClass, LoadError> {
 /// Read the pinned role from `path`: [`LoadError::NotPinned`] when the file is
 /// absent, [`LoadError::Malformed`] when it lacks a parseable `role` value.
 /// Callers fail closed on either.
+///
+/// # Errors
+///
+/// Returns [`LoadError::NotPinned`] when the file is absent, [`LoadError::Io`]
+/// for read failures, or [`LoadError::Malformed`] when no valid role is found.
 pub fn load_from(path: &Path) -> Result<Role, LoadError> {
     let text = match read_role_file(path) {
         Ok(t) => t,
@@ -509,6 +523,12 @@ impl std::error::Error for PinError {
 }
 
 /// Pin `role` at [`default_role_path`]. See [`pin_at`].
+///
+/// # Errors
+///
+/// Returns [`PinError::Downgrade`] for a lower-ranked role,
+/// [`PinError::MalformedExisting`] for an invalid existing pin, or
+/// [`PinError::Io`] for filesystem failures.
 pub fn pin(role: Role) -> Result<PinOutcome, PinError> {
     pin_at(&default_role_path(), role)
 }
@@ -570,6 +590,12 @@ pub fn pin_class_at(path: &Path, class: &RoleClass) -> Result<PinOutcome, PinErr
 /// The write is atomic (temp file + rename) so a crash never leaves a
 /// half-written pin; the refusal paths never open the file for writing, so the
 /// downgrade case leaves it byte-for-byte identical.
+///
+/// # Errors
+///
+/// Returns [`PinError::Downgrade`] for a lower-ranked role,
+/// [`PinError::MalformedExisting`] for an invalid existing pin, or
+/// [`PinError::Io`] for filesystem failures.
 pub fn pin_at(path: &Path, role: Role) -> Result<PinOutcome, PinError> {
     let outcome = match load_from(path) {
         Err(LoadError::NotPinned) => PinOutcome::Pinned(role),
