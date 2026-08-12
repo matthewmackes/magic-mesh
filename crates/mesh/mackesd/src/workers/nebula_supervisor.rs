@@ -625,10 +625,10 @@ fn initial_phase_for(node_id: &str, tick: Duration) -> Duration {
     if node_id.is_empty() || window_ms == 0 {
         return Duration::ZERO;
     }
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in node_id.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     Duration::from_millis((u128::from(hash) % (window_ms + 1)) as u64)
 }
