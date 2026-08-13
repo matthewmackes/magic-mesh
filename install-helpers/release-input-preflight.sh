@@ -9,6 +9,7 @@ APP_TRUST_VERIFY="${MCNF_APP_TRUST_VERIFY:-$ROOT/install-helpers/verify-app-vm-c
 CUTTLEFISH_VERIFY="${MCNF_CUTTLEFISH_VERIFY:-$ROOT/packaging/android/verify-guest-payload.sh}"
 SOURCE_VERIFY="${MCNF_SOURCE_VERIFY:-$ROOT/install-helpers/source-revision-receipt.sh}"
 RPM_SIGNING_RECEIPT="${MCNF_RPM_SIGNING_RECEIPT_INSPECTOR:-$ROOT/install-helpers/produce-rpm-signing-identity-receipt.py}"
+BOOTC_DIGEST_RECEIPT="${MCNF_BOOTC_DIGEST_RECEIPT_INSPECTOR:-$ROOT/install-helpers/produce-bootc-digest-receipt.py}"
 
 die() { printf 'release-input-preflight: REFUSED: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${2:-}" ]] || die "missing mandatory input: $1"; }
@@ -19,7 +20,8 @@ digest() {
 
 source_revision='' source_epoch='' app_receipt='' app_key=''
 cuttlefish_declaration='' cuttlefish_signature='' cuttlefish_relay='' cuttlefish_agent=''
-rpm_signing_receipt='' bootc_base_digest='' app_vm_base_digest='' cuttlefish_image_digest=''
+rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
+app_vm_base_digest='' cuttlefish_image_digest=''
 cuttlefish_packages=()
 while (($#)); do
   case "$1" in
@@ -33,7 +35,10 @@ while (($#)); do
     --cuttlefish-vdi-agent) cuttlefish_agent=${2:-}; shift 2 ;;
     --cuttlefish-guest-package) cuttlefish_packages+=("${2:-}"); shift 2 ;;
     --rpm-signing-identity-receipt) rpm_signing_receipt=${2:-}; shift 2 ;;
-    --bootc-base-digest) bootc_base_digest=${2:-}; shift 2 ;;
+    --bootc-base-digest-receipt) bootc_receipt=${2:-}; shift 2 ;;
+    --bootc-base-image-reference) bootc_reference=${2:-}; shift 2 ;;
+    --bootc-base-architecture) bootc_architecture=${2:-}; shift 2 ;;
+    --bootc-release-role) bootc_role=${2:-}; shift 2 ;;
     --app-vm-base-digest) app_vm_base_digest=${2:-}; shift 2 ;;
     --cuttlefish-image-digest) cuttlefish_image_digest=${2:-}; shift 2 ;;
     *) die "unknown or incomplete argument: $1" ;;
@@ -45,7 +50,9 @@ for pair in \
   'App VM catalog trust receipt' "$app_receipt" 'App VM catalog trust key' "$app_key" \
   'Cuttlefish declaration' "$cuttlefish_declaration" 'Cuttlefish signature' "$cuttlefish_signature" \
   'Cuttlefish readiness relay' "$cuttlefish_relay" 'Cuttlefish VDI agent' "$cuttlefish_agent" \
-  'RPM signing identity receipt' "$rpm_signing_receipt" 'bootc base digest' "$bootc_base_digest" \
+  'RPM signing identity receipt' "$rpm_signing_receipt" 'bootc base digest receipt' "$bootc_receipt" \
+  'bootc base image reference' "$bootc_reference" 'bootc base architecture' "$bootc_architecture" \
+  'bootc release role' "$bootc_role" \
   'App VM base digest' "$app_vm_base_digest" 'Cuttlefish image digest' "$cuttlefish_image_digest"; do
   if [[ -z ${label+x} ]]; then label=$pair; else need "$label" "$pair"; unset label; fi
 done
@@ -76,7 +83,12 @@ python3 "$RPM_SIGNING_RECEIPT" inspect --receipt "$rpm_signing_receipt" \
   --expected-source-revision "$source_revision" --expected-release-epoch "$source_epoch" >/dev/null \
   || die 'RPM signing identity receipt admission failed'
 
-digest 'bootc base digest' "$bootc_base_digest"
+python3 "$BOOTC_DIGEST_RECEIPT" inspect --receipt "$bootc_receipt" \
+  --expected-image-reference "$bootc_reference" --expected-architecture "$bootc_architecture" \
+  --expected-source-revision "$source_revision" --expected-commit-epoch "$source_epoch" \
+  --expected-release-role "$bootc_role" >/dev/null \
+  || die 'bootc base digest receipt admission failed'
+
 digest 'App VM base digest' "$app_vm_base_digest"
 digest 'Cuttlefish image digest' "$cuttlefish_image_digest"
 printf 'release-input-preflight: PASS: all mandatory first-release inputs admitted for %s\n' "$source_revision"
