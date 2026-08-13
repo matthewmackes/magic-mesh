@@ -463,7 +463,7 @@ payload_compress = "xz"
 # correct taskbar/health presentation truth.
 # -32 (2026-08-10): admit RDP-only Windows discovery, enforce one kernel-leased
 # owner per grouped worker process, and revoke stale terminal Display1 leases.
-release = "33"
+release = "34"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -826,6 +826,14 @@ assets = [
     { source = "automation/ansible/playbooks/*",       dest = "/usr/share/mde/iac/automation/ansible/playbooks/",       mode = "644" },
     { source = "automation/ansible/plugins/**/*",      dest = "/usr/share/mde/iac/automation/ansible/plugins/",      mode = "644" },
     { source = "automation/ansible/roles/**/*",        dest = "/usr/share/mde/iac/automation/ansible/roles/",        mode = "644" },
+    # WL-FUNC-020 — package-owned Cuttlefish guest release boundary. The exact
+    # DEBs remain governed release inputs; these immutable tools and unit
+    # definitions let a Workstation authenticate, stage, and inspect them.
+    { source = "packaging/android/stage-guest-runtime-artifacts.sh", dest = "/usr/libexec/mackesd/cuttlefish/stage-guest-runtime-artifacts", mode = "755" },
+    { source = "packaging/android/verify-guest-payload.sh", dest = "/usr/libexec/mackesd/cuttlefish/verify-guest-payload", mode = "755" },
+    { source = "packaging/android/verify-guest-debs.sh", dest = "/usr/libexec/mackesd/cuttlefish/verify-guest-debs", mode = "755" },
+    { source = "packaging/android/debian/mcnf-cuttlefish-readiness-relay.service", dest = "/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-readiness-relay.service", mode = "644" },
+    { source = "packaging/android/debian/mcnf-cuttlefish-vdi-agent.service", dest = "/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-vdi-agent.service", mode = "644" },
     # The backoffice systemd units (mcnf-*). The boot-time convergence oneshot
     # (mcnf-backoffice-up.service, DAR-46/47) runs backoffice-up.sh from-intent
     # --adopt; the reconciler/DR/status units are installed live by the *-up.sh
@@ -1701,6 +1709,13 @@ assets = [
     { source = "automation/ansible/playbooks/*",       dest = "/usr/share/mde/iac/automation/ansible/playbooks/",       mode = "644" },
     { source = "automation/ansible/plugins/**/*",      dest = "/usr/share/mde/iac/automation/ansible/plugins/",      mode = "644" },
     { source = "automation/ansible/roles/**/*",        dest = "/usr/share/mde/iac/automation/ansible/roles/",        mode = "644" },
+    # WL-FUNC-020 — the headless compute role owns the same authenticated guest
+    # staging/verifier boundary and service definitions as a Workstation.
+    { source = "packaging/android/stage-guest-runtime-artifacts.sh", dest = "/usr/libexec/mackesd/cuttlefish/stage-guest-runtime-artifacts", mode = "755" },
+    { source = "packaging/android/verify-guest-payload.sh", dest = "/usr/libexec/mackesd/cuttlefish/verify-guest-payload", mode = "755" },
+    { source = "packaging/android/verify-guest-debs.sh", dest = "/usr/libexec/mackesd/cuttlefish/verify-guest-debs", mode = "755" },
+    { source = "packaging/android/debian/mcnf-cuttlefish-readiness-relay.service", dest = "/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-readiness-relay.service", mode = "644" },
+    { source = "packaging/android/debian/mcnf-cuttlefish-vdi-agent.service", dest = "/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-vdi-agent.service", mode = "644" },
     { source = "packaging/systemd/mcnf-backoffice-up.service",  dest = "/usr/lib/systemd/system/mcnf-backoffice-up.service",  mode = "644" },
     { source = "packaging/systemd/mcnf-backoffice-status.service", dest = "/usr/lib/systemd/system/mcnf-backoffice-status.service", mode = "644" },
     { source = "packaging/systemd/mcnf-backoffice-status.timer",   dest = "/usr/lib/systemd/system/mcnf-backoffice-status.timer",   mode = "644" },

@@ -172,6 +172,11 @@ readonly ANDROID_VM_PAYLOAD_MEMBERS=(
   "automation/ansible/roles/cuttlefish_host/defaults/main.yml|/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/defaults/main.yml"
   "automation/ansible/roles/cuttlefish_host/meta/main.yml|/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/meta/main.yml"
   "automation/ansible/roles/cuttlefish_host/tasks/main.yml|/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/tasks/main.yml"
+  "packaging/android/stage-guest-runtime-artifacts.sh|/usr/libexec/mackesd/cuttlefish/stage-guest-runtime-artifacts"
+  "packaging/android/verify-guest-payload.sh|/usr/libexec/mackesd/cuttlefish/verify-guest-payload"
+  "packaging/android/verify-guest-debs.sh|/usr/libexec/mackesd/cuttlefish/verify-guest-debs"
+  "packaging/android/debian/mcnf-cuttlefish-readiness-relay.service|/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-readiness-relay.service"
+  "packaging/android/debian/mcnf-cuttlefish-vdi-agent.service|/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-vdi-agent.service"
 )
 readonly ANDROID_VM_PLAYBOOK_MARKERS=(
   "hosts: delivery_android_vm"
@@ -551,14 +556,19 @@ check_android_vm_payload() {
       covered=0
       while IFS=$'\t' read -r source dest; do
         [ -n "$source" ] || continue
-        case "$member" in
-          $source)
-            case "$dest" in
-              */playbooks/) [[ "$install_path" == "$dest"* ]] && covered=1 ;;
-              */roles/) [[ "$install_path" == "$dest"* ]] && covered=1 ;;
-            esac
-            ;;
-        esac
+        if [[ "$source" == "$member" && "$dest" == "$install_path" ]]; then
+          covered=1
+        else
+          # Asset sources intentionally contain cargo-generate-rpm globs.
+          # shellcheck disable=SC2254
+          case "$member" in
+            $source)
+              case "$dest" in
+                */playbooks/|*/roles/) [[ "$install_path" == "$dest"* ]] && covered=1 ;;
+              esac
+              ;;
+          esac
+        fi
       done < <($parser "$CARGO_TOML")
       if [ "$covered" -eq 1 ]; then
         ok "android $label manifest covers $member -> $install_path"
@@ -1406,6 +1416,29 @@ LISTING
     ok "self-test: non-empty Ansible payload cannot hide a missing Cuttlefish runtime"
   else
     fail "self-test: missing Cuttlefish runtime escaped exact RPM verification"; st_fail=1
+  fi
+
+  # The legacy Ansible contract can be complete while the deterministic guest
+  # package boundary is absent. Preserve every other newly required member and
+  # prove omission of the exact DEB verifier still fails the built-RPM list.
+  local android_missing_deb_verifier="$tmp/android-missing-deb-verifier-list"
+  cat >"$android_missing_deb_verifier" <<'LISTING'
+/usr/share/mde/iac/automation/ansible/playbooks/site.yml
+/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/defaults/main.yml
+/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/meta/main.yml
+/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/tasks/main.yml
+/usr/libexec/mackesd/cuttlefish/stage-guest-runtime-artifacts
+/usr/libexec/mackesd/cuttlefish/verify-guest-payload
+/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-readiness-relay.service
+/usr/share/mde/cuttlefish/guest-systemd/mcnf-cuttlefish-vdi-agent.service
+LISTING
+  out="$(MCNF_FAKE_RPM_LIST="$android_missing_deb_verifier" \
+      bash "$0" android-vm-payload "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "/usr/libexec/mackesd/cuttlefish/verify-guest-debs MISSING" <<<"$out"; then
+    ok "self-test: complete legacy Android payload cannot hide a missing deterministic DEB verifier"
+  else
+    fail "self-test: missing deterministic DEB verifier escaped exact RPM verification"; st_fail=1
   fi
 
   # Generic VM and credential payload is not Browser delivery. Keep unrelated

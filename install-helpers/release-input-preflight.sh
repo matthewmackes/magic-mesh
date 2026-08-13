@@ -7,6 +7,7 @@ ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 KIRON_VERIFY="${MCNF_KIRON_VERIFY:-$ROOT/packaging/kiron/verify-package.sh}"
 APP_TRUST_VERIFY="${MCNF_APP_TRUST_VERIFY:-$ROOT/install-helpers/verify-app-vm-catalog-trust.py}"
 CUTTLEFISH_VERIFY="${MCNF_CUTTLEFISH_VERIFY:-$ROOT/packaging/android/verify-guest-payload.sh}"
+CUTTLEFISH_DEB_VERIFY="${MCNF_CUTTLEFISH_DEB_VERIFY:-$ROOT/packaging/android/verify-guest-debs.sh}"
 SOURCE_VERIFY="${MCNF_SOURCE_VERIFY:-$ROOT/install-helpers/source-revision-receipt.sh}"
 RPM_SIGNING_RECEIPT="${MCNF_RPM_SIGNING_RECEIPT_INSPECTOR:-$ROOT/install-helpers/produce-rpm-signing-identity-receipt.py}"
 BOOTC_DIGEST_RECEIPT="${MCNF_BOOTC_DIGEST_RECEIPT_INSPECTOR:-$ROOT/install-helpers/produce-bootc-digest-receipt.py}"
@@ -84,8 +85,9 @@ done
 
 trust_stage=$(mktemp -d)
 payload_parent=$(mktemp -d)
+deb_stage=$(mktemp -d)
 image_identity=$(mktemp)
-cleanup() { rm -rf -- "$trust_stage" "$payload_parent"; rm -f -- "$image_identity"; }
+cleanup() { rm -rf -- "$trust_stage" "$payload_parent" "$deb_stage"; rm -f -- "$image_identity"; }
 trap cleanup EXIT
 "$APP_TRUST_VERIFY" --receipt "$app_receipt" --key "$app_key" \
   --expected-source-revision "$source_revision" --stage-dir "$trust_stage" >/dev/null \
@@ -100,6 +102,31 @@ for package in "${cuttlefish_packages[@]}"; do
 done
 "$CUTTLEFISH_VERIFY" "${cuttlefish_args[@]}" >/dev/null \
   || die 'Cuttlefish signed guest payload admission failed'
+
+# The signed declaration alone does not prove that release engineering supplied
+# the deterministic package set. Require the exact two package names from one
+# manifest-bearing directory, then bind their archived binaries and units to
+# the same admitted relay/agent bytes through the owning package verifier.
+[[ ${#cuttlefish_packages[@]} -eq 2 ]] \
+  || die 'Cuttlefish release requires exactly two deterministic guest DEBs'
+package_dir=''
+declare -A cuttlefish_package_names=()
+for package in "${cuttlefish_packages[@]}"; do
+  [[ -f "$package" && ! -L "$package" ]] || die "Cuttlefish guest DEB is missing or substituted: $package"
+  [[ -z "$package_dir" || $(dirname -- "$package") == "$package_dir" ]] \
+    || die 'Cuttlefish guest DEBs must share one manifest-bearing directory'
+  package_dir=$(dirname -- "$package")
+  cuttlefish_package_names["$(basename -- "$package")"]=1
+done
+for name in mcnf-cuttlefish-readiness-relay.deb mcnf-cuttlefish-vdi-agent.deb; do
+  [[ ${cuttlefish_package_names[$name]:-0} -eq 1 ]] \
+    || die "Cuttlefish deterministic guest DEB is missing: $name"
+done
+install -m 0555 -- "$cuttlefish_relay" "$deb_stage/mcnf-cuttlefish-readiness-relay"
+install -m 0555 -- "$cuttlefish_agent" "$deb_stage/mcnf-cuttlefish-vdi-agent"
+"$CUTTLEFISH_DEB_VERIFY" --source-revision "$source_revision" \
+  --stage-dir "$deb_stage" --package-dir "$package_dir" >/dev/null \
+  || die 'Cuttlefish deterministic guest DEB admission failed'
 
 python3 "$CUTTLEFISH_IMAGE_RECEIPT" --repo "$CUTTLEFISH_IMAGE_REPO" inspect \
   --source-kind "$cuttlefish_image_source_kind" \

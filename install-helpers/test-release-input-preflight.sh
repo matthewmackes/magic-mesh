@@ -19,7 +19,7 @@ source_epoch=$(git -C "$fixture/source-repo" show -s --format=%ct "$source_revis
 bootc_reference='registry.invalid/mcnf/bootc:release'
 bootc_architecture='amd64'
 bootc_role='unified-seat-server'
-for verifier in source kiron app cuttlefish; do
+for verifier in source kiron app; do
   cat >"$fixture/$verifier" <<'EOF'
 #!/usr/bin/env bash
 exit "${FAKE_VERIFIER_RC:-0}"
@@ -42,6 +42,26 @@ mkdir -p "$stage"
 cp "$declaration" "$stage/release.json"
 EOF
 chmod 0755 "$fixture/cuttlefish"
+cat >"$fixture/guest-debs" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+revision='' stage='' packages=''
+while (($#)); do
+  case "$1" in
+    --source-revision) revision=$2; shift 2 ;;
+    --stage-dir) stage=$2; shift 2 ;;
+    --package-dir) packages=$2; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+[[ ${FAKE_VERIFIER_RC:-0} -eq 0 ]] || exit "${FAKE_VERIFIER_RC}"
+[[ $revision =~ ^[0-9a-f]{40}$ ]]
+cmp -s "$stage/mcnf-cuttlefish-readiness-relay" "$PREFLIGHT_TEST_RELAY"
+cmp -s "$stage/mcnf-cuttlefish-vdi-agent" "$PREFLIGHT_TEST_AGENT"
+[[ -f $packages/guest-deb-manifest.json ]]
+touch "$PREFLIGHT_TEST_DEB_MARKER"
+EOF
+chmod 0755 "$fixture/guest-debs"
 cat >"$fixture/signing-receipt.py" <<'EOF'
 #!/usr/bin/env python3
 import os
@@ -66,6 +86,10 @@ printf 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n'
 EOF
 chmod 0755 "$fixture/bin/gpg"
 touch "$fixture/receipt" "$fixture/key" "$fixture/signature" "$fixture/relay" "$fixture/agent" "$fixture/signing-receipt.json"
+mkdir "$fixture/guest-debs-input"
+touch "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
+touch "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
+touch "$fixture/guest-debs-input/guest-deb-manifest.json"
 printf 'immutable Cuttlefish image fixture\n' >"$fixture/cuttlefish-image.tar"
 python3 "$ROOT/packaging/android/produce-image-receipt.py" --repo "$fixture/source-repo" produce \
   --source-kind artifact --original-source "$fixture/cuttlefish-image.tar" \
@@ -111,6 +135,8 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --app-vm-catalog-trust-receipt "$fixture/receipt" --app-vm-catalog-trust-key "$fixture/key"
   --cuttlefish-declaration "$fixture/declaration" --cuttlefish-signature "$fixture/signature"
   --cuttlefish-readiness-relay "$fixture/relay" --cuttlefish-vdi-agent "$fixture/agent"
+  --cuttlefish-guest-package "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
+  --cuttlefish-guest-package "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
   --rpm-signing-identity-receipt "$fixture/signing-receipt.json"
   --bootc-base-digest-receipt "$fixture/bootc-receipt.json"
   --bootc-base-image-reference "$bootc_reference"
@@ -128,6 +154,9 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --cuttlefish-image-artifact-format android-cuttlefish-image-archive)
 envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_VERIFY="$fixture/kiron"
   MCNF_APP_TRUST_VERIFY="$fixture/app" MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
+  MCNF_CUTTLEFISH_DEB_VERIFY="$fixture/guest-debs"
+  PREFLIGHT_TEST_RELAY="$fixture/relay" PREFLIGHT_TEST_AGENT="$fixture/agent"
+  PREFLIGHT_TEST_DEB_MARKER="$fixture/guest-debs-verified"
   MCNF_RPM_SIGNING_RECEIPT_INSPECTOR="$fixture/signing-receipt.py"
   MCNF_BOOTC_DIGEST_RECEIPT_INSPECTOR="$fixture/bootc-inspector"
   MCNF_CUTTLEFISH_IMAGE_RECEIPT_INSPECTOR="$ROOT/packaging/android/produce-image-receipt.py"
@@ -138,8 +167,23 @@ envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_
 run_release() { env "${envs[@]}" "$PRE" "$@" && : >"$marker"; }
 run_release "${args[@]}"
 [[ -e "$marker" ]] || { echo 'preflight self-test: valid fixture did not reach build command' >&2; exit 1; }
+[[ -e "$fixture/guest-debs-verified" ]] || { echo 'preflight self-test: deterministic guest DEB verifier was not invoked' >&2; exit 1; }
 echo 'release-input-preflight: bootc receipt integration PASS (revision, epoch, architecture, role, and image reference matched)'
 rm -f "$marker"
+
+missing_deb=()
+for ((index = 0; index < ${#args[@]}; index++)); do
+  if [[ ${args[index]} == --cuttlefish-guest-package \
+      && ${args[index + 1]} == *mcnf-cuttlefish-readiness-relay.deb ]]; then
+    index=$((index + 1))
+    continue
+  fi
+  missing_deb+=("${args[index]}")
+done
+if run_release "${missing_deb[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: incomplete deterministic guest DEB set reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: incomplete guest DEBs mutated build state' >&2; exit 1; }
 
 if run_release "${args[@]:0:${#args[@]}-2}" >/dev/null 2>&1; then
   echo 'preflight self-test: incomplete image receipt interface reached build command' >&2; exit 1
