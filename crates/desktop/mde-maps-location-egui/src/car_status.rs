@@ -182,6 +182,40 @@ impl CarStatusItem {
         Self::NavSummary,
     ];
 
+    /// Whether this tile claims a current MG90 radio observation.
+    ///
+    /// `RadioHealth` is deliberately excluded: it is the one diagnostic tile
+    /// that must keep explaining a stale or unavailable inventory. Every
+    /// operational value fails closed when the typed v2 radio domain is not
+    /// fresh, even if the retained legacy mirror still contains plausible
+    /// carrier, address, signal, or WAN values.
+    const fn requires_fresh_radio_snapshot(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveWan
+                | Self::CellASignal
+                | Self::CellABars
+                | Self::CellACarrier
+                | Self::CellATech
+                | Self::CellASim
+                | Self::CellAIp
+                | Self::CellAHealth
+                | Self::CellBSignal
+                | Self::CellBCarrier
+                | Self::CellBTech
+                | Self::CellBSim
+                | Self::CellBHealth
+                | Self::WifiState
+                | Self::EthernetState
+                | Self::VpnState
+                | Self::LinkQuality
+                | Self::LatencyMs
+                | Self::PacketLoss
+                | Self::Failovers
+                | Self::DataUsed
+        )
+    }
+
     /// The short label shown above the value in the strip tile.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -312,6 +346,9 @@ impl CarStatusItem {
                 }
             }
             Self::CellAHealth | Self::CellBHealth => {
+                if !radio_snapshot_is_fresh(s) {
+                    return CarStatusTone::Muted;
+                }
                 let healthy = match self {
                     Self::CellAHealth => s.mg90.status.cellular_a.healthy,
                     Self::CellBHealth => s.mg90.status.cellular_b.healthy,
@@ -334,6 +371,9 @@ impl CarStatusItem {
     /// when the source is not present — never fabricated.
     #[must_use]
     pub fn value(self, s: &MapsLocationSurface) -> String {
+        if self.requires_fresh_radio_snapshot() && !radio_snapshot_is_fresh(s) {
+            return "—".to_string();
+        }
         let t = &s.vehicle.telemetry;
         let w = &s.mg90.status;
         let sample = s.locations.primary_source().map(|src| &src.sample);
@@ -515,6 +555,14 @@ pub fn live_speed_mph(s: &MapsLocationSurface) -> Option<f32> {
     // policy applies the same validation at its public boundary as defense in
     // depth for callers that do not use this helper.
     (telemetry_is_live(s) && mph.is_finite() && mph >= 0.0).then_some(mph)
+}
+
+/// Whether operational MG90 radio details have current typed provenance.
+/// Retained legacy status remains useful to the fold for recovery diagnostics,
+/// but it cannot authorize a current WAN/link claim after v2 freshness expires.
+#[must_use]
+pub fn radio_snapshot_is_fresh(s: &MapsLocationSurface) -> bool {
+    s.vehicle_radio_health.radios_freshness.state == crate::model::VehicleFreshnessState::Fresh
 }
 
 fn cardinal(deg: f32) -> &'static str {
@@ -1111,7 +1159,51 @@ mod tests {
         assert_eq!(CarStatusItem::CellASignal.value(&s), "—");
         assert_eq!(CarStatusItem::LatencyMs.value(&s), "—");
         assert_eq!(CarStatusItem::PacketLoss.value(&s), "—");
-        assert_eq!(CarStatusItem::CellABars.value(&s), "▯▯▯▯▯");
+        assert_eq!(CarStatusItem::CellABars.value(&s), "—");
+    }
+
+    #[test]
+    fn stale_or_unproven_radio_snapshot_revokes_all_operational_tiles() {
+        use crate::model::VehicleFreshnessState;
+
+        let mut surface = MapsLocationSurface::simulated();
+        surface.mg90.status.active_wan = "Cellular A".to_string();
+        surface.mg90.status.cellular_a.signal_dbm = -67;
+        surface.mg90.status.cellular_a.carrier = "Retained Carrier".to_string();
+        surface.mg90.status.cellular_a.wan_ip = "192.0.2.42".to_string();
+        surface.mg90.status.cellular_a.healthy = true;
+        surface.mg90.status.wifi_state = "connected".to_string();
+        surface.mg90.status.vpn_state = "up".to_string();
+        surface.mg90.status.latency_ms = 18;
+        surface.mg90.status.packet_loss_percent = 0.2;
+        surface.mg90.status.data_transferred = "12 MiB".to_string();
+
+        for freshness in [VehicleFreshnessState::Unknown, VehicleFreshnessState::Stale] {
+            surface.vehicle_radio_health.radios_freshness.state = freshness;
+            for item in [
+                CarStatusItem::ActiveWan,
+                CarStatusItem::CellASignal,
+                CarStatusItem::CellABars,
+                CarStatusItem::CellACarrier,
+                CarStatusItem::CellAIp,
+                CarStatusItem::CellAHealth,
+                CarStatusItem::WifiState,
+                CarStatusItem::VpnState,
+                CarStatusItem::LatencyMs,
+                CarStatusItem::PacketLoss,
+                CarStatusItem::DataUsed,
+            ] {
+                let display = item.display(&surface);
+                assert_eq!(display.value, "—", "{item:?} leaked a {freshness:?} claim");
+                assert_eq!(display.tone, CarStatusTone::Muted, "{item:?} tone");
+                assert!(display.accessibility_label.contains("unavailable"));
+            }
+            assert_ne!(
+                CarStatusItem::RadioHealth.value(&surface),
+                "—",
+                "the diagnostic tile must retain the reason"
+            );
+        }
     }
 
     #[test]
