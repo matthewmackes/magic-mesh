@@ -42,6 +42,7 @@ const HISTORY_COMPONENT_FILTER_STATE_ID: &str = "health-history-component-filter
 const HISTORY_SOURCE_FILTER_STATE_ID: &str = "health-history-source-filter";
 const HISTORY_PROVIDER_FILTER_STATE_ID: &str = "health-history-provider-filter";
 const HISTORY_PAGE_STATE_ID: &str = "health-history-page";
+const HISTORY_SELECTION_STATE_ID: &str = "health-history-selection";
 const HISTORY_ORIGIN_FILTER_LIMIT: usize = 32;
 const SNAPSHOT_AUTHORITY_STATE_ID: &str = "health-snapshot-authority";
 const ACTION_PROGRESS_STATE_ID: &str = "health-action-result-progress";
@@ -65,6 +66,12 @@ struct HistoryPageState {
     source: Option<String>,
     provider: Option<String>,
     page: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistorySelection {
+    node: String,
+    incident_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -725,6 +732,7 @@ fn detail(
             if history.rows.is_empty() {
                 ui.colored_label(Style::TEXT_DIM, "No history matches this filter.");
             }
+            let selected_incident = history_selection(ui.ctx(), &node);
             for recurrence in history.rows {
                 let condition = recurrence.condition;
                 let recurrence_copy = if recurrence.occurrences == 1 {
@@ -732,7 +740,7 @@ fn detail(
                 } else {
                     format!("{} times", recurrence.occurrences)
                 };
-                ui.label(format!(
+                let row_text = format!(
                     "{} · occurred {recurrence_copy} · resolved {} · duration {}",
                     redact_support_text(&condition.evidence.summary),
                     condition
@@ -740,7 +748,16 @@ fn detail(
                         .map_or_else(|| "—".into(), format_timestamp),
                     resolution_duration_ms(condition)
                         .map_or_else(|| "unknown".to_string(), format_health_duration_ms),
-                ));
+                );
+                if ui
+                    .selectable_label(
+                        selected_incident.as_deref() == Some(condition.id.as_str()),
+                        row_text,
+                    )
+                    .clicked()
+                {
+                    set_history_selection(ui.ctx(), &node, &condition.id);
+                }
             }
             if history.total > HISTORY_PAGE_SIZE {
                 ui.horizontal(|ui| {
@@ -763,7 +780,57 @@ fn detail(
                 });
             }
             set_history_page_state(ui.ctx(), page_state);
+            if let Some(incident_id) = history_selection(ui.ctx(), &node) {
+                ui.add_space(Style::SP_S);
+                ui.strong("Resolved issue detail");
+                if let Some(condition) = selected_history_condition(
+                    &snapshot.resolved_conditions,
+                    &node,
+                    snapshot.generated_at_ms,
+                    &incident_id,
+                ) {
+                    resolved_condition_detail(ui, condition);
+                } else {
+                    ui.colored_label(
+                        Style::TEXT_DIM,
+                        "This resolved issue is no longer in the retained history.",
+                    );
+                }
+            }
         }
+    }
+}
+
+fn resolved_condition_detail(ui: &mut egui::Ui, condition: &HealthCondition) {
+    ui.label(redact_support_text(&condition.evidence.summary));
+    ui.label(format!(
+        "{:?} · {:?} · source {} · provider {}",
+        condition.severity,
+        condition.component,
+        redact_support_text(&condition.source),
+        redact_support_text(&condition.evidence.provider),
+    ));
+    ui.label(format!(
+        "Observed {} · resolved {} · duration {}",
+        format_timestamp(condition.evidence.observed_at_ms),
+        condition
+            .resolved_at_ms
+            .map_or_else(|| "—".into(), format_timestamp),
+        resolution_duration_ms(condition)
+            .map_or_else(|| "unknown".to_string(), format_health_duration_ms),
+    ));
+    for (key, value) in condition
+        .evidence
+        .facts
+        .iter()
+        .filter(|(key, _)| !credential_shaped(key))
+        .take(SUPPORT_BUNDLE_MAX_FACTS)
+    {
+        ui.label(format!(
+            "{}: {}",
+            redact_support_text(key),
+            redact_support_text(value)
+        ));
     }
 }
 
@@ -2048,6 +2115,24 @@ fn set_history_page_state(ctx: &egui::Context, state: HistoryPageState) {
     ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_PAGE_STATE_ID), state));
 }
 
+fn history_selection(ctx: &egui::Context, node: &str) -> Option<String> {
+    ctx.data(|data| data.get_temp::<HistorySelection>(egui::Id::new(HISTORY_SELECTION_STATE_ID)))
+        .filter(|selection| selection.node == node)
+        .map(|selection| selection.incident_id)
+}
+
+fn set_history_selection(ctx: &egui::Context, node: &str, incident_id: &str) {
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(HISTORY_SELECTION_STATE_ID),
+            HistorySelection {
+                node: node.to_owned(),
+                incident_id: incident_id.to_owned(),
+            },
+        );
+    });
+}
+
 struct HistoryRecurrence<'a> {
     condition: &'a HealthCondition,
     occurrences: usize,
@@ -2056,6 +2141,27 @@ struct HistoryRecurrence<'a> {
 struct HistoryPage<'a> {
     rows: Vec<HistoryRecurrence<'a>>,
     total: usize,
+}
+
+fn selected_history_condition<'a>(
+    conditions: &'a [HealthCondition],
+    node: &str,
+    as_of_ms: u64,
+    incident_id: &str,
+) -> Option<&'a HealthCondition> {
+    let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
+    conditions
+        .iter()
+        .filter(|condition| {
+            condition.id == incident_id
+                && matches!(&condition.scope, HealthScope::Node { node: target } if target == node)
+                && !condition.is_active()
+                && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
+                    (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
+                        && resolved_at_ms >= condition.last_observed_ms
+                })
+        })
+        .min_by(|left, right| history_order(left, right))
 }
 
 /// Aggregate stable lifecycle identities without materializing an unbounded
@@ -3098,6 +3204,69 @@ mod tests {
             1,
             "history filtering cannot absorb or duplicate active conditions"
         );
+    }
+
+    #[test]
+    fn resolved_history_selection_keeps_exact_identity_across_reorder_filter_and_page_changes() {
+        let ctx = egui::Context::default();
+        let mut selected = condition(
+            "node:selected-incident",
+            "node",
+            HealthSeverity::Warning,
+            HealthComponent::Devices,
+        );
+        selected.source = "selected-source".into();
+        selected.resolved_at_ms = Some(9_000);
+        selected.last_observed_ms = 9_000;
+        let mut substitute = condition(
+            "node:substitute-incident",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        substitute.resolved_at_ms = Some(10_000);
+        substitute.last_observed_ms = 10_000;
+        let mut conditions = vec![selected.clone(), substitute.clone()];
+
+        set_history_selection(&ctx, "node", &selected.id);
+        conditions.reverse();
+        assert_eq!(history_selection(&ctx, "node"), Some(selected.id.clone()));
+        assert_eq!(
+            selected_history_condition(&conditions, "node", 10_000, &selected.id)
+                .map(|condition| condition.id.as_str()),
+            Some(selected.id.as_str()),
+            "live reorder must resolve detail by stable incident identity"
+        );
+
+        let filtered_page = paged_recurrence_history(
+            &conditions,
+            "node",
+            10_000,
+            HistorySeverityFilter::Critical,
+            HistoryComponentFilter::Component(HealthComponent::System),
+            None,
+            None,
+            7,
+        );
+        assert!(filtered_page.rows.is_empty());
+        assert_eq!(history_selection(&ctx, "node"), Some(selected.id.clone()));
+        assert_eq!(
+            selected_history_condition(&conditions, "node", 10_000, &selected.id)
+                .map(|condition| condition.source.as_str()),
+            Some("selected-source"),
+            "filter and page state cannot replace selected detail"
+        );
+
+        conditions.retain(|condition| condition.id != selected.id);
+        assert!(selected_history_condition(&conditions, "node", 10_000, &selected.id).is_none());
+        assert_eq!(history_selection(&ctx, "node"), Some(selected.id));
+        assert_ne!(
+            selected_history_condition(&conditions, "node", 10_000, "node:selected-incident")
+                .map(|condition| condition.id.as_str()),
+            Some(substitute.id.as_str()),
+            "a vanished incident must not substitute the next visible row"
+        );
+        assert_eq!(history_selection(&ctx, "other-node"), None);
     }
 
     #[test]
