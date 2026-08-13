@@ -16,6 +16,7 @@ BROWSER_MANIFEST_VERIFY=${MCNF_DERIVATIVE_BROWSER_MANIFEST_VERIFY:-$ROOT/packagi
 APP_MANIFEST_VERIFY=${MCNF_DERIVATIVE_APP_MANIFEST_VERIFY:-$ROOT/packaging/app-vm/verify-qcow2-manifest.py}
 RELEASE_KEY=${MCNF_DERIVATIVE_RELEASE_KEY:-$ROOT/packaging/repo/RPM-GPG-KEY-magic-mesh}
 PROFILE=${MCNF_DERIVATIVE_BROWSER_PROFILE:-$ROOT/packaging/browser-vm/profile.env}
+PROFILE_FREEZE=${MCNF_DERIVATIVE_BROWSER_PROFILE_FREEZE:-$ROOT/packaging/browser-vm/release-profile.py}
 
 refuse() { printf 'release-derivative-images: REFUSED: %s\n' "$*" >&2; exit 2; }
 usage() {
@@ -92,10 +93,6 @@ regular_input 'Browser RPM candidate manifest' "$browser_candidate" 1048576
 regular_input 'Browser base receipt' "$browser_base_receipt" 1048576
 regular_input 'governed release key' "$RELEASE_KEY" 1048576
 regular_input 'Browser profile' "$PROFILE" 65536
-
-profile_revision=$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$PROFILE")
-[[ "$profile_revision" == "$source_revision" ]] \
-    || refuse 'Browser profile is not bound to the requested release revision'
 [[ ! -e "$output" && ! -L "$output" ]] || refuse 'output path already exists or is substituted'
 output_parent=$(dirname -- "$output")
 [[ -d "$output_parent" && ! -L "$output_parent" ]] || refuse 'output parent must be an existing real directory'
@@ -111,6 +108,12 @@ browser_out=$work/browser-build
 app_out=$work/app-build
 collection=$work/collection
 mkdir -m 0700 "$inputs" "$browser_out" "$app_out" "$collection"
+
+frozen_profile=$inputs/browser-profile.env
+"$PROFILE_FREEZE" --repo "$ROOT" --source-revision "$source_revision" \
+    --output "$frozen_profile" >/dev/null \
+    || refuse 'Browser release profile freeze failed'
+regular_input 'frozen Browser profile' "$frozen_profile" 65536
 
 # Snapshot the admitted bytes. Builders never receive caller-owned RPM paths,
 # so failure cannot partially sign, rewrite, or consume the signed originals.
@@ -134,7 +137,8 @@ MCNF_APP_VM_SOURCE_COMMIT="$source_revision" "$APP_BUILDER" \
     --disk qcow2 --out "$app_out" \
     || refuse 'App VM derivative build or verification failed'
 
-"$BROWSER_BUILDER" --rpm "$inputs/lighthouse.rpm" \
+"$BROWSER_BUILDER" --profile "$frozen_profile" --source-revision "$source_revision" \
+    --rpm "$inputs/lighthouse.rpm" \
     --base-receipt "$browser_base_receipt" --base "$browser_base" \
     --disk qcow2 --out "$browser_out" \
     || refuse 'Browser VM derivative build or verification failed'
@@ -145,8 +149,9 @@ browser_manifest=${browser_disk}.mcnf-manifest.json
 for pair in 'App VM disk' "$app_disk" 'Browser VM disk' "$browser_disk" 'Browser VM manifest' "$browser_manifest"; do
     if [[ -z ${label+x} ]]; then label=$pair; else regular_input "$label" "$pair" 137438953472; unset label; fi
 done
-python3 "$BROWSER_MANIFEST_VERIFY" verify --repo-root "$ROOT" --profile "$PROFILE" \
-    --image "$browser_disk" --manifest "$browser_manifest" >/dev/null \
+python3 "$BROWSER_MANIFEST_VERIFY" verify --repo-root "$ROOT" --profile "$frozen_profile" \
+    --source-revision "$source_revision" --image "$browser_disk" \
+    --manifest "$browser_manifest" >/dev/null \
     || refuse 'Browser VM emitted manifest re-verification failed'
 
 install -m 0400 -- "$app_disk" "$collection/app-vm-wayland-standard.qcow2"

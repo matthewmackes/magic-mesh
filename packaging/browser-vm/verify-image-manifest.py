@@ -306,6 +306,23 @@ def self_test(repo_root: Path, profile: Path) -> None:
 
     with tempfile.TemporaryDirectory(prefix="browser-vm-manifest-") as raw:
         root = Path(raw)
+        values, _ = parse_profile(profile)
+        if values["BROWSER_VM_SOURCE_COMMIT"] == "@RELEASE_REVISION@":
+            try:
+                revision = subprocess.run(
+                    ["git", "-C", str(repo_root), "rev-parse", "HEAD"], check=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+                ).stdout.strip()
+                frozen = root / "profile.env"
+                subprocess.run(
+                    [str(repo_root / "packaging/browser-vm/release-profile.py"),
+                     "--repo", str(repo_root), "--source-revision", revision,
+                     "--output", str(frozen)], check=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, timeout=30,
+                )
+                profile = frozen
+            except (OSError, subprocess.SubprocessError) as exc:
+                fail(f"cannot derive self-test release profile: {exc}")
         image = root / "browser-vm.iso"
         manifest = root / "browser-vm.iso.mcnf-manifest.json"
         image.write_bytes(b"bounded-browser-vm-image-fixture\n")
@@ -395,9 +412,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "create":
+            source_revision = parse_profile(args.profile)[0]["BROWSER_VM_SOURCE_COMMIT"]
+            if SOURCE_REVISION.fullmatch(source_revision) is None or source_revision == "0" * 40:
+                fail("profile is not a frozen release snapshot")
             value = build_manifest(args.repo_root, args.profile, args.image, args.format)
             write_manifest(value, args.manifest)
-            source_revision = parse_profile(args.profile)[0]["BROWSER_VM_SOURCE_COMMIT"]
             verify_manifest(
                 args.repo_root,
                 args.profile,

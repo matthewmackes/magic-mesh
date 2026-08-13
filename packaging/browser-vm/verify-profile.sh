@@ -9,10 +9,12 @@ SOURCE_REVISION=
 MANIFEST=
 IMAGE=
 SELF_TEST=0
+TEMPLATE_MODE=0
 POSITIONAL=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --source) SOURCE_MODE=1; shift ;;
+        --template) TEMPLATE_MODE=1; shift ;;
         --source-revision) SOURCE_REVISION="${2:?--source-revision needs a revision}"; shift 2 ;;
         --manifest) MANIFEST="${2:?--manifest needs a path}"; shift 2 ;;
         --image) IMAGE="${2:?--image needs a path}"; shift 2 ;;
@@ -34,7 +36,12 @@ if [ "$SELF_TEST" -eq 1 ]; then
         echo 'verify-browser-vm-profile: --self-test accepts no other input' >&2
         exit 2
     fi
-    "$MANIFEST_VERIFY" self-test --repo-root "$ROOT" --profile "$PROFILE"
+    self_test_work=$(mktemp -d)
+    trap 'rm -rf -- "$self_test_work"' EXIT
+    self_test_revision=$(git -C "$ROOT" rev-parse HEAD)
+    "$ROOT/packaging/browser-vm/release-profile.py" --repo "$ROOT" \
+        --source-revision "$self_test_revision" --output "$self_test_work/profile.env" >/dev/null
+    "$MANIFEST_VERIFY" self-test --repo-root "$ROOT" --profile "$self_test_work/profile.env"
     echo 'Browser VM profile/manifest self-tests passed'
     exit 0
 fi
@@ -42,8 +49,16 @@ if { [ -n "$MANIFEST" ] && [ -z "$IMAGE" ]; } || { [ -z "$MANIFEST" ] && [ -n "$
     echo 'verify-browser-vm-profile: --manifest and --image are required together' >&2
     exit 2
 fi
+[ -z "$MANIFEST" ] || [ -n "$SOURCE_REVISION" ] || {
+    echo 'verify-browser-vm-profile: manifest admission requires --source-revision' >&2
+    exit 2
+}
 [ -z "$SOURCE_REVISION" ] || [ "$SOURCE_MODE" -eq 1 ] || {
     echo 'verify-browser-vm-profile: --source-revision requires --source' >&2
+    exit 2
+}
+[ "$TEMPLATE_MODE" -eq 0 ] || { [ "$SOURCE_MODE" -eq 0 ] && [ -z "$SOURCE_REVISION" ]; } || {
+    echo 'verify-browser-vm-profile: --template cannot be combined with source admission' >&2
     exit 2
 }
 
@@ -58,7 +73,7 @@ profile_metadata=$(stat -c '%u %a' "$PROFILE" 2>/dev/null) \
     || die "profile metadata is unreadable: $PROFILE"
 profile_owner=${profile_metadata%% *}
 profile_mode=${profile_metadata##* }
-if [ "$SOURCE_MODE" -eq 0 ]; then
+if [ "$SOURCE_MODE" -eq 0 ] && [ "$TEMPLATE_MODE" -eq 0 ]; then
     [[ "$profile_owner" == 0 ]] || die "profile must be owned by root: $PROFILE"
 else
     # Farm rsync preserves the build user as owner. Source mode checks regular
@@ -114,10 +129,15 @@ done
     || die "source repository is not the governed repository"
 [[ "${values[BROWSER_VM_SOURCE_PATH]}" == packaging/browser-vm/profile.env ]] \
     || die "source path is not the profile itself"
-[[ "${values[BROWSER_VM_SOURCE_COMMIT]}" =~ ^[0-9a-f]{40}$ ]] \
-    || die "source commit must be a 40-character immutable Git revision"
-[[ "${values[BROWSER_VM_SOURCE_COMMIT]}" != 0000000000000000000000000000000000000000 ]] \
-    || die "source commit must identify a real Git object"
+if [ "$TEMPLATE_MODE" -eq 1 ]; then
+    [[ "${values[BROWSER_VM_SOURCE_COMMIT]}" == @RELEASE_REVISION@ ]] \
+        || die "tracked template must contain the non-authoritative release marker"
+else
+    [[ "${values[BROWSER_VM_SOURCE_COMMIT]}" =~ ^[0-9a-f]{40}$ ]] \
+        || die "source commit must be a 40-character immutable Git revision"
+    [[ "${values[BROWSER_VM_SOURCE_COMMIT]}" != 0000000000000000000000000000000000000000 ]] \
+        || die "source commit must identify a real Git object"
+fi
 if [ -n "$SOURCE_REVISION" ]; then
     [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
         || die "requested source revision must be one full lowercase Git commit ID"
@@ -126,21 +146,12 @@ if [ -n "$SOURCE_REVISION" ]; then
     [[ "$(git -C "$ROOT" cat-file -t "$SOURCE_REVISION" 2>/dev/null)" == commit ]] \
         || die "requested source revision is not an available Git commit"
 
-    # The commit field is the release binding and therefore cannot be part of
-    # its own Git identity without a hash fixed-point. Compare every other byte
-    # against the governed blob at the requested commit. This admits only that
-    # one release-field substitution and rejects stale, dirty, or substituted
-    # configuration before an image builder mutates staging or output state.
     freeze_work=$(mktemp -d)
     trap 'rm -rf -- "$freeze_work"' EXIT
-    git -C "$ROOT" show "$SOURCE_REVISION:${values[BROWSER_VM_SOURCE_PATH]}" \
-        >"$freeze_work/committed" 2>/dev/null \
-        || die "profile path is absent from the requested source revision"
-    sed 's/^BROWSER_VM_SOURCE_COMMIT=.*/BROWSER_VM_SOURCE_COMMIT=@RELEASE_REVISION@/' \
-        "$freeze_work/committed" >"$freeze_work/committed.normalized"
-    sed 's/^BROWSER_VM_SOURCE_COMMIT=.*/BROWSER_VM_SOURCE_COMMIT=@RELEASE_REVISION@/' \
-        "$PROFILE" >"$freeze_work/supplied.normalized"
-    cmp -s -- "$freeze_work/supplied.normalized" "$freeze_work/committed.normalized" \
+    "$ROOT/packaging/browser-vm/release-profile.py" --repo "$ROOT" \
+        --source-revision "$SOURCE_REVISION" --output "$freeze_work/expected" >/dev/null \
+        || die "cannot derive governed profile snapshot from requested revision"
+    cmp -s -- "$PROFILE" "$freeze_work/expected" \
         || die "profile bytes differ from the requested source revision"
 fi
 [[ "${values[BROWSER_VM_GUEST_OS]}" == fedora-bootc ]] || die "unsupported guest OS"
@@ -170,13 +181,13 @@ fi
 if [ "$SOURCE_MODE" -eq 1 ]; then
     if [ -n "$MANIFEST" ]; then
         "$MANIFEST_VERIFY" verify --repo-root "$ROOT" --profile "$PROFILE" \
-            --image "$IMAGE" --manifest "$MANIFEST" >/dev/null
+            --image "$IMAGE" --manifest "$MANIFEST" --source-revision "${SOURCE_REVISION:?}" >/dev/null
     fi
     echo "Browser VM source profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
 else
     if [ -n "$MANIFEST" ]; then
         "$MANIFEST_VERIFY" verify --repo-root "$ROOT" --profile "$PROFILE" \
-            --image "$IMAGE" --manifest "$MANIFEST" >/dev/null
+            --image "$IMAGE" --manifest "$MANIFEST" --source-revision "${SOURCE_REVISION:?}" >/dev/null
     fi
     echo "Browser VM profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
 fi

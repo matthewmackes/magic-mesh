@@ -12,10 +12,23 @@ BROWSER_BASE_IMAGE="registry.invalid/browser@sha256:$(printf 'b%.0s' {1..64})"
 for name in workstation.rpm lighthouse.rpm app-candidate.json browser-candidate.json app-base.json browser-base.json trust.json trust.key release.key; do
     printf 'admitted-%s\n' "$name" >"$work/$name"; chmod 0400 "$work/$name"
 done
-cat >"$work/profile.env" <<EOF
-BROWSER_VM_SOURCE_COMMIT=$REVISION
-EOF
+printf 'BROWSER_VM_SOURCE_COMMIT=@RELEASE_REVISION@\n' >"$work/profile.env"
 chmod 0400 "$work/profile.env"
+
+cat >"$work/bin/profile-freeze" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'profile-freeze %s\n' "$*" >>"$CALLS"
+[ "${FAIL_PROFILE_FREEZE:-0}" -eq 0 ] || exit 9
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --source-revision) revision=$2; shift 2 ;;
+        --output) output=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+(umask 377; printf 'BROWSER_VM_SOURCE_COMMIT=%s\n' "$revision" >"$output")
+EOF
 
 cat >"$work/bin/app-verify" <<'EOF'
 #!/bin/sh
@@ -49,9 +62,9 @@ chmod 0400 "$out/qcow2/"*
 EOF
 cat >"$work/bin/manifest-verify" <<'EOF'
 #!/usr/bin/env python3
-import os
+import os, sys
 with open(os.environ["CALLS"], "a", encoding="utf-8") as stream:
-    stream.write("manifest-verify\n")
+    stream.write("manifest-verify " + " ".join(sys.argv[1:]) + "\n")
 raise SystemExit(int(os.environ.get("FAIL_MANIFEST_VERIFY", "0")))
 EOF
 chmod 0500 "$work/bin/"*
@@ -72,6 +85,7 @@ run() {
   MCNF_DERIVATIVE_APP_RPM_VERIFY=$work/bin/app-verify \
   MCNF_DERIVATIVE_BROWSER_RPM_VERIFY=$work/bin/browser-verify \
   MCNF_DERIVATIVE_BROWSER_MANIFEST_VERIFY=$work/bin/manifest-verify \
+  MCNF_DERIVATIVE_BROWSER_PROFILE_FREEZE=$work/bin/profile-freeze \
   MCNF_DERIVATIVE_RELEASE_KEY=$work/release.key \
   MCNF_DERIVATIVE_BROWSER_PROFILE=$work/profile.env "$HELPER" "${common[@]}" "$@"
 }
@@ -82,8 +96,12 @@ run --output "$work/out-parent/good"
 [ -f "$work/out-parent/good/app-vm-wayland-standard.mcnf-manifest.json" ]
 grep -Fq '"promotion":"forbidden"' "$work/out-parent/good/derivative-images.json"
 grep -Fq 'app-builder --rpm ' "$work/calls"
-grep -Fq 'browser-builder --rpm ' "$work/calls"
-grep -Fq 'manifest-verify' "$work/calls"
+grep -Fq 'browser-builder ' "$work/calls"
+grep -Fq -- "--rpm $work" "$work/calls"
+grep -Fq "browser-builder --profile " "$work/calls"
+grep -Fq -- "--source-revision $REVISION" "$work/calls"
+grep -Fq "manifest-verify verify --repo-root $ROOT --profile " "$work/calls"
+grep -Fq -- "--source-revision $REVISION" "$work/calls"
 [ "$before" = "$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")" ]
 
 : >"$work/calls"
@@ -103,12 +121,13 @@ fi
 [ ! -e "$work/out-parent/manifest-failed" ]
 [ "$before" = "$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")" ]
 
-sed -i "s/$REVISION/1123456789abcdef0123456789abcdef01234567/" "$work/profile.env"
-chmod 0400 "$work/profile.env"
 : >"$work/calls"
-if run --output "$work/out-parent/stale-profile" >/dev/null 2>&1; then
-  echo 'hostile test: stale Browser profile was accepted' >&2; exit 1
+if FAIL_PROFILE_FREEZE=1 run --output "$work/out-parent/freeze-failed" >/dev/null 2>&1; then
+  echo 'hostile test: Browser profile freeze failure was accepted' >&2; exit 1
 fi
-[ ! -s "$work/calls" ] && [ ! -e "$work/out-parent/stale-profile" ]
+[ ! -e "$work/out-parent/freeze-failed" ]
+if grep -Eq 'app-verify|browser-verify|app-builder|browser-builder|manifest-verify' "$work/calls"; then
+  echo 'hostile test: release mutation continued after profile freeze failure' >&2; exit 1
+fi
 
 echo 'test-build-release-derivative-images: hostile orchestration suite passed'

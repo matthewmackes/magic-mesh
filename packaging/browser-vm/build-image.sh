@@ -18,23 +18,10 @@ BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder@sha256:2b5
 BROWSER_VM_ROOTFS="${MCNF_BROWSER_VM_ROOTFS:-ext4}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 
-SOURCE_COMMIT="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$DIR/profile.env")"
-[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
-    echo 'FATAL: Browser VM profile source commit is not a 40-character revision' >&2
-    exit 2
-}
-"$DIR/verify-profile.sh" --source --source-revision "$SOURCE_COMMIT" \
-    "$DIR/profile.env" >/dev/null || {
-    echo 'FATAL: Browser VM profile is not frozen to its requested source revision' >&2
-    exit 2
-}
-DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$DIR/profile.env")"
-[[ "$DISK_GB" =~ ^[0-9]+$ && "$DISK_GB" -ge 64 ]] || {
-    echo 'FATAL: Browser VM profile disk floor must be at least 64 GiB' >&2
-    exit 2
-}
+PROFILE=""
+SOURCE_COMMIT=""
 
-usage() { echo "Usage: $0 --rpm PATH --base-receipt PATH [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
+usage() { echo "Usage: $0 --profile PATH --source-revision REVISION --rpm PATH --base-receipt PATH [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
 
 resolve_image() {
     local ref=$1 label=$2 err rc=0
@@ -50,6 +37,8 @@ resolve_image() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --rpm) RPMS+=("${2:?--rpm needs a path}"); shift 2 ;;
+        --profile) PROFILE="${2:?--profile needs a path}"; shift 2 ;;
+        --source-revision) SOURCE_COMMIT="${2:?--source-revision needs a revision}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
         --base-receipt) BASE_RECEIPT="${2:?--base-receipt needs a path}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
@@ -59,6 +48,20 @@ while [ "$#" -gt 0 ]; do
         *) echo "FATAL: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+if [ -z "$PROFILE" ] || [ -z "$SOURCE_COMMIT" ]; then
+    echo 'FATAL: Browser VM build requires a frozen profile and source revision' >&2
+    exit 2
+fi
+"$DIR/verify-profile.sh" --source --source-revision "$SOURCE_COMMIT" "$PROFILE" >/dev/null || {
+    echo 'FATAL: Browser VM release profile is not the governed snapshot for the requested revision' >&2
+    exit 2
+}
+DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$PROFILE")"
+[[ "$DISK_GB" =~ ^[0-9]+$ && "$DISK_GB" -ge 64 ]] || {
+    echo 'FATAL: Browser VM profile disk floor must be at least 64 GiB' >&2
+    exit 2
+}
 
 case "$DISK" in
     ""|qcow2|raw) ;;
@@ -116,7 +119,7 @@ podman build "${args[@]}" \
     --label "org.mcnf.browser-vm.base-image-id=$base_id" \
     -t "$IMAGE" --ignorefile "$DIR/context.containerignore" -f "$DIR/Containerfile" "$REPO"
 
-"$DIR/verify-image.sh" "$IMAGE"
+MCNF_BROWSER_VM_RELEASE_PROFILE="$PROFILE" "$DIR/verify-image.sh" "$IMAGE"
 if [ -n "$DISK" ]; then
     [ "$(id -u)" -eq 0 ] || { echo 'FATAL: --disk requires root' >&2; exit 2; }
     resolve_image "$BIB_IMAGE" bootc-image-builder
@@ -143,9 +146,10 @@ if [ -n "$DISK" ]; then
     fi
     manifest_path="${disk_path}.mcnf-manifest.json"
     "$MANIFEST_VERIFY" create \
-        --repo-root "$REPO" --profile "$DIR/profile.env" \
+        --repo-root "$REPO" --profile "$PROFILE" \
         --image "$disk_path" --format "$DISK" --manifest "$manifest_path"
     "$DIR/verify-profile.sh" --source --manifest "$manifest_path" \
-        --image "$disk_path" "$DIR/profile.env"
-    "$DIR/verify-image.sh" --artifact "$disk_path" "$manifest_path"
+        --image "$disk_path" --source-revision "$SOURCE_COMMIT" "$PROFILE"
+    MCNF_BROWSER_VM_RELEASE_PROFILE="$PROFILE" \
+        "$DIR/verify-image.sh" --artifact "$disk_path" "$manifest_path"
 fi

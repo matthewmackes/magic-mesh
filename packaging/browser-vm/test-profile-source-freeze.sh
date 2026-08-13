@@ -3,14 +3,15 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 VERIFY=$ROOT/packaging/browser-vm/verify-profile.sh
+FREEZE=$ROOT/packaging/browser-vm/release-profile.py
+BUILDER=$ROOT/packaging/browser-vm/build-image.sh
+IMAGE_VERIFY=$ROOT/packaging/browser-vm/verify-image.sh
 REVISION=$(git -C "$ROOT" rev-parse HEAD)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 
 freeze_profile() {
-    sed "s/^BROWSER_VM_SOURCE_COMMIT=.*/BROWSER_VM_SOURCE_COMMIT=$REVISION/" \
-        "$ROOT/packaging/browser-vm/profile.env" >"$1"
-    chmod 0400 "$1"
+    "$FREEZE" --repo "$ROOT" --source-revision "$REVISION" --output "$1" >/dev/null
 }
 
 expect_refused() {
@@ -24,6 +25,15 @@ expect_refused() {
 
 freeze_profile "$work/frozen.env"
 "$VERIFY" --source --source-revision "$REVISION" "$work/frozen.env" >/dev/null
+"$VERIFY" --template "$ROOT/packaging/browser-vm/profile.env" >/dev/null
+
+expect_refused 'an existing output' "$FREEZE" --repo "$ROOT" \
+    --source-revision "$REVISION" --output "$work/frozen.env"
+
+mkdir "$work/writable-parent"
+chmod 0770 "$work/writable-parent"
+expect_refused 'a group-writable output parent' "$FREEZE" --repo "$ROOT" \
+    --source-revision "$REVISION" --output "$work/writable-parent/profile.env"
 
 stale=1123456789abcdef0123456789abcdef01234567
 sed "s/$REVISION/$stale/" "$work/frozen.env" >"$work/stale.env"
@@ -47,5 +57,18 @@ expect_refused 'a substituted profile' "$VERIFY" --source \
 other_revision=2123456789abcdef0123456789abcdef01234567
 expect_refused 'a mismatched requested revision' "$VERIFY" --source \
     --source-revision "$other_revision" "$work/frozen.env"
+
+dirty_repo="$work/dirty-repo"
+git clone -q --no-local "$ROOT" "$dirty_repo"
+printf '# mutation\n' >>"$dirty_repo/packaging/browser-vm/profile.env"
+"$FREEZE" --repo "$dirty_repo" --source-revision "$REVISION" \
+    --output "$work/from-dirty-repo.env" >/dev/null
+cmp -s "$work/from-dirty-repo.env" "$work/frozen.env" \
+    || { echo 'producer admitted dirty working-tree bytes as authority' >&2; exit 1; }
+
+grep -Fq "MCNF_BROWSER_VM_RELEASE_PROFILE=\"\$PROFILE\"" "$BUILDER" \
+    || { echo 'builder does not pass the frozen profile to static verification' >&2; exit 1; }
+grep -Fq 'MCNF_BROWSER_VM_RELEASE_PROFILE:-' "$IMAGE_VERIFY" \
+    || { echo 'static verifier cannot consume the frozen release profile' >&2; exit 1; }
 
 echo 'Browser VM profile source-freeze hostile test passed'

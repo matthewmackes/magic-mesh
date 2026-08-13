@@ -6,13 +6,14 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SESSION_INPUT_VERIFY="$ROOT/packaging/browser-vm/verify-session-input-contract.sh"
 PRODUCTION_CONTROL_VERIFY="$ROOT/packaging/browser-vm/verify-production-control-image.py"
 MANIFEST_VERIFY="$ROOT/packaging/browser-vm/verify-image-manifest.py"
+RELEASE_PROFILE=${MCNF_BROWSER_VM_RELEASE_PROFILE:-$ROOT/packaging/browser-vm/profile.env}
 
 if [[ "${1:-}" == "--self-test" ]]; then
     [ "$#" -eq 1 ] || { echo 'usage: verify-image.sh --self-test' >&2; exit 2; }
     # shellcheck disable=SC2050 # Deliberate fixed positive provenance fixture.
     [[ "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
     "$MANIFEST_VERIFY" self-test --repo-root "$ROOT" \
-        --profile "$ROOT/packaging/browser-vm/profile.env" >/dev/null
+        --profile "$RELEASE_PROFILE" >/dev/null
     "$SESSION_INPUT_VERIFY" --self-test >/dev/null
     "$PRODUCTION_CONTROL_VERIFY" --self-test >/dev/null
     echo 'Browser VM image provenance/manifest self-tests passed'
@@ -23,16 +24,18 @@ if [[ "${1:-}" == "--artifact" ]]; then
         echo 'usage: verify-image.sh --artifact IMAGE MANIFEST' >&2
         exit 2
     }
+    profile_source_commit="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$RELEASE_PROFILE")"
     "$ROOT/packaging/browser-vm/verify-profile.sh" --source \
+        --source-revision "$profile_source_commit" \
         --manifest "$3" --image "$2" \
-        "$ROOT/packaging/browser-vm/profile.env"
+        "$RELEASE_PROFILE"
     exit 0
 fi
 command -v podman >/dev/null 2>&1 || { echo 'FATAL: podman is required' >&2; exit 2; }
 podman image exists "$TAG" || { echo "FATAL: image is missing: $TAG" >&2; exit 1; }
 profile="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.profile"}}' "$TAG")"
 [[ "$profile" == browser-vm-chromium-v1 ]] || { echo 'FATAL: immutable Browser VM profile label missing' >&2; exit 1; }
-profile_source_commit="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$ROOT/packaging/browser-vm/profile.env")"
+profile_source_commit="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$RELEASE_PROFILE")"
 image_source_commit="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.source-commit"}}' "$TAG")"
 lighthouse_rpm_sha256="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.lighthouse-rpm-sha256"}}' "$TAG")"
 [[ "$profile_source_commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'FATAL: profile source commit is malformed' >&2; exit 1; }
