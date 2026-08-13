@@ -269,6 +269,16 @@ pub(crate) enum FrontDoorRequest {
     OpenWorkbenchPlane(Plane),
 }
 
+/// Ephemeral, exact permission approval for one admitted App-VM launch.
+///
+/// The full typed target is retained so a catalog refresh, capability change,
+/// placement change, or application substitution invalidates approval instead
+/// of inheriting it by row index or display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrontDoorPeerAppApproval {
+    target: FrontDoorPeerAppTarget,
+}
+
 /// The stable identity of a guest-owned Flatpak application.
 ///
 /// Flatpak IDs are untrusted catalog data at this boundary. Keep the accepted
@@ -864,6 +874,7 @@ pub(crate) struct FrontDoorState {
     suppress_click_away_once: bool,
     lifecycle_arm: Option<FrontDoorLifecycleArm>,
     service_lifecycle_arm: Option<FrontDoorServiceLifecycleArm>,
+    peer_app_approval: Option<FrontDoorPeerAppApproval>,
     taskbar_pins: Option<Vec<Surface>>,
     peer_app_favorites: FrontDoorPeerAppFavorites,
 }
@@ -882,6 +893,7 @@ impl FrontDoorState {
         self.expanded = false;
         self.lifecycle_arm = None;
         self.service_lifecycle_arm = None;
+        self.peer_app_approval = None;
         self.suppress_click_away_once = true;
     }
 
@@ -895,6 +907,7 @@ impl FrontDoorState {
         self.focus_pending = false;
         self.lifecycle_arm = None;
         self.service_lifecycle_arm = None;
+        self.peer_app_approval = None;
         self.suppress_click_away_once = false;
     }
 
@@ -1570,6 +1583,7 @@ fn move_front_door_selection(
     state.selected_target = hits.get(state.selected).map(|hit| hit.item.payload.clone());
     state.lifecycle_arm = None;
     state.service_lifecycle_arm = None;
+    state.peer_app_approval = None;
 }
 
 // PLATFORM-INTERFACES Q15 — Spotlight geometry: the Front Door is a centered
@@ -1715,6 +1729,7 @@ pub(crate) fn front_door_panel_with_sources(
                     state.selected_target = None;
                     state.lifecycle_arm = None;
                     state.service_lifecycle_arm = None;
+                    state.peer_app_approval = None;
                 }
 
                 ui.add_space(Style::SP_XS);
@@ -1724,6 +1739,7 @@ pub(crate) fn front_door_panel_with_sources(
                     state.selected_target = None;
                     state.lifecycle_arm = None;
                     state.service_lifecycle_arm = None;
+                    state.peer_app_approval = None;
                 }
                 if let Some(step) = filter_keyboard_step(ui) {
                     state.filter = moved_filter(state.filter, step);
@@ -1731,6 +1747,7 @@ pub(crate) fn front_door_panel_with_sources(
                     state.selected_target = None;
                     state.lifecycle_arm = None;
                     state.service_lifecycle_arm = None;
+                    state.peer_app_approval = None;
                 }
 
                 let command_mode = run_command_mode(&state.query);
@@ -1792,7 +1809,9 @@ pub(crate) fn front_door_panel_with_sources(
                         move_front_door_selection(state, &hits, index);
                     }
                     if enter && selection_is_current {
-                        action = hits.get(state.selected).map(activation_request_for_hit);
+                        action = hits
+                            .get(state.selected)
+                            .and_then(|hit| primary_action_for_hit(state, hit));
                     }
                 }
 
@@ -1862,6 +1881,7 @@ pub(crate) fn front_door_panel_with_sources(
                                         if state.selected != idx {
                                             state.lifecycle_arm = None;
                                             state.service_lifecycle_arm = None;
+                                            state.peer_app_approval = None;
                                         }
                                         state.selected = idx;
                                         state.selected_target = Some(hit.item.payload.clone());
@@ -2588,10 +2608,33 @@ fn action_button_label_visible(button_width: f32) -> bool {
     button_width >= ACTION_BUTTON_TEXT_MIN_W
 }
 
-fn primary_action_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
+fn peer_app_action_enabled(target: &FrontDoorPeerAppTarget) -> bool {
+    matches!(
+        peer_app_launch_state(target),
+        FrontDoorPeerAppLaunchState::Ready
+            | FrontDoorPeerAppLaunchState::Connected
+            | FrontDoorPeerAppLaunchState::Paused
+    )
+}
+
+fn peer_app_approval_matches(state: &FrontDoorState, target: &FrontDoorPeerAppTarget) -> bool {
+    state
+        .peer_app_approval
+        .as_ref()
+        .is_some_and(|approval| approval.target == *target)
+}
+
+fn primary_action_label(state: &FrontDoorState, hit: &SearchHit<FrontDoorTarget>) -> &'static str {
     match &hit.item.payload {
         FrontDoorTarget::App(_) => "Launch",
-        FrontDoorTarget::PeerApp(target) => peer_app_launch_state(target).action_label(),
+        FrontDoorTarget::PeerApp(target) => match peer_app_launch_state(target) {
+            FrontDoorPeerAppLaunchState::Ready if peer_app_approval_matches(state, target) => {
+                "Confirm"
+            }
+            FrontDoorPeerAppLaunchState::Ready => "Approve",
+            FrontDoorPeerAppLaunchState::Connected | FrontDoorPeerAppLaunchState::Paused => "Focus",
+            state => state.action_label(),
+        },
         FrontDoorTarget::Workflow(_) | FrontDoorTarget::ServiceLifecycle(_) => "Open",
         FrontDoorTarget::File(_)
         | FrontDoorTarget::Browser(_)
@@ -2605,6 +2648,44 @@ fn activation_request_for_hit(hit: &SearchHit<FrontDoorTarget>) -> FrontDoorRequ
     match &hit.item.payload {
         FrontDoorTarget::PeerApp(target) => FrontDoorRequest::LaunchPeerApp(target.clone()),
         _ => FrontDoorRequest::Activate(hit.item.payload.clone()),
+    }
+}
+
+/// Resolve the selected row into a typed UI action. App-VM rows never launch
+/// from a single activation: the first activation arms the exact catalog and
+/// permission declaration, and only the second activation emits LaunchPeerApp.
+/// Connected/paused rows focus the existing VDI source instead of provisioning
+/// a duplicate guest.
+fn primary_action_for_hit(
+    state: &mut FrontDoorState,
+    hit: &SearchHit<FrontDoorTarget>,
+) -> Option<FrontDoorRequest> {
+    let FrontDoorTarget::PeerApp(target) = &hit.item.payload else {
+        state.peer_app_approval = None;
+        return Some(activation_request_for_hit(hit));
+    };
+    match peer_app_launch_state(target) {
+        FrontDoorPeerAppLaunchState::Ready => {
+            if peer_app_approval_matches(state, target) {
+                state.peer_app_approval = None;
+                Some(FrontDoorRequest::LaunchPeerApp(target.clone()))
+            } else {
+                state.peer_app_approval = Some(FrontDoorPeerAppApproval {
+                    target: target.clone(),
+                });
+                None
+            }
+        }
+        FrontDoorPeerAppLaunchState::Connected | FrontDoorPeerAppLaunchState::Paused => {
+            state.peer_app_approval = None;
+            Some(FrontDoorRequest::ConnectDesktopSource(
+                target.desktop_source_id(),
+            ))
+        }
+        _ => {
+            state.peer_app_approval = None;
+            None
+        }
     }
 }
 
@@ -3038,20 +3119,25 @@ fn primary_action_accesskit_id(hit: &SearchHit<FrontDoorTarget>) -> egui::Id {
 
 fn install_primary_action_accessibility(
     ctx: &egui::Context,
+    state: &FrontDoorState,
     hit: &SearchHit<FrontDoorTarget>,
     rect: egui::Rect,
 ) {
     let _ = ctx.accesskit_node_builder(primary_action_accesskit_id(hit), |node| {
         let blocked = matches!(
             &hit.item.payload,
-            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+            FrontDoorTarget::PeerApp(target) if !peer_app_action_enabled(target)
         );
         node.set_role(if blocked {
             egui::accesskit::Role::Status
         } else {
             egui::accesskit::Role::Button
         });
-        node.set_label(format!("{} {}", primary_action_label(hit), hit.item.title));
+        node.set_label(format!(
+            "{} {}",
+            primary_action_label(state, hit),
+            hit.item.title
+        ));
         node.set_value(format!(
             "Primary action: {}, {}",
             result_domain_label(hit),
@@ -3464,12 +3550,12 @@ fn result_action_panel(
         ui,
         primary_rect,
         primary_action_accesskit_id(hit),
-        primary_action_label(hit),
+        primary_action_label(state, hit),
         result_icon_id(hit),
         false,
         !matches!(
             &hit.item.payload,
-            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+            FrontDoorTarget::PeerApp(target) if !peer_app_action_enabled(target)
         ),
     );
 
@@ -3641,11 +3727,18 @@ fn result_action_panel(
         });
         let lifecycle_note = service_lifecycle_note.or(instance_lifecycle_note);
         let peer_app_note = match &hit.item.payload {
-            FrontDoorTarget::PeerApp(target) => Some(format!(
-                "{} · {}",
-                peer_app_launch_state(target).guidance(),
-                peer_app_permission_explanation(target)
-            )),
+            FrontDoorTarget::PeerApp(target) => Some(if peer_app_approval_matches(state, target) {
+                format!(
+                    "Permission approval armed for this exact catalog revision; click Confirm. · {}",
+                    peer_app_permission_explanation(target)
+                )
+            } else {
+                format!(
+                    "{} · {}",
+                    peer_app_launch_state(target).guidance(),
+                    peer_app_permission_explanation(target)
+                )
+            }),
             _ => None,
         };
         let (text, color) = if let Some(note) = lifecycle_note {
@@ -3675,7 +3768,7 @@ fn result_action_panel(
         );
     }
 
-    install_primary_action_accessibility(ui.ctx(), hit, primary_rect);
+    install_primary_action_accessibility(ui.ctx(), state, hit, primary_rect);
     for (target, op, response) in service_lifecycle_responses {
         if response.clicked() {
             if let Some(request) = service_lifecycle_action_clicked(state, &target, op) {
@@ -3700,16 +3793,9 @@ fn result_action_panel(
             return Some(FrontDoorRequest::OpenWorkbenchPlane(workflow_action.plane));
         }
     }
-    primary_response.clicked().then(|| {
-        if matches!(
-            &hit.item.payload,
-            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
-        ) {
-            None
-        } else {
-            Some(activation_request_for_hit(hit))
-        }
-    })?
+    primary_response
+        .clicked()
+        .then(|| primary_action_for_hit(state, hit))?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3768,22 +3854,22 @@ fn install_context_menu_row_accessibility(
 fn result_context_menu_request(
     response: &egui::Response,
     hit: &SearchHit<FrontDoorTarget>,
-    state: &FrontDoorState,
+    state: &mut FrontDoorState,
 ) -> Option<FrontDoorRequest> {
     let mut request = None;
     let _ = front_door_context_menu(response, |ui| {
         let peer_app_blocked = matches!(
             &hit.item.payload,
-            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+            FrontDoorTarget::PeerApp(target) if !peer_app_action_enabled(target)
         );
         if !peer_app_blocked
             && context_menu_row(
                 ui,
                 result_context_item_id(hit, ResultContextItem::Open),
-                primary_action_label(hit),
+                primary_action_label(state, hit),
             )
         {
-            request = Some(activation_request_for_hit(hit));
+            request = primary_action_for_hit(state, hit);
             ui.close_menu();
         }
         if let Some(workflow_action) = workflow_quick_action_for_hit(hit) {
@@ -5101,7 +5187,10 @@ mod tests {
         assert!(hit.item.terms.iter().any(|term| *term == "unavailable"));
         assert!(hit.item.target.contains("connection required"));
         assert!(hit.item.target.contains("no host-browser fallback"));
-        assert_eq!(primary_action_label(&hit), "Open");
+        assert_eq!(
+            primary_action_label(&FrontDoorState::default(), &hit),
+            "Open"
+        );
         assert_eq!(
             activation_request_for_hit(&hit),
             FrontDoorRequest::Activate(FrontDoorTarget::Workflow(*card))
@@ -6895,7 +6984,7 @@ mod tests {
         let nodes = accesskit_nodes(&out);
         let label = format!(
             "{} {}",
-            primary_action_label(selected_hit),
+            primary_action_label(&FrontDoorState::default(), selected_hit),
             selected_hit.item.title
         );
         let action = nodes
@@ -7579,7 +7668,10 @@ mod tests {
             panic!("fixture should produce a peer app target");
         };
 
-        assert_eq!(primary_action_label(&hit), "Launch");
+        assert_eq!(
+            primary_action_label(&FrontDoorState::default(), &hit),
+            "Approve"
+        );
         assert_eq!(
             activation_request_for_hit(&hit),
             FrontDoorRequest::LaunchPeerApp(target.clone())
@@ -7621,8 +7713,8 @@ mod tests {
         let launch = nodes
             .iter()
             .map(|(_, node)| node)
-            .find(|node| node.label() == Some("Launch Firefox"))
-            .expect("selected peer app should expose a Launch primary action");
+            .find(|node| node.label() == Some("Approve Firefox"))
+            .expect("selected peer app should expose a permission approval action");
         assert_eq!(launch.role(), egui::accesskit::Role::Button);
         assert!(launch.supports_action(egui::accesskit::Action::Click));
 
@@ -7635,6 +7727,60 @@ mod tests {
         assert_eq!(
             connect.value(),
             Some("Desktop source: peer:oak; uses Desktop chooser path")
+        );
+    }
+
+    #[test]
+    fn app_vm_launch_requires_exact_permission_confirmation_and_focuses_existing_session() {
+        let items = peer_app_search_items(
+            [FrontDoorPeerApp {
+                id: "org.mozilla.Firefox.desktop".to_owned(),
+                name: "Firefox".to_owned(),
+                node: "oak".to_owned(),
+                source: "flatpak".to_owned(),
+                icon: "firefox".to_owned(),
+                health: "online".to_owned(),
+                state: "installed".to_owned(),
+                catalog_revision: Some("catalog-42".to_owned()),
+                guest_profile: Some("wayland-standard".to_owned()),
+                requested_capabilities: vec!["audio-playback".to_owned()],
+            }],
+            0,
+        );
+        let hit = ranked_front_door_hits("firefox", items)
+            .into_iter()
+            .next()
+            .expect("peer app hit");
+        let mut state = FrontDoorState::default();
+
+        assert_eq!(primary_action_for_hit(&mut state, &hit), None);
+        assert_eq!(primary_action_label(&state, &hit), "Confirm");
+
+        let mut replaced = hit.clone();
+        let FrontDoorTarget::PeerApp(replaced_target) = &mut replaced.item.payload else {
+            unreachable!();
+        };
+        replaced_target.catalog_revision = Some("catalog-43".to_owned());
+        let expected_replaced_target = replaced_target.clone();
+        assert_eq!(primary_action_for_hit(&mut state, &replaced), None);
+        assert_eq!(primary_action_label(&state, &replaced), "Confirm");
+        assert_eq!(primary_action_label(&state, &hit), "Approve");
+        assert_eq!(
+            primary_action_for_hit(&mut state, &replaced),
+            Some(FrontDoorRequest::LaunchPeerApp(expected_replaced_target))
+        );
+
+        let mut connected = hit.clone();
+        let FrontDoorTarget::PeerApp(connected_target) = &mut connected.item.payload else {
+            unreachable!();
+        };
+        connected_target.launch_blocked_reason = Some("not launchable: connected".to_owned());
+        assert_eq!(primary_action_label(&state, &connected), "Focus");
+        assert_eq!(
+            primary_action_for_hit(&mut state, &connected),
+            Some(FrontDoorRequest::ConnectDesktopSource(
+                "peer:oak".to_owned()
+            ))
         );
     }
 
