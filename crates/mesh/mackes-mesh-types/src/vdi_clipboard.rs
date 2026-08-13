@@ -1259,6 +1259,94 @@ pub const MAX_VDI_CLIPBOARD_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
 /// generic 4-GiB Files-envelope ceiling: one clipboard image is materialized in
 /// the seat process and must remain comfortably below its cgroup memory limit.
 pub const MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum number of file descriptors in one VDI clipboard snapshot.
+pub const MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS: usize = 1_024;
+/// Maximum UTF-8 bytes in a clipboard file basename.
+pub const MAX_VDI_CLIPBOARD_FILE_NAME_BYTES: usize = 255;
+/// Maximum UTF-8 bytes in an optional relative parent path.
+pub const MAX_VDI_CLIPBOARD_FILE_RELATIVE_PATH_BYTES: usize = 1_024;
+
+/// Canonical bounded metadata for one Files object crossing a VDI clipboard.
+///
+/// This type conveys metadata, never host path authority. Consumers may join
+/// `relative_path` only below a governed Files destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VdiClipboardFileDescriptorV1 {
+    /// Safe leaf name, never a path.
+    pub name: String,
+    /// Optional relative parent below a governed destination.
+    pub relative_path: Option<String>,
+    /// Exact admitted MIME representation.
+    pub mime: String,
+    /// Exact file size in bytes.
+    pub byte_count: u64,
+}
+
+impl VdiClipboardFileDescriptorV1 {
+    pub fn new(
+        name: impl Into<String>,
+        relative_path: Option<String>,
+        mime: impl Into<String>,
+        byte_count: u64,
+    ) -> Result<Self, VdiClipboardFileDescriptorErrorV1> {
+        let descriptor = Self {
+            name: name.into(),
+            relative_path,
+            mime: mime.into(),
+            byte_count,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    pub fn validate(&self) -> Result<(), VdiClipboardFileDescriptorErrorV1> {
+        if self.name.len() > MAX_VDI_CLIPBOARD_FILE_NAME_BYTES
+            || !valid_vdi_clipboard_file_component(&self.name)
+        {
+            return Err(VdiClipboardFileDescriptorErrorV1::InvalidName);
+        }
+        if self.relative_path.as_deref().is_some_and(|path| {
+            path.is_empty()
+                || path.len() > MAX_VDI_CLIPBOARD_FILE_RELATIVE_PATH_BYTES
+                || path.starts_with(['/', '\\'])
+                || path
+                    .split(['/', '\\'])
+                    .any(|component| !valid_vdi_clipboard_file_component(component))
+        }) {
+            return Err(VdiClipboardFileDescriptorErrorV1::InvalidRelativePath);
+        }
+        if self.mime.len() > MAX_CLIPBOARD_ENVELOPE_V2_MIME_BYTES
+            || !valid_clipboard_mime_offer(&self.mime)
+        {
+            return Err(VdiClipboardFileDescriptorErrorV1::InvalidMime);
+        }
+        if self.byte_count > MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES {
+            return Err(VdiClipboardFileDescriptorErrorV1::Oversized);
+        }
+        Ok(())
+    }
+}
+
+fn valid_vdi_clipboard_file_component(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':' | '\0'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VdiClipboardFileDescriptorErrorV1 {
+    /// The leaf name is empty, unsafe, or overlong.
+    InvalidName,
+    /// The parent is absolute, traversing, unsafe, or overlong.
+    InvalidRelativePath,
+    /// MIME metadata is malformed or overlong.
+    InvalidMime,
+    /// The byte count exceeds the rich Files ceiling.
+    Oversized,
+}
 /// Schema for the root-local, descriptor-backed Files materialization request.
 pub const VDI_CLIPBOARD_FILES_MATERIALIZATION_SCHEMA_VERSION: u16 = 1;
 /// Maximum JSON request or response packet on the local authority socket.
@@ -1344,10 +1432,9 @@ impl VdiClipboardFilesMaterializationRequestV1 {
         {
             return Err(VdiClipboardFilesMaterializationErrorV1::InvalidIdentity);
         }
-        if !matches!(
-            self.selected_mime.to_ascii_lowercase().as_str(),
-            "image/png" | "image/jpeg"
-        ) {
+        if self.selected_mime.len() > MAX_CLIPBOARD_ENVELOPE_V2_MIME_BYTES
+            || !valid_clipboard_mime_offer(&self.selected_mime)
+        {
             return Err(VdiClipboardFilesMaterializationErrorV1::UnsupportedMime);
         }
         if self.byte_count == 0 || self.byte_count > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES {
@@ -2155,6 +2242,19 @@ mod tests {
             .validate_against(&message, &lease, now_ms + 1)
             .expect("exact current request");
 
+        let mut arbitrary_file = message.clone();
+        arbitrary_file.selected_mime = "application/pdf".into();
+        arbitrary_file
+            .envelope
+            .mime_offers
+            .push("application/pdf".into());
+        let file_request = VdiClipboardFilesMaterializationRequestV1::from_message(
+            &arbitrary_file,
+            "31b69cf1-420f-4d10-94c7-61f671b4f314",
+        )
+        .expect("non-image Files descriptor request");
+        assert_eq!(file_request.selected_mime, "application/pdf");
+
         let mut changed = request.clone();
         changed.message_sequence += 1;
         assert_eq!(
@@ -2769,5 +2869,25 @@ mod tests {
             ClipboardSessionConsentV1::from_json_bytes(&oversized),
             Err(ClipboardSessionConsentDecodeError::BodyTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn file_descriptor_is_bounded_and_path_free() {
+        let descriptor = VdiClipboardFileDescriptorV1::new(
+            "report.pdf",
+            Some("exports/2026".into()),
+            "application/pdf",
+            17,
+        )
+        .expect("bounded descriptor");
+        assert_eq!(descriptor.byte_count, 17);
+        assert!(VdiClipboardFileDescriptorV1::new(
+            "escape.pdf",
+            Some("../secrets".into()),
+            "application/pdf",
+            17,
+        )
+        .is_err());
+        assert!(VdiClipboardFileDescriptorV1::new("report.pdf", None, "not a mime", 17,).is_err());
     }
 }

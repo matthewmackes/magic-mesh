@@ -30,6 +30,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
+use mackes_mesh_types::vdi_clipboard::{
+    VdiClipboardFileDescriptorV1, MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
@@ -52,18 +55,9 @@ pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 pub const VDI_GUEST_FILES_INGEST_SOCKET: &str = "vdi-clipboard-guest-files.sock";
 const VDI_GUEST_FILES_PACKET_BYTES: usize = 384 * 1024;
 const VDI_GUEST_FILES_CHUNK_BYTES: usize = 256 * 1024;
-const VDI_GUEST_FILES_MAX_COUNT: usize = 1_024;
 const VDI_GUEST_FILES_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const VDI_GUEST_FILES_TRANSACTION_TTL_MS: u64 = 60_000;
 const VDI_GUEST_FILES_STAGING_DIR: &str = ".mde-vdi-clipboard-staging";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GuestFileMetadata {
-    name: String,
-    relative_path: Option<String>,
-    size: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -71,7 +65,7 @@ enum GuestFilesRequest {
     Begin {
         transaction_id: String,
         session_id: String,
-        files: Vec<GuestFileMetadata>,
+        files: Vec<VdiClipboardFileDescriptorV1>,
         total_bytes: u64,
     },
     Chunk {
@@ -118,7 +112,7 @@ enum GuestFilesResponse {
 }
 
 struct GuestFilesTransaction {
-    files: Vec<GuestFileMetadata>,
+    files: Vec<VdiClipboardFileDescriptorV1>,
     total_bytes: u64,
     next_file_index: usize,
     next_offset: u64,
@@ -277,7 +271,7 @@ impl GuestFilesAuthority {
         &mut self,
         transaction_id: String,
         session_id: String,
-        files: Vec<GuestFileMetadata>,
+        files: Vec<VdiClipboardFileDescriptorV1>,
         total_bytes: u64,
         now_ms: u64,
     ) -> Result<GuestFilesResponse, (String, String)> {
@@ -286,7 +280,7 @@ impl GuestFilesAuthority {
             return refuse("invalid transaction or session identity");
         }
         if files.is_empty()
-            || files.len() > VDI_GUEST_FILES_MAX_COUNT
+            || files.len() > MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS
             || total_bytes > VDI_GUEST_FILES_MAX_TOTAL_BYTES
             || self.transactions.contains_key(&transaction_id)
         {
@@ -294,16 +288,11 @@ impl GuestFilesAuthority {
         }
         let mut declared = 0_u64;
         for file in &files {
-            if !safe_guest_component(&file.name)
-                || file
-                    .relative_path
-                    .as_deref()
-                    .is_some_and(|path| !safe_guest_relative_path(path))
-            {
+            if file.validate().is_err() {
                 return refuse("unsafe guest file metadata");
             }
             declared = declared
-                .checked_add(file.size)
+                .checked_add(file.byte_count)
                 .ok_or_else(|| (transaction_id.clone(), "file size overflow".to_owned()))?;
         }
         if declared != total_bytes {
@@ -385,8 +374,8 @@ impl GuestFilesAuthority {
             .decode(data_base64.as_bytes())
             .map_err(|_| failure("chunk is not canonical base64".into()))?;
         if data.len() > VDI_GUEST_FILES_CHUNK_BYTES
-            || (data.is_empty() && metadata.size != 0)
-            || offset.saturating_add(data.len() as u64) > metadata.size
+            || (data.is_empty() && metadata.byte_count != 0)
+            || offset.saturating_add(data.len() as u64) > metadata.byte_count
         {
             return Err(failure("chunk exceeds its admitted file range".into()));
         }
@@ -414,7 +403,7 @@ impl GuestFilesAuthority {
         transaction.next_offset = transaction.next_offset.saturating_add(data.len() as u64);
         transaction.bytes_received = transaction.bytes_received.saturating_add(data.len() as u64);
         transaction.expires_at_ms = now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS);
-        if complete != (transaction.next_offset == metadata.size) {
+        if complete != (transaction.next_offset == metadata.byte_count) {
             return Err(failure(
                 "chunk completion disagrees with admitted size".into(),
             ));
@@ -550,7 +539,7 @@ fn guest_seqpacket_listener(path: &Path) -> std::io::Result<UnixStream> {
     Ok(socket.into())
 }
 
-fn guest_staged_relative_path(metadata: &GuestFileMetadata) -> PathBuf {
+fn guest_staged_relative_path(metadata: &VdiClipboardFileDescriptorV1) -> PathBuf {
     metadata
         .relative_path
         .as_deref()
@@ -565,23 +554,6 @@ fn safe_guest_identity(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
-}
-
-fn safe_guest_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && value != "."
-        && value != ".."
-        && !value
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':' | '\0'))
-}
-
-fn safe_guest_relative_path(value: &str) -> bool {
-    !value.is_empty()
-        && !value.starts_with(['/', '\\'])
-        && value.len() <= 1_024
-        && value.split(['/', '\\']).all(safe_guest_component)
 }
 
 fn create_guest_directories(root: &Path, destination: &Path) -> std::io::Result<()> {
@@ -1553,16 +1525,9 @@ mod tests {
         authority.owner = None;
         let now = 1_700_000_000_000_u64;
         let files = vec![
-            GuestFileMetadata {
-                name: "report.txt".into(),
-                relative_path: None,
-                size: 6,
-            },
-            GuestFileMetadata {
-                name: "chart.csv".into(),
-                relative_path: Some("nested".into()),
-                size: 5,
-            },
+            VdiClipboardFileDescriptorV1::new("report.txt", None, "text/plain", 6).unwrap(),
+            VdiClipboardFileDescriptorV1::new("chart.csv", Some("nested".into()), "text/csv", 5)
+                .unwrap(),
         ];
         assert!(matches!(
             authority.handle(
@@ -1637,11 +1602,13 @@ mod tests {
                 GuestFilesRequest::Begin {
                     transaction_id: "tx-cancel".into(),
                     session_id: "rdp-session".into(),
-                    files: vec![GuestFileMetadata {
-                        name: "partial.bin".into(),
-                        relative_path: None,
-                        size: 8,
-                    }],
+                    files: vec![VdiClipboardFileDescriptorV1::new(
+                        "partial.bin",
+                        None,
+                        "application/octet-stream",
+                        8,
+                    )
+                    .unwrap()],
                     total_bytes: 8,
                 },
                 now + 4,

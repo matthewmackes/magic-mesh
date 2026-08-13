@@ -11,7 +11,8 @@ use ironrdp_cliprdr::pdu::{
 };
 use ironrdp_core::impl_as_any;
 use mackes_mesh_types::vdi_clipboard::{
-    MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES, MAX_VDI_CLIPBOARD_TEXT_BYTES,
+    VdiClipboardFileDescriptorV1, MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES,
+    MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS, MAX_VDI_CLIPBOARD_TEXT_BYTES,
     MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES,
 };
 
@@ -30,7 +31,6 @@ pub const DIB_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId(8
 pub const DIBV5_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId(17));
 
 const MAX_REMOTE_FORMATS: usize = 256;
-const MAX_REMOTE_FILES: usize = 4_096;
 const REMOTE_FILE_CHUNK_BYTES: u32 = 256 * 1024;
 const MAX_LOCAL_FILE_RESPONSES: usize = 32;
 const LOCAL_FILE_SERVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -153,28 +153,26 @@ pub struct RemoteClipboardImage {
 /// where a later, chunked transfer is materialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteClipboardFile {
-    name: String,
-    relative_path: Option<String>,
-    size: u64,
+    descriptor: VdiClipboardFileDescriptorV1,
 }
 
 impl RemoteClipboardFile {
     /// Sanitized basename supplied by IronRDP and re-attested by this boundary.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        &self.descriptor.name
     }
 
     /// Sanitized relative directory, never an absolute or parent path.
     #[must_use]
     pub fn relative_path(&self) -> Option<&str> {
-        self.relative_path.as_deref()
+        self.descriptor.relative_path.as_deref()
     }
 
     /// Declared byte size admitted under the rich-envelope aggregate ceiling.
     #[must_use]
     pub const fn size(&self) -> u64 {
-        self.size
+        self.descriptor.byte_count
     }
 }
 
@@ -382,13 +380,15 @@ impl ClipboardBridge {
         name: String,
         data: Vec<u8>,
     ) -> Result<FileDescriptor, ClipboardBridgeError> {
-        if !safe_host_file_name(&name)
-            || data.is_empty()
-            || data.len() as u64 > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES
-        {
+        let Ok(descriptor) = VdiClipboardFileDescriptorV1::new(
+            name.clone(),
+            None,
+            "application/octet-stream",
+            data.len() as u64,
+        ) else {
             self.revoke_local_offer();
             return Err(ClipboardBridgeError::InvalidLocalFile);
-        }
+        };
         let mut state = self.lock();
         if !state.ready || !state.file_stream_ready {
             drop(state);
@@ -406,7 +406,7 @@ impl ClipboardBridge {
             admitted_at: std::time::Instant::now(),
         });
         state.local_advertised_generation = Some(generation);
-        Ok(FileDescriptor::new(name)
+        Ok(FileDescriptor::new(descriptor.name)
             .with_file_size(state.local_file.as_ref().map_or(0, |file| file.data.len()) as u64))
     }
 
@@ -534,7 +534,7 @@ impl ClipboardBridge {
             .files
             .get(file_index)
             .ok_or(ClipboardBridgeError::InvalidFileTransfer)?
-            .size;
+            .size();
         let clip_data_id = snapshot.clip_data_id;
         if size == 0 {
             state.remote_file_chunk = Some(Ok(RemoteClipboardFileChunk {
@@ -610,14 +610,6 @@ impl ClipboardBridge {
         state.local_advertised_generation = None;
         state.local_file_responses.clear();
     }
-}
-
-fn safe_host_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().count() <= 255
-        && !name.chars().any(char::is_control)
-        && !name.contains(['/', '\\'])
-        && !matches!(name, "." | "..")
 }
 
 fn local_file_response(
@@ -979,7 +971,7 @@ fn admit_remote_file_list(
     files: &[FileDescriptor],
     clip_data_id: Option<u32>,
 ) -> Result<RemoteClipboardFileList, ClipboardBridgeError> {
-    if files.is_empty() || files.len() > MAX_REMOTE_FILES {
+    if files.is_empty() || files.len() > MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS {
         return Err(ClipboardBridgeError::InvalidFileList);
     }
 
@@ -993,41 +985,19 @@ fn admit_remote_file_list(
             .checked_add(size)
             .filter(|total| *total <= MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES)
             .ok_or(ClipboardBridgeError::InvalidFileList)?;
-        if !safe_file_component(&file.name)
-            || file
-                .relative_path
-                .as_deref()
-                .is_some_and(|path| !safe_relative_path(path))
-        {
-            return Err(ClipboardBridgeError::InvalidFileList);
-        }
-        admitted.push(RemoteClipboardFile {
-            name: file.name.clone(),
-            relative_path: file.relative_path.clone(),
+        let descriptor = VdiClipboardFileDescriptorV1::new(
+            file.name.clone(),
+            file.relative_path.clone(),
+            "application/octet-stream",
             size,
-        });
+        )
+        .map_err(|_| ClipboardBridgeError::InvalidFileList)?;
+        admitted.push(RemoteClipboardFile { descriptor });
     }
     Ok(RemoteClipboardFileList {
         files: admitted,
         clip_data_id,
     })
-}
-
-fn safe_file_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && value != "."
-        && value != ".."
-        && !value
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':' | '\0'))
-}
-
-fn safe_relative_path(value: &str) -> bool {
-    !value.is_empty()
-        && !value.starts_with(['/', '\\'])
-        && value.len() <= 1_024
-        && value.split(['/', '\\']).all(safe_file_component)
 }
 
 fn decode_unicode_text(data: &[u8]) -> Option<String> {
@@ -1866,9 +1836,10 @@ mod tests {
                 | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA,
         );
         let descriptor = bridge
-            .offer_host_file("Clipboard-a1b2.png".into(), b"governed-bytes".to_vec())
+            .offer_host_file("quarterly-report.pdf".into(), b"governed-bytes".to_vec())
             .expect("permission-approved Files descriptor");
         assert_eq!(descriptor.file_size, Some(14));
+        assert_eq!(descriptor.name, "quarterly-report.pdf");
 
         backend.on_lock(LockDataId(41));
         backend.on_file_contents_request(FileContentsRequest {

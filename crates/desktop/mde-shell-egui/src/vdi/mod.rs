@@ -46,8 +46,9 @@ use {
     },
     mackes_mesh_types::vdi_clipboard::{
         vdi_clipboard_session_topic, ClipboardEnvelopeV2, VdiClipboardDisclosureV2,
-        VdiClipboardFilesMaterializationRequestV1, VdiClipboardFilesMaterializationResponseV1,
-        VdiClipboardLeaseV2, VdiClipboardMessageV2, VdiClipboardReceiptV2, VdiClipboardText,
+        VdiClipboardFileDescriptorV1, VdiClipboardFilesMaterializationRequestV1,
+        VdiClipboardFilesMaterializationResponseV1, VdiClipboardLeaseV2, VdiClipboardMessageV2,
+        VdiClipboardReceiptV2, VdiClipboardText,
         MAX_VDI_CLIPBOARD_FILES_MATERIALIZATION_PACKET_BYTES, MAX_VDI_CLIPBOARD_LEASE_TTL_MS,
         MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES, VDI_CLIPBOARD_FILES_MATERIALIZATION_SOCKET,
         VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX, VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
@@ -1143,7 +1144,9 @@ enum RdpClipboardPayload {
     Text(String),
     Html(String),
     Image,
-    File { name: String },
+    File {
+        descriptor: VdiClipboardFileDescriptorV1,
+    },
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1155,21 +1158,12 @@ const VDI_GUEST_FILES_MIME: &str = "application/x-mde-file-list";
 
 #[cfg(feature = "live-vdi")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RdpGuestFileMetadata {
-    name: String,
-    relative_path: Option<String>,
-    size: u64,
-}
-
-#[cfg(feature = "live-vdi")]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum RdpGuestFilesRequest {
     Begin {
         transaction_id: String,
         session_id: String,
-        files: Vec<RdpGuestFileMetadata>,
+        files: Vec<VdiClipboardFileDescriptorV1>,
         total_bytes: u64,
     },
     Chunk {
@@ -1219,7 +1213,7 @@ enum RdpGuestFilesResponse {
 #[cfg(feature = "live-vdi")]
 struct RdpGuestFilesTransfer {
     transaction_id: String,
-    files: Vec<RdpGuestFileMetadata>,
+    files: Vec<VdiClipboardFileDescriptorV1>,
     total_bytes: u64,
     next_file_index: usize,
     staged_message: Option<VdiClipboardMessageV2>,
@@ -1236,15 +1230,19 @@ impl RdpGuestFilesTransfer {
         let files = list
             .files()
             .iter()
-            .map(|file| RdpGuestFileMetadata {
-                name: file.name().to_owned(),
-                relative_path: file.relative_path().map(str::to_owned),
-                size: file.size(),
+            .map(|file| {
+                VdiClipboardFileDescriptorV1::new(
+                    file.name(),
+                    file.relative_path().map(str::to_owned),
+                    "application/octet-stream",
+                    file.size(),
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("RDP guest file descriptor refused: {error:?}"))?;
         let total_bytes = files.iter().try_fold(0_u64, |total, file| {
             total
-                .checked_add(file.size)
+                .checked_add(file.byte_count)
                 .ok_or_else(|| "RDP guest file aggregate overflow".to_owned())
         })?;
         let transaction_id = uuid::Uuid::new_v4().simple().to_string();
@@ -1597,7 +1595,16 @@ fn read_latest_rdp_host_clipboard(
     let Some(command) = read_latest_host_clipboard_command(root, lease, now_ms)? else {
         return Ok(None);
     };
-    let payload = if command.selected_mime.eq_ignore_ascii_case("text/html")
+    let payload = if let Some(descriptor) = rdp_host_file_descriptor(&command)? {
+        if command.envelope.files_reference.is_none()
+            || command.envelope.inline_text.is_some()
+            || command.envelope.byte_count == 0
+            || command.envelope.byte_count > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES
+        {
+            return Err("RDP file clipboard command has no bounded Files payload".to_owned());
+        }
+        RdpClipboardPayload::File { descriptor }
+    } else if command.selected_mime.eq_ignore_ascii_case("text/html")
         || command
             .selected_mime
             .eq_ignore_ascii_case("text/html;charset=utf-8")
@@ -1633,15 +1640,7 @@ fn read_latest_rdp_host_clipboard(
         {
             return Err("RDP image clipboard command has no bounded Files payload".to_owned());
         }
-        if let Some(name) = rdp_host_file_name(
-            &command.envelope.mime_offers,
-            &command.selected_mime,
-            &command.envelope.content_hash,
-        )? {
-            RdpClipboardPayload::File { name }
-        } else {
-            RdpClipboardPayload::Image
-        }
+        RdpClipboardPayload::Image
     } else {
         return Err("RDP clipboard command refused: unsupported MIME representation".to_owned());
     };
@@ -1649,31 +1648,28 @@ fn read_latest_rdp_host_clipboard(
 }
 
 #[cfg(feature = "live-vdi")]
-fn rdp_host_file_name(
-    mime_offers: &[String],
-    selected_mime: &str,
-    content_hash: &str,
-) -> Result<Option<String>, String> {
-    if !mime_offers
+fn rdp_host_file_descriptor(
+    command: &VdiClipboardMessageV2,
+) -> Result<Option<VdiClipboardFileDescriptorV1>, String> {
+    if !command
+        .envelope
+        .mime_offers
         .iter()
         .any(|mime| mime.eq_ignore_ascii_case(VDI_GUEST_FILES_MIME))
     {
         return Ok(None);
     }
-    let extension = if selected_mime.eq_ignore_ascii_case("image/png") {
-        "png"
-    } else if selected_mime.eq_ignore_ascii_case("image/jpeg") {
-        "jpg"
-    } else {
-        return Err("RDP file clipboard command has no supported representation".to_owned());
-    };
-    let digest_prefix = content_hash
-        .get(..12)
-        .filter(|prefix| prefix.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| "RDP file clipboard command has an invalid digest".to_owned())?;
-    Ok(Some(format!("Clipboard-{digest_prefix}.{extension}")))
+    VdiClipboardFileDescriptorV1::new(
+        command.envelope.preview.clone(),
+        None,
+        command.selected_mime.clone(),
+        command.envelope.byte_count,
+    )
+    .map(Some)
+    .map_err(|error| format!("RDP file descriptor refused: {error:?}"))
 }
 
+#[cfg(feature = "live-vdi")]
 /// Ask the single daemon Files authority for one descriptor after the shell's
 /// one-use permission CAS. The request and response carry metadata only; image
 /// bytes are read from the verified descriptor and re-hashed locally.
@@ -2287,7 +2283,7 @@ fn run_live_rdp(
                         .map_err(ConnectError::Clipboard)?;
                     conn.send_dibv5_clipboard_to_guest(dib)
                 }
-                RdpClipboardPayload::File { name } => {
+                RdpClipboardPayload::File { descriptor } => {
                     let root = clipboard_root.as_deref().ok_or_else(|| {
                         ConnectError::Clipboard(
                             "RDP file clipboard Bus root is unavailable".to_owned(),
@@ -2295,7 +2291,7 @@ fn run_live_rdp(
                     })?;
                     let source = materialize_rdp_image_from_files(root, &command)
                         .map_err(ConnectError::Clipboard)?;
-                    conn.send_file_clipboard_to_guest(name.clone(), source)
+                    conn.send_file_clipboard_to_guest(descriptor.name.clone(), source)
                 }
             }) {
                 Ok(RdpClipboardMaterialization::Pending) => {
@@ -5186,17 +5182,38 @@ mod guest_files_materialization_tests {
 
     #[test]
     fn host_file_offer_uses_governed_metadata_not_a_host_path() {
-        let offers = vec!["image/png".into(), VDI_GUEST_FILES_MIME.into()];
-        let name = rdp_host_file_name(
-            &offers,
-            "image/png",
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        let now = 1_700_000_000_000_u64;
+        let envelope = ClipboardEnvelopeV2::new_files(
+            "host",
+            "seat-1",
+            "session-1",
+            1,
+            now,
+            vec!["application/pdf".into(), VDI_GUEST_FILES_MIME.into()],
+            "quarterly-report.pdf",
+            ClipboardEnvelopeV2::content_hash_for(&[7; 42]),
+            42,
+            "files:v2:00000000-0000-0000-0000-000000000001",
+            now + 60_000,
         )
-        .expect("valid metadata")
-        .expect("native file offer");
-        assert_eq!(name, "Clipboard-aabbccddeeff.png");
-        assert!(!name.contains('/'));
-        assert!(rdp_host_file_name(&offers, "image/png", "../host").is_err());
+        .expect("Files envelope");
+        let command = VdiClipboardMessageV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: "session-1".into(),
+            generation: 1,
+            lease_id: "lease-1".into(),
+            lease_expires_at_ms: now + 60_000,
+            message_sequence: 1,
+            selected_mime: "application/pdf".into(),
+            disclosure: VdiClipboardDisclosureV2::Shareable,
+            envelope,
+        };
+        let descriptor = rdp_host_file_descriptor(&command)
+            .expect("valid host Files command")
+            .expect("native arbitrary-file descriptor");
+        assert_eq!(descriptor.name, "quarterly-report.pdf");
+        assert_eq!(descriptor.mime, "application/pdf");
+        assert!(VdiClipboardFileDescriptorV1::new("../host", None, "application/pdf", 42).is_err());
     }
 }
 
