@@ -84,6 +84,11 @@ mde-kdc-host = { path = "../../kdc/mde-kdc-host", optional = true }
 # types, no I/O or async runtime needed in the base build.
 mde-kdc-proto = { path = "../../kdc/mde-kdc-proto" }
 
+# WL-FUNC-011 S4 — reuse the shipped pure-Rust SIP/RTP + PipeWire voice core
+# as the first concrete Calls provider.  It remains behind the daemon worker
+# feature; sync/read-only consumers do not pull the media stack.
+mde-voice-hud = { path = "../../services/mde-voice-hud", optional = true }
+
 # EPIC-MESH-PROBE (MESH-PROBE-2) — the probe inventory IS universal
 # Cards (Q7): the nmap parser emits Host cards with Service children
 # via `crate::card::probe` (the subsystem folded in from the retired
@@ -354,6 +359,7 @@ async-services = [
     "dep:mde-chat",
     "dep:mde-collab-types",
     "dep:mde-collab-core",
+    "dep:mde-voice-hud",
     "dep:mde-bookmarks",
     "dep:uuid",
     # reqwest backs the async-services HTTP consumers (music_autoconfig,

@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -21,6 +22,7 @@ use mde_collab_types::{
     CallMediaRequirement, CallMediaSession, CallMediaVerification, CallMediaVerificationRow,
     CallMediaVerificationStatus, CollabCommand,
 };
+use mde_voice_hud::sip::{AgentCommand, AgentEvent, RegistrationState, SipAccount};
 
 const MAX_READINESS_BODY_BYTES: usize = 256 * 1024;
 const MAX_VERIFICATION_SESSIONS: usize = 256;
@@ -29,6 +31,181 @@ const MAX_DETAIL_BYTES: usize = 512;
 // Private cache marker for a retained verification tombstone. This is not a
 // Bus payload and cannot collide with the serialized verification object.
 const VERIFICATION_UNAVAILABLE: &str = "\0call-media-verification-unavailable";
+const SIP_COMMAND_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SipProviderHealth {
+    Starting,
+    Ready,
+    Unavailable(String),
+}
+
+/// Concrete adapter over the already-shipped SIP/RTP voice core.
+///
+/// The provider starts only when a governed SIP account exists.  The voice
+/// core owns registration, inbound INVITE handling, RTP/G.711, PipeWire/ALSA,
+/// mute state, and RFC 4733 DTMF.  This adapter deliberately exposes only the
+/// commands that core can acknowledge through its bounded agent queue; an
+/// outbound Collaboration call has no dial target in its current command
+/// contract and therefore continues to fail closed.
+struct SipGatewayProvider {
+    commands: std::sync::mpsc::SyncSender<AgentCommand>,
+    health: Arc<Mutex<SipProviderHealth>>,
+}
+
+impl SipGatewayProvider {
+    fn activate() -> Result<Self, String> {
+        let accounts = SipAccount::load_accounts()
+            .ok_or_else(|| "no governed SIP account is installed".to_string())?;
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(SIP_COMMAND_CAPACITY);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let health = Arc::new(Mutex::new(SipProviderHealth::Starting));
+        let monitor_health = Arc::clone(&health);
+        std::thread::Builder::new()
+            .name("mcnf-collab-sip-agent".to_string())
+            .spawn(move || {
+                mde_voice_hud::sip::run_agent_accounts(&accounts, &event_tx, &command_rx);
+            })
+            .map_err(|error| format!("start SIP agent: {error}"))?;
+        std::thread::Builder::new()
+            .name("mcnf-collab-sip-health".to_string())
+            .spawn(move || {
+                while let Ok(event) = event_rx.recv() {
+                    let next = match event {
+                        AgentEvent::Registration(RegistrationState::Registered { .. }) => {
+                            SipProviderHealth::Ready
+                        }
+                        AgentEvent::Registration(RegistrationState::Failed(detail)) => {
+                            SipProviderHealth::Unavailable(bounded_health_detail(&detail))
+                        }
+                        AgentEvent::Registration(_) => SipProviderHealth::Starting,
+                        AgentEvent::Incoming { .. }
+                        | AgentEvent::Established
+                        | AgentEvent::RemoteHangup => continue,
+                    };
+                    if let Ok(mut current) = monitor_health.lock() {
+                        *current = next;
+                    }
+                }
+                if let Ok(mut current) = monitor_health.lock() {
+                    *current = SipProviderHealth::Unavailable("SIP agent stopped".to_string());
+                }
+            })
+            .map_err(|error| format!("start SIP health monitor: {error}"))?;
+        Ok(Self {
+            commands: command_tx,
+            health,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_channel(
+        commands: std::sync::mpsc::SyncSender<AgentCommand>,
+        health: SipProviderHealth,
+    ) -> Self {
+        Self {
+            commands,
+            health: Arc::new(Mutex::new(health)),
+        }
+    }
+
+    fn require_ready(&self) -> Result<(), CallMediaProviderError> {
+        let health =
+            self.health
+                .lock()
+                .map_err(|_| CallMediaProviderError::ProviderUnavailable {
+                    detail: "SIP provider health lock is unavailable".to_string(),
+                })?;
+        match &*health {
+            SipProviderHealth::Ready => Ok(()),
+            SipProviderHealth::Starting => Err(CallMediaProviderError::ProviderUnavailable {
+                detail: "SIP provider registration is not ready".to_string(),
+            }),
+            SipProviderHealth::Unavailable(detail) => {
+                Err(CallMediaProviderError::ProviderUnavailable {
+                    detail: detail.clone(),
+                })
+            }
+        }
+    }
+}
+
+fn bounded_health_detail(detail: &str) -> String {
+    let mut end = detail.len().min(MAX_DETAIL_BYTES);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail[..end].to_string()
+}
+
+impl CallMediaFrameVerifier for SipGatewayProvider {
+    fn execute_command(
+        &self,
+        command: &CollabCommand,
+        adapter: CallMediaAdapter,
+    ) -> Result<(), CallMediaProviderError> {
+        if adapter != CallMediaAdapter::SipGateway {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "SIP provider was selected for an incompatible adapter".to_string(),
+            });
+        }
+        let cleanup = matches!(
+            command,
+            CollabCommand::DeclineCall { .. } | CollabCommand::HangUpCall { .. }
+        );
+        if let Err(error) = self.require_ready() {
+            // Provider loss must never trap the signed collaboration call in
+            // an active state. Cleanup remains locally authoritative and the
+            // dead adapter receives no command.
+            return if cleanup { Ok(()) } else { Err(error) };
+        }
+        let command = match command {
+            CollabCommand::AnswerCall { .. } => AgentCommand::Answer,
+            CollabCommand::DeclineCall { .. } => AgentCommand::Decline,
+            CollabCommand::HangUpCall { .. } => AgentCommand::HangUp,
+            CollabCommand::SendDtmf { digit, .. } => AgentCommand::Dtmf(*digit),
+            CollabCommand::StartCall { .. } => {
+                return Err(CallMediaProviderError::ExecutionRefused {
+                    detail: "outbound SIP execution requires an explicit dial target".to_string(),
+                });
+            }
+            CollabCommand::SetCallMuted { .. } => {
+                return Err(CallMediaProviderError::ExecutionRefused {
+                    detail: "SIP agent mute acknowledgement is not yet available".to_string(),
+                });
+            }
+            _ => return Ok(()),
+        };
+        self.commands.try_send(command).map_err(|error| {
+            CallMediaProviderError::ProviderUnavailable {
+                detail: match error {
+                    std::sync::mpsc::TrySendError::Full(_) => {
+                        "SIP provider command queue is full".to_string()
+                    }
+                    std::sync::mpsc::TrySendError::Disconnected(_) => {
+                        "SIP provider command queue is disconnected".to_string()
+                    }
+                },
+            }
+        })
+    }
+
+    fn prove_advancing_frames(
+        &self,
+        _session: &CallMediaSession,
+        adapter: CallMediaAdapter,
+    ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+        if adapter != CallMediaAdapter::SipGateway {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "SIP provider was selected for an incompatible adapter".to_string(),
+            });
+        }
+        self.require_ready()?;
+        Err(CallMediaProviderError::ExecutionRefused {
+            detail: "SIP/RTP frame counters are unavailable; live media is not proven".to_string(),
+        })
+    }
+}
 
 pub(super) fn publish_retained_call_media_verification(
     persist: &Persist,
@@ -415,6 +592,30 @@ impl CallMediaProviderRegistry {
         Self::default()
     }
 
+    /// Construct the production registry.  A configured SIP core is admitted
+    /// as the concrete audio provider; absent/failed activation leaves the
+    /// registry empty so no call state can be fabricated.
+    #[must_use]
+    pub(crate) fn production() -> Self {
+        let mut registry = Self::empty();
+        // Unit tests inject deterministic providers and must never bind the
+        // developer's real SIP account merely by constructing a worker.
+        if cfg!(test) && std::env::var_os("MCNF_TEST_ENABLE_REAL_SIP_PROVIDER").is_none() {
+            return registry;
+        }
+        if !matches!(mde_role::load(), Ok(mde_role::Role::Workstation)) {
+            tracing::info!(target: "mackesd::collab", "SIP Calls provider requires a pinned Workstation role");
+            return registry;
+        }
+        match SipGatewayProvider::activate() {
+            Ok(provider) => registry.sip_gateway = Some(Box::new(provider)),
+            Err(detail) => {
+                tracing::info!(target: "mackesd::collab", detail, "SIP Calls provider not activated")
+            }
+        }
+        registry
+    }
+
     #[cfg(test)]
     pub(crate) fn register<P>(
         &mut self,
@@ -671,6 +872,7 @@ pub(crate) enum CallMediaProviderRegistrationError {
     AlreadyRegistered { adapter: CallMediaAdapter },
 }
 
+#[derive(Debug)]
 pub(crate) enum CallMediaProviderError {
     TransportUnavailable { detail: String },
     ProviderUnavailable { detail: String },
@@ -805,6 +1007,69 @@ mod tests {
             connected_participants: vec![ActorId::new("alice"), ActorId::new("bob")],
             local_muted: false,
         }
+    }
+
+    #[test]
+    fn concrete_sip_provider_is_bounded_health_checked_and_fail_closed() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let provider = SipGatewayProvider::with_channel(tx, SipProviderHealth::Ready);
+        let call = CallId::new();
+
+        provider
+            .execute_command(
+                &CollabCommand::AnswerCall { call },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("healthy provider queues one real agent command");
+        assert!(matches!(
+            rx.recv().expect("agent command"),
+            AgentCommand::Answer
+        ));
+
+        provider
+            .execute_command(
+                &CollabCommand::SendDtmf { call, digit: '5' },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("healthy provider routes DTMF");
+        assert!(matches!(
+            rx.recv().expect("DTMF command"),
+            AgentCommand::Dtmf('5')
+        ));
+
+        let outbound = provider
+            .execute_command(
+                &CollabCommand::StartCall {
+                    space: SpaceId::new(),
+                    call,
+                    kind: CallKind::Audio,
+                },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect_err("missing dial target must fail closed");
+        assert!(matches!(
+            outbound,
+            CallMediaProviderError::ExecutionRefused { .. }
+        ));
+
+        *provider.health.lock().expect("health") =
+            SipProviderHealth::Unavailable("registration lost".to_string());
+        provider
+            .execute_command(
+                &CollabCommand::HangUpCall { call },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("provider loss must not trap signed cleanup state");
+        let unavailable = provider
+            .execute_command(
+                &CollabCommand::SendDtmf { call, digit: '6' },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect_err("unhealthy provider must not accept media effects");
+        assert!(matches!(
+            unavailable,
+            CallMediaProviderError::ProviderUnavailable { .. }
+        ));
     }
 
     fn empty_registry() -> CallMediaProviderRegistry {

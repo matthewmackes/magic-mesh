@@ -238,9 +238,9 @@ pub struct CollabWorker {
     /// authority; until then AI requests are visible failures and every local
     /// collaboration workflow continues.
     ai_cloud_consent: bool,
-    /// Worker-owned real-media proof providers. Empty by default, which keeps
-    /// `state/collab/call-media-verification` honest until a WebRTC/SIP/LiveKit
-    /// adapter is explicitly registered.
+    /// Worker-owned real-media providers. Production explicitly activates the
+    /// existing SIP/RTP adapter when its governed account is healthy; otherwise
+    /// the registry remains fail-closed.
     call_media_providers: super::collab_media::CallMediaProviderRegistry,
 }
 
@@ -267,7 +267,7 @@ impl CollabWorker {
             cursor_prime_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
             ai_cloud_consent: false,
-            call_media_providers: super::collab_media::CallMediaProviderRegistry::empty(),
+            call_media_providers: super::collab_media::CallMediaProviderRegistry::production(),
         }
     }
 
