@@ -7,6 +7,7 @@ DIR="$REPO/packaging/browser-vm"
 MANIFEST_VERIFY="$DIR/verify-image-manifest.py"
 IMAGE="localhost/magic-mesh-browser-vm-chromium:latest"
 BASE=""
+BASE_RECEIPT=""
 RPMS=()
 DISK=""
 OUT="$DIR/out"
@@ -28,7 +29,7 @@ DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$DIR/profile.env")"
     exit 2
 }
 
-usage() { echo "Usage: $0 --rpm PATH [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
+usage() { echo "Usage: $0 --rpm PATH --base-receipt PATH [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
 
 resolve_image() {
     local ref=$1 label=$2 err rc=0
@@ -45,6 +46,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --rpm) RPMS+=("${2:?--rpm needs a path}"); shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
+        --base-receipt) BASE_RECEIPT="${2:?--base-receipt needs a path}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
         --disk) DISK="${2:?--disk needs a type}"; shift 2 ;;
         --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
@@ -78,20 +80,27 @@ guest_rpm_sha256=$(sha256sum -- "$guest_rpm" | awk '{print $1}')
     exit 2
 }
 
+[ -n "$BASE_RECEIPT" ] || { echo 'FATAL: Browser VM build requires a base-image receipt' >&2; exit 2; }
+effective_base="${BASE:-$(sed -n 's/^ARG BROWSER_VM_BASE=//p' "$DIR/Containerfile" | head -n1)}"
+commit_epoch=$(git -C "$REPO" show -s --format=%ct "$SOURCE_COMMIT")
+case "$(uname -m)" in
+    x86_64) registry_arch=amd64 ;;
+    aarch64) registry_arch=arm64 ;;
+    *) echo 'FATAL: unsupported Browser VM build architecture' >&2; exit 2 ;;
+esac
+base_receipt_json=$("$DIR/produce-base-image-receipt.py" --repo "$REPO" inspect \
+    --image-reference "$effective_base" --architecture "$registry_arch" \
+    --source-revision "$SOURCE_COMMIT" --commit-epoch "$commit_epoch" \
+    --receipt "$BASE_RECEIPT") || { echo 'FATAL: Browser VM base-image receipt admission failed' >&2; exit 2; }
+base_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resolved_digest"])' <<<"$base_receipt_json")
+
 command -v podman >/dev/null 2>&1 || { echo 'FATAL: podman is required' >&2; exit 2; }
 [ -f "$DIR/Containerfile" ] || { echo 'FATAL: Browser VM Containerfile is missing' >&2; exit 2; }
 mkdir -p "$DIR/rpms"
 find "$DIR/rpms" -maxdepth 1 -type f -name '*.rpm' -delete
 cp -- "$guest_rpm" "$DIR/rpms/"
 
-effective_base="${BASE:-$(sed -n 's/^ARG BROWSER_VM_BASE=//p' "$DIR/Containerfile" | head -n1)}"
 resolve_image "$effective_base" 'Browser VM base image'
-base_id="$(podman image inspect --format '{{.Digest}}' "$effective_base")"
-if [[ ! "$base_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
-    base_id="$(podman image inspect --format '{{.Id}}' "$effective_base")"
-    [[ "$base_id" =~ ^[0-9a-fA-F]{64}$ ]] && base_id="sha256:$base_id"
-fi
-[[ "$base_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || { echo 'FATAL: base image has no immutable digest' >&2; exit 2; }
 
 args=(--build-arg "BROWSER_VM_SOURCE_COMMIT=$SOURCE_COMMIT" --build-arg "BROWSER_VM_LIGHTHOUSE_RPM_SHA256=$guest_rpm_sha256")
 [ -n "$BASE" ] && args+=(--build-arg "BROWSER_VM_BASE=$BASE")

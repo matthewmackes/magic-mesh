@@ -30,11 +30,28 @@ DEPLOY_IMAGE="$BROWSER_VM/deploy-image.sh"
 PRODUCTION_CONTROL_UNIT="$ROOT/install-helpers/browser-vm-production-control/deploy/browser-vm-guest-audio-probe-controller.service"
 PRODUCTION_CONTROL_CONFIG="$ROOT/install-helpers/browser-vm-production-control/deploy/controller-config.example.json"
 PRODUCTION_CONTROL_POLICY="$BROWSER_VM/mcnf-browser-vm-managed-policy.json"
+BASE_RECEIPT="$BROWSER_VM/produce-base-image-receipt.py"
+BASE_RECEIPT_TEST="$BROWSER_VM/test-produce-base-image-receipt.py"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
     exit 1
 }
+
+if [[ "${1:-}" == --base-receipt-self-test ]]; then
+    [[ "$#" -eq 1 ]] || fail "--base-receipt-self-test accepts no additional arguments"
+    "$BASE_RECEIPT_TEST"
+    grep -Fq -- '--base-receipt' "$IMAGE_BUILD" || fail "Browser builder omits required base receipt"
+    grep -Fq 'produce-base-image-receipt.py' "$IMAGE_BUILD" || fail "Browser builder does not revalidate base receipt"
+    receipt_line=$(grep -n 'base_receipt_json=' "$IMAGE_BUILD" | cut -d: -f1)
+    mutation_line=$(grep -n "mkdir -p \"\$DIR/rpms\"" "$IMAGE_BUILD" | cut -d: -f1)
+    [[ "$receipt_line" =~ ^[0-9]+$ && "$mutation_line" =~ ^[0-9]+$ && "$receipt_line" -lt "$mutation_line" ]] \
+        || fail "Browser builder admits base receipt after build-context mutation"
+    $IMAGE_BUILD --rpm /definitely/missing >/dev/null 2>&1 && rc=0 || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "Browser builder did not refuse hostile input"
+    echo 'Browser base-image receipt contract self-test passed'
+    exit 0
+fi
 
 verify_lighthouse_rpm_handoff() {
     local containerfile=$1
@@ -79,6 +96,8 @@ fi
 [ -x "$MANIFEST_VERIFY" ] || fail "image-manifest verifier is not executable"
 [ -x "$CATALOG_PROMOTE" ] || fail "catalog promotion helper is not executable"
 [ -x "$PRODUCTION_CONTROL_VERIFY" ] || fail "production-control image verifier is not executable"
+[ -x "$BASE_RECEIPT" ] || fail "base-image receipt producer is not executable"
+[ -x "$BASE_RECEIPT_TEST" ] || fail "base-image receipt hostile test is not executable"
 [ -x "$RUNTIME" ] || fail "guest runtime is not executable"
 [ -x "$XRDP_STARTWM" ] || fail "xrdp session entrypoint is not executable"
 [ -x "$SESSION" ] || fail "media session supervisor is not executable"
@@ -97,7 +116,7 @@ fi
 [ -f "$PRODUCTION_CONTROL_POLICY" ] || fail "production-control Chromium policy is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$SESSION_INPUT_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
-python3 -m py_compile "$MANIFEST_VERIFY" "$CATALOG_PROMOTE" "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY" "$PRODUCTION_CONTROL_VERIFY"
+python3 -m py_compile "$MANIFEST_VERIFY" "$CATALOG_PROMOTE" "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY" "$PRODUCTION_CONTROL_VERIFY" "$BASE_RECEIPT" "$BASE_RECEIPT_TEST"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
