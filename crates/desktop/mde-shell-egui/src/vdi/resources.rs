@@ -16,7 +16,8 @@ use mackes_mesh_types::resources::{
     ResourceDiscoveryProjection, ResourceScope, TransportProtocol,
 };
 use mackes_mesh_types::workloads::{
-    WorkloadOperationAction, WorkloadOperationRequest, WORKLOAD_OPERATION_TOPIC,
+    WorkloadOperationAction, WorkloadOperationRequest, WorkloadOperationStatus,
+    WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
@@ -44,6 +45,27 @@ struct AndroidStartBinding {
     node: String,
     workload_id: String,
     app: AospStarterApp,
+    card_expires_at_ms: u64,
+    action_expires_at_ms: u64,
+}
+
+/// Exact catalog identity for a generation-bound VM/container lifecycle action.
+/// Mutable Workload details are deliberately not copied from the card: the click
+/// reopens the authoritative projection and must find this same node, workload,
+/// generation, and operation before it can construct a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkloadActionBinding {
+    catalog_revision: String,
+    catalog_content_digest: String,
+    resource_id: String,
+    resource_class: ResourceClass,
+    action_id: String,
+    target: ResourceActionTarget,
+    node: String,
+    workload_id: String,
+    generation: u64,
+    verb: ResourceActionVerb,
+    operation: WorkloadOperationAction,
     card_expires_at_ms: u64,
     action_expires_at_ms: u64,
 }
@@ -166,7 +188,7 @@ struct ResourceReplyLedger {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingActionKind {
-    Start,
+    Invoke,
     Cancel,
 }
 
@@ -195,6 +217,7 @@ impl Default for FeedState {
 pub(super) struct RemoteSessionsModel {
     projection: Option<ResourceDiscoveryProjection>,
     android_starts: BTreeMap<String, AndroidStartBinding>,
+    workload_actions: BTreeMap<String, WorkloadActionBinding>,
     cancellable_actions: BTreeMap<String, ResourceActionReceipt>,
     reply_ledger: ResourceReplyLedger,
     feed_state: FeedState,
@@ -210,6 +233,7 @@ impl Default for RemoteSessionsModel {
         Self {
             projection: None,
             android_starts: BTreeMap::new(),
+            workload_actions: BTreeMap::new(),
             cancellable_actions: BTreeMap::new(),
             reply_ledger: ResourceReplyLedger::default(),
             feed_state: FeedState::default(),
@@ -228,8 +252,10 @@ impl RemoteSessionsModel {
             .discovery_projection()
             .map_err(|error| format!("Resource catalog rejected: {error}"))?;
         let android_starts = android_start_bindings(&catalog);
+        let workload_actions = workload_action_bindings(&catalog);
         self.install_projection(projection)?;
         self.android_starts = android_starts;
+        self.workload_actions = workload_actions;
         Ok(())
     }
 
@@ -293,6 +319,7 @@ impl RemoteSessionsModel {
     fn revoke_action_authority(&mut self) {
         self.admission_epoch = self.admission_epoch.wrapping_add(1);
         self.android_starts.clear();
+        self.workload_actions.clear();
         self.cancellable_actions.clear();
     }
 
@@ -336,7 +363,40 @@ impl RemoteSessionsModel {
             binding.app.display_name()
         ));
         self.action_pending = Some(PendingResourceAction {
-            kind: PendingActionKind::Start,
+            kind: PendingActionKind::Invoke,
+            admission_epoch: self.admission_epoch,
+            receiver,
+        });
+        std::thread::spawn(move || {
+            let result = publish_resource_action(invocation);
+            let _ = sender.send(result);
+        });
+    }
+
+    fn begin_workload_action(&mut self, resource_id: &str, now_ms: u64) {
+        if self.action_pending.is_some() {
+            return;
+        }
+        let Some(binding) = self.workload_actions.get(resource_id).cloned() else {
+            self.action_feedback =
+                Some("Action refused: this card has no generation-bound Workload identity.".into());
+            return;
+        };
+        let invocation = match current_workload_invocation(&binding, now_ms) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.action_feedback = Some(format!("Action refused: {error}"));
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.action_feedback = Some(format!(
+            "{} {} through Workload authority…",
+            action_label(binding.verb),
+            binding.workload_id
+        ));
+        self.action_pending = Some(PendingResourceAction {
+            kind: PendingActionKind::Invoke,
             admission_epoch: self.admission_epoch,
             receiver,
         });
@@ -446,7 +506,7 @@ impl RemoteSessionsModel {
             }
             Ok(Err(error)) => {
                 let label = match kind {
-                    PendingActionKind::Start => "Start",
+                    PendingActionKind::Invoke => "Action",
                     PendingActionKind::Cancel => "Cancel",
                 };
                 self.action_feedback = Some(format!("{label} failed: {error}"));
@@ -572,6 +632,11 @@ pub(super) fn remote_sessions_panel(ui: &mut egui::Ui, model: &mut RemoteSession
                 for entry in group {
                     let can_start_android = model.android_starts.contains_key(&entry.resource_id)
                         && model.action_pending.is_none();
+                    let workload_verb = model
+                        .workload_actions
+                        .get(&entry.resource_id)
+                        .map(|binding| binding.verb)
+                        .filter(|_| model.action_pending.is_none());
                     let can_cancel = model.cancellable_actions.contains_key(&entry.resource_id)
                         && model.action_pending.is_none();
                     if let Some(intent) = paint_resource_card(
@@ -580,6 +645,7 @@ pub(super) fn remote_sessions_panel(ui: &mut egui::Ui, model: &mut RemoteSession
                         now_ms,
                         &model.feed_state,
                         can_start_android,
+                        workload_verb,
                         can_cancel,
                     ) {
                         requested_action = Some((entry.resource_id.clone(), intent));
@@ -592,6 +658,9 @@ pub(super) fn remote_sessions_panel(ui: &mut egui::Ui, model: &mut RemoteSession
         if let Some((resource_id, intent)) = requested_action {
             match intent {
                 CardActionIntent::StartAndroid => model.begin_android_start(&resource_id, now_ms),
+                CardActionIntent::InvokeWorkload => {
+                    model.begin_workload_action(&resource_id, now_ms)
+                }
                 CardActionIntent::Cancel => model.begin_cancellation(&resource_id, now_ms),
             }
         }
@@ -629,6 +698,7 @@ fn paint_feed_state(ui: &mut egui::Ui, model: &RemoteSessionsModel) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardActionIntent {
     StartAndroid,
+    InvokeWorkload,
     Cancel,
 }
 
@@ -638,6 +708,7 @@ fn paint_resource_card(
     now_ms: u64,
     feed_state: &FeedState,
     can_start_android: bool,
+    workload_verb: Option<ResourceActionVerb>,
     can_cancel: bool,
 ) -> Option<CardActionIntent> {
     let mut intent = None;
@@ -669,7 +740,29 @@ fn paint_resource_card(
                 .color(Style::TEXT_DIM),
             );
             if !entry.ready_actions.is_empty() {
-                if entry.ready_actions.contains(&ResourceActionVerb::Start) {
+                if let Some(verb) = workload_verb {
+                    let usable = matches!(feed_state, FeedState::Ready)
+                        && entry.expires_at_ms > now_ms
+                        && matches!(
+                            entry.health_status,
+                            HealthStatus::Available
+                                | HealthStatus::Degraded
+                                | HealthStatus::Unavailable
+                        )
+                        && matches!(
+                            entry.auth_status,
+                            AuthStatus::NotRequired | AuthStatus::Authorized
+                        );
+                    if ui
+                        .add_enabled(usable, egui::Button::new(action_label(verb)))
+                        .on_hover_text(
+                            "Revalidates the exact generation against Workloads before routing.",
+                        )
+                        .clicked()
+                    {
+                        intent = Some(CardActionIntent::InvokeWorkload);
+                    }
+                } else if entry.ready_actions.contains(&ResourceActionVerb::Start) {
                     let usable = can_start_android
                         && matches!(feed_state, FeedState::Ready)
                         && entry.expires_at_ms > now_ms
@@ -713,6 +806,14 @@ fn paint_resource_card(
             }
         });
     intent
+}
+
+const fn action_label(verb: ResourceActionVerb) -> &'static str {
+    match verb {
+        ResourceActionVerb::Start => "Start",
+        ResourceActionVerb::Resume => "Resume",
+        _ => "Action",
+    }
 }
 
 fn android_start_bindings(catalog: &ResourceCatalog) -> BTreeMap<String, AndroidStartBinding> {
@@ -766,6 +867,149 @@ fn android_start_bindings(catalog: &ResourceCatalog) -> BTreeMap<String, Android
             ))
         })
         .collect()
+}
+
+fn workload_action_bindings(catalog: &ResourceCatalog) -> BTreeMap<String, WorkloadActionBinding> {
+    let digest = catalog.computed_content_digest();
+    catalog
+        .cards
+        .iter()
+        .filter_map(|card| {
+            if !matches!(
+                card.identity.class,
+                ResourceClass::VirtualMachine | ResourceClass::Container
+            ) {
+                return None;
+            }
+            let mut parts = card.identity.canonical_key.split('/');
+            let (Some("workload"), Some(node), Some(workload_id), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return None;
+            };
+            if !safe_workload_segment(node) || !safe_workload_segment(workload_id) {
+                return None;
+            }
+            let mut routed = card.actions.iter().filter_map(|action| {
+                let (prefix, operation) = match action.verb {
+                    ResourceActionVerb::Start => ("start-g", WorkloadOperationAction::Start),
+                    ResourceActionVerb::Resume => ("resume-g", WorkloadOperationAction::Resume),
+                    _ => return None,
+                };
+                if action.target != ResourceActionTarget::Resource
+                    || action.availability.status != ActionAvailabilityStatus::Ready
+                {
+                    return None;
+                }
+                let generation = action.action_id.strip_prefix(prefix)?.parse::<u64>().ok()?;
+                (generation != 0).then_some((action, generation, operation))
+            });
+            let (action, generation, operation) = routed.next()?;
+            if routed.next().is_some() {
+                return None;
+            }
+            Some((
+                card.resource_id().to_owned(),
+                WorkloadActionBinding {
+                    catalog_revision: catalog.revision.clone(),
+                    catalog_content_digest: digest.clone(),
+                    resource_id: card.resource_id().to_owned(),
+                    resource_class: card.identity.class,
+                    action_id: action.action_id.clone(),
+                    target: action.target.clone(),
+                    node: node.to_owned(),
+                    workload_id: workload_id.to_owned(),
+                    generation,
+                    verb: action.verb,
+                    operation,
+                    card_expires_at_ms: card.expires_at_ms,
+                    action_expires_at_ms: action.expires_at_ms,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn safe_workload_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+}
+
+fn current_workload_invocation(
+    binding: &WorkloadActionBinding,
+    now_ms: u64,
+) -> Result<ResourceActionInvocation, String> {
+    let root = mde_bus::client_data_dir()
+        .ok_or_else(|| "the local mesh Bus directory is unavailable".to_owned())?;
+    let persist = mde_bus::persist::Persist::open(root)
+        .map_err(|error| format!("authoritative Workload projection unavailable: {error}"))?;
+    let status = crate::workload_api::read_status(&persist, &binding.node, &binding.workload_id)
+        .ok_or_else(|| "the exact Workload identity is unavailable".to_owned())?;
+    build_workload_invocation(binding, &status, now_ms)
+}
+
+fn build_workload_invocation(
+    binding: &WorkloadActionBinding,
+    status: &WorkloadOperationStatus,
+    now_ms: u64,
+) -> Result<ResourceActionInvocation, String> {
+    if status.workload_id.as_str() != binding.workload_id || status.generation != binding.generation
+    {
+        return Err("the Workload generation changed after catalog admission".to_owned());
+    }
+    if (binding.resource_class == ResourceClass::VirtualMachine) != status.backend.is_vm() {
+        return Err("the Workload backend no longer matches the admitted resource kind".to_owned());
+    }
+    let deadline_at_ms = now_ms
+        .saturating_add(RESOURCE_ACTION_TTL_MS)
+        .min(binding.card_expires_at_ms)
+        .min(binding.action_expires_at_ms);
+    if now_ms == 0 || deadline_at_ms <= now_ms {
+        return Err("the generation-bound Workload action is stale".to_owned());
+    }
+    let sequence = RESOURCE_ACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let request_id = format!(
+        "resource-workload-{}-{now_ms}-{sequence}",
+        action_label(binding.verb).to_ascii_lowercase()
+    );
+    let request = WorkloadOperationRequest {
+        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        request_id: request_id.clone(),
+        workload_id: status.workload_id.clone(),
+        backend: status.backend,
+        resources: status.resources,
+        image_ref: status.image_ref.clone(),
+        target_node: binding.node.clone(),
+        expected_generation: binding.generation,
+        action: binding.operation,
+        target_request_id: None,
+        deadline_at_ms,
+        preferred_attachment: None,
+        armed_token: None,
+    };
+    request
+        .validate(now_ms)
+        .map_err(|error| format!("typed Workload request is invalid: {error}"))?;
+    Ok(ResourceActionInvocation {
+        schema_version: 1,
+        request_id: request_id.clone(),
+        catalog_revision: binding.catalog_revision.clone(),
+        catalog_content_digest: binding.catalog_content_digest.clone(),
+        resource_id: binding.resource_id.clone(),
+        action_id: binding.action_id.clone(),
+        verb: binding.verb,
+        target: binding.target.clone(),
+        expected_generation: binding.generation,
+        cancellation_id: format!("cancel-{request_id}"),
+        cancels_request_id: None,
+        issued_at_ms: now_ms,
+        deadline_at_ms,
+        authority_request: TypedAuthorityRequest::Workload(request),
+        armed_token: None,
+    })
 }
 
 fn safe_android_segment(value: &str) -> bool {
@@ -1275,7 +1519,8 @@ mod tests {
         RESOURCE_CONTRACT_VERSION,
     };
     use mackes_mesh_types::workloads::{
-        WorkloadBackend, WorkloadId, WorkloadResources, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        WorkloadBackend, WorkloadId, WorkloadOperationPhase, WorkloadPowerState, WorkloadReadiness,
+        WorkloadResources, WorkloadRuntimeSignals,
     };
 
     const NOW: u64 = 1_900_000_000_000;
@@ -1448,6 +1693,52 @@ mod tests {
         }
     }
 
+    fn workload_catalog() -> ResourceCatalog {
+        let mut catalog = android_catalog("android-app/node-a/android-vm-a/com.android.browser");
+        let card = &mut catalog.cards[0];
+        card.identity = ResourceIdentity::new(
+            ResourceClass::VirtualMachine,
+            IdentityAuthority::Mesh,
+            "workload/node-a/vm-a",
+            vec![],
+        )
+        .expect("Workload resource identity");
+        card.display_name = "vm-a".into();
+        card.summary = Some("Virtual machine on node-a".into());
+        card.actions[0].action_id = "resume-g7".into();
+        card.actions[0].verb = ResourceActionVerb::Resume;
+        catalog.revision = "revision-workload-9".into();
+        catalog.content_digest = Some(catalog.computed_content_digest());
+        catalog.validate().expect("valid Workload catalog");
+        catalog
+    }
+
+    fn workload_status(generation: u64) -> WorkloadOperationStatus {
+        WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: "previous-workload-operation".into(),
+            workload_id: WorkloadId::new("vm-a").expect("workload ID"),
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadResources {
+                vcpu: 2,
+                memory_mb: 4_096,
+                disk_gb: 32,
+            },
+            image_ref: Some("construct:12.1".into()),
+            generation,
+            phase: WorkloadOperationPhase::Ready,
+            power: WorkloadPowerState::Paused,
+            readiness: WorkloadReadiness::Ready,
+            signals: WorkloadRuntimeSignals::default(),
+            retryable: false,
+            attempt: 0,
+            next_retry_at_ms: 0,
+            reason: None,
+            remediation: None,
+            attachment: None,
+        }
+    }
+
     fn accepted_reply(invocation: &ResourceActionInvocation) -> ResourceActionReply {
         let (topic, kind) = expected_downstream(invocation).expect("known typed authority");
         ResourceActionReply {
@@ -1594,7 +1885,7 @@ mod tests {
 
         let (sender, receiver) = mpsc::channel();
         model.action_pending = Some(PendingResourceAction {
-            kind: PendingActionKind::Start,
+            kind: PendingActionKind::Invoke,
             admission_epoch: model.admission_epoch,
             receiver,
         });
@@ -1633,7 +1924,7 @@ mod tests {
 
         let (sender, receiver) = mpsc::channel();
         model.action_pending = Some(PendingResourceAction {
-            kind: PendingActionKind::Start,
+            kind: PendingActionKind::Invoke,
             admission_epoch: model.admission_epoch,
             receiver,
         });
@@ -1721,6 +2012,49 @@ mod tests {
                 format!("{}:{}", invocation.resource_id, invocation.action_id)
             )
         );
+    }
+
+    #[test]
+    fn vm_resume_routes_only_after_exact_workload_generation_revalidation() {
+        let catalog = workload_catalog();
+        let resource_id = catalog.cards[0].resource_id().to_owned();
+        let bindings = workload_action_bindings(&catalog);
+        let binding = bindings
+            .get(&resource_id)
+            .expect("generation-bound VM action");
+        assert_eq!(binding.node, "node-a");
+        assert_eq!(binding.workload_id, "vm-a");
+        assert_eq!(binding.generation, 7);
+        assert_eq!(binding.verb, ResourceActionVerb::Resume);
+
+        let invocation = build_workload_invocation(binding, &workload_status(7), NOW + 1)
+            .expect("fresh authoritative Workload identity");
+        let TypedAuthorityRequest::Workload(request) = &invocation.authority_request else {
+            panic!("VM action crossed into a non-Workload authority");
+        };
+        assert_eq!(request.target_node, "node-a");
+        assert_eq!(request.workload_id.as_str(), "vm-a");
+        assert_eq!(request.expected_generation, 7);
+        assert_eq!(request.action, WorkloadOperationAction::Resume);
+        assert_eq!(request.backend, WorkloadBackend::LibvirtVirtqemud);
+        assert_eq!(request.image_ref.as_deref(), Some("construct:12.1"));
+        assert!(request.armed_token.is_none());
+        assert_eq!(
+            expected_downstream(&invocation).expect("closed route"),
+            (
+                WORKLOAD_OPERATION_TOPIC,
+                DownstreamReplyKind::WorkloadOperation
+            )
+        );
+
+        let error = build_workload_invocation(binding, &workload_status(8), NOW + 1)
+            .expect_err("replacement generation must fail closed");
+        assert!(error.contains("generation changed"));
+
+        let mut ambiguous = catalog.clone();
+        let duplicate = ambiguous.cards[0].actions[0].clone();
+        ambiguous.cards[0].actions.push(duplicate);
+        assert!(workload_action_bindings(&ambiguous).is_empty());
     }
 
     #[test]
