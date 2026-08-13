@@ -341,6 +341,11 @@ pub(super) struct ResourceBrowserState {
     /// The key is injected by the approved desktop credential wiring. The
     /// default shell remains untrusted until that wiring supplies a key.
     publisher_key: Option<Vec<u8>>,
+    /// Production credentials are re-read at every snapshot boundary. Keeping
+    /// the directory (rather than only the decoded key) prevents a deleted or
+    /// replaced systemd credential from leaving stale action authority alive
+    /// for the lifetime of the shell process.
+    publisher_credential_directory: Option<PathBuf>,
     /// Separately published, safe browser projection bound to the admitted
     /// catalog. The card remains the action source; this projection owns
     /// discovery/filter facets so the shell never infers health or capability
@@ -382,7 +387,11 @@ impl ResourceBrowserState {
         } else {
             None
         };
-        Self::with_publisher_key(bus_root, publisher_key)
+        let mut state = Self::with_publisher_key(bus_root, publisher_key);
+        if rustix::process::geteuid().is_root() {
+            state.publisher_credential_directory = directory;
+        }
+        state
     }
 
     pub(super) fn with_publisher_key(
@@ -394,6 +403,7 @@ impl ResourceBrowserState {
             catalog: None,
             authenticated_catalog: None,
             publisher_key,
+            publisher_credential_directory: None,
             discovery: None,
             filter: CatalogFilter::All,
             stack_expanded: false,
@@ -413,6 +423,7 @@ impl ResourceBrowserState {
     }
 
     pub(super) fn refresh(&mut self) {
+        self.reload_managed_publisher_key();
         let Some(root) = self.bus_root.as_ref() else {
             return;
         };
@@ -460,6 +471,22 @@ impl ResourceBrowserState {
                 )?)
             });
         self.apply_refresh_result(result);
+    }
+
+    fn reload_managed_publisher_key(&mut self) {
+        let Some(directory) = self.publisher_credential_directory.as_deref() else {
+            return;
+        };
+        let next = publisher_key_from_systemd_credentials(Some(directory));
+        if next != self.publisher_key {
+            // Rotation and loss both invalidate every authorization derived
+            // from the previous key. A later coherent refresh may promote the
+            // catalog under `next`; until then inspection is deliberately
+            // untrusted and a prepared/live VDI request is revoked exactly.
+            self.authenticated_catalog = None;
+            self.cancel_vdi_handoff();
+        }
+        self.publisher_key = next;
     }
 
     fn apply_refresh_result(&mut self, result: Result<AdmittedResourceSnapshot, String>) {
@@ -2194,6 +2221,54 @@ mod tests {
         let state = ResourceBrowserState::new(None);
         assert!(state.publisher_key.is_none());
         assert!(state.authenticated_catalog.is_none());
+    }
+
+    #[test]
+    fn managed_publisher_credential_loss_revokes_retained_action_authority() {
+        let temp = tempfile::tempdir().expect("credential directory");
+        let path = temp.path().join(RESOURCE_PUBLISHER_HMAC_CREDENTIAL);
+        std::fs::write(&path, KEY).expect("publisher credential");
+
+        let (catalog_body, discovery_body) = snapshot_bodies();
+        let catalog = catalog();
+        let proof = ResourcePublisherAttestation::mint(
+            &catalog,
+            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
+            KEY,
+            NOW,
+            NOW + 60_000,
+        )
+        .expect("publisher proof");
+        let admitted = admit_resource_snapshot(
+            &catalog_body,
+            &discovery_body,
+            Some(&serde_json::to_string(&proof).expect("proof JSON")),
+            Some(KEY),
+            NOW + 1,
+        )
+        .expect("authenticated snapshot");
+
+        let mut state = ResourceBrowserState::with_publisher_key(None, Some(KEY.to_vec()));
+        state.publisher_credential_directory = Some(temp.path().to_path_buf());
+        state.apply_refresh_result(Ok(admitted));
+        state.vdi_handoff = Some(ApprovedCatalogDesktop {
+            resource_id: "resource:credential-bound".into(),
+            display_name: "Credential-bound desktop".into(),
+            host: "172.20.146.54".into(),
+            port: 3_389,
+        });
+        assert!(state.authenticated_catalog.is_some());
+
+        std::fs::remove_file(path).expect("remove publisher credential");
+        state.reload_managed_publisher_key();
+
+        assert!(state.publisher_key.is_none());
+        assert!(state.authenticated_catalog.is_none());
+        assert!(state.take_vdi_handoff().is_none());
+        assert!(state
+            .action_feedback
+            .as_deref()
+            .is_some_and(|feedback| feedback.contains("CANCELLED BEFORE DISPATCH")));
     }
 
     #[test]
