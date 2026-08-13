@@ -412,6 +412,22 @@ impl DeviceControlExecWorker {
         Ok(())
     }
 
+    /// Re-attest the exact preview generation and device identity immediately
+    /// before executing an already-authorized mutation.
+    fn re_attest_authorized_request(
+        &self,
+        req: &DeviceControlRequest,
+    ) -> Result<device_inventory::DeviceRecord, String> {
+        let Some(device) = self.offered(&req.target, req.expected_inventory_published_at_ms) else {
+            return Err(format!(
+                "device `{}` left {}'s authorized inventory generation {} before execution — refused before mutation",
+                req.target.name, self.self_hostname, req.expected_inventory_published_at_ms,
+            ));
+        };
+        Self::admit_control_state(req.op, &device)?;
+        Ok(device)
+    }
+
     /// Handle one request: gate → plan → execute. Returns the typed result WITHOUT
     /// side-effecting the audit/notify (those wrap it in [`Self::process`]) so the
     /// gate + plan logic is unit-testable in isolation.
@@ -477,6 +493,16 @@ impl DeviceControlExecWorker {
                 &req.id,
                 format!("device-control authorization refused: {reason}"),
             );
+        }
+        // Authorization can involve durable nonce-ledger I/O. The inventory may
+        // advance while that work is in flight, so the earlier preview gate is
+        // not sufficient authority for the eventual hardware effect. Re-read
+        // the provider publication at the last possible point and require the
+        // exact previewed generation and control identity to remain actionable.
+        // A consumed capability is intentionally not reusable when this gate
+        // fails: the operator must preview and authorize the new generation.
+        if let Err(reason) = self.re_attest_authorized_request(req) {
+            return DeviceControlResult::failed(&req.id, reason);
         }
         match execute_plan(&steps).await {
             Ok(note) => DeviceControlResult::ok(
@@ -1207,6 +1233,68 @@ mod tests {
             std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
             "1",
             "unavailable state must be refused before the sysfs seam"
+        );
+    }
+
+    #[test]
+    fn superseded_inventory_generation_is_re_attested_before_hardware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        let authorized = dev_dir.join("authorized");
+        std::fs::write(&authorized, "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+        let device = DeviceRecord {
+            sysfs_path: Some(sysfs_path.clone()),
+            ..DeviceRecord::new("Generation-bound webcam", DeviceStatus::Ok)
+        };
+        write_inventory_at(tmp.path(), "edge-2", 41, vec![device.clone()]);
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_authorizer(test_authorizer(tmp.path()));
+        let request = authorize_request(
+            &DeviceControlRequest {
+                schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+                armed_token: None,
+                id: "01GENERATION-REATTEST".into(),
+                op: DeviceControlOp::Disable,
+                target: DeviceTarget {
+                    name: "Generation-bound webcam".into(),
+                    category: category::NETWORK_ADAPTERS.into(),
+                    sysfs_path: Some(sysfs_path),
+                    driver: None,
+                },
+                target_host: "edge-2".into(),
+                expected_inventory_published_at_ms: 41,
+                from: "peer:operator-seat".into(),
+            },
+            "generation-re-attestation",
+        );
+
+        assert!(
+            worker
+                .offered(&request.target, request.expected_inventory_published_at_ms)
+                .is_some(),
+            "the preview generation must initially be offered"
+        );
+        // Simulate a provider publication superseding that successful preview
+        // while durable authorization is in flight, then exercise the final
+        // gate directly so this regression cannot pass on the initial gate.
+        write_inventory_at(tmp.path(), "edge-2", 42, vec![device]);
+        let result = worker.re_attest_authorized_request(&request);
+
+        let error = result.expect_err("a superseded preview must fail final attestation");
+        assert!(
+            error.contains("authorized inventory generation 41"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&authorized).unwrap(),
+            "1",
+            "a superseded preview generation must never reach sysfs"
         );
     }
 
