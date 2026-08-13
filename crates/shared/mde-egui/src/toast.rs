@@ -198,6 +198,75 @@ pub enum Dwell {
     UntilAck,
 }
 
+/// Governed rendering tier for an A-F KIRON health scene.
+///
+/// `Static` is implemented entirely with egui primitives and is therefore
+/// always admitted. Richer tiers are selected only after their renderer has
+/// explicitly reported both assets and device state ready.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KironSceneTier {
+    /// Deterministic primitive-only fallback.
+    #[default]
+    Static,
+    /// Verified pre-rendered scene frames.
+    PreRendered,
+    /// Verified live 3D scene rendering.
+    Live3d,
+}
+
+/// Current readiness reported by the richer KIRON render backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KironSceneReadiness {
+    /// The graphics device can accept richer scene work.
+    pub device_ready: bool,
+    /// All governed pre-rendered assets needed for the active grade are ready.
+    pub pre_rendered_ready: bool,
+    /// All governed live-3D assets and pipelines needed for the active grade are ready.
+    pub live_3d_ready: bool,
+}
+
+impl KironSceneReadiness {
+    /// No external assets or graphics device are assumed at startup.
+    pub const UNAVAILABLE: Self = Self {
+        device_ready: false,
+        pre_rendered_ready: false,
+        live_3d_ready: false,
+    };
+
+    const fn best_tier(self) -> KironSceneTier {
+        if !self.device_ready {
+            KironSceneTier::Static
+        } else if self.live_3d_ready {
+            KironSceneTier::Live3d
+        } else if self.pre_rendered_ready {
+            KironSceneTier::PreRendered
+        } else {
+            KironSceneTier::Static
+        }
+    }
+}
+
+/// Result of applying a renderer-readiness update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KironTierTransition {
+    /// The effective tier did not change.
+    Unchanged(KironSceneTier),
+    /// Readiness loss selected a less capable, still truthful tier.
+    FellBack {
+        /// Tier in use before the loss.
+        from: KironSceneTier,
+        /// Best remaining admitted tier.
+        to: KironSceneTier,
+    },
+    /// Corrected-forward readiness selected a more capable tier.
+    Recovered {
+        /// Tier in use before readiness returned.
+        from: KironSceneTier,
+        /// Best newly admitted tier.
+        to: KironSceneTier,
+    },
+}
+
 /// The optional click-through on a chyron: a button `label` plus an **opaque**
 /// action `verb`.
 ///
@@ -417,6 +486,9 @@ pub struct ToastHost {
     /// Highest admitted generation per health authority.
     /// Unlike `current`/`pending`, clearing a toast does not clear this state.
     health_watermarks: VecDeque<HealthAuthorityWatermark>,
+    /// Effective A-F scene tier. Independent from alert lifecycle state so a
+    /// renderer reset cannot restart a dwell or clear an acknowledgement hold.
+    kiron_scene_tier: KironSceneTier,
 }
 
 impl ToastHost {
@@ -432,6 +504,7 @@ impl ToastHost {
             chyron_fade: None,
             osd_fade: None,
             health_watermarks: VecDeque::new(),
+            kiron_scene_tier: KironSceneTier::Static,
         }
     }
 
@@ -749,6 +822,33 @@ impl ToastHost {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.current.is_none() && self.pending.is_empty() && self.osd.is_none()
+    }
+
+    /// Apply one complete renderer-readiness snapshot and deterministically
+    /// select `Live3d`, then `PreRendered`, then the always-available `Static`
+    /// tier. Missing assets can never be selected merely because the graphics
+    /// device recovered.
+    ///
+    /// This mutates no queue, countdown, hover, interruption, or
+    /// acknowledgement state.
+    pub fn update_kiron_scene_readiness(
+        &mut self,
+        readiness: KironSceneReadiness,
+    ) -> KironTierTransition {
+        let from = self.kiron_scene_tier;
+        let to = readiness.best_tier();
+        self.kiron_scene_tier = to;
+        match to.cmp(&from) {
+            std::cmp::Ordering::Less => KironTierTransition::FellBack { from, to },
+            std::cmp::Ordering::Greater => KironTierTransition::Recovered { from, to },
+            std::cmp::Ordering::Equal => KironTierTransition::Unchanged(to),
+        }
+    }
+
+    /// Effective admitted tier for governed A-F scenes.
+    #[must_use]
+    pub const fn kiron_scene_tier(&self) -> KironSceneTier {
+        self.kiron_scene_tier
     }
 
     // ── renders (over Style + Motion) ─────────────────────────────────────────
@@ -2299,6 +2399,102 @@ mod tests {
         assert_eq!(KironGradeScene::from_flag("SYSTEM · GRADE F"), None);
         assert_eq!(KironGradeScene::from_flag("HEALTH · GRADE G"), None);
         assert_eq!(KironGradeScene::from_flag("health · grade F"), None);
+    }
+
+    #[test]
+    fn device_loss_falls_back_and_recovers_without_resetting_scene_lifecycle() {
+        let mut timed = ToastHost::new();
+        timed.enqueue(info("timed-scene").with_dwell(Dwell::For(Duration::from_secs(15))));
+        timed.tick(Duration::from_secs(4));
+        let remaining = timed.remaining();
+
+        let live = KironSceneReadiness {
+            device_ready: true,
+            pre_rendered_ready: true,
+            live_3d_ready: true,
+        };
+        assert_eq!(
+            timed.update_kiron_scene_readiness(live),
+            KironTierTransition::Recovered {
+                from: KironSceneTier::Static,
+                to: KironSceneTier::Live3d,
+            }
+        );
+        assert_eq!(timed.remaining(), remaining);
+
+        let device_lost = KironSceneReadiness {
+            device_ready: false,
+            // A hostile stale asset-ready report must not override device loss.
+            pre_rendered_ready: true,
+            live_3d_ready: true,
+        };
+        assert_eq!(
+            timed.update_kiron_scene_readiness(device_lost),
+            KironTierTransition::FellBack {
+                from: KironSceneTier::Live3d,
+                to: KironSceneTier::Static,
+            }
+        );
+        assert_eq!(timed.remaining(), remaining);
+
+        let pre_rendered_only = KironSceneReadiness {
+            device_ready: true,
+            pre_rendered_ready: true,
+            live_3d_ready: false,
+        };
+        assert_eq!(
+            timed.update_kiron_scene_readiness(pre_rendered_only),
+            KironTierTransition::Recovered {
+                from: KironSceneTier::Static,
+                to: KironSceneTier::PreRendered,
+            }
+        );
+        assert_eq!(timed.remaining(), remaining);
+
+        // Asset loss degrades to the primitive tier even though the graphics
+        // device itself remains healthy.
+        assert_eq!(
+            timed.update_kiron_scene_readiness(KironSceneReadiness {
+                device_ready: true,
+                pre_rendered_ready: false,
+                live_3d_ready: false,
+            }),
+            KironTierTransition::FellBack {
+                from: KironSceneTier::PreRendered,
+                to: KironSceneTier::Static,
+            }
+        );
+        assert_eq!(timed.remaining(), remaining);
+
+        // The richer renderer state is also orthogonal to the bounded operator
+        // interruption slot and the grade-F acknowledgement lifecycle.
+        let mut held = ToastHost::new();
+        held.enqueue(
+            Toast::alert(Severity::Critical, "node", "HEALTH · GRADE F", "held")
+                .with_dwell(Dwell::UntilAck),
+        );
+        held.enqueue(Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "operator notice",
+        ));
+        let current = held.current().map(|toast| toast.headline.clone());
+        let backlog = held.backlog();
+        assert_eq!(
+            held.update_kiron_scene_readiness(live),
+            KironTierTransition::Recovered {
+                from: KironSceneTier::Static,
+                to: KironSceneTier::Live3d,
+            }
+        );
+        assert_eq!(held.current().map(|toast| toast.headline.clone()), current);
+        assert_eq!(held.backlog(), backlog);
+        held.advance();
+        assert!(matches!(
+            held.current().map(|toast| toast.dwell),
+            Some(Dwell::UntilAck)
+        ));
     }
 
     #[test]
