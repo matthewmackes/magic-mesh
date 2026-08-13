@@ -881,9 +881,6 @@ fn command_body(
             schedule_id,
             action,
         } => {
-            if action == TimerAction::Remove {
-                return Ok(ClockCommandKindV1::RemoveSchedule { schedule_id });
-            }
             if action == TimerAction::Stop {
                 let occurrence = snapshot
                     .occurrences
@@ -904,6 +901,12 @@ fn command_body(
                 );
             }
             let mut schedule = find_schedule(snapshot, &schedule_id)?.clone();
+            if schedule.origin_node_id != snapshot.node_id {
+                return Err("a peer timer is read-only on this node".to_owned());
+            }
+            if action == TimerAction::Remove {
+                return Ok(ClockCommandKindV1::RemoveSchedule { schedule_id });
+            }
             let ClockScheduleKindV1::Timer(timer) = &mut schedule.schedule else {
                 return Err("the selected schedule is not a timer".to_owned());
             };
@@ -1303,8 +1306,15 @@ fn timers(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnap
     for schedule in &s.schedules {
         if let ClockScheduleKindV1::Timer(timer) = &schedule.schedule {
             any = true;
+            let read_only = schedule.origin_node_id != s.node_id;
             ui.horizontal(|ui| {
                 ui.label(&schedule.label);
+                if read_only {
+                    ui.colored_label(
+                        Style::TEXT_DIM,
+                        format!("From {} · read-only", schedule.origin_node_id),
+                    );
+                }
                 let left = match timer.phase {
                     ClockTimerPhase::Running => timer
                         .absolute_deadline_utc_ms
@@ -1325,7 +1335,7 @@ fn timers(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnap
                                 action: TimerAction::Stop,
                             });
                         }
-                    } else {
+                    } else if !read_only {
                         if ui.button("Add 1 minute").clicked() {
                             state.emit(ClockUiAction::ControlTimer {
                                 schedule_id: schedule.schedule_id.clone(),
@@ -1339,7 +1349,7 @@ fn timers(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnap
                             });
                         }
                     }
-                } else {
+                } else if !read_only {
                     let action = if timer.phase == ClockTimerPhase::Running {
                         TimerAction::Pause
                     } else {
@@ -1352,7 +1362,7 @@ fn timers(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnap
                         });
                     }
                 }
-                if ui.button("Remove").clicked() {
+                if !read_only && ui.button("Remove").clicked() {
                     state.emit(ClockUiAction::ControlTimer {
                         schedule_id: schedule.schedule_id.clone(),
                         action: TimerAction::Remove,
@@ -1739,6 +1749,46 @@ mod tests {
             result,
             Err("a mirrored stopwatch is read-only on this node".to_owned())
         );
+    }
+
+    #[test]
+    fn peer_timer_refuses_local_schedule_mutations() {
+        let mut snapshot = ringing_snapshot();
+        snapshot.schedules[1].origin_node_id = "node-b".into();
+
+        for action in [
+            TimerAction::Pause,
+            TimerAction::Resume,
+            TimerAction::Restart,
+            TimerAction::AddMinute,
+            TimerAction::Remove,
+        ] {
+            assert_eq!(
+                command_body(
+                    ClockUiAction::ControlTimer {
+                        schedule_id: "timer-1".into(),
+                        action,
+                    },
+                    &snapshot,
+                    snapshot.produced_at_utc_ms,
+                    1,
+                ),
+                Err("a peer timer is read-only on this node".to_owned())
+            );
+        }
+
+        assert!(matches!(
+            command_body(
+                ClockUiAction::ControlTimer {
+                    schedule_id: "timer-1".into(),
+                    action: TimerAction::Stop,
+                },
+                &snapshot,
+                snapshot.produced_at_utc_ms,
+                1,
+            ),
+            Ok(ClockCommandKindV1::Acknowledge { .. })
+        ));
     }
 
     #[test]
