@@ -371,7 +371,7 @@ impl OfflineTileCache {
             let path = tile_path(&self.root, &entry.tile, &entry.sha256)?;
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata)
-                    if metadata.file_type().is_file() && metadata.len() == entry.byte_len =>
+                    if is_exclusive_regular_file(&metadata) && metadata.len() == entry.byte_len =>
                 {
                     referenced.insert(path);
                     retained.push(entry.clone());
@@ -446,7 +446,7 @@ fn read_bounded_regular_file(path: &Path, expected: u64) -> Result<Vec<u8>, Read
             ReadFailure::UnsafeOrIo
         }
     })?;
-    if !metadata.file_type().is_file()
+    if !is_exclusive_regular_file(&metadata)
         || metadata.len() != expected
         || expected > MAX_TILE_BYTES as u64
     {
@@ -477,7 +477,7 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(CacheError::Io(error.to_string())),
     };
-    if !metadata.file_type().is_file() || metadata.len() > MAX_INDEX_BYTES {
+    if !is_exclusive_regular_file(&metadata) || metadata.len() > MAX_INDEX_BYTES {
         return Err(CacheError::Index(
             "index is not a bounded regular file".to_string(),
         ));
@@ -546,6 +546,17 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
         ));
     }
     Ok(index.entries)
+}
+
+fn is_exclusive_regular_file(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return false;
+    }
+    true
 }
 
 fn invalidate_legacy_index(root: &Path, bytes: &[u8]) -> Result<Vec<CacheEntry>, CacheError> {
@@ -1140,5 +1151,40 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join(INDEX_FILE)).unwrap()).unwrap();
         assert_eq!(recovered.schema, INDEX_SCHEMA);
         assert!(recovered.entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_cache_authority_is_rejected_without_touching_external_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = CachePolicy::bounded(1024, 10_000).unwrap();
+        let id = tile(0);
+        let bytes = b"verified";
+        let digest = sha256_hex(bytes);
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        cache
+            .store_verified(&catalog(), id.clone(), bytes, &digest, 1)
+            .unwrap();
+
+        let payload = tile_path(dir.path(), &id, &digest).unwrap();
+        let external_payload = outside.path().join("externally-owned.tile");
+        std::fs::hard_link(&payload, &external_payload).unwrap();
+        assert!(matches!(
+            cache.lookup(&catalog(), &id, 2),
+            OfflineTile::Unavailable(UnavailableReason::CorruptRemoved)
+        ));
+        assert_eq!(std::fs::read(&external_payload).unwrap(), bytes);
+        assert!(!payload.exists());
+
+        let external_index = outside.path().join("externally-owned-index.json");
+        std::fs::hard_link(dir.path().join(INDEX_FILE), &external_index).unwrap();
+        assert!(matches!(
+            OfflineTileCache::open(dir.path(), policy),
+            Err(CacheError::Index(error)) if error == "index is not a bounded regular file"
+        ));
+        let preserved: CacheIndex =
+            serde_json::from_slice(&std::fs::read(external_index).unwrap()).unwrap();
+        assert_eq!(preserved.schema, INDEX_SCHEMA);
     }
 }
