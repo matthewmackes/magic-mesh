@@ -905,11 +905,31 @@ fn acknowledgement_body(
     })
 }
 
-fn stopwatch_elapsed(stopwatch: &ClockStopwatchV1, now_ms: i64) -> u64 {
-    let live = stopwatch
-        .started_wall_utc_ms
-        .and_then(|started| u64::try_from(now_ms.saturating_sub(started)).ok())
-        .unwrap_or(0);
+fn stopwatch_elapsed(
+    stopwatch: &ClockStopwatchV1,
+    now_wall_utc_ms: i64,
+    now_monotonic_ms: u64,
+    local_clock_domain: bool,
+) -> u64 {
+    // A local running stopwatch must not jump when NTP or an operator corrects
+    // wall time. A delivered mirror's monotonic value belongs to another boot
+    // clock and cannot be compared here. After a local reboot, the new
+    // monotonic epoch can also precede the persisted start; in both cases the
+    // absolute wall timestamps are the only comparable clock domain.
+    let monotonic_live = if local_clock_domain {
+        stopwatch
+            .started_monotonic_ms
+            .and_then(|started| now_monotonic_ms.checked_sub(started))
+    } else {
+        None
+    };
+    let wall_live = || {
+        stopwatch
+            .started_wall_utc_ms
+            .and_then(|started| u64::try_from(now_wall_utc_ms.saturating_sub(started)).ok())
+            .unwrap_or(0)
+    };
+    let live = monotonic_live.unwrap_or_else(wall_live);
     stopwatch.accumulated_elapsed_ms.saturating_add(live)
 }
 
@@ -1163,13 +1183,14 @@ fn command_body(
                     stopwatch.started_monotonic_ms = Some(monotonic_ms);
                 }
                 StopwatchAction::Pause if stopwatch.phase == ClockStopwatchPhase::Running => {
-                    stopwatch.accumulated_elapsed_ms = stopwatch_elapsed(&stopwatch, now_ms);
+                    stopwatch.accumulated_elapsed_ms =
+                        stopwatch_elapsed(&stopwatch, now_ms, monotonic_ms, true);
                     stopwatch.phase = ClockStopwatchPhase::Paused;
                     stopwatch.started_wall_utc_ms = None;
                     stopwatch.started_monotonic_ms = None;
                 }
                 StopwatchAction::Lap if stopwatch.phase == ClockStopwatchPhase::Running => {
-                    let total = stopwatch_elapsed(&stopwatch, now_ms);
+                    let total = stopwatch_elapsed(&stopwatch, now_ms, monotonic_ms, true);
                     let previous = stopwatch.laps.last().map_or(0, |lap| lap.total_elapsed_ms);
                     let split = total.saturating_sub(previous);
                     if split == 0 {
@@ -1564,7 +1585,9 @@ fn stopwatch(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockS
     let sw = projection.map(StopwatchProjection::stopwatch);
     let read_only = projection.is_some_and(StopwatchProjection::is_read_only);
     let now_ms = now_unix().saturating_mul(1_000);
-    let elapsed = sw.map_or(0, |value| stopwatch_elapsed(value, now_ms));
+    let elapsed = sw.map_or(0, |value| {
+        stopwatch_elapsed(value, now_ms, monotonic_ms(), !read_only)
+    });
     ui.label(RichText::new(fmt_duration(elapsed)).size(Style::DISPLAY));
     if let Some(stopwatch) = sw.filter(|_| read_only) {
         ui.colored_label(
@@ -2007,6 +2030,45 @@ mod tests {
             result,
             Err("a mirrored stopwatch is read-only on this node".to_owned())
         );
+    }
+
+    #[test]
+    fn local_stopwatch_pause_and_lap_ignore_backward_wall_clock_correction() {
+        let mut snapshot = snapshot();
+        let wall_start = snapshot.produced_at_utc_ms;
+        snapshot.stopwatches.push(ClockStopwatchV1 {
+            stopwatch_id: "local-running".into(),
+            origin_node_id: "node-a".into(),
+            mirror_target_ids: vec!["node-a".into()],
+            revision: 3,
+            phase: ClockStopwatchPhase::Running,
+            started_wall_utc_ms: Some(wall_start),
+            started_monotonic_ms: Some(10_000),
+            accumulated_elapsed_ms: 2_000,
+            laps: Vec::new(),
+        });
+
+        for action in [StopwatchAction::Pause, StopwatchAction::Lap] {
+            let body = command_body(
+                ClockUiAction::ControlStopwatch {
+                    stopwatch_id: Some("local-running".into()),
+                    action,
+                },
+                &snapshot,
+                wall_start - 30_000,
+                15_000,
+            )
+            .expect("monotonic stopwatch command survives wall rollback");
+            let ClockCommandKindV1::UpsertStopwatch { stopwatch } = body else {
+                panic!("stopwatch control must remain a typed stopwatch update");
+            };
+            assert_eq!(stopwatch.accumulated_elapsed_ms, 7_000);
+            if action == StopwatchAction::Lap {
+                assert_eq!(stopwatch.laps.len(), 1);
+                assert_eq!(stopwatch.laps[0].split_elapsed_ms, 7_000);
+                assert_eq!(stopwatch.laps[0].total_elapsed_ms, 7_000);
+            }
+        }
     }
 
     #[test]
