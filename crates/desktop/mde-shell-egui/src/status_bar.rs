@@ -2238,57 +2238,58 @@ mod tests {
         let mut construct = ConstructChrome::default();
         let segments = StatusSegments::default();
         let health = HealthStatus::default();
-        let mut run = |events: Vec<egui::Event>| {
-            let mut clicked = false;
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
+        {
+            let mut run = |events: Vec<egui::Event>| {
+                let mut clicked = false;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        clicked = mount_top_with_active(
+                            ctx,
+                            &mut construct,
+                            &segments,
+                            &health,
+                            visible_env(),
+                            1.0,
+                            None,
+                            None,
+                            Some(weather.clone()),
+                        );
+                    },
+                );
+                clicked
+            };
+            for _ in 0..3 {
+                assert!(!run(Vec::new()));
+            }
+            let pos = ctx
+                .read_response(live_weather_id("top"))
+                .expect("weather target")
+                .rect
+                .center();
+            assert!(!run(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
                 },
-                |ctx| {
-                    clicked = mount_top_with_active(
-                        ctx,
-                        &mut construct,
-                        &segments,
-                        &health,
-                        visible_env(),
-                        1.0,
-                        None,
-                        None,
-                        Some(weather.clone()),
-                    );
+            ]));
+            assert!(run(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
                 },
-            );
-            clicked
-        };
-        for _ in 0..3 {
-            assert!(!run(Vec::new()));
+            ]));
         }
-        let pos = ctx
-            .read_response(live_weather_id("top"))
-            .expect("weather target")
-            .rect
-            .center();
-        assert!(!run(vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            },
-        ]));
-        assert!(run(vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            },
-        ]));
-        drop(run);
         assert!(!construct.notification_center_open);
         assert!(!construct.control_center_open);
     }
