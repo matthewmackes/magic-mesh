@@ -36,7 +36,10 @@ GATE_KEYS = {
 
 EXPECTED_ROSTERS = {
     "github_checks": ["github-required"],
-    "farm_packages": ["farm-ci", "workstation-rpm", "lighthouse-rpm"],
+    "farm_packages": [
+        "farm-ci", "workstation-rpm", "lighthouse-rpm",
+        "workloads-rpm-transaction",
+    ],
     "seats": ["dell", "seat15", "surface"],
     "lighthouses": [
         "lh-104-236-118-177", "lh-46-101-219-245", "lh-64-23-131-57",
@@ -58,11 +61,19 @@ FARM_CATEGORIES = {
     "farm-ci": {"farm"},
     "workstation-rpm": {"package"},
     "lighthouse-rpm": {"package"},
+    "workloads-rpm-transaction": {"package"},
 }
 ALL_CATEGORIES = {
     "ci", "farm", "runtime", "gui", "network", "audio", "vdi", "package",
     "recovery",
 }
+
+WORKLOADS_RPM_TRANSACTION_SCOPE = "workloads-rpm-transaction"
+WORKLOADS_RPM_TRANSACTION_PASS_CONDITION = (
+    "the exact Workloads compute RPMs pass hard dependency headers, payload identity, "
+    "repository install and upgrade transactions, and ordered retired mackesd.service "
+    "to grouped mackesd.target ownership handoff"
+)
 
 
 class MatrixError(ValueError):
@@ -218,6 +229,21 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
             # optional-seat inspection into the release baseline.
             if re.search(r"(?:^|\s)--inspect-seat(?:=|\s|$)", command):
                 fail(f"{label}.command cannot promote optional seat inspection to a required gate")
+        if scope_kind == "farm_package" and scope_id == WORKLOADS_RPM_TRANSACTION_SCOPE:
+            expected_command = (
+                "install-helpers/release-evidence.sh validate "
+                f"docs/platform/release-evidence/{revision}/workloads-rpm-transaction.json"
+            )
+            if gate["command"] != expected_command:
+                fail(
+                    f"{label}.command must validate the revision-bound Workloads RPM "
+                    "transaction evidence"
+                )
+            if gate["pass_condition"] != WORKLOADS_RPM_TRANSACTION_PASS_CONDITION:
+                fail(
+                    f"{label}.pass_condition must require dependencies, payload, "
+                    "repository transaction, and upgrade-owner handoff"
+                )
         evidence = gate["evidence_filename"]
         if not EVIDENCE_RE.fullmatch(evidence) or f"/{revision}/" not in evidence:
             fail(f"{label}.evidence_filename must be a revision-bound canonical JSON filename")
@@ -270,17 +296,30 @@ def generated_fixture(revision: str) -> dict[str, Any]:
         }[scope_kind]
         categories = FARM_CATEGORIES[scope_id] if scope_kind == "farm_package" else SCOPE_CATEGORIES[scope_kind]
         gate_id = f"{prefix}-{scope_id}"
+        workloads_transaction = (
+            scope_kind == "farm_package"
+            and scope_id == WORKLOADS_RPM_TRANSACTION_SCOPE
+        )
         gates.append({
             "gate_id": gate_id, "scope_kind": scope_kind, "scope_id": scope_id,
             "categories": sorted(categories), "owner": "self-test-owner",
             "command": (
-                "install-helpers/test-five-seat-core.py --required-baseline"
-                if scope_kind == "seat" else f"self-test --gate {gate_id}"
+                "install-helpers/release-evidence.sh validate "
+                f"docs/platform/release-evidence/{revision}/"
+                "workloads-rpm-transaction.json"
+                if workloads_transaction
+                else "install-helpers/test-five-seat-core.py --required-baseline"
+                if scope_kind == "seat"
+                else f"self-test --gate {gate_id}"
             ),
             "evidence_filename": expected_evidence_filename(
                 revision, scope_kind, scope_id, gate_id
             ),
-            "pass_condition": "typed result is pass", "revision_ref": "source_revision",
+            "pass_condition": (
+                WORKLOADS_RPM_TRANSACTION_PASS_CONDITION
+                if workloads_transaction else "typed result is pass"
+            ),
+            "revision_ref": "source_revision",
             "required": True,
         })
     gates.sort(key=lambda gate: gate["gate_id"])
@@ -376,6 +415,15 @@ def self_test() -> None:
     case("unknown category", lambda value: value["gates"][0]["categories"].append("implied"))
     case("optional required gate", lambda value: value["gates"][0].__setitem__("required", False))
     case("unbound revision", lambda value: value["gates"][0].__setitem__("revision_ref", "HEAD"))
+    case(
+        "incomplete Workloads RPM transaction",
+        lambda value: next(
+            gate for gate in value["gates"]
+            if gate["scope_id"] == WORKLOADS_RPM_TRANSACTION_SCOPE
+        ).__setitem__(
+            "pass_condition", "the Workloads RPM file exists and is below the size limit"
+        ),
+    )
 
     rejected = 0
     with tempfile.TemporaryDirectory(prefix="mcnf-release-gate-matrix-self-test-") as temp:

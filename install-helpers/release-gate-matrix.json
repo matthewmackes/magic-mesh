@@ -5,6 +5,7 @@
   "required_gate_ids": [
     "farm-package-farm-ci",
     "farm-package-lighthouse-rpm",
+    "farm-package-workloads-rpm-transaction",
     "farm-package-workstation-rpm",
     "github-github-required",
     "lighthouse-lh-104-236-118-177",
@@ -28,7 +29,8 @@
     "farm_packages": [
       "farm-ci",
       "workstation-rpm",
-      "lighthouse-rpm"
+      "lighthouse-rpm",
+      "workloads-rpm-transaction"
     ],
     "seats": [
       "dell",
@@ -72,6 +74,18 @@
       "command": "install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-lighthouse-*.rpm",
       "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/lighthouse-rpm.json",
       "pass_condition": "the thin lighthouse RPM digest, payload allowlist, Fedora target, transaction result, and source revision all pass",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "farm-package-workloads-rpm-transaction",
+      "scope_kind": "farm_package",
+      "scope_id": "workloads-rpm-transaction",
+      "categories": ["package"],
+      "owner": "release-engineering",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/workloads-rpm-transaction.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/workloads-rpm-transaction.json",
+      "pass_condition": "the exact Workloads compute RPMs pass hard dependency headers, payload identity, repository install and upgrade transactions, and ordered retired mackesd.service to grouped mackesd.target ownership handoff",
       "revision_ref": "source_revision",
       "required": true
     },
