@@ -372,6 +372,7 @@ pub fn run_pending_for(root: &Path, run: &JobRun, self_hostname: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn cand(host: &str, role: &str, tags: &[&str]) -> Candidate {
         Candidate {
@@ -386,7 +387,7 @@ mod tests {
             id: id.into(),
             description: format!("{id} description"),
             playbook: "playbooks/patch.yml".into(),
-            vars: Default::default(),
+            vars: BTreeMap::default(),
             targets: TargetSelector::default(),
             schedule: None,
         }
@@ -488,11 +489,11 @@ mod tests {
             run_id: "r-1".into(),
             playbook: "playbooks/patch.yml".into(),
             playbook_digest: String::new(),
-            vars: Default::default(),
+            vars: BTreeMap::default(),
             targets: vec!["pine".into(), "oak".into()],
             launched_by: "peer:pine".into(),
             at: 100,
-            execution_auth: Default::default(),
+            execution_auth: BTreeMap::default(),
         };
         write_run(tmp.path(), &run).unwrap();
         assert_eq!(read_run(tmp.path(), "r-1").unwrap().targets.len(), 2);
@@ -523,11 +524,11 @@ mod tests {
             run_id: "valid".into(),
             playbook: "playbooks/patch.yml".into(),
             playbook_digest: String::new(),
-            vars: Default::default(),
+            vars: BTreeMap::default(),
             targets: vec!["pine".into()],
             launched_by: String::new(),
             at: 42,
-            execution_auth: Default::default(),
+            execution_auth: BTreeMap::default(),
         };
         write_run(tmp.path(), &valid).unwrap();
 

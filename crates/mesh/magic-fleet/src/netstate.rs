@@ -829,7 +829,7 @@ mod tests {
         let ops = MockOps {
             actual: NetState::default(),
             reachable: true,
-            log: Default::default(),
+            log: std::cell::RefCell::default(),
         };
         let desired = NetState {
             interfaces: vec![iface("eth0", "10.42.0.7")],
@@ -845,7 +845,7 @@ mod tests {
         let ops = MockOps {
             actual: NetState::default(),
             reachable: false, // post-apply we can't reach the overlay
-            log: Default::default(),
+            log: std::cell::RefCell::default(),
         };
         let desired = NetState {
             interfaces: vec![iface("eth0", "10.42.0.7")],
@@ -869,7 +869,7 @@ mod tests {
         let ops = MockOps {
             actual: state.clone(),
             reachable: true,
-            log: Default::default(),
+            log: std::cell::RefCell::default(),
         };
         let out = apply_with_self_test(&ops, &state, &["10.42.0.1".into()]);
         assert_eq!(out, ApplyOutcome::NoChange);

@@ -344,7 +344,7 @@ mod tests {
             MessageClass::Notification,
         ] {
             assert!(
-                score(&[weak.clone()], class, &Policy::default()).is_none(),
+                score(std::slice::from_ref(&weak), class, &Policy::default()).is_none(),
                 "{class:?} must refuse the weak transport"
             );
         }
@@ -451,8 +451,10 @@ mod tests {
 
     #[test]
     fn pinned_primary_wins_over_scoring() {
-        let mut policy = Policy::default();
-        policy.pinned_primary = vec![TransportKind::NebulaHttps443];
+        let policy = Policy {
+            pinned_primary: vec![TransportKind::NebulaHttps443],
+            ..Policy::default()
+        };
         let samples = vec![
             all_carrier(TransportKind::NebulaDirect),
             all_carrier(TransportKind::NebulaHttps443),
@@ -467,8 +469,10 @@ mod tests {
     fn pinned_primary_falls_through_when_not_in_candidates() {
         // Pinned kind isn't available (no sample). Pinning silently
         // disables; pure scoring takes over.
-        let mut policy = Policy::default();
-        policy.pinned_primary = vec![TransportKind::NebulaHttps443];
+        let policy = Policy {
+            pinned_primary: vec![TransportKind::NebulaHttps443],
+            ..Policy::default()
+        };
         let samples = vec![all_carrier(TransportKind::NebulaDirect)];
         let r = score(&samples, MessageClass::Control, &policy).unwrap();
         assert_eq!(r.primary, TransportKind::NebulaDirect);
@@ -477,8 +481,10 @@ mod tests {
 
     #[test]
     fn denylist_removes_a_candidate() {
-        let mut policy = Policy::default();
-        policy.denylist = vec![TransportKind::NebulaDirect];
+        let policy = Policy {
+            denylist: vec![TransportKind::NebulaDirect],
+            ..Policy::default()
+        };
         let samples = vec![
             all_carrier(TransportKind::NebulaDirect),
             all_carrier(TransportKind::KdcTls),
@@ -489,8 +495,10 @@ mod tests {
 
     #[test]
     fn denylist_can_eliminate_all_candidates() {
-        let mut policy = Policy::default();
-        policy.denylist = TransportKind::all().to_vec();
+        let policy = Policy {
+            denylist: TransportKind::all().to_vec(),
+            ..Policy::default()
+        };
         let samples = vec![all_carrier(TransportKind::NebulaDirect)];
         let r = score(&samples, MessageClass::Control, &policy);
         assert!(r.is_none());

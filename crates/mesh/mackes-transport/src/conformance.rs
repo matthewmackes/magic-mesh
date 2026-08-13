@@ -410,7 +410,7 @@ mod tests {
             fn kind(&self) -> TransportKind {
                 // Flips between two kinds every call — breaks C1.
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     TransportKind::NebulaDirect
                 } else {
                     TransportKind::KdcTls
