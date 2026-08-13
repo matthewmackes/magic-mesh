@@ -186,25 +186,39 @@ impl OfflineTileCache {
         if incoming > self.policy.quota_bytes {
             return Err(CacheError::OverQuota);
         }
-        self.remove_expired(now_ms)?;
-        if let Some(position) = self.entries.iter().position(|entry| entry.tile == tile) {
-            self.remove_position(position)?;
-        }
-        while self.used_bytes().saturating_add(incoming) > self.policy.quota_bytes {
-            let position = self
-                .entries
+        // Build the complete replacement index before touching any payload that
+        // the durable index still references. Provisioning can then fail at any
+        // point before index publication without destroying valid offline data.
+        let previous = self.entries.clone();
+        let mut replacement: Vec<CacheEntry> = previous
+            .iter()
+            .filter(|entry| {
+                entry.tile != tile
+                    && entry.verified_at_ms <= now_ms
+                    && now_ms.saturating_sub(entry.verified_at_ms) <= self.policy.max_age_ms
+            })
+            .cloned()
+            .collect();
+        while replacement
+            .iter()
+            .map(|entry| entry.byte_len)
+            .sum::<u64>()
+            .saturating_add(incoming)
+            > self.policy.quota_bytes
+        {
+            let position = replacement
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, entry)| (entry.last_access_ms, entry.verified_at_ms, &entry.tile))
                 .map(|(position, _)| position)
                 .ok_or(CacheError::OverQuota)?;
-            self.remove_position(position)?;
+            replacement.remove(position);
         }
 
         let path = tile_path(&self.root, &tile, expected_sha256)?;
         ensure_tile_parent(&self.root, &tile)?;
         write_atomic(&path, bytes)?;
-        self.entries.push(CacheEntry {
+        replacement.push(CacheEntry {
             tile,
             catalog_sha256: catalog.digest().to_string(),
             sha256: expected_sha256.to_string(),
@@ -212,10 +226,27 @@ impl OfflineTileCache {
             verified_at_ms: now_ms,
             last_access_ms: now_ms,
         });
-        if let Err(error) = self.persist() {
-            self.entries.pop();
-            let _ = std::fs::remove_file(path);
+        if let Err(error) = self.persist_entries(&replacement) {
+            if !previous.iter().any(|entry| {
+                tile_path(&self.root, &entry.tile, &entry.sha256)
+                    .ok()
+                    .as_ref()
+                    == Some(&path)
+            }) {
+                let _ = std::fs::remove_file(path);
+            }
             return Err(error);
+        }
+        self.entries = replacement;
+        for retired in previous.iter().filter(|entry| {
+            !self
+                .entries
+                .iter()
+                .any(|kept| kept.tile == entry.tile && kept.sha256 == entry.sha256)
+        }) {
+            if let Ok(retired_path) = tile_path(&self.root, &retired.tile, &retired.sha256) {
+                quarantine_then_remove(&retired_path);
+            }
         }
         Ok(())
     }
@@ -276,23 +307,6 @@ impl OfflineTileCache {
         }
     }
 
-    fn remove_expired(&mut self, now_ms: u64) -> Result<(), CacheError> {
-        let mut positions: Vec<usize> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                now_ms.saturating_sub(entry.verified_at_ms) > self.policy.max_age_ms
-            })
-            .map(|(position, _)| position)
-            .collect();
-        positions.reverse();
-        for position in positions {
-            self.remove_position(position)?;
-        }
-        Ok(())
-    }
-
     fn remove_bad(
         &mut self,
         position: usize,
@@ -329,9 +343,13 @@ impl OfflineTileCache {
     }
 
     fn persist(&self) -> Result<(), CacheError> {
+        self.persist_entries(&self.entries)
+    }
+
+    fn persist_entries(&self, entries: &[CacheEntry]) -> Result<(), CacheError> {
         let bytes = serde_json::to_vec(&CacheIndex {
             schema: INDEX_SCHEMA,
-            entries: self.entries.clone(),
+            entries: entries.to_vec(),
         })
         .map_err(|error| CacheError::Index(error.to_string()))?;
         if bytes.len() as u64 > MAX_INDEX_BYTES {
@@ -485,8 +503,8 @@ fn invalidate_legacy_index(root: &Path, bytes: &[u8]) -> Result<Vec<CacheEntry>,
 fn recover_corrupt_regular_index(root: &Path) -> Result<Vec<CacheEntry>, CacheError> {
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let path = root.join(INDEX_FILE);
-    let metadata = std::fs::symlink_metadata(&path)
-        .map_err(|error| CacheError::Io(error.to_string()))?;
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|error| CacheError::Io(error.to_string()))?;
     if !metadata.file_type().is_file() {
         return Err(CacheError::Index(
             "corrupt index is not a regular file".to_string(),
@@ -654,6 +672,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_provisioning_preserves_tiles_selected_for_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CachePolicy::bounded(3, 10_000).unwrap();
+        let admitted = catalog();
+        let retained = tile(0);
+        let blocked = tile(1);
+        let bytes = b"old";
+        let digest = sha256_hex(bytes);
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        cache
+            .store_verified(&admitted, retained.clone(), bytes, &digest, 1)
+            .unwrap();
+
+        let blocked_parent = dir
+            .path()
+            .join("test-region")
+            .join("2")
+            .join(blocked.x.to_string());
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+
+        assert!(matches!(
+            cache.store_verified(&admitted, blocked, b"new", &sha256_hex(b"new"), 2),
+            Err(CacheError::Policy(_))
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.used_bytes(), 3);
+        assert!(matches!(
+            cache.lookup(&admitted, &retained, 3),
+            OfflineTile::Verified { bytes: found, .. } if found == bytes
+        ));
+
+        let mut restarted = OfflineTileCache::open(dir.path(), policy).unwrap();
+        assert!(matches!(
+            restarted.lookup(&admitted, &retained, 4),
+            OfflineTile::Verified { bytes: found, .. } if found == bytes
+        ));
+    }
+
+    #[test]
     fn quota_property_holds_across_varying_tiles_and_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let policy = CachePolicy::bounded(32, 10_000).unwrap();
@@ -722,8 +779,8 @@ mod tests {
             .unwrap();
 
         let index_path = dir.path().join(INDEX_FILE);
-        let mut index: CacheIndex = serde_json::from_slice(&std::fs::read(&index_path).unwrap())
-            .unwrap();
+        let mut index: CacheIndex =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
         index.entries[0].verified_at_ms = 20;
         index.entries[0].last_access_ms = 20;
         std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
