@@ -28,7 +28,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{audio_provider, device_inventory, wifi_provider, ShutdownToken, Worker};
+use super::{
+    audio_provider, device_inventory, privacy_provider, wifi_provider, ShutdownToken, Worker,
+};
 use mackes_mesh_types::peer_probe::{
     BusTopology, Descriptors, KernelDriver, NatClass, PeerProbe, PowerThermal,
 };
@@ -399,6 +401,13 @@ impl Worker for HardwareProbeWorker {
                         target: "mackesd::hardware_probe",
                         %error,
                         "audio provider publish failed",
+                    );
+                }
+                if let Err(error) = privacy_provider::publish_system(&root, &host) {
+                    tracing::warn!(
+                        target: "mackesd::hardware_probe",
+                        %error,
+                        "privacy provider publish failed",
                     );
                 }
                 inventory
