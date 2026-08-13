@@ -320,6 +320,13 @@ fn bounded_pin_selector_query(query: &str) -> String {
     query.chars().take(MAX_PIN_SELECTOR_QUERY_CHARS).collect()
 }
 
+/// A focused taskbar control is a real keyboard button, not merely a painted
+/// focus ring. Keep pointer and keyboard activation in one predicate so every
+/// icon action, including Start/Search/Back/Home, has identical semantics.
+fn control_activated(clicked: bool, focused: bool, enter: bool, space: bool) -> bool {
+    clicked || (focused && (enter || space))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ProfileState {
     /// A seat with no navigation preference has not completed first boot.
@@ -910,17 +917,18 @@ impl State {
                     let _response = response.clone().on_hover_ui(move |ui| {
                         nav_bar_tooltip(ui, label.as_str());
                     });
-                    let keyboard_toggle = response.has_focus()
-                        && ctx.input(|input| {
-                            input.key_pressed(egui::Key::Enter)
-                                || input.key_pressed(egui::Key::Space)
-                        });
+                    let activated = control_activated(
+                        clicked,
+                        response.has_focus(),
+                        ctx.input(|input| input.key_pressed(egui::Key::Enter)),
+                        ctx.input(|input| input.key_pressed(egui::Key::Space)),
+                    );
                     if control.kind == ControlKind::Overflow {
                         overflow_response = Some(response.clone());
-                        if clicked || keyboard_toggle {
+                        if activated {
                             ctx.memory_mut(|memory| memory.toggle_popup(overflow_popup_id));
                         }
-                    } else if clicked {
+                    } else if activated {
                         action = Some(control_action(*control, pinned_sources, connected_sessions));
                     }
                     if control.kind != ControlKind::Overflow {
@@ -3237,6 +3245,15 @@ mod tests {
             filtered_pin_catalog(&query),
             filtered_pin_catalog(&rendered_query)
         );
+    }
+
+    #[test]
+    fn focused_taskbar_controls_activate_only_on_enter_or_space() {
+        assert!(control_activated(false, true, true, false));
+        assert!(control_activated(false, true, false, true));
+        assert!(!control_activated(false, false, true, false));
+        assert!(!control_activated(false, true, false, false));
+        assert!(control_activated(true, false, false, false));
     }
 
     #[test]
