@@ -47,7 +47,7 @@ def require_policy(module: ModuleType) -> None:
         raise BoundaryError("denylist must explicitly reject cookie, login, and state stores")
     if not isinstance(denied_parts, tuple) or not {"credential", "password", "secret", "token"} <= set(denied_parts):
         raise BoundaryError("denylist must reject credential-bearing filename parts")
-    for name in ("profile_candidates", "migrate", "self_test"):
+    for name in ("profile_candidates", "migrate", "import_bundle", "self_test"):
         if not callable(getattr(module, name, None)):
             raise BoundaryError(f"migration helper is missing required callable: {name}")
 
@@ -165,6 +165,36 @@ def validate_bundle(module: ModuleType, roots: list[tuple[Path, str]], output: P
         if path.is_file() and b"_SECRET" in path.read_bytes():
             raise BoundaryError(f"bundle payload leaked fixture secret: {path}")
     return manifest
+
+
+def validate_idempotent_import(module: ModuleType, roots: list[tuple[Path, str]], bundle: Path) -> None:
+    guest = bundle.parent / "guest"
+    destinations = {
+        "bookmarks": guest / "profile",
+        "history": guest / "profile",
+        "sessions": guest / "profile",
+        "extensions": guest / "profile",
+        "downloads": guest / "downloads",
+        "policies": guest / "policies",
+    }
+    first = module.import_bundle(bundle, destinations)
+    second = module.import_bundle(bundle, destinations)
+    if first != {"imported": 6, "retained": 0, "failed": 0}:
+        raise BoundaryError(f"first portable import reported wrong counts: {first}")
+    if second != {"imported": 0, "retained": 6, "failed": 0}:
+        raise BoundaryError(f"repeated portable import was not idempotent: {second}")
+    if (guest / "downloads" / "manual.pdf").read_bytes() != b"portable-download":
+        raise BoundaryError("portable download did not survive import")
+    if any(b"_SECRET" in path.read_bytes() for path in guest.rglob("*") if path.is_file()):
+        raise BoundaryError("portable import materialized a credential fixture")
+    (guest / "profile" / "History").write_bytes(b"guest-conflict")
+    try:
+        module.import_bundle(bundle, destinations)
+    except module.MigrationError as exc:
+        if "conflicts with bundle" not in str(exc):
+            raise BoundaryError(f"guest conflict failed for the wrong reason: {exc}") from exc
+    else:
+        raise BoundaryError("portable import silently replaced conflicting guest state")
 
 
 def validate_duplicate_identity_rejection(
@@ -351,6 +381,7 @@ def validate_source(repo_root: Path) -> None:
         second_output = base / "second"
         duplicate_output = base / "duplicate"
         first = validate_bundle(module, roots, first_output)
+        validate_idempotent_import(module, roots, first_output)
         second = validate_bundle(module, roots, second_output)
         if first != second or sha256(first_output / "manifest.json") != sha256(second_output / "manifest.json"):
             raise BoundaryError("identical input must yield byte-identical deterministic manifests")

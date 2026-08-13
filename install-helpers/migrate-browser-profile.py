@@ -324,6 +324,15 @@ def verify_existing_bundle(output: Path, manifest: dict) -> None:
                 raise MigrationError("existing bundle skipped entry names a payload")
             continue
         relative = entry.get("output")
+        category = entry.get("category")
+        source_relative = entry.get("path")
+        if (
+            category not in {"bookmarks", "history", "sessions", "downloads", "policies", "extensions"}
+            or not isinstance(source_relative, str)
+            or denied(source_relative) is not None
+            or relative != output_name(category, source_relative).as_posix()
+        ):
+            raise MigrationError("existing bundle has an invalid portable mapping")
         destination = bundle_payload_path(output, relative)
         expected_size = entry.get("bytes")
         expected_sha256 = entry.get("sha256")
@@ -360,6 +369,90 @@ def verify_existing_bundle(output: Path, manifest: dict) -> None:
         actual_files.add(relative)
     if actual_files != expected_files:
         raise MigrationError("existing bundle contains missing or unexpected files")
+
+
+def validate_import_root(root: Path) -> None:
+    """Require an import destination to have no symlinked path component."""
+
+    absolute = root.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.relative_to(absolute.anchor).parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise MigrationError(f"import destination is unreadable: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise MigrationError(f"import destination must not contain a symlink: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise MigrationError(f"import destination path is not a directory: {current}")
+
+
+def import_bundle(bundle: Path, destinations: dict[str, Path]) -> dict:
+    """Import one admitted portable bundle into explicit guest-owned roots.
+
+    Existing byte-identical files are retained, making a second import a true
+    no-op. Conflicting files fail closed instead of silently replacing guest
+    state. Each new file is copied to a private temporary sibling and then
+    atomically published.
+    """
+
+    validate_output_parent(bundle)
+    manifest = manifest_for(bundle)
+    verify_existing_bundle(bundle, manifest)
+    required = {entry["category"] for entry in manifest["entries"] if entry["status"] == "imported"}
+    missing = sorted(required - destinations.keys())
+    if missing:
+        raise MigrationError(f"missing import destinations: {', '.join(missing)}")
+    for category, root in destinations.items():
+        if category not in {"bookmarks", "history", "sessions", "downloads", "policies", "extensions"}:
+            raise MigrationError(f"unknown import destination category: {category}")
+        validate_import_root(root)
+
+    imported = retained = 0
+    for entry in manifest["entries"]:
+        if entry["status"] != "imported":
+            continue
+        category = entry["category"]
+        source_relative = entry["path"]
+        if denied(source_relative) is not None:
+            raise MigrationError("bundle attempts to import a credential-bearing path")
+        relative = PurePosixPath(source_relative)
+        if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+            raise MigrationError("bundle has an unsafe import destination")
+        root = destinations[category]
+        destination = root.joinpath(*relative.parts)
+        source = bundle_payload_path(bundle, entry["output"])
+        source_size, source_sha256, source_identity = source_snapshot(source)
+        if source_size != entry["bytes"] or source_sha256 != entry["sha256"]:
+            raise MigrationError("bundle payload changed before import")
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_file():
+                raise MigrationError(f"import destination is unsafe: {destination}")
+            size, digest, _identity = source_snapshot(destination)
+            if size != source_size or digest != source_sha256:
+                raise MigrationError(f"import destination conflicts with bundle: {destination}")
+            retained += 1
+            continue
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        validate_import_root(destination.parent)
+        descriptor, temporary_raw = tempfile.mkstemp(prefix=f".{destination.name}.import-", dir=destination.parent)
+        os.close(descriptor)
+        temporary = Path(temporary_raw)
+        temporary.unlink()
+        try:
+            copy_verified(source, temporary, source_size, source_sha256, source_identity)
+            os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+            if destination.exists() or destination.is_symlink():
+                raise MigrationError(f"import destination appeared during import: {destination}")
+            os.link(temporary, destination)
+            temporary.unlink()
+        finally:
+            temporary.unlink(missing_ok=True)
+        imported += 1
+    return {"imported": imported, "retained": retained, "failed": 0}
 
 
 def directory_identity(path: Path) -> tuple[int, int]:
@@ -708,6 +801,29 @@ def self_test() -> None:
             encoding="utf-8"
         ) == '{"roots":{"new":{}}}\n'
 
+        guest = Path(raw) / "guest"
+        destinations = {
+            "bookmarks": guest / "profile",
+            "history": guest / "profile",
+            "sessions": guest / "profile",
+            "extensions": guest / "profile",
+            "downloads": guest / "downloads",
+            "policies": guest / "policies",
+        }
+        imported = import_bundle(output, destinations)
+        assert imported == {"imported": 6, "retained": 0, "failed": 0}
+        repeated = import_bundle(output, destinations)
+        assert repeated == {"imported": 0, "retained": 6, "failed": 0}
+        assert (guest / "profile" / "Bookmarks").read_text(encoding="utf-8") == '{"roots":{"new":{}}}\n'
+        assert (guest / "downloads" / "report.pdf").read_bytes() == b"download"
+        (guest / "profile" / "History").write_bytes(b"conflicting-history")
+        try:
+            import_bundle(output, destinations)
+        except MigrationError as error:
+            assert "conflicts with bundle" in str(error)
+        else:
+            raise AssertionError("portable import replaced conflicting guest state")
+
         overflow = Path(raw) / "overflow"
         overflow.mkdir()
         for index in range(MAX_FILES + 1):
@@ -728,10 +844,33 @@ def main() -> int:
     parser.add_argument("--downloads", type=Path)
     parser.add_argument("--policies", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--import-bundle", type=Path, help="verified portable bundle to import")
+    parser.add_argument("--profile-destination", type=Path)
+    parser.add_argument("--downloads-destination", type=Path)
+    parser.add_argument("--policies-destination", type=Path)
     parser.add_argument("--replace", action="store_true", help="replace an existing reviewed bundle")
     args = parser.parse_args()
     if args.self_test:
         self_test()
+        return 0
+    if args.import_bundle is not None:
+        if args.source is not None or args.output is not None or args.replace:
+            parser.error("--import-bundle cannot be combined with export options")
+        if args.profile_destination is None:
+            parser.error("--profile-destination is required with --import-bundle")
+        destinations = {
+            category: args.profile_destination
+            for category in ("bookmarks", "history", "sessions", "extensions")
+        }
+        if args.downloads_destination is not None:
+            destinations["downloads"] = args.downloads_destination
+        if args.policies_destination is not None:
+            destinations["policies"] = args.policies_destination
+        try:
+            counts = import_bundle(args.import_bundle, destinations)
+        except MigrationError as error:
+            parser.exit(1, f"migrate-browser-profile: {error}\n")
+        print(json.dumps({"kind": "browser_vm_portable_import", "counts": counts}, sort_keys=True))
         return 0
     if args.source is None or args.output is None:
         parser.error("--source and --output are required unless --self-test is used")
