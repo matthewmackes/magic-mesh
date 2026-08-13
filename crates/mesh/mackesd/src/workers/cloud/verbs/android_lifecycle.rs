@@ -119,20 +119,37 @@ fn publish_workload_operation(
     source: &Request,
 ) -> Result<mackes_mesh_types::cloud::WorkloadSpec, String> {
     let now = now_ms();
-    let catalog = crate::workers::android_catalog::load_admitted_catalog(&worker.host, now)
-        .map_err(|error| {
-            format!(
-                "Android workload `{}` is quarantined: current signed release provenance is unavailable: {error}",
-                source.workload_id
-            )
-        })?;
-    publish_workload_operation_against_catalog(worker, source, &catalog, now)
+    let catalog = if source.operation == Operation::Start {
+        Some(
+            crate::workers::android_catalog::load_admitted_catalog(&worker.host, now).map_err(
+                |error| {
+                    format!(
+                        "Android workload `{}` is quarantined: current signed release provenance is unavailable: {error}",
+                        source.workload_id
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    publish_workload_operation_with_catalog(worker, source, catalog.as_ref(), now)
 }
 
+#[cfg(test)]
 fn publish_workload_operation_against_catalog(
     worker: &CloudWorker,
     source: &Request,
     catalog: &AndroidSignedCatalog,
+    now: u64,
+) -> Result<mackes_mesh_types::cloud::WorkloadSpec, String> {
+    publish_workload_operation_with_catalog(worker, source, Some(catalog), now)
+}
+
+fn publish_workload_operation_with_catalog(
+    worker: &CloudWorker,
+    source: &Request,
+    catalog: Option<&AndroidSignedCatalog>,
     now: u64,
 ) -> Result<mackes_mesh_types::cloud::WorkloadSpec, String> {
     if source.node != worker.host {
@@ -150,43 +167,45 @@ fn publish_workload_operation_against_catalog(
     let bus_root = worker
         .bus_root()
         .ok_or_else(|| "Android Workload Bus is unavailable; lifecycle failed closed".to_owned())?;
-    let spec = reconcile::read_desired_doc_strict(
-        &worker.state_root,
-        &source.node,
-        &source.workload_id,
-    )
-    .map_err(|error| format!("read Android Workload declaration: {error}"))?
-    .ok_or_else(|| {
-        format!(
-            "Android workload `{}` has no admitted desired-state declaration",
-            source.workload_id
-        )
-    })?;
+    let spec =
+        reconcile::read_desired_doc_strict(&worker.state_root, &source.node, &source.workload_id)
+            .map_err(|error| format!("read Android Workload declaration: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "Android workload `{}` has no admitted desired-state declaration",
+                    source.workload_id
+                )
+            })?;
     if spec.delivery_type != DeliveryType::AndroidVm {
         return Err(format!(
             "workload `{}` is not an admitted Android VM declaration",
             source.workload_id
         ));
     }
-    let image = &catalog.payload.image_manifest;
-    let package_manifest = super::super::load_android_package_manifest(
-        &worker.state_root,
-        &source.workload_id,
-    )
-    .ok_or_else(|| {
-        format!(
-            "Android workload `{}` is quarantined: its admitted package provenance is missing or invalid",
-            source.workload_id
+    if source.operation == Operation::Start {
+        let catalog = catalog.ok_or_else(|| {
+            "Android Start requires current signed release provenance; nothing changed".to_owned()
+        })?;
+        let image = &catalog.payload.image_manifest;
+        let package_manifest = super::super::load_android_package_manifest(
+            &worker.state_root,
+            &source.workload_id,
         )
-    })?;
-    if spec.image.as_deref() != Some(image.image_id.as_str())
-        || spec.image_digest.as_deref() != Some(image.image_digest.as_str())
-        || package_manifest != catalog.payload.package_manifest
-    {
-        return Err(format!(
-            "Android workload `{}` is quarantined: desired image/package provenance does not match the current signed release catalog",
-            source.workload_id
-        ));
+        .ok_or_else(|| {
+            format!(
+                "Android workload `{}` is quarantined: its admitted package provenance is missing or invalid",
+                source.workload_id
+            )
+        })?;
+        if spec.image.as_deref() != Some(image.image_id.as_str())
+            || spec.image_digest.as_deref() != Some(image.image_digest.as_str())
+            || package_manifest != catalog.payload.package_manifest
+        {
+            return Err(format!(
+                "Android workload `{}` is quarantined: desired image/package provenance does not match the current signed release catalog",
+                source.workload_id
+            ));
+        }
     }
 
     // The already-verified Cloud capability carries the stable operation
@@ -251,10 +270,9 @@ fn publish_workload_operation_against_catalog(
     };
     token.signature = worker.signer.sign_payload(&token.signing_payload());
     operation.armed_token = Some(token.encode());
-    let body = serde_json::to_string(&operation)
-        .map_err(|error| {
-            format!("encode armed Android Workload {action_label} handoff: {error}")
-        })?;
+    let body = serde_json::to_string(&operation).map_err(|error| {
+        format!("encode armed Android Workload {action_label} handoff: {error}")
+    })?;
     Persist::open(bus_root.clone())
         .map_err(|error| format!("open Android Workload Bus {}: {error}", bus_root.display()))?
         .write(
@@ -318,8 +336,7 @@ mod tests {
                 .map(|app| {
                     AndroidImagePackage::for_app(
                         app,
-                        AndroidPackageVersion::new("2026.08.11", 1)
-                            .expect("package version"),
+                        AndroidPackageVersion::new("2026.08.11", 1).expect("package version"),
                     )
                 })
                 .collect(),
@@ -408,13 +425,9 @@ mod tests {
         // A daemon restart must not turn a pre-provenance desired row into a
         // recoverable-ready workload or publish any backend effect.
         let legacy_request = parse(&body("android-cloud-legacy")).expect("legacy Start request");
-        let refusal = publish_workload_operation_against_catalog(
-            &worker,
-            &legacy_request,
-            &catalog,
-            now,
-        )
-        .expect_err("legacy desired row must remain quarantined after restart");
+        let refusal =
+            publish_workload_operation_against_catalog(&worker, &legacy_request, &catalog, now)
+                .expect_err("legacy desired row must remain quarantined after restart");
         assert!(
             refusal.contains("quarantined"),
             "unexpected refusal: {refusal}"
@@ -558,23 +571,19 @@ mod tests {
                 && error.contains("nothing changed")
         }));
 
-        let cross_workload = parse(&body("android-two", "stop", "android-stop-cross"))
-            .expect("cross-workload Stop");
-        let refusal = publish_workload_operation_against_catalog(
-            &worker,
-            &cross_workload,
-            &catalog,
-            now,
-        )
-        .expect_err("another workload must not be inferred or retargeted");
+        let cross_workload =
+            parse(&body("android-two", "stop", "android-stop-cross")).expect("cross-workload Stop");
+        let refusal =
+            publish_workload_operation_against_catalog(&worker, &cross_workload, &catalog, now)
+                .expect_err("another workload must not be inferred or retargeted");
         assert!(refusal.contains("has no admitted desired-state declaration"));
 
-        let first_request = parse(&body("android-one", "stop", "android-stop-a"))
-            .expect("first Stop request");
+        let first_request =
+            parse(&body("android-one", "stop", "android-stop-a")).expect("first Stop request");
         publish_workload_operation_against_catalog(&worker, &first_request, &catalog, now)
             .expect("first typed Stop handoff");
-        let replay_request = parse(&body("android-one", "stop", "android-stop-b"))
-            .expect("replayed Stop request");
+        let replay_request =
+            parse(&body("android-one", "stop", "android-stop-b")).expect("replayed Stop request");
         publish_workload_operation_against_catalog(&worker, &replay_request, &catalog, now)
             .expect("idempotent typed Stop handoff");
 
@@ -611,6 +620,76 @@ mod tests {
         first.armed_token = None;
         replay.armed_token = None;
         assert_eq!(first, replay, "only the delivery capability may rotate");
+    }
+
+    #[test]
+    fn stop_remains_available_when_release_catalog_is_unavailable() {
+        let state = tempfile::tempdir().expect("temporary state root");
+        let bus = tempfile::tempdir().expect("temporary Bus root");
+        let signer = Arc::new(HmacTokenSigner::new(
+            b"android-cleanup-without-catalog-test-key".to_vec(),
+        ));
+        let now = now_ms();
+        let catalog = current_catalog(now);
+        let current = super::super::android::android_spec_from_manifest(
+            "node-a",
+            "android-one",
+            catalog.payload.image_manifest,
+        )
+        .expect("current Android declaration");
+        reconcile::write_desired_doc(state.path(), &current).expect("Android declaration");
+        let worker = CloudWorker::new(
+            "node-a".into(),
+            "peer:node-a".into(),
+            state.path().to_path_buf(),
+        )
+        .with_bus_root(Some(bus.path().to_path_buf()))
+        .with_signer(signer.clone());
+
+        let mut document = serde_json::json!({
+            "schema_version": 1,
+            "node": "node-a",
+            "workload_id": "android-one",
+            "request_id": "android-cleanup-1",
+            "expected_generation": 73,
+            "operation": "stop",
+            "app": null,
+            "armed_token": null,
+            "typed_name": null
+        });
+        let unsigned = document.to_string();
+        let digest = cloud_request_digest(&unsigned).expect("Cloud request digest");
+        let token = CloudArmedToken::mint(
+            signer.as_ref(),
+            "android-cleanup-without-catalog",
+            i64::try_from(now).unwrap() + 20_000,
+            "android-lifecycle",
+            "node-a",
+            "android-one",
+            &digest,
+        );
+        document["armed_token"] = serde_json::Value::String(token.encode());
+        let request = parse(&document.to_string()).expect("generation-bound Stop request");
+
+        // No signed catalog or package-manifest state is installed. Cleanup
+        // must still reach the sole Workloads actuator for the exact admitted
+        // Android desired row; requiring launch provenance here would strand a
+        // running outer VM precisely when the provider/catalog has failed.
+        publish_workload_operation(&worker, &request)
+            .expect("cleanup remains available without release catalog state");
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        let messages = persist
+            .list_since(WORKLOAD_OPERATION_TOPIC, None)
+            .expect("read Workload operations");
+        assert_eq!(messages.len(), 1);
+        let body = messages[0].body.as_deref().expect("Stop body");
+        let operation = WorkloadOperationRequest::from_json(body, now_ms())
+            .expect("typed Workload Stop request");
+        assert_eq!(operation.action, WorkloadOperationAction::Stop);
+        assert_eq!(operation.workload_id.as_str(), "android-one");
+        assert_eq!(operation.expected_generation, 73);
+        assert_eq!(operation.target_node, "peer:node-a");
     }
 
     #[test]
