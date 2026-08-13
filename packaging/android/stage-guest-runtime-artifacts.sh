@@ -81,13 +81,16 @@ export CARGO_TARGET_DIR=$source_tree/target
 target_dir=$CARGO_TARGET_DIR
 relay_source=$target_dir/$TARGET/release/$RELAY
 agent_source=$target_dir/$TARGET/release/$AGENT
-verify_elf "$relay_source" "$RELAY" "$revision"
-verify_elf "$agent_source" "$AGENT" "$revision"
 
 work=$(mktemp -d -- "$parent/.cuttlefish-guest-stage.XXXXXX")
 trap 'rm -rf -- "$source_tree" "$work"' EXIT
 install -m 0555 -- "$relay_source" "$work/$RELAY"
 install -m 0555 -- "$agent_source" "$work/$AGENT"
+# Cargo may hard-link a top-level release binary to its internal artifact.
+# Admission begins only after `install` creates private, single-link candidate
+# inodes; no compiler-target alias can retain mutation authority over them.
+verify_elf "$work/$RELAY" "$RELAY" "$revision"
+verify_elf "$work/$AGENT" "$AGENT" "$revision"
 version=$(cd "$source_tree" && cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="mcnf-cuttlefish-guest"))')
 rustc_identity=$(rustc -Vv | tr '\n' ';' | sed 's/;$/\n/')
 python3 - "$work" "$revision" "$version" "$rustc_identity" "$RELAY" "$AGENT" <<'PY'
