@@ -834,6 +834,120 @@ const BANNER_BUTTON_W: f32 = Style::SP_XL * 2.6;
 /// Reserved width for countdown and backlog metadata.
 const BANNER_META_W: f32 = Style::SP_XL * 3.25;
 
+/// The six governed KIRON health scenes carried by the typed shell bridge.
+///
+/// This is presentation-only: health authority remains in UX-013 and the
+/// [`ToastHost`] queue remains grade-agnostic. The exact marker is intentionally
+/// required so an ordinary producer cannot opt into cinematic health chrome by
+/// putting a stray grade letter in its flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KironGradeScene {
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+}
+
+impl KironGradeScene {
+    const MARKER: &'static str = "HEALTH · GRADE ";
+
+    fn from_flag(flag: &str) -> Option<Self> {
+        let grade = flag.strip_prefix(Self::MARKER)?.chars().next()?;
+        match grade {
+            'A' => Some(Self::A),
+            'B' => Some(Self::B),
+            'C' => Some(Self::C),
+            'D' => Some(Self::D),
+            'E' => Some(Self::E),
+            'F' => Some(Self::F),
+            _ => None,
+        }
+    }
+
+    const fn letter(self) -> char {
+        match self {
+            Self::A => 'A',
+            Self::B => 'B',
+            Self::C => 'C',
+            Self::D => 'D',
+            Self::E => 'E',
+            Self::F => 'F',
+        }
+    }
+
+    /// A distinct bar count makes every static scene identifiable even when a
+    /// monochrome capture or colour-vision deficiency removes the palette cue.
+    const fn motif_count(self) -> usize {
+        match self {
+            Self::A => 1,
+            Self::B => 2,
+            Self::C => 3,
+            Self::D => 4,
+            Self::E => 5,
+            Self::F => 6,
+        }
+    }
+
+    const fn color(self) -> Color32 {
+        match self {
+            Self::A => Style::GRADE_A,
+            Self::B => Style::GRADE_B,
+            Self::C => Style::GRADE_C,
+            Self::D => Style::GRADE_D,
+            // UX-013's E is a critical multi-warning state. Use the shared
+            // critical support colour, leaving F on the canonical danger rung.
+            Self::E => Style::SUPPORT_ERROR,
+            Self::F => Style::GRADE_F,
+        }
+    }
+}
+
+/// Paint the deterministic static tier for one grade-specific health scene.
+///
+/// The richer live/pre-rendered tiers can replace this field later without
+/// changing queue, text, controls, or semantics. This tier deliberately uses
+/// only egui primitives and shared Style colours, so device-loss fallback can
+/// always retain a truthful A-F identity.
+fn paint_kiron_grade_scene(
+    painter: &egui::Painter,
+    card: Rect,
+    scene: KironGradeScene,
+    alpha: f32,
+) {
+    let color = scene.color();
+    let field = Rect::from_min_max(
+        card.min,
+        pos2(
+            (card.left() + BANNER_GLYPH_PLATE * 3.0).min(card.right()),
+            card.bottom(),
+        ),
+    );
+    painter.rect_filled(field, Style::RADIUS_L, color.gamma_multiply(0.10 * alpha));
+
+    let rail_h = 2.0;
+    let rail_gap = Style::SP_XS;
+    for index in 0..scene.motif_count() {
+        let inset = Style::SP_S + index as f32 * rail_gap;
+        let rail = Rect::from_min_max(
+            pos2(field.left() + inset, field.bottom() - Style::SP_S - rail_h),
+            pos2(field.right() - Style::SP_S, field.bottom() - Style::SP_S),
+        );
+        if rail.is_positive() {
+            painter.rect_filled(rail, rail_h * 0.5, color.gamma_multiply(alpha));
+        }
+    }
+
+    painter.text(
+        pos2(field.right() - Style::SP_S, field.top() + Style::SP_XS),
+        Align2::RIGHT_TOP,
+        scene.letter(),
+        Style::typography_font_with_size(TypographyRole::Display, Style::TYPE_TITLE1),
+        color.gamma_multiply(0.28 * alpha),
+    );
+}
+
 /// The AI-generated deployment alert is intentionally compact: a readable
 /// desktop modal, not a full-screen takeover or an unconstrained message panel.
 const AI_ALERT_MAX_W: f32 = 680.0;
@@ -969,6 +1083,10 @@ fn paint_banner(
         egui::Stroke::new(1.0, Style::BORDER.gamma_multiply(alpha)),
         egui::StrokeKind::Inside,
     );
+
+    if let Some(scene) = KironGradeScene::from_flag(&toast.flag) {
+        paint_kiron_grade_scene(&painter, card, scene, alpha);
+    }
 
     // Left: the Carbon severity glyph on a severity-tinted plate.
     let plate = Rect::from_center_size(
@@ -2071,6 +2189,29 @@ mod tests {
                 severity.glyph_name(),
             );
         }
+    }
+
+    #[test]
+    fn governed_health_flags_select_six_distinct_static_grade_scenes() {
+        let expected = [
+            ('A', KironGradeScene::A),
+            ('B', KironGradeScene::B),
+            ('C', KironGradeScene::C),
+            ('D', KironGradeScene::D),
+            ('E', KironGradeScene::E),
+            ('F', KironGradeScene::F),
+        ];
+
+        for (index, (letter, scene)) in expected.into_iter().enumerate() {
+            let flag = format!("HEALTH · GRADE {letter} · 10s · nvme0n1");
+            assert_eq!(KironGradeScene::from_flag(&flag), Some(scene));
+            assert_eq!(scene.letter(), letter);
+            assert_eq!(scene.motif_count(), index + 1);
+        }
+
+        assert_eq!(KironGradeScene::from_flag("SYSTEM · GRADE F"), None);
+        assert_eq!(KironGradeScene::from_flag("HEALTH · GRADE G"), None);
+        assert_eq!(KironGradeScene::from_flag("health · grade F"), None);
     }
 
     #[test]
