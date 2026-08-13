@@ -3,7 +3,7 @@ use crate::auth::{Credential, DesktopAuth};
 use mackes_mesh_types::workloads::{
     workload_state_topic, WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId,
     WorkloadOperationAction, WorkloadOperationPhase, WorkloadOperationStatus, WorkloadPowerState,
-    WorkloadProfile, WorkloadReadiness, WorkloadRuntimeSignals, WorkloadStateSnapshot,
+    WorkloadReadiness, WorkloadRuntimeSignals, WorkloadStateSnapshot,
     WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
@@ -56,8 +56,12 @@ fn write_browser_workload_status_with_attachment(
             request_id: "browser-existing".to_owned(),
             workload_id: WorkloadId::new("browser-vm").expect("browser workload id"),
             backend: WorkloadBackend::LibvirtVirtqemud,
-            resources: WorkloadProfile::Standard.resources(),
-            image_ref: Some("browser:1.0".to_owned()),
+            resources: mackes_mesh_types::workloads::WorkloadResources {
+                vcpu: 3,
+                memory_mb: 8_192,
+                disk_gb: 64,
+            },
+            image_ref: Some("browser-vm-chromium".to_owned()),
             generation: 7,
             phase: WorkloadOperationPhase::Completed,
             power: WorkloadPowerState::Running,
@@ -137,6 +141,79 @@ fn browser_rdp_alternate_requires_exact_live_workloads_lease_and_revokes_on_repl
         "a generation-substituted lease must revoke the installed transport"
     );
     assert!(state.browser_transport_authority.is_none());
+}
+
+#[test]
+fn browser_rdp_alternate_refuses_substituted_guest_profile_and_unadvertised_target() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let target = crate::web::BrowserVmTarget {
+        serving_peer: "dell".into(),
+        workload: "browser-vm".into(),
+        status: "active".into(),
+        reachable: true,
+    };
+    let mut status = WorkloadOperationStatus {
+        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        request_id: "browser-profile-authority".into(),
+        workload_id: WorkloadId::new("browser-vm").expect("workload id"),
+        backend: WorkloadBackend::LibvirtVirtqemud,
+        resources: mackes_mesh_types::workloads::WorkloadResources {
+            vcpu: 3,
+            memory_mb: 8_192,
+            disk_gb: 64,
+        },
+        image_ref: Some("browser-vm-chromium".into()),
+        generation: 9,
+        phase: WorkloadOperationPhase::Completed,
+        power: WorkloadPowerState::Running,
+        readiness: WorkloadReadiness::Ready,
+        signals: WorkloadRuntimeSignals::default(),
+        retryable: false,
+        attempt: 0,
+        next_retry_at_ms: 0,
+        reason: None,
+        remediation: None,
+        attachment: Some(mackes_mesh_types::workloads::WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "browser-rdp-profile-9".into(),
+            nonce: "browser-rdp-profile-nonce-9".into(),
+            workload_id: WorkloadId::new("browser-vm").expect("workload id"),
+            generation: 9,
+            protocol: WorkloadAttachmentProtocol::Rdp,
+            expires_at_ms: now_ms + 10_000,
+        }),
+    };
+
+    assert!(super::browser_transport::BrowserTransportAuthority::admit(
+        &target, "seat-170", &status, now_ms
+    )
+    .is_ok());
+
+    status.image_ref = Some("app-vm-wayland-standard".into());
+    assert!(super::browser_transport::BrowserTransportAuthority::admit(
+        &target, "seat-170", &status, now_ms
+    )
+    .is_err());
+    status.image_ref = Some("browser-vm-chromium".into());
+    status.resources.vcpu = 4;
+    assert!(super::browser_transport::BrowserTransportAuthority::admit(
+        &target, "seat-170", &status, now_ms
+    )
+    .is_err());
+
+    status.resources.vcpu = 3;
+    let mut unavailable = target;
+    unavailable.reachable = false;
+    assert!(super::browser_transport::BrowserTransportAuthority::admit(
+        &unavailable,
+        "seat-170",
+        &status,
+        now_ms
+    )
+    .is_err());
 }
 
 fn governed_android_handoff(now_ms: u64) -> crate::iac::AndroidVdiHandoff {
@@ -1505,8 +1582,10 @@ fn browser_activation_publishes_only_a_native_display1_workload_attachment() {
     );
     assert_eq!(request.target_node, "dell");
     assert_eq!(request.expected_generation, 7);
-    assert_eq!(request.resources, WorkloadProfile::Standard.resources());
-    assert_eq!(request.image_ref.as_deref(), Some("browser:1.0"));
+    assert_eq!(request.resources.vcpu, 3);
+    assert_eq!(request.resources.memory_mb, 8_192);
+    assert_eq!(request.resources.disk_gb, 64);
+    assert_eq!(request.image_ref.as_deref(), Some("browser-vm-chromium"));
     assert!(
         request.armed_token.is_some(),
         "request remains capability-bound"

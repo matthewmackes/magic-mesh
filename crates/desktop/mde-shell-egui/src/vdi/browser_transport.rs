@@ -18,6 +18,10 @@ use super::{
 use crate::auth::DesktopAuth;
 
 const BROWSER_WORKLOAD: &str = "browser-vm";
+const BROWSER_IMAGE: &str = "browser-vm-chromium";
+const BROWSER_VCPU: u16 = 3;
+const BROWSER_MEMORY_MB: u32 = 8_192;
+const BROWSER_DISK_GB: u32 = 64;
 const RDP_PORT: u16 = 3389;
 
 /// Exact authority retained while an RDP Browser presentation is installed.
@@ -42,6 +46,11 @@ impl BrowserTransportAuthority {
         now_ms: u64,
     ) -> Result<Self, &'static str> {
         if target.workload != BROWSER_WORKLOAD
+            || !target.reachable
+            || !matches!(
+                target.status.trim().to_ascii_lowercase().as_str(),
+                "active" | "running"
+            )
             || status.workload_id.as_str() != BROWSER_WORKLOAD
             || status.backend != WorkloadBackend::LibvirtVirtqemud
             || status.phase != WorkloadOperationPhase::Completed
@@ -49,6 +58,13 @@ impl BrowserTransportAuthority {
             || status.readiness != WorkloadReadiness::Ready
         {
             return Err("Browser workload is not ready for an RDP attachment");
+        }
+        if status.image_ref.as_deref() != Some(BROWSER_IMAGE)
+            || status.resources.vcpu != BROWSER_VCPU
+            || status.resources.memory_mb != BROWSER_MEMORY_MB
+            || status.resources.disk_gb != BROWSER_DISK_GB
+        {
+            return Err("Browser workload does not match the governed guest profile");
         }
         let lease = status
             .attachment
