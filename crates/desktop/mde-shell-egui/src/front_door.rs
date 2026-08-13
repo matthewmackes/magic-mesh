@@ -1697,12 +1697,14 @@ pub(crate) fn front_door_panel_with_sources(
                     state.selected = 0;
                 }
 
-                let (escape, enter, up, down) = ui.input(|i| {
+                let (escape, enter, up, down, home, end) = ui.input(|i| {
                     (
                         i.key_pressed(egui::Key::Escape),
                         i.key_pressed(egui::Key::Enter),
                         i.key_pressed(egui::Key::ArrowUp),
                         i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::Home),
+                        i.key_pressed(egui::Key::End),
                     )
                 });
                 if escape {
@@ -1716,6 +1718,16 @@ pub(crate) fn front_door_panel_with_sources(
                         )));
                     }
                 } else if !hits.is_empty() {
+                    if home {
+                        state.selected = 0;
+                        state.lifecycle_arm = None;
+                        state.service_lifecycle_arm = None;
+                    }
+                    if end {
+                        state.selected = hits.len() - 1;
+                        state.lifecycle_arm = None;
+                        state.service_lifecycle_arm = None;
+                    }
                     if down {
                         state.selected = (state.selected + 1) % hits.len();
                         state.lifecycle_arm = None;
@@ -6140,6 +6152,59 @@ mod tests {
             "ArrowDown + Enter must activate the second ranked hit"
         );
         assert!(!state.is_open(), "activation closes the Spotlight card");
+    }
+
+    #[test]
+    fn front_door_keyboard_home_and_end_activate_result_boundaries() {
+        // Search-first Home must remain efficient with a full launcher catalog:
+        // Home/End select the visible result boundaries through the production
+        // focused TextEdit path, and Enter activates that exact boundary row.
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 640.0),
+            )),
+            events,
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let run = |state: &mut FrontDoorState, events: Vec<egui::Event>| {
+            let mut out = None;
+            let _ = ctx.run(input(events), |ctx| {
+                out = front_door_panel(ctx, state, fixture_front_door_items());
+            });
+            out
+        };
+
+        let hits = visible_front_door_hits("browser", fixture_front_door_items());
+        assert!(hits.len() > 2, "fixture must exercise a real result range");
+
+        let mut state = FrontDoorState::default();
+        state.open();
+        let _ = run(&mut state, Vec::new());
+        let _ = run(&mut state, vec![egui::Event::Text("browser".to_owned())]);
+        let last = run(&mut state, vec![key(egui::Key::End), key(egui::Key::Enter)]);
+        assert_eq!(
+            last,
+            Some(activation_request_for_hit(hits.last().unwrap())),
+            "End + Enter must activate the final visible search result"
+        );
+
+        state.open();
+        let _ = run(&mut state, Vec::new());
+        let _ = run(&mut state, vec![egui::Event::Text("browser".to_owned())]);
+        let _ = run(&mut state, vec![key(egui::Key::ArrowDown)]);
+        let first = run(
+            &mut state,
+            vec![key(egui::Key::Home), key(egui::Key::Enter)],
+        );
+        assert_eq!(
+            first,
+            Some(activation_request_for_hit(&hits[0])),
+            "Home + Enter must return to and activate the first visible result"
+        );
     }
 
     #[test]
