@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::fonts::{FontSelection, PlatformFont};
@@ -75,6 +75,10 @@ const SETTINGS_TOOLTIP_W: f32 = 260.0;
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
 /// this window.
 const REFRESH: Duration = Duration::from_secs(5);
+/// Bluetooth mutations are authorized only while the retained seat snapshot is
+/// demonstrably live. Three missed pump publications preserve enough tolerance
+/// for a slow probe without leaving old BlueZ object paths actionable forever.
+const BLUETOOTH_STALE_AFTER: Duration = Duration::from_secs(15);
 
 /// The world-readable mesh-status snapshot the SETTINGS-4 Mesh & System sections
 /// fold — the SAME source the chrome bar + the This Node / Network planes already
@@ -294,6 +298,10 @@ pub(crate) struct SystemState {
     /// The latest snapshot, drained from the off-thread [`pump`](Self::pump). `None`
     /// until the pump publishes its first one (within a frame of spawn).
     snapshot: Option<SeatSnapshot>,
+    /// Monotonic receipt time for the retained seat snapshot. Bluetooth object
+    /// paths are ephemeral provider authority, so their controls fail closed when
+    /// this receipt ages beyond [`BLUETOOTH_STALE_AFTER`].
+    snapshot_received_at: Option<Instant>,
     /// The background snapshot producer (perf-2): a dedicated thread over its own
     /// read-only seat that publishes the newest [`SeatSnapshot`] over a channel the
     /// render thread drains. Spawned lazily on the first [`poll`](Self::poll) (it
@@ -432,6 +440,7 @@ impl Default for SystemState {
             seat: Seat::new(),
             service: ZbusService::new(),
             snapshot: None,
+            snapshot_received_at: None,
             pump: None,
             layout: DisplayLayout::default(),
             layout_key: Vec::new(),
@@ -549,6 +558,23 @@ pub(crate) enum SysAction {
     PairingRetry,
 }
 
+impl SysAction {
+    const fn is_bluetooth_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::BtPower(..)
+                | Self::BtDiscoverable(..)
+                | Self::BtPairable(..)
+                | Self::BtScan(..)
+                | Self::BtConnect(..)
+                | Self::BtDisconnect(..)
+                | Self::BtPair(..)
+                | Self::BtForget { .. }
+                | Self::BtTrust(..)
+        )
+    }
+}
+
 impl SystemState {
     fn record_action_audit(&mut self, action: &'static str, succeeded: bool) {
         const MAX_RECORDS: usize = 32;
@@ -593,6 +619,7 @@ impl SystemState {
             // Workbench. Published on the shared cadence, not per-frame.
             self.mirror.publish(&snap);
             self.snapshot = Some(snap);
+            self.snapshot_received_at = Some(Instant::now());
             // Fold this node's mesh identity / role / network facts from the same
             // world-readable snapshot the chrome bar reads (SETTINGS-4, §6). A
             // missing / unreadable file folds to the honest unseen facts, never a
@@ -1771,6 +1798,7 @@ impl SystemState {
         // the mutable destructure (a Copy bool) so the Pairing section can surface
         // the responder's honest live state (SETTINGS-4).
         let agent_active = self.agent.is_some();
+        let bluetooth_actions_fresh = self.bluetooth_actions_fresh();
         {
             let Self {
                 snapshot,
@@ -1860,6 +1888,7 @@ impl SystemState {
                                 car_keys,
                                 agent_active,
                                 prompt_in_flight,
+                                bluetooth_actions_fresh,
                                 &mut actions,
                             );
                             // WL-SEC-002 — cross-mesh Federation lives under the same
@@ -1988,6 +2017,17 @@ impl SystemState {
     /// honest inline error (never a panic, never a silent no-op).
     fn apply(&mut self, actions: Vec<SysAction>) {
         for action in actions {
+            if action.is_bluetooth_mutation() && !self.bluetooth_actions_fresh() {
+                let detail = "Bluetooth controls unavailable: the seat snapshot is stale.";
+                self.error = Some(detail.to_owned());
+                self.pending_toasts.push(Toast::alert(
+                    Severity::Warning,
+                    String::new(),
+                    "BLUETOOTH",
+                    detail,
+                ));
+                continue;
+            }
             match action {
                 SysAction::ToggleOutput(id, on) => match self.layout.set_enabled(&id, on) {
                     Ok(()) => self.error = None,
@@ -2124,6 +2164,12 @@ impl SystemState {
                 SysAction::PairingRetry => self.retry_pairing_agent(),
             }
         }
+    }
+
+    /// Whether provider-issued BlueZ paths still carry mutation authority.
+    fn bluetooth_actions_fresh(&self) -> bool {
+        self.snapshot_received_at
+            .is_some_and(|received| received.elapsed() <= BLUETOOTH_STALE_AFTER)
     }
 
     /// Re-arm the pairing responder (SETTINGS-4 Pairing section): clear the
@@ -4621,6 +4667,7 @@ fn settings_detail(
     car_keys: &mut crate::car_keymap::CarKeyBindings,
     agent_active: bool,
     prompt_in_flight: bool,
+    bluetooth_actions_fresh: bool,
     actions: &mut Vec<SysAction>,
 ) {
     // The section title lives in the pane's shared AppFrame (Q27) — the body
@@ -4632,7 +4679,7 @@ fn settings_detail(
         }
         SettingsSection::Mouse => mouse_touch_section(ui, mouse_touch),
         SettingsSection::Audio => mixer_section(ui, snap, actions),
-        SettingsSection::Bluetooth => bluetooth_section(ui, snap, actions),
+        SettingsSection::Bluetooth => bluetooth_section(ui, snap, bluetooth_actions_fresh, actions),
         SettingsSection::Power => power_section(
             ui,
             snap,
@@ -5150,7 +5197,12 @@ fn bt_error_toast(verb: &str, e: &SeatError) -> Toast {
 /// discoverable / pairable / scan, and per-device connect / pair / trust / forget,
 /// each driving the real `BlueZ` backend through the one seat. `Absent` renders the
 /// shared honest not-available note.
-fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>, actions: &mut Vec<SysAction>) {
+fn bluetooth_section(
+    ui: &mut egui::Ui,
+    snap: Option<&SeatSnapshot>,
+    actions_fresh: bool,
+    actions: &mut Vec<SysAction>,
+) {
     probe_section(
         ui,
         snap,
@@ -5159,6 +5211,16 @@ fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>, actions: &m
             if bt.adapters.is_empty() {
                 muted_note(ui, "No Bluetooth adapter.");
                 return;
+            }
+            if !actions_fresh {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(
+                        "Bluetooth status is stale. Controls will return after a fresh seat update.",
+                    )
+                    .font(Style::typography_font(TypographyRole::Caption)),
+                );
+                ui.add_space(Style::SP_S);
             }
             // Devices hang off the first adapter (the RemoveDevice owner). A scan
             // annotates each device row with live RSSI.
@@ -5179,20 +5241,22 @@ fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>, actions: &m
                     device_row(ui, device, adapter_path, scanning, actions);
                 }
             };
-            if fit_columns(ui.available_width(), 2) == 2 {
-                ui.columns(2, |columns| {
-                    column_card(&mut columns[0], "Adapters", |ui| {
-                        render_adapters(ui, actions);
+            ui.add_enabled_ui(actions_fresh, |ui| {
+                if fit_columns(ui.available_width(), 2) == 2 {
+                    ui.columns(2, |columns| {
+                        column_card(&mut columns[0], "Adapters", |ui| {
+                            render_adapters(ui, actions);
+                        });
+                        column_card(&mut columns[1], "Devices", |ui| {
+                            render_devices(ui, actions);
+                        });
                     });
-                    column_card(&mut columns[1], "Devices", |ui| {
-                        render_devices(ui, actions);
-                    });
-                });
-            } else {
-                column_card(ui, "Adapters", |ui| render_adapters(ui, actions));
-                ui.add_space(Style::SP_S);
-                column_card(ui, "Devices", |ui| render_devices(ui, actions));
-            }
+                } else {
+                    column_card(ui, "Adapters", |ui| render_adapters(ui, actions));
+                    ui.add_space(Style::SP_S);
+                    column_card(ui, "Devices", |ui| render_devices(ui, actions));
+                }
+            });
         },
     );
 }

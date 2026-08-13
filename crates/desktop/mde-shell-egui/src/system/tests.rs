@@ -820,6 +820,7 @@ fn a_bluetooth_toggle_couples_the_cache_update_to_the_real_write() {
         devices: vec![],
     });
     st.snapshot = Some(snap);
+    st.snapshot_received_at = Some(std::time::Instant::now());
     st.apply(vec![SysAction::BtDiscoverable(
         "/org/bluez/hci0".to_owned(),
         true,
@@ -836,6 +837,44 @@ fn a_bluetooth_toggle_couples_the_cache_update_to_the_real_write() {
         !cached_on,
         "the cache update must track the write outcome"
     );
+}
+
+#[test]
+fn stale_bluetooth_snapshot_revokes_queued_mutation_authority() {
+    let mut st = SystemState::default();
+    let mut snap = Seat::new().snapshot();
+    snap.bluetooth = Probe::Present(BtStatus {
+        adapters: vec![BtAdapter {
+            path: "/org/bluez/hci0".to_owned(),
+            name: "retained".to_owned(),
+            powered: true,
+            discovering: false,
+            discoverable: false,
+            pairable: false,
+        }],
+        devices: vec![],
+    });
+    st.snapshot = Some(snap);
+    st.snapshot_received_at = Some(
+        std::time::Instant::now()
+            .checked_sub(BLUETOOTH_STALE_AFTER + Duration::from_secs(1))
+            .expect("representable stale receipt"),
+    );
+
+    st.apply(vec![SysAction::BtDiscoverable(
+        "/org/bluez/hci0".to_owned(),
+        true,
+    )]);
+
+    assert!(matches!(
+        st.snapshot.as_ref().map(|s| &s.bluetooth),
+        Some(Probe::Present(bt)) if !bt.adapters[0].discoverable
+    ));
+    assert!(st
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("stale")));
+    assert_eq!(st.take_toasts().len(), 1);
 }
 
 #[test]
