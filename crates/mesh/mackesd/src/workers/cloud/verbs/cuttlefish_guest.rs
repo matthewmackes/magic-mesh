@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::android_apps::{
@@ -25,6 +26,8 @@ use mackes_mesh_types::cuttlefish_guest::{
 use super::cuttlefish::CuttlefishProviderError;
 
 const GUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const GUEST_CONNECT_ATTEMPTS: usize = 2;
+const GUEST_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_GUEST_SOCKET_ROOT: &str = "/run/mackesd/cuttlefish-guest";
 const GUEST_SOCKET_ROOT_ENV: &str = "MDE_CUTTLEFISH_GUEST_SOCKET_DIR";
 
@@ -80,8 +83,7 @@ impl UnixCuttlefishGuestTransport {
             .validate()
             .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
         let socket = socket_path(&self.socket_root, request.target.vm_id.as_str())?;
-        let mut stream = UnixStream::connect(&socket)
-            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        let mut stream = connect_guest_relay(&socket)?;
         validate_connected_socket(&self.socket_root, &socket, &stream)?;
         stream
             .set_read_timeout(Some(GUEST_IO_TIMEOUT))
@@ -143,6 +145,23 @@ impl UnixCuttlefishGuestTransport {
         )
         .expect("validated provider inputs must form a guest request")
     }
+}
+
+/// Tolerate one relay restart race before any governed request bytes leave the
+/// process. Once a connection succeeds, all write/read failures are returned to
+/// the caller without an in-process replay: a launch may already have taken
+/// effect even when its acknowledgement was lost.
+fn connect_guest_relay(socket: &Path) -> Result<UnixStream, CuttlefishProviderError> {
+    for attempt in 0..GUEST_CONNECT_ATTEMPTS {
+        match UnixStream::connect(socket) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if attempt + 1 < GUEST_CONNECT_ATTEMPTS => {
+                thread::sleep(GUEST_CONNECT_RETRY_DELAY);
+            }
+            Err(_) => return Err(CuttlefishProviderError::ProviderUnavailable),
+        }
+    }
+    Err(CuttlefishProviderError::ProviderUnavailable)
 }
 
 /// Bind a connected relay to the protected runtime directory and the kernel's
@@ -315,6 +334,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
     use std::thread;
 
     use mackes_mesh_types::android_apps::{
@@ -592,5 +612,47 @@ mod tests {
             0,
             "an unauthenticated relay must receive no governed request bytes"
         );
+    }
+
+    #[test]
+    fn relay_restart_before_connect_gets_one_bounded_side_effect_free_retry() {
+        let temporary = tempfile::tempdir().expect("socket root");
+        let socket = temporary.path().join("android-one.sock");
+        let (start_tx, start_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            start_rx.recv().expect("start relay restart");
+            thread::sleep(GUEST_CONNECT_RETRY_DELAY / 2);
+            let listener = UnixListener::bind(&socket).expect("restarted guest listener");
+            let (mut stream, _) = listener.accept().expect("retried guest connection");
+            let request = read_request(&mut stream);
+            write_response(
+                &mut stream,
+                &GuestResponse {
+                    schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    target: request.target,
+                    catalog_digest: request.catalog_digest,
+                    generation: request.generation,
+                    inventory: Some(ready_inventory()),
+                    launch_outcome: None,
+                    vdi_source: Some(vdi_source()),
+                    cleanup_complete: false,
+                },
+            );
+        });
+
+        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
+        start_tx.send(()).expect("start relay restart");
+        let snapshot = transport
+            .observe(
+                "observe-restart-7",
+                &target(),
+                CATALOG_DIGEST,
+                &manifest(),
+                7,
+            )
+            .expect("bounded reconnect reaches restarted relay");
+        assert_eq!(snapshot.vdi_source.session_id, "session-7");
+        server.join().expect("guest server");
     }
 }
