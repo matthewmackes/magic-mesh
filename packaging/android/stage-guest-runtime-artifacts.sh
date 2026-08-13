@@ -14,15 +14,17 @@ fail() { echo "Cuttlefish guest artifact staging: $*" >&2; exit 2; }
 valid_revision() { [[ $1 =~ ^[0-9a-f]{40}$ ]]; }
 
 verify_elf() {
-    local file=$1 expected_name=$2 revision=$3 header machine kind marker identity
+    local file=$1 expected_name=$2 revision=$3 header machine kind identity
     [[ -f $file && ! -L $file && $(stat -c %h -- "$file") -eq 1 ]] || fail "$expected_name is not a single-link regular file"
     header=$(readelf -hW -- "$file") || fail "$expected_name is not ELF"
     machine=$(sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p' <<<"$header")
     kind=$(sed -n 's/^[[:space:]]*Type:[[:space:]]*\([^[:space:]]*\).*/\1/p' <<<"$header")
     [[ $machine == 'Advanced Micro Devices X86-64' && $kind =~ ^(DYN|EXEC)$ ]] || fail "$expected_name has the wrong ELF architecture or type"
     ! readelf -SW -- "$file" | grep -Eq '[[:space:]]\.debug(_|[[:space:]])' || fail "$expected_name retains debug sections instead of governed release stripping"
-    marker="MCNF_SOURCE_REVISION=$revision"
-    strings -a -- "$file" | grep -Fxq "$marker" || fail "$expected_name does not embed the exact source revision"
+    # The executable identity probe is the governed source-revision ABI. Do
+    # not infer provenance from an unreferenced string section: release linkers
+    # are allowed to garbage-collect such data while preserving executable
+    # behavior.
     identity=$($file --build-identity) || fail "$expected_name identity probe failed"
     [[ $identity == "$revision" ]] || fail "$expected_name reports a stale source revision"
 }
@@ -71,7 +73,7 @@ git -C "$ROOT" cat-file -e "$revision^{commit}" 2>/dev/null || fail "source revi
 parent=$(dirname -- "$output")
 [[ -d $parent && ! -L $parent ]] || fail "output parent is missing or substituted"
 
-for tool in cargo git readelf strings sha256sum python3; do command -v "$tool" >/dev/null || fail "required tool is unavailable: $tool"; done
+for tool in cargo git readelf sha256sum python3; do command -v "$tool" >/dev/null || fail "required tool is unavailable: $tool"; done
 source_tree=$(mktemp -d)
 trap 'rm -rf -- "$source_tree"' EXIT
 git -C "$ROOT" archive "$revision" | tar -x -C "$source_tree"
