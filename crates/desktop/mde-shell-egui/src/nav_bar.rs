@@ -195,15 +195,21 @@ fn surface_from_key(key: &str) -> Option<Surface> {
     // Persisted profiles can predate the canonical Workers entry. Decode old
     // keys explicitly, then canonicalize aliases,
     // so migration preserves those pins instead of silently dropping them.
+    // Settings are user-owned input: tolerate the harmless formatting drift
+    // produced by older exporters and hand-edited profiles, while keeping the
+    // finite key table below as the authority for what may be restored.
+    let key = key.trim().to_ascii_lowercase().replace('_', "-");
     PIN_CATALOG
         .into_iter()
         .find(|surface| surface_key(*surface) == key)
-        .or_else(|| match key {
-            "fleet-mesh" | "fleetmesh" => Some(Surface::FleetMesh),
+        .or_else(|| match key.as_str() {
+            // Historical node-management destinations collapse directly to
+            // the single Workers taskbar authority.
+            "fleet-mesh" | "fleetmesh" => Some(Surface::Workers),
             "workbench" => Some(Surface::Workbench),
             "mesh-view" => Some(Surface::MeshView),
             "explorer" => Some(Surface::Explorer),
-            "this-node" | "thisnode" => Some(Surface::ThisNode),
+            "this-node" | "thisnode" => Some(Surface::Workers),
             "phones" | "phone" => Some(Surface::Phones),
             "system" => Some(Surface::System),
             "storage" => Some(Surface::Storage),
@@ -3485,6 +3491,17 @@ mod tests {
         assert_eq!(
             decode_pinned_surfaces(&keys),
             vec![Surface::Browser, Surface::MapsLocation]
+        );
+
+        let migrated_keys = vec![
+            "  BROWSER ".to_owned(),
+            "MESH_TEAMS".to_owned(),
+            "Auto_Home".to_owned(),
+        ];
+        assert_eq!(
+            decode_pinned_surfaces(&migrated_keys),
+            vec![Surface::Browser, Surface::Communications],
+            "harmless key formatting must preserve canonical persisted pins"
         );
 
         let prefs = NavBarPrefs {
