@@ -1461,19 +1461,20 @@ fn merge_lifecycle(
                 && now_ms.saturating_sub(resolved_at_ms) <= HEALTH_HISTORY_RETENTION_MS
         })
     });
-    // Own the ids so the lifecycle pass can mutate `current` while it compares
-    // the previous active set. Borrowing `&str` here would keep an immutable
-    // borrow of the entire slice alive through `iter_mut()`.
-    let current_ids: BTreeSet<_> = current
+    // Own the provenance tuples so the lifecycle pass can mutate `current`
+    // while it compares the previous active set.
+    let current_identities: Vec<_> = current
         .iter()
-        .map(|condition| condition.id.clone())
+        .map(condition_lifecycle_identity)
         .collect();
     if let Some(previous) = previous {
         for condition in current.iter_mut() {
             if let Some(old) = previous
                 .active_conditions
                 .iter()
-                .find(|old| old.id == condition.id)
+                .find(|old| {
+                    condition_lifecycle_identity(old) == condition_lifecycle_identity(condition)
+                })
             {
                 condition.active_since_ms = old.active_since_ms;
                 condition.acknowledged_at_ms = old.acknowledged_at_ms;
@@ -1481,7 +1482,10 @@ fn merge_lifecycle(
             }
         }
         for old in &previous.active_conditions {
-            if !current_ids.contains(old.id.as_str()) {
+            if !current_identities
+                .iter()
+                .any(|identity| identity == &condition_lifecycle_identity(old))
+            {
                 let mut closed = old.clone();
                 closed.resolved_at_ms = Some(now_ms);
                 // The recovery sample proves that the condition is absent; it
@@ -1495,6 +1499,30 @@ fn merge_lifecycle(
     resolved.sort_by(|left, right| right.resolved_at_ms.cmp(&left.resolved_at_ms));
     resolved.truncate(128);
     resolved
+}
+
+/// A condition id is stable only within its complete authority provenance.
+/// Treating the display id alone as lifecycle identity would let a different
+/// provider/component inherit acknowledgement and snooze state, while erasing
+/// the prior incident from history.
+fn condition_lifecycle_identity(
+    condition: &HealthCondition,
+) -> (
+    String,
+    HealthScope,
+    HealthComponent,
+    String,
+    RequirementClass,
+    String,
+) {
+    (
+        condition.id.clone(),
+        condition.scope.clone(),
+        condition.component,
+        condition.source.clone(),
+        condition.requirement,
+        condition.evidence.provider.clone(),
+    )
 }
 
 fn emit_json<T: Serialize>(persist: &mut Persist, topic: &str, value: &T) -> Result<(), String> {
@@ -2882,6 +2910,67 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].last_observed_ms, 140);
         assert_eq!(resolved[0].evidence.observed_at_ms, 140);
+        assert_eq!(resolved[0].resolved_at_ms, Some(200));
+    }
+
+    #[test]
+    fn lifecycle_provenance_substitution_starts_new_incident_and_preserves_history() {
+        let sample = observations("workstation");
+        let mut prior = condition(
+            "node",
+            "shared-id",
+            HealthComponent::Resources,
+            "root-filesystem",
+            HealthSeverity::Warning,
+            "Original resource incident.",
+            100,
+            Vec::new(),
+        );
+        prior.acknowledged_at_ms = Some(110);
+        prior.snoozed_until_ms = Some(10_000);
+        prior.last_observed_ms = 140;
+        prior.evidence.observed_at_ms = 140;
+        let previous = NodeHealthState {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            publisher: "node".into(),
+            roster_revision: "r1".into(),
+            generation: 7,
+            published_at_ms: 150,
+            valid_until_ms: 270,
+            grade: NodeGrade::evaluate(
+                "node",
+                100,
+                factors("node", &sample, 150),
+                std::slice::from_ref(&prior),
+                150,
+            ),
+            active_conditions: vec![prior],
+            resolved_conditions: Vec::new(),
+        };
+        let mut replacement = condition(
+            "node",
+            "shared-id",
+            HealthComponent::System,
+            "service-supervisor",
+            HealthSeverity::Critical,
+            "Different provider incident.",
+            200,
+            Vec::new(),
+        );
+
+        let resolved = merge_lifecycle(
+            Some(&previous),
+            std::slice::from_mut(&mut replacement),
+            200,
+        );
+
+        assert_eq!(replacement.active_since_ms, 200);
+        assert_eq!(replacement.acknowledged_at_ms, None);
+        assert_eq!(replacement.snoozed_until_ms, None);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].component, HealthComponent::Resources);
+        assert_eq!(resolved[0].source, "root-filesystem");
+        assert_eq!(resolved[0].last_observed_ms, 140);
         assert_eq!(resolved[0].resolved_at_ms, Some(200));
     }
 
