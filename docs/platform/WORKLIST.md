@@ -426,7 +426,10 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
 - Required outcome: six supervised groups publish bounded snapshots; Surface::Workers owns worker tree/graph/inspector/Network Operations/Action Console; remove duplicate surfaces.
-- Current state: bounded starts and six groups ship; ownership, UI cutover, and fleet proof remain. Latest: `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
+- Current state: bounded starts and six groups ship; ownership and UI cutover
+  implementation remain. Fleet/package/live proof is explicitly post-release
+  acceptance and non-blocking for the coding drain. Latest:
+  `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console evidence (2026-08-08/09):** generation/digest gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census/aggregate (2026-08-09):** 160 starts fail closed without stable rows; live proof: `evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
@@ -1857,7 +1860,9 @@ behavioral evidence is not completion.
 - Required outcome: one egui-native Clock surface provides World Clock, Alarms, Timers, and Stopwatch with AOSP DeskClock-derived procedures under Quazar styling. The
   visible clock opens Clock, a dedicated bell opens Notification Center, mackesd owns persisted scheduling and signed multi-peer execution, and mde-musicd remains the
   only Music/radio/NPR source and playback authority.
-- Current state: Signed contracts, durable scheduling/convergence, governed audio, and Clock/bell chrome exist; multi-process/UI/package/live proof remains.
+- Current state: Signed contracts, durable scheduling/convergence, governed
+  audio, and Clock/bell chrome exist. Multi-process/UI/package/live proof is
+  explicitly post-release acceptance and non-blocking for the coding drain.
 - **Contract/peer checkpoints (2026-08-08):** bounded Clock contracts and delivery/loss/rejoin/replay/global Stop passed `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`, `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
 - **Scheduler/restart checkpoint (2026-08-09):** weekday/DST execution and durable alarm auto-silence/audio stop passed the 7/7 Clock suite:
