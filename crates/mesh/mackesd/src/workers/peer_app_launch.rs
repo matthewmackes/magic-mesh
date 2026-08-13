@@ -53,6 +53,7 @@ use mde_bus::persist::Persist;
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::apps::{default_app_dirs, scan_local_apps, AppEntry};
 use mackes_mesh_types::vdi_session::{AppVmLaunchRequest, SessionRequest};
+use mackes_mesh_types::workloads::WorkloadId;
 
 use super::{ShutdownToken, Worker};
 
@@ -293,6 +294,15 @@ pub fn app_vm_session_request(req: &LaunchRequest) -> Option<SessionRequest> {
     let catalog_revision = req.catalog_revision.clone()?;
     let guest_profile = req.guest_profile.clone()?;
     let client_peer = req.client_peer.clone()?;
+    // These route identities cross from the peer-app envelope into the
+    // Workloads/session authority. Reject values that would be interpreted
+    // differently by a later filesystem, libvirt, or replicated-session
+    // boundary instead of publishing a lifecycle mutation that can never be
+    // admitted. The App VM declaration below separately validates the session,
+    // catalog, profile, application, and capability identities.
+    WorkloadId::new(req.node.clone()).ok()?;
+    WorkloadId::new(vm_id.clone()).ok()?;
+    WorkloadId::new(client_peer.clone()).ok()?;
     let launch = AppVmLaunchRequest::new(
         req.app_id.clone(),
         catalog_revision.clone(),
@@ -1566,6 +1576,31 @@ mod tests {
             app_vm_session_request(&req).is_none(),
             "unsupported capabilities must not become an OpenApp lifecycle mutation"
         );
+    }
+
+    #[test]
+    fn guest_launch_rejects_unadmitted_route_provenance_before_session_projection() {
+        let admitted = parse_launch_request(
+            r#"{"node":"node-a","app_id":"org.example.Guest","source":"flatpak","mode":"guest-app-vm","session_id":"sess-1","vm_id":"vm-1","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":["audio"],"client_peer":"peer:seat"}"#,
+        )
+        .expect("admitted route parses");
+        for (field, value) in [
+            ("node", "peer/serving"),
+            ("vm_id", "vm\\substituted"),
+            ("client_peer", "peer:\nseat"),
+        ] {
+            let mut request = admitted.clone();
+            match field {
+                "node" => request.node = value.into(),
+                "vm_id" => request.vm_id = Some(value.into()),
+                "client_peer" => request.client_peer = Some(value.into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                app_vm_session_request(&request).is_none(),
+                "unsafe {field} must not become an OpenApp lifecycle mutation"
+            );
+        }
     }
 
     #[test]
