@@ -1025,7 +1025,7 @@ impl State {
                             ctx.memory_mut(|memory| memory.toggle_popup(overflow_popup_id));
                         }
                     } else if activated {
-                        action = Some(control_action(*control, pinned_sources, connected_sessions));
+                        action = control_action(*control, pinned_sources, connected_sessions);
                     }
                     if control.kind != ControlKind::Overflow {
                         if let Some(menu_action) =
@@ -2319,7 +2319,7 @@ fn paint_overflow_popup(
                 input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
             });
         if response.clicked() || keyboard_activate {
-            *action = Some(control_action(control, pinned_sources, connected_sessions));
+            *action = control_action(control, pinned_sources, connected_sessions);
             ui.memory_mut(|memory| memory.close_popup());
         }
     }
@@ -2494,27 +2494,36 @@ fn control_action(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
     connected_sessions: &[SessionRailEntry],
-) -> Action {
+) -> Option<Action> {
     if control.kind == ControlKind::RemoteSession {
-        if let Some(id) = control
+        return control
             .source_index
             .and_then(|index| connected_sessions.get(index))
             .and_then(SessionRailEntry::session_id)
-        {
-            return Action::RemoteSession(id.to_owned());
-        }
-        return Action::Home;
+            .map(|id| Action::RemoteSession(id.to_owned()));
     }
-    if let Some(source) = control
-        .source_index
-        .and_then(|index| pinned_sources.get(index))
-    {
-        return Action::DesktopSource(source.id.clone());
+    if control.kind == ControlKind::PinnedDesktop {
+        return control
+            .source_index
+            .and_then(|index| pinned_sources.get(index))
+            .map(|source| Action::DesktopSource(source.id.clone()));
     }
     if let Some(surface) = control.surface {
-        return Action::OpenSurface(surface);
+        return (control.kind == ControlKind::SurfaceLauncher)
+            .then_some(Action::OpenSurface(surface));
     }
-    control.kind.action()
+    match control.kind {
+        ControlKind::Start
+        | ControlKind::Search
+        | ControlKind::Back
+        | ControlKind::Home
+        | ControlKind::Editor
+        | ControlKind::Pin => Some(control.kind.action()),
+        ControlKind::Overflow
+        | ControlKind::SurfaceLauncher
+        | ControlKind::PinnedDesktop
+        | ControlKind::RemoteSession => None,
+    }
 }
 
 fn taskbar_context_menu(
@@ -2840,8 +2849,8 @@ mod tests {
         assert_eq!(control_icon(start), IconId::Grid);
         assert_eq!(control_icon(search), IconId::Search);
         assert_eq!(control_icon(home), IconId::FileHome);
-        assert_eq!(control_action(start, &[], &[]), Action::OpenFrontDoor);
-        assert_eq!(control_action(search, &[], &[]), Action::FocusSearch);
+        assert_eq!(control_action(start, &[], &[]), Some(Action::OpenFrontDoor));
+        assert_eq!(control_action(search, &[], &[]), Some(Action::FocusSearch));
     }
 
     #[test]
@@ -3121,7 +3130,10 @@ mod tests {
             .find(|control| control.kind == ControlKind::Pin)
             .copied()
             .expect("persisted Left placement must retain its Bottom escape target");
-        assert_eq!(control_action(placement, &[], &[]), Action::ToggleDock);
+        assert_eq!(
+            control_action(placement, &[], &[]),
+            Some(Action::ToggleDock)
+        );
         assert!(geometry.outer.contains_rect(placement.rect));
         assert_eq!(
             placement.rect.bottom(),
@@ -3315,8 +3327,34 @@ mod tests {
         assert_eq!(control_label(control, &[], &sessions), "Open Writer on Ash");
         assert_eq!(
             control_action(control, &[], &sessions),
-            Action::RemoteSession("s2".to_owned())
+            Some(Action::RemoteSession("s2".to_owned()))
         );
+    }
+
+    #[test]
+    fn missing_or_malformed_dynamic_controls_fail_closed_without_home_fallback() {
+        let retired_session = Control {
+            kind: ControlKind::RemoteSession,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: Some(1),
+        };
+        let retired_pin = Control {
+            kind: ControlKind::PinnedDesktop,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: Some(1),
+        };
+        let substituted_static = Control {
+            kind: ControlKind::Start,
+            rect: egui::Rect::NOTHING,
+            surface: Some(Surface::Browser),
+            source_index: None,
+        };
+
+        assert_eq!(control_action(retired_session, &[], &[]), None);
+        assert_eq!(control_action(retired_pin, &[], &[]), None);
+        assert_eq!(control_action(substituted_static, &[], &[]), None);
     }
 
     #[test]
