@@ -581,13 +581,17 @@ impl VehicleRadioHealth {
                 }
                 .to_string()
             });
+            let active_path = row.active_path && operation != VehicleRadioOperation::Stale;
             radios.push(VehicleRadioRow {
                 id: bounded_vehicle_text(row.id.as_str()),
                 presence,
                 operation,
                 reason,
                 age_ms,
-                active_path: row.active_path,
+                // An active-path claim is only meaningful while the row is
+                // fresh.  Retained radio metadata must not keep steering the
+                // UI toward a path whose gateway observation has expired.
+                active_path,
                 role: match row.configured_role {
                     mackes_mesh_types::vehicle::RadioRole::Wan => "WAN",
                     mackes_mesh_types::vehicle::RadioRole::AccessPoint => "access point",
@@ -8030,6 +8034,7 @@ mod tests {
             VehicleRadioPresence::NotInstalled
         );
         assert_eq!(health.radios[1].operation, VehicleRadioOperation::Active);
+        assert!(health.radios[1].active_path);
         assert_eq!(health.radios[1].age_label(), "12 ms");
         assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
     }
@@ -8048,6 +8053,7 @@ mod tests {
             .radios
             .iter()
             .all(|row| row.operation == VehicleRadioOperation::Stale));
+        assert!(health.radios.iter().all(|row| !row.active_path));
         assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
     }
 

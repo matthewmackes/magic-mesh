@@ -519,7 +519,7 @@ mod tests {
         let mut layer = WildfireLayerState::default();
         let base = snapshot(now).perimeters[0].clone();
         let mut oversized = snapshot(now);
-        oversized.perimeters = (0..(MAX_PAINTABLE_PERIMETERS + 1))
+        oversized.perimeters = (0..=MAX_PAINTABLE_PERIMETERS)
             .map(|index| WildfirePerimeter {
                 id: index.to_string(),
                 ..base.clone()
