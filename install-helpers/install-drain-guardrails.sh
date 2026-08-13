@@ -61,7 +61,7 @@ self_test_fail() {
   exit 1
 }
 self_test() {
-  local tmp test_home test_bin log expected unknown_err command rc
+  local tmp test_home test_bin log expected command rc rustup_bin rustup_home integration_home
   tmp="$(mktemp -d)"
   SELF_TEST_TMP="$tmp"
   trap 'if [ -n "${SELF_TEST_TMP:-}" ]; then rm -rf "$SELF_TEST_TMP"; fi' EXIT
@@ -69,17 +69,11 @@ self_test() {
   test_bin="$test_home/bin"
   log="$tmp/cargo.log"
   expected="$tmp/expected.log"
-  unknown_err="$tmp/unknown-proxy.err"
   mkdir -p "$test_bin"
 
   cat >"$test_bin/rustup" <<'EOF'
 #!/usr/bin/env bash
 set -eu
-proxy="${RUSTUP_FORCE_ARG0:-$(basename "$0")}"
-if [ "$proxy" != cargo ]; then
-  echo "error: unknown proxy name: $proxy" >&2
-  exit 1
-fi
 printf '%s\n' "${1:-}" >>"${CARGO_GUARD_TEST_LOG:?}"
 EOF
   chmod 0755 "$test_bin/rustup"
@@ -88,12 +82,6 @@ EOF
   CARGO_HOME="$test_home" "$HERE/install-drain-guardrails.sh" --guard-only >/dev/null
   [ "$(readlink "$test_bin/cargo-real")" = rustup ] || \
     self_test_fail 'installer did not preserve the rustup proxy as cargo-real'
-
-  if CARGO_GUARD_TEST_LOG="$log" "$test_bin/cargo-real" fmt >/dev/null 2>"$unknown_err"; then
-    self_test_fail 'rustup fixture accepted the cargo-real proxy name'
-  fi
-  grep -Fq 'unknown proxy name: cargo-real' "$unknown_err" || \
-    self_test_fail 'rustup fixture did not reproduce the cargo-real proxy failure'
 
   for command in fmt metadata; do
     CARGO_GUARD_TEST_LOG="$log" "$test_bin/cargo" "$command" >/dev/null || \
@@ -119,6 +107,34 @@ EOF
   CARGO_HOME="$test_home" "$HERE/install-drain-guardrails.sh" --guard-only >/dev/null
   cmp -s "$HERE/cargo-farm-guard.sh" "$test_bin/cargo" || \
     self_test_fail 'reinstall did not refresh the installed guard'
+
+  # Exercise the real rustup proxy when available. A shell fixture cannot
+  # observe the argv[0] supplied to a shebang interpreter, while rustup's ELF
+  # proxy dispatch depends on it. This catches both the cargo-real-name failure
+  # and recursive cargo-fmt dispatch that motivated the guard repair.
+  rustup_bin="$(command -v rustup || true)"
+  rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+  if [ -n "$rustup_bin" ] && [ -x "$rustup_bin" ] && [ -d "$rustup_home" ]; then
+    integration_home="$tmp/rustup-cargo-home"
+    mkdir -p "$integration_home/bin"
+    install -m 0755 "$(readlink -f "$rustup_bin")" "$integration_home/bin/rustup"
+    ln -s rustup "$integration_home/bin/cargo"
+    ln -s rustup "$integration_home/bin/cargo-fmt"
+    CARGO_HOME="$integration_home" \
+      "$HERE/install-drain-guardrails.sh" --guard-only >/dev/null
+    if CARGO_HOME="$integration_home" RUSTUP_HOME="$rustup_home" \
+        "$integration_home/bin/cargo-real" --version \
+        >"$tmp/cargo-real.out" 2>"$tmp/cargo-real.err"; then
+      self_test_fail 'rustup accepted the preserved cargo-real proxy name'
+    fi
+    grep -Fq 'unknown proxy name' "$tmp/cargo-real.err" || \
+      self_test_fail 'rustup did not reproduce the cargo-real proxy failure'
+    PATH="$integration_home/bin:$PATH" CARGO_HOME="$integration_home" \
+      RUSTUP_HOME="$rustup_home" "$integration_home/bin/cargo" fmt --version \
+      >"$tmp/cargo-fmt-version.out"
+    grep -Fq 'rustfmt ' "$tmp/cargo-fmt-version.out" || \
+      self_test_fail 'guarded cargo fmt did not dispatch to rustfmt'
+  fi
 
   echo 'install-drain-guardrails.sh: self-test passed'
 }

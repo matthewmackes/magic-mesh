@@ -41,9 +41,10 @@ case "${1:-}" in
   *)
     if [ -n "$real" ]; then
       # rustup selects a proxy from argv[0].  The preserved proxy is named
-      # `cargo-real`, so force its original identity when delegating.
-      export RUSTUP_FORCE_ARG0=cargo
-      exec "$real" "$@"
+      # `cargo-real`, so restore the original identity only for this exec.
+      # An exported RUSTUP_FORCE_ARG0 leaks into `cargo fmt`'s cargo-fmt child
+      # and makes rustup recursively dispatch Cargo instead of rustfmt.
+      exec -a cargo "$real" "$@"
     fi
     echo "cargo-farm-guard: real cargo not found alongside the shim" >&2; exit 1 ;;
 esac
