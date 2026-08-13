@@ -10,7 +10,7 @@ use mackes_mesh_types::android_provider::{
     AndroidProviderAdmission, AndroidProviderReadiness, AndroidProviderRefusal,
     CuttlefishImageProvenanceRef, ANDROID_PROVIDER_ADMISSION_SCHEMA_VERSION,
 };
-use mackes_mesh_types::cloud::WorkloadSpec;
+use mackes_mesh_types::cloud::{DeliveryType, WorkloadSpec};
 use sha2::{Digest, Sha256};
 
 pub(super) const ANDROID_IMAGE_FILE_ENV: &str = "MDE_ANDROID_IMAGE_FILE";
@@ -164,7 +164,9 @@ pub(super) fn preflight(
         if package_manifest != &catalog.payload.package_manifest {
             return Err(AndroidProviderRefusal::PackageManifestMismatch);
         }
-        if input.workload.image.as_deref() != Some(image.image_id.as_str())
+        if input.workload.delivery_type != DeliveryType::AndroidVm
+            || !input.workload.network_isolation
+            || input.workload.image.as_deref() != Some(image.image_id.as_str())
             || input.workload.image_digest.as_deref() != Some(image.image_digest.as_str())
             || u64::from(input.workload.vcpu) < required_vcpus.into()
             || u64::from(input.workload.memory_mb) < required_memory_mib
@@ -354,7 +356,7 @@ mod tests {
         AndroidResourceProfile, AospStarterApp, AospStarterCatalog,
         ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
     };
-    use mackes_mesh_types::cloud::{DeliveryType, StoragePool};
+    use mackes_mesh_types::cloud::StoragePool;
 
     const NOW: u64 = 1_800_000_000_000;
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -467,9 +469,19 @@ mod tests {
         now: u64,
         healthy: bool,
     ) -> AndroidProviderAdmission {
+        run_with_workload(&workload(), catalog, probe, now, healthy)
+    }
+
+    fn run_with_workload(
+        workload: &WorkloadSpec,
+        catalog: &AndroidSignedCatalog,
+        probe: &FakeProbe,
+        now: u64,
+        healthy: bool,
+    ) -> AndroidProviderAdmission {
         preflight(
             AndroidPreflightInput {
-                workload: &workload(),
+                workload,
                 catalog: Some(catalog),
                 package_manifest: Some(&catalog.payload.package_manifest),
                 artifact: Some(Path::new("/image.qcow2")),
@@ -538,6 +550,26 @@ mod tests {
             Some(AndroidProviderRefusal::CatalogUnavailable)
         );
         assert_eq!(admission.readiness, AndroidProviderReadiness::Unavailable);
+    }
+
+    #[test]
+    fn provider_refuses_non_android_or_non_isolated_workload_replay() {
+        let signed = catalog();
+        let mut hostile = workload();
+        hostile.delivery_type = DeliveryType::ServiceContainer;
+        let wrong_class = run_with_workload(&hostile, &signed, &healthy_probe(), NOW, true);
+
+        hostile.delivery_type = DeliveryType::AndroidVm;
+        hostile.network_isolation = false;
+        let unisolated = run_with_workload(&hostile, &signed, &healthy_probe(), NOW, true);
+
+        for admission in [wrong_class, unisolated] {
+            assert_eq!(
+                admission.refusal,
+                Some(AndroidProviderRefusal::DesiredImageMismatch)
+            );
+            assert_eq!(admission.readiness, AndroidProviderReadiness::Unavailable);
+        }
     }
 
     #[test]
