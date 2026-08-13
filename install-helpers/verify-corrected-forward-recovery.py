@@ -26,6 +26,7 @@ GROUPS = ("control", "observation", "actions", "data", "compute", "integrations"
 XDG_DIRS = ("Documents", "Downloads", "Music", "Pictures", "Videos")
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 PACKAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~:-]{0,255}$")
+PAYLOAD_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 OVERLAY = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$")
 MAX_OUTPUT = 16_384
 MAX_EVIDENCE = 64 * 1024
@@ -145,6 +146,8 @@ def validate_corrected_forward(
     expect_target: str,
     expect_previous_package: str,
     expect_forward_package: str,
+    expect_previous_payload_digest: str,
+    expect_forward_payload_digest: str,
 ) -> dict[str, str | bool]:
     if not IDENTIFIER.fullmatch(expect_target):
         refuse("expected target is malformed")
@@ -156,6 +159,14 @@ def validate_corrected_forward(
             refuse(f"{label} is malformed")
     if expect_previous_package == expect_forward_package:
         refuse("corrected-forward package must differ from the previous package")
+    for value, label in (
+        (expect_previous_payload_digest, "expected previous payload digest"),
+        (expect_forward_payload_digest, "expected forward payload digest"),
+    ):
+        if not PAYLOAD_DIGEST.fullmatch(value) or value == "sha256:" + "0" * 64:
+            refuse(f"{label} is malformed or null")
+    if expect_previous_payload_digest == expect_forward_payload_digest:
+        refuse("corrected-forward payload must differ from the previous payload")
     for field in ("target", "role", "overlay", "session_user"):
         if before.get(field) != after.get(field):
             refuse(f"corrected-forward capture changed target authority: {field}")
@@ -165,6 +176,10 @@ def validate_corrected_forward(
         refuse("pre-upgrade capture does not match the authorized previous package")
     if after.get("package") != expect_forward_package:
         refuse("post-upgrade capture does not match the authorized forward package")
+    if before.get("package_payload_digest") != expect_previous_payload_digest:
+        refuse("pre-upgrade capture does not match the signed previous payload")
+    if after.get("package_payload_digest") != expect_forward_payload_digest:
+        refuse("post-upgrade capture does not match the signed forward payload")
     before_boot_id = before.get("boot_id")
     if not isinstance(before_boot_id, str) or not IDENTIFIER.fullmatch(before_boot_id):
         refuse("pre-upgrade capture has an invalid boot identity")
@@ -178,6 +193,8 @@ def validate_corrected_forward(
         "target": expect_target,
         "previous_package": expect_previous_package,
         "forward_package": expect_forward_package,
+        "previous_payload_digest": expect_previous_payload_digest,
+        "forward_payload_digest": expect_forward_payload_digest,
         "before_boot_id": before_boot_id,
         "after_boot_id": after_boot_id,
     }
@@ -234,6 +251,19 @@ def trusted_package_file(path: Path) -> str:
     if not owner.startswith("magic-mesh-"):
         refuse(f"recovery path is not owned by a magic-mesh package: {path}: {owner}")
     return owner
+
+
+def installed_payload_digest(package: str) -> str:
+    value = run(
+        "/usr/bin/rpm", "-q", "--qf", "%{PAYLOADDIGESTALGO}\t%{PAYLOADDIGEST}",
+        "--", package,
+    ).lower().split("\t")
+    if len(value) != 2 or value[0] not in {"8", "sha256"}:
+        refuse(f"installed package payload digest is not SHA-256: {package}")
+    digest = "sha256:" + value[1]
+    if not PAYLOAD_DIGEST.fullmatch(digest) or digest == "sha256:" + "0" * 64:
+        refuse(f"installed package has no trusted SHA-256 payload digest: {package}")
+    return digest
 
 
 def systemctl_value(unit: str, field: str) -> str:
@@ -381,12 +411,14 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     if "PASS" not in identity:
         refuse("installed identity guard did not admit exactly one trusted identity")
 
+    package = next(iter(owners))
     return {
         "schema_version": 1,
         "target": hostname,
         "role": role,
         "overlay": addresses[0],
-        "package": next(iter(owners)),
+        "package": package,
+        "package_payload_digest": installed_payload_digest(package),
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "session_user": args.session_user,
         "recovery_path": "package-owned",
@@ -619,6 +651,7 @@ def self_test() -> None:
         "overlay": "172.20.0.15/24",
         "session_user": "mm",
         "package": "magic-mesh-32.0.0-1.x86_64",
+        "package_payload_digest": "sha256:" + "a" * 64,
         "boot_id": "before",
     }
     forward = {
@@ -627,6 +660,7 @@ def self_test() -> None:
         "overlay": "172.20.0.15/24",
         "session_user": "mm",
         "package": "magic-mesh-33.0.0-1.x86_64",
+        "package_payload_digest": "sha256:" + "b" * 64,
     }
     validate_corrected_forward(
         before,
@@ -634,6 +668,8 @@ def self_test() -> None:
         expect_target="seat-15",
         expect_previous_package="magic-mesh-32.0.0-1.x86_64",
         expect_forward_package="magic-mesh-33.0.0-1.x86_64",
+        expect_previous_payload_digest="sha256:" + "a" * 64,
+        expect_forward_payload_digest="sha256:" + "b" * 64,
     )
     try:
         validate_corrected_forward(
@@ -642,15 +678,51 @@ def self_test() -> None:
             expect_target="seat-15",
             expect_previous_package="magic-mesh-32.0.0-1.x86_64",
             expect_forward_package="magic-mesh-33.0.0-1.x86_64",
+            expect_previous_payload_digest="sha256:" + "a" * 64,
+            expect_forward_payload_digest="sha256:" + "b" * 64,
         )
     except Refused:
         pass
     else:
         raise AssertionError("retained pre-upgrade package authority was accepted")
+    for hostile, label in (
+        ({**forward, "package_payload_digest": "sha256:" + "c" * 64}, "substituted forward payload"),
+        ({**forward, "package_payload_digest": "sha256:" + "a" * 64}, "retained previous payload"),
+    ):
+        try:
+            validate_corrected_forward(
+                before,
+                hostile,
+                expect_target="seat-15",
+                expect_previous_package="magic-mesh-32.0.0-1.x86_64",
+                expect_forward_package="magic-mesh-33.0.0-1.x86_64",
+                expect_previous_payload_digest="sha256:" + "a" * 64,
+                expect_forward_payload_digest="sha256:" + "b" * 64,
+            )
+        except Refused:
+            continue
+        raise AssertionError(f"{label} was accepted")
+    for previous_digest, forward_digest, label in (
+        ("sha256:bad", "sha256:" + "b" * 64, "malformed signed payload digest"),
+        ("sha256:" + "b" * 64, "sha256:" + "b" * 64, "same-payload rollback authority"),
+    ):
+        try:
+            validate_corrected_forward(
+                before,
+                forward,
+                expect_target="seat-15",
+                expect_previous_package="magic-mesh-32.0.0-1.x86_64",
+                expect_forward_package="magic-mesh-33.0.0-1.x86_64",
+                expect_previous_payload_digest=previous_digest,
+                expect_forward_payload_digest=forward_digest,
+            )
+        except Refused:
+            continue
+        raise AssertionError(f"{label} was accepted")
     assert strict_majority(1) == 1
     assert strict_majority(3) == 2
     assert strict_majority(5) == 3
-    print("verify-corrected-forward-recovery: self-test passed 15/15")
+    print("verify-corrected-forward-recovery: self-test passed 19/19")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -663,6 +735,8 @@ def parser() -> argparse.ArgumentParser:
     forward.add_argument("--expect-target", required=True)
     forward.add_argument("--expect-previous-package", required=True)
     forward.add_argument("--expect-forward-package", required=True)
+    forward.add_argument("--expect-previous-payload-digest", required=True)
+    forward.add_argument("--expect-forward-payload-digest", required=True)
     for name in ("preflight", "post-reboot"):
         command = sub.add_parser(name)
         command.add_argument("--expect-host", required=True)
@@ -687,6 +761,8 @@ def main() -> int:
                 expect_target=args.expect_target,
                 expect_previous_package=args.expect_previous_package,
                 expect_forward_package=args.expect_forward_package,
+                expect_previous_payload_digest=args.expect_previous_payload_digest,
+                expect_forward_payload_digest=args.expect_forward_payload_digest,
             )
             print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             return 0
