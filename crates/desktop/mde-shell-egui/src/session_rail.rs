@@ -40,6 +40,15 @@ struct RailSession {
     app: Option<AppVmLaunchRequest>,
     app_state: Option<AppVmLifecycleState>,
     app_reason: Option<String>,
+    generation: u64,
+}
+
+#[derive(Debug)]
+struct PendingFocus<T> {
+    owner_peer: String,
+    owner_generation: u64,
+    session_generation: u64,
+    value: T,
 }
 
 /// The app-specific half of a focused rail session. The shell consumes this
@@ -74,8 +83,11 @@ pub(crate) struct SessionRailState {
     bus_root: Option<PathBuf>,
     cursor: Option<String>,
     sessions: BTreeMap<String, RailSession>,
-    pending_app_handoff: Option<AppSessionHandoff>,
-    pending_desktop_focus: Option<DesktopSessionFocus>,
+    taskbar_owner_peer: Option<String>,
+    taskbar_owner_generation: u64,
+    next_session_generation: u64,
+    pending_app_handoff: Option<PendingFocus<AppSessionHandoff>>,
+    pending_desktop_focus: Option<PendingFocus<DesktopSessionFocus>>,
 }
 
 impl SessionRailState {
@@ -99,6 +111,7 @@ impl SessionRailState {
     /// stay visible so reconnect remains discoverable.
     pub(crate) fn entries(&mut self, client_peer: &str) -> Vec<SessionRailEntry> {
         self.poll();
+        self.bind_taskbar_owner(client_peer);
         self.sessions
             .values()
             .filter(|s| s.client_peer == client_peer)
@@ -130,6 +143,7 @@ impl SessionRailState {
     /// pretending to be directly openable taskbar targets.
     pub(crate) fn connected_entries(&mut self, client_peer: &str) -> Vec<SessionRailEntry> {
         self.poll();
+        self.bind_taskbar_owner(client_peer);
         self.sessions
             .values()
             .filter(|session| session.client_peer == client_peer)
@@ -152,10 +166,13 @@ impl SessionRailState {
     /// from roster text.
     pub(crate) fn focus_session(&mut self, id: &str) -> bool {
         self.poll();
+        let Some(owner_peer) = self.taskbar_owner_peer.as_deref() else {
+            return false;
+        };
         let Some(session) = self.sessions.get_mut(id) else {
             return false;
         };
-        if !app_session_can_focus(session) {
+        if session.client_peer != owner_peer || !app_session_can_focus(session) {
             return false;
         }
         if matches!(
@@ -164,14 +181,24 @@ impl SessionRailState {
         ) {
             session.state = SessionState::Active;
             if let Some(request) = session.app.clone() {
-                self.pending_app_handoff = Some(AppSessionHandoff {
-                    request,
-                    serving_peer: session.serving_peer.clone(),
-                    vm_id: session.vm_id.clone(),
+                self.pending_app_handoff = Some(PendingFocus {
+                    owner_peer: owner_peer.to_owned(),
+                    owner_generation: self.taskbar_owner_generation,
+                    session_generation: session.generation,
+                    value: AppSessionHandoff {
+                        request,
+                        serving_peer: session.serving_peer.clone(),
+                        vm_id: session.vm_id.clone(),
+                    },
                 });
             } else {
-                self.pending_desktop_focus = Some(DesktopSessionFocus {
-                    id: session.id.clone(),
+                self.pending_desktop_focus = Some(PendingFocus {
+                    owner_peer: owner_peer.to_owned(),
+                    owner_generation: self.taskbar_owner_generation,
+                    session_generation: session.generation,
+                    value: DesktopSessionFocus {
+                        id: session.id.clone(),
+                    },
                 });
             }
             true
@@ -183,13 +210,48 @@ impl SessionRailState {
     /// Consume the one-shot app handoff raised by focusing an App VM session.
     /// A focus action is not allowed to retrigger a launch on every frame.
     pub(crate) fn take_app_handoff(&mut self) -> Option<AppSessionHandoff> {
-        self.pending_app_handoff.take()
+        self.poll();
+        let pending = self.pending_app_handoff.take()?;
+        self.pending_is_current(&pending, &pending.value.request.session_id)
+            .then_some(pending.value)
     }
 
     /// Consume the identity-only ordinary desktop focus raised by a taskbar or
     /// Sessions click. The VDI owner resolves it only against retained requests.
     pub(crate) fn take_desktop_focus(&mut self) -> Option<DesktopSessionFocus> {
-        self.pending_desktop_focus.take()
+        self.poll();
+        let pending = self.pending_desktop_focus.take()?;
+        self.pending_is_current(&pending, &pending.value.id)
+            .then_some(pending.value)
+    }
+
+    fn bind_taskbar_owner(&mut self, client_peer: &str) {
+        if self.taskbar_owner_peer.as_deref() == Some(client_peer) {
+            return;
+        }
+        self.taskbar_owner_generation = self.taskbar_owner_generation.saturating_add(1).max(1);
+        self.taskbar_owner_peer = Some(client_peer.to_owned());
+        self.revoke_pending_focus();
+    }
+
+    fn pending_is_current<T>(&self, pending: &PendingFocus<T>, id: &str) -> bool {
+        self.taskbar_owner_peer.as_deref() == Some(pending.owner_peer.as_str())
+            && self.taskbar_owner_generation == pending.owner_generation
+            && self.sessions.get(id).is_some_and(|session| {
+                session.client_peer == pending.owner_peer
+                    && session.generation == pending.session_generation
+                    && app_session_can_focus(session)
+            })
+    }
+
+    fn revoke_pending_focus(&mut self) {
+        self.pending_app_handoff = None;
+        self.pending_desktop_focus = None;
+    }
+
+    fn allocate_session_generation(&mut self) -> u64 {
+        self.next_session_generation = self.next_session_generation.saturating_add(1).max(1);
+        self.next_session_generation
     }
 
     fn poll(&mut self) {
@@ -220,6 +282,8 @@ impl SessionRailState {
                 client_peer,
                 ..
             } => {
+                let generation = self.allocate_session_generation();
+                self.revoke_pending_for(&id);
                 self.sessions.insert(
                     id.clone(),
                     RailSession {
@@ -231,6 +295,7 @@ impl SessionRailState {
                         app: None,
                         app_state: None,
                         app_reason: None,
+                        generation,
                     },
                 );
             }
@@ -261,6 +326,8 @@ impl SessionRailState {
                 .and_then(|request| request.validate_admitted().map(|()| request)) else {
                     return;
                 };
+                let generation = self.allocate_session_generation();
+                self.revoke_pending_for(&id);
                 self.sessions.insert(
                     id.clone(),
                     RailSession {
@@ -272,6 +339,7 @@ impl SessionRailState {
                         app: Some(app_request),
                         app_state: Some(AppVmLifecycleState::WaitingForPlacement),
                         app_reason: None,
+                        generation,
                     },
                 );
             }
@@ -283,8 +351,12 @@ impl SessionRailState {
                 reason,
                 ..
             } => self.set_app_state(&id, state, reason),
-            SessionRequest::Disconnect { id } => self.set_state(&id, SessionState::Disconnected),
+            SessionRequest::Disconnect { id } => {
+                self.revoke_pending_for(&id);
+                self.set_state(&id, SessionState::Disconnected);
+            }
             SessionRequest::Close { id } => {
+                self.revoke_pending_for(&id);
                 self.sessions.remove(&id);
             }
         }
@@ -297,11 +369,33 @@ impl SessionRailState {
     }
 
     fn set_app_state(&mut self, id: &str, state: AppVmLifecycleState, reason: Option<String>) {
+        let mut revoke = false;
         if let Some(session) = self.sessions.get_mut(id) {
             if session.app.is_some() {
                 session.app_state = Some(state);
                 session.app_reason = bound_app_reason(reason);
+                revoke = !app_session_can_focus(session);
             }
+        }
+        if revoke {
+            self.revoke_pending_for(id);
+        }
+    }
+
+    fn revoke_pending_for(&mut self, id: &str) {
+        if self
+            .pending_app_handoff
+            .as_ref()
+            .is_some_and(|pending| pending.value.request.session_id == id)
+        {
+            self.pending_app_handoff = None;
+        }
+        if self
+            .pending_desktop_focus
+            .as_ref()
+            .is_some_and(|pending| pending.value.id == id)
+        {
+            self.pending_desktop_focus = None;
         }
     }
 }
@@ -686,6 +780,7 @@ mod tests {
         );
 
         let mut state = SessionRailState::with_bus_root(root.clone());
+        assert_eq!(state.connected_entries("eagle").len(), 1);
         assert!(state.focus_session("app-session-1"));
         assert_eq!(
             state.take_app_handoff(),
@@ -749,6 +844,62 @@ mod tests {
         assert_eq!(entries[0].session_id(), Some("app-session-1"));
         assert!(state.focus_session("app-session-1"));
         assert!(state.take_app_handoff().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn taskbar_focus_is_revoked_across_seat_switch_and_session_replacement() {
+        let root = temp_bus("taskbar-focus-generation");
+        publish(
+            &root,
+            r#"{"op":"open","id":"shared-id","serving_peer":"oak","vm_id":"first","client_peer":"seat-a"}"#,
+        );
+        publish(&root, r#"{"op":"active","id":"shared-id"}"#);
+
+        let mut state = SessionRailState::with_bus_root(root.clone());
+        assert_eq!(state.connected_entries("seat-a").len(), 1);
+        assert!(state.focus_session("shared-id"));
+
+        assert!(state.connected_entries("seat-b").is_empty());
+        assert!(
+            state.take_desktop_focus().is_none(),
+            "a queued taskbar action must not cross into a replacement seat owner"
+        );
+        assert!(
+            !state.focus_session("shared-id"),
+            "the new seat owner cannot focus another seat's session by public id"
+        );
+
+        assert_eq!(state.connected_entries("seat-a").len(), 1);
+        assert!(state.focus_session("shared-id"));
+        publish(&root, r#"{"op":"disconnect","id":"shared-id"}"#);
+        assert!(
+            state.take_desktop_focus().is_none(),
+            "a disconnect arriving after the click must revoke the queued action"
+        );
+        publish(&root, r#"{"op":"active","id":"shared-id"}"#);
+        assert_eq!(state.connected_entries("seat-a").len(), 1);
+        assert!(state.focus_session("shared-id"));
+        publish(&root, r#"{"op":"close","id":"shared-id"}"#);
+        publish(
+            &root,
+            r#"{"op":"open","id":"shared-id","serving_peer":"ash","vm_id":"replacement","client_peer":"seat-a"}"#,
+        );
+        publish(&root, r#"{"op":"active","id":"shared-id"}"#);
+        assert_eq!(state.connected_entries("seat-a").len(), 1);
+        assert!(
+            state.take_desktop_focus().is_none(),
+            "a stale action must not target a replacement session incarnation"
+        );
+        assert!(state.focus_session("shared-id"));
+        assert_eq!(
+            state.take_desktop_focus(),
+            Some(DesktopSessionFocus {
+                id: "shared-id".to_owned()
+            }),
+            "the sole current seat owner can focus the exact replacement generation"
+        );
+        assert!(state.take_desktop_focus().is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }
