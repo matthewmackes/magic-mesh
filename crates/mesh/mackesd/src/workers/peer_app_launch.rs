@@ -50,8 +50,12 @@ use std::time::Duration;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
-use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+use crate::ipc::action_auth::{
+    production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
+    MAX_AUTH_TTL_MS,
+};
 use crate::ipc::apps::{default_app_dirs, scan_local_apps, AppEntry};
+use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mackes_mesh_types::vdi_session::{AppVmLaunchRequest, SessionRequest};
 use mackes_mesh_types::workloads::WorkloadId;
 
@@ -60,6 +64,7 @@ use super::{ShutdownToken, Worker};
 /// The flat Bus topic this worker drains. Per-node targeting is via the request's
 /// `node` field, not the topic (the same shape [`crate::workers::container`] uses).
 pub const ACTION_TOPIC: &str = "action/apps/launch";
+const VDI_SESSION_ACTION_TOPIC: &str = "action/vdi/session";
 
 /// Action-drain cadence. The bus read is a cheap local log scan; a launch is a
 /// rare, operator-initiated event, so a 1 s poll is responsive without spinning.
@@ -122,14 +127,12 @@ impl LaunchSource {
     }
 }
 
-/// The execution plane requested by Front Door. This worker implements only
-/// the legacy host plane; guest App VM execution belongs to a later worker and
-/// must not silently fall through here.
+/// The execution plane requested by Front Door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
     /// Execute a validated host `.desktop` entry through this worker.
     LegacyHost,
-    /// Route a guest-owned app through an App VM launcher (not implemented here).
+    /// Route a guest-owned app through the typed App VM session authority.
     GuestAppVm,
 }
 
@@ -762,6 +765,13 @@ fn default_state_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/var/lib/mde/peer-app-launch"))
 }
 
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 // ───────────────────────────── the worker ─────────────────────────────
 
 /// The WL-UX-005 peer-app remote-execution executor.
@@ -782,6 +792,8 @@ pub struct PeerAppLaunchWorker {
     state_root: PathBuf,
     /// Shared, fail-closed authorization gate for the remote launch mutation.
     authorizer: Arc<ActionAuthorizer>,
+    /// Root-only signer for the daemon-owned App VM to session-broker handoff.
+    session_signer: Option<CloudArmSigner>,
     #[cfg(test)]
     after_action_read: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
     #[cfg(test)]
@@ -794,6 +806,16 @@ impl PeerAppLaunchWorker {
     /// `node_id` is the sole launch target this worker acts on.
     #[must_use]
     pub fn new(node_id: String) -> Self {
+        let session_signer = production_action_signer()
+            .map_err(|error| {
+                tracing::error!(
+                    target: "mackesd::peer_app_launch",
+                    %error,
+                    "App VM session handoff signing unavailable; guest launches fail closed"
+                );
+                error
+            })
+            .ok();
         Self {
             node_id,
             home: default_home(),
@@ -802,6 +824,7 @@ impl PeerAppLaunchWorker {
             bus_root_override: None,
             state_root: default_state_root(),
             authorizer: Arc::new(ActionAuthorizer::production()),
+            session_signer,
             #[cfg(test)]
             after_action_read: None,
             #[cfg(test)]
@@ -866,6 +889,55 @@ impl PeerAppLaunchWorker {
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
         self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_session_signer(mut self, signer: CloudArmSigner) -> Self {
+        self.session_signer = Some(signer);
+        self
+    }
+
+    fn authorized_session_body(
+        &self,
+        request_ulid: &str,
+        request: &SessionRequest,
+    ) -> Result<String, &'static str> {
+        let signer = self
+            .session_signer
+            .as_ref()
+            .ok_or("App VM session authority is unavailable")?;
+        let SessionRequest::OpenApp { id, .. } = request else {
+            return Err("App VM route produced a non-open session request");
+        };
+        let mut document = serde_json::to_value(request)
+            .map_err(|_| "App VM session request could not be serialized")?;
+        document
+            .as_object_mut()
+            .ok_or("App VM session request is not an object")?
+            .insert(
+                "schema_version".to_owned(),
+                serde_json::Value::from(ACTION_SCHEMA_VERSION),
+            );
+        let unsigned = document.to_string();
+        let digest =
+            cloud_request_digest(&unsigned).map_err(|_| "App VM session request digest failed")?;
+        let nonce = format!("peer-app-session-{request_ulid}");
+        let token = CloudArmedToken::mint(
+            signer,
+            &nonce,
+            wall_now_ms().saturating_add(MAX_AUTH_TTL_MS),
+            "vdi-session-open",
+            "vdi-session",
+            &format!("session:{id}"),
+            &digest,
+        )
+        .encode();
+        document
+            .as_object_mut()
+            .expect("session request object checked above")
+            .insert("armed_token".to_owned(), serde_json::Value::String(token));
+        Ok(document.to_string())
     }
 
     fn bus_root(&self) -> Option<PathBuf> {
@@ -1180,6 +1252,81 @@ impl PeerAppLaunchWorker {
         if !request.targets(&self.node_id) {
             return Ok(());
         }
+        if request.mode == LaunchMode::GuestAppVm {
+            let Some(session_request) = app_vm_session_request(&request) else {
+                return journal.insert_terminal(self.terminal_for(
+                    ulid,
+                    Some(request.app_id),
+                    LaunchResultStatus::Refused,
+                    "invalid-or-incomplete-App-VM-session-request",
+                ));
+            };
+            let session_body = match self.authorized_session_body(ulid, &session_request) {
+                Ok(body) => body,
+                Err(reason) => {
+                    return journal.insert_terminal(self.terminal_for(
+                        ulid,
+                        Some(request.app_id),
+                        LaunchResultStatus::Refused,
+                        reason,
+                    ));
+                }
+            };
+            journal.insert_prepared(
+                ulid,
+                body.clone(),
+                self.node_id.clone(),
+                request.app_id.clone(),
+                Vec::new(),
+            )?;
+            transaction.verify_current()?;
+            if let Err(error) = self.authorizer.authorize(
+                &body,
+                MutationContext {
+                    verb: PEER_APP_LAUNCH_AUTH_VERB,
+                    node: &self.node_id,
+                    target: &request.app_id,
+                },
+            ) {
+                return journal.set_phase(
+                    ulid,
+                    LaunchJournalPhase::Terminal {
+                        result: self.terminal_for(
+                            ulid,
+                            Some(request.app_id),
+                            LaunchResultStatus::Refused,
+                            format!("authorization-refused: {error}"),
+                        ),
+                        delivered_to: None,
+                    },
+                );
+            }
+            journal.set_phase(ulid, LaunchJournalPhase::EffectClaimed)?;
+            transaction.verify_current()?;
+            let dispatch = transaction.persist.write(
+                VDI_SESSION_ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&session_body),
+            );
+            let (status, reason) = match dispatch {
+                Ok(_) => (
+                    LaunchResultStatus::Succeeded,
+                    "App VM session dispatch accepted".to_owned(),
+                ),
+                Err(error) => (
+                    LaunchResultStatus::Indeterminate,
+                    format!("App VM session dispatch failed after durable claim: {error}"),
+                ),
+            };
+            return journal.set_phase(
+                ulid,
+                LaunchJournalPhase::Terminal {
+                    result: self.terminal_for(ulid, Some(request.app_id), status, reason),
+                    delivered_to: None,
+                },
+            );
+        }
         let argv = match self.resolve_launch_argv(&request) {
             Ok(argv) => argv,
             Err(reason) => {
@@ -1410,6 +1557,21 @@ mod tests {
         )
     }
 
+    fn armed_guest_launch_body(nonce: &str) -> String {
+        let unsigned = r#"{"node":"node-a","app_id":"org.example.Guest","name":"Guest","source":"flatpak","mode":"guest-app-vm","session_id":"sess-1","vm_id":"vm-1","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":["audio"],"client_peer":"peer:seat","resume":true,"schema_version":1}"#;
+        authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb: PEER_APP_LAUNCH_AUTH_VERB,
+                node: "node-a",
+                target: "org.example.Guest",
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
     fn worker_with_auth(
         home: PathBuf,
         launcher: Arc<RecordingLauncher>,
@@ -1553,6 +1715,78 @@ mod tests {
                 guest_profile: "wayland-standard".into(),
                 requested_capabilities: vec!["audio".into()],
                 resume: true,
+            })
+        );
+    }
+
+    #[test]
+    fn guest_launch_dispatches_one_authorized_open_app_to_session_broker() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let state_root = temp.path().join("state");
+        let inbound_auth_root = temp.path().join("inbound-auth");
+        let session_auth_root = temp.path().join("session-auth");
+        drop(Persist::open(bus_root.clone()).unwrap());
+        let signer = CloudArmSigner::new(AUTH_KEY.to_vec()).expect("session signer");
+        let worker = worker_with_auth(
+            temp.path().join("home"),
+            Arc::new(RecordingLauncher::default()),
+            &inbound_auth_root,
+        )
+        .with_session_signer(signer)
+        .with_state_root(state_root.clone());
+        let transaction = BusTransaction::open(&bus_root).unwrap();
+        let mut journal = LaunchJournal::open(&state_root).unwrap();
+        worker
+            .process_action(
+                &transaction,
+                &mut journal,
+                "01JAPPVMROUTE00000000000000",
+                armed_guest_launch_body("guest-route-once"),
+            )
+            .unwrap();
+
+        let downstream = Persist::open(bus_root)
+            .unwrap()
+            .read_latest(VDI_SESSION_ACTION_TOPIC)
+            .unwrap()
+            .and_then(|message| message.body)
+            .expect("typed session dispatch");
+        let request: SessionRequest = serde_json::from_str(&downstream).expect("OpenApp wire");
+        assert!(matches!(
+            &request,
+            SessionRequest::OpenApp {
+                id,
+                app_id,
+                vm_id,
+                ..
+            } if id == "sess-1" && app_id == "org.example.Guest" && vm_id == "vm-1"
+        ));
+        ActionAuthorizer::for_test(AUTH_KEY, session_auth_root, wall_now_ms())
+            .authorize(
+                &downstream,
+                MutationContext {
+                    verb: "vdi-session-open",
+                    node: "vdi-session",
+                    target: "session:sess-1",
+                },
+            )
+            .expect("session broker accepts exact daemon handoff");
+        assert_eq!(
+            journal
+                .state
+                .records
+                .get("01JAPPVMROUTE00000000000000")
+                .map(|record| &record.phase),
+            Some(&LaunchJournalPhase::Terminal {
+                result: LaunchResult::new(
+                    "01JAPPVMROUTE00000000000000",
+                    "node-a",
+                    Some("org.example.Guest".into()),
+                    LaunchResultStatus::Succeeded,
+                    "App VM session dispatch accepted",
+                ),
+                delivered_to: None,
             })
         );
     }
