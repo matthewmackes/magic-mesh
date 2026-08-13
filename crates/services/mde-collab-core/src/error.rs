@@ -80,6 +80,10 @@ pub enum CollabError {
     /// The referenced call does not exist.
     #[error("call {0} does not exist")]
     CallNotFound(CallId),
+    /// An outbound provider dial target was empty, oversized, padded, or
+    /// contained control characters.
+    #[error("outbound call dial target is invalid")]
+    InvalidCallDialTarget,
     /// The referenced alert does not exist.
     #[error("alert {0} does not exist")]
     AlertNotFound(EventId),

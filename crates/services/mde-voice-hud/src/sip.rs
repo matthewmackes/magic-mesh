@@ -1111,6 +1111,11 @@ pub fn peer_host_for(dialed: &str) -> String {
     }
 }
 
+fn direct_peer_user(dialed: &str) -> &str {
+    let target = dialed.trim().strip_prefix("sip:").unwrap_or(dialed.trim());
+    target.split_once('@').map_or(target, |(user, _)| user)
+}
+
 /// Place an outbound call: INVITE (+ digest retry) → await a final response,
 /// ACK a 2xx, and return the established `CallSession`. Blocking + socket —
 /// run off the UI thread. The live audio path is slice 3 (RTP/ALSA).
@@ -1166,9 +1171,9 @@ fn place_call_inner(
 
     // Await a final (>=200) response, honouring provisional 1xx and one auth
     // challenge, bounded by ring_timeout.
-    let deadline_passes = (ring_timeout.as_secs().max(1) / 2 + 1) as u32 * 8;
+    let deadline = std::time::Instant::now() + ring_timeout.max(Duration::from_secs(1));
     let mut authed = false;
-    for _ in 0..deadline_passes {
+    while std::time::Instant::now() < deadline {
         let resp = match recv_response(&sock) {
             Ok(r) => r,
             Err(_) => continue, // 2s read timeout tick; keep waiting for ring_timeout
@@ -1433,6 +1438,12 @@ pub enum AgentEvent {
 /// Command from the UI to the agent thread.
 #[derive(Debug, Clone)]
 pub enum AgentCommand {
+    /// Place one outbound call and acknowledge only after SIP establishment
+    /// and the duplex media session both succeed.
+    Dial {
+        target: String,
+        completion: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
     /// Answer the ringing call (200 OK + SDP answer + media).
     Answer,
     /// Decline the ringing call (486 Busy).
@@ -1444,6 +1455,11 @@ pub enum AgentCommand {
     /// in-call keypad digits route here. A no-op if no call/media is up or the
     /// key is not a DTMF digit.
     Dtmf(char),
+    /// Set microphone mute and return the live media session's observed state.
+    SetMuted {
+        muted: bool,
+        completion: std::sync::mpsc::SyncSender<Result<bool, String>>,
+    },
     /// POLISH-voicehud-loadstate — re-attempt registration now (the topbar Retry
     /// affordance). Reuses the agent's existing periodic re-REGISTER path
     /// (`agent_register`) by firing it on the next loop tick; a no-op for a
@@ -1941,10 +1957,43 @@ fn run_agent_inner(
     let mut next_status = Instant::now() + Duration::from_secs(STATUS_HEARTBEAT_SECS);
     let mut pending: Option<InboundInvite> = None;
     let mut media: Option<crate::media::MediaSession> = None;
+    let mut outbound: Option<CallSession> = None;
     let mut buf = [0u8; 4096];
 
     loop {
         match commands.try_recv() {
+            Ok(AgentCommand::Dial { target, completion }) => {
+                let result = if pending.is_some() || media.is_some() || outbound.is_some() {
+                    Err("another call is already active".to_string())
+                } else {
+                    let established = match route_call(&target) {
+                        CallRoute::MeshP2p { peer_host } => place_call_direct(
+                            account,
+                            direct_peer_user(&target),
+                            &peer_host,
+                            P2P_SIP_PORT,
+                            Duration::from_secs(30),
+                        ),
+                        CallRoute::ExternalTrunk => {
+                            if account.server_host.trim().is_empty() {
+                                Err("external dialing requires a configured SIP trunk".to_string())
+                            } else {
+                                place_call(account, &target, Duration::from_secs(30))
+                            }
+                        }
+                    };
+                    established.and_then(|session| {
+                        crate::media::start_media(session.rtp_port, &session.remote).map(
+                            |running| {
+                                media = Some(running);
+                                outbound = Some(session);
+                                let _ = events.send(AgentEvent::Established);
+                            },
+                        )
+                    })
+                };
+                let _ = completion.try_send(result);
+            }
             Ok(AgentCommand::Answer) => {
                 if let Some(inv) = pending.take() {
                     let sdp = build_sdp_answer(&local_ip, rtp_port);
@@ -1986,9 +2035,22 @@ fn run_agent_inner(
                     let _ = m.send_dtmf(key);
                 }
             }
+            Ok(AgentCommand::SetMuted { muted, completion }) => {
+                let result = media.as_ref().map_or_else(
+                    || Err("no active media session".to_string()),
+                    |session| {
+                        session.set_muted(muted);
+                        Ok(session.is_muted())
+                    },
+                );
+                let _ = completion.try_send(result);
+            }
             Ok(AgentCommand::HangUp) => {
                 if let Some(m) = media.take() {
                     m.stop();
+                }
+                if let Some(session) = outbound.take() {
+                    let _ = hang_up(&session);
                 }
                 pending = None;
             }
@@ -2003,6 +2065,9 @@ fn run_agent_inner(
             Err(TryRecvError::Disconnected) => {
                 if let Some(m) = media.take() {
                     m.stop();
+                }
+                if let Some(session) = outbound.take() {
+                    let _ = hang_up(&session);
                 }
                 break;
             }
@@ -2087,6 +2152,13 @@ mod tests {
             direct_target_uri("  ", "birch.mesh.mde"),
             "sip:birch.mesh.mde"
         );
+    }
+
+    #[test]
+    fn direct_peer_user_does_not_duplicate_an_explicit_host() {
+        assert_eq!(direct_peer_user("pine"), "pine");
+        assert_eq!(direct_peer_user("alice@pine.mesh.mde"), "alice");
+        assert_eq!(direct_peer_user("sip:bob@oak.mesh.mde"), "bob");
     }
 
     #[test]

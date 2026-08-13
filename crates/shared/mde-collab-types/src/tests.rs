@@ -549,6 +549,11 @@ fn every_command() -> Vec<CollabCommand> {
             call: CallId::new(),
             kind: CallKind::Video,
         },
+        CollabCommand::StartOutboundCall {
+            space: SpaceId::new(),
+            call: CallId::new(),
+            target: "+15551234567".into(),
+        },
         CollabCommand::AnswerCall {
             call: CallId::new(),
         },

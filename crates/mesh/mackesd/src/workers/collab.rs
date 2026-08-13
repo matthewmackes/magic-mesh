@@ -691,18 +691,6 @@ impl CollabWorker {
                     );
                     continue;
                 }
-                if let Err(error) = self
-                    .call_media_providers
-                    .execute_command(&cmd, existing_call_kind)
-                {
-                    tracing::warn!(
-                        target: "mackesd::collab",
-                        verb,
-                        error = %error,
-                        "refused signed call-state mutation after provider execution failed",
-                    );
-                    continue;
-                }
                 let events = match &cmd {
                     CollabCommand::LinkFile {
                         space,
@@ -753,6 +741,22 @@ impl CollabWorker {
                         }
                     },
                 };
+                // Authorize and derive the signed state transition before any
+                // media-provider side effect. The events are still uncommitted;
+                // a provider failure discards them, while an unauthorized or
+                // malformed command can never dial, answer, or alter media.
+                if let Err(error) = self
+                    .call_media_providers
+                    .execute_command(&cmd, existing_call_kind)
+                {
+                    tracing::warn!(
+                        target: "mackesd::collab",
+                        verb,
+                        error = %error,
+                        "refused signed call-state mutation after provider execution failed",
+                    );
+                    continue;
+                }
                 self.handle_ai_sidecar(&cmd, state, now_ms, touched, changed);
                 for env in &events {
                     // Durable-append to this node's own per-space actor log BEFORE

@@ -550,6 +550,19 @@ pub enum CollabCommand {
         /// What the call carries.
         kind: crate::value::CallKind,
     },
+    /// Start an outbound SIP/P2P audio call to an explicit dial target.
+    ///
+    /// This is separate from [`Self::StartCall`], whose space-scoped call has
+    /// no provider address. The daemon validates and signs the intent before a
+    /// concrete provider is allowed to dial it.
+    StartOutboundCall {
+        /// The space that owns the call.
+        space: SpaceId,
+        /// The new call id.
+        call: CallId,
+        /// Bounded provider dial string (mesh peer, extension, or E.164).
+        target: String,
+    },
     /// Answer a ringing call.
     AnswerCall {
         /// The call.
@@ -660,6 +673,7 @@ impl CollabCommand {
             Self::StartTransfer { .. } => "start_transfer",
             Self::ControlTransfer { .. } => "control_transfer",
             Self::StartCall { .. } => "start_call",
+            Self::StartOutboundCall { .. } => "start_outbound_call",
             Self::AnswerCall { .. } => "answer_call",
             Self::DeclineCall { .. } => "decline_call",
             Self::HangUpCall { .. } => "hang_up_call",

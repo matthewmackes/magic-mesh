@@ -18,7 +18,8 @@ use std::io::Read;
 use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::ids::{EventId, FileRefId, SpaceId};
 use mde_collab_types::value::{
-    AlertActionKind, CallParticipantState, FileRef, MessageBody, PayloadRef, TransferState,
+    AlertActionKind, CallKind, CallParticipantState, FileRef, MessageBody, PayloadRef,
+    TransferState,
 };
 use mde_collab_types::{
     ActorClock, CollabCommand, CollabEventEnvelope, FileReferenceView, PresenceState, SpaceRole,
@@ -1030,6 +1031,23 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 },
             )])
         }
+        CollabCommand::StartOutboundCall {
+            space,
+            call,
+            target,
+        } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_call_dial_target(target)?;
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::CallStarted {
+                    call: *call,
+                    kind: CallKind::Audio,
+                    initiator: ctx.actor.clone(),
+                },
+            )])
+        }
         CollabCommand::AnswerCall { call } => {
             let space = require_call(state, *call)?;
             // A call id is discoverable replicated state, not authority to
@@ -1144,6 +1162,23 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         return Err(CollabError::InvalidEvent(invalid.event_id));
     }
     Ok(events)
+}
+
+const MAX_CALL_DIAL_TARGET_BYTES: usize = 256;
+
+fn require_call_dial_target(target: &str) -> Result<()> {
+    let trimmed = target.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_CALL_DIAL_TARGET_BYTES
+        || trimmed != target
+        || !trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'+' | b'*' | b'#' | b'@' | b'.' | b'_' | b':' | b'-')
+        })
+    {
+        return Err(CollabError::InvalidCallDialTarget);
+    }
+    Ok(())
 }
 
 fn is_nonzero_lower_sha256(value: &str) -> bool {
@@ -1970,6 +2005,55 @@ mod tests {
                 space: denied_space,
                 actor
             }) if denied_space == space && actor == ActorId::new("mallory")
+        ));
+    }
+
+    #[test]
+    fn outbound_call_requires_a_bounded_explicit_target() {
+        let signer = Ed25519Signer::from_seed([18; 32]);
+        let mut ids = SeqIds(120);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "calls".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let state = DomainState::from_events(&created);
+
+        for target in ["", " padded", "line\nfeed", "alice example.com"] {
+            let denied = apply_command(
+                &state,
+                &CollabCommand::StartOutboundCall {
+                    space,
+                    call: CallId::new(),
+                    target: target.into(),
+                },
+                &mut alice,
+            );
+            assert!(matches!(denied, Err(CollabError::InvalidCallDialTarget)));
+        }
+
+        let accepted = apply_command(
+            &state,
+            &CollabCommand::StartOutboundCall {
+                space,
+                call: CallId::new(),
+                target: "+15551234567".into(),
+            },
+            &mut alice,
+        )
+        .expect("explicit target is authorized");
+        assert!(matches!(
+            accepted[0].kind,
+            CollabEventKind::CallStarted {
+                kind: CallKind::Audio,
+                ..
+            }
         ));
     }
 

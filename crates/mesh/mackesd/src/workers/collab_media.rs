@@ -32,6 +32,7 @@ const MAX_DETAIL_BYTES: usize = 512;
 // Bus payload and cannot collide with the serialized verification object.
 const VERIFICATION_UNAVAILABLE: &str = "\0call-media-verification-unavailable";
 const SIP_COMMAND_CAPACITY: usize = 16;
+const SIP_COMMAND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SipProviderHealth {
@@ -128,6 +129,33 @@ impl SipGatewayProvider {
             }
         }
     }
+
+    fn send_acknowledged<T>(
+        &self,
+        build: impl FnOnce(std::sync::mpsc::SyncSender<Result<T, String>>) -> AgentCommand,
+    ) -> Result<T, CallMediaProviderError> {
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .try_send(build(completion_tx))
+            .map_err(|error| CallMediaProviderError::ProviderUnavailable {
+                detail: match error {
+                    std::sync::mpsc::TrySendError::Full(_) => {
+                        "SIP provider command queue is full".to_string()
+                    }
+                    std::sync::mpsc::TrySendError::Disconnected(_) => {
+                        "SIP provider command queue is disconnected".to_string()
+                    }
+                },
+            })?;
+        completion_rx
+            .recv_timeout(SIP_COMMAND_ACK_TIMEOUT)
+            .map_err(|error| CallMediaProviderError::ProviderUnavailable {
+                detail: format!("SIP provider acknowledgement unavailable: {error}"),
+            })?
+            .map_err(|detail| CallMediaProviderError::ExecutionRefused {
+                detail: bounded_health_detail(&detail),
+            })
+    }
 }
 
 fn bounded_health_detail(detail: &str) -> String {
@@ -169,10 +197,23 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
                     detail: "outbound SIP execution requires an explicit dial target".to_string(),
                 });
             }
-            CollabCommand::SetCallMuted { .. } => {
-                return Err(CallMediaProviderError::ExecutionRefused {
-                    detail: "SIP agent mute acknowledgement is not yet available".to_string(),
+            CollabCommand::StartOutboundCall { target, .. } => {
+                return self.send_acknowledged(|completion| AgentCommand::Dial {
+                    target: target.clone(),
+                    completion,
                 });
+            }
+            CollabCommand::SetCallMuted { muted, .. } => {
+                let observed = self.send_acknowledged(|completion| AgentCommand::SetMuted {
+                    muted: *muted,
+                    completion,
+                })?;
+                if observed != *muted {
+                    return Err(CallMediaProviderError::ExecutionRefused {
+                        detail: "SIP agent returned a mismatched mute state".to_string(),
+                    });
+                }
+                return Ok(());
             }
             _ => return Ok(()),
         };
@@ -644,6 +685,7 @@ impl CallMediaProviderRegistry {
     ) -> Result<(), CallMediaCommandAdmissionError> {
         let kind = match command {
             CollabCommand::StartCall { kind, .. } => Some(*kind),
+            CollabCommand::StartOutboundCall { .. } => Some(CallKind::Audio),
             CollabCommand::AnswerCall { .. }
             | CollabCommand::SendDtmf { .. }
             | CollabCommand::SetCallMuted { .. } => existing_kind,
@@ -676,6 +718,7 @@ impl CallMediaProviderRegistry {
     ) -> Result<(), CallMediaCommandExecutionError> {
         let (kind, cleanup) = match command {
             CollabCommand::StartCall { kind, .. } => (Some(*kind), false),
+            CollabCommand::StartOutboundCall { .. } => (Some(CallKind::Audio), false),
             CollabCommand::AnswerCall { .. }
             | CollabCommand::SendDtmf { .. }
             | CollabCommand::SetCallMuted { .. } => (existing_kind, false),
@@ -1051,6 +1094,40 @@ mod tests {
             outbound,
             CallMediaProviderError::ExecutionRefused { .. }
         ));
+
+        let responder = std::thread::spawn(move || {
+            match rx.recv().expect("dial command") {
+                AgentCommand::Dial { target, completion } => {
+                    assert_eq!(target, "+15551234567");
+                    completion.send(Ok(())).expect("acknowledge dial");
+                }
+                other => panic!("unexpected agent command: {other:?}"),
+            }
+            match rx.recv().expect("mute command") {
+                AgentCommand::SetMuted { muted, completion } => {
+                    assert!(muted);
+                    completion.send(Ok(true)).expect("acknowledge mute");
+                }
+                other => panic!("unexpected agent command: {other:?}"),
+            }
+        });
+        provider
+            .execute_command(
+                &CollabCommand::StartOutboundCall {
+                    space: SpaceId::new(),
+                    call,
+                    target: "+15551234567".into(),
+                },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("dial completes only after the agent acknowledgement");
+        provider
+            .execute_command(
+                &CollabCommand::SetCallMuted { call, muted: true },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("mute completes only after observed media state");
+        responder.join().expect("agent responder");
 
         *provider.health.lock().expect("health") =
             SipProviderHealth::Unavailable("registration lost".to_string());
