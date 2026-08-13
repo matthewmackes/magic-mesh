@@ -382,7 +382,18 @@ fn adapt_app_vm_catalogs(
         let source_id = format!("app-vm-catalog/{node}");
         let topic = format!("state/app-catalog/{node}");
         let body = retained_body(persist.as_ref(), &topic);
-        adapt_app_vm_body(node, &source_id, body.as_deref(), now_ms, adapted);
+        let workload_body = retained_body(persist.as_ref(), &workload_state_topic(node));
+        let workload_snapshot = workload_body
+            .as_deref()
+            .and_then(|body| decode_workload_snapshot(body, node, now_ms).ok());
+        adapt_app_vm_body(
+            node,
+            &source_id,
+            body.as_deref(),
+            workload_snapshot.as_ref(),
+            now_ms,
+            adapted,
+        );
     }
 }
 
@@ -390,6 +401,7 @@ fn adapt_app_vm_body(
     node: &str,
     source_id: &str,
     body: Option<&str>,
+    workload_snapshot: Option<&WorkloadStateSnapshot>,
     now_ms: u64,
     adapted: &mut AdaptedSources,
 ) {
@@ -461,18 +473,37 @@ fn adapt_app_vm_body(
         .entries
         .iter()
         .map(|entry| {
-            projection_card(
+            let readiness =
+                app_vm_readiness(node, projection.revision, entry, workload_snapshot, now_ms);
+            let mut card = projection_card(
                 ResourceClass::Application,
                 format!("app-vm/{node}/{}", entry.app_id),
                 entry.display_name.clone(),
                 format!("Signed App VM catalog on {node}"),
                 now_ms,
                 expires,
-                HealthStatus::Available,
-                None,
+                readiness.health,
+                readiness.failure,
                 format!("app-vm/{node}/{}", entry.app_id),
                 vec![ResourceOperatingRole::Client, ResourceOperatingRole::Loader],
-            )
+            )?;
+            card.actions = vec![inspect_action(now_ms, expires)];
+            if let Some(generation) = readiness.launch_generation {
+                card.actions.push(ResourceAction {
+                    schema_version: RESOURCE_CONTRACT_VERSION,
+                    action_id: format!("launch-g{generation}"),
+                    verb: ResourceActionVerb::Launch,
+                    target: ResourceActionTarget::Resource,
+                    availability: ActionAvailability {
+                        status: ActionAvailabilityStatus::Ready,
+                        failure: None,
+                    },
+                    issued_at_ms: now_ms,
+                    expires_at_ms: expires,
+                });
+            }
+            card.validate().map_err(|error| error.to_string())?;
+            Ok(card)
         })
         .collect::<Result<Vec<_>, _>>();
     admit_source_cards(
@@ -482,6 +513,91 @@ fn adapt_app_vm_body(
         cards,
         adapted,
     );
+}
+
+struct AppVmReadiness {
+    health: HealthStatus,
+    failure: Option<FailureReason>,
+    launch_generation: Option<u64>,
+}
+
+/// Join an admitted App row to the sole typed Workload runtime authority.
+///
+/// The catalog proves metadata and launch intent, but never proves that an
+/// image exists or that a guest is ready.  A runtime row must bind the exact
+/// serving node, App ID, catalog revision, and guest-profile image before it
+/// can make the App available.  Ambiguous matches fail closed.
+fn app_vm_readiness(
+    node: &str,
+    catalog_revision: u64,
+    entry: &AdmittedFlatpakAppProjection,
+    workload_snapshot: Option<&WorkloadStateSnapshot>,
+    now_ms: u64,
+) -> AppVmReadiness {
+    if !entry
+        .supported_actions
+        .iter()
+        .any(|action| action == "launch")
+    {
+        return unavailable_app_vm("signed App catalog does not admit launch");
+    }
+    let Some(snapshot) = workload_snapshot else {
+        return unavailable_app_vm("App VM workload readiness has not been observed");
+    };
+    if now_ms.saturating_sub(snapshot.observed_at_ms) >= SOURCE_TTL_MS {
+        return AppVmReadiness {
+            health: HealthStatus::Stale,
+            failure: Some(failure(
+                FailureCode::Stale,
+                "App VM workload readiness is stale",
+            )),
+            launch_generation: None,
+        };
+    }
+
+    let identity_prefix = format!("app-vm:{node}:");
+    let identity_suffix = format!(":{}:catalog-{catalog_revision}", entry.app_id);
+    let image_prefix = format!("app-vm-{}:", entry.guest_profile);
+    let mut matches = snapshot.workloads.iter().filter(|workload| {
+        let workload_id = workload.workload_id.as_str();
+        workload.backend.is_vm()
+            && workload_id.starts_with(&identity_prefix)
+            && workload_id.ends_with(&identity_suffix)
+            && workload_id
+                .strip_prefix(&identity_prefix)
+                .and_then(|identity| identity.strip_suffix(&identity_suffix))
+                .is_some_and(|name| !name.is_empty() && is_safe_id(name))
+            && workload.image_ref.as_deref().is_some_and(|image_ref| {
+                image_ref
+                    .strip_prefix(&image_prefix)
+                    .is_some_and(|version| !version.is_empty() && is_safe_id(version))
+            })
+    });
+    let Some(workload) = matches.next() else {
+        return unavailable_app_vm("App VM image/profile readiness is unavailable");
+    };
+    if matches.next().is_some() {
+        return unavailable_app_vm("App VM workload readiness identity is ambiguous");
+    }
+
+    let (health, failure) = workload_health(workload);
+    let launch_generation = (workload.phase == WorkloadOperationPhase::Ready
+        && workload.power == WorkloadPowerState::Running
+        && workload.readiness == WorkloadReadiness::Ready)
+        .then_some(workload.generation);
+    AppVmReadiness {
+        health,
+        failure,
+        launch_generation,
+    }
+}
+
+fn unavailable_app_vm(message: &'static str) -> AppVmReadiness {
+    AppVmReadiness {
+        health: HealthStatus::Unavailable,
+        failure: Some(failure(FailureCode::NotObserved, message)),
+        launch_generation: None,
+    }
 }
 
 fn valid_app_projection(entry: &AdmittedFlatpakAppProjection) -> bool {
@@ -1646,6 +1762,27 @@ mod tests {
         }
     }
 
+    fn app_vm_workload(
+        app_id: &str,
+        catalog_revision: u64,
+        guest_profile: &str,
+    ) -> WorkloadOperationStatus {
+        let mut workload = workload(&format!(
+            "app-vm:seat193:writer:{app_id}:catalog-{catalog_revision}"
+        ));
+        workload.image_ref = Some(format!("app-vm-{guest_profile}:2026.08.13"));
+        workload
+    }
+
+    fn workload_snapshot(workloads: Vec<WorkloadOperationStatus>) -> WorkloadStateSnapshot {
+        WorkloadStateSnapshot {
+            schema_version: 1,
+            node: "seat193".into(),
+            observed_at_ms: NOW - 1_000,
+            workloads,
+        }
+    }
+
     #[test]
     fn ambiguous_peer_identity_cannot_authorize_downstream_resource_reads() {
         let first = peer("alpha");
@@ -2109,6 +2246,7 @@ mod tests {
             "seat193",
             "app-vm-catalog/seat193",
             Some(&body),
+            None,
             NOW,
             &mut adapted,
         );
@@ -2117,6 +2255,109 @@ mod tests {
         let wire = serde_json::to_string(&catalog).unwrap();
         assert!(!wire.contains("wayland-standard"));
         assert!(!wire.contains("launch"));
+    }
+
+    #[test]
+    fn app_vm_cards_require_exact_typed_workload_readiness_before_launch() {
+        let projection = app_projection("Writer");
+        let body = serde_json::to_string(&projection).unwrap();
+
+        let cases = [
+            (None, HealthStatus::Unavailable),
+            (
+                Some(workload_snapshot(vec![app_vm_workload(
+                    "org.example.Writer",
+                    projection.revision,
+                    "substituted-profile",
+                )])),
+                HealthStatus::Unavailable,
+            ),
+            (
+                Some(workload_snapshot(vec![app_vm_workload(
+                    "org.example.Reader",
+                    projection.revision,
+                    "wayland-standard",
+                )])),
+                HealthStatus::Unavailable,
+            ),
+        ];
+        for (snapshot, expected_health) in cases {
+            let mut adapted = AdaptedSources::default();
+            adapt_app_vm_body(
+                "seat193",
+                "app-vm-catalog/seat193",
+                Some(&body),
+                snapshot.as_ref(),
+                NOW,
+                &mut adapted,
+            );
+            assert_eq!(adapted.cards.len(), 1);
+            assert_eq!(adapted.cards[0].health.status, expected_health);
+            assert!(adapted.cards[0]
+                .actions
+                .iter()
+                .all(|action| action.verb != ResourceActionVerb::Launch));
+        }
+
+        let ready = workload_snapshot(vec![app_vm_workload(
+            "org.example.Writer",
+            projection.revision,
+            "wayland-standard",
+        )]);
+        let mut inspect_only_projection = projection.clone();
+        inspect_only_projection.entries[0].supported_actions = vec!["inspect".into()];
+        let inspect_only_body = serde_json::to_string(&inspect_only_projection).unwrap();
+        let mut inspect_only = AdaptedSources::default();
+        adapt_app_vm_body(
+            "seat193",
+            "app-vm-catalog/seat193",
+            Some(&inspect_only_body),
+            Some(&ready),
+            NOW,
+            &mut inspect_only,
+        );
+        assert_eq!(
+            inspect_only.cards[0].health.status,
+            HealthStatus::Unavailable
+        );
+        assert!(inspect_only.cards[0]
+            .actions
+            .iter()
+            .all(|action| action.verb != ResourceActionVerb::Launch));
+
+        let mut adapted = AdaptedSources::default();
+        adapt_app_vm_body(
+            "seat193",
+            "app-vm-catalog/seat193",
+            Some(&body),
+            Some(&ready),
+            NOW,
+            &mut adapted,
+        );
+        let card = &adapted.cards[0];
+        assert_eq!(card.health.status, HealthStatus::Available);
+        assert!(card.actions.iter().any(|action| {
+            action.verb == ResourceActionVerb::Launch
+                && action.action_id == "launch-g1"
+                && action.availability.status == ActionAvailabilityStatus::Ready
+        }));
+
+        let mut stale = ready;
+        stale.observed_at_ms = NOW - SOURCE_TTL_MS;
+        let mut adapted = AdaptedSources::default();
+        adapt_app_vm_body(
+            "seat193",
+            "app-vm-catalog/seat193",
+            Some(&body),
+            Some(&stale),
+            NOW,
+            &mut adapted,
+        );
+        assert_eq!(adapted.cards[0].health.status, HealthStatus::Stale);
+        assert!(adapted.cards[0]
+            .actions
+            .iter()
+            .all(|action| action.verb != ResourceActionVerb::Launch));
     }
 
     #[test]
@@ -2277,7 +2518,14 @@ mod tests {
     #[test]
     fn absent_named_sources_are_unavailable_not_empty_success() {
         let mut adapted = AdaptedSources::default();
-        adapt_app_vm_body("seat193", "app-vm-catalog/seat193", None, NOW, &mut adapted);
+        adapt_app_vm_body(
+            "seat193",
+            "app-vm-catalog/seat193",
+            None,
+            None,
+            NOW,
+            &mut adapted,
+        );
         adapt_android_body(
             "seat193",
             "android-catalog/seat193",
