@@ -18,6 +18,22 @@ pub const MAX_REVISION_BYTES: usize = 96;
 pub const MAX_TILE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ZOOM: u8 = 22;
 
+fn revision_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REVISION_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogError {
     Oversized,
@@ -145,10 +161,7 @@ impl VerifiedCatalog {
         let mut identities = BTreeSet::new();
         for region in &document.regions {
             RegionId::parse(region.region_id.0.clone())?;
-            if region.revision.is_empty()
-                || region.revision.len() > MAX_REVISION_BYTES
-                || region.revision.chars().any(char::is_control)
-            {
+            if !revision_is_safe(&region.revision) {
                 return Err(CatalogError::Policy("region revision is invalid"));
             }
             if region.min_zoom > region.max_zoom || region.max_zoom > MAX_ZOOM {
@@ -179,7 +192,7 @@ impl VerifiedCatalog {
                 region.region_id == tile.region
                     && tile.z >= region.min_zoom
                     && tile.z <= region.max_zoom
-                    && now_ms <= region.expires_at_ms
+                    && now_ms < region.expires_at_ms
             })
     }
 }
@@ -291,8 +304,8 @@ mod tests {
         let catalog = VerifiedCatalog::admit_json(&bytes, &sha256_hex(&bytes)).unwrap();
         let tile = TileId::new(RegionId::parse("east-texas").unwrap(), 12, 957, 1661).unwrap();
         assert_eq!(tile.stable_identity(), "east-texas/12/957/1661");
-        assert!(catalog.permits(&tile, 2_000));
-        assert!(!catalog.permits(&tile, 2_001));
+        assert!(catalog.permits(&tile, 1_999));
+        assert!(!catalog.permits(&tile, 2_000));
     }
 
     #[test]
@@ -305,6 +318,31 @@ mod tests {
         assert!(VerifiedCatalog::admit_json(duplicate, &sha256_hex(duplicate)).is_err());
         let bytes = catalog_json();
         assert!(VerifiedCatalog::admit_json(&bytes, &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn ambiguous_revision_provenance_fails_closed() {
+        for revision in [
+            " 2026-08",
+            "2026-08 ",
+            "2026 08",
+            "2026/08",
+            "2026\u{2010}08",
+            ".2026-08",
+            "2026-08.",
+        ] {
+            let bytes = format!(
+                r#"{{"schema":1,"provider":"openstreetmap-derived","regions":[{{"region_id":"east-texas","revision":"{revision}","min_zoom":0,"max_zoom":18,"expires_at_ms":2000}}]}}"#
+            );
+            assert!(
+                VerifiedCatalog::admit_json(bytes.as_bytes(), &sha256_hex(bytes.as_bytes()))
+                    .is_err(),
+                "accepted ambiguous revision {revision:?}"
+            );
+        }
+
+        let bytes = catalog_json();
+        assert!(VerifiedCatalog::admit_json(&bytes, &sha256_hex(&bytes)).is_ok());
     }
 
     #[test]
