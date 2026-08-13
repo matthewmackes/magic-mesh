@@ -1122,8 +1122,52 @@ fn short_node(path: Option<&str>) -> String {
         .to_string()
 }
 
-/// Battery / power supplies (`/sys/class/power_supply/*`), each carrying its
-/// type + charge as an event line.
+const MAX_POWER_IDENTITY_BYTES: usize = 128;
+
+fn power_identity(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        value.len() <= MAX_POWER_IDENTITY_BYTES
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    })
+}
+
+fn power_supply_type(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        matches!(
+            value.as_str(),
+            "Unknown"
+                | "Battery"
+                | "UPS"
+                | "Mains"
+                | "USB"
+                | "USB_DCP"
+                | "USB_CDP"
+                | "USB_ACA"
+                | "USB_C"
+                | "USB_PD"
+                | "USB_PD_DRP"
+                | "BrickID"
+                | "Wireless"
+        )
+    })
+}
+
+fn power_supply_status(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        matches!(
+            value.as_str(),
+            "Unknown" | "Charging" | "Discharging" | "Not charging" | "Full"
+        )
+    })
+}
+
+/// Battery / power supplies (`/sys/class/power_supply/*`).
+///
+/// Only the kernel ABI's bounded enumerations and numeric ranges cross the
+/// provider boundary. Missing or malformed core state is published as an
+/// unavailable row rather than a fabricated healthy supply.
 #[must_use]
 pub fn power_supplies(roots: &SysfsRoots) -> Vec<DeviceRecord> {
     let mut out = Vec::new();
@@ -1136,19 +1180,58 @@ pub fn power_supplies(roots: &SysfsRoots) -> Vec<DeviceRecord> {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        let kind = read_trim(&dir.join("type")).unwrap_or_else(|| "Power".to_string());
-        let model = read_trim(&dir.join("model_name"));
-        let vendor = read_trim(&dir.join("manufacturer"));
-        let disp = model.clone().unwrap_or_else(|| format!("{kind} ({node})"));
+        let kind = power_supply_type(read_trim(&dir.join("type")));
+        let model = power_identity(read_trim(&dir.join("model_name")));
+        let vendor = power_identity(read_trim(&dir.join("manufacturer")));
+        let disp = model.clone().unwrap_or_else(|| {
+            kind.as_deref().map_or_else(
+                || format!("Power supply ({node})"),
+                |kind| format!("{kind} ({node})"),
+            )
+        });
+        let capacity = read_trim(&dir.join("capacity"))
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|capacity| *capacity <= 100);
+        let supply_status = power_supply_status(read_trim(&dir.join("status")));
+        let online = read_trim(&dir.join("online")).and_then(|value| match value.as_str() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        });
+        let state_available = match kind.as_deref() {
+            Some("Battery") | Some("UPS") => {
+                capacity.is_some()
+                    && supply_status
+                        .as_deref()
+                        .is_some_and(|status| status != "Unknown")
+            }
+            Some("Unknown") | None => false,
+            Some(_) => online.is_some(),
+        };
+        let status = if state_available {
+            DeviceStatus::Ok
+        } else {
+            DeviceStatus::Unknown
+        };
         let mut rec = DeviceRecord {
             vendor,
             model,
             sysfs_path: Some(dir.to_string_lossy().into_owned()),
-            ..DeviceRecord::new(disp, DeviceStatus::Ok)
+            problem: (!state_available).then(|| "power supply state unavailable".to_string()),
+            ..DeviceRecord::new(disp, status)
         };
-        if let Some(cap) = read_trim(&dir.join("capacity")) {
-            let st = read_trim(&dir.join("status")).unwrap_or_default();
-            rec.events.push(format!("{cap}% {st}").trim().to_string());
+        if let Some(kind) = kind {
+            rec.events.push(format!("type: {kind}"));
+        }
+        if let Some(capacity) = capacity {
+            rec.events.push(format!("capacity: {capacity}%"));
+        }
+        if let Some(supply_status) = supply_status {
+            rec.events.push(format!("status: {supply_status}"));
+        }
+        if let Some(online) = online {
+            rec.events
+                .push(format!("online: {}", if online { "yes" } else { "no" }));
         }
         out.push(rec);
     }
@@ -1898,6 +1981,46 @@ mod tests {
         assert_eq!(records.len(), MAX_POWER_SUPPLIES);
         assert_eq!(records[0].name, "Model 0");
         assert_eq!(records.last().unwrap().name, "Model 63");
+    }
+
+    #[test]
+    fn power_supply_provider_reports_unavailable_and_filters_hostile_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let power = roots.sys.join("class/power_supply");
+
+        let battery = power.join("BAT0");
+        put(&battery.join("type"), "Battery\n");
+        put(&battery.join("model_name"), "Honest Battery\n");
+        put(&battery.join("manufacturer"), "ACME\n");
+        put(&battery.join("capacity"), "73\n");
+        put(&battery.join("status"), "Discharging\n");
+
+        let unavailable = power.join("BAT1");
+        put(&unavailable.join("type"), "Battery\n");
+        put(&unavailable.join("capacity"), "101\n");
+        put(&unavailable.join("status"), "credential=do-not-publish\n");
+        put(
+            &unavailable.join("manufacturer"),
+            &format!("{}\n", "x".repeat(MAX_POWER_IDENTITY_BYTES + 1)),
+        );
+
+        let records = power_supplies(&roots);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].status, DeviceStatus::Ok);
+        assert_eq!(
+            records[0].events,
+            ["type: Battery", "capacity: 73%", "status: Discharging"]
+        );
+        assert_eq!(records[1].status, DeviceStatus::Unknown);
+        assert_eq!(
+            records[1].problem.as_deref(),
+            Some("power supply state unavailable")
+        );
+        let published = serde_json::to_string(&records[1]).unwrap();
+        assert!(!published.contains("credential"));
+        assert!(!published.contains(&"x".repeat(MAX_POWER_IDENTITY_BYTES + 1)));
+        assert!(!published.contains("101%"));
     }
 
     #[test]
