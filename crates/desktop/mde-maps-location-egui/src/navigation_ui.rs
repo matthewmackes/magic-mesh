@@ -124,6 +124,11 @@ impl NavigationConsumer {
             destination,
         });
         self.wire_action = None;
+        // A replacement destination invalidates the prior route immediately.
+        // Waiting for the daemon's Calculating projection would leave the old
+        // geometry and maneuver visible under a RouteQueued status, presenting
+        // guidance for a destination the operator has already replaced.
+        self.route = None;
         self.status = NavigationRouteStatus::RouteQueued;
         self.refusal = None;
     }
@@ -420,6 +425,25 @@ mod tests {
         assert_eq!(action.topic, navigation_cancel_action_topic("seat-1"));
         let request = CancelNavigationRequest::from_json_at(action.body.as_bytes(), NOW).unwrap();
         assert_eq!(request.expected_generation, 4);
+    }
+
+    #[test]
+    fn replacement_request_retracts_prior_route_before_publication() {
+        let mut state = NavigationConsumer::default();
+        assert!(state.fold("seat-1", snapshot("seat-1", 4, active_phase("req-1")), NOW));
+        assert!(state.route().is_some());
+
+        state.request_route(
+            endpoint("Current position", 40.0),
+            endpoint("New stop", 40.2),
+        );
+
+        assert_eq!(state.status(), &NavigationRouteStatus::RouteQueued);
+        assert_eq!(state.route(), None);
+        let action = state.prepare_action("seat-1", NOW + 1).unwrap();
+        let request = RouteRequest::from_json_at(action.body.as_bytes(), NOW + 1).unwrap();
+        assert_eq!(request.expected_generation, 4);
+        assert_eq!(request.destination.label, "New stop");
     }
 
     #[test]
