@@ -947,6 +947,20 @@ systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
 # Surface exposed that duplicate live. Remove the global edge and select the
 # first production seat identity. Direct user-bus calls avoid systemctl's
 # broken `--machine=user@` transient-unit bridge on current Fedora seats.
+# Materialize the public verification key before starting mde-musicd: its
+# Authorizer loads that key once, so starting first leaves every Music mutation
+# fail-closed until a later daemon restart. Also establish the selected user's
+# lingering manager before the first user-systemctl call; a fresh install has no
+# login session and the old helper silently skipped activation when its Bus was
+# absent.
+# Invoke the materializer directly so its result remains observable.  The
+# packaged oneshot intentionally treats a missing sealed seed as best-effort at
+# boot, which makes `systemctl restart` unsuitable as an authorization gate.
+mcnf_music_authorized=0
+if timeout 45 /usr/libexec/mackesd/provision-music-action-credential --refresh \
+     >/dev/null 2>&1 && [ -s /etc/mde/music-action-public-key ]; then
+  mcnf_music_authorized=1
+fi
 systemctl --global disable mde-musicd.service >/dev/null 2>&1 || :
 mcnf_user_systemctl() {
   mcnf_user="$1"
@@ -956,7 +970,7 @@ mcnf_user_systemctl() {
   runuser -u "$mcnf_user" -- env \
     XDG_RUNTIME_DIR="/run/user/$mcnf_uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$mcnf_uid/bus" \
-    systemctl --user "$@" >/dev/null 2>&1 || :
+    systemctl --user "$@" >/dev/null 2>&1
 }
 mcnf_music_seat_user=
 for candidate in mm mde; do
@@ -965,14 +979,27 @@ for candidate in mm mde; do
     break
   fi
 done
+if [ -n "$mcnf_music_seat_user" ]; then
+  loginctl enable-linger "$mcnf_music_seat_user" >/dev/null 2>&1 || :
+  mcnf_music_uid="$(id -u "$mcnf_music_seat_user" 2>/dev/null || :)"
+  if [ -z "$mcnf_music_uid" ] || \
+     ! systemctl start "user@$mcnf_music_uid.service" >/dev/null 2>&1 || \
+     [ ! -S "/run/user/$mcnf_music_uid/bus" ]; then
+    mcnf_music_authorized=0
+  fi
+fi
 for candidate in root mm mde; do
   id "$candidate" >/dev/null 2>&1 || continue
   if [ "$candidate" = "$mcnf_music_seat_user" ]; then
-    mcnf_user_systemctl "$candidate" daemon-reload
-    mcnf_user_systemctl "$candidate" enable mde-musicd.service
-    mcnf_user_systemctl "$candidate" restart mde-musicd.service
+    if [ "$mcnf_music_authorized" -eq 1 ]; then
+      mcnf_user_systemctl "$candidate" daemon-reload && \
+      mcnf_user_systemctl "$candidate" enable mde-musicd.service && \
+      mcnf_user_systemctl "$candidate" restart mde-musicd.service || :
+    else
+      mcnf_user_systemctl "$candidate" disable --now mde-musicd.service || :
+    fi
   else
-    mcnf_user_systemctl "$candidate" disable --now mde-musicd.service
+    mcnf_user_systemctl "$candidate" disable --now mde-musicd.service || :
   fi
 done
 # AUDIO-SEAT — compositor-less DRM Workstations do not have a desktop login
@@ -1004,8 +1031,8 @@ if getent group audio >/dev/null 2>&1; then
     fi
   done
   if [ -n "$mcnf_audio_seat_user" ]; then
-    mcnf_user_systemctl "$mcnf_audio_seat_user" daemon-reload
-    mcnf_user_systemctl "$mcnf_audio_seat_user" enable --now mcnf-qemu-pulse-endpoint.service
+    mcnf_user_systemctl "$mcnf_audio_seat_user" daemon-reload || :
+    mcnf_user_systemctl "$mcnf_audio_seat_user" enable --now mcnf-qemu-pulse-endpoint.service || :
   fi
 fi
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
@@ -1081,6 +1108,11 @@ alsa-lib = "*"
 # declare both so the enabled provisioning service cannot fail on a fresh seat.
 openssl = "*"
 curl = "*"
+# WL-FUNC-017 — daemon-owned NWS/weather HTTPS uses rustls-native-certs and
+# therefore reads Fedora's system trust store at runtime.  Source/farm hosts
+# already carry it, but a minimal fresh RPM install must not depend on that
+# ambient image state or every trusted weather provider fails closed.
+ca-certificates = "*"
 # WL-FUNC-020 — Android release admission dearmors the installed project key
 # and verifies one detached guest-artifact signature before provisioning.
 # Fedora splits those commands, so both are hard runtime requirements.

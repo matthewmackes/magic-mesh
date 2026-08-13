@@ -34,6 +34,7 @@
 #                                                        # and reject retired Timers payload
 #   install-helpers/verify-rpm-payload.sh requirements            # pin source metadata for base VDI-host hard Requires
 #   install-helpers/verify-rpm-payload.sh requirements a.rpm      # also inspect a built RPM's actual Requires header
+#   install-helpers/verify-rpm-payload.sh music-package           # Music payload + fresh-install activation contract
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
 #   install-helpers/verify-rpm-payload.sh candidate-payload # credential payload in base + lighthouse candidates
 #   install-helpers/verify-rpm-payload.sh app-vm-payload [a.rpm] # exact App VM guest bootstrap payload
@@ -135,6 +136,13 @@ readonly CANDIDATE_CREDENTIAL_ASSETS=(
   "packaging/systemd/resource-publisher-hmac.conf|/usr/libexec/mackesd/resource-publisher-hmac.conf"
   "packaging/systemd/mcnf-resource-publisher-credential.service|/usr/lib/systemd/system/mcnf-resource-publisher-credential.service"
 )
+readonly MUSIC_PACKAGE_ASSETS=(
+  "target/release/mde-musicd|/usr/bin/mde-musicd"
+  "install-helpers/provision-music-action-credential.sh|/usr/libexec/mackesd/provision-music-action-credential"
+  "packaging/systemd/music-action-credential.conf|/usr/libexec/mackesd/music-action-credential.conf"
+  "packaging/systemd/mcnf-music-action-credential.service|/usr/lib/systemd/system/mcnf-music-action-credential.service"
+  "packaging/systemd/mde-musicd.service|/usr/lib/systemd/user/mde-musicd.service"
+)
 readonly BASE_VDI_HOST_REQUIRES=(
   "libvirt"
   "podman"
@@ -150,6 +158,7 @@ readonly BUILT_RPM_KVM_REQUIRES=(
   "libvirt-daemon-kvm"
 )
 readonly SERVER_WORKLOAD_REQUIRES=("podman")
+readonly MAPS_WEATHER_REQUIRES=("ca-certificates")
 readonly APP_VM_BOOTSTRAP_SOURCE="infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 readonly APP_VM_BOOTSTRAP_DEST="/usr/share/mde/iac/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 readonly APP_VM_BOOTSTRAP_MARKERS=(
@@ -336,6 +345,70 @@ check_candidate_credential_assets() {
   done
 }
 
+# WL-FUNC-021 — source-tested Music is not install-ready unless the daemon,
+# authorization materializer, and both service assets ship together. The RPM
+# lifecycle must materialize the verification key and establish the seat user
+# manager before activating mde-musicd because its Authorizer reads the key only
+# once at process start.
+check_music_package() {
+  hdr "Music first-install payload and activation"
+  local source dest pair expected expected_dest
+  local -A present=()
+  while IFS=$'\t' read -r source dest; do
+    [ -n "$source" ] && present["$source"]="$dest"
+  done < <(parse_assets "$CARGO_TOML")
+  for pair in "${MUSIC_PACKAGE_ASSETS[@]}"; do
+    expected="${pair%%|*}"
+    expected_dest="${pair#*|}"
+    if [ "${present["$expected"]:-}" = "$expected_dest" ]; then
+      ok "music asset    $expected -> $expected_dest"
+    else
+      fail "music asset    $expected MISSING or has the wrong destination"
+    fi
+  done
+
+  if python3 - "$CARGO_TOML" <<'PY'
+import pathlib
+import sys
+
+manifest = pathlib.Path(sys.argv[1]).read_text()
+marker = 'post_install_script = """'
+start = manifest.find(marker)
+if start < 0:
+    print("RPM post_install_script missing", file=sys.stderr)
+    raise SystemExit(1)
+start += len(marker)
+end = manifest.find('"""', start)
+if end < 0:
+    print("RPM post_install_script is unterminated", file=sys.stderr)
+    raise SystemExit(1)
+text = manifest[start:end]
+tokens = [
+    '/usr/libexec/mackesd/provision-music-action-credential --refresh',
+    'mcnf_music_authorized=1',
+    'loginctl enable-linger "$mcnf_music_seat_user"',
+    'systemctl start "user@$mcnf_music_uid.service"',
+    '[ ! -S "/run/user/$mcnf_music_uid/bus" ]',
+    'if [ "$mcnf_music_authorized" -eq 1 ]',
+    'mcnf_user_systemctl "$candidate" enable mde-musicd.service',
+    'mcnf_user_systemctl "$candidate" restart mde-musicd.service',
+]
+positions = [text.find(token) for token in tokens]
+if any(position < 0 for position in positions):
+    missing = [token for token, position in zip(tokens, positions) if position < 0]
+    print("Music activation token missing: " + ", ".join(missing), file=sys.stderr)
+    raise SystemExit(1)
+if positions != sorted(positions):
+    print("Music activation order is unsafe: credential/user manager must precede daemon activation", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    ok "music activation materializes authorization and starts the seat manager before daemon activation"
+  else
+    fail "music activation does not establish authorization and user-manager authority before mde-musicd"
+  fi
+}
+
 # Emit each direct key in a TOML table. This intentionally stops at the next
 # table so a package present only in Recommends cannot satisfy a hard-Requires
 # assertion.
@@ -368,6 +441,15 @@ check_vdi_host_requires() {
       ok "hard-requires  $package"
     else
       fail "hard-requires  $package MISSING from [package.metadata.generate-rpm.requires]"
+    fi
+  done
+
+  hdr "Maps weather HTTPS trust — base RPM hard Requires"
+  for package in "${MAPS_WEATHER_REQUIRES[@]}"; do
+    if [ -n "${seen["$package"]:-}" ]; then
+      ok "maps hard-requires  $package"
+    else
+      fail "maps hard-requires  $package MISSING from [package.metadata.generate-rpm.requires]"
     fi
   done
 
@@ -732,6 +814,7 @@ check_payload_dryrun() {
   check_browser_vm_payload
   check_grouped_mackesd_assets
   check_candidate_credential_assets
+  check_music_package
 }
 
 # Read the RPM file list (real, or a fake listing for --self-test).
@@ -1174,6 +1257,7 @@ qemu-kvm = "*"
 qemu-ui-dbus = "*"
 libvirt-daemon-kvm = "*"
 libvirt-daemon-driver-storage = "*"
+ca-certificates = "*"
 [package.metadata.generate-rpm.variants.server]
 assets = [
     { source = "target/release/should-be-ignored", dest = "/usr/bin/should-be-ignored", mode = "755" },
@@ -1224,8 +1308,9 @@ TOML
       && grep -q "qemu-ui-dbus MISSING" <<<"$out" \
       && grep -q "libvirt-daemon-kvm MISSING" <<<"$out" \
       && grep -q "hard-requires  podman MISSING" <<<"$out" \
+      && grep -q "maps hard-requires  ca-certificates MISSING" <<<"$out" \
       && grep -q "server hard-requires  podman MISSING" <<<"$out"; then
-    ok "self-test: weak-only Workloads/KVM dependencies fail the hard-Requires gate"
+    ok "self-test: weak-only Workloads/KVM and absent Maps trust dependencies fail the hard-Requires gate"
   else
     fail "self-test: weak-only Fedora KVM dependencies were not rejected"; st_fail=1
   fi
@@ -1376,6 +1461,18 @@ TOML
     fail "self-test: did not flag the dropped shell key-bin"; st_fail=1
   fi
 
+  # The production manifest is the fixture because this contract spans its
+  # literal RPM lifecycle script. Removing the credential restart must make the
+  # focused Music package gate fail before any RPM is cut.
+  local music_bad="$tmp/music-bad.toml"
+  sed '\|/usr/libexec/mackesd/provision-music-action-credential --refresh|d' "$CARGO_TOML" >"$music_bad"
+  out="$(CARGO_TOML="$music_bad" bash "$0" music-package 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "Music activation token missing" <<<"$out"; then
+    ok "self-test: daemon-before-credential Music activation is rejected"
+  else
+    fail "self-test: unsafe Music fresh-install activation escaped the package gate"; st_fail=1
+  fi
+
   # ---- fixture C: surface reachability on a synthetic desktop tree ----------
   local dt="$tmp/desktop"
   mkdir -p "$dt/mde-shell-egui/src" "$dt/mde-good-egui" "$dt/mde-orphan-egui"
@@ -1470,6 +1567,7 @@ main() {
     overlay-claims-package) check_overlay_claims_package ;;
     grouped-process) check_grouped_mackesd_assets ;;
     candidate-payload) check_candidate_credential_assets ;;
+    music-package) check_music_package ;;
     app-vm-payload) shift; check_app_vm_payload "${1:-}" ;;
     android-vm-payload) shift; check_android_vm_payload "${1:-}" ;;
     browser-vm-payload) shift; check_browser_vm_payload "${1:-}" ;;
