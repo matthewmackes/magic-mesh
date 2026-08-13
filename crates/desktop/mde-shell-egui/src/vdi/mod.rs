@@ -1143,6 +1143,7 @@ enum RdpClipboardPayload {
     Text(String),
     Html(String),
     Image,
+    File { name: String },
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1632,11 +1633,45 @@ fn read_latest_rdp_host_clipboard(
         {
             return Err("RDP image clipboard command has no bounded Files payload".to_owned());
         }
-        RdpClipboardPayload::Image
+        if let Some(name) = rdp_host_file_name(
+            &command.envelope.mime_offers,
+            &command.selected_mime,
+            &command.envelope.content_hash,
+        )? {
+            RdpClipboardPayload::File { name }
+        } else {
+            RdpClipboardPayload::Image
+        }
     } else {
         return Err("RDP clipboard command refused: unsupported MIME representation".to_owned());
     };
     Ok(Some((command, payload)))
+}
+
+#[cfg(feature = "live-vdi")]
+fn rdp_host_file_name(
+    mime_offers: &[String],
+    selected_mime: &str,
+    content_hash: &str,
+) -> Result<Option<String>, String> {
+    if !mime_offers
+        .iter()
+        .any(|mime| mime.eq_ignore_ascii_case(VDI_GUEST_FILES_MIME))
+    {
+        return Ok(None);
+    }
+    let extension = if selected_mime.eq_ignore_ascii_case("image/png") {
+        "png"
+    } else if selected_mime.eq_ignore_ascii_case("image/jpeg") {
+        "jpg"
+    } else {
+        return Err("RDP file clipboard command has no supported representation".to_owned());
+    };
+    let digest_prefix = content_hash
+        .get(..12)
+        .filter(|prefix| prefix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "RDP file clipboard command has an invalid digest".to_owned())?;
+    Ok(Some(format!("Clipboard-{digest_prefix}.{extension}")))
 }
 
 /// Ask the single daemon Files authority for one descriptor after the shell's
@@ -2251,6 +2286,16 @@ fn run_live_rdp(
                     let dib = rdp_image_to_dibv5(&command.selected_mime, &source)
                         .map_err(ConnectError::Clipboard)?;
                     conn.send_dibv5_clipboard_to_guest(dib)
+                }
+                RdpClipboardPayload::File { name } => {
+                    let root = clipboard_root.as_deref().ok_or_else(|| {
+                        ConnectError::Clipboard(
+                            "RDP file clipboard Bus root is unavailable".to_owned(),
+                        )
+                    })?;
+                    let source = materialize_rdp_image_from_files(root, &command)
+                        .map_err(ConnectError::Clipboard)?;
+                    conn.send_file_clipboard_to_guest(name.clone(), source)
                 }
             }) {
                 Ok(RdpClipboardMaterialization::Pending) => {
@@ -5137,6 +5182,21 @@ mod guest_files_materialization_tests {
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(!encoded.contains("report.txt"));
         assert!(!encoded.contains("/home/"));
+    }
+
+    #[test]
+    fn host_file_offer_uses_governed_metadata_not_a_host_path() {
+        let offers = vec!["image/png".into(), VDI_GUEST_FILES_MIME.into()];
+        let name = rdp_host_file_name(
+            &offers,
+            "image/png",
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        )
+        .expect("valid metadata")
+        .expect("native file offer");
+        assert_eq!(name, "Clipboard-aabbccddeeff.png");
+        assert!(!name.contains('/'));
+        assert!(rdp_host_file_name(&offers, "image/png", "../host").is_err());
     }
 }
 

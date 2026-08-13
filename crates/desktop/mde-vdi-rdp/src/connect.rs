@@ -932,6 +932,27 @@ impl RdpConnection {
         self.announce_clipboard_offer()
     }
 
+    /// Offer one permission-approved Files object through native CLIPRDR
+    /// delayed rendering. Only metadata is announced; guest SIZE/RANGE
+    /// requests are served from the exact bounded bytes retained by the bridge.
+    pub fn send_file_clipboard_to_guest(
+        &mut self,
+        name: String,
+        data: Vec<u8>,
+    ) -> Result<(), ConnectError> {
+        let descriptor = self
+            .clipboard
+            .offer_host_file(name, data)
+            .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        let messages = self
+            .active_stage
+            .get_svc_processor_mut::<CliprdrClient>()
+            .ok_or_else(|| ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into()))?
+            .initiate_file_copy(vec![descriptor])
+            .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        self.write_clipboard_messages(messages)
+    }
+
     fn announce_clipboard_offer(&mut self) -> Result<(), ConnectError> {
         let formats = self.clipboard.advertised_formats();
         let messages = self
@@ -1033,6 +1054,17 @@ impl RdpConnection {
                     ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
                 })?
                 .submit_format_data(response)
+                .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+            self.write_clipboard_messages(messages)?;
+        }
+        while let Some(response) = self.clipboard.take_local_file_response() {
+            let messages = self
+                .active_stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .ok_or_else(|| {
+                    ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
+                })?
+                .submit_file_contents(response)
                 .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
             self.write_clipboard_messages(messages)?;
         }

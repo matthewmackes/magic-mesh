@@ -1,5 +1,6 @@
 //! Bounded Unicode-text and CF_HTML CLIPRDR backend for the live RDP transport.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use ironrdp_cliprdr::backend::CliprdrBackend;
@@ -31,6 +32,8 @@ pub const DIBV5_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId
 const MAX_REMOTE_FORMATS: usize = 256;
 const MAX_REMOTE_FILES: usize = 4_096;
 const REMOTE_FILE_CHUNK_BYTES: u32 = 256 * 1024;
+const MAX_LOCAL_FILE_RESPONSES: usize = 32;
+const LOCAL_FILE_SERVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const CF_HTML_HEADER_SLACK_BYTES: usize = 1024;
 const CF_HTML_PREFIX: &str = "<html><body><!--StartFragment-->";
 const CF_HTML_SUFFIX: &str = "<!--EndFragment--></body></html>";
@@ -223,6 +226,13 @@ struct RemoteFileTransfer {
     request_outstanding: bool,
 }
 
+#[derive(Debug, Clone)]
+struct LocalFileOffer {
+    generation: u64,
+    data: Arc<[u8]>,
+    admitted_at: std::time::Instant,
+}
+
 impl RemoteClipboardFileList {
     /// Admitted file metadata in guest order.
     #[must_use]
@@ -261,12 +271,16 @@ impl RemoteClipboardImage {
 #[derive(Debug, Default)]
 struct ClipboardState {
     ready: bool,
+    file_stream_ready: bool,
     initial_format_list_requested: bool,
     local_generation: u64,
     local_advertised_generation: Option<u64>,
     local_text: Option<String>,
     local_html: Option<Vec<u8>>,
     local_dib: Option<Vec<u8>>,
+    local_file: Option<LocalFileOffer>,
+    locked_local_files: BTreeMap<u32, LocalFileOffer>,
+    local_file_responses: VecDeque<FileContentsResponse<'static>>,
     local_data_request: Option<(FormatDataRequest, Option<u64>)>,
     remote_unicode_offer: Option<RemoteFormat>,
     remote_html_offer: Option<RemoteFormat>,
@@ -358,6 +372,49 @@ impl ClipboardBridge {
         Ok(())
     }
 
+    /// Replace the host offer with one bounded daemon-materialized file.
+    ///
+    /// The shell must obtain `data` from the governed Files descriptor only
+    /// after its one-use permission decision. This boundary retains no path and
+    /// serves only exact delayed-rendering ranges requested by CLIPRDR.
+    pub fn offer_host_file(
+        &self,
+        name: String,
+        data: Vec<u8>,
+    ) -> Result<FileDescriptor, ClipboardBridgeError> {
+        if !safe_host_file_name(&name)
+            || data.is_empty()
+            || data.len() as u64 > MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES
+        {
+            self.revoke_local_offer();
+            return Err(ClipboardBridgeError::InvalidLocalFile);
+        }
+        let mut state = self.lock();
+        if !state.ready || !state.file_stream_ready {
+            drop(state);
+            self.revoke_local_offer();
+            return Err(ClipboardBridgeError::InvalidLocalFile);
+        }
+        state.local_generation = state.local_generation.wrapping_add(1);
+        let generation = state.local_generation;
+        state.local_text = None;
+        state.local_html = None;
+        state.local_dib = None;
+        state.local_file = Some(LocalFileOffer {
+            generation,
+            data: Arc::from(data),
+            admitted_at: std::time::Instant::now(),
+        });
+        state.local_advertised_generation = Some(generation);
+        Ok(FileDescriptor::new(name)
+            .with_file_size(state.local_file.as_ref().map_or(0, |file| file.data.len()) as u64))
+    }
+
+    /// Take one response to a guest's delayed file request.
+    pub fn take_local_file_response(&self) -> Option<FileContentsResponse<'static>> {
+        self.lock().local_file_responses.pop_front()
+    }
+
     /// Return only formats backed by the current local offer.
     #[must_use]
     pub fn advertised_formats(&self) -> Vec<ClipboardFormat> {
@@ -372,6 +429,10 @@ impl ClipboardBridge {
             // classic CF_DIB ID as an alias would let a peer request a
             // different wire format and receive bytes validated only for V5.
             vec![DIBV5_FORMAT]
+        } else if state.local_file.is_some() {
+            // File offers are announced by IronRDP's `initiate_file_copy`,
+            // which owns the registered format IDs and snapshot bookkeeping.
+            Vec::new()
         } else {
             Vec::new()
         }
@@ -545,7 +606,58 @@ impl ClipboardBridge {
         state.local_text = None;
         state.local_html = None;
         state.local_dib = None;
+        state.local_file = None;
+        state.local_advertised_generation = None;
+        state.local_file_responses.clear();
     }
+}
+
+fn safe_host_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 255
+        && !name.chars().any(char::is_control)
+        && !name.contains(['/', '\\'])
+        && !matches!(name, "." | "..")
+}
+
+fn local_file_response(
+    state: &ClipboardState,
+    request: &FileContentsRequest,
+) -> FileContentsResponse<'static> {
+    let file = match request.data_id {
+        Some(data_id) => state.locked_local_files.get(&data_id),
+        None => None,
+    };
+    let Some(file) =
+        file.filter(|file| request.index == 0 && file.admitted_at.elapsed() < LOCAL_FILE_SERVE_TTL)
+    else {
+        return FileContentsResponse::new_error(request.stream_id);
+    };
+    if request.flags == FileContentsFlags::SIZE {
+        if request.position != 0 || request.requested_size != 8 {
+            return FileContentsResponse::new_error(request.stream_id);
+        }
+        return FileContentsResponse::new_size_response(request.stream_id, file.data.len() as u64);
+    }
+    if request.flags != FileContentsFlags::RANGE
+        || request.requested_size == 0
+        || request.requested_size > REMOTE_FILE_CHUNK_BYTES
+    {
+        return FileContentsResponse::new_error(request.stream_id);
+    }
+    let Ok(start) = usize::try_from(request.position) else {
+        return FileContentsResponse::new_error(request.stream_id);
+    };
+    let Some(end) = start.checked_add(request.requested_size as usize) else {
+        return FileContentsResponse::new_error(request.stream_id);
+    };
+    if start >= file.data.len() {
+        return FileContentsResponse::new_error(request.stream_id);
+    }
+    FileContentsResponse::new_data_response(
+        request.stream_id,
+        file.data[start..end.min(file.data.len())].to_vec(),
+    )
 }
 
 /// A bounded CLIPRDR admission failure.
@@ -564,6 +676,8 @@ pub enum ClipboardBridgeError {
     InvalidFileList,
     /// Guest file ranges were unsolicited, non-sequential, oversized, or stale.
     InvalidFileTransfer,
+    /// Host file metadata or bytes exceeded the bounded serving contract.
+    InvalidLocalFile,
 }
 
 impl core::fmt::Display for ClipboardBridgeError {
@@ -579,6 +693,9 @@ impl core::fmt::Display for ClipboardBridgeError {
             }
             Self::InvalidFileTransfer => {
                 formatter.write_str("RDP clipboard file transfer is malformed or stale")
+            }
+            Self::InvalidLocalFile => {
+                formatter.write_str("RDP host clipboard file is malformed or oversized")
             }
         }
     }
@@ -609,7 +726,9 @@ impl CliprdrBackend for TextCliprdrBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::empty()
+        ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
     }
 
     fn on_ready(&mut self) {
@@ -620,10 +739,29 @@ impl CliprdrBackend for TextCliprdrBackend {
         self.with_state(|state| state.initial_format_list_requested = true);
     }
 
+    fn on_format_list_response(&mut self, ok: bool) {
+        if !ok {
+            self.with_state(|state| {
+                state.local_generation = state.local_generation.wrapping_add(1);
+                state.local_advertised_generation = None;
+                state.local_text = None;
+                state.local_html = None;
+                state.local_dib = None;
+                state.local_file = None;
+                state.local_file_responses.clear();
+            });
+        }
+    }
+
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        self.with_state(|state| {
+            state.file_stream_ready = capabilities
+                .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
+                && capabilities.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA);
+        });
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -736,7 +874,19 @@ impl CliprdrBackend for TextCliprdrBackend {
         });
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        self.with_state(|state| {
+            let response = local_file_response(state, &request);
+            if state.local_file_responses.len() >= MAX_LOCAL_FILE_RESPONSES {
+                state.local_file_responses.clear();
+                state
+                    .local_file_responses
+                    .push_back(FileContentsResponse::new_error(request.stream_id));
+            } else {
+                state.local_file_responses.push_back(response);
+            }
+        });
+    }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
         self.with_state(|state| {
@@ -771,9 +921,23 @@ impl CliprdrBackend for TextCliprdrBackend {
         });
     }
 
-    fn on_lock(&mut self, _data_id: LockDataId) {}
+    fn on_lock(&mut self, data_id: LockDataId) {
+        self.with_state(|state| {
+            if let Some(file) = state
+                .local_file
+                .as_ref()
+                .filter(|file| state.local_advertised_generation == Some(file.generation))
+            {
+                state.locked_local_files.insert(data_id.0, file.clone());
+            }
+        });
+    }
 
-    fn on_unlock(&mut self, _data_id: LockDataId) {}
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        self.with_state(|state| {
+            state.locked_local_files.remove(&data_id.0);
+        });
+    }
 
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
         self.with_state(|state| {
@@ -1111,13 +1275,14 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardBridge, ClipboardBridgeError, DIB_FORMAT, DIBV5_FORMAT, HTML_FORMAT_ID,
-        RemoteClipboardImageFormat, UNICODE_TEXT_FORMAT, decode_cf_html, decode_unicode_text,
-        encode_cf_html, guest_html_fragment_is_safe, html_format,
+        decode_cf_html, decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe,
+        html_format, ClipboardBridge, ClipboardBridgeError, RemoteClipboardImageFormat,
+        DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
     };
     use ironrdp_cliprdr::pdu::{
-        ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FileContentsFlags,
-        FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
+        ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
+        FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
+        FormatDataRequest, FormatDataResponse, LockDataId,
     };
     use mackes_mesh_types::vdi_clipboard::MAX_VDI_CLIPBOARD_TEXT_BYTES;
 
@@ -1337,12 +1502,10 @@ mod tests {
         bridge
             .offer_host_html("new".into())
             .expect("replacement HTML");
-        assert!(
-            bridge
-                .take_local_data_response()
-                .expect("fail-closed response")
-                .is_error()
-        );
+        assert!(bridge
+            .take_local_data_response()
+            .expect("fail-closed response")
+            .is_error());
     }
 
     #[test]
@@ -1379,12 +1542,10 @@ mod tests {
         ));
 
         assert_eq!(bridge.advertised_formats(), Vec::<ClipboardFormat>::new());
-        assert!(
-            bridge
-                .take_local_data_response()
-                .expect("queued stale request must receive a response")
-                .is_error()
-        );
+        assert!(bridge
+            .take_local_data_response()
+            .expect("queued stale request must receive a response")
+            .is_error());
     }
 
     #[test]
@@ -1399,12 +1560,10 @@ mod tests {
         backend.on_format_data_request(FormatDataRequest {
             format: ClipboardFormatId::CF_UNICODETEXT,
         });
-        assert!(
-            bridge
-                .take_local_data_response()
-                .expect("stale request must receive a response")
-                .is_error()
-        );
+        assert!(bridge
+            .take_local_data_response()
+            .expect("stale request must receive a response")
+            .is_error());
 
         assert_eq!(bridge.advertised_formats(), vec![UNICODE_TEXT_FORMAT]);
         backend.on_format_data_request(FormatDataRequest {
@@ -1696,5 +1855,99 @@ mod tests {
             Some(Err(ClipboardBridgeError::InvalidFileTransfer))
         );
         assert_eq!(bridge.take_remote_file_contents_request(), None);
+    }
+
+    #[test]
+    fn host_file_serving_is_permission_bounded_range_bound_and_cancelled() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        backend.on_ready();
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA,
+        );
+        let descriptor = bridge
+            .offer_host_file("Clipboard-a1b2.png".into(), b"governed-bytes".to_vec())
+            .expect("permission-approved Files descriptor");
+        assert_eq!(descriptor.file_size, Some(14));
+
+        backend.on_lock(LockDataId(41));
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 7,
+            index: 0,
+            flags: FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: Some(41),
+        });
+        let size = bridge.take_local_file_response().expect("size response");
+        assert_eq!(size.data_as_size().expect("u64 size"), 14);
+
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 71,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 4,
+            data_id: None,
+        });
+        assert!(
+            bridge
+                .take_local_file_response()
+                .expect("unbound response")
+                .is_error(),
+            "a negotiated file stream must never bypass its lock identity"
+        );
+
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 8,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 9,
+            requested_size: 5,
+            data_id: Some(41),
+        });
+        assert_eq!(
+            bridge
+                .take_local_file_response()
+                .expect("range response")
+                .data(),
+            b"bytes"
+        );
+
+        bridge
+            .offer_host_file("replacement.png".into(), b"replacement".to_vec())
+            .expect("replacement offer");
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 9,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 8,
+            data_id: Some(41),
+        });
+        assert_eq!(
+            bridge
+                .take_local_file_response()
+                .expect("locked snapshot response")
+                .data(),
+            b"governed"
+        );
+
+        backend.on_unlock(LockDataId(41));
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 10,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 8,
+            data_id: Some(41),
+        });
+        assert!(
+            bridge
+                .take_local_file_response()
+                .expect("cancel response")
+                .is_error(),
+            "unlock must destroy the prior delayed-rendering authority"
+        );
     }
 }
