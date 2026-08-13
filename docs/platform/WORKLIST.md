@@ -437,7 +437,9 @@ behavioral evidence is not completion.
 - **Bounded Nebula systemctl (2026-08-11):** hung commands die at 2 seconds with 8 KiB caps; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-nebula-systemctl-bound-r230.md`.
 - **Bounded Netdata overlay IP (2026-08-11):** source files cap at 256 bytes before trim; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-netdata-overlay-bound-r231.md`.
 - **Fleet reconcile retry:** failed attempts remain due; `.50` passed 1/1: `docs/platform/evidence/WL-ARCH-009-WL-CRIT-007-2026-08-11-fleet-reconcile-retry-r276.md`.
-- Remaining work: **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip bursts; evidence: `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
+- **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip
+  bursts; focused implementation/test/clippy gates are complete. Evidence:
+  `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
 - **Service-catalog canonical file (2026-08-11):** crash-left staging files cannot enable uncommitted services; BigBoy passed 1/1:
   `docs/platform/evidence/WL-ARCH-009-2026-08-11-service-catalog-canonical-file-r312.md`.
 - **Bounded DC health probe (2026-08-11):** Dom0 SSH hangs fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-dc-health-dom0-timeout-r233.md`.
