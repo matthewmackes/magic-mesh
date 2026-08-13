@@ -1698,13 +1698,19 @@ impl Shell {
             Surface::FleetMesh => {
                 self.workers_tab = WorkersTab::Control;
                 self.fleet_mesh_tab = FleetMeshTab::Workbench;
-                self.workers_destination = WorkersDestination::ThisNode;
+                self.workers_destination = WorkersDestination::ThisNodePage(
+                    this_node_catalog::page_for_route("this-node/overview")
+                        .unwrap_or(this_node_catalog::page_index()[0]),
+                );
                 self.nav.surface = Surface::Workers;
             }
             Surface::Workbench => {
                 self.workers_tab = WorkersTab::Control;
                 self.fleet_mesh_tab = FleetMeshTab::Workbench;
-                self.workers_destination = WorkersDestination::ThisNode;
+                self.workers_destination = WorkersDestination::ThisNodePage(
+                    this_node_catalog::page_for_route("this-node/overview")
+                        .unwrap_or(this_node_catalog::page_index()[0]),
+                );
                 self.nav.surface = Surface::Workers;
             }
             Surface::MeshView => {
@@ -1726,7 +1732,10 @@ impl Shell {
             }
             Surface::ThisNode => {
                 self.workers_tab = WorkersTab::LocalNode;
-                self.workers_destination = WorkersDestination::ThisNode;
+                self.workers_destination = WorkersDestination::ThisNodePage(
+                    this_node_catalog::page_for_route("this-node/overview")
+                        .unwrap_or(this_node_catalog::page_index()[0]),
+                );
                 self.nav.surface = Surface::Workers;
             }
             Surface::System => {
@@ -2307,67 +2316,6 @@ impl Shell {
                     &mut self.spawn_lighthouse,
                 );
             }
-        }
-    }
-
-    /// Render the mesh-control child views inside Workers. The old method name
-    /// remains as a private implementation seam while the public route is now
-    /// unambiguously `Surface::Workers`.
-    fn show_fleet_mesh(&mut self, ui: &mut egui::Ui) {
-        let mut tab = self.fleet_mesh_tab;
-        let surface_handoff = ui
-            .push_id("shell-workers-mesh-control", |ui| {
-                // Workbench owns the shared MenuBar, including its View menu. Do
-                // not mount the legacy Fleet & Mesh wrapper menu above it: at
-                // narrow/large-text sizes that produced a detached duplicate
-                // `View` button before a workspace's own shared frame. Mesh Map
-                // remains the one exception because its canvas is intentionally
-                // headerless and needs a route switcher; Explorer owns its shared
-                // AppFrame/domain header and must not receive a second wrapper control.
-                if tab == FleetMeshTab::MeshMap {
-                    ui.horizontal(|ui| {
-                        ui.menu_button("View", |ui| {
-                            for (candidate, label) in [
-                                (FleetMeshTab::Workbench, "Workbench"),
-                                (FleetMeshTab::MeshMap, "Mesh Map"),
-                                (FleetMeshTab::Explorer, "Explorer"),
-                            ] {
-                                if ui.radio_value(&mut tab, candidate, label).clicked() {
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                    });
-                    ui.separator();
-                }
-                match tab {
-                    FleetMeshTab::Workbench => workbench::show(
-                        ui,
-                        &mut tab,
-                        &mut self.nav.plane,
-                        &mut self.datacenter,
-                        &mut self.thisnode,
-                        &mut self.system,
-                        &mut self.surface_card,
-                        &self.network,
-                        &self.controller,
-                        &self.provisioning,
-                        &mut self.spawn_lighthouse,
-                    ),
-                    FleetMeshTab::MeshMap => {
-                        self.show_mesh_map(ui);
-                        None
-                    }
-                    FleetMeshTab::Explorer => {
-                        self.show_explorer(ui);
-                        None
-                    }
-                }
-            })
-            .inner;
-        self.fleet_mesh_tab = tab;
-        if let Some(handoff) = surface_handoff {
-            self.apply_surface_card_handoff(handoff);
         }
     }
 
@@ -4815,11 +4763,11 @@ mod tests {
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
         this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
-        WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
-        LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
-        MENU_BAR_MINIMIZE_DURATION,
+        WorkersDestination, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
+        LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
+        LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
     };
-    use crate::this_node_catalog::{Section, SectionGroup};
+    use crate::this_node_catalog::{self, Section, SectionGroup};
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use mde_chat::{
@@ -5798,22 +5746,49 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        let overview = WorkersDestination::ThisNodePage(
+            this_node_catalog::page_for_route("this-node/overview")
+                .expect("governed overview route"),
+        );
+        let storage = WorkersDestination::ThisNodePage(
+            this_node_catalog::page_for_route("this-node/storage").expect("governed storage route"),
+        );
+        let hardware = WorkersDestination::ThisNodePage(
+            this_node_catalog::page_for_route("this-node/hardware")
+                .expect("governed hardware route"),
+        );
 
-        for (legacy, expected_workers_tab) in [
-            (Surface::FleetMesh, WorkersTab::Control),
-            (Surface::Workbench, WorkersTab::Control),
-            (Surface::MeshView, WorkersTab::Network),
-            (Surface::Explorer, WorkersTab::Discovery),
-            (Surface::ThisNode, WorkersTab::LocalNode),
-            (Surface::Phones, WorkersTab::Phones),
-            (Surface::System, WorkersTab::LocalNode),
-            (Surface::Storage, WorkersTab::LocalNode),
-            (Surface::About, WorkersTab::LocalNode),
+        for (legacy, expected_workers_tab, expected_destination) in [
+            (Surface::FleetMesh, WorkersTab::Control, overview),
+            (Surface::Workbench, WorkersTab::Control, overview),
+            (
+                Surface::MeshView,
+                WorkersTab::Network,
+                WorkersDestination::MeshMap,
+            ),
+            (
+                Surface::Explorer,
+                WorkersTab::Discovery,
+                WorkersDestination::Discovery,
+            ),
+            (Surface::ThisNode, WorkersTab::LocalNode, overview),
+            (
+                Surface::Phones,
+                WorkersTab::Phones,
+                WorkersDestination::Phones,
+            ),
+            (Surface::System, WorkersTab::LocalNode, overview),
+            (Surface::Storage, WorkersTab::LocalNode, storage),
+            (Surface::About, WorkersTab::LocalNode, hardware),
         ] {
             shell.nav.surface = legacy;
             shell.normalize_surface_aliases();
             assert_eq!(shell.nav.surface, Surface::Workers, "{legacy:?} surface");
             assert_eq!(shell.workers_tab, expected_workers_tab, "{legacy:?} tab");
+            assert_eq!(
+                shell.workers_destination, expected_destination,
+                "{legacy:?} destination"
+            );
         }
         for (legacy, expected_tab) in [
             (Surface::System, ThisNodeTab::System),
