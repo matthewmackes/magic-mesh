@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use ironrdp_cliprdr::backend::CliprdrBackend;
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
-    FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
-    FormatDataResponse, LockDataId, OwnedFormatDataResponse,
+    FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
+    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
 use ironrdp_core::impl_as_any;
 use mackes_mesh_types::vdi_clipboard::{
@@ -30,6 +30,7 @@ pub const DIBV5_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId
 
 const MAX_REMOTE_FORMATS: usize = 256;
 const MAX_REMOTE_FILES: usize = 4_096;
+const REMOTE_FILE_CHUNK_BYTES: u32 = 256 * 1024;
 const CF_HTML_HEADER_SLACK_BYTES: usize = 1024;
 const CF_HTML_PREFIX: &str = "<html><body><!--StartFragment-->";
 const CF_HTML_SUFFIX: &str = "<!--EndFragment--></body></html>";
@@ -181,6 +182,47 @@ pub struct RemoteClipboardFileList {
     clip_data_id: Option<u32>,
 }
 
+/// One sequential, bounded range ready for the Files authority to persist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteClipboardFileChunk {
+    file_index: usize,
+    offset: u64,
+    data: Vec<u8>,
+    complete: bool,
+}
+
+impl RemoteClipboardFileChunk {
+    #[must_use]
+    pub const fn file_index(&self) -> usize {
+        self.file_index
+    }
+
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteFileTransfer {
+    file_index: usize,
+    size: u64,
+    next_offset: u64,
+    stream_id: u32,
+    clip_data_id: Option<u32>,
+    request_outstanding: bool,
+}
+
 impl RemoteClipboardFileList {
     /// Admitted file metadata in guest order.
     #[must_use]
@@ -236,6 +278,9 @@ struct ClipboardState {
     remote_html: Option<String>,
     remote_image: Option<RemoteClipboardImage>,
     remote_files: Option<Result<RemoteClipboardFileList, ClipboardBridgeError>>,
+    admitted_remote_files: Option<RemoteClipboardFileList>,
+    remote_file_transfer: Option<RemoteFileTransfer>,
+    remote_file_chunk: Option<Result<RemoteClipboardFileChunk, ClipboardBridgeError>>,
 }
 
 /// Thread-local connection handle used by the wire pump to service CLIPRDR
@@ -407,6 +452,81 @@ impl ClipboardBridge {
         self.lock().remote_files.take()
     }
 
+    /// Begin sequential range retrieval for one admitted guest file.
+    ///
+    /// Bytes are exposed only as bounded chunks for the Files authority to
+    /// persist; this transport boundary never allocates from the declared full
+    /// file size.
+    pub fn begin_remote_file_retrieval(
+        &self,
+        file_index: usize,
+    ) -> Result<(), ClipboardBridgeError> {
+        let mut state = self.lock();
+        if state.remote_file_transfer.is_some() || state.remote_file_chunk.is_some() {
+            return Err(ClipboardBridgeError::InvalidFileTransfer);
+        }
+        let snapshot = state
+            .admitted_remote_files
+            .as_ref()
+            .ok_or(ClipboardBridgeError::InvalidFileTransfer)?;
+        let size = snapshot
+            .files
+            .get(file_index)
+            .ok_or(ClipboardBridgeError::InvalidFileTransfer)?
+            .size;
+        let clip_data_id = snapshot.clip_data_id;
+        if size == 0 {
+            state.remote_file_chunk = Some(Ok(RemoteClipboardFileChunk {
+                file_index,
+                offset: 0,
+                data: Vec::new(),
+                complete: true,
+            }));
+            return Ok(());
+        }
+        let stream_id = state.local_generation.wrapping_add(1) as u32;
+        state.local_generation = state.local_generation.wrapping_add(1);
+        state.remote_file_transfer = Some(RemoteFileTransfer {
+            file_index,
+            size,
+            next_offset: 0,
+            stream_id,
+            clip_data_id,
+            request_outstanding: false,
+        });
+        Ok(())
+    }
+
+    /// Take the next exact CLIPRDR range request. Only one request may be in flight.
+    pub fn take_remote_file_contents_request(&self) -> Option<FileContentsRequest> {
+        let mut state = self.lock();
+        if state.remote_file_chunk.is_some() {
+            return None;
+        }
+        let transfer = state.remote_file_transfer.as_mut()?;
+        if transfer.request_outstanding || transfer.next_offset >= transfer.size {
+            return None;
+        }
+        let remaining = transfer.size - transfer.next_offset;
+        let requested_size = remaining.min(u64::from(REMOTE_FILE_CHUNK_BYTES)) as u32;
+        transfer.request_outstanding = true;
+        Some(FileContentsRequest {
+            stream_id: transfer.stream_id,
+            index: i32::try_from(transfer.file_index).ok()?,
+            flags: FileContentsFlags::RANGE,
+            position: transfer.next_offset,
+            requested_size,
+            data_id: transfer.clip_data_id,
+        })
+    }
+
+    /// Take one validated sequential chunk for Files materialization.
+    pub fn take_remote_file_chunk(
+        &self,
+    ) -> Option<Result<RemoteClipboardFileChunk, ClipboardBridgeError>> {
+        self.lock().remote_file_chunk.take()
+    }
+
     /// Whether CLIPRDR completed its capability handshake.
     #[must_use]
     pub fn is_ready(&self) -> bool {
@@ -442,6 +562,8 @@ pub enum ClipboardBridgeError {
     InvalidImage,
     /// Guest file-list metadata was unsafe, incomplete, or exceeded a bound.
     InvalidFileList,
+    /// Guest file ranges were unsolicited, non-sequential, oversized, or stale.
+    InvalidFileTransfer,
 }
 
 impl core::fmt::Display for ClipboardBridgeError {
@@ -454,6 +576,9 @@ impl core::fmt::Display for ClipboardBridgeError {
             Self::InvalidImage => formatter.write_str("RDP clipboard DIB is malformed or unsafe"),
             Self::InvalidFileList => {
                 formatter.write_str("RDP clipboard file list is malformed or unsafe")
+            }
+            Self::InvalidFileTransfer => {
+                formatter.write_str("RDP clipboard file transfer is malformed or stale")
             }
         }
     }
@@ -516,6 +641,9 @@ impl CliprdrBackend for TextCliprdrBackend {
             state.remote_html = None;
             state.remote_image = None;
             state.remote_files = None;
+            state.admitted_remote_files = None;
+            state.remote_file_transfer = None;
+            state.remote_file_chunk = None;
 
             if available_formats.len() > MAX_REMOTE_FORMATS {
                 return;
@@ -610,7 +738,38 @@ impl CliprdrBackend for TextCliprdrBackend {
 
     fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
 
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        self.with_state(|state| {
+            let Some(transfer) = state.remote_file_transfer.as_mut() else {
+                return;
+            };
+            let expected = (transfer.size - transfer.next_offset)
+                .min(u64::from(REMOTE_FILE_CHUNK_BYTES)) as usize;
+            if !transfer.request_outstanding
+                || response.stream_id() != transfer.stream_id
+                || response.is_error()
+                || response.data().is_empty()
+                || response.data().len() > expected
+            {
+                state.remote_file_transfer = None;
+                state.remote_file_chunk = Some(Err(ClipboardBridgeError::InvalidFileTransfer));
+                return;
+            }
+            let offset = transfer.next_offset;
+            transfer.next_offset += response.data().len() as u64;
+            transfer.request_outstanding = false;
+            let complete = transfer.next_offset == transfer.size;
+            state.remote_file_chunk = Some(Ok(RemoteClipboardFileChunk {
+                file_index: transfer.file_index,
+                offset,
+                data: response.data().to_vec(),
+                complete,
+            }));
+            if complete {
+                state.remote_file_transfer = None;
+            }
+        });
+    }
 
     fn on_lock(&mut self, _data_id: LockDataId) {}
 
@@ -630,6 +789,7 @@ impl CliprdrBackend for TextCliprdrBackend {
                 return;
             }
             let result = admit_remote_file_list(files, clip_data_id);
+            state.admitted_remote_files = result.as_ref().ok().cloned();
             state.remote_files = Some(result);
         });
     }
@@ -637,13 +797,15 @@ impl CliprdrBackend for TextCliprdrBackend {
     fn on_outgoing_locks_cleared(&mut self, clip_data_ids: &[LockDataId]) {
         self.with_state(|state| {
             let cleared = state
-                .remote_files
+                .admitted_remote_files
                 .as_ref()
-                .and_then(|result| result.as_ref().ok())
                 .and_then(RemoteClipboardFileList::clip_data_id)
                 .is_some_and(|id| clip_data_ids.iter().any(|cleared| cleared.0 == id));
             if cleared {
                 state.remote_files = None;
+                state.admitted_remote_files = None;
+                state.remote_file_transfer = None;
+                state.remote_file_chunk = None;
             }
         });
     }
@@ -949,13 +1111,13 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_cf_html, decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe,
-        html_format, ClipboardBridge, ClipboardBridgeError, RemoteClipboardImageFormat,
-        DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
+        ClipboardBridge, ClipboardBridgeError, DIB_FORMAT, DIBV5_FORMAT, HTML_FORMAT_ID,
+        RemoteClipboardImageFormat, UNICODE_TEXT_FORMAT, decode_cf_html, decode_unicode_text,
+        encode_cf_html, guest_html_fragment_is_safe, html_format,
     };
     use ironrdp_cliprdr::pdu::{
-        ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FileDescriptor, FormatDataRequest,
-        FormatDataResponse, LockDataId,
+        ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FileContentsFlags,
+        FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
     };
     use mackes_mesh_types::vdi_clipboard::MAX_VDI_CLIPBOARD_TEXT_BYTES;
 
@@ -1175,10 +1337,12 @@ mod tests {
         bridge
             .offer_host_html("new".into())
             .expect("replacement HTML");
-        assert!(bridge
-            .take_local_data_response()
-            .expect("fail-closed response")
-            .is_error());
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("fail-closed response")
+                .is_error()
+        );
     }
 
     #[test]
@@ -1215,10 +1379,12 @@ mod tests {
         ));
 
         assert_eq!(bridge.advertised_formats(), Vec::<ClipboardFormat>::new());
-        assert!(bridge
-            .take_local_data_response()
-            .expect("queued stale request must receive a response")
-            .is_error());
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("queued stale request must receive a response")
+                .is_error()
+        );
     }
 
     #[test]
@@ -1233,10 +1399,12 @@ mod tests {
         backend.on_format_data_request(FormatDataRequest {
             format: ClipboardFormatId::CF_UNICODETEXT,
         });
-        assert!(bridge
-            .take_local_data_response()
-            .expect("stale request must receive a response")
-            .is_error());
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("stale request must receive a response")
+                .is_error()
+        );
 
         assert_eq!(bridge.advertised_formats(), vec![UNICODE_TEXT_FORMAT]);
         backend.on_format_data_request(FormatDataRequest {
@@ -1455,5 +1623,78 @@ mod tests {
             None,
             "one registered ID cannot mean both files and unnamed bytes"
         );
+    }
+
+    #[test]
+    fn guest_file_retrieval_is_sequential_chunked_and_snapshot_bound() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        let file_format_id = ClipboardFormatId(0xC322);
+        backend.on_remote_copy(&[
+            ClipboardFormat::new(file_format_id).with_name(ClipboardFormatName::FILE_LIST)
+        ]);
+        assert_eq!(bridge.take_remote_format_request(), Some(file_format_id));
+        backend.on_remote_file_list(
+            &[FileDescriptor::new("recording.bin").with_file_size(300_000)],
+            Some(91),
+        );
+        bridge
+            .take_remote_file_list()
+            .expect("metadata callback")
+            .expect("admitted metadata");
+
+        bridge.begin_remote_file_retrieval(0).expect("start file");
+        let first = bridge
+            .take_remote_file_contents_request()
+            .expect("first range");
+        assert_eq!(first.index, 0);
+        assert_eq!(first.flags, FileContentsFlags::RANGE);
+        assert_eq!(first.position, 0);
+        assert_eq!(first.requested_size, 256 * 1024);
+        assert_eq!(first.data_id, Some(91));
+        assert_eq!(bridge.take_remote_file_contents_request(), None);
+
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(
+            first.stream_id,
+            vec![0xA5; 100_000],
+        ));
+        let first_chunk = bridge
+            .take_remote_file_chunk()
+            .expect("first callback")
+            .expect("valid first range");
+        assert_eq!(first_chunk.file_index(), 0);
+        assert_eq!(first_chunk.offset(), 0);
+        assert_eq!(first_chunk.data().len(), 100_000);
+        assert!(!first_chunk.is_complete());
+
+        let second = bridge
+            .take_remote_file_contents_request()
+            .expect("tail range");
+        assert_eq!(second.position, 100_000);
+        assert_eq!(second.requested_size, 200_000);
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(
+            second.stream_id,
+            vec![0x5A; second.requested_size as usize],
+        ));
+        let tail = bridge
+            .take_remote_file_chunk()
+            .expect("tail callback")
+            .expect("valid tail");
+        assert_eq!(tail.offset(), 100_000);
+        assert!(tail.is_complete());
+        assert_eq!(bridge.take_remote_file_contents_request(), None);
+
+        bridge.begin_remote_file_retrieval(0).expect("restart file");
+        let replay = bridge
+            .take_remote_file_contents_request()
+            .expect("fresh range");
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(
+            replay.stream_id.wrapping_add(1),
+            vec![0; replay.requested_size as usize],
+        ));
+        assert_eq!(
+            bridge.take_remote_file_chunk(),
+            Some(Err(ClipboardBridgeError::InvalidFileTransfer))
+        );
+        assert_eq!(bridge.take_remote_file_contents_request(), None);
     }
 }
