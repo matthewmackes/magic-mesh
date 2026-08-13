@@ -2819,7 +2819,7 @@ mod tests {
     fn admitted_runtime_aliases_preserve_process_group_ownership() {
         let canonical = spec("mesh_router").expect("canonical worker must be registered");
         assert!(belongs_to_group("mesh-router", canonical.group));
-        assert!(!belongs_to_group("mesh-router", WorkerGroup::Control));
+        assert!(!belongs_to_group("mesh-router", WorkerGroup::Observation));
         assert!(!belongs_to_group("mesh-router-extra", canonical.group));
     }
 
