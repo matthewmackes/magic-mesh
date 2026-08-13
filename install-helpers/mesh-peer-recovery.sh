@@ -362,6 +362,19 @@ main() {
             publish "offline-after-etcd"
             return 0
         fi
+        # The physical route can remain healthy while the overlay process or
+        # the just-started local coordination member is replaced/lost.  Do not
+        # mutate Syncthing from that stale completed-step result: both earlier
+        # dependencies must still own their readiness immediately before the
+        # next service transaction.
+        if ! nebula_ready; then
+            publish "overlay-lost-after-etcd"
+            return 1
+        fi
+        if ! bounded_systemctl is-active --quiet etcd.service >/dev/null 2>&1; then
+            publish "etcd-lost-after-etcd"
+            return 1
+        fi
     else
         publish "skipped-etcd-client-only"
     fi

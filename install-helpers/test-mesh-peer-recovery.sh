@@ -58,6 +58,18 @@ case "$1" in
             test -f "$state/online"
             exit $?
         fi
+        if [ "$unit" = nebula.service ] && [ -f "$state/force-nebula-inactive" ]; then
+            exit 3
+        fi
+        if [ "$unit" = etcd.service ] && [ -f "$state/drop-etcd-after-etcd-start-armed" ]; then
+            checks=$(cat "$state/etcd-post-start-checks" 2>/dev/null || printf 0)
+            checks=$((checks + 1))
+            printf '%s\n' "$checks" >"$state/etcd-post-start-checks"
+            if [ "$checks" -ge 2 ]; then
+                rm -f "$state/drop-etcd-after-etcd-start-armed" \
+                    "$state/active-etcd.service"
+            fi
+        fi
         if [ "$unit" = nebula.service ] && [ -s "$state/nebula-attempts" ]; then
             checks=$(cat "$state/nebula-ready-checks" 2>/dev/null || printf 0)
             checks=$((checks + 1))
@@ -122,6 +134,14 @@ case "$1" in
             : >"$state/active-$unit"
             if [ "$unit" = etcd.service ] && [ -f "$state/drop-after-etcd-start" ]; then
                 rm -f "$state/drop-after-etcd-start" "$state/online"
+            elif [ "$unit" = etcd.service ] && [ -f "$state/drop-overlay-after-etcd-start" ]; then
+                rm -f "$state/drop-overlay-after-etcd-start" \
+                    "$state/active-nebula.service"
+                : >"$state/force-nebula-inactive"
+            elif [ "$unit" = etcd.service ] && [ -f "$state/drop-etcd-after-etcd-start" ]; then
+                rm -f "$state/drop-etcd-after-etcd-start" \
+                    "$state/etcd-post-start-checks"
+                : >"$state/drop-etcd-after-etcd-start-armed"
             elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-after-syncthing-start" ]; then
                 rm -f "$state/drop-after-syncthing-start" "$state/online"
             elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-etcd-after-syncthing-start" ]; then
@@ -357,6 +377,33 @@ cmp "$STATE/expected-mutations" "$STATE/mutations"
 grep -Fq 'status=offline-after-etcd' "$STATE/notifies"
 rm -f "$STATE/drop-after-etcd-start"
 echo 'PASS substrate boundary fixture: link loss after etcd prevents Syncthing mutation'
+
+# A healthy physical route does not preserve the completed overlay or
+# coordination step.  If either disappears after etcd startup, Syncthing must
+# not be mutated from the stale success result.
+for lost_dependency in overlay etcd; do
+    rm -f "$STATE"/active-etcd.service "$STATE"/active-syncthing.service \
+        "$STATE"/active-mackesd-*.service
+    : >"$STATE/active-nebula.service"
+    : >"$STATE/online"
+    : >"$STATE/drop-${lost_dependency}-after-etcd-start"
+    : >"$STATE/mutations"
+    : >"$STATE/notifies"
+    if run_helper; then
+        echo "lost $lost_dependency unexpectedly allowed Syncthing mutation" >&2
+        exit 1
+    fi
+    printf '%s\n' etcd.service >"$STATE/expected-mutations"
+    cmp "$STATE/expected-mutations" "$STATE/mutations"
+    grep -Fq "status=${lost_dependency}-lost-after-etcd" "$STATE/notifies"
+    rm -f "$STATE/drop-${lost_dependency}-after-etcd-start" \
+        "$STATE/force-nebula-inactive" \
+        "$STATE/drop-etcd-after-etcd-start-armed" \
+        "$STATE/etcd-post-start-checks"
+done
+: >"$STATE/active-nebula.service"
+: >"$STATE/active-etcd.service"
+echo 'PASS post-etcd dependency fixture: lost overlay/coordination blocks Syncthing mutation'
 
 # A boot-time event can arrive after Syncthing became active but before the
 # grouped workers.  Recovery must preserve that process instead of racing its
