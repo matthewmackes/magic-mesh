@@ -2053,6 +2053,21 @@ fn runtime_cache(
 fn runtime_ownership(
     worker: &WorkerSpec,
 ) -> Result<runtime::WorkerOwnership, runtime::WorkerRuntimeContractError> {
+    if worker.ownership.state != worker.group {
+        return Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+            "worker_spec.ownership.state_group",
+        ));
+    }
+    if worker.ownership.health != worker.group {
+        return Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+            "worker_spec.ownership.health_group",
+        ));
+    }
+    if worker.ownership.actions != worker.group {
+        return Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+            "worker_spec.ownership.action_group",
+        ));
+    }
     if !(1..=60).contains(&worker.ownership.cleanup.grace_secs) {
         return Err(runtime::WorkerRuntimeContractError::InvalidField(
             "worker_spec.cleanup.grace_secs",
@@ -2718,6 +2733,33 @@ mod tests {
         );
 
         invalid.activation.config = ConfigPredicate::Always;
+        invalid.ownership.state = WorkerGroup::Observation;
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+                "worker_spec.ownership.state_group"
+            ))
+        );
+
+        invalid.ownership.state = WorkerGroup::Control;
+        invalid.ownership.health = WorkerGroup::Observation;
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+                "worker_spec.ownership.health_group"
+            ))
+        );
+
+        invalid.ownership.health = WorkerGroup::Control;
+        invalid.ownership.actions = WorkerGroup::Observation;
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+                "worker_spec.ownership.action_group"
+            ))
+        );
+
+        invalid.ownership.actions = WorkerGroup::Control;
         invalid.ownership.cleanup.grace_secs = 0;
         assert_eq!(
             worker_contract(&invalid),
