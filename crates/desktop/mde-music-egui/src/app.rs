@@ -874,6 +874,42 @@ impl MusicApp {
         true
     }
 
+    /// Publish a queue-relative transport or playback-policy mutation against
+    /// the exact daemon queue generation currently rendered by the workspace.
+    /// Next/previous, shuffle, and repeat have no compatibility-worker seam:
+    /// once daemon authority is active they must never degrade into local UI
+    /// state or race a replacement queue.
+    fn publish_queue_playback_action(
+        &mut self,
+        action: &str,
+        shuffle: Option<bool>,
+        repeat: Option<&str>,
+    ) {
+        let Some(snapshot) = self.state.workspace.as_ref() else {
+            self.state.error = Some("Music queue state is not available yet.".to_owned());
+            return;
+        };
+        if snapshot.playback.current.is_none() || snapshot.queue.is_empty() {
+            self.state.error = Some("Music queue has no current track.".to_owned());
+            return;
+        }
+        let Some(publisher) = self.workspace_action_publisher.as_ref() else {
+            self.state.error =
+                Some("Music queue controls require the authenticated Construct shell.".to_owned());
+            return;
+        };
+
+        let mut request = workspace_action_request(action);
+        request.expected_queue_revision = Some(snapshot.playback.queue_revision);
+        request.shuffle = shuffle;
+        request.repeat = repeat.map(str::to_owned);
+        if let Err(error) = publish_workspace_request(publisher.as_ref(), request) {
+            self.state.error = Some(format!("Music queue action failed: {error}"));
+        } else {
+            self.state.error = None;
+        }
+    }
+
     /// Start the worker from the current credential file, or retain the honest
     /// first-run error until provisioning writes one.  This path is shared by
     /// initial construction and the live retry below.
@@ -2992,8 +3028,10 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                             );
                             ui.label(RichText::new(&song.artist).small().color(Style::TEXT_DIM));
                         });
-                        if ui.button("⏮").clicked() {
-                            if !app.try_publish_transport_action("seek", Some(0), None) {
+                        if ui.button("⏮").on_hover_text("Previous track").clicked() {
+                            if app.state.workspace.is_some() {
+                                app.publish_queue_playback_action("previous", None, None);
+                            } else if !app.try_publish_transport_action("seek", Some(0), None) {
                                 app.send(Command::Seek(0));
                             }
                         }
@@ -3012,6 +3050,11 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                             if !app.try_publish_transport_action("stop", None, None) {
                                 app.send(Command::Stop);
                             }
+                        }
+                        if app.state.workspace.is_some()
+                            && ui.button("⏭").on_hover_text("Next track").clicked()
+                        {
+                            app.publish_queue_playback_action("next", None, None);
                         }
                         if !narrow {
                             let duration_ms = u64::from(song.duration).saturating_mul(1000);
@@ -3050,6 +3093,51 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                                     Some(volume_milli),
                                 ) {
                                     app.send(Command::SetVolume(volume));
+                                }
+                            }
+                            if let Some(playback) = app
+                                .state
+                                .workspace
+                                .as_ref()
+                                .map(|snapshot| snapshot.playback.clone())
+                            {
+                                let shuffle_label = if playback.shuffle {
+                                    "Shuffle on"
+                                } else {
+                                    "Shuffle off"
+                                };
+                                if ui
+                                    .selectable_label(playback.shuffle, "🔀")
+                                    .on_hover_text(shuffle_label)
+                                    .clicked()
+                                {
+                                    app.publish_queue_playback_action(
+                                        "shuffle",
+                                        Some(!playback.shuffle),
+                                        None,
+                                    );
+                                }
+                                let next_repeat = match playback.repeat.as_str() {
+                                    "off" => "context",
+                                    "context" => "track",
+                                    _ => "off",
+                                };
+                                if ui
+                                    .button(match playback.repeat.as_str() {
+                                        "track" => "🔂",
+                                        _ => "🔁",
+                                    })
+                                    .on_hover_text(format!(
+                                        "Repeat {} (choose {next_repeat})",
+                                        playback.repeat
+                                    ))
+                                    .clicked()
+                                {
+                                    app.publish_queue_playback_action(
+                                        "repeat",
+                                        None,
+                                        Some(next_repeat),
+                                    );
                                 }
                             }
                         }
@@ -4781,6 +4869,51 @@ mod tests {
             standalone.state.error.as_deref(),
             Some("Music transport is unavailable until the authenticated daemon action path is connected.")
         );
+    }
+
+    #[test]
+    fn queue_controls_publish_exact_rendered_generation_and_policy() {
+        let mut state = MusicState::new();
+        let mut snapshot = empty_workspace_snapshot(23);
+        let content = ContentRef {
+            source_id: "airsonic:forge".to_owned(),
+            remote_id: "track-7".to_owned(),
+            kind: ContentKind::Music,
+        };
+        snapshot.playback.current = Some(content.clone());
+        snapshot.playback.queue_revision = 91;
+        snapshot.queue.push(QueueEntry {
+            id: "queue-7".to_owned(),
+            content,
+            title: "Rendered track".to_owned(),
+        });
+        state.workspace = Some(snapshot);
+        let mut app = app_with(state, None);
+        let (published_tx, published_rx) = mpsc::sync_channel::<String>(3);
+        app.set_workspace_action_publisher(move |body| {
+            published_tx
+                .send(body.to_owned())
+                .map_err(|error| error.to_string())
+        });
+
+        app.publish_queue_playback_action("next", None, None);
+        app.publish_queue_playback_action("shuffle", Some(true), None);
+        app.publish_queue_playback_action("repeat", None, Some("track"));
+
+        let requests = (0..3)
+            .map(|_| {
+                serde_json::from_str::<MusicActionRequestV1>(
+                    &published_rx.try_recv().expect("queue action"),
+                )
+                .expect("typed queue request")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests[0].action, "next");
+        assert_eq!(requests[1].shuffle, Some(true));
+        assert_eq!(requests[2].repeat.as_deref(), Some("track"));
+        assert!(requests
+            .iter()
+            .all(|request| request.expected_queue_revision == Some(91)));
     }
 
     #[test]
