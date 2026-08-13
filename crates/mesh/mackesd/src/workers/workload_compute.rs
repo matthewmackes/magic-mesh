@@ -13,7 +13,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
@@ -1217,14 +1217,29 @@ impl SystemWorkloadActuator {
         digest.update(request.request_id.as_bytes());
         digest.update([0]);
         digest.update(generation.to_be_bytes());
+        digest.update([0]);
+        digest.update(request.target_node.as_bytes());
+        // The first-release Browser profile is intentionally one-node: the
+        // serving Workstation and consuming seat are the same authenticated
+        // mesh identity. Bind both roles explicitly so a future remote-client
+        // profile cannot inherit this lease without changing the wire contract.
+        digest.update([0]);
+        digest.update(request.target_node.as_bytes());
         let digest = hex_digest(&digest.finalize());
+        let protocol = request
+            .preferred_attachment
+            .unwrap_or(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf);
+        let prefix = match protocol {
+            WorkloadAttachmentProtocol::Rdp => "browser-rdp",
+            _ => "display1",
+        };
         WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
-            lease_id: format!("display1-{}", &digest[..32]),
+            lease_id: format!("{prefix}-{}", &digest[..32]),
             nonce: digest,
             workload_id: request.workload_id.clone(),
             generation: generation.max(1),
-            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            protocol,
             expires_at_ms: request
                 .deadline_at_ms
                 .min(now_ms.saturating_add(MAX_AUTH_TTL_MS as u64)),
@@ -1316,6 +1331,11 @@ impl SystemWorkloadActuator {
         let Some(lease) = status.attachment.as_ref() else {
             return;
         };
+        // RDP has no node-local Display1 socket. Its authority is revoked by
+        // removing the exact durable lease from the Workloads projection.
+        if lease.protocol == WorkloadAttachmentProtocol::Rdp {
+            return;
+        }
         if let Ok(mut attachments) = self.attachments.lock() {
             let workload_id = status.workload_id.as_str();
             if attachments
@@ -2253,6 +2273,23 @@ impl WorkloadActuator for SystemWorkloadActuator {
             return Ok(Some(outcome));
         }
 
+        if lease.protocol == WorkloadAttachmentProtocol::Rdp {
+            return match browser_rdp_endpoint_ready(request) {
+                Ok(()) => Ok(Some(WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::Ready,
+                    retryable: false,
+                    reason: None,
+                    remediation: None,
+                    attachment: Some(lease.clone()),
+                })),
+                Err(reason) => Ok(Some(Self::recovered_attachment_unavailable(format!(
+                    "the recovered Browser RDP endpoint was unavailable and its lease was revoked: {reason}"
+                )))),
+            };
+        }
+
         let runtime = self.attachment_for_status(request, status, now_ms)?;
         if runtime.registration_state() == DISPLAY1_REGISTRATION_NEW {
             runtime.register(Self::qemu_display1_address(request)?);
@@ -2325,12 +2362,20 @@ impl WorkloadActuator for SystemWorkloadActuator {
         {
             self.ensure_container_unit(request)?;
         }
-        let attachment = if request.action == WorkloadOperationAction::StartAndAttach {
+        let attachment = if request.action == WorkloadOperationAction::StartAndAttach
+            && request.preferred_attachment == Some(WorkloadAttachmentProtocol::Rdp)
+        {
+            Some(Self::attachment_lease(
+                request,
+                request.expected_generation.saturating_add(1).max(1),
+                now_ms(),
+            ))
+        } else if request.action == WorkloadOperationAction::StartAndAttach {
             let runtime = match self.ensure_attachment(
-                    request,
-                    request.expected_generation.saturating_add(1).max(1),
-                    now_ms(),
-                ) {
+                request,
+                request.expected_generation.saturating_add(1).max(1),
+                now_ms(),
+            ) {
                 Ok(runtime) => runtime,
                 Err(error) if request.backend == WorkloadBackend::QuadletSystemd => {
                     if let Err(cleanup) = Self::remove_container_unit(request) {
@@ -2589,6 +2634,24 @@ impl WorkloadActuator for SystemWorkloadActuator {
                 WorkloadOperationPhase::WaitingForService
                     if request.action == WorkloadOperationAction::StartAndAttach =>
                 {
+                    if request.preferred_attachment == Some(WorkloadAttachmentProtocol::Rdp) {
+                        browser_rdp_endpoint_ready(request)
+                            .map_err(WorkloadActuatorError::Retryable)?;
+                        let lease = status.attachment.clone().ok_or_else(|| {
+                            WorkloadActuatorError::Permanent(
+                                "Browser RDP readiness has no journaled attachment lease".into(),
+                            )
+                        })?;
+                        return Ok(Some(WorkloadActuatorOutcome {
+                            phase: WorkloadOperationPhase::Completed,
+                            power: WorkloadPowerState::Running,
+                            readiness: WorkloadReadiness::Ready,
+                            retryable: false,
+                            reason: None,
+                            remediation: None,
+                            attachment: Some(lease),
+                        }));
+                    }
                     let runtime = self.attachment_for_status(request, status, now_ms())?;
                     let address = Self::qemu_display1_address(request)?;
                     runtime.register(address);
@@ -2709,6 +2772,11 @@ fn validate_native_attachment_route(
                 .into(),
         ));
     }
+    if request.preferred_attachment == Some(WorkloadAttachmentProtocol::Rdp)
+        && is_browser_rdp_request(request)
+    {
+        return Ok(());
+    }
     if request.preferred_attachment != Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf) {
         return Err(WorkloadActuatorError::Permanent(
             "the local Workload actuator supports StartAndAttach only through QEMU Display1 DMA-BUF"
@@ -2716,6 +2784,41 @@ fn validate_native_attachment_route(
         ));
     }
     Ok(())
+}
+
+const BROWSER_RDP_PORT: u16 = 3389;
+const BROWSER_WORKLOAD_ID: &str = "browser-vm";
+
+fn is_browser_rdp_request(request: &WorkloadOperationRequest) -> bool {
+    request.workload_id.as_str() == BROWSER_WORKLOAD_ID
+        && request.backend == WorkloadBackend::LibvirtVirtqemud
+        && request.target_node.len() <= 128
+        && !request.target_node.is_empty()
+}
+
+fn browser_rdp_endpoint_ready(request: &WorkloadOperationRequest) -> Result<(), String> {
+    browser_rdp_endpoint_ready_at(request, BROWSER_RDP_PORT, Duration::from_secs(2))
+}
+
+fn browser_rdp_endpoint_ready_at(
+    request: &WorkloadOperationRequest,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), String> {
+    if !is_browser_rdp_request(request)
+        || request.preferred_attachment != Some(WorkloadAttachmentProtocol::Rdp)
+    {
+        return Err("RDP publication is reserved for the canonical Browser VM profile".into());
+    }
+    let mut addresses = (request.target_node.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("resolve Browser RDP endpoint: {error}"))?;
+    let address = addresses
+        .next()
+        .ok_or_else(|| "Browser RDP endpoint resolved to no bounded address".to_string())?;
+    TcpStream::connect_timeout(&address, timeout)
+        .map(|_| ())
+        .map_err(|error| format!("Browser RDP endpoint {address} is unavailable: {error}"))
 }
 
 fn queued_status(request: &WorkloadOperationRequest) -> WorkloadOperationStatus {
@@ -4939,8 +5042,15 @@ fn validate_recovered_attachment_lease(
     if lease.generation != status.generation {
         return Err("lease generation does not match the recovered Workload generation");
     }
-    if lease.protocol != WorkloadAttachmentProtocol::QemuDisplay1Dmabuf {
-        return Err("lease protocol is not the authenticated Display1 protocol");
+    if lease.protocol
+        != request
+            .preferred_attachment
+            .unwrap_or(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf)
+    {
+        return Err("lease protocol does not match the owning Workload request");
+    }
+    if lease.protocol == WorkloadAttachmentProtocol::Rdp && !is_browser_rdp_request(request) {
+        return Err("RDP lease is not owned by the canonical Browser VM profile");
     }
     if lease.expires_at_ms > request.deadline_at_ms {
         return Err("lease outlives the originating Workload operation deadline");
@@ -6534,6 +6644,80 @@ mod tests {
         let next = SystemWorkloadActuator::attachment_lease(&next_request, 2, now);
         assert_ne!(first.lease_id, next.lease_id);
         assert_eq!(next.generation, 2);
+    }
+
+    #[test]
+    fn browser_rdp_publication_binds_exact_one_node_workloads_authority() {
+        let now = now_ms();
+        let mut browser = request();
+        browser.request_id = "browser-rdp-request-7".into();
+        browser.workload_id = WorkloadId::new(BROWSER_WORKLOAD_ID).expect("Browser workload");
+        browser.target_node = "seat15".into();
+        browser.preferred_attachment = Some(WorkloadAttachmentProtocol::Rdp);
+        assert!(validate_native_attachment_route(&browser).is_ok());
+
+        let lease = SystemWorkloadActuator::attachment_lease(&browser, 1, now);
+        assert_eq!(lease.protocol, WorkloadAttachmentProtocol::Rdp);
+        assert_eq!(lease.workload_id.as_str(), BROWSER_WORKLOAD_ID);
+        assert_eq!(lease.generation, 1);
+        assert!(lease.lease_id.starts_with("browser-rdp-"));
+        assert!(lease.validate(now).is_ok());
+
+        let mut status = queued_status(&browser);
+        status.phase = WorkloadOperationPhase::Completed;
+        status.power = WorkloadPowerState::Running;
+        status.readiness = WorkloadReadiness::Ready;
+        status.attachment = Some(lease.clone());
+        assert!(validate_recovered_attachment_lease(&browser, &status, &lease, now).is_ok());
+
+        let mut replacement = browser.clone();
+        replacement.request_id = "browser-rdp-request-replacement".into();
+        assert_ne!(
+            lease,
+            SystemWorkloadActuator::attachment_lease(&replacement, 1, now),
+            "a replaced request must not inherit the prior RDP lease"
+        );
+        replacement.request_id = browser.request_id.clone();
+        replacement.target_node = "replacement-seat".into();
+        assert_ne!(
+            lease,
+            SystemWorkloadActuator::attachment_lease(&replacement, 1, now),
+            "a serving/client identity replacement must mint a distinct lease"
+        );
+
+        let mut non_browser = browser;
+        non_browser.workload_id = WorkloadId::new("other-vm").expect("other workload");
+        assert!(validate_native_attachment_route(&non_browser).is_err());
+        assert!(validate_recovered_attachment_lease(&non_browser, &status, &lease, now).is_err());
+    }
+
+    #[test]
+    fn browser_rdp_publication_waits_for_the_bounded_guest_endpoint() {
+        let mut browser = request();
+        browser.workload_id = WorkloadId::new(BROWSER_WORKLOAD_ID).expect("Browser workload");
+        browser.target_node = "127.0.0.1".into();
+        browser.preferred_attachment = Some(WorkloadAttachmentProtocol::Rdp);
+
+        let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("closed Browser endpoint");
+        let closed_port = closed.local_addr().expect("closed endpoint address").port();
+        drop(closed);
+        assert!(browser_rdp_endpoint_ready_at(
+            &browser,
+            closed_port,
+            Duration::from_millis(100)
+        )
+        .is_err());
+
+        let ready = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("ready Browser endpoint");
+        let ready_port = ready.local_addr().expect("ready endpoint address").port();
+        assert!(browser_rdp_endpoint_ready_at(
+            &browser,
+            ready_port,
+            Duration::from_millis(100)
+        )
+        .is_ok());
     }
 
     #[test]

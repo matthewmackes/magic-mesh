@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Start the stable Browser VM through the sole Workloads authority.
 #
-# This helper deliberately has no libvirt, QEMU, SPICE, RDP, console, or
-# placement implementation.  It creates one capability-bound StartAndAttach
-# request and waits for the authoritative Display1 lease.  The compute worker
-# owns every provider side effect.
+# This helper deliberately has no libvirt, QEMU, console, or placement
+# implementation. It creates one capability-bound StartAndAttach request and
+# waits for the authoritative Browser RDP lease. The compute worker owns every
+# provider side effect and publishes only after the fixed guest endpoint is
+# ready.
 set -euo pipefail
 set +x
 umask 077
@@ -62,7 +63,6 @@ ACTION_VERB = "workload-operation"
 STATE_PREFIX = "state/workloads/"
 SCHEMA_VERSION = 1
 WORKLOAD_NAME = "browser-vm"
-WORKLOAD_PREFIX = "vm"
 BACKEND = "libvirt_virtqemud"
 DEFAULT_ACTION = "start_and_attach"
 SUPPORTED_ACTIONS = frozenset({
@@ -70,7 +70,7 @@ SUPPORTED_ACTIONS = frozenset({
 })
 IMAGE_REQUIRED_ACTIONS = frozenset({"start_and_attach", "start"})
 EXISTING_WORKLOAD_ACTIONS = frozenset({"stop", "restart", "resume", "destroy"})
-ATTACHMENT = "qemu_display1_dmabuf"
+ATTACHMENT = "rdp"
 # Keep one hardware thread available to Dom0 on the four-thread Dell seat.
 # Three guest cores preserve interactive parallelism without letting QEMU
 # contend for every host thread during shell, sync, and Bus activity.
@@ -80,6 +80,7 @@ BROWSER_VCPU = 2
 BROWSER_MEMORY_MB = 4096
 BROWSER_DISK_GB = 32
 TOKEN_TTL_MS = 25_000
+RDP_OPERATION_TTL_MS = 15 * 60 * 1_000
 OPERATION_TIMEOUT_SECONDS = 330.0
 BUS_COMMAND_TIMEOUT_SECONDS = 8.0
 POLL_SECONDS = 0.5
@@ -106,7 +107,8 @@ def current_ms():
 
 
 def workload_id(node):
-    return f"{WORKLOAD_PREFIX}:{node}:{WORKLOAD_NAME}"
+    del node
+    return WORKLOAD_NAME
 
 
 def validate_node(node):
@@ -196,7 +198,7 @@ def build_request(key, node, image_ref, generation, nonce, now, action):
         "target_node": node,
         "expected_generation": generation,
         "action": action,
-        "deadline_at_ms": now + 20_000,
+        "deadline_at_ms": now + (RDP_OPERATION_TTL_MS if action == "start_and_attach" else 20_000),
         "preferred_attachment": ATTACHMENT if action == "start_and_attach" else None,
     }
     digest = request_digest(request)
@@ -368,7 +370,7 @@ def wait_for(bus, root, node, request_receipt, request_id, action):
         if status == "malformed":
             raise SafeFailure("workload-state-malformed")
         time.sleep(POLL_SECONDS)
-    raise SafeFailure("display1-ready-timeout" if saw_reply else "operation-reply-timeout")
+    raise SafeFailure("browser-rdp-ready-timeout" if saw_reply else "operation-reply-timeout")
 
 
 def live(credential_path, node, action, image_ref, bus, root):
@@ -418,7 +420,7 @@ def self_test():
     assert EXISTING_WORKLOAD_ACTIONS == frozenset({"stop", "restart", "resume", "destroy"})
     assert requires_existing_generation("restart")
     assert not requires_existing_generation("start_and_attach")
-    assert ATTACHMENT == "qemu_display1_dmabuf"
+    assert ATTACHMENT == "rdp"
     node = "seat15"
     image_ref = "browser-vm-chromium:20260806"
     validate_node(node)
@@ -439,13 +441,14 @@ def self_test():
             raise AssertionError("unsafe image reference accepted")
     key = bytearray.fromhex("00" * 32)
     request = build_request(key, node, image_ref, 7, "00112233445566778899aabbccddeeff", 1_893_456_000_000, DEFAULT_ACTION)
-    assert request["workload_id"] == "vm:seat15:browser-vm"
+    assert request["workload_id"] == "browser-vm"
     assert request["expected_generation"] == 7
     assert request["action"] == DEFAULT_ACTION
     assert request["preferred_attachment"] == ATTACHMENT
+    assert request["deadline_at_ms"] == 1_893_456_000_000 + RDP_OPERATION_TTL_MS
     assert request["backend"] == BACKEND
     assert request["resources"] == {"vcpu": 2, "memory_mb": 4096, "disk_gb": 32}
-    assert request["armed_token"].split("|")[3:6] == [ACTION_VERB, node, "workload:vm:seat15:browser-vm"]
+    assert request["armed_token"].split("|")[3:6] == [ACTION_VERB, node, "workload:browser-vm"]
     assert "armed_token" not in canonical_json({key: value for key, value in request.items() if key != "armed_token"})
     assert generation_from_snapshot(None, node) == 0
     snapshot = {"schema_version": 1, "node": node, "observed_at_ms": 1,
