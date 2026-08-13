@@ -39,7 +39,10 @@ const MAX_REDACTION_SCAN_BYTES: usize = 16 * 1024;
 const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
 const HISTORY_FILTER_STATE_ID: &str = "health-history-severity-filter";
 const HISTORY_COMPONENT_FILTER_STATE_ID: &str = "health-history-component-filter";
+const HISTORY_SOURCE_FILTER_STATE_ID: &str = "health-history-source-filter";
+const HISTORY_PROVIDER_FILTER_STATE_ID: &str = "health-history-provider-filter";
 const HISTORY_PAGE_STATE_ID: &str = "health-history-page";
+const HISTORY_ORIGIN_FILTER_LIMIT: usize = 32;
 const SNAPSHOT_AUTHORITY_STATE_ID: &str = "health-snapshot-authority";
 const ACTION_PROGRESS_STATE_ID: &str = "health-action-result-progress";
 const ACTION_RESULT_TAIL_BOUND: usize = 8;
@@ -59,6 +62,8 @@ struct HistoryPageState {
     node: String,
     filter: HistorySeverityFilter,
     component: HistoryComponentFilter,
+    source: Option<String>,
+    provider: Option<String>,
     page: usize,
 }
 
@@ -625,13 +630,82 @@ fn detail(
                     }
                 });
             set_history_component_filter(ui.ctx(), component);
-            let mut page_state = history_page_state(ui.ctx(), &node, filter, component);
+            let sources = history_origin_choices(
+                &snapshot.resolved_conditions,
+                &node,
+                snapshot.generated_at_ms,
+                |condition| &condition.source,
+            );
+            let providers = history_origin_choices(
+                &snapshot.resolved_conditions,
+                &node,
+                snapshot.generated_at_ms,
+                |condition| &condition.evidence.provider,
+            );
+            let mut source = history_source_filter(ui.ctx());
+            if source
+                .as_ref()
+                .is_some_and(|selected| !sources.contains(selected))
+            {
+                source = None;
+            }
+            egui::ComboBox::from_id_salt("health-history-source-filter-combo")
+                .selected_text(
+                    source
+                        .as_deref()
+                        .map_or("All sources".into(), redact_support_text),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut source, None, "All sources");
+                    for choice in &sources {
+                        ui.selectable_value(
+                            &mut source,
+                            Some(choice.clone()),
+                            redact_support_text(choice),
+                        );
+                    }
+                });
+            set_history_source_filter(ui.ctx(), source.clone());
+            let mut provider = history_provider_filter(ui.ctx());
+            if provider
+                .as_ref()
+                .is_some_and(|selected| !providers.contains(selected))
+            {
+                provider = None;
+            }
+            egui::ComboBox::from_id_salt("health-history-provider-filter-combo")
+                .selected_text(
+                    provider
+                        .as_deref()
+                        .map_or("All providers".into(), redact_support_text),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut provider, None, "All providers");
+                    for choice in &providers {
+                        ui.selectable_value(
+                            &mut provider,
+                            Some(choice.clone()),
+                            redact_support_text(choice),
+                        );
+                    }
+                });
+            set_history_provider_filter(ui.ctx(), provider.clone());
+            let mut page_state = history_page_state(
+                ui.ctx(),
+                &node,
+                filter,
+                component,
+                source.as_deref(),
+                provider.as_deref(),
+            );
             let mut history = paged_recurrence_history(
                 &snapshot.resolved_conditions,
                 &node,
                 snapshot.generated_at_ms,
                 filter,
                 component,
+                source.as_deref(),
+                provider.as_deref(),
                 page_state.page,
             );
             let page_count = history.total.div_ceil(HISTORY_PAGE_SIZE).max(1);
@@ -643,6 +717,8 @@ fn detail(
                     snapshot.generated_at_ms,
                     filter,
                     component,
+                    source.as_deref(),
+                    provider.as_deref(),
                     page_state.page,
                 );
             }
@@ -1920,15 +1996,23 @@ fn history_page_state(
     node: &str,
     filter: HistorySeverityFilter,
     component: HistoryComponentFilter,
+    source: Option<&str>,
+    provider: Option<&str>,
 ) -> HistoryPageState {
     ctx.data(|data| data.get_temp::<HistoryPageState>(egui::Id::new(HISTORY_PAGE_STATE_ID)))
         .filter(|state| {
-            state.node == node && state.filter == filter && state.component == component
+            state.node == node
+                && state.filter == filter
+                && state.component == component
+                && state.source.as_deref() == source
+                && state.provider.as_deref() == provider
         })
         .unwrap_or_else(|| HistoryPageState {
             node: node.to_string(),
             filter,
             component,
+            source: source.map(str::to_owned),
+            provider: provider.map(str::to_owned),
             page: 0,
         })
 }
@@ -1942,6 +2026,22 @@ fn history_component_filter(ctx: &egui::Context) -> HistoryComponentFilter {
 
 fn set_history_component_filter(ctx: &egui::Context, filter: HistoryComponentFilter) {
     ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_COMPONENT_FILTER_STATE_ID), filter));
+}
+
+fn history_source_filter(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|data| data.get_temp(egui::Id::new(HISTORY_SOURCE_FILTER_STATE_ID)))
+}
+
+fn set_history_source_filter(ctx: &egui::Context, filter: Option<String>) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_SOURCE_FILTER_STATE_ID), filter));
+}
+
+fn history_provider_filter(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|data| data.get_temp(egui::Id::new(HISTORY_PROVIDER_FILTER_STATE_ID)))
+}
+
+fn set_history_provider_filter(ctx: &egui::Context, filter: Option<String>) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_PROVIDER_FILTER_STATE_ID), filter));
 }
 
 fn set_history_page_state(ctx: &egui::Context, state: HistoryPageState) {
@@ -1985,6 +2085,8 @@ fn filtered_recurrence_history<'a>(
         as_of_ms,
         filter,
         HistoryComponentFilter::All,
+        None,
+        None,
         0,
     )
     .rows
@@ -1996,6 +2098,8 @@ fn paged_recurrence_history<'a>(
     as_of_ms: u64,
     filter: HistorySeverityFilter,
     component: HistoryComponentFilter,
+    source: Option<&str>,
+    provider: Option<&str>,
     page: usize,
 ) -> HistoryPage<'a> {
     let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
@@ -2003,6 +2107,8 @@ fn paged_recurrence_history<'a>(
         matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
             && filter.admits(condition.severity)
             && component.admits(condition.component)
+            && source.is_none_or(|source| condition.source == source)
+            && provider.is_none_or(|provider| condition.evidence.provider == provider)
             && !condition.is_active()
             && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
                 (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
@@ -2060,6 +2166,30 @@ fn paged_recurrence_history<'a>(
         .take(HISTORY_PAGE_SIZE)
         .collect();
     HistoryPage { rows, total }
+}
+
+fn history_origin_choices(
+    conditions: &[HealthCondition],
+    node: &str,
+    as_of_ms: u64,
+    value: impl for<'a> Fn(&'a HealthCondition) -> &'a str,
+) -> Vec<String> {
+    let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
+    let mut choices = std::collections::BTreeSet::new();
+    for condition in conditions.iter().filter(|condition| {
+        matches!(&condition.scope, HealthScope::Node { node: target } if target == node)
+            && !condition.is_active()
+            && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
+                (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
+                    && resolved_at_ms >= condition.last_observed_ms
+            })
+    }) {
+        choices.insert(value(condition).to_owned());
+        if choices.len() > HISTORY_ORIGIN_FILTER_LIMIT {
+            choices.pop_last();
+        }
+    }
+    choices.into_iter().collect()
 }
 
 fn history_order(left: &HealthCondition, right: &HealthCondition) -> std::cmp::Ordering {
@@ -2785,6 +2915,8 @@ mod tests {
             100_000,
             HistorySeverityFilter::All,
             HistoryComponentFilter::All,
+            None,
+            None,
             1,
         );
         assert_eq!(second.total, 19);
@@ -2797,6 +2929,8 @@ mod tests {
             100_000,
             HistorySeverityFilter::All,
             HistoryComponentFilter::All,
+            None,
+            None,
             2,
         );
         assert_eq!(stale_page.total, 3);
@@ -2807,6 +2941,8 @@ mod tests {
             100_000,
             HistorySeverityFilter::All,
             HistoryComponentFilter::All,
+            None,
+            None,
             0,
         );
         assert_eq!(clamped.rows.len(), 3);
@@ -2840,6 +2976,8 @@ mod tests {
             100_000,
             HistorySeverityFilter::Critical,
             HistoryComponentFilter::Component(HealthComponent::Devices),
+            None,
+            None,
             0,
         );
         assert_eq!(page.total, 8, "the intersection is counted before paging");
@@ -2854,6 +2992,8 @@ mod tests {
             node: "node".into(),
             filter: HistorySeverityFilter::Critical,
             component: HistoryComponentFilter::Component(HealthComponent::Audio),
+            source: Some("old-source".into()),
+            provider: Some("old-provider".into()),
             page: 3,
         };
         set_history_page_state(&ctx, stale);
@@ -2863,10 +3003,100 @@ mod tests {
                 "node",
                 HistorySeverityFilter::Critical,
                 HistoryComponentFilter::Component(HealthComponent::Devices),
+                Some("new-source"),
+                Some("new-provider"),
             )
             .page,
             0,
             "changing the component dimension resets stale page authority"
+        );
+    }
+
+    #[test]
+    fn history_source_and_provider_filters_compose_before_recurrence_and_paging() {
+        let mut conditions = Vec::new();
+        for index in 0..40 {
+            let mut resolved = condition(
+                &format!("node:resolved-{:02}", index % 10),
+                "node",
+                if index % 2 == 0 {
+                    HealthSeverity::Critical
+                } else {
+                    HealthSeverity::Warning
+                },
+                if index % 4 < 2 {
+                    HealthComponent::Devices
+                } else {
+                    HealthComponent::Audio
+                },
+            );
+            resolved.source = if index % 5 == 0 {
+                "remote-probe".into()
+            } else {
+                "local-probe".into()
+            };
+            resolved.evidence.provider = if index % 10 == 0 {
+                "provider-a".into()
+            } else {
+                "provider-b".into()
+            };
+            resolved.resolved_at_ms = Some(2_000 + index);
+            conditions.push(resolved);
+        }
+
+        let page = paged_recurrence_history(
+            &conditions,
+            "node",
+            100_000,
+            HistorySeverityFilter::Critical,
+            HistoryComponentFilter::Component(HealthComponent::Devices),
+            Some("remote-probe"),
+            Some("provider-a"),
+            0,
+        );
+        assert_eq!(
+            page.total, 1,
+            "all four dimensions precede identity aggregation"
+        );
+        assert_eq!(
+            page.rows[0].occurrences, 2,
+            "matching recurrences remain complete"
+        );
+        assert!(page.rows.iter().all(|recurrence| {
+            recurrence.condition.source == "remote-probe"
+                && recurrence.condition.evidence.provider == "provider-a"
+                && recurrence.condition.severity == HealthSeverity::Critical
+                && recurrence.condition.component == HealthComponent::Devices
+        }));
+
+        let choices = history_origin_choices(&conditions, "node", 100_000, |condition| {
+            &condition.evidence.provider
+        });
+        assert_eq!(choices, ["provider-a", "provider-b"]);
+
+        let mut active = condition(
+            "node:active-provider-a",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::Devices,
+        );
+        active.source = "remote-probe".into();
+        active.evidence.provider = "provider-a".into();
+        conditions.push(active);
+        assert_eq!(
+            paged_recurrence_history(
+                &conditions,
+                "node",
+                100_000,
+                HistorySeverityFilter::All,
+                HistoryComponentFilter::All,
+                Some("remote-probe"),
+                Some("provider-a"),
+                0,
+            )
+            .total,
+            1,
+            "history filtering cannot absorb or duplicate active conditions"
         );
     }
 
