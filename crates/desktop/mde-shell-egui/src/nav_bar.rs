@@ -705,12 +705,7 @@ impl State {
                     "navigation preference directory is unavailable",
                 )
             })?;
-            state.save_with_profile_to(
-                &path,
-                state.mode,
-                pins,
-                ProfileState::Configured,
-            )
+            state.save_with_profile_to(&path, state.mode, pins, ProfileState::Configured)
         })
     }
 
@@ -3452,10 +3447,10 @@ mod tests {
         state.toggle_pin_selector_surface(Surface::Browser);
         assert_eq!(state.pin_selector.selected, vec![Surface::Browser]);
 
-        let failed = state.commit_first_boot_selection(
-            state.bounded_first_boot_selection(),
-            |_, _| Err(std::io::Error::other("simulated durable write failure")),
-        );
+        let failed = state
+            .commit_first_boot_selection(state.bounded_first_boot_selection(), |_, _| {
+                Err(std::io::Error::other("simulated durable write failure"))
+            });
         assert!(!failed);
         assert!(state.is_new_profile());
         assert!(state.pinned_surfaces().is_empty());
@@ -3464,12 +3459,7 @@ mod tests {
         let committed = state.commit_first_boot_selection(
             state.bounded_first_boot_selection(),
             |state, pins| {
-                state.save_with_profile_to(
-                    &path,
-                    state.mode,
-                    pins,
-                    ProfileState::Configured,
-                )
+                state.save_with_profile_to(&path, state.mode, pins, ProfileState::Configured)
             },
         );
         assert!(committed);
@@ -3503,10 +3493,9 @@ mod tests {
             vec![Surface::Browser, Surface::MapsLocation]
         );
 
-        assert!(state.commit_first_boot_selection(
-            state.bounded_first_boot_selection(),
-            |_, _| Ok(())
-        ));
+        assert!(
+            state.commit_first_boot_selection(state.bounded_first_boot_selection(), |_, _| Ok(()))
+        );
 
         assert!(!state.is_new_profile());
         assert_eq!(
@@ -3518,10 +3507,9 @@ mod tests {
     #[test]
     fn first_boot_empty_selection_does_not_restore_defaults() {
         let mut state = State::new_profile(DockMode::Floating);
-        assert!(state.commit_first_boot_selection(
-            state.bounded_first_boot_selection(),
-            |_, _| Ok(())
-        ));
+        assert!(
+            state.commit_first_boot_selection(state.bounded_first_boot_selection(), |_, _| Ok(()))
+        );
 
         assert!(!state.is_new_profile());
         assert!(state.pinned_surfaces().is_empty());
@@ -3539,10 +3527,9 @@ mod tests {
             Surface::AutoHome,
         ];
 
-        assert!(state.commit_first_boot_selection(
-            state.bounded_first_boot_selection(),
-            |_, _| Ok(())
-        ));
+        assert!(
+            state.commit_first_boot_selection(state.bounded_first_boot_selection(), |_, _| Ok(()))
+        );
 
         assert_eq!(
             state.pinned_surfaces(),
