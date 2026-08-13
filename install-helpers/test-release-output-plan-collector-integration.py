@@ -164,10 +164,10 @@ def main() -> None:
         tools = root / "bin"; tools.mkdir(mode=0o700)
         tool(tools / "rpm", """
 case " $* " in *' --initdb '*|*' --import '*) exit 0 ;; esac
-rpm=${@: -1}; case "$(basename "$rpm")" in
-  workstation-rpm.rpm) name=magic-mesh; release=34 ;;
-  server-rpm.rpm) name=magic-mesh-server; release=23 ;;
-  lighthouse-rpm.rpm) name=magic-mesh-lighthouse; release=11 ;;
+rpm=${@: -1}; case "$rpm" in
+  *workstation-rpm.rpm) name=magic-mesh; release=34 ;;
+  *server-rpm-reverify-*/candidate.rpm|*server-rpm.rpm) name=magic-mesh-server; release=23 ;;
+  *browser-lighthouse-verify-*/candidate.rpm|*lighthouse-rpm.rpm) name=magic-mesh-lighthouse; release=11 ;;
   *) exit 2 ;;
 esac
 printf '%s\\t0\\t12.1.6\\t%s\\tx86_64\\n8\\t%s\\n' "$name" "$release" "$(printf 'a%.0s' {1..64})"
