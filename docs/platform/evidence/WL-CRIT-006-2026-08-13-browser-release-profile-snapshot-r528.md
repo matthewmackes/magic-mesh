@@ -29,6 +29,12 @@ or either image builder, then passes the same snapshot and revision to the
 Browser builder and final manifest verifier. A freeze failure cannot publish a
 collection or invoke RPM verifiers/builders.
 
+The immutable derivative collection retains that exact snapshot as
+`browser-vm-chromium.profile.env`, records its digest and size in
+`derivative-images.json`, and performs final Browser manifest verification
+against the retained copy. The release-output plan can therefore resume from
+the collection without reconstructing or substituting profile authority.
+
 ## Exact farm gates
 
 - `.50`, `crit006-browser-profile-hostile-r528e`: initialized a slot-local Git
@@ -48,6 +54,16 @@ collection or invoke RPM verifiers/builders.
 - `.196`, `crit006-browser-profile-python-r528c`: Python bytecode compilation
   and tabnanny for `release-profile.py` and `verify-image-manifest.py`; passed.
 - Local scoped `git diff --check`; passed.
+
+Follow-up collection integration gates:
+
+- `.50`, `crit006-derivative-profile-publish-r529`: derivative hostile
+  orchestration suite passed, including retained-profile existence and revision,
+  exact digest/size manifest entry, collection-path Browser verification, failed
+  freeze/build/manifest handling, and no partial publication.
+- `.50`, `crit006-derivative-profile-shellcheck-r529`: strict ShellCheck and
+  Bash syntax checks for the derivative orchestrator and hostile suite passed
+  with no diagnostics.
 
 An initial producer run exposed and led to correction of a mode-`000` umask;
 an initial static route found that `.170` lacks ShellCheck, so the authoritative

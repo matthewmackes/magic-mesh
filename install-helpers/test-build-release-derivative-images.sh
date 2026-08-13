@@ -94,13 +94,27 @@ before=$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")
 run --output "$work/out-parent/good"
 [ -f "$work/out-parent/good/derivative-images.json" ]
 [ -f "$work/out-parent/good/app-vm-wayland-standard.mcnf-manifest.json" ]
+[ -f "$work/out-parent/good/browser-vm-chromium.profile.env" ]
+grep -Fxq "BROWSER_VM_SOURCE_COMMIT=$REVISION" \
+  "$work/out-parent/good/browser-vm-chromium.profile.env"
 grep -Fq '"promotion":"forbidden"' "$work/out-parent/good/derivative-images.json"
+python3 - "$work/out-parent/good" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+profile = root / "browser-vm-chromium.profile.env"
+record = json.loads((root / "derivative-images.json").read_text())["artifacts"][profile.name]
+assert record == {
+    "sha256": "sha256:" + hashlib.sha256(profile.read_bytes()).hexdigest(),
+    "size": profile.stat().st_size,
+}
+PY
 grep -Fq 'app-builder --rpm ' "$work/calls"
 grep -Fq 'browser-builder ' "$work/calls"
 grep -Fq -- "--rpm $work" "$work/calls"
 grep -Fq "browser-builder --profile " "$work/calls"
 grep -Fq -- "--source-revision $REVISION" "$work/calls"
 grep -Fq "manifest-verify verify --repo-root $ROOT --profile " "$work/calls"
+grep -Fq -- "/collection/browser-vm-chromium.profile.env" "$work/calls"
 grep -Fq -- "--source-revision $REVISION" "$work/calls"
 [ "$before" = "$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")" ]
 
