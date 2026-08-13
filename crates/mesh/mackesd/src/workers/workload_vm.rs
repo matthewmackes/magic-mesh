@@ -44,7 +44,7 @@ pub enum VmDomainSpecError {
     UnsafeDiskPath,
     /// The disk attachment belongs to a different Workload domain identity.
     MismatchedDiskIdentity,
-    /// A domain or network identity exceeds the bounded XML contract.
+    /// A domain or network identity violates the bounded libvirt XML contract.
     InvalidIdentity,
 }
 
@@ -59,7 +59,9 @@ impl std::fmt::Display for VmDomainSpecError {
             Self::MismatchedDiskIdentity => {
                 formatter.write_str("VM disk attachment does not match the Workload domain")
             }
-            Self::InvalidIdentity => formatter.write_str("VM identity exceeds the bounded XML contract"),
+            Self::InvalidIdentity => {
+                formatter.write_str("VM identity violates the bounded libvirt XML contract")
+            }
         }
     }
 }
@@ -82,9 +84,13 @@ impl VmDomainSpec {
     }
 
     fn validate_identity(&self) -> Result<(), VmDomainSpecError> {
-        if self.name.is_empty()
-            || self.name.len() > MAX_VM_IDENTITY_BYTES
-            || self.network_or_default().len() > MAX_VM_IDENTITY_BYTES
+        let valid = |identity: &str| {
+            !identity.is_empty()
+                && identity.len() <= MAX_VM_IDENTITY_BYTES
+                && identity.trim() == identity
+                && !identity.chars().any(char::is_control)
+        };
+        if !valid(&self.name) || !valid(self.network_or_default())
         {
             return Err(VmDomainSpecError::InvalidIdentity);
         }
@@ -323,6 +329,36 @@ mod tests {
             build_domain_xml(&spec, "/var/lib/mde-vms/guest.qcow2"),
             Err(VmDomainSpecError::InvalidIdentity)
         );
+    }
+
+    #[test]
+    fn invalid_libvirt_identities_fail_before_domain_definition() {
+        let build = |name: &str, network: Option<&str>| {
+            let spec = VmDomainSpec {
+                name: name.into(),
+                vcpus: 1,
+                ram_mb: 1024,
+                host_threads: 2,
+                network: network.map(str::to_owned),
+            };
+            let disk_path = format!("/var/lib/mde-vms/{name}.qcow2");
+            build_domain_xml(&spec, &disk_path)
+        };
+
+        for name in [" workload", "workload ", "work\nload", "work\0load"] {
+            assert_eq!(
+                build(name, None),
+                Err(VmDomainSpecError::InvalidIdentity),
+                "invalid domain identity must not reach libvirt: {name:?}"
+            );
+        }
+        for network in ["", " default", "default ", "mesh\nnetwork", "mesh\0network"] {
+            assert_eq!(
+                build("workload", Some(network)),
+                Err(VmDomainSpecError::InvalidIdentity),
+                "invalid network identity must not reach libvirt: {network:?}"
+            );
+        }
     }
 
     #[test]
