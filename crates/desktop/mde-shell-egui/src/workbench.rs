@@ -101,8 +101,9 @@ mod action_console {
         worker_change_set_action_topic, worker_change_set_digest, worker_change_set_result_topic,
         WorkerAction, WorkerActionDescriptor, WorkerArmingRequirement, WorkerChangeSetItem,
         WorkerChangeSetOperation, WorkerChangeSetOutcome, WorkerChangeSetRequest,
-        WorkerChangeSetResult, WorkerChangeSetTarget, WorkerContract, WorkerRuntimeSnapshot,
-        MAX_WORKER_CHANGE_SET_TTL_MS, WORKER_CHANGE_SET_AUTH_VERB, WORKER_RUNTIME_SCHEMA_VERSION,
+        WorkerChangeSetResult, WorkerChangeSetTarget, WorkerContract, WorkerGroup,
+        WorkerRelationEndpoint, WorkerRuntimeSnapshot, MAX_WORKER_CHANGE_SET_TTL_MS,
+        WORKER_CHANGE_SET_AUTH_VERB, WORKER_RUNTIME_SCHEMA_VERSION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -254,15 +255,14 @@ mod action_console {
 
         fn reconcile_selection(&mut self) {
             let selected_exists = self.selected_worker.as_ref().is_some_and(|selected| {
-                self.workers.iter().any(|row| {
-                    row.contract.worker_id == *selected && !row.contract.actions.is_empty()
-                })
+                self.workers
+                    .iter()
+                    .any(|row| row.contract.worker_id == *selected)
             });
             if !selected_exists {
                 self.selected_worker = self
                     .workers
-                    .iter()
-                    .find(|row| !row.contract.actions.is_empty())
+                    .first()
                     .map(|row| row.contract.worker_id.clone());
             }
             let allowed = self
@@ -449,46 +449,136 @@ mod action_console {
 
         fn show(&mut self, ui: &mut egui::Ui, now_ms: u64) {
             self.poll(now_ms);
-            egui::CollapsingHeader::new("Action Console")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.colored_label(
-                        Style::TEXT_DIM,
-                        "Preview one admitted worker action, then explicitly commit or cancel it.",
-                    );
-                    if self.workers.is_empty() {
-                        ui.colored_label(
-                            Style::TEXT_DIM,
-                            "No current worker runtime snapshot is available on this node.",
-                        );
-                    } else {
-                        self.show_selection(ui);
-                        self.show_stage(ui, now_ms);
-                    }
-                    if let Some(error) = &self.last_error {
-                        ui.colored_label(Style::DANGER, error);
-                    }
-                    self.show_result(ui);
+            ui.colored_label(
+                Style::TEXT_DIM,
+                "One live worker selection drives the tree, typed graph, inspector, history, and staged actions.",
+            );
+            if self.workers.is_empty() {
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    "No current worker runtime snapshot is available on this node.",
+                );
+            } else if ui.available_width() < 760.0 {
+                self.show_worker_tree(ui, now_ms);
+                ui.separator();
+                self.show_inspector(ui, now_ms);
+            } else {
+                ui.columns(2, |columns| {
+                    self.show_worker_tree(&mut columns[0], now_ms);
+                    self.show_inspector(&mut columns[1], now_ms);
                 });
+            }
+            if let Some(error) = &self.last_error {
+                ui.colored_label(Style::DANGER, error);
+            }
+            self.show_result(ui);
         }
 
-        fn show_selection(&mut self, ui: &mut egui::Ui) {
+        fn show_worker_tree(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+            ui.label(RichText::new("Workers").strong());
             let prior_worker = self.selected_worker.clone();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Target");
-                egui::ComboBox::from_id_salt("workers-action-target")
-                    .selected_text(self.selected_worker.as_deref().unwrap_or("Unavailable"))
-                    .show_ui(ui, |ui| {
-                        for row in &self.workers {
-                            if !row.contract.actions.is_empty() {
-                                ui.selectable_value(
-                                    &mut self.selected_worker,
-                                    Some(row.contract.worker_id.clone()),
-                                    &row.contract.display_name,
-                                );
-                            }
+            for group in WorkerGroup::ALL {
+                let count = self
+                    .workers
+                    .iter()
+                    .filter(|row| row.contract.group == group)
+                    .count();
+                if count == 0 {
+                    continue;
+                }
+                egui::CollapsingHeader::new(format!("{} ({count})", group.as_str()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for row in self
+                            .workers
+                            .iter()
+                            .filter(|row| row.contract.group == group)
+                        {
+                            let state = row.snapshot.effective_state(now_ms);
+                            ui.selectable_value(
+                                &mut self.selected_worker,
+                                Some(row.contract.worker_id.clone()),
+                                format!("{}  ·  {}", row.contract.display_name, state.as_str()),
+                            );
                         }
                     });
+            }
+            if self.selected_worker != prior_worker {
+                self.selected_action = None;
+                self.reconcile_selection();
+                self.staged = None;
+                self.result = None;
+            }
+        }
+
+        fn show_inspector(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+            let Some(row) = self.selected_row().cloned() else {
+                ui.colored_label(Style::TEXT_DIM, "Select a worker to inspect it.");
+                return;
+            };
+            ui.label(RichText::new(&row.contract.display_name).strong());
+            ui.monospace(format!(
+                "{} · {} · generation {}",
+                row.contract.worker_id,
+                row.snapshot.effective_state(now_ms).as_str(),
+                row.snapshot.generation
+            ));
+            if !row.contract.description.is_empty() {
+                ui.label(&row.contract.description);
+            }
+            ui.small(format!(
+                "Restarts {} · observed {} ms · fresh until {} ms",
+                row.snapshot.restart_count,
+                row.snapshot.observed_at_ms,
+                row.snapshot.fresh_until_ms
+            ));
+
+            egui::CollapsingHeader::new(format!("Typed graph ({})", row.snapshot.relations.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if row.snapshot.relations.is_empty() {
+                        ui.colored_label(Style::TEXT_DIM, "No typed relations published.");
+                    }
+                    for relation in &row.snapshot.relations {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(relation_endpoint(&relation.source));
+                            ui.label(format!("{:?}", relation.relation));
+                            ui.monospace(relation_endpoint(&relation.target));
+                            if let Some(label) = &relation.label {
+                                ui.colored_label(Style::TEXT_DIM, label);
+                            }
+                        });
+                    }
+                });
+
+            egui::CollapsingHeader::new(format!("History ({})", row.snapshot.timeline.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if row.snapshot.timeline.is_empty() {
+                        ui.colored_label(Style::TEXT_DIM, "No bounded history published.");
+                    }
+                    for event in row.snapshot.timeline.iter().rev() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(format!("#{}", event.sequence));
+                            ui.label(format!("{:?}", event.kind));
+                            ui.label(&event.summary);
+                            if let Some(detail) = &event.detail {
+                                ui.colored_label(Style::TEXT_DIM, detail);
+                            }
+                        });
+                    }
+                });
+
+            ui.separator();
+            ui.label(RichText::new("Action Console").strong());
+            if row.contract.actions.is_empty() {
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    "This worker publishes no admitted lifecycle actions.",
+                );
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Action");
                 let actions = self
                     .selected_row()
@@ -509,20 +599,7 @@ mod action_console {
                         }
                     });
             });
-            if self.selected_worker != prior_worker {
-                self.selected_action = None;
-                self.reconcile_selection();
-                self.staged = None;
-                self.result = None;
-            }
-            if let Some(row) = self.selected_row() {
-                ui.small(format!(
-                    "{} · generation {} · {}",
-                    row.contract.worker_id,
-                    row.snapshot.generation,
-                    row.snapshot.effective_state(unix_ms()).as_str(),
-                ));
-            }
+            self.show_stage(ui, now_ms);
         }
 
         fn show_stage(&mut self, ui: &mut egui::Ui, now_ms: u64) {
@@ -593,6 +670,18 @@ mod action_console {
                     }
                 });
             }
+        }
+    }
+
+    fn relation_endpoint(endpoint: &WorkerRelationEndpoint) -> String {
+        match endpoint {
+            WorkerRelationEndpoint::Worker { worker_id } => format!("worker:{worker_id}"),
+            WorkerRelationEndpoint::Node { node_id } => format!("node:{node_id}"),
+            WorkerRelationEndpoint::Output {
+                worker_id,
+                output_kind,
+            } => format!("output:{worker_id}/{output_kind}"),
+            WorkerRelationEndpoint::Topic { topic } => format!("topic:{topic}"),
         }
     }
 
@@ -755,6 +844,33 @@ mod action_console {
                 admitted.items[0].outcome,
                 WorkerChangeSetItemOutcome::Failed
             );
+        }
+
+        #[test]
+        fn inspector_selection_is_not_limited_to_actionable_workers() {
+            let temp = tempfile::tempdir().expect("bus root");
+            let mut observer = worker(7);
+            observer.contract.worker_id = "metrics-collector".to_string();
+            observer.contract.display_name = "Metrics collector".to_string();
+            observer.contract.actions.clear();
+            observer.snapshot.worker_id = observer.contract.worker_id.clone();
+            observer.contract.validate().expect("observer contract");
+            observer.snapshot.validate().expect("observer snapshot");
+
+            let mut console = state(temp.path().to_path_buf());
+            console.workers = vec![observer, worker(7)];
+            console.selected_worker = Some("metrics-collector".to_string());
+            console.selected_action = Some(WorkerAction::Refresh);
+            console.reconcile_selection();
+
+            assert_eq!(
+                console
+                    .selected_row()
+                    .map(|row| row.contract.worker_id.as_str()),
+                Some("metrics-collector")
+            );
+            assert_eq!(console.selected_action, None);
+            assert!(console.stage_preview(3_000).is_err());
         }
     }
 }
