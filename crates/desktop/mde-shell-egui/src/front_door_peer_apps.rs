@@ -24,6 +24,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CACHE_REFRESH: Duration = Duration::from_secs(30);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RETRIES: u8 = 2;
+const MAX_NODE_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 struct PendingPeerAppsRequest {
@@ -439,7 +440,16 @@ fn flatpak_state_label(state: FlatpakInstallState) -> &'static str {
 
 fn clean_node(node: &str) -> Option<&str> {
     let node = node.trim();
-    (!node.is_empty()).then_some(node)
+    if node.is_empty()
+        || node.len() > MAX_NODE_ID_BYTES
+        || matches!(node, "." | "..")
+        || node
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(node)
 }
 
 #[cfg(test)]
@@ -506,6 +516,47 @@ mod tests {
         assert_eq!(
             note.as_deref(),
             Some("app discovery reply was for pine, not oak")
+        );
+    }
+
+    #[test]
+    fn unsafe_peer_identity_never_reaches_discovery_or_reply_cache_authority() {
+        let dir = tempfile::tempdir().expect("temp bus");
+        let root = dir.path().to_path_buf();
+        let persist = Persist::open(root.clone()).expect("open bus");
+        let mut state = FrontDoorPeerAppsState::new(Some(root));
+
+        for unsafe_node in [
+            "../oak",
+            "oak/guest",
+            "oak\nadmin",
+            ".",
+            "..",
+            &"n".repeat(MAX_NODE_ID_BYTES + 1),
+        ] {
+            state.drive_for_focus(Some(unsafe_node));
+        }
+
+        assert!(state.pending_ulid().is_none());
+        assert!(persist
+            .list_since(PEER_APPS_ACTION, None)
+            .expect("discovery requests")
+            .is_empty());
+
+        let (apps, note) = fold_peer_apps_reply(
+            "oak",
+            PeerAppsReply {
+                ok: true,
+                node: "oak/guest".into(),
+                entries: Vec::new(),
+                catalog: Some(catalog()),
+                error: None,
+            },
+        );
+        assert!(apps.is_empty());
+        assert_eq!(
+            note.as_deref(),
+            Some("oak app discovery reply omitted its node")
         );
     }
 
