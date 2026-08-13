@@ -156,13 +156,14 @@ pub(super) fn check_runtime_evidence(
     }
 
     // A shared runtime topic carries observations for multiple App VM
-    // sessions. Search newest-first for this exact identity; an unrelated
-    // session's fresh heartbeat must not block a valid resume here. Once a
-    // record can be identified as belonging to this request, all freshness,
-    // validation, and terminal-state checks remain fail-closed. Keep the
-    // newest generation as the authority while scanning: a delayed
-    // lower-generation row must not roll back to an older guest incarnation.
-    let mut newest_matching = None;
+    // sessions. Fold its chronological Bus rows for this exact identity; an
+    // unrelated session's fresh heartbeat must not block a valid resume here.
+    // Once a record can be identified as belonging to this request, all
+    // freshness, validation, and terminal-state checks remain fail-closed.
+    // Equal-generation rows advance state (in particular Connected -> Failed),
+    // forward generations replace the prior incarnation, and a delayed lower
+    // generation fails closed instead of rolling readiness backward.
+    let mut newest_matching: Option<(AppVmRuntimeEvidence, i64)> = None;
     for message in &messages {
         let Some(body) = message.body.as_deref() else {
             return AppVmRuntimeAdmission::Mismatched(
@@ -196,31 +197,14 @@ pub(super) fn check_runtime_evidence(
                 evidence.vm_id
             ));
         }
-        if let Some((_, newest_generation)) = newest_matching {
-            if evidence.generation < newest_generation {
+        if let Some((newest, _)) = newest_matching.as_ref() {
+            if evidence.generation < newest.generation {
                 return AppVmRuntimeAdmission::Stale(
                     "guest runtime evidence regressed to an older generation".to_owned(),
                 );
             }
-            continue;
         }
-
-        if message.ts_unix_ms > now_ms
-            || now_ms.saturating_sub(message.ts_unix_ms) > APP_VM_RUNTIME_STALE_AFTER_MS
-        {
-            return AppVmRuntimeAdmission::Stale(format!(
-                "matching guest observation is outside the {}ms freshness window",
-                APP_VM_RUNTIME_STALE_AFTER_MS
-            ));
-        }
-        if evidence.state == AppVmRuntimeState::Failed {
-            return AppVmRuntimeAdmission::Terminal(
-                evidence
-                    .reason
-                    .unwrap_or_else(|| "guest application reported failure".to_owned()),
-            );
-        }
-        newest_matching = Some((evidence.state, evidence.generation));
+        newest_matching = Some((evidence, message.ts_unix_ms));
     }
 
     newest_matching.map_or_else(
@@ -230,7 +214,27 @@ pub(super) fn check_runtime_evidence(
                 request.session_id, request.app_id
             ))
         },
-        |(state, generation)| AppVmRuntimeAdmission::Observed { state, generation },
+        |(evidence, observed_at_ms)| {
+            if observed_at_ms > now_ms
+                || now_ms.saturating_sub(observed_at_ms) > APP_VM_RUNTIME_STALE_AFTER_MS
+            {
+                return AppVmRuntimeAdmission::Stale(format!(
+                    "matching guest observation is outside the {}ms freshness window",
+                    APP_VM_RUNTIME_STALE_AFTER_MS
+                ));
+            }
+            if evidence.state == AppVmRuntimeState::Failed {
+                return AppVmRuntimeAdmission::Terminal(
+                    evidence
+                        .reason
+                        .unwrap_or_else(|| "guest application reported failure".to_owned()),
+                );
+            }
+            AppVmRuntimeAdmission::Observed {
+                state: evidence.state,
+                generation: evidence.generation,
+            }
+        },
     )
 }
 
@@ -768,6 +772,38 @@ mod tests {
                 message.ts_unix_ms,
             ),
             AppVmRuntimeAdmission::Terminal(_)
+        ));
+    }
+
+    #[test]
+    fn later_same_generation_crash_revokes_connected_runtime() {
+        let root = tempdir().unwrap();
+        publish_runtime(
+            root.path(),
+            "session-1",
+            "org.example.Writer",
+            4,
+            AppVmRuntimeState::Connected,
+            None,
+        );
+        let failed = publish_runtime(
+            root.path(),
+            "session-1",
+            "org.example.Writer",
+            4,
+            AppVmRuntimeState::Failed,
+            Some("application process exited"),
+        );
+
+        assert!(matches!(
+            check_runtime_evidence(
+                Some(root.path()),
+                &runtime_request("session-1", "org.example.Writer"),
+                "app-vm-1",
+                failed.ts_unix_ms,
+            ),
+            AppVmRuntimeAdmission::Terminal(reason)
+                if reason == "application process exited"
         ));
     }
 
