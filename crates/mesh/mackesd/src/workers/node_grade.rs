@@ -20,7 +20,7 @@ use mackes_mesh_types::health::{
     HealthCondition, HealthEvidence, HealthRemediation, HealthScope, HealthSeverity,
     NodeAvailabilityAssessment, NodeAvailabilityPolicy, NodeGrade, NodeHealthState,
     RequirementClass, SystemMeshHealthSnapshot, ACTION_TOPIC, CRITICAL_NOTIFY_TOPIC,
-    HEALTH_SCHEMA_VERSION, SNAPSHOT_TOPIC,
+    HEALTH_SCHEMA_VERSION, MAX_NODE_HEALTH_CONDITIONS, SNAPSHOT_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -759,8 +759,7 @@ fn evaluate_conditions(
                 false,
             )],
         )),
-        Some(inventory) if inventory.host != host || inventory.published_at_ms > now_ms =>
-        {
+        Some(inventory) if inventory.host != host || inventory.published_at_ms > now_ms => {
             conditions.push(condition(
                 host,
                 "device-evidence-invalid",
@@ -778,9 +777,7 @@ fn evaluate_conditions(
                 )],
             ));
         }
-        Some(inventory)
-            if now_ms - inventory.published_at_ms > DEVICE_INVENTORY_VALIDITY_MS =>
-        {
+        Some(inventory) if now_ms - inventory.published_at_ms > DEVICE_INVENTORY_VALIDITY_MS => {
             conditions.push(condition(
                 host,
                 "device-evidence-stale",
@@ -1292,6 +1289,17 @@ fn read_state(path: &Path) -> Option<NodeHealthState> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+fn read_snapshot(path: &Path) -> Option<SystemMeshHealthSnapshot> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_HEALTH_FILE_BYTES
+    {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
 /// Admit the producer's durable row only as its own restart generation.
 ///
 /// The canonical directory is replicated, so the filename alone cannot prove
@@ -1381,6 +1389,64 @@ fn fold_health_snapshot(
         SNAPSHOT_VALIDITY_MS,
         reachable_lighthouses,
     )
+}
+
+fn merge_availability_lifecycle(
+    snapshot: &mut SystemMeshHealthSnapshot,
+    previous: Option<&SystemMeshHealthSnapshot>,
+    now_ms: u64,
+) {
+    const SOURCE: &str = "health-availability-fold";
+    let Some(previous) = previous else {
+        return;
+    };
+
+    for current in snapshot
+        .active_conditions
+        .iter_mut()
+        .filter(|condition| condition.source == SOURCE)
+    {
+        if let Some(prior) = previous.active_conditions.iter().find(|prior| {
+            prior.source == SOURCE && prior.id == current.id && prior.scope == current.scope
+        }) {
+            current.active_since_ms = prior.active_since_ms;
+            current.acknowledged_at_ms = prior.acknowledged_at_ms;
+            current.snoozed_until_ms = prior.snoozed_until_ms;
+        }
+    }
+
+    for prior in previous
+        .active_conditions
+        .iter()
+        .filter(|condition| condition.source == SOURCE)
+    {
+        let remains_active = snapshot
+            .active_conditions
+            .iter()
+            .any(|current| current.id == prior.id && current.scope == prior.scope);
+        if remains_active {
+            continue;
+        }
+        let mut resolved = prior.clone();
+        resolved.resolved_at_ms = Some(now_ms);
+        snapshot.resolved_conditions.push(resolved);
+    }
+
+    snapshot.resolved_conditions.retain(|condition| {
+        condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
+            resolved_at_ms <= now_ms
+                && now_ms.saturating_sub(resolved_at_ms) <= HEALTH_HISTORY_RETENTION_MS
+        })
+    });
+    snapshot.resolved_conditions.sort_by(|left, right| {
+        right
+            .resolved_at_ms
+            .cmp(&left.resolved_at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    snapshot
+        .resolved_conditions
+        .truncate(MAX_NODE_HEALTH_CONDITIONS);
 }
 
 fn merge_lifecycle(
@@ -2262,7 +2328,15 @@ impl NodeGradeWorker {
         let mut publications = read_canonical_states(&self.workgroup_root);
         publications.retain(|published| published.publisher != self.host);
         publications.push(state.clone());
-        let snapshot = fold_health_snapshot(
+        let durable_snapshot = self.last_snapshot.clone().or_else(|| {
+            read_snapshot(&snapshot_path(&self.workgroup_root, &self.host)).filter(|snapshot| {
+                snapshot.observer == self.host
+                    && snapshot.roster_revision == observations.roster_revision
+                    && snapshot.generated_at_ms <= now
+                    && snapshot.is_fresh(snapshot.generated_at_ms)
+            })
+        });
+        let mut snapshot = fold_health_snapshot(
             &self.workgroup_root,
             &self.host,
             observations.roster_revision,
@@ -2272,6 +2346,7 @@ impl NodeGradeWorker {
             now,
             observations.reachable_lighthouses,
         );
+        merge_availability_lifecycle(&mut snapshot, durable_snapshot.as_ref(), now);
         let snapshot_key = snapshot_publication_key(&snapshot);
         // The injected failure exercises a real partial canonical transaction:
         // the node row is durable, the snapshot write fails, and no Bus
@@ -2934,6 +3009,85 @@ mod tests {
     }
 
     #[test]
+    fn availability_lifecycle_survives_refresh_and_records_return_history() {
+        use super::super::node_availability::runtime_availability_path;
+        use mackes_mesh_types::health::{
+            ExpectedReturn, NodeAvailabilityIntent, NodeAvailabilityState, NodeConnectionType,
+            NodeDeviceClass, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+        };
+
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let node = "seat-remote";
+        let intent = NodeAvailabilityIntent {
+            schema_version: NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+            node_id: node.into(),
+            device_id: "seat-remote-device".into(),
+            device_class: NodeDeviceClass::Laptop,
+            connection_type: NodeConnectionType::Wifi,
+            state: NodeAvailabilityState::Sleeping,
+            reason: "local seat suspend".into(),
+            source: "host-state".into(),
+            event_id: "sleep-history-1".into(),
+            generation: 1,
+            observed_at_ms: 1_000,
+            expires_at_ms: 500_000,
+            expected_return: Some(ExpectedReturn::new(31_000)),
+            old_connectivity: None,
+            new_connectivity: None,
+        };
+        write_json_atomic(&runtime_availability_path(workgroup.path(), node), &intent)
+            .expect("write lifecycle intent");
+        let canonical = BTreeSet::from([node.to_string()]);
+        let mut first = fold_health_snapshot(
+            workgroup.path(),
+            "observer",
+            "r1".into(),
+            &canonical,
+            Vec::new(),
+            1,
+            40_000,
+            1,
+        );
+        first.active_conditions[0].acknowledged_at_ms = Some(42_000);
+
+        let mut escalated = fold_health_snapshot(
+            workgroup.path(),
+            "observer",
+            "r1".into(),
+            &canonical,
+            Vec::new(),
+            2,
+            91_000,
+            1,
+        );
+        merge_availability_lifecycle(&mut escalated, Some(&first), 91_000);
+        assert_eq!(escalated.active_conditions[0].active_since_ms, 40_000);
+        assert_eq!(
+            escalated.active_conditions[0].acknowledged_at_ms,
+            Some(42_000)
+        );
+        assert_eq!(
+            escalated.active_conditions[0].severity,
+            HealthSeverity::Warning
+        );
+
+        let mut returned = escalated.clone();
+        returned.generation = 3;
+        returned.generated_at_ms = 100_000;
+        returned.fresh_until_ms = 130_000;
+        returned.active_conditions.clear();
+        returned.resolved_conditions.clear();
+        merge_availability_lifecycle(&mut returned, Some(&escalated), 100_000);
+
+        assert_eq!(returned.resolved_conditions.len(), 1);
+        let history = &returned.resolved_conditions[0];
+        assert_eq!(history.active_since_ms, 40_000);
+        assert_eq!(history.last_observed_ms, 91_000);
+        assert_eq!(history.resolved_at_ms, Some(100_000));
+        assert_eq!(history.acknowledged_at_ms, Some(42_000));
+    }
+
+    #[test]
     fn audio_probe_requires_all_bounded_provider_bits() {
         assert_eq!(
             parse_audio_probe("graph=1 pulse=0 wireplumber=1 playback=1 capture=0\n"),
@@ -2969,8 +3123,7 @@ mod tests {
         let mut sample = observations("workstation");
         sample.device_inventory.as_mut().unwrap().published_at_ms = now + 1;
 
-        let conditions =
-            evaluate_conditions("node", &sample, &PressureWindow::default(), 1, now);
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, now);
         let grade_factors = factors("node", &sample, now);
         let grade = NodeGrade::evaluate(
             "node",
@@ -3246,13 +3399,7 @@ mod tests {
             generation: 1,
             published_at_ms: 100,
             valid_until_ms: 200,
-            grade: NodeGrade::evaluate(
-                "node",
-                100,
-                factors("node", &sample, 100),
-                &[],
-                100,
-            ),
+            grade: NodeGrade::evaluate("node", 100, factors("node", &sample, 100), &[], 100),
             active_conditions: Vec::new(),
             resolved_conditions: Vec::new(),
         };
@@ -3860,9 +4007,7 @@ mod tests {
             source_ulid: message.ulid.clone(),
             result: result.clone(),
         };
-        worker
-            .store_action_journal(&message.ulid, &record)
-            .unwrap();
+        worker.store_action_journal(&message.ulid, &record).unwrap();
         let conflicting = HealthActionResult {
             detail: "hostile conflicting result".into(),
             ..result.clone()
@@ -3887,12 +4032,7 @@ mod tests {
         assert_eq!(restarted.action_execution_count, 0);
         assert_eq!(restarted.action_cursor, None);
         assert_eq!(
-            read_action_journal(
-                &restarted.action_state_root,
-                &journal_path,
-                trusted_uid
-            )
-            .unwrap(),
+            read_action_journal(&restarted.action_state_root, &journal_path, trusted_uid).unwrap(),
             Some(record),
             "a conflicting Bus row must not discard the genuine durable result"
         );
@@ -3935,9 +4075,7 @@ mod tests {
             already_published: false,
         };
 
-        assert!(worker
-            .publish_action_result(&mut persist, &staged)
-            .is_err());
+        assert!(worker.publish_action_result(&mut persist, &staged).is_err());
         let topic = action_result_topic(request_id);
         assert!(persist.list_since(&topic, None).unwrap().is_empty());
 
