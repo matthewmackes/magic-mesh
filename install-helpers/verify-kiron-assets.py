@@ -15,8 +15,9 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import wave
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 KIND = "mcnf-kiron-asset-manifest"
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_ASSET_BYTES = 32 * 1024 * 1024
@@ -24,6 +25,8 @@ HASH_CHUNK = 1024 * 1024
 GRADES = tuple("ABCDEF")
 MODES = ("live-3d", "pre-rendered", "static")
 LICENSES = {"Apache-2.0", "CC0-1.0", "CC-BY-4.0", "MIT"}
+MAX_AUDIO_SECONDS = 15
+SAMPLE_RATES = {44_100, 48_000}
 
 
 class ManifestError(ValueError):
@@ -115,6 +118,37 @@ def digest(value: object, label: str) -> str:
     return value
 
 
+def provenance(value: object, label: str) -> None:
+    record = exact_keys(value, {"origin", "creator", "source_revision"}, label)
+    if record["origin"] not in {"original", "third-party"}:
+        fail(f"{label}.origin is unsupported")
+    if not isinstance(record["creator"], str) or not record["creator"].strip():
+        fail(f"{label}.creator is required")
+    digest(record["source_revision"], f"{label}.source_revision")
+
+
+def verify_wave(contents: bytes, row: dict[str, object], label: str) -> None:
+    import io
+
+    try:
+        with wave.open(io.BytesIO(contents), "rb") as source:
+            channels = source.getnchannels()
+            sample_rate = source.getframerate()
+            frames = source.getnframes()
+            sample_width = source.getsampwidth()
+            compression = source.getcomptype()
+    except (EOFError, wave.Error) as exc:
+        fail(f"{label} is not a valid WAV file: {exc}")
+    if compression != "NONE" or sample_width not in {2, 3}:
+        fail(f"{label} must be 16-bit or 24-bit uncompressed PCM")
+    if channels not in {1, 2} or sample_rate not in SAMPLE_RATES:
+        fail(f"{label} has unsupported channels or sample rate")
+    if frames <= 0 or frames > sample_rate * MAX_AUDIO_SECONDS:
+        fail(f"{label} duration is outside the bounded contract")
+    if (row["channels"], row["sample_rate_hz"], row["frames"]) != (channels, sample_rate, frames):
+        fail(f"{label} waveform metadata does not match the file")
+
+
 def verify_manifest(root: Path, manifest: Path) -> None:
     try:
         manifest_bytes, _ = read_regular_file(manifest, "manifest", MAX_MANIFEST_BYTES)
@@ -122,16 +156,16 @@ def verify_manifest(root: Path, manifest: Path) -> None:
     except (UnicodeError, json.JSONDecodeError) as exc:
         fail(f"manifest is malformed: {exc}")
 
-    document = exact_keys(value, {"kind", "schema_version", "assets"}, "manifest")
+    document = exact_keys(value, {"kind", "schema_version", "scenes", "audio"}, "manifest")
     if document["kind"] != KIND or document["schema_version"] != SCHEMA_VERSION:
         fail("manifest identity/version is unsupported")
-    assets = document["assets"]
+    assets = document["scenes"]
     if not isinstance(assets, list) or len(assets) != len(GRADES) * len(MODES):
         fail("manifest must contain exactly one asset for each grade and fallback mode")
 
     seen: set[tuple[str, str]] = set()
     for index, raw in enumerate(assets):
-        row = exact_keys(raw, {"grade", "mode", "path", "bytes", "sha256", "license"}, f"assets[{index}]")
+        row = exact_keys(raw, {"grade", "mode", "path", "bytes", "sha256", "license", "provenance"}, f"scenes[{index}]")
         grade, mode = row["grade"], row["mode"]
         if grade not in GRADES or mode not in MODES:
             fail(f"assets[{index}] has an unsupported grade or fallback mode")
@@ -141,6 +175,7 @@ def verify_manifest(root: Path, manifest: Path) -> None:
         seen.add(identity)
         if row["license"] not in LICENSES:
             fail(f"assets[{index}] has no approved SPDX license")
+        provenance(row["provenance"], f"scenes[{index}].provenance")
         if not isinstance(row["bytes"], int) or isinstance(row["bytes"], bool) or row["bytes"] <= 0 or row["bytes"] > MAX_ASSET_BYTES:
             fail(f"assets[{index}].bytes is outside the bounded contract")
         expected = digest(row["sha256"], f"assets[{index}].sha256")
@@ -154,9 +189,38 @@ def verify_manifest(root: Path, manifest: Path) -> None:
     if seen != expected_identities:
         fail("fallback ladder is incomplete: every A-F grade needs live, pre-rendered, and static assets")
 
+    audio = document["audio"]
+    if not isinstance(audio, list) or len(audio) != len(GRADES):
+        fail("manifest must contain exactly one audio cue for each A-F grade")
+    audio_grades: set[str] = set()
+    audio_paths: set[object] = set()
+    for index, raw in enumerate(audio):
+        row = exact_keys(raw, {"grade", "path", "bytes", "sha256", "license", "provenance", "channels", "sample_rate_hz", "frames"}, f"audio[{index}]")
+        grade = row["grade"]
+        if grade not in GRADES or grade in audio_grades:
+            fail(f"audio[{index}] has an unsupported or duplicate grade")
+        if row["path"] in audio_paths:
+            fail("each grade must have a distinct governed audio path")
+        audio_grades.add(grade)
+        audio_paths.add(row["path"])
+        if row["license"] not in LICENSES:
+            fail(f"audio[{index}] has no approved SPDX license")
+        provenance(row["provenance"], f"audio[{index}].provenance")
+        if not isinstance(row["bytes"], int) or isinstance(row["bytes"], bool) or row["bytes"] <= 0 or row["bytes"] > MAX_ASSET_BYTES:
+            fail(f"audio[{index}].bytes is outside the bounded contract")
+        expected = digest(row["sha256"], f"audio[{index}].sha256")
+        contents, size = regular_asset(root, row["path"], f"audio[{index}]")
+        if size != row["bytes"] or hashlib.sha256(contents).hexdigest() != expected:
+            fail(f"audio[{index}] identity does not match the file")
+        verify_wave(contents, row, f"audio[{index}]")
+    if audio_grades != set(GRADES):
+        fail("audio coverage is incomplete: every A-F grade needs one cue")
+
 
 def write_fixture(root: Path, manifest: Path) -> None:
     assets = []
+    fixture_revision = hashlib.sha256(b"self-test governed source revision").hexdigest()
+    fixture_provenance = {"origin": "original", "creator": "MCNF self-test", "source_revision": fixture_revision}
     for grade in GRADES:
         for mode in MODES:
             relative = f"assets/{grade.lower()}-{mode}.bin"
@@ -171,8 +235,26 @@ def write_fixture(root: Path, manifest: Path) -> None:
                 "bytes": target.stat().st_size,
                 "sha256": sha256(target),
                 "license": "CC0-1.0",
+                "provenance": fixture_provenance,
             })
-    manifest.write_text(json.dumps({"kind": KIND, "schema_version": SCHEMA_VERSION, "assets": assets}, separators=(",", ":")), encoding="utf-8")
+    audio = []
+    for index, grade in enumerate(GRADES):
+        relative = f"audio/{grade.lower()}-cue.wav"
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(target), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(48_000)
+            output.writeframes(bytes([index + 1, 0]) * 480)
+        os.chmod(target, 0o644)
+        audio.append({
+            "grade": grade, "path": relative, "bytes": target.stat().st_size,
+            "sha256": sha256(target), "license": "CC0-1.0",
+            "provenance": fixture_provenance, "channels": 1,
+            "sample_rate_hz": 48_000, "frames": 480,
+        })
+    manifest.write_text(json.dumps({"kind": KIND, "schema_version": SCHEMA_VERSION, "scenes": assets, "audio": audio}, separators=(",", ":")), encoding="utf-8")
 
 
 def self_test() -> None:
@@ -183,7 +265,7 @@ def self_test() -> None:
         verify_manifest(root, manifest)
 
         tampered = json.loads(manifest.read_text(encoding="utf-8"))
-        tampered["assets"][0]["sha256"] = "1" * 64
+        tampered["scenes"][0]["sha256"] = "1" * 64
         manifest.write_text(json.dumps(tampered, separators=(",", ":")), encoding="utf-8")
         try:
             verify_manifest(root, manifest)
@@ -194,7 +276,7 @@ def self_test() -> None:
 
         write_fixture(root, manifest)
         incomplete = json.loads(manifest.read_text(encoding="utf-8"))
-        incomplete["assets"] = [row for row in incomplete["assets"] if row["mode"] != "static" or row["grade"] != "F"]
+        incomplete["scenes"] = [row for row in incomplete["scenes"] if row["mode"] != "static" or row["grade"] != "F"]
         manifest.write_text(json.dumps(incomplete, separators=(",", ":")), encoding="utf-8")
         try:
             verify_manifest(root, manifest)
@@ -215,6 +297,28 @@ def self_test() -> None:
             pass
         else:
             fail("self-test accepted a multiply-linked grade-F restart scene")
+
+        write_fixture(root, manifest)
+        missing_audio = json.loads(manifest.read_text(encoding="utf-8"))
+        missing_audio["audio"].pop()
+        manifest.write_text(json.dumps(missing_audio, separators=(",", ":")), encoding="utf-8")
+        try:
+            verify_manifest(root, manifest)
+        except ManifestError:
+            pass
+        else:
+            fail("self-test accepted an incomplete A-F audio package")
+
+        write_fixture(root, manifest)
+        false_waveform = json.loads(manifest.read_text(encoding="utf-8"))
+        false_waveform["audio"][0]["frames"] += 1
+        manifest.write_text(json.dumps(false_waveform, separators=(",", ":")), encoding="utf-8")
+        try:
+            verify_manifest(root, manifest)
+        except ManifestError:
+            pass
+        else:
+            fail("self-test accepted false waveform metadata")
     print("Kiron asset manifest verification self-tests passed")
 
 
