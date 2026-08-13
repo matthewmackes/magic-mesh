@@ -38,6 +38,7 @@
 #   install-helpers/verify-rpm-payload.sh candidate-payload # credential payload in base + lighthouse candidates
 #   install-helpers/verify-rpm-payload.sh app-vm-payload [a.rpm] # exact App VM guest bootstrap payload
 #   install-helpers/verify-rpm-payload.sh android-vm-payload [a.rpm] # exact Cuttlefish guest role payload
+#   install-helpers/verify-rpm-payload.sh browser-vm-payload [a.rpm] # exact Browser VM image/profile/runtime/bootstrap boundary
 #   install-helpers/verify-rpm-payload.sh overlay-claims-package  # WL-CRIT-007 three-variant package/runtime shape
 #   install-helpers/verify-rpm-payload.sh surfaces       # surface-reachability check only
 #   install-helpers/verify-rpm-payload.sh --self-test    # exercise the parser on good+broken fixtures
@@ -173,6 +174,37 @@ readonly ANDROID_VM_RUNTIME_MARKERS=(
   "path: /dev/kvm"
   "cvd version"
   "cvd start --start_vnc_server"
+)
+readonly BROWSER_VM_SOURCE_ARTIFACTS=(
+  "packaging/browser-vm/Containerfile"
+  "packaging/browser-vm/profile.env"
+  "packaging/browser-vm/mcnf-browser-vm-runtime.service"
+  "packaging/browser-vm/build-image.sh"
+)
+readonly BROWSER_VM_PAYLOAD_MEMBERS=(
+  "install-helpers/request-browser-vm-workload.sh|/usr/libexec/mackesd/request-browser-vm-workload"
+  "install-helpers/provision-browser-vm-rdp-credential.sh|/usr/libexec/mackesd/provision-browser-vm-rdp-credential"
+  "packaging/systemd/browser-vm-rdp-credential.conf|/usr/libexec/mackesd/browser-vm-rdp-credential.conf"
+)
+readonly BROWSER_VM_IMAGE_MARKERS=(
+  "COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtime"
+  "COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service"
+  "RUN systemctl enable mcnf-browser-vm-runtime.service"
+)
+readonly BROWSER_VM_PROFILE_MARKERS=(
+  "BROWSER_VM_PROFILE_ID=browser-vm-chromium"
+  "BROWSER_VM_IMAGE_ID=browser-vm-chromium"
+  "BROWSER_VM_HOST_BROWSER=false"
+)
+readonly BROWSER_VM_RUNTIME_MARKERS=(
+  "ExecStart=/usr/local/libexec/mcnf-browser-vm-runtime"
+  "User=mcnf-browser"
+  "Restart=on-failure"
+)
+readonly BROWSER_VM_BOOTSTRAP_MARKERS=(
+  '"$DIR/verify-image.sh" "$IMAGE"'
+  '"$MANIFEST_VERIFY" create'
+  '"$DIR/verify-profile.sh" --source --manifest'
 )
 
 # build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
@@ -479,6 +511,83 @@ check_android_vm_payload() {
   done
 }
 
+# WL-ARCH-008 — Browser delivery has four distinct release inputs: the immutable
+# image recipe, its typed profile, the guest runtime service, and the image
+# builder/bootstrap.  The base RPM does not embed the qcow2; it ships the sole
+# typed workload request and sealed RDP credential boundary used to consume the
+# promoted image.  Pin both sides exactly so generic cloud/image content or an
+# unrelated helper under /usr/libexec/mackesd cannot make the release look
+# Browser-capable.
+check_browser_vm_payload() {
+  local rpm="${1:-}" artifact pair source install_path marker listing="" covered
+  hdr "Browser VM image/profile/runtime/bootstrap — exact release boundary"
+
+  for artifact in "${BROWSER_VM_SOURCE_ARTIFACTS[@]}"; do
+    if [ -f "$REPO_ROOT/$artifact" ]; then
+      ok "browser source  $artifact"
+    else
+      fail "browser source  $artifact MISSING"
+    fi
+  done
+
+  for marker in "${BROWSER_VM_IMAGE_MARKERS[@]}"; do
+    grep -Fq -- "$marker" "$REPO_ROOT/packaging/browser-vm/Containerfile" \
+      && ok "browser image $marker" \
+      || fail "browser image marker MISSING: $marker"
+  done
+  for marker in "${BROWSER_VM_PROFILE_MARKERS[@]}"; do
+    grep -Fqx -- "$marker" "$REPO_ROOT/packaging/browser-vm/profile.env" \
+      && ok "browser profile $marker" \
+      || fail "browser profile marker MISSING: $marker"
+  done
+  for marker in "${BROWSER_VM_RUNTIME_MARKERS[@]}"; do
+    grep -Fqx -- "$marker" "$REPO_ROOT/packaging/browser-vm/mcnf-browser-vm-runtime.service" \
+      && ok "browser runtime $marker" \
+      || fail "browser runtime marker MISSING: $marker"
+  done
+  for marker in "${BROWSER_VM_BOOTSTRAP_MARKERS[@]}"; do
+    grep -Fq -- "$marker" "$REPO_ROOT/packaging/browser-vm/build-image.sh" \
+      && ok "browser bootstrap $marker" \
+      || fail "browser bootstrap marker MISSING: $marker"
+  done
+
+  for pair in "${BROWSER_VM_PAYLOAD_MEMBERS[@]}"; do
+    source="${pair%%|*}"
+    install_path="${pair#*|}"
+    covered=0
+    while IFS=$'\t' read -r manifest_source dest; do
+      [ "$manifest_source" = "$source" ] || continue
+      case "$dest" in
+        */) [ "${dest}${source##*/}" = "$install_path" ] && covered=1 ;;
+        *)  [ "$dest" = "$install_path" ] && covered=1 ;;
+      esac
+    done < <(parse_assets "$CARGO_TOML")
+    if [ "$covered" -eq 1 ]; then
+      ok "browser manifest $source -> $install_path"
+    else
+      fail "browser manifest does not cover $source at $install_path"
+    fi
+  done
+
+  [ -n "$rpm" ] || return
+  if [ -z "${MCNF_FAKE_RPM_LIST:-}" ] && [ ! -f "$rpm" ]; then
+    fail "browser RPM not found: $rpm"
+    return
+  fi
+  if ! listing="$(rpm_file_list "$rpm")"; then
+    fail "browser could not read file list from $rpm"
+    return
+  fi
+  for pair in "${BROWSER_VM_PAYLOAD_MEMBERS[@]}"; do
+    install_path="${pair#*|}"
+    if grep -Fxq "$install_path" <<<"$listing"; then
+      ok "browser payload $install_path present in rpm -qlp"
+    else
+      fail "browser payload $install_path MISSING from the RPM payload"
+    fi
+  done
+}
+
 # Read the actual RPM Requires header (or the self-test fixture). Production
 # validation intentionally uses the exact query form required by the gate.
 rpm_requires_header() {
@@ -604,6 +713,7 @@ check_payload_dryrun() {
   check_vdi_host_requires
   check_app_vm_payload
   check_android_vm_payload
+  check_browser_vm_payload
   check_grouped_mackesd_assets
   check_candidate_credential_assets
 }
@@ -715,6 +825,7 @@ check_payload_rpm() {
     check_built_rpm_vdi_host_requires "$rpm"
     check_app_vm_payload "$rpm"
     check_android_vm_payload "$rpm"
+    check_browser_vm_payload "$rpm"
   elif [ "$shape" = "server" ]; then
     check_android_vm_payload "$rpm"
   else
@@ -1186,6 +1297,25 @@ LISTING
     fail "self-test: missing Cuttlefish runtime escaped exact RPM verification"; st_fail=1
   fi
 
+  # Generic VM and credential payload is not Browser delivery. Keep unrelated
+  # libexec content present while removing the exact typed workload bootstrap;
+  # the Browser-specific release gate must still fail and name that member.
+  local browser_missing_list="$tmp/browser-missing-list"
+  cat >"$browser_missing_list" <<'LISTING'
+/usr/libexec/mackesd/provision-browser-vm-rdp-credential
+/usr/libexec/mackesd/browser-vm-rdp-credential.conf
+/usr/libexec/mackesd/request-app-vm-workload
+/usr/share/mde/iac/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl
+LISTING
+  out="$(MCNF_FAKE_RPM_LIST="$browser_missing_list" \
+      bash "$0" browser-vm-payload "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "/usr/libexec/mackesd/request-browser-vm-workload MISSING" <<<"$out"; then
+    ok "self-test: unrelated VM payload cannot hide a missing Browser VM bootstrap"
+  else
+    fail "self-test: missing Browser VM bootstrap escaped exact RPM verification"; st_fail=1
+  fi
+
   # ---- fixture B: a SYNTHETICALLY-BROKEN manifest ---------------------------
   # Drops the shell key-bin, adds a bin nothing builds, adds a missing file.
   local bad="$tmp/bad.toml"
@@ -1316,6 +1446,7 @@ main() {
     candidate-payload) check_candidate_credential_assets ;;
     app-vm-payload) shift; check_app_vm_payload "${1:-}" ;;
     android-vm-payload) shift; check_android_vm_payload "${1:-}" ;;
+    browser-vm-payload) shift; check_browser_vm_payload "${1:-}" ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")
