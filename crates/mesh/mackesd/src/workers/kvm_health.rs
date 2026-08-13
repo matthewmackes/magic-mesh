@@ -26,6 +26,7 @@
 
 #![cfg(feature = "async-services")]
 
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -45,6 +46,189 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bus topic the whole-host KVM stack health summary is published to.
 pub const SERVICES_TOPIC: &str = "event/kvm/services";
+
+/// Credential-free readiness projection consumed by the Workers virtualization provider.
+pub const VIRTUALIZATION_PROVIDER_TOPIC: &str = "event/provider/virtualization";
+
+const MAX_PROBE_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualizationReadiness {
+    Ready,
+    Disconnected,
+    Disabled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VirtualizationProviderSnapshot {
+    pub schema_version: u16,
+    pub node_id: String,
+    pub observed_unix_ms: u64,
+    pub readiness: VirtualizationReadiness,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvmDeviceFact {
+    CharacterDevice,
+    Missing,
+    Substituted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitFact {
+    Active,
+    Inactive,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceFact {
+    Active,
+    Inactive,
+    Missing,
+}
+
+fn classify_virtualization(
+    device: Option<KvmDeviceFact>,
+    kernel_module: Option<bool>,
+    libvirt: Option<UnitFact>,
+    connection: Option<bool>,
+    network: Option<ResourceFact>,
+    pool: Option<ResourceFact>,
+) -> (VirtualizationReadiness, &'static str) {
+    let (Some(device), Some(kernel_module), Some(libvirt), Some(connection), Some(network), Some(pool)) =
+        (device, kernel_module, libvirt, connection, network, pool)
+    else {
+        return (VirtualizationReadiness::Unknown, "virtualization facts unavailable or malformed");
+    };
+    if device == KvmDeviceFact::Substituted {
+        return (VirtualizationReadiness::Unknown, "/dev/kvm is not a character device");
+    }
+    if (device == KvmDeviceFact::CharacterDevice) != kernel_module {
+        return (VirtualizationReadiness::Unknown, "kernel KVM facts contradict each other");
+    }
+    if libvirt != UnitFact::Active && connection {
+        return (VirtualizationReadiness::Unknown, "inactive libvirt unit contradicts a live connection");
+    }
+    if !connection && matches!(network, ResourceFact::Active) {
+        return (VirtualizationReadiness::Unknown, "active libvirt network contradicts connection state");
+    }
+    if !connection && matches!(pool, ResourceFact::Active) {
+        return (VirtualizationReadiness::Unknown, "active libvirt pool contradicts connection state");
+    }
+    if device == KvmDeviceFact::Missing
+        && !kernel_module
+        && libvirt == UnitFact::Disabled
+        && !connection
+        && network == ResourceFact::Missing
+        && pool == ResourceFact::Missing
+    {
+        return (VirtualizationReadiness::Disabled, "KVM and libvirt are explicitly unavailable");
+    }
+    if device == KvmDeviceFact::CharacterDevice
+        && libvirt == UnitFact::Active
+        && connection
+        && network == ResourceFact::Active
+        && pool == ResourceFact::Active
+    {
+        return (VirtualizationReadiness::Ready, "KVM, libvirt, network, and storage facts agree");
+    }
+    (VirtualizationReadiness::Disconnected, "virtualization is present but not fully connected")
+}
+
+fn bounded_output(command: Command) -> Option<String> {
+    let output = crate::workers::proc::output_with_timeout(
+        command,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    ).ok()?;
+    if !output.status.success() || output.stdout.len() > MAX_PROBE_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    (!text.contains('\0')).then_some(text)
+}
+
+fn parse_unit(raw: &str) -> Option<UnitFact> {
+    let mut active = None;
+    let mut enabled = None;
+    for line in raw.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "ActiveState" if active.replace(value).is_none() => {}
+            "UnitFileState" if enabled.replace(value).is_none() => {}
+            _ => return None,
+        }
+    }
+    match (active?, enabled?) {
+        ("active", _) => Some(UnitFact::Active),
+        ("inactive" | "failed", "disabled" | "masked") => Some(UnitFact::Disabled),
+        ("inactive" | "failed", "enabled" | "static" | "indirect") => Some(UnitFact::Inactive),
+        _ => None,
+    }
+}
+
+fn parse_resource(raw: &str) -> Option<ResourceFact> {
+    match raw.trim() {
+        "active" => Some(ResourceFact::Active),
+        "inactive" => Some(ResourceFact::Inactive),
+        "missing" => Some(ResourceFact::Missing),
+        _ => None,
+    }
+}
+
+fn probe_resource(kind: &str) -> Option<ResourceFact> {
+    let mut command = Command::new("virsh");
+    command.args(["-c", "qemu:///system", kind, "default"]);
+    let output = crate::workers::proc::output_with_timeout(
+        command,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    ).ok()?;
+    if output.stdout.len() > MAX_PROBE_BYTES || output.stderr.len() > MAX_PROBE_BYTES {
+        return None;
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8(output.stderr).ok()?;
+        return (stderr.contains("not found") || stderr.contains("no network") || stderr.contains("no storage pool"))
+            .then_some(ResourceFact::Missing);
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let state = text.lines().find_map(|line| line.split_once(':').and_then(|(key, value)|
+        (key.trim() == "Active").then_some(if value.trim() == "yes" { "active" } else if value.trim() == "no" { "inactive" } else { "malformed" })
+    ))?;
+    parse_resource(state)
+}
+
+fn gather_virtualization(node_id: &str, now_ms: u64) -> VirtualizationProviderSnapshot {
+    let device = match std::fs::symlink_metadata("/dev/kvm") {
+        Ok(metadata) if metadata.file_type().is_char_device() => Some(KvmDeviceFact::CharacterDevice),
+        Ok(_) => Some(KvmDeviceFact::Substituted),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(KvmDeviceFact::Missing),
+        Err(_) => None,
+    };
+    let kernel_module = Some(std::path::Path::new("/sys/module/kvm").is_dir());
+    let mut systemctl = Command::new("systemctl");
+    systemctl.args(["show", "--property=ActiveState,UnitFileState", "libvirtd.service"]);
+    let libvirt = bounded_output(systemctl).as_deref().and_then(parse_unit);
+    let mut virsh = Command::new("virsh");
+    virsh.args(["-c", "qemu:///system", "uri"]);
+    let connection = bounded_output(virsh).and_then(|raw| match raw.trim() {
+        "qemu:///system" => Some(true),
+        _ => None,
+    });
+    let network = probe_resource("net-info");
+    let pool = probe_resource("pool-info");
+    let (readiness, reason) = classify_virtualization(device, kernel_module, libvirt, connection, network, pool);
+    VirtualizationProviderSnapshot {
+        schema_version: 1,
+        node_id: node_id.to_owned(),
+        observed_unix_ms: now_ms,
+        readiness,
+        reason: reason.to_owned(),
+    }
+}
 
 /// Injectable seam over the per-unit `systemctl is-active` probe, so the pure
 /// [`decide`] core is unit-testable without a live systemd. Production wires
@@ -181,6 +365,17 @@ fn publish(persist: &Persist, health: &KvmHealth) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn publish_virtualization(
+    persist: &Persist,
+    snapshot: &VirtualizationProviderSnapshot,
+) -> Result<(), String> {
+    let body = serde_json::to_string(snapshot).map_err(|error| error.to_string())?;
+    persist
+        .write(VIRTUALIZATION_PROVIDER_TOPIC, Priority::Default, None, Some(&body))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// The KVM-HEALTH worker.
 pub struct KvmHealthWorker {
     /// Publishing node identity, stamped into every summary's `host`.
@@ -275,7 +470,8 @@ impl KvmHealthWorker {
             return Ok(());
         };
         let persist = Persist::open(root).map_err(|error| error.to_string())?;
-        publish(&persist, &health)
+        publish(&persist, &health)?;
+        publish_virtualization(&persist, &gather_virtualization(&self.host, health.published_at_ms))
     }
 }
 
@@ -315,6 +511,42 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_virtualization_facts_fail_unknown() {
+        let substituted = classify_virtualization(
+            Some(KvmDeviceFact::Substituted), Some(true), Some(UnitFact::Active),
+            Some(true), Some(ResourceFact::Active), Some(ResourceFact::Active),
+        );
+        assert_eq!(substituted.0, VirtualizationReadiness::Unknown);
+
+        let contradictory_kernel = classify_virtualization(
+            Some(KvmDeviceFact::CharacterDevice), Some(false), Some(UnitFact::Active),
+            Some(true), Some(ResourceFact::Active), Some(ResourceFact::Active),
+        );
+        assert_eq!(contradictory_kernel.0, VirtualizationReadiness::Unknown);
+
+        let contradictory_service = classify_virtualization(
+            Some(KvmDeviceFact::CharacterDevice), Some(true), Some(UnitFact::Disabled),
+            Some(true), Some(ResourceFact::Active), Some(ResourceFact::Active),
+        );
+        assert_eq!(contradictory_service.0, VirtualizationReadiness::Unknown);
+
+        let malformed = parse_unit("ActiveState=active\nUnitFileState=enabled\nInjected=x\n");
+        assert_eq!(malformed, None);
+        assert_eq!(parse_resource("active\nsecret"), None);
+
+        let ready = classify_virtualization(
+            Some(KvmDeviceFact::CharacterDevice), Some(true), Some(UnitFact::Active),
+            Some(true), Some(ResourceFact::Active), Some(ResourceFact::Active),
+        );
+        assert_eq!(ready.0, VirtualizationReadiness::Ready);
+        let disabled = classify_virtualization(
+            Some(KvmDeviceFact::Missing), Some(false), Some(UnitFact::Disabled),
+            Some(false), Some(ResourceFact::Missing), Some(ResourceFact::Missing),
+        );
+        assert_eq!(disabled.0, VirtualizationReadiness::Disabled);
+    }
     use std::cell::RefCell;
     use std::collections::BTreeSet;
 
