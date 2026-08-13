@@ -36,6 +36,7 @@ use mackes_mesh_types::vdi_clipboard::{
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
+use mde_collab_types::{ActorId, FileRef, FileRefId, FileReferenceView, FileReferences, SpaceId};
 use rustix::net::{
     accept_with, bind_unix, connect_unix, listen, recv, send, socket_with, AddressFamily,
     RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
@@ -121,12 +122,15 @@ struct GuestFilesTransaction {
     staging_root: PathBuf,
     expires_at_ms: u64,
     staged_hash: Option<String>,
+    file_reference: FileRefId,
+    space: SpaceId,
 }
 
 struct GuestFilesAuthority {
     listener: UnixStream,
     socket_path: PathBuf,
     destination_root: PathBuf,
+    content_root: PathBuf,
     owner: Option<(u32, u32)>,
     expected_uid: u32,
     transactions: BTreeMap<String, GuestFilesTransaction>,
@@ -156,10 +160,16 @@ pub struct Surface {
 }
 
 impl GuestFilesAuthority {
-    fn bind(bus_root: &Path, destination_root: PathBuf) -> std::io::Result<Self> {
+    fn bind(
+        bus_root: &Path,
+        destination_root: PathBuf,
+        content_root: PathBuf,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(bus_root)?;
         std::fs::create_dir_all(&destination_root)?;
         let destination_root = std::fs::canonicalize(destination_root)?;
+        std::fs::create_dir_all(&content_root)?;
+        let content_root = std::fs::canonicalize(content_root)?;
         if let Some((uid, gid)) = desktop_files_owner() {
             let _ = std::os::unix::fs::chown(&destination_root, Some(uid), Some(gid));
         }
@@ -188,13 +198,14 @@ impl GuestFilesAuthority {
             listener,
             socket_path,
             destination_root,
+            content_root,
             owner: desktop_files_owner(),
             expected_uid: rustix::process::getuid().as_raw(),
             transactions: BTreeMap::new(),
         })
     }
 
-    fn drain(&mut self, now_ms: u64) {
+    fn drain(&mut self, persist: &Persist, now_ms: u64) {
         let expired = self
             .transactions
             .iter()
@@ -221,7 +232,7 @@ impl GuestFilesAuthority {
             };
             let _ = peer;
             let response = match receive_guest_files_request(&stream) {
-                Ok(request) => self.handle(request, now_ms),
+                Ok(request) => self.handle(persist, request, now_ms),
                 Err(reason) => GuestFilesResponse::Refused {
                     transaction_id: String::new(),
                     reason,
@@ -233,7 +244,12 @@ impl GuestFilesAuthority {
         }
     }
 
-    fn handle(&mut self, request: GuestFilesRequest, now_ms: u64) -> GuestFilesResponse {
+    fn handle(
+        &mut self,
+        persist: &Persist,
+        request: GuestFilesRequest,
+        now_ms: u64,
+    ) -> GuestFilesResponse {
         let result = match request {
             GuestFilesRequest::Begin {
                 transaction_id,
@@ -255,7 +271,9 @@ impl GuestFilesAuthority {
                 complete,
                 now_ms,
             ),
-            GuestFilesRequest::Commit { transaction_id } => self.commit(transaction_id),
+            GuestFilesRequest::Commit { transaction_id } => {
+                self.commit(persist, transaction_id, now_ms)
+            }
             GuestFilesRequest::Cancel { transaction_id } => {
                 self.cancel(&transaction_id);
                 Ok(GuestFilesResponse::Cancelled { transaction_id })
@@ -334,6 +352,8 @@ impl GuestFilesAuthority {
                 staging_root,
                 expires_at_ms: now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS),
                 staged_hash: None,
+                file_reference: FileRefId::new(),
+                space: SpaceId::new(),
             },
         );
         Ok(GuestFilesResponse::Ready {
@@ -422,7 +442,7 @@ impl GuestFilesAuthority {
                 transaction_id: transaction_id.clone(),
                 content_hash: hash,
                 byte_count: transaction.total_bytes,
-                files_reference: format!("files:v2:vdi-guest:{transaction_id}"),
+                files_reference: transaction.file_reference.to_string(),
             });
         }
         Ok(GuestFilesResponse::Ready {
@@ -432,7 +452,12 @@ impl GuestFilesAuthority {
         })
     }
 
-    fn commit(&mut self, transaction_id: String) -> Result<GuestFilesResponse, (String, String)> {
+    fn commit(
+        &mut self,
+        persist: &Persist,
+        transaction_id: String,
+        now_ms: u64,
+    ) -> Result<GuestFilesResponse, (String, String)> {
         let Some(transaction) = self.transactions.remove(&transaction_id) else {
             return Err((transaction_id, "unknown or expired transaction".to_owned()));
         };
@@ -459,6 +484,56 @@ impl GuestFilesAuthority {
             let _ = std::fs::remove_dir_all(&transaction.staging_root);
             return Err((transaction_id, format!("atomic commit failed: {error}")));
         }
+        if transaction.files.len() == 1 {
+            let metadata = &transaction.files[0];
+            let source = destination.join(guest_staged_relative_path(metadata));
+            let digest = transaction.staged_hash.as_deref().ok_or_else(|| {
+                (
+                    transaction_id.clone(),
+                    "staged digest disappeared".to_owned(),
+                )
+            })?;
+            if let Err(reason) =
+                publish_guest_cas_object(&self.content_root, digest, metadata.byte_count, &source)
+            {
+                let _ = std::fs::remove_dir_all(&destination);
+                let _ = std::fs::remove_dir(&transaction.staging_root);
+                return Err((transaction_id, reason));
+            }
+            let references = FileReferences {
+                space: transaction.space,
+                files: vec![FileReferenceView {
+                    file: transaction.file_reference,
+                    reference: FileRef {
+                        name: metadata.name.clone(),
+                        size: metadata.byte_count,
+                        sha256_hex: digest.to_owned(),
+                        mime: Some(metadata.mime.clone()),
+                    },
+                    linked_by: ActorId::new("vdi-guest"),
+                    linked_unix_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
+                }],
+            };
+            let references_body = serde_json::to_string(&references).map_err(|_| {
+                (
+                    transaction_id.clone(),
+                    "Files projection encoding failed".to_owned(),
+                )
+            })?;
+            if let Err(error) = persist.write(
+                &format!("state/collab/file-references/{}", transaction.space),
+                Priority::Default,
+                None,
+                Some(&references_body),
+            ) {
+                let _ = std::fs::remove_dir_all(&destination);
+                let _ = std::fs::remove_dir(&transaction.staging_root);
+                return Err((
+                    transaction_id,
+                    format!("Files projection publication failed: {error}"),
+                ));
+            }
+        }
         chown_guest_tree(&destination, self.owner);
         let _ = std::fs::remove_dir(&transaction.staging_root);
         Ok(GuestFilesResponse::Committed {
@@ -473,6 +548,89 @@ impl GuestFilesAuthority {
             let _ = std::fs::remove_dir_all(transaction.staging_root);
         }
     }
+}
+
+fn publish_guest_cas_object(
+    content_root: &Path,
+    digest: &str,
+    expected_size: u64,
+    source: &Path,
+) -> Result<(), String> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("staged digest is not a canonical SHA-256 identity".into());
+    }
+    let shard = content_root.join(&digest[..2]);
+    std::fs::create_dir_all(&shard)
+        .map_err(|error| format!("CAS shard creation failed: {error}"))?;
+    let object = shard.join(digest);
+    if object.exists() {
+        return verify_guest_cas_object(&object, digest, expected_size);
+    }
+    let temporary = shard.join(format!(".{digest}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        std::fs::copy(source, &temporary)
+            .map_err(|error| format!("CAS staging copy failed: {error}"))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&temporary)
+            .map_err(|error| format!("CAS staging reopen failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("CAS staging sync failed: {error}"))?;
+        verify_guest_cas_object(&temporary, digest, expected_size)?;
+        match rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &temporary,
+            rustix::fs::CWD,
+            &object,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            Err(rustix::io::Errno::EXIST) => {
+                verify_guest_cas_object(&object, digest, expected_size)
+            }
+            Err(error) => Err(format!("CAS publication failed: {error}")),
+        }
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn verify_guest_cas_object(path: &Path, digest: &str, expected_size: u64) -> Result<(), String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("CAS object metadata failed: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_size {
+        return Err("CAS object type or size disagrees with admitted bytes".into());
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("CAS object open failed: {error}"))?;
+    let mut hash = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("CAS object read failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(read as u64)
+            .ok_or_else(|| "CAS object size overflow".to_owned())?;
+        if observed > expected_size {
+            return Err("CAS object exceeded admitted size".into());
+        }
+        hash.update(&buffer[..read]);
+    }
+    if observed != expected_size || format!("{:x}", hash.finalize()) != digest {
+        return Err("CAS object digest disagrees with admitted bytes".into());
+    }
+    Ok(())
 }
 
 impl Drop for GuestFilesAuthority {
@@ -626,7 +784,11 @@ pub fn serve_all(persist: &Persist, surfaces: &[Surface], should_stop: impl Fn()
     let mut guest_files_authority = mde_bus::default_data_dir()
         .zip(desktop_files_destination())
         .and_then(|(bus_root, destination)| {
-            match GuestFilesAuthority::bind(&bus_root, destination) {
+            match GuestFilesAuthority::bind(
+                &bus_root,
+                destination,
+                crate::default_qnm_shared_root().join("collab/content"),
+            ) {
                 Ok(authority) => Some(authority),
                 Err(error) => {
                     tracing::warn!(%error, "VDI guest Files authority unavailable");
@@ -636,7 +798,7 @@ pub fn serve_all(persist: &Persist, surfaces: &[Surface], should_stop: impl Fn()
         });
     while !should_stop() {
         if let Some(authority) = &mut guest_files_authority {
-            authority.drain(guest_files_now_ms());
+            authority.drain(persist, guest_files_now_ms());
         }
         for s in surfaces {
             poll_once(persist, s.prefix, s.verbs, &s.reply, &mut cursors);
@@ -1520,8 +1682,14 @@ mod tests {
 
         let bus = tempfile::tempdir().expect("bus root");
         let destination = tempfile::tempdir().expect("Files destination");
-        let mut authority = GuestFilesAuthority::bind(bus.path(), destination.path().to_path_buf())
-            .expect("bind Files authority");
+        let content = tempfile::tempdir().expect("CAS root");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        let mut authority = GuestFilesAuthority::bind(
+            bus.path(),
+            destination.path().to_path_buf(),
+            content.path().to_path_buf(),
+        )
+        .expect("bind Files authority");
         authority.owner = None;
         let now = 1_700_000_000_000_u64;
         let files = vec![
@@ -1531,6 +1699,7 @@ mod tests {
         ];
         assert!(matches!(
             authority.handle(
+                &persist,
                 GuestFilesRequest::Begin {
                     transaction_id: "tx-atomic".into(),
                     session_id: "rdp-session".into(),
@@ -1543,6 +1712,7 @@ mod tests {
         ));
         assert!(matches!(
             authority.handle(
+                &persist,
                 GuestFilesRequest::Chunk {
                     transaction_id: "tx-atomic".into(),
                     file_index: 0,
@@ -1558,6 +1728,7 @@ mod tests {
             }
         ));
         let staged = authority.handle(
+            &persist,
             GuestFilesRequest::Chunk {
                 transaction_id: "tx-atomic".into(),
                 file_index: 1,
@@ -1580,6 +1751,7 @@ mod tests {
         );
         assert!(matches!(
             authority.handle(
+                &persist,
                 GuestFilesRequest::Commit {
                     transaction_id: "tx-atomic".into(),
                 },
@@ -1599,6 +1771,7 @@ mod tests {
 
         assert!(matches!(
             authority.handle(
+                &persist,
                 GuestFilesRequest::Begin {
                     transaction_id: "tx-cancel".into(),
                     session_id: "rdp-session".into(),
@@ -1616,6 +1789,7 @@ mod tests {
             GuestFilesResponse::Ready { .. }
         ));
         let _ = authority.handle(
+            &persist,
             GuestFilesRequest::Chunk {
                 transaction_id: "tx-cancel".into(),
                 file_index: 0,
@@ -1627,6 +1801,7 @@ mod tests {
         );
         assert!(matches!(
             authority.handle(
+                &persist,
                 GuestFilesRequest::Cancel {
                     transaction_id: "tx-cancel".into(),
                 },
@@ -1642,6 +1817,93 @@ mod tests {
                 .exists(),
             "cancel removes every partial byte"
         );
+    }
+
+    #[test]
+    fn guest_clipboard_image_commit_publishes_exact_cas_and_files_identity() {
+        use base64::Engine as _;
+
+        let bus = tempfile::tempdir().expect("bus root");
+        let destination = tempfile::tempdir().expect("Files destination");
+        let content = tempfile::tempdir().expect("CAS root");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        let mut authority = GuestFilesAuthority::bind(
+            bus.path(),
+            destination.path().to_path_buf(),
+            content.path().to_path_buf(),
+        )
+        .expect("bind Files authority");
+        authority.owner = None;
+        let bytes = b"bounded admitted CF_DIBV5 bytes";
+        let descriptor = VdiClipboardFileDescriptorV1::new(
+            "clipboard.cf_dibv5",
+            None,
+            "application/x-rdp-cf-dibv5",
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let now = 1_700_000_000_000_u64;
+
+        assert!(matches!(
+            authority.handle(
+                &persist,
+                GuestFilesRequest::Begin {
+                    transaction_id: "tx-image-cas".into(),
+                    session_id: "rdp-image-session".into(),
+                    files: vec![descriptor],
+                    total_bytes: bytes.len() as u64,
+                },
+                now,
+            ),
+            GuestFilesResponse::Ready { .. }
+        ));
+        let staged = authority.handle(
+            &persist,
+            GuestFilesRequest::Chunk {
+                transaction_id: "tx-image-cas".into(),
+                file_index: 0,
+                offset: 0,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                complete: true,
+            },
+            now + 1,
+        );
+        let (digest, file_reference) = match staged {
+            GuestFilesResponse::Staged {
+                content_hash,
+                files_reference,
+                ..
+            } => (content_hash, files_reference),
+            other => panic!("expected staged CAS identity, got {other:?}"),
+        };
+        assert!(matches!(
+            authority.handle(
+                &persist,
+                GuestFilesRequest::Commit {
+                    transaction_id: "tx-image-cas".into(),
+                },
+                now + 2,
+            ),
+            GuestFilesResponse::Committed { file_count: 1, .. }
+        ));
+
+        assert_eq!(
+            std::fs::read(content.path().join(&digest[..2]).join(&digest)).unwrap(),
+            bytes
+        );
+        let topic = persist
+            .list_topics()
+            .unwrap()
+            .into_iter()
+            .find(|topic| topic.starts_with("state/collab/file-references/"))
+            .expect("Files projection topic");
+        let body = persist.read_latest(&topic).unwrap().unwrap().body.unwrap();
+        let references: FileReferences = serde_json::from_str(&body).unwrap();
+        assert_eq!(references.files.len(), 1);
+        assert_eq!(references.files[0].file.to_string(), file_reference);
+        assert_eq!(references.files[0].reference.sha256_hex, digest);
+        assert_eq!(references.files[0].reference.size, bytes.len() as u64);
+        assert_eq!(references.files[0].linked_by.as_str(), "vdi-guest");
     }
 
     // AUD2-2 — the pre-FileXfer free reply builders were removed; the
