@@ -11,9 +11,8 @@ use ironrdp_cliprdr::pdu::{
 };
 use ironrdp_core::impl_as_any;
 use mackes_mesh_types::vdi_clipboard::{
-    VdiClipboardFileDescriptorV1, MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES,
-    MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS, MAX_VDI_CLIPBOARD_TEXT_BYTES,
-    MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES, MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS,
+    MAX_VDI_CLIPBOARD_TEXT_BYTES, MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES, VdiClipboardFileDescriptorV1,
 };
 
 /// The standard CLIPRDR text format supported by this backend.
@@ -294,6 +293,14 @@ struct ClipboardState {
     remote_file_transfer: Option<RemoteFileTransfer>,
     remote_file_chunk: Option<Result<RemoteClipboardFileChunk, ClipboardBridgeError>>,
 }
+
+/// Maximum delayed-rendering snapshots a guest may lock concurrently.
+///
+/// CLIPRDR lock IDs are peer-selected and callbacks carry no admission result,
+/// so overflow must be handled by refusing to retain the new ID. Existing
+/// locks remain usable until unlock or expiry; this prevents a lock flood from
+/// revoking an already active, permission-approved transfer.
+const MAX_LOCKED_LOCAL_FILES: usize = 16;
 
 /// Thread-local connection handle used by the wire pump to service CLIPRDR
 /// callbacks without exposing an OS clipboard directly to IronRDP.
@@ -917,10 +924,18 @@ impl CliprdrBackend for TextCliprdrBackend {
 
     fn on_lock(&mut self, data_id: LockDataId) {
         self.with_state(|state| {
+            let now = std::time::Instant::now();
+            state.locked_local_files.retain(|_, file| {
+                now.saturating_duration_since(file.admitted_at) < LOCAL_FILE_SERVE_TTL
+            });
             if let Some(file) = state
                 .local_file
                 .as_ref()
                 .filter(|file| state.local_advertised_generation == Some(file.generation))
+                .filter(|_| {
+                    state.locked_local_files.contains_key(&data_id.0)
+                        || state.locked_local_files.len() < MAX_LOCKED_LOCAL_FILES
+                })
             {
                 state.locked_local_files.insert(data_id.0, file.clone());
             }
@@ -1247,9 +1262,9 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_cf_html, decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe,
-        html_format, ClipboardBridge, ClipboardBridgeError, RemoteClipboardImageFormat,
-        DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
+        ClipboardBridge, ClipboardBridgeError, DIB_FORMAT, DIBV5_FORMAT, HTML_FORMAT_ID,
+        MAX_LOCKED_LOCAL_FILES, RemoteClipboardImageFormat, UNICODE_TEXT_FORMAT, decode_cf_html,
+        decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe, html_format,
     };
     use ironrdp_cliprdr::pdu::{
         ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
@@ -1474,10 +1489,12 @@ mod tests {
         bridge
             .offer_host_html("new".into())
             .expect("replacement HTML");
-        assert!(bridge
-            .take_local_data_response()
-            .expect("fail-closed response")
-            .is_error());
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("fail-closed response")
+                .is_error()
+        );
     }
 
     #[test]
@@ -1514,10 +1531,12 @@ mod tests {
         ));
 
         assert_eq!(bridge.advertised_formats(), Vec::<ClipboardFormat>::new());
-        assert!(bridge
-            .take_local_data_response()
-            .expect("queued stale request must receive a response")
-            .is_error());
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("queued stale request must receive a response")
+                .is_error()
+        );
     }
 
     #[test]
@@ -1532,10 +1551,12 @@ mod tests {
         backend.on_format_data_request(FormatDataRequest {
             format: ClipboardFormatId::CF_UNICODETEXT,
         });
-        assert!(bridge
-            .take_local_data_response()
-            .expect("stale request must receive a response")
-            .is_error());
+        assert!(
+            bridge
+                .take_local_data_response()
+                .expect("stale request must receive a response")
+                .is_error()
+        );
 
         assert_eq!(bridge.advertised_formats(), vec![UNICODE_TEXT_FORMAT]);
         backend.on_format_data_request(FormatDataRequest {
@@ -1942,6 +1963,59 @@ mod tests {
                 .expect("cancel response")
                 .is_error(),
             "unlock must destroy the prior delayed-rendering authority"
+        );
+    }
+
+    #[test]
+    fn host_file_lock_ownership_is_bounded_and_released() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        backend.on_ready();
+        backend.on_process_negotiated_capabilities(
+            ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA,
+        );
+        bridge
+            .offer_host_file("bounded.bin".into(), b"governed".to_vec())
+            .expect("permission-approved file");
+
+        for id in 1..=MAX_LOCKED_LOCAL_FILES as u32 {
+            backend.on_lock(LockDataId(id));
+        }
+        let overflow_id = MAX_LOCKED_LOCAL_FILES as u32 + 1;
+        backend.on_lock(LockDataId(overflow_id));
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 91,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 4,
+            data_id: Some(overflow_id),
+        });
+        assert!(
+            bridge
+                .take_local_file_response()
+                .expect("overflow response")
+                .is_error(),
+            "a peer-selected lock ID above the ownership bound must retain no bytes"
+        );
+
+        backend.on_unlock(LockDataId(1));
+        backend.on_lock(LockDataId(overflow_id));
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 92,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 4,
+            data_id: Some(overflow_id),
+        });
+        assert_eq!(
+            bridge
+                .take_local_file_response()
+                .expect("released-capacity response")
+                .data(),
+            b"gove",
+            "unlock must release capacity for a new lock on the current offer"
         );
     }
 }
