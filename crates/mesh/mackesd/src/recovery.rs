@@ -599,6 +599,21 @@ pub fn execute(
                 node_id: node_id.clone(),
                 steps: steps.clone(),
             })?;
+            // The apply seam may cross a process or a remote enrollment endpoint.
+            // Do not let a delayed completion from an older recovery session (or a
+            // completion for another peer/mesh) certify this plan as recovered.
+            // The plan's immutable identity is the authority; only its exact receipt
+            // can advance the corrected-forward outcome.
+            if receipt.node_id != *node_id || receipt.mesh_id != *mesh_id {
+                return Err(RecoveryError::Failed {
+                    step: "reenroll-receipt",
+                    reason: format!(
+                        "recovery receipt identity mismatch: planned node `{node_id}` in mesh \
+                         `{mesh_id}`, received node `{}` in mesh `{}`",
+                        receipt.node_id, receipt.mesh_id
+                    ),
+                });
+            }
             Ok(RecoveryOutcome::Reenrolled { receipt })
         }
     }
@@ -987,6 +1002,51 @@ mod tests {
             }
         );
         assert!(apply.calls.borrow().is_empty(), "no seam call when blocked");
+    }
+
+    struct ForeignReceiptApply {
+        receipt: ReenrollReceipt,
+    }
+
+    impl RecoveryApply for ForeignReceiptApply {
+        fn reenroll(&self, _req: &ReenrollRequest) -> Result<ReenrollReceipt, RecoveryError> {
+            Ok(self.receipt.clone())
+        }
+
+        fn blocklist_old_identity(
+            &self,
+            _req: &EvictRequest,
+        ) -> Result<EvictReceipt, RecoveryError> {
+            unreachable!("receipt validation never performs eviction")
+        }
+    }
+
+    #[test]
+    fn execute_rejects_stale_or_foreign_recovery_receipts() {
+        let plan = plan_recovery("peer:anvil", &facts(true, None));
+
+        for receipt in [
+            ReenrollReceipt {
+                node_id: "peer:birch".to_string(),
+                mesh_id: "home-deadbeef".to_string(),
+                overlay_ip: "10.42.0.8".to_string(),
+            },
+            ReenrollReceipt {
+                node_id: "peer:anvil".to_string(),
+                mesh_id: "home-replaced".to_string(),
+                overlay_ip: "10.42.0.7".to_string(),
+            },
+        ] {
+            let err = execute(&plan, &ForeignReceiptApply { receipt })
+                .expect_err("a foreign recovery receipt must fail closed");
+            assert!(matches!(
+                err,
+                RecoveryError::Failed {
+                    step: "reenroll-receipt",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
