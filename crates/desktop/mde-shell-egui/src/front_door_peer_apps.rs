@@ -377,6 +377,7 @@ fn fold_peer_apps_reply(
                                 },
                                 state,
                                 catalog_revision: Some(catalog_revision.clone()),
+                                source_revision: Some(entry.source_revision),
                                 guest_profile: Some(entry.guest_profile),
                                 requested_capabilities: entry.declared_capabilities,
                             }
@@ -416,6 +417,7 @@ fn fold_peer_apps_reply(
                 health: entry.health,
                 state: entry.state,
                 catalog_revision: None,
+                source_revision: None,
                 guest_profile: None,
                 requested_capabilities: Vec::new(),
             };
@@ -480,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_catalog_projects_into_launchable_front_door_row() {
+    fn validated_catalog_source_revision_projects_into_front_door_row() {
         let reply = PeerAppsReply {
             ok: true,
             node: "oak".into(),
@@ -495,6 +497,7 @@ mod tests {
         assert_eq!(apps[0].state, "installed");
         assert_eq!(apps[0].health, "ready");
         assert_eq!(apps[0].catalog_revision.as_deref(), Some("catalog-42"));
+        assert_eq!(apps[0].source_revision.as_deref(), Some("flathub-42"));
         assert_eq!(apps[0].guest_profile.as_deref(), Some("wayland-standard"));
         assert_eq!(apps[0].requested_capabilities, vec!["audio"]);
     }
@@ -819,6 +822,7 @@ mod tests {
                     health: "ready".into(),
                     state: "installed".into(),
                     catalog_revision: Some("catalog-42".into()),
+                    source_revision: Some("flathub-42".into()),
                     guest_profile: Some("wayland-standard".into()),
                     requested_capabilities: vec!["audio".into()],
                 }],
@@ -864,6 +868,7 @@ mod tests {
                     health: "ready".into(),
                     state: "installed".into(),
                     catalog_revision: Some("catalog-42".into()),
+                    source_revision: Some("flathub-42".into()),
                     guest_profile: Some("wayland-standard".into()),
                     requested_capabilities: vec!["audio".into(), "clipboard".into()],
                 }],

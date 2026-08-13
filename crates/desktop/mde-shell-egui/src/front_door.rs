@@ -506,6 +506,8 @@ pub(crate) struct FrontDoorPeerApp {
     pub(crate) state: String,
     /// Signed catalog revision carried by a validated Flatpak catalog.
     pub(crate) catalog_revision: Option<String>,
+    /// Exact guest package/source revision carried by the admitted row.
+    pub(crate) source_revision: Option<String>,
     /// Approved guest profile carried by the catalog row.
     pub(crate) guest_profile: Option<String>,
     /// Policy capabilities carried by the catalog row.
@@ -529,6 +531,10 @@ impl FrontDoorPeerApp {
             && self.state.trim().eq_ignore_ascii_case("installed")
             && self
                 .catalog_revision
+                .as_deref()
+                .is_some_and(|revision| !revision.trim().is_empty())
+            && self
+                .source_revision
                 .as_deref()
                 .is_some_and(|revision| !revision.trim().is_empty())
             && self
@@ -1340,6 +1346,8 @@ fn peer_app_declaration_matches(left: &FrontDoorPeerApp, right: &FrontDoorPeerAp
         && left.state.trim().eq_ignore_ascii_case(right.state.trim())
         && left.catalog_revision.as_deref().map(str::trim)
             == right.catalog_revision.as_deref().map(str::trim)
+        && left.source_revision.as_deref().map(str::trim)
+            == right.source_revision.as_deref().map(str::trim)
         && left.guest_profile.as_deref().map(str::trim)
             == right.guest_profile.as_deref().map(str::trim)
         && left.requested_capabilities == right.requested_capabilities
@@ -7241,6 +7249,7 @@ mod tests {
                     health: String::new(),
                     state: "installed".to_owned(),
                     catalog_revision: Some("catalog-test".to_owned()),
+                    source_revision: Some("source-test".to_owned()),
                     guest_profile: Some("wayland-standard".to_owned()),
                     requested_capabilities: Vec::new(),
                 },
@@ -7253,6 +7262,7 @@ mod tests {
                     health: String::new(),
                     state: "installed".to_owned(),
                     catalog_revision: Some("catalog-test".to_owned()),
+                    source_revision: Some("source-test".to_owned()),
                     guest_profile: Some("wayland-standard".to_owned()),
                     requested_capabilities: Vec::new(),
                 },
@@ -7264,7 +7274,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_peer_app_declarations_never_become_launch_targets() {
+    fn source_revision_substitution_never_becomes_a_launch_target() {
         let exact = admitted_peer_app("org.example.Exact", "Exact", "oak");
         let mut exact_replay = exact.clone();
         exact_replay.health = "reconnecting".to_owned();
@@ -7276,6 +7286,10 @@ mod tests {
         let capability = admitted_peer_app("org.example.Capability", "Capability", "oak");
         let mut conflicting_capability = capability.clone();
         conflicting_capability.requested_capabilities = vec!["clipboard".to_owned()];
+
+        let package = admitted_peer_app("org.example.Package", "Package", "oak");
+        let mut conflicting_package = package.clone();
+        conflicting_package.source_revision = Some("source-substituted".to_owned());
 
         let source = admitted_peer_app("org.example.Source", "Source", "oak");
         let mut conflicting_source = source.clone();
@@ -7289,11 +7303,13 @@ mod tests {
                 exact,
                 revision,
                 capability,
+                package,
                 source,
                 unrelated,
                 exact_replay,
                 conflicting_revision,
                 conflicting_capability,
+                conflicting_package,
                 conflicting_source,
             ],
             0,
@@ -7329,6 +7345,7 @@ mod tests {
             health: "ready".to_owned(),
             state: "installed".to_owned(),
             catalog_revision: Some("catalog-test".to_owned()),
+            source_revision: Some("source-test".to_owned()),
             guest_profile: Some("wayland-standard".to_owned()),
             requested_capabilities: Vec::new(),
         }
@@ -7607,6 +7624,7 @@ mod tests {
                 health: "online".to_owned(),
                 state: "stale".to_owned(),
                 catalog_revision: Some("catalog-test".to_owned()),
+                source_revision: Some("source-test".to_owned()),
                 guest_profile: Some("wayland-standard".to_owned()),
                 requested_capabilities: Vec::new(),
             }],
@@ -7687,6 +7705,7 @@ mod tests {
                 health: "online".to_owned(),
                 state: "installed".to_owned(),
                 catalog_revision: Some("catalog-test".to_owned()),
+                source_revision: Some("source-test".to_owned()),
                 guest_profile: Some("wayland-standard".to_owned()),
                 requested_capabilities: Vec::new(),
             }],
@@ -7711,6 +7730,7 @@ mod tests {
                 health: "online".to_owned(),
                 state: "installed".to_owned(),
                 catalog_revision: Some("catalog-test".to_owned()),
+                source_revision: Some("source-test".to_owned()),
                 guest_profile: Some("wayland-standard".to_owned()),
                 requested_capabilities: Vec::new(),
             }],
@@ -7798,6 +7818,7 @@ mod tests {
                 health: "online".to_owned(),
                 state: "installed".to_owned(),
                 catalog_revision: Some("catalog-42".to_owned()),
+                source_revision: Some("source-42".to_owned()),
                 guest_profile: Some("wayland-standard".to_owned()),
                 requested_capabilities: vec!["audio-playback".to_owned()],
             }],
