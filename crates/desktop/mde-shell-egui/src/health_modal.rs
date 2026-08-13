@@ -74,6 +74,18 @@ struct HistorySelection {
     incident_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SupportExportAuthority {
+    snapshot_generation: u64,
+    snapshot_generated_at_ms: u64,
+    node_scope: String,
+    severity: HistorySeverityFilter,
+    component: HistoryComponentFilter,
+    source: Option<String>,
+    provider: Option<String>,
+    selected_incident_id: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum HistoryComponentFilter {
     #[default]
@@ -216,7 +228,12 @@ fn show(
         );
         if export.clicked() {
             let snapshot = snapshot.expect("enabled export requires a current snapshot");
-            apply_support_export_result(ui.ctx(), export_support_bundle(snapshot));
+            apply_support_export_result(
+                ui.ctx(),
+                capture_support_export_authority(ui.ctx(), chrome, snapshot).and_then(
+                    |authority| export_support_bundle(ui.ctx(), chrome, snapshot, &authority),
+                ),
+            );
         }
     });
     if let Some(outcome) = support_export_outcome(ui.ctx()) {
@@ -1114,15 +1131,88 @@ fn sanitize_support_filename(name: &str) -> String {
     }
 }
 
-fn export_support_bundle(snapshot: &SystemMeshHealthSnapshot) -> std::io::Result<PathBuf> {
-    export_support_bundle_to(&support_export_dir()?, snapshot)
+fn capture_support_export_authority(
+    ctx: &egui::Context,
+    chrome: &ConstructChrome,
+    snapshot: &SystemMeshHealthSnapshot,
+) -> std::io::Result<SupportExportAuthority> {
+    let node_scope = chrome.health_selected_node.clone().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "support export has no admitted Health selection",
+        )
+    })?;
+    let selected_incident_id = history_selection(ctx, &node_scope);
+    let authority = SupportExportAuthority {
+        snapshot_generation: snapshot.generation,
+        snapshot_generated_at_ms: snapshot.generated_at_ms,
+        node_scope,
+        severity: history_filter(ctx),
+        component: history_component_filter(ctx),
+        source: history_source_filter(ctx),
+        provider: history_provider_filter(ctx),
+        selected_incident_id,
+    };
+    validate_support_export_authority(snapshot, &authority)?;
+    Ok(authority)
+}
+
+fn validate_support_export_authority(
+    snapshot: &SystemMeshHealthSnapshot,
+    authority: &SupportExportAuthority,
+) -> std::io::Result<()> {
+    let snapshot_matches = authority.snapshot_generation == snapshot.generation
+        && authority.snapshot_generated_at_ms == snapshot.generated_at_ms;
+    let scope_matches = authority.node_scope == MESH_SELECTION
+        || snapshot
+            .current_node_grades
+            .iter()
+            .any(|grade| grade.node == authority.node_scope);
+    let incident_matches = authority
+        .selected_incident_id
+        .as_ref()
+        .is_none_or(|incident_id| {
+            selected_history_condition(
+                &snapshot.resolved_conditions,
+                &authority.node_scope,
+                snapshot.generated_at_ms,
+                incident_id,
+            )
+            .is_some()
+        });
+    if !snapshot_matches || !scope_matches || !incident_matches {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Health changed before the support export became durable; review the current selection and try again",
+        ));
+    }
+    Ok(())
+}
+
+fn export_support_bundle(
+    ctx: &egui::Context,
+    chrome: &ConstructChrome,
+    snapshot: &SystemMeshHealthSnapshot,
+    authority: &SupportExportAuthority,
+) -> std::io::Result<PathBuf> {
+    let current = capture_support_export_authority(ctx, chrome, snapshot)?;
+    export_support_bundle_to(&support_export_dir()?, snapshot, authority, &current)
 }
 
 fn export_support_bundle_to(
     directory: &Path,
     snapshot: &SystemMeshHealthSnapshot,
+    authority: &SupportExportAuthority,
+    current: &SupportExportAuthority,
 ) -> std::io::Result<PathBuf> {
-    let encoded = support_bundle_json(snapshot)?;
+    if authority != current {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Health selection or filters changed before the support export became durable; review the current view and try again",
+        ));
+    }
+    validate_support_export_authority(snapshot, authority)?;
+    let encoded = support_bundle_json(snapshot, authority)?;
     write_support_bundle(directory, &support_bundle_filename(snapshot), &encoded)
 }
 
@@ -1301,7 +1391,11 @@ fn bounded_sorted_clones<'a, T: Clone + 'a>(
     selected
 }
 
-fn support_bundle_json(snapshot: &SystemMeshHealthSnapshot) -> std::io::Result<Vec<u8>> {
+fn support_bundle_json(
+    snapshot: &SystemMeshHealthSnapshot,
+    authority: &SupportExportAuthority,
+) -> std::io::Result<Vec<u8>> {
+    validate_support_export_authority(snapshot, authority)?;
     let mut nodes = bounded_sorted_clones(
         snapshot.current_node_grades.iter(),
         SUPPORT_BUNDLE_MAX_NODES,
@@ -1333,7 +1427,7 @@ fn support_bundle_json(snapshot: &SystemMeshHealthSnapshot) -> std::io::Result<V
     );
 
     loop {
-        let value = support_bundle_value(snapshot, &nodes, &active, &resolved);
+        let value = support_bundle_value(snapshot, authority, &nodes, &active, &resolved);
         let encoded = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
         if encoded.len() <= SUPPORT_BUNDLE_MAX_BYTES {
             return Ok(encoded);
@@ -1359,6 +1453,7 @@ fn support_condition_order(left: &HealthCondition, right: &HealthCondition) -> s
 
 fn support_bundle_value(
     snapshot: &SystemMeshHealthSnapshot,
+    authority: &SupportExportAuthority,
     nodes: &[NodeGrade],
     active: &[HealthCondition],
     resolved: &[HealthCondition],
@@ -1372,6 +1467,16 @@ fn support_bundle_value(
             "fresh_until_ms": snapshot.fresh_until_ms,
             "observer": redact_support_text(&snapshot.observer),
             "roster_revision": redact_support_text(&snapshot.roster_revision),
+        },
+        "export_authority": {
+            "snapshot_generation": authority.snapshot_generation,
+            "snapshot_generated_at_ms": authority.snapshot_generated_at_ms,
+            "node_scope": redact_support_text(&authority.node_scope),
+            "severity_filter": authority.severity.label(),
+            "component_filter": authority.component.label(),
+            "source_filter": authority.source.as_deref().map(redact_support_text),
+            "provider_filter": authority.provider.as_deref().map(redact_support_text),
+            "selected_incident_id": authority.selected_incident_id.as_deref().map(redact_support_text),
         },
         "mesh_summary": {
             "grade": snapshot.mesh_summary.grade.as_str(),
@@ -2451,6 +2556,19 @@ mod tests {
                 active_critical: critical,
                 unacknowledged_actionable: warnings + critical,
             },
+        }
+    }
+
+    fn fixture_export_authority(snapshot: &SystemMeshHealthSnapshot) -> SupportExportAuthority {
+        SupportExportAuthority {
+            snapshot_generation: snapshot.generation,
+            snapshot_generated_at_ms: snapshot.generated_at_ms,
+            node_scope: MESH_SELECTION.into(),
+            severity: HistorySeverityFilter::All,
+            component: HistoryComponentFilter::All,
+            source: None,
+            provider: None,
+            selected_incident_id: None,
         }
     }
 
@@ -4008,10 +4126,12 @@ mod tests {
             snapshot.resolved_conditions.push(active);
         }
 
-        let encoded = support_bundle_json(&snapshot).expect("hostile snapshot remains exportable");
+        let authority = fixture_export_authority(&snapshot);
+        let encoded = support_bundle_json(&snapshot, &authority)
+            .expect("hostile snapshot remains exportable");
         assert_eq!(
             encoded,
-            support_bundle_json(&snapshot).expect("same snapshot encodes identically"),
+            support_bundle_json(&snapshot, &authority).expect("same snapshot encodes identically"),
             "the bundle is deterministic"
         );
         assert!(encoded.len() <= SUPPORT_BUNDLE_MAX_BYTES);
@@ -4048,6 +4168,10 @@ mod tests {
         );
         assert_eq!(parsed["snapshot"]["observer"], "[redacted]");
         assert_eq!(parsed["snapshot"]["roster_revision"], "[redacted]");
+        assert_eq!(
+            parsed["export_authority"]["snapshot_generation"],
+            snapshot.generation
+        );
     }
 
     #[test]
@@ -4141,13 +4265,68 @@ mod tests {
     }
 
     #[test]
+    fn support_export_rejects_replaced_generation_scope_filters_and_incident() {
+        let root = tempfile::tempdir().expect("support export authority fixture");
+        let snapshot = fixture_snapshot(true, true);
+        let incident_id = snapshot.resolved_conditions[0].id.clone();
+        let captured = SupportExportAuthority {
+            snapshot_generation: snapshot.generation,
+            snapshot_generated_at_ms: snapshot.generated_at_ms,
+            node_scope: "Dell-operations-workstation".into(),
+            severity: HistorySeverityFilter::Warning,
+            component: HistoryComponentFilter::Component(HealthComponent::Firmware),
+            source: Some("render-proof".into()),
+            provider: Some("direct seat poll".into()),
+            selected_incident_id: Some(incident_id),
+        };
+        validate_support_export_authority(&snapshot, &captured)
+            .expect("the initiating Health view is admitted");
+
+        let mut replacements = Vec::new();
+        let mut generation = captured.clone();
+        generation.snapshot_generation += 1;
+        replacements.push(("generation", generation));
+        let mut scope = captured.clone();
+        scope.node_scope = "Basement".into();
+        replacements.push(("scope", scope));
+        let mut severity = captured.clone();
+        severity.severity = HistorySeverityFilter::Critical;
+        replacements.push(("severity", severity));
+        let mut component = captured.clone();
+        component.component = HistoryComponentFilter::Component(HealthComponent::Audio);
+        replacements.push(("component", component));
+        let mut source = captured.clone();
+        source.source = Some("replacement-source".into());
+        replacements.push(("source", source));
+        let mut provider = captured.clone();
+        provider.provider = Some("replacement-provider".into());
+        replacements.push(("provider", provider));
+        let mut incident = captured.clone();
+        incident.selected_incident_id = Some("Dell-operations-workstation:replacement".into());
+        replacements.push(("incident", incident));
+
+        for (label, current) in replacements {
+            let directory = root.path().join(label);
+            let error = export_support_bundle_to(&directory, &snapshot, &captured, &current)
+                .expect_err("replaced live Health authority must fail closed");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                !directory.exists(),
+                "{label} replacement reached the durable write boundary"
+            );
+        }
+    }
+
+    #[test]
     fn support_bundle_export_writes_atomic_round_trip_json() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = tempfile::tempdir().expect("support export fixture");
         let directory = root.path().join("exports");
         let snapshot = fixture_snapshot(true, true);
-        let path = export_support_bundle_to(&directory, &snapshot).expect("real export succeeds");
+        let authority = fixture_export_authority(&snapshot);
+        let path = export_support_bundle_to(&directory, &snapshot, &authority, &authority)
+            .expect("real export succeeds");
         assert_eq!(path.parent(), Some(directory.as_path()));
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
@@ -4193,7 +4372,9 @@ mod tests {
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"block directory creation").expect("write blocker");
         let snapshot = fixture_snapshot(false, true);
-        let failed = export_support_bundle_to(&blocker.join("exports"), &snapshot);
+        let authority = fixture_export_authority(&snapshot);
+        let failed =
+            export_support_bundle_to(&blocker.join("exports"), &snapshot, &authority, &authority);
         assert!(failed.is_err(), "the hostile write must fail");
 
         let ctx = egui::Context::default();
