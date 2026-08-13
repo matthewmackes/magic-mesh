@@ -13,11 +13,14 @@ CONTAINERFILE="$APP_VM_DIR/Containerfile"
 RPMS_DIR="$APP_VM_DIR/rpms"
 RPM_SUPPLY_VERIFY="$APP_VM_DIR/verify-rpm-supply.sh"
 RPM_KEY="$REPO/packaging/repo/RPM-GPG-KEY-magic-mesh"
+CATALOG_TRUST_VERIFY="$REPO/install-helpers/verify-app-vm-catalog-trust.py"
 IMAGE="localhost/magic-mesh-app-vm-wayland:latest"
 BASE=""
 LANE="repo"
 RPMS=()
 CANDIDATE_MANIFEST=""
+CATALOG_TRUST_RECEIPT=""
+CATALOG_TRUST_KEY=""
 DISK=""
 OUT="$APP_VM_DIR/out"
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
@@ -86,7 +89,8 @@ fi
 
 usage() {
     cat <<'EOF'
-Usage: packaging/app-vm/build-image.sh [--rpm PATH --candidate-manifest PATH]
+Usage: packaging/app-vm/build-image.sh --catalog-trust-receipt PATH --catalog-trust-key PATH
+       [--rpm PATH --candidate-manifest PATH]
        [--base IMAGE]
        [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]
        packaging/app-vm/build-image.sh --self-test
@@ -139,6 +143,8 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --rpm) RPMS+=("${2:?--rpm needs a path}"); LANE=local; shift 2 ;;
         --candidate-manifest) CANDIDATE_MANIFEST="${2:?--candidate-manifest needs a path}"; shift 2 ;;
+        --catalog-trust-receipt) CATALOG_TRUST_RECEIPT="${2:?--catalog-trust-receipt needs a path}"; shift 2 ;;
+        --catalog-trust-key) CATALOG_TRUST_KEY="${2:?--catalog-trust-key needs a path}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
         --disk) DISK="${2:?--disk needs a type}"; shift 2 ;;
@@ -155,6 +161,11 @@ command -v podman >/dev/null 2>&1 || missing+=("podman is required")
 [ -f "$REPO/packaging/repo/magic-mesh.repo" ] || missing+=("channel repo file missing: $REPO/packaging/repo/magic-mesh.repo")
 [ -x "$RPM_SUPPLY_VERIFY" ] || missing+=("RPM supply verifier missing or not executable: $RPM_SUPPLY_VERIFY")
 [ -f "$RPM_KEY" ] || missing+=("governed RPM key missing: $RPM_KEY")
+[ -x "$CATALOG_TRUST_VERIFY" ] || missing+=("catalog trust verifier missing or not executable: $CATALOG_TRUST_VERIFY")
+[ -n "$CATALOG_TRUST_RECEIPT" ] || missing+=("--catalog-trust-receipt is required")
+[ -n "$CATALOG_TRUST_KEY" ] || missing+=("--catalog-trust-key is required")
+[ -z "$CATALOG_TRUST_RECEIPT" ] || [ -f "$CATALOG_TRUST_RECEIPT" ] || missing+=("catalog trust receipt is not a regular file")
+[ -z "$CATALOG_TRUST_KEY" ] || [ -f "$CATALOG_TRUST_KEY" ] || missing+=("catalog trust key is not a regular file")
 
 if [ "$LANE" = "local" ]; then
     [ "${#RPMS[@]}" -eq 1 ] || missing+=("local lane requires exactly one magic-mesh RPM")
@@ -176,6 +187,20 @@ if [ "${#missing[@]}" -gt 0 ]; then
     for item in "${missing[@]}"; do echo "  - $item" >&2; done
     exit 2
 fi
+
+# Admit and snapshot trust before RPM staging, registry access, or Podman can
+# mutate image state. The verifier reads no path twice; the build consumes only
+# its immutable, private staging copies.
+TRUST_STAGE="$(mktemp -d)"
+cleanup_trust_stage() { rm -rf -- "$TRUST_STAGE"; }
+trap cleanup_trust_stage EXIT
+TRUST_METADATA="$($CATALOG_TRUST_VERIFY \
+    --receipt "$CATALOG_TRUST_RECEIPT" \
+    --key "$CATALOG_TRUST_KEY" \
+    --expected-source-revision "$SOURCE_COMMIT" \
+    --stage-dir "$TRUST_STAGE")"
+CATALOG_SIGNER_ID="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["signer_id"])' <<<"$TRUST_METADATA")"
+CATALOG_KEY_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["verification_key_sha256"])' <<<"$TRUST_METADATA")"
 
 if [ -n "$DISK" ] && [ "$(id -u)" -ne 0 ]; then
     echo "FATAL: --disk requires root for bootc-image-builder" >&2
@@ -228,6 +253,10 @@ args=(
     --build-arg "MCNF_RPM_LANE=$LANE"
     --build-arg "MCNF_APP_VM_SOURCE_COMMIT=$SOURCE_COMMIT"
     --build-arg "MCNF_APP_VM_BASE_IMAGE_ID=$BASE_ID"
+    --build-arg "MCNF_FLATPAK_CATALOG_SIGNER_ID=$CATALOG_SIGNER_ID"
+    --build-arg "MCNF_FLATPAK_CATALOG_KEY_SHA256=$CATALOG_KEY_SHA256"
+    --secret "id=mcnf_catalog_trust_receipt,src=$TRUST_STAGE/catalog-trust-receipt.json"
+    --secret "id=mcnf_catalog_verification_key,src=$TRUST_STAGE/catalog-verification.key"
 )
 # Never let the mutable selection ref cross the build boundary. A tag may be
 # retargeted after resolve/inspect; FROM consumes the captured immutable ID.

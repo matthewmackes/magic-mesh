@@ -10,6 +10,8 @@ FROM ${APP_VM_BASE}
 ARG MCNF_RPM_LANE=repo
 ARG MCNF_APP_VM_SOURCE_COMMIT
 ARG MCNF_APP_VM_BASE_IMAGE_ID
+ARG MCNF_FLATPAK_CATALOG_SIGNER_ID
+ARG MCNF_FLATPAK_CATALOG_KEY_SHA256
 
 COPY packaging/app-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate
@@ -21,7 +23,35 @@ COPY packaging/app-vm/verify-installed-rpm-identity.sh /tmp/verify-installed-rpm
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 COPY packaging/repo/RPM-GPG-KEY-magic-mesh /tmp/RPM-GPG-KEY-magic-mesh
 
+RUN --mount=type=secret,id=mcnf_catalog_trust_receipt,required=true \
+    --mount=type=secret,id=mcnf_catalog_verification_key,required=true \
+    set -eux; \
+    python3 - "${MCNF_APP_VM_SOURCE_COMMIT}" "${MCNF_FLATPAK_CATALOG_SIGNER_ID}" "${MCNF_FLATPAK_CATALOG_KEY_SHA256}" <<'PY'
+import hashlib, json, pathlib, sys
+revision, signer, expected_digest = sys.argv[1:]
+receipt_path = pathlib.Path('/run/secrets/mcnf_catalog_trust_receipt')
+key_path = pathlib.Path('/run/secrets/mcnf_catalog_verification_key')
+receipt = json.loads(receipt_path.read_bytes())
+expected_keys = {'schema_version', 'kind', 'signer_id', 'source_revision', 'verification_key_sha256'}
+if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+    raise SystemExit('catalog trust receipt has an unexpected field set')
+if receipt['schema_version'] != 1 or receipt['kind'] != 'mcnf-flatpak-catalog-trust':
+    raise SystemExit('catalog trust receipt identity is invalid')
+if receipt['source_revision'] != revision or receipt['signer_id'] != signer:
+    raise SystemExit('catalog trust receipt does not match release build arguments')
+key = key_path.read_bytes()
+if len(key) != 65 or not key.endswith(b'\n') or not all(c in b'0123456789abcdef' for c in key[:-1]):
+    raise SystemExit('catalog verification key is not canonical lowercase Ed25519 hex')
+digest = hashlib.sha256(key).hexdigest()
+if digest != expected_digest or digest != receipt['verification_key_sha256']:
+    raise SystemExit('catalog verification key digest does not match release authority')
+pathlib.Path('/etc/mackesd').mkdir(mode=0o755, parents=True, exist_ok=True)
+pathlib.Path('/usr/share/mcnf/app-vm').mkdir(mode=0o755, parents=True, exist_ok=True)
+pathlib.Path('/etc/mackesd/flatpak-catalog-verification.key').write_bytes(key)
+pathlib.Path('/usr/share/mcnf/app-vm/catalog-trust-receipt.json').write_bytes(receipt_path.read_bytes())
+PY
 RUN set -eux; \
+    chmod 0444 /etc/mackesd/flatpak-catalog-verification.key /usr/share/mcnf/app-vm/catalog-trust-receipt.json; \
     printf '%s\n' "${MCNF_APP_VM_BASE_IMAGE_ID}" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || { \
         echo "FATAL: App VM base image provenance must be a complete sha256 digest" >&2; exit 1; }; \
     printf '%s\n' "${MCNF_APP_VM_SOURCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' && \
