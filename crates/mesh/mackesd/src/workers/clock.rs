@@ -866,14 +866,16 @@ impl ClockWorker {
                 schedule_id,
                 enabled,
             } => {
-                let Some(schedule) = snapshot
+                let Some(schedule_index) = snapshot
                     .schedules
-                    .iter_mut()
-                    .find(|value| value.schedule_id == schedule_id)
+                    .iter()
+                    .position(|value| value.schedule_id == schedule_id)
                 else {
                     anyhow::bail!("Clock schedule does not exist");
                 };
-                let ClockScheduleKindV1::Alarm(alarm) = &mut schedule.schedule else {
+                let ClockScheduleKindV1::Alarm(alarm) =
+                    &mut snapshot.schedules[schedule_index].schedule
+                else {
                     anyhow::bail!("timer enable command is invalid");
                 };
                 if peer_origin {
@@ -885,8 +887,46 @@ impl ClockWorker {
                     // Snooze creates a durable Scheduled child independently
                     // of the parent alarm's recurrence.  Once the parent is
                     // disabled, that child must not survive to ring later. A
-                    // one-time alarm is already disabled when it first rings,
-                    // so cancellation itself must count as the mutation.
+                    // one-time alarm is already disabled when it first rings.
+                    // Disable must also terminally acknowledge every exact
+                    // ringing generation so the atomic audio transition queues
+                    // Music Stop instead of leaving a disabled alarm audible.
+                    let ringing_occurrences = snapshot
+                        .occurrences
+                        .iter()
+                        .filter(|occurrence| {
+                            occurrence.schedule_id == schedule_id
+                                && occurrence.phase == ClockOccurrencePhase::Ringing
+                        })
+                        .map(|occurrence| {
+                            (
+                                occurrence.occurrence_id.clone(),
+                                occurrence.global_event_id.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let actor_clock =
+                        expected_snapshot_revision.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("Clock schedule-disable generation exhausted")
+                        })?;
+                    for (occurrence_id, global_event_id) in ringing_occurrences {
+                        let acknowledgement = ClockAcknowledgementV1 {
+                            acknowledgement_id: schedule_disable_acknowledgement_id(
+                                &occurrence_id,
+                                request_id,
+                            ),
+                            global_event_id,
+                            actor_node_id: command_origin.to_owned(),
+                            actor_clock,
+                            acknowledged_at_utc_ms: issued_at_ms,
+                            stop: true,
+                        };
+                        anyhow::ensure!(
+                            acknowledge(snapshot, &occurrence_id, acknowledgement)?,
+                            "Clock schedule disable could not stop its ringing occurrence"
+                        );
+                        changed = true;
+                    }
                     let occurrence_count = snapshot.occurrences.len();
                     snapshot.occurrences.retain(|occurrence| {
                         occurrence.schedule_id != schedule_id
@@ -2532,6 +2572,18 @@ fn schedule_removal_acknowledgement_id(occurrence_id: &str, request_id: &str) ->
     digest.update(request_id.as_bytes());
     format!(
         "clock-schedule-removal-{}",
+        &hex_bytes(&digest.finalize())[..32]
+    )
+}
+
+fn schedule_disable_acknowledgement_id(occurrence_id: &str, request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"magic-mesh:clock-schedule-disable:v1\0");
+    digest.update(occurrence_id.as_bytes());
+    digest.update([0]);
+    digest.update(request_id.as_bytes());
+    format!(
+        "clock-schedule-disable-{}",
         &hex_bytes(&digest.finalize())[..32]
     )
 }
@@ -4892,6 +4944,85 @@ mod tests {
             occurrence.occurrence_id != child_id
                 && occurrence.phase != ClockOccurrencePhase::Ringing
         }));
+    }
+
+    #[test]
+    fn disabling_a_ringing_alarm_atomically_stops_its_exact_audio_generation() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        fixture.publish(&fixture.alarm_command("disable-ringing", 1, NOW + 5_000));
+        fixture.worker.tick_once().unwrap();
+
+        let disable_at = NOW + 10_000;
+        fixture.clock.0.store(disable_at, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let ringing = fixture.worker.snapshot.as_ref().unwrap().occurrences[0].clone();
+        assert_eq!(ringing.phase, ClockOccurrencePhase::Ringing);
+        assert_eq!(ringing.revision, 3);
+
+        let request_id = "disable-active-alarm";
+        let disable = ClockCommandV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: request_id.into(),
+            origin_node_id: "seat-1".into(),
+            expected_revision: 3,
+            issued_at_utc_ms: disable_at,
+            expires_at_utc_ms: disable_at + MAX_CLOCK_COMMAND_TTL_MS,
+            body: ClockCommandKindV1::SetScheduleEnabled {
+                schedule_id: ringing.schedule_id.clone(),
+                enabled: false,
+            },
+            signer_id: String::new(),
+            signature: String::new(),
+        }
+        .sign(
+            "seat-1-key",
+            &fixture.signing_key,
+            &fixture.worker.context(disable_at),
+        )
+        .unwrap();
+        fixture.publish(&disable);
+        fixture.worker.tick_once().unwrap();
+
+        let disabled = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(disabled.revision, 4);
+        assert!(matches!(
+            &disabled.schedules[0].schedule,
+            ClockScheduleKindV1::Alarm(ClockAlarmV1 { enabled: false, .. })
+        ));
+        let stopped = disabled
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.occurrence_id == ringing.occurrence_id)
+            .unwrap();
+        assert_eq!(stopped.phase, ClockOccurrencePhase::Stopped);
+        let acknowledgement = stopped.acknowledgement.as_ref().unwrap();
+        assert!(acknowledgement.stop);
+        assert_eq!(acknowledgement.actor_clock, 4);
+        assert_eq!(acknowledgement.acknowledged_at_utc_ms, disable_at);
+        assert_eq!(
+            acknowledgement.acknowledgement_id,
+            schedule_disable_acknowledgement_id(&ringing.occurrence_id, request_id)
+        );
+
+        let audio = fixture.audio_messages();
+        assert_eq!(audio.len(), 2, "disable must publish one exact Music Stop");
+        let stop = ClockAudioRequestV1::from_json_at(audio.last().unwrap().as_bytes(), disable_at)
+            .unwrap();
+        assert_eq!(stop.occurrence_id, ringing.occurrence_id);
+        assert_eq!(stop.global_event_id, ringing.global_event_id);
+        assert_eq!(stop.occurrence_generation, ringing.revision);
+        assert!(matches!(
+            stop.body,
+            ClockAudioActionV1::Stop { ref acknowledgement_id }
+                if acknowledgement_id
+                    == &schedule_disable_acknowledgement_id(&ringing.occurrence_id, request_id)
+        ));
+
+        fixture.publish(&disable);
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 4);
+        assert_eq!(fixture.audio_messages().len(), 2, "replay must stay closed");
     }
 
     #[test]
