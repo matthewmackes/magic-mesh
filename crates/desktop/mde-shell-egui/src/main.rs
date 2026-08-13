@@ -1708,12 +1708,11 @@ impl Shell {
                 self.nav.surface = Surface::Workers;
             }
             Surface::Workbench => {
-                self.workers_tab = WorkersTab::Control;
-                self.fleet_mesh_tab = FleetMeshTab::Workbench;
-                self.workers_destination = WorkersDestination::ThisNodePage(
-                    this_node_catalog::page_for_route("this-node/overview")
-                        .unwrap_or(this_node_catalog::page_index()[0]),
-                );
+                // Workbench is a retired sibling surface, not navigation
+                // authority.  Collapse persisted/stale values into Workers but
+                // preserve the destination selected through the typed catalog.
+                // In particular, the alias must not replace Action Console with
+                // a legacy overview activation.
                 self.nav.surface = Surface::Workers;
             }
             Surface::MeshView => {
@@ -5800,7 +5799,6 @@ mod tests {
 
         for (legacy, expected_workers_tab, expected_destination) in [
             (Surface::FleetMesh, WorkersTab::Control, overview),
-            (Surface::Workbench, WorkersTab::Control, overview),
             (
                 Surface::MeshView,
                 WorkersTab::Network,
@@ -5842,6 +5840,26 @@ mod tests {
                 "{legacy:?} local-node tab"
             );
         }
+    }
+
+    #[test]
+    fn retired_workbench_surface_cannot_override_typed_action_console_destination() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        shell.open_workers_destination(WorkersDestination::ActionConsole);
+        assert_eq!(shell.workers_tab, WorkersTab::Control);
+        assert_eq!(shell.workers_destination, WorkersDestination::ActionConsole);
+
+        // A stale persisted surface or hostile legacy caller must not regain
+        // authority to select the former Workbench overview/plane.
+        shell.nav.surface = Surface::Workbench;
+        shell.normalize_surface_aliases();
+
+        assert_eq!(shell.nav.surface, Surface::Workers);
+        assert_eq!(shell.workers_tab, WorkersTab::Control);
+        assert_eq!(shell.workers_destination, WorkersDestination::ActionConsole);
     }
 
     #[test]
