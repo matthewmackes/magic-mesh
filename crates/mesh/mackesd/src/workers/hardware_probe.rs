@@ -39,6 +39,7 @@ pub const TICK: Duration = Duration::from_secs(300);
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_POWER_SUPPLIES: usize = 64;
+const MAX_SYSFS_CLASSES: usize = 256;
 
 /// Run one command, returning trimmed stdout lines (empty on any failure).
 fn cmd_lines(bin: &str, args: &[&str]) -> Vec<String> {
@@ -140,6 +141,32 @@ fn gather_power(power_supply_root: &Path) -> (Option<u8>, bool) {
     (battery_pct, on_ac || !saw_battery)
 }
 
+/// Publish a deterministic, bounded summary of the kernel's device classes.
+///
+/// `/sys/class` is provider-owned input.  Sort before applying the bound so a
+/// noisy or compromised mount cannot make the visible subset depend on
+/// directory iteration order, and ignore aliases that are not directories.
+fn gather_sysfs_classes(sysfs_class_root: &Path) -> Vec<String> {
+    let mut classes = std::fs::read_dir(sysfs_class_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_type()
+                        .map(|kind| kind.is_dir() || kind.is_symlink())
+                        .unwrap_or(false)
+                })
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    classes.sort_unstable();
+    classes.dedup();
+    classes.truncate(MAX_SYSFS_CLASSES);
+    classes
+}
+
 /// Gather this node's hardware probe. Pure-ish (shells read-only tools).
 #[must_use]
 pub fn gather(node_id: &str) -> PeerProbe {
@@ -159,13 +186,7 @@ pub fn gather(node_id: &str) -> PeerProbe {
     // Power: best-effort sysfs read (laptop) — None on a server/desktop.
     let (battery_pct, on_ac) = gather_power(Path::new("/sys/class/power_supply"));
 
-    let sysfs_classes = std::fs::read_dir("/sys/class")
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let sysfs_classes = gather_sysfs_classes(Path::new("/sys/class"));
 
     PeerProbe {
         peer_id: node_id.to_string(),
@@ -410,6 +431,22 @@ mod tests {
         assert_eq!(gather_power(sysfs.path()), (Some(73), false));
         std::fs::write(battery.join("capacity"), "255\n").unwrap();
         assert_eq!(gather_power(sysfs.path()), (None, false));
+    }
+
+    #[test]
+    fn sysfs_class_projection_is_typed_deterministic_and_bounded() {
+        let sysfs = tempfile::tempdir().unwrap();
+        for index in (0..MAX_SYSFS_CLASSES + 16).rev() {
+            std::fs::create_dir(sysfs.path().join(format!("class-{index:03}"))).unwrap();
+        }
+        std::fs::write(sysfs.path().join("not-a-class"), b"noise").unwrap();
+
+        let classes = gather_sysfs_classes(sysfs.path());
+
+        assert_eq!(classes.len(), MAX_SYSFS_CLASSES);
+        assert_eq!(classes.first().map(String::as_str), Some("class-000"));
+        assert_eq!(classes.last().map(String::as_str), Some("class-255"));
+        assert!(!classes.iter().any(|name| name == "not-a-class"));
     }
 
     #[cfg(unix)]
