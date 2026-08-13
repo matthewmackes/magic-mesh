@@ -894,6 +894,9 @@ fn workload_action_bindings(catalog: &ResourceCatalog) -> BTreeMap<String, Workl
                 let (prefix, operation) = match action.verb {
                     ResourceActionVerb::Start => ("start-g", WorkloadOperationAction::Start),
                     ResourceActionVerb::Resume => ("resume-g", WorkloadOperationAction::Resume),
+                    ResourceActionVerb::Launch => {
+                        ("launch-g", WorkloadOperationAction::StartAndAttach)
+                    }
                     _ => return None,
                 };
                 if action.target != ResourceActionTarget::Resource
@@ -2055,6 +2058,38 @@ mod tests {
         let duplicate = ambiguous.cards[0].actions[0].clone();
         ambiguous.cards[0].actions.push(duplicate);
         assert!(workload_action_bindings(&ambiguous).is_empty());
+    }
+
+    #[test]
+    fn running_vm_launch_routes_through_start_and_attach_authority() {
+        let mut catalog = workload_catalog();
+        catalog.cards[0].actions[0].action_id = "launch-g7".into();
+        catalog.cards[0].actions[0].verb = ResourceActionVerb::Launch;
+        catalog.content_digest = Some(catalog.computed_content_digest());
+        catalog.validate().expect("valid running Workload catalog");
+        let resource_id = catalog.cards[0].resource_id().to_owned();
+
+        let bindings = workload_action_bindings(&catalog);
+        let binding = bindings
+            .get(&resource_id)
+            .expect("generation-bound Launch action");
+        assert_eq!(binding.verb, ResourceActionVerb::Launch);
+        assert_eq!(binding.operation, WorkloadOperationAction::StartAndAttach);
+
+        let invocation = build_workload_invocation(binding, &workload_status(7), NOW + 1)
+            .expect("fresh running Workload identity");
+        let TypedAuthorityRequest::Workload(request) = &invocation.authority_request else {
+            panic!("Launch crossed into a non-Workload authority");
+        };
+        assert_eq!(request.action, WorkloadOperationAction::StartAndAttach);
+        assert_eq!(request.expected_generation, 7);
+        assert_eq!(invocation.verb, ResourceActionVerb::Launch);
+        assert_eq!(
+            resource_auth_context(&invocation)
+                .expect("Launch auth context")
+                .0,
+            "resource-action-launch"
+        );
     }
 
     #[test]
