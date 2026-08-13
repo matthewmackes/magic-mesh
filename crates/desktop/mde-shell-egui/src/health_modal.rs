@@ -1397,7 +1397,9 @@ fn support_bundle_json(
 ) -> std::io::Result<Vec<u8>> {
     validate_support_export_authority(snapshot, authority)?;
     let mut nodes = bounded_sorted_clones(
-        snapshot.current_node_grades.iter(),
+        snapshot.current_node_grades.iter().filter(|node| {
+            authority.node_scope == MESH_SELECTION || node.node == authority.node_scope
+        }),
         SUPPORT_BUNDLE_MAX_NODES,
         |left, right| {
             left.node
@@ -1407,10 +1409,9 @@ fn support_bundle_json(
     );
 
     let mut active = bounded_sorted_clones(
-        snapshot
-            .active_conditions
-            .iter()
-            .filter(|condition| condition.is_active()),
+        snapshot.active_conditions.iter().filter(|condition| {
+            condition.is_active() && support_scope_admits(authority, condition)
+        }),
         SUPPORT_BUNDLE_MAX_ACTIVE,
         support_condition_order,
     );
@@ -1418,9 +1419,21 @@ fn support_bundle_json(
     let window_start = snapshot.generated_at_ms.saturating_sub(HISTORY_WINDOW_MS);
     let mut resolved = bounded_sorted_clones(
         snapshot.resolved_conditions.iter().filter(|condition| {
-            condition.resolved_at_ms.is_some_and(|resolved_at| {
-                (window_start..=snapshot.generated_at_ms).contains(&resolved_at)
-            })
+            support_scope_admits(authority, condition)
+                && authority.severity.admits(condition.severity)
+                && authority.component.admits(condition.component)
+                && authority
+                    .source
+                    .as_deref()
+                    .is_none_or(|source| condition.source == source)
+                && authority
+                    .provider
+                    .as_deref()
+                    .is_none_or(|provider| condition.evidence.provider == provider)
+                && condition.resolved_at_ms.is_some_and(|resolved_at| {
+                    (window_start..=snapshot.generated_at_ms).contains(&resolved_at)
+                        && resolved_at >= condition.last_observed_ms
+                })
         }),
         SUPPORT_BUNDLE_MAX_RESOLVED,
         support_condition_order,
@@ -1440,6 +1453,14 @@ fn support_bundle_json(
             "support bundle metadata exceeds the byte limit",
         ));
     }
+}
+
+fn support_scope_admits(authority: &SupportExportAuthority, condition: &HealthCondition) -> bool {
+    authority.node_scope == MESH_SELECTION
+        || matches!(
+            &condition.scope,
+            HealthScope::Node { node } if node == &authority.node_scope
+        )
 }
 
 fn support_condition_order(left: &HealthCondition, right: &HealthCondition) -> std::cmp::Ordering {
@@ -4172,6 +4193,87 @@ mod tests {
             parsed["export_authority"]["snapshot_generation"],
             snapshot.generation
         );
+    }
+
+    #[test]
+    fn support_bundle_materializes_only_the_captured_health_view() {
+        let mut snapshot = fixture_snapshot(false, true);
+        snapshot.active_conditions.clear();
+        snapshot.resolved_conditions.clear();
+
+        let mut active = condition(
+            "dell:active",
+            "Dell-operations-workstation",
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        active.evidence.summary = "admitted active condition".into();
+        snapshot.active_conditions.push(active);
+
+        let mut foreign_active = condition(
+            "surface:active-secret",
+            "Surface",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        foreign_active.evidence.summary = "foreign-active-marker".into();
+        snapshot.active_conditions.push(foreign_active);
+
+        let mut matching = condition(
+            "dell:matching-history",
+            "Dell-operations-workstation",
+            HealthSeverity::Warning,
+            HealthComponent::Firmware,
+        );
+        matching.source = "firmware-monitor".into();
+        matching.evidence.provider = "fwupd".into();
+        matching.evidence.summary = "admitted-history-marker".into();
+        matching.last_observed_ms = snapshot.generated_at_ms.saturating_sub(2_000);
+        matching.resolved_at_ms = Some(snapshot.generated_at_ms.saturating_sub(1_000));
+        snapshot.resolved_conditions.push(matching);
+
+        for index in 0..64 {
+            let mut hostile = condition(
+                &format!("surface:critical-{index}"),
+                "Surface",
+                HealthSeverity::Critical,
+                HealthComponent::Firmware,
+            );
+            hostile.source = "firmware-monitor".into();
+            hostile.evidence.provider = "fwupd".into();
+            hostile.evidence.summary = format!("foreign-history-marker-{index}");
+            hostile.last_observed_ms = snapshot.generated_at_ms.saturating_sub(2_000);
+            hostile.resolved_at_ms = Some(snapshot.generated_at_ms.saturating_sub(1_000));
+            snapshot.resolved_conditions.push(hostile);
+        }
+
+        let authority = SupportExportAuthority {
+            snapshot_generation: snapshot.generation,
+            snapshot_generated_at_ms: snapshot.generated_at_ms,
+            node_scope: "Dell-operations-workstation".into(),
+            severity: HistorySeverityFilter::Warning,
+            component: HistoryComponentFilter::Component(HealthComponent::Firmware),
+            source: Some("firmware-monitor".into()),
+            provider: Some("fwupd".into()),
+            selected_incident_id: None,
+        };
+        let encoded = support_bundle_json(&snapshot, &authority)
+            .expect("the captured filtered Health view is exportable");
+        let text = String::from_utf8(encoded.clone()).expect("support bundle is UTF-8");
+        assert!(text.contains("admitted active condition"));
+        assert!(text.contains("admitted-history-marker"));
+        assert!(!text.contains("foreign-active-marker"));
+        assert!(!text.contains("foreign-history-marker"));
+
+        let parsed: serde_json::Value = serde_json::from_slice(&encoded).expect("valid JSON");
+        assert_eq!(parsed["nodes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            parsed["active_conditions"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(parsed["resolved_history"].as_array().map(Vec::len), Some(1));
+        assert_eq!(parsed["limits"]["resolved_in_snapshot"], 65);
+        assert_eq!(parsed["limits"]["resolved_exported"], 1);
     }
 
     #[test]
