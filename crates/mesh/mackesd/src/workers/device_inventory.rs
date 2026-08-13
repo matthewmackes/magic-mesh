@@ -796,20 +796,61 @@ fn class_named_devices_bounded(
     out
 }
 
+/// Maximum input devices retained in one inventory generation.
+const MAX_INPUT_DEVICES: usize = 256;
+
 /// Input devices (`/sys/class/input/input*/name`).
+///
+/// Input names are kernel-provider observations, not authority.  A missing or
+/// unreadable name therefore remains a sourced row with an explicit unavailable
+/// state instead of being promoted to a healthy device using its node name.
+/// Admission is deterministic and bounded before any attributes are read.
 #[must_use]
 pub fn input_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
-    class_named_devices(roots, "input", Some("name"))
+    input_children_bounded(&roots.sys.join("class").join("input"))
         .into_iter()
-        // Keep only the `input*` device nodes (skip the `event*`/`mouse*` children
-        // sysfs also lists under class/input).
-        .filter(|r| {
-            r.sysfs_path
-                .as_deref()
-                .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
-                .is_some_and(|n| n.starts_with("input"))
+        .filter_map(|dir| {
+            let node = dir.file_name()?.to_str()?;
+            let observed_name = read_trim(&dir.join("name"));
+            let status = if observed_name.is_some() {
+                DeviceStatus::Ok
+            } else {
+                DeviceStatus::Unknown
+            };
+            Some(DeviceRecord {
+                name: observed_name.unwrap_or_else(|| node.to_string()),
+                sysfs_path: Some(dir.to_string_lossy().into_owned()),
+                problem: (status == DeviceStatus::Unknown)
+                    .then(|| "input device name unavailable".to_string()),
+                ..DeviceRecord::new(node, status)
+            })
         })
         .collect()
+}
+
+/// Select physical/logical `input*` provider rows before applying the budget;
+/// sibling `event*`/`mouse*` nodes must not consume input-device capacity.
+fn input_children_bounded(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut admitted = BTreeSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(node) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !node.starts_with("input") {
+            continue;
+        }
+        admitted.insert(path);
+        if admitted.len() > MAX_INPUT_DEVICES {
+            if let Some(last) = admitted.iter().next_back().cloned() {
+                admitted.remove(&last);
+            }
+        }
+    }
+    admitted.into_iter().collect()
 }
 
 /// Maximum physical network interfaces published by one inventory generation.
@@ -1784,6 +1825,35 @@ mod tests {
         assert!(power_supplies(&roots)
             .iter()
             .any(|r| r.name.contains("Battery")));
+    }
+
+    #[test]
+    fn input_provider_is_bounded_and_reports_unavailable_names_truthfully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let input = roots.sys.join("class/input");
+        for index in 0..MAX_INPUT_DEVICES.saturating_add(16) {
+            let device = input.join(format!("input{index:04}"));
+            if index != 0 {
+                put(&device.join("name"), &format!("Input device {index}\n"));
+            } else {
+                fs::create_dir_all(&device).unwrap();
+            }
+        }
+        put(&input.join("event0000/dev"), "13:64\n");
+
+        let records = input_devices(&roots);
+        assert_eq!(records.len(), MAX_INPUT_DEVICES);
+        assert_eq!(records[0].name, "input0000");
+        assert_eq!(records[0].status, DeviceStatus::Unknown);
+        assert_eq!(
+            records[0].problem.as_deref(),
+            Some("input device name unavailable")
+        );
+        assert_eq!(records.last().unwrap().name, "Input device 255");
+        assert!(records
+            .iter()
+            .all(|record| !record.name.starts_with("event")));
     }
 
     #[test]
