@@ -88,6 +88,9 @@ pub(crate) struct RetainedClockActions {
     pub(crate) identity: String,
     pub(crate) actions: [ClockBannerAction; 2],
     pub(crate) actionable: bool,
+    /// A control from this exact retained payload was already handed to the
+    /// Clock controller.  Periodic live projections cannot re-arm it.
+    consumed: bool,
 }
 
 /// The Notification Center's bounded in-memory history (module doc: the shell
@@ -149,6 +152,7 @@ impl NotificationRing {
                 identity: banner.identity.clone(),
                 actions: banner.actions.clone(),
                 actionable: true,
+                consumed: false,
             }),
         });
         while self.entries.len() > RING_CAP {
@@ -170,15 +174,39 @@ impl NotificationRing {
             let Some(retained) = &mut entry.clock_actions else {
                 continue;
             };
-            retained.actionable = live.iter().any(|banner| {
-                banner.identity == retained.identity
-                    && banner.actions == retained.actions
-                    && retained
-                        .actions
-                        .iter()
-                        .all(|action| now_ms <= action.valid_until_utc_ms)
-            });
+            retained.actionable = !retained.consumed
+                && live.iter().any(|banner| {
+                    banner.identity == retained.identity
+                        && banner.actions == retained.actions
+                        && retained
+                            .actions
+                            .iter()
+                            .all(|action| now_ms <= action.valid_until_utc_ms)
+                });
         }
+    }
+
+    /// Consume one retained Clock control exactly once.  The row is only a
+    /// presentation projection, so it must fail closed unless the clicked
+    /// payload is still the exact daemon-admitted payload retained for that
+    /// occurrence/schedule generation.  Revocation happens before the request
+    /// is published, preventing a second frame (or a double activation) from
+    /// replaying Snooze/Stop against the same retained authority.
+    fn take_clock_action(
+        &mut self,
+        identity: &str,
+        requested: &ClockBannerAction,
+    ) -> Option<ClockBannerAction> {
+        let retained = self.entries.iter_mut().find_map(|entry| {
+            let retained = entry.clock_actions.as_mut()?;
+            (retained.identity == identity).then_some(retained)
+        })?;
+        if !retained.actionable || !retained.actions.contains(requested) {
+            return None;
+        }
+        retained.actionable = false;
+        retained.consumed = true;
+        Some(requested.clone())
     }
 
     /// Retained entry count.
@@ -408,6 +436,7 @@ fn panel_contents(ui: &mut egui::Ui, toasts: &mut ToastBridge, panel_h: f32) {
             // Per-group clear is deferred past the loop: the groups borrow the
             // ring immutably while rendering.
             let mut clear_topic: Option<String> = None;
+            let mut clock_action: Option<(String, ClockBannerAction)> = None;
             for group in grouped(toasts.history()) {
                 if group_header(ui, group.topic, true) {
                     clear_topic = Some(group.topic.to_owned());
@@ -418,18 +447,25 @@ fn panel_contents(ui: &mut egui::Ui, toasts: &mut ToastBridge, panel_h: f32) {
                     } else {
                         format!("{} · {}", entry.source_host, hhmm(entry.at_unix))
                     };
-                    row(
+                    if let Some(action) = row(
                         ui,
                         entry.severity,
                         &entry.headline,
                         &footnote,
                         entry.clock_actions.as_ref(),
-                    );
+                    ) {
+                        clock_action = Some(action);
+                    }
                 }
                 ui.add_space(Style::SP_S);
             }
             if let Some(topic) = clear_topic {
                 toasts.history_mut().clear_topic(&topic);
+            }
+            if let Some((identity, action)) = clock_action {
+                if let Some(action) = toasts.history_mut().take_clock_action(&identity, &action) {
+                    request_clock_banner_action(ui.ctx(), action);
+                }
             }
         });
 }
@@ -465,7 +501,8 @@ fn row(
     title: &str,
     footnote: &str,
     clock_actions: Option<&RetainedClockActions>,
-) {
+) -> Option<(String, ClockBannerAction)> {
+    let mut requested = None;
     // Alert text is external input. Reserve the glyph and its gap before
     // laying out the labels so a long headline cannot expand the modal past
     // its fixed panel width and move controls outside the hit target.
@@ -501,7 +538,7 @@ fn row(
                     ui.horizontal(|ui| {
                         for action in &actions.actions {
                             if ui.button(action.label).clicked() {
-                                request_clock_banner_action(ui.ctx(), action.clone());
+                                requested = Some((actions.identity.clone(), action.clone()));
                             }
                         }
                     });
@@ -516,6 +553,7 @@ fn row(
         });
     });
     ui.add_space(Style::SP_XS);
+    requested
 }
 
 #[cfg(test)]
@@ -738,6 +776,43 @@ mod tests {
         assert_eq!(
             retained.actions, original.actions,
             "retained controls stay bound to the originally admitted snapshot"
+        );
+    }
+
+    #[test]
+    fn retained_clock_action_is_consumed_before_publication_and_cannot_rearm() {
+        let banner = clock_banner(10_000);
+        let mut ring = NotificationRing::default();
+        ring.record_clock(&banner, 1);
+
+        let requested = banner.actions[0].clone();
+        assert_eq!(
+            ring.take_clock_action(&banner.identity, &requested),
+            Some(requested.clone()),
+            "the exact live retained payload is admitted once"
+        );
+        assert_eq!(
+            ring.take_clock_action(&banner.identity, &requested),
+            None,
+            "a second activation cannot replay the retained authority"
+        );
+
+        ring.refresh_clock_actionability(std::slice::from_ref(&banner), 9_000);
+        assert!(
+            !ring.entries[0]
+                .clock_actions
+                .as_ref()
+                .expect("Clock metadata retained")
+                .actionable,
+            "an unchanged periodic daemon projection cannot re-arm a consumed control"
+        );
+
+        let mut foreign = requested;
+        foreign.schedule_revision += 1;
+        assert_eq!(
+            ring.take_clock_action(&banner.identity, &foreign),
+            None,
+            "a foreign schedule generation fails closed"
         );
     }
 
