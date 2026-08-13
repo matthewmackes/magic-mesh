@@ -812,7 +812,7 @@ mod tests {
         entries.insert("A".to_string(), serde_json::json!("go_nav"));
         entries.insert("Space".to_string(), serde_json::json!("go_home"));
         entries.insert("F13".to_string(), serde_json::json!("go_home"));
-        entries.insert("".to_string(), serde_json::json!("go_home"));
+        entries.insert(String::new(), serde_json::json!("go_home"));
         entries.insert("B".to_string(), serde_json::json!("not_an_action"));
         entries.insert("C".to_string(), serde_json::json!({"action": "go_home"}));
         for index in 0..4096 {
