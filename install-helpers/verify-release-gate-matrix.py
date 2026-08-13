@@ -69,6 +69,10 @@ ALL_CATEGORIES = {
 }
 
 WORKLOADS_RPM_TRANSACTION_SCOPE = "workloads-rpm-transaction"
+WORKLOADS_RPM_TRANSACTION_COMMAND = (
+    "install-helpers/release-evidence.sh validate "
+    "${MCNF_WORKLOADS_RPM_TRANSACTION_EVIDENCE}"
+)
 WORKLOADS_RPM_TRANSACTION_PASS_CONDITION = (
     "the exact Workloads compute RPMs pass hard dependency headers, payload identity, "
     "repository install and upgrade transactions, and ordered retired mackesd.service "
@@ -230,14 +234,10 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
             if re.search(r"(?:^|\s)--inspect-seat(?:=|\s|$)", command):
                 fail(f"{label}.command cannot promote optional seat inspection to a required gate")
         if scope_kind == "farm_package" and scope_id == WORKLOADS_RPM_TRANSACTION_SCOPE:
-            expected_command = (
-                "install-helpers/release-evidence.sh validate "
-                f"docs/platform/release-evidence/{revision}/workloads-rpm-transaction.json"
-            )
-            if gate["command"] != expected_command:
+            if gate["command"] != WORKLOADS_RPM_TRANSACTION_COMMAND:
                 fail(
-                    f"{label}.command must validate the revision-bound Workloads RPM "
-                    "transaction evidence"
+                    f"{label}.command must validate the bounded Workloads RPM "
+                    "transaction evidence parameter"
                 )
             if gate["pass_condition"] != WORKLOADS_RPM_TRANSACTION_PASS_CONDITION:
                 fail(
@@ -304,9 +304,7 @@ def generated_fixture(revision: str) -> dict[str, Any]:
             "gate_id": gate_id, "scope_kind": scope_kind, "scope_id": scope_id,
             "categories": sorted(categories), "owner": "self-test-owner",
             "command": (
-                "install-helpers/release-evidence.sh validate "
-                f"docs/platform/release-evidence/{revision}/"
-                "workloads-rpm-transaction.json"
+                WORKLOADS_RPM_TRANSACTION_COMMAND
                 if workloads_transaction
                 else "install-helpers/test-five-seat-core.py --required-baseline"
                 if scope_kind == "seat"
@@ -422,6 +420,16 @@ def self_test() -> None:
             if gate["scope_id"] == WORKLOADS_RPM_TRANSACTION_SCOPE
         ).__setitem__(
             "pass_condition", "the Workloads RPM file exists and is below the size limit"
+        ),
+    )
+    case(
+        "unbounded Workloads RPM transaction evidence",
+        lambda value: next(
+            gate for gate in value["gates"]
+            if gate["scope_id"] == WORKLOADS_RPM_TRANSACTION_SCOPE
+        ).__setitem__(
+            "command",
+            "install-helpers/release-evidence.sh validate workloads-rpm-transaction.json",
         ),
     )
 

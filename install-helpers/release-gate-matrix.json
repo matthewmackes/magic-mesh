@@ -83,7 +83,7 @@
       "scope_id": "workloads-rpm-transaction",
       "categories": ["package"],
       "owner": "release-engineering",
-      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/workloads-rpm-transaction.json",
+      "command": "install-helpers/release-evidence.sh validate ${MCNF_WORKLOADS_RPM_TRANSACTION_EVIDENCE}",
       "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/workloads-rpm-transaction.json",
       "pass_condition": "the exact Workloads compute RPMs pass hard dependency headers, payload identity, repository install and upgrade transactions, and ordered retired mackesd.service to grouped mackesd.target ownership handoff",
       "revision_ref": "source_revision",
