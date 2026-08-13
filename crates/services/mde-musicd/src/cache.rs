@@ -180,6 +180,10 @@ pub struct CacheEntry {
     /// On-disk pathname scheme. Zero is the pre-v2 lossy sanitized mapping.
     #[serde(default)]
     pub path_version: u8,
+    /// SHA-256 of the complete audio object. Entries without a digest predate
+    /// integrity-bound cache admission and are not safe for offline playback.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// The cache index: `song-id → entry`.
@@ -213,6 +217,7 @@ impl CacheIndex {
                 starred,
                 suffix: suffix.to_string(),
                 path_version: EXACT_TRACK_PATH_VERSION,
+                sha256: None,
             },
         );
     }
@@ -349,14 +354,17 @@ pub fn read_cached_track_bytes(dir: &Path, song_id: &str, now_ms: u64) -> Option
     if entry.bytes == 0 || u64::try_from(bytes.len()).ok()? != entry.bytes {
         return None;
     }
+    if entry.sha256.as_deref()? != sha256_hex(&bytes) {
+        return None;
+    }
     index.record_play(song_id, now_ms);
     let _ = write_index(dir, &index);
     Some(bytes)
 }
 
-/// Return the suffix for a fully cached track without reading its audio bytes
-/// or changing its LRU timestamp. Playback uses this bounded probe to decide
-/// whether a queue can be served during an Airsonic outage.
+/// Return the suffix for a fully cached track without returning its audio bytes
+/// or changing its LRU timestamp. Playback uses this integrity-checking probe
+/// to decide whether a queue can be served during an Airsonic outage.
 #[must_use]
 pub fn cached_track_suffix(dir: &Path, song_id: &str) -> Option<String> {
     let index = read_index(dir);
@@ -365,8 +373,11 @@ pub fn cached_track_suffix(dir: &Path, song_id: &str) -> Option<String> {
         return None;
     }
     let path = indexed_track_path(dir, &index, song_id, entry)?;
-    let metadata = std::fs::metadata(path).ok()?;
-    (metadata.is_file() && metadata.len() == entry.bytes).then(|| entry.suffix.clone())
+    let bytes = std::fs::read(path).ok()?;
+    (entry.bytes != 0
+        && u64::try_from(bytes.len()).ok()? == entry.bytes
+        && entry.sha256.as_deref()? == sha256_hex(&bytes))
+    .then(|| entry.suffix.clone())
 }
 
 /// Write a fully-fetched finite stream into the recently-played audio cache.
@@ -418,7 +429,18 @@ pub fn write_cached_track(
         now_ms,
         starred,
     );
+    index
+        .entries
+        .get_mut(song_id)
+        .expect("entry was inserted")
+        .sha256 = Some(sha256_hex(bytes));
     write_index(dir, &index)
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    crate::bus_responder::music_action_auth::hex_encode(
+        &crate::bus_responder::music_action_auth::sha256(input),
+    )
 }
 
 /// Remove one cached finite track and its index entry. Missing tracks are a
@@ -891,6 +913,38 @@ mod tests {
                 .map(|entry| entry.last_played_ms),
             Some(10),
             "a rejected partial file must not refresh cache recency"
+        );
+    }
+
+    #[test]
+    fn same_length_cached_track_replacement_is_not_admitted_after_restart() {
+        let dir = tempdir().unwrap();
+        write_cached_track(
+            dir.path(),
+            "song-replaced",
+            "flac",
+            b"trusted-audio",
+            10,
+            false,
+        )
+        .unwrap();
+
+        let replacement = b"hostile-bytes";
+        assert_eq!(replacement.len(), b"trusted-audio".len());
+        std::fs::write(track_path(dir.path(), "song-replaced", "flac"), replacement).unwrap();
+
+        assert_eq!(cached_track_suffix(dir.path(), "song-replaced"), None);
+        assert_eq!(
+            read_cached_track_bytes(dir.path(), "song-replaced", 99),
+            None
+        );
+        assert_eq!(
+            read_index(dir.path())
+                .entries
+                .get("song-replaced")
+                .map(|entry| entry.last_played_ms),
+            Some(10),
+            "rejected replacement must not acquire fresh LRU authority"
         );
     }
 

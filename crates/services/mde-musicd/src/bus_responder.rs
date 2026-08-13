@@ -51,7 +51,7 @@ use crate::seat_audio::{SeatAudioAuthority, SeatDuckGeneration};
 /// `mackesd::ipc::action_auth`: schema v1, the canonical request digest, the
 /// v2 armed-token format, a 30-second maximum lifetime, and a durable
 /// host-local nonce claim. Missing credentials fail closed.
-mod music_action_auth {
+pub(crate) mod music_action_auth {
     use std::path::{Path, PathBuf};
 
     use ed25519_dalek::VerifyingKey;
@@ -478,7 +478,7 @@ mod music_action_auth {
         }
     }
 
-    pub(super) fn hex_encode(bytes: &[u8]) -> String {
+    pub(crate) fn hex_encode(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut output = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
@@ -488,7 +488,7 @@ mod music_action_auth {
         output
     }
 
-    pub(super) fn sha256(input: &[u8]) -> [u8; 32] {
+    pub(crate) fn sha256(input: &[u8]) -> [u8; 32] {
         const K: [u32; 64] = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
             0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
