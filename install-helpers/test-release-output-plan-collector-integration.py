@@ -58,7 +58,7 @@ def rpm_manifest(path: Path, rpm: Path, role: str, revision: str) -> Path:
     names = {
         "workstation-rpm": ("magic-mesh-12.1.6-34.x86_64", "mcnf-app-vm-rpm-candidate-manifest", 2),
         "server-rpm": ("magic-mesh-server-12.1.6-23.x86_64", "mcnf-server-rpm-candidate-manifest", 1),
-        "lighthouse-rpm": ("magic-mesh-lighthouse-12.1.6-11.x86_64", "mcnf-lighthouse-rpm-candidate-manifest", 1),
+        "lighthouse-rpm": ("magic-mesh-lighthouse-12.1.6-11.x86_64", "mcnf-browser-vm-lighthouse-rpm-candidate-manifest", 1),
     }
     nevra, kind, schema = names[role]
     value: dict[str, object] = {
