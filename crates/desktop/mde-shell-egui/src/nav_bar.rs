@@ -590,9 +590,11 @@ impl State {
         {
             return false;
         }
-        self.pinned_surfaces.push(surface);
-        self.save();
-        true
+        let mut candidate = self.pinned_surfaces.clone();
+        candidate.push(surface);
+        self.commit_pinned_surfaces(candidate, |state, pins| {
+            state.save_with_pinned_surfaces(pins)
+        })
     }
 
     /// Unpin one launchable catalog surface. Start/Back/Home/placement are
@@ -609,8 +611,35 @@ impl State {
         else {
             return false;
         };
-        self.pinned_surfaces.remove(index);
-        self.save();
+        let mut candidate = self.pinned_surfaces.clone();
+        candidate.remove(index);
+        self.commit_pinned_surfaces(candidate, |state, pins| {
+            state.save_with_pinned_surfaces(pins)
+        })
+    }
+
+    /// Publish a pin projection only after its exact bounded identities are
+    /// durable. A failed preference write must not leave the running taskbar
+    /// advertising state that will disappear at the next shell restart.
+    fn commit_pinned_surfaces<F>(&mut self, candidate: Vec<Surface>, persist: F) -> bool
+    where
+        F: FnOnce(&Self, &[Surface]) -> std::io::Result<()>,
+    {
+        if candidate.len() > MAX_PINNED_SURFACES
+            || candidate
+                .iter()
+                .any(|surface| !pin_catalog_contains(*surface))
+            || candidate
+                .iter()
+                .enumerate()
+                .any(|(index, surface)| candidate[..index].contains(surface))
+        {
+            return false;
+        }
+        if persist(self, &candidate).is_err() {
+            return false;
+        }
+        self.pinned_surfaces = candidate;
         true
     }
 
@@ -1243,19 +1272,36 @@ impl State {
 
     fn save(&self) {
         if let Some(path) = Self::default_path() {
-            let prefs = NavBarPrefs {
-                schema_version: NAV_PREFS_SCHEMA_VERSION,
-                mode: self.mode,
-                pinned_surfaces: self
-                    .pinned_surfaces
-                    .iter()
-                    .map(|surface| surface_key(*surface).to_owned())
-                    .collect(),
-                profile_state: self.profile_state,
-                peer_app_favorites: self.peer_app_favorites.clone(),
-            };
-            let _ = save_to(&path, prefs);
+            let _ = self.save_with_pinned_surfaces_to(&path, &self.pinned_surfaces);
         }
+    }
+
+    fn save_with_pinned_surfaces(&self, pinned_surfaces: &[Surface]) -> std::io::Result<()> {
+        let path = Self::default_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "navigation preference directory is unavailable",
+            )
+        })?;
+        self.save_with_pinned_surfaces_to(&path, pinned_surfaces)
+    }
+
+    fn save_with_pinned_surfaces_to(
+        &self,
+        path: &Path,
+        pinned_surfaces: &[Surface],
+    ) -> std::io::Result<()> {
+        let prefs = NavBarPrefs {
+            schema_version: NAV_PREFS_SCHEMA_VERSION,
+            mode: self.mode,
+            pinned_surfaces: pinned_surfaces
+                .iter()
+                .map(|surface| surface_key(*surface).to_owned())
+                .collect(),
+            profile_state: self.profile_state,
+            peer_app_favorites: self.peer_app_favorites.clone(),
+        };
+        save_to(path, prefs)
     }
 }
 
@@ -3570,6 +3616,47 @@ mod tests {
         assert_eq!(state.pinned_surfaces(), original.as_slice());
         assert!(!state.unpin_surface(Surface::Workbench));
         assert!(!state.unpin_surface(Surface::AutoHome));
+    }
+
+    #[test]
+    fn taskbar_pin_projection_commits_only_after_exact_preferences_are_durable() {
+        let dir = tempfile_dir();
+        let path = dir.join(CONFIG_FILE);
+        let mut state = State::new_profile(DockMode::Docked);
+
+        let failed = state.commit_pinned_surfaces(vec![Surface::Browser], |_, _| {
+            Err(std::io::Error::other("simulated durable write failure"))
+        });
+        assert!(!failed);
+        assert!(state.pinned_surfaces().is_empty());
+
+        let committed = state.commit_pinned_surfaces(
+            vec![Surface::Browser, Surface::MapsLocation],
+            |state, pins| state.save_with_pinned_surfaces_to(&path, pins),
+        );
+        assert!(committed);
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::Browser, Surface::MapsLocation]
+        );
+
+        let saved: NavBarPrefs = serde_json::from_str(
+            &read_bounded_config(&path).expect("read committed navigation preferences"),
+        )
+        .expect("decode committed navigation preferences");
+        let restarted = State::from_prefs(saved);
+        assert_eq!(restarted.mode, DockMode::Docked);
+        assert_eq!(restarted.pinned_surfaces(), state.pinned_surfaces());
+
+        assert!(!state
+            .commit_pinned_surfaces(vec![Surface::Browser, Surface::Browser], |_, _| panic!(
+                "duplicate identities must be rejected before persistence"
+            )));
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::Browser, Surface::MapsLocation]
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
