@@ -129,6 +129,13 @@ impl Onboard {
 
     /// Whether the disclaimer has been acknowledged.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "state accessor is consumed by the onboarding test/API surface"
+        )
+    )]
     pub fn acked(&self) -> bool {
         self.acked
     }
@@ -141,6 +148,13 @@ impl Onboard {
 
     /// The picked intent, once chosen.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "state accessor is consumed by the onboarding test/API surface"
+        )
+    )]
     pub fn intent(&self) -> Option<Intent> {
         self.intent
     }

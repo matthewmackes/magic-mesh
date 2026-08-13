@@ -416,11 +416,10 @@ mod tests {
         // Either BadSni (preferred — fails fast on SNI parse)
         // or CertIo if the system CA bundle is missing.
         // Both prove the dial path's pre-flight guards work.
-        match res {
-            Err(TunnelError::BadSni(_)) | Err(TunnelError::CertIo(_)) => {}
-            Err(other) => panic!("unexpected dial error: {other}"),
-            Ok(_) => panic!("dial somehow succeeded against 127.0.0.1:1"),
-        }
+        assert!(matches!(
+            res,
+            Err(TunnelError::BadSni(_)) | Err(TunnelError::CertIo(_))
+        ));
     }
 
     #[test]

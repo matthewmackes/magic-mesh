@@ -480,13 +480,11 @@ mod tests {
             reason: "no daemon".into(),
         }));
         assert!(!err.is_present());
-        match err {
-            Probe::Absent { backend, reason } => {
-                assert_eq!(backend, Backend::PipeWire);
-                assert!(reason.contains("PipeWire"));
-            }
-            Probe::Present(_) => panic!("expected Absent"),
-        }
+        let Probe::Absent { backend, reason } = err else {
+            unreachable!("expected Absent");
+        };
+        assert_eq!(backend, Backend::PipeWire);
+        assert!(reason.contains("PipeWire"));
     }
 
     #[test]
