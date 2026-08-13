@@ -13,6 +13,9 @@ MANIFEST_VERIFY="$ANDROID/verify-manifest.sh"
 TOOL_READINESS="$ANDROID/record-guest-tool-readiness.sh"
 PLACEMENT_READINESS="$ROOT/install-helpers/verify-cuttlefish-readiness.py"
 GUEST_PAYLOAD_VERIFY="$ANDROID/verify-guest-payload.sh"
+IMAGE_RECEIPT="$ANDROID/produce-image-receipt.py"
+IMAGE_RECEIPT_TEST="$ANDROID/test-produce-image-receipt.py"
+DECLARATION_PRODUCER="$ANDROID/produce-guest-payload-declaration.sh"
 PACKAGE_MANIFEST="$ROOT/crates/mesh/mackesd/Cargo.toml"
 PROJECT_RELEASE_KEY="$ROOT/packaging/repo/RPM-GPG-KEY-magic-mesh"
 PROJECT_RELEASE_FINGERPRINT="B546CC2EF9489F1899657AC9E6C820DAFBD1B07A"
@@ -133,11 +136,22 @@ fi
 [ -x "$TOOL_READINESS" ] || fail "guest-tool readiness recorder is not executable"
 [ -x "$PLACEMENT_READINESS" ] || fail "Cuttlefish placement verifier is not executable"
 [ -x "$GUEST_PAYLOAD_VERIFY" ] || fail "signed guest-payload verifier is not executable"
+[ -x "$IMAGE_RECEIPT" ] || fail "Cuttlefish image-receipt producer is not executable"
+[ -x "$IMAGE_RECEIPT_TEST" ] || fail "Cuttlefish image-receipt hostile test is not executable"
+[ -x "$DECLARATION_PRODUCER" ] || fail "signed declaration producer is not executable"
 [ -r "$CUTTLEFISH_TASKS" ] || fail "production Cuttlefish assembly tasks are missing"
 [ -r "$CUTTLEFISH_DEFAULTS" ] || fail "production Cuttlefish assembly defaults are missing"
 
-bash -n "$MANIFEST_VERIFY" "$TOOL_READINESS" "$GUEST_PAYLOAD_VERIFY" "$0"
-python3 -m py_compile "$PLACEMENT_READINESS"
+bash -n "$MANIFEST_VERIFY" "$TOOL_READINESS" "$GUEST_PAYLOAD_VERIFY" \
+    "$DECLARATION_PRODUCER" "$0"
+python3 -m py_compile "$PLACEMENT_READINESS" "$IMAGE_RECEIPT" "$IMAGE_RECEIPT_TEST"
+
+grep -Fq 'produce-image-receipt.py' "$DECLARATION_PRODUCER" \
+    || fail "signed declaration producer bypasses Cuttlefish image receipt admission"
+grep -Fq '"schema_version": 3' "$DECLARATION_PRODUCER" \
+    || fail "signed declaration producer does not emit governed image schema v3"
+grep -Fq 'document["schema_version"] != 3' "$GUEST_PAYLOAD_VERIFY" \
+    || fail "guest payload verifier does not require governed image schema v3"
 
 # Keep the packaging path explicit: readiness must call the real Android
 # manifest verifier, not a second permissive parser or an always-success stub.
@@ -206,6 +220,7 @@ cvd_line=$(grep -n -m1 'Start the Cuttlefish device with a VNC server' \
 "$TOOL_READINESS" --self-test >/dev/null
 "$PLACEMENT_READINESS" --self-test >/dev/null
 "$GUEST_PAYLOAD_VERIFY" --self-test >/dev/null
+python3 "$IMAGE_RECEIPT_TEST" >/dev/null
 
 # Exercise the exact armored-key -> binary-keyring -> gpgv path with an
 # ephemeral Ed25519 release signer. gpgv cannot consume the shipped ASCII armor

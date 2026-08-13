@@ -138,7 +138,7 @@ exact(document, {
     "schema_version", "kind", "release_id", "compatibility_version",
     "source_revision", "provider_identity", "image_identity", "artifacts",
 }, "declaration")
-if type(document["schema_version"]) is not int or document["schema_version"] != 2:
+if type(document["schema_version"]) is not int or document["schema_version"] != 3:
     reject("unsupported declaration schema_version")
 if document["kind"] != "cuttlefish_guest_payload_release":
     reject("unsupported declaration kind")
@@ -151,13 +151,29 @@ if not isinstance(document["source_revision"], str) or not revision_re.fullmatch
 if not isinstance(document["provider_identity"], str) or not name_re.fullmatch(document["provider_identity"]):
     reject("provider_identity is malformed")
 image_identity = document["image_identity"]
-exact(image_identity, {"id", "sha256"}, "image_identity")
-if not isinstance(image_identity["id"], str) or not name_re.fullmatch(image_identity["id"]):
-    reject("image_identity.id is malformed")
-if not isinstance(image_identity["sha256"], str) or not digest_re.fullmatch(image_identity["sha256"]):
-    reject("image_identity.sha256 is malformed")
-if image_identity["sha256"] == "sha256:" + "0" * 64:
-    reject("image_identity.sha256 is null")
+exact(image_identity, {
+    "android_release_id", "architecture", "commit_epoch", "compatibility_id",
+    "digest", "format", "kind", "media_type", "original_source",
+    "platform_digest", "provider_identity", "schema_version", "source_kind",
+    "source_revision",
+}, "image_identity")
+if image_identity["kind"] != "mcnf-cuttlefish-image-receipt" or image_identity["schema_version"] != 1:
+    reject("image_identity receipt schema is unsupported")
+if image_identity["source_revision"] != document["source_revision"]:
+    reject("image_identity source revision does not match declaration")
+if image_identity["provider_identity"] != document["provider_identity"]:
+    reject("image_identity provider does not match declaration")
+for field in ("android_release_id", "compatibility_id", "provider_identity"):
+    if not isinstance(image_identity[field], str) or not name_re.fullmatch(image_identity[field]):
+        reject(f"image_identity.{field} is malformed")
+if image_identity["architecture"] not in ("amd64", "arm64"):
+    reject("image_identity architecture is unsupported")
+if image_identity["source_kind"] not in ("registry", "artifact"):
+    reject("image_identity source kind is unsupported")
+if not isinstance(image_identity["digest"], str) or not digest_re.fullmatch(image_identity["digest"]):
+    reject("image_identity digest is malformed")
+if image_identity["digest"] == "sha256:" + "0" * 64:
+    reject("image_identity digest is null")
 
 artifacts = document["artifacts"]
 exact(artifacts, {"readiness_relay", "vdi_agent", "guest_packages"}, "artifacts")
@@ -251,15 +267,23 @@ self_test() {
     python3 - "$fixture/release.json" "$relay_digest" "$agent_digest" "$package_digest" <<'PY'
 import json, sys
 document = {
-    "schema_version": 2,
+    "schema_version": 3,
     "kind": "cuttlefish_guest_payload_release",
     "release_id": "fixture-r1",
     "compatibility_version": "2026.08.1",
     "source_revision": "0123456789abcdef0123456789abcdef01234567",
     "provider_identity": "provider-fixture",
     "image_identity": {
-        "id": "android-image-fixture",
-        "sha256": "sha256:" + "1" * 64,
+        "android_release_id": "android-image-fixture", "architecture": "amd64",
+        "commit_epoch": 1700000000, "compatibility_id": "cuttlefish-fixture-v1",
+        "digest": "sha256:" + "1" * 64,
+        "format": "android-cuttlefish-image-archive",
+        "kind": "mcnf-cuttlefish-image-receipt",
+        "media_type": "application/vnd.mcnf.cuttlefish.image.v1+tar",
+        "original_source": "/fixture/cuttlefish-image.tar", "platform_digest": None,
+        "provider_identity": "provider-fixture", "schema_version": 1,
+        "source_kind": "artifact",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
     },
     "artifacts": {
         "readiness_relay": {"name": "readiness-relay.sh", "sha256": sys.argv[2]},

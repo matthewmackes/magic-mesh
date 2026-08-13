@@ -7,6 +7,7 @@ PRODUCER_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly PRODUCER_DIR
 readonly PROJECT_SIGNING_IDENTITY=${MAGIC_MESH_SIGN_KEY:-Magic Mesh Release Signing}
 readonly PROJECT_PRIMARY_FINGERPRINT=B546CC2EF9489F1899657AC9E6C820DAFBD1B07A
+readonly IMAGE_RECEIPT_TOOL="$PRODUCER_DIR/produce-image-receipt.py"
 
 producer_fail() {
     echo "cuttlefish guest payload producer: $*" >&2
@@ -18,7 +19,10 @@ usage() {
 Usage: produce-guest-payload-declaration.sh \
   --release-id ID --compatibility-version VERSION \
   --source-revision FULL_GIT_COMMIT --provider-identity ID \
-  --image-id ID --image-digest sha256:HEX \
+  --image-receipt FILE --image-source-kind registry|artifact \
+  --image-original-source SOURCE --image-architecture amd64|arm64 \
+  --android-release-id ID --image-compatibility-id ID \
+  --source-epoch EPOCH [--image-media-type TYPE] [--image-artifact-format FORMAT] \
   --readiness-relay FILE --vdi-agent FILE --guest-package FILE [...] \
   --output-dir NEW_DIRECTORY
        produce-guest-payload-declaration.sh --self-test
@@ -87,9 +91,9 @@ PY
 
 produce_declaration() {
     local release_id=$1 compatibility=$2 source_revision=$3 provider_identity=$4
-    local image_id=$5 image_digest=$6 relay=$7 agent=$8 output_dir=$9
-    local signer_identity=${10} expected_fingerprint=${11}
-    shift 11
+    local image_receipt=$5 relay=$6 agent=$7 output_dir=$8
+    local signer_identity=$9 expected_fingerprint=${10}
+    shift 10
     local -a packages=("$@")
     local parent output_name work signer
 
@@ -113,7 +117,7 @@ produce_declaration() {
         || { producer_fail "could not create private candidate directory"; return 1; }
 
     if ! python3 - "$work/release.json" "$release_id" "$compatibility" \
-        "$source_revision" "$provider_identity" "$image_id" "$image_digest" \
+        "$source_revision" "$provider_identity" "$image_receipt" \
         "$relay" "$agent" "${packages[@]}" <<'PY'
 import hashlib
 import json
@@ -124,9 +128,10 @@ import sys
 from pathlib import Path
 
 output = Path(sys.argv[1])
-release_id, compatibility, source_revision, provider_identity, image_id, image_digest = sys.argv[2:8]
-relay, agent = map(Path, sys.argv[8:10])
-packages = [Path(value) for value in sys.argv[10:]]
+release_id, compatibility, source_revision, provider_identity = sys.argv[2:6]
+image_receipt = Path(sys.argv[6])
+relay, agent = map(Path, sys.argv[7:9])
+packages = [Path(value) for value in sys.argv[9:]]
 identity_re = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:-]{0,254}\Z")
 revision_re = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 digest_re = re.compile(r"sha256:([0-9a-f]{64})\Z")
@@ -135,14 +140,30 @@ def reject(message):
     raise SystemExit(f"cuttlefish guest payload producer: {message}")
 
 for label, value in (("release_id", release_id), ("compatibility_version", compatibility),
-                     ("provider_identity", provider_identity), ("image_id", image_id)):
+                     ("provider_identity", provider_identity)):
     if not identity_re.fullmatch(value):
         reject(f"{label} is malformed")
 if not revision_re.fullmatch(source_revision):
     reject("source_revision must be a full lowercase Git object ID")
-match = digest_re.fullmatch(image_digest)
+try:
+    image = json.loads(image_receipt.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    reject(f"inspected image receipt is invalid: {error}")
+required_image = {
+    "android_release_id", "architecture", "commit_epoch", "compatibility_id",
+    "digest", "format", "kind", "media_type", "original_source",
+    "platform_digest", "provider_identity", "schema_version", "source_kind",
+    "source_revision",
+}
+if not isinstance(image, dict) or set(image) != required_image:
+    reject("inspected image receipt fields are not exact")
+if image["kind"] != "mcnf-cuttlefish-image-receipt" or image["schema_version"] != 1:
+    reject("inspected image receipt schema is unsupported")
+if image["source_revision"] != source_revision or image["provider_identity"] != provider_identity:
+    reject("image receipt authority does not match the declaration")
+match = digest_re.fullmatch(image.get("digest", ""))
 if match is None or set(match.group(1)) == {"0"}:
-    reject("image_digest must be a non-zero lowercase sha256 digest")
+    reject("image receipt digest must be a non-zero lowercase sha256 digest")
 
 def descriptor(path, label):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -188,13 +209,13 @@ if len(set(package_names)) != len(package_names):
     reject("guest package basenames are not unique")
 
 document = {
-    "schema_version": 2,
+    "schema_version": 3,
     "kind": "cuttlefish_guest_payload_release",
     "release_id": release_id,
     "compatibility_version": compatibility,
     "source_revision": source_revision,
     "provider_identity": provider_identity,
-    "image_identity": {"id": image_id, "sha256": image_digest},
+    "image_identity": image,
     "artifacts": {
         "readiness_relay": descriptor(relay, "readiness relay"),
         "vdi_agent": descriptor(agent, "VDI agent"),
@@ -249,9 +270,22 @@ self_test() {
     printf 'user package bytes\n' >"$fixture/input/cuttlefish-user.deb"
     revision=0123456789abcdef0123456789abcdef01234567
     image_digest=sha256:$(printf 'governed image\n' | sha256sum | awk '{print $1}')
+    python3 - "$fixture/image-receipt.json" "$revision" "$image_digest" <<'PY'
+import json, sys
+json.dump({
+    "android_release_id":"android-fixture-r1", "architecture":"amd64",
+    "commit_epoch":1700000000, "compatibility_id":"cuttlefish-fixture-v1",
+    "digest":sys.argv[3], "format":"android-cuttlefish-image-archive",
+    "kind":"mcnf-cuttlefish-image-receipt",
+    "media_type":"application/vnd.mcnf.cuttlefish.image.v1+tar",
+    "original_source":"/fixture/cuttlefish-image.tar", "platform_digest":None,
+    "provider_identity":"provider-fixture", "schema_version":1,
+    "source_kind":"artifact", "source_revision":sys.argv[2],
+}, open(sys.argv[1], "w"), sort_keys=True, separators=(",", ":"))
+PY
 
     produce_declaration fixture-r1 2026.08.1 "$revision" provider-fixture \
-        android-image-r1 "$image_digest" "$fixture/input/readiness-relay.sh" \
+        "$fixture/image-receipt.json" "$fixture/input/readiness-relay.sh" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/good" \
         'Cuttlefish producer fixture' "$fingerprint" \
         "$fixture/input/cuttlefish-base.deb" "$fixture/input/cuttlefish-user.deb" >/dev/null
@@ -270,7 +304,7 @@ self_test() {
 
     before=$(sha256sum "$fixture/output/good/release.json" | awk '{print $1}')
     if produce_declaration fixture-r2 2026.08.1 "$revision" provider-fixture \
-        android-image-r1 "$image_digest" "$fixture/input/readiness-relay.sh" \
+        "$fixture/image-receipt.json" "$fixture/input/readiness-relay.sh" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/good" \
         'Cuttlefish producer fixture' "$fingerprint" \
         "$fixture/input/cuttlefish-base.deb" >/dev/null 2>&1; then
@@ -280,7 +314,7 @@ self_test() {
         || { producer_fail "rejected replacement changed the published declaration"; return 1; }
 
     if produce_declaration fixture-r3 2026.08.1 "$revision" provider-fixture \
-        android-image-r1 "$image_digest" "$fixture/input/missing.deb" \
+        "$fixture/image-receipt.json" "$fixture/input/missing.deb" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/missing" \
         'Cuttlefish producer fixture' "$fingerprint" \
         "$fixture/input/cuttlefish-base.deb" >/dev/null 2>&1; then
@@ -290,7 +324,7 @@ self_test() {
         || { producer_fail "missing input published an output"; return 1; }
 
     if produce_declaration fixture-r4 2026.08.1 "$revision" provider-fixture \
-        android-image-r1 "$image_digest" "$fixture/input/readiness-relay.sh" \
+        "$fixture/image-receipt.json" "$fixture/input/readiness-relay.sh" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/no-key" \
         'missing release key' "$fingerprint" "$fixture/input/cuttlefish-base.deb" \
         >/dev/null 2>&1; then
@@ -319,7 +353,7 @@ for field, replacement in (
     ).returncode == 0:
         raise SystemExit(f"signed declaration did not bind {field}")
 changed = json.loads(json.dumps(document))
-changed["image_identity"]["id"] = "substituted-image"
+changed["image_identity"]["android_release_id"] = "substituted-image"
 with open(path + ".tampered", "w", encoding="utf-8") as stream:
     json.dump(changed, stream, sort_keys=True, separators=(",", ":"))
 if __import__("subprocess").run(
@@ -338,8 +372,11 @@ if [[ ${1:-} == --self-test ]]; then
     exit 0
 fi
 
-release_id='' compatibility='' source_revision='' provider_identity=''
-image_id='' image_digest='' relay='' agent='' output_dir=''
+release_id='' compatibility='' source_revision='' source_epoch='' provider_identity=''
+image_receipt='' image_source_kind='' image_original_source='' image_architecture=''
+android_release_id='' image_compatibility_id='' image_media_type='application/octet-stream'
+image_artifact_format='android-cuttlefish-host-package'
+relay='' agent='' output_dir=''
 packages=()
 while (($#)); do
     case $1 in
@@ -347,8 +384,15 @@ while (($#)); do
         --compatibility-version) compatibility=${2:-}; shift 2 ;;
         --source-revision) source_revision=${2:-}; shift 2 ;;
         --provider-identity) provider_identity=${2:-}; shift 2 ;;
-        --image-id) image_id=${2:-}; shift 2 ;;
-        --image-digest) image_digest=${2:-}; shift 2 ;;
+        --source-epoch) source_epoch=${2:-}; shift 2 ;;
+        --image-receipt) image_receipt=${2:-}; shift 2 ;;
+        --image-source-kind) image_source_kind=${2:-}; shift 2 ;;
+        --image-original-source) image_original_source=${2:-}; shift 2 ;;
+        --image-architecture) image_architecture=${2:-}; shift 2 ;;
+        --android-release-id) android_release_id=${2:-}; shift 2 ;;
+        --image-compatibility-id) image_compatibility_id=${2:-}; shift 2 ;;
+        --image-media-type) image_media_type=${2:-}; shift 2 ;;
+        --image-artifact-format) image_artifact_format=${2:-}; shift 2 ;;
         --readiness-relay) relay=${2:-}; shift 2 ;;
         --vdi-agent) agent=${2:-}; shift 2 ;;
         --guest-package) packages+=("${2:-}"); shift 2 ;;
@@ -358,7 +402,9 @@ while (($#)); do
     esac
 done
 [[ -n $release_id && -n $compatibility && -n $source_revision \
-    && -n $provider_identity && -n $image_id && -n $image_digest \
+    && -n $source_epoch && -n $provider_identity && -n $image_receipt \
+    && -n $image_source_kind && -n $image_original_source && -n $image_architecture \
+    && -n $android_release_id && -n $image_compatibility_id \
     && -n $relay && -n $agent && -n $output_dir ]] || { usage >&2; exit 2; }
 
 checkout_revision=$(git -C "$PRODUCER_DIR/../.." rev-parse --verify 'HEAD^{commit}' 2>/dev/null) \
@@ -366,7 +412,18 @@ checkout_revision=$(git -C "$PRODUCER_DIR/../.." rev-parse --verify 'HEAD^{commi
 [[ $source_revision == "$checkout_revision" ]] \
     || { producer_fail "source revision does not match the producer checkout"; exit 1; }
 
+inspected_receipt=$(mktemp)
+trap 'rm -f -- "$inspected_receipt"' EXIT
+python3 "$IMAGE_RECEIPT_TOOL" --repo "$PRODUCER_DIR/../.." inspect \
+    --source-kind "$image_source_kind" --original-source "$image_original_source" \
+    --architecture "$image_architecture" --provider-identity "$provider_identity" \
+    --android-release-id "$android_release_id" --compatibility-id "$image_compatibility_id" \
+    --source-revision "$source_revision" --commit-epoch "$source_epoch" \
+    --media-type "$image_media_type" --artifact-format "$image_artifact_format" \
+    --receipt "$image_receipt" >"$inspected_receipt" \
+    || { producer_fail "Cuttlefish image receipt admission failed"; exit 1; }
+
 produce_declaration "$release_id" "$compatibility" "$source_revision" \
-    "$provider_identity" "$image_id" "$image_digest" "$relay" "$agent" \
+    "$provider_identity" "$inspected_receipt" "$relay" "$agent" \
     "$output_dir" "$PROJECT_SIGNING_IDENTITY" "$PROJECT_PRIMARY_FINGERPRINT" \
     "${packages[@]}"

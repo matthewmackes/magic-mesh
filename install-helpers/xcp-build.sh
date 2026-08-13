@@ -691,7 +691,15 @@ case "${1:-}" in
       --bootc-base-architecture "${MCNF_BOOTC_BASE_ARCHITECTURE:-}"
       --bootc-release-role "${MCNF_BOOTC_RELEASE_ROLE:-}"
       --app-vm-base-digest "${MCNF_APP_VM_BASE_DIGEST:-}"
-      --cuttlefish-image-digest "${MCNF_CUTTLEFISH_IMAGE_DIGEST:-}"
+      --cuttlefish-image-receipt "${MCNF_CUTTLEFISH_IMAGE_RECEIPT:-}"
+      --cuttlefish-image-source-kind "${MCNF_CUTTLEFISH_IMAGE_SOURCE_KIND:-}"
+      --cuttlefish-image-original-source "${MCNF_CUTTLEFISH_IMAGE_ORIGINAL_SOURCE:-}"
+      --cuttlefish-image-architecture "${MCNF_CUTTLEFISH_IMAGE_ARCHITECTURE:-}"
+      --cuttlefish-provider-identity "${MCNF_CUTTLEFISH_PROVIDER_IDENTITY:-}"
+      --cuttlefish-android-release-id "${MCNF_CUTTLEFISH_ANDROID_RELEASE_ID:-}"
+      --cuttlefish-image-compatibility-id "${MCNF_CUTTLEFISH_IMAGE_COMPATIBILITY_ID:-}"
+      --cuttlefish-image-media-type "${MCNF_CUTTLEFISH_IMAGE_MEDIA_TYPE:-application/octet-stream}"
+      --cuttlefish-image-artifact-format "${MCNF_CUTTLEFISH_IMAGE_ARTIFACT_FORMAT:-android-cuttlefish-host-package}"
     )
     while IFS= read -r package; do
       [[ -n "$package" ]] && preflight_args+=(--cuttlefish-guest-package "$package")
