@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::io::Write;
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -344,6 +346,10 @@ pub fn read_runtime_status_file(
     path: &Path,
     now_ms: u64,
 ) -> Result<WorkerRuntimeNodeStatus, WorkerRuntimeStatusError> {
+    let parent = path
+        .parent()
+        .ok_or(WorkerRuntimeStatusError::RuntimeFile("parent"))?;
+    ensure_directory_chain(parent, false)?;
     let source = std::fs::symlink_metadata(path)
         .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("metadata"))?;
     if source.file_type().is_symlink() || !source.is_file() {
@@ -926,19 +932,7 @@ pub fn write_runtime_status_file(
     let parent = path
         .parent()
         .ok_or(WorkerRuntimeStatusError::RuntimeFile("parent"))?;
-    if let Ok(metadata) = std::fs::symlink_metadata(parent) {
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(WorkerRuntimeStatusError::RuntimeFile("parent_type"));
-        }
-    } else {
-        std::fs::create_dir_all(parent)
-            .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("create_parent"))?;
-        let metadata = std::fs::symlink_metadata(parent)
-            .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("parent_metadata"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(WorkerRuntimeStatusError::RuntimeFile("parent_type"));
-        }
-    }
+    ensure_directory_chain(parent, true)?;
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(WorkerRuntimeStatusError::RuntimeFile("destination_type"));
@@ -975,6 +969,48 @@ pub fn write_runtime_status_file(
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Validate every directory component without following a symlink. Group
+/// processes and the aggregate owner share the runtime root, so checking only
+/// the final parent would let a redirected ancestor escape that ownership
+/// boundary. Missing components are created one at a time and admitted before
+/// descending further.
+fn ensure_directory_chain(
+    directory: &Path,
+    create_missing: bool,
+) -> Result<(), WorkerRuntimeStatusError> {
+    let mut admitted = PathBuf::new();
+    for component in directory.components() {
+        match component {
+            Component::Prefix(_) | Component::ParentDir => {
+                return Err(WorkerRuntimeStatusError::RuntimeFile("parent_component"));
+            }
+            Component::RootDir | Component::CurDir | Component::Normal(_) => {
+                admitted.push(component.as_os_str());
+            }
+        }
+        if admitted.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&admitted) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(WorkerRuntimeStatusError::RuntimeFile("parent_type"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+                std::fs::create_dir(&admitted)
+                    .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("create_parent"))?;
+                let metadata = std::fs::symlink_metadata(&admitted)
+                    .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("parent_metadata"))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(WorkerRuntimeStatusError::RuntimeFile("parent_type"));
+                }
+            }
+            Err(_) => return Err(WorkerRuntimeStatusError::RuntimeFile("parent_metadata")),
+        }
+    }
+    Ok(())
 }
 
 /// Return the canonical state topic for one admitted worker contract.
@@ -1915,6 +1951,22 @@ mod tests {
                 Err(WorkerRuntimeStatusError::RuntimeFile(
                     "source_type_or_capacity"
                 ))
+            );
+
+            let outside = tempfile::tempdir().expect("outside runtime root");
+            let redirected = root.path().join("redirected");
+            std::os::unix::fs::symlink(outside.path(), &redirected)
+                .expect("runtime ancestor symlink");
+            let escaped = redirected.join("control.json");
+            assert_eq!(
+                write_runtime_status_file(&escaped, &node),
+                Err(WorkerRuntimeStatusError::RuntimeFile("parent_type"))
+            );
+            std::fs::write(outside.path().join("control.json"), node.to_json().unwrap())
+                .expect("hostile redirected status");
+            assert_eq!(
+                read_runtime_status_file(&escaped, 2_500),
+                Err(WorkerRuntimeStatusError::RuntimeFile("parent_type"))
             );
         }
     }
