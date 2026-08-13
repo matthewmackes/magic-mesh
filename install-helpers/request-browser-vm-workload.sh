@@ -17,11 +17,13 @@ readonly PYTHON_BIN=/usr/bin/python3
 readonly MDE_BUS_BIN=/usr/bin/mde-bus
 readonly BUS_ROOT=/run/mde-bus
 readonly DEFAULT_ACTION=start_and_attach
+readonly DEFAULT_CATALOG_ROOT=/var/lib/mcnf/image-catalog
 
 usage() {
   cat >&2 <<'EOF'
 usage: request-browser-vm-workload --node NODE \
   [--action ACTION] [--image-ref browser-vm-chromium:VERSION] \
+  [--catalog-root /var/lib/mcnf/image-catalog] \
   [--credential-path PATH]
        request-browser-vm-workload --self-test
 
@@ -30,8 +32,10 @@ action/workload/operation. ACTION is one of start_and_attach (the default),
 start, stop, restart, resume, or destroy. The image reference is required for
 start and start_and_attach, and is always an approved catalog reference.
 IMAGE-REF must name an already approved, promoted VM image in the local mesh
-catalog. This command never accepts a VM path, SPICE/RDP endpoint, password,
-or provider command. Existing browser-vm domains must first be converted with
+catalog. Before a start request is authored, the promoted pointer, catalog
+admission receipt, identity manifest, and complete image digest are verified
+from CATALOG-ROOT. This command never accepts a VM path, SPICE/RDP endpoint,
+password, or provider command. Existing browser-vm domains must first be converted with
 packaging/browser-vm/migrate-display1-domain.sh; conversion preserves the
 guest overlay and never force-destroys a running VM.
 EOF
@@ -89,6 +93,7 @@ MAX_CREDENTIAL_BYTES = 65
 ULID_RE = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}\Z")
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 IMAGE_REF_RE = re.compile(r"[A-Za-z0-9._-]{1,63}:[A-Za-z0-9._-]{1,63}\Z")
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class SafeFailure(Exception):
@@ -122,6 +127,113 @@ def validate_image_ref(image_ref):
     name, _version = image_ref.split(":", 1)
     if name != "browser-vm-chromium":
         raise SafeFailure("invalid-image-ref")
+
+
+def regular_catalog_file(path, maximum, label):
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise SafeFailure("image-not-promoted") from error
+    if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size <= 0 or metadata.st_size > maximum
+            or metadata.st_mode & 0o022):
+        raise SafeFailure("catalog-readiness-invalid")
+    return metadata
+
+
+def bounded_json(path, maximum):
+    regular_catalog_file(path, maximum, "catalog document")
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise SafeFailure("catalog-readiness-invalid")
+            value[key] = item
+        return value
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle, object_pairs_hook=unique,
+                             parse_constant=lambda _item: (_ for _ in ()).throw(
+                                 SafeFailure("catalog-readiness-invalid")))
+    except SafeFailure:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SafeFailure("catalog-readiness-invalid") from error
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise SafeFailure("catalog-readiness-invalid") from error
+    return f"sha256:{digest.hexdigest()}"
+
+
+def validate_catalog_readiness(catalog_root, image_ref):
+    validate_image_ref(image_ref)
+    if not os.path.isabs(catalog_root):
+        raise SafeFailure("catalog-readiness-invalid")
+    name, version = image_ref.split(":", 1)
+    root = os.path.realpath(catalog_root)
+    if root != catalog_root.rstrip("/") or not os.path.isdir(root):
+        raise SafeFailure("catalog-readiness-invalid")
+    promoted = os.path.join(root, "images", name, "PROMOTED")
+    regular_catalog_file(promoted, 129, "promoted pointer")
+    try:
+        with open(promoted, "r", encoding="ascii") as handle:
+            promoted_version = handle.read(130)
+    except (OSError, UnicodeError) as error:
+        raise SafeFailure("catalog-readiness-invalid") from error
+    if promoted_version != f"{version}\n":
+        raise SafeFailure("image-not-promoted")
+    version_dir = os.path.join(root, "images", name, version)
+    if os.path.realpath(version_dir) != version_dir or not os.path.isdir(version_dir):
+        raise SafeFailure("catalog-readiness-invalid")
+    admission_path = os.path.join(version_dir, "catalog-admission.json")
+    admission = bounded_json(admission_path, 64 * 1024)
+    expected_fields = {
+        "schema_version", "kind", "name", "version", "artifact",
+        "artifact_bytes", "artifact_sha256", "identity_manifest",
+        "identity_manifest_sha256", "profile",
+    }
+    if (not isinstance(admission, dict) or set(admission) != expected_fields
+            or admission.get("schema_version") != 1
+            or admission.get("kind") != "browser_vm_catalog_admission"
+            or admission.get("name") != name or admission.get("version") != version
+            or admission.get("profile") != "browser-vm-chromium"):
+        raise SafeFailure("catalog-readiness-invalid")
+    artifact_rel = f"images/{name}/{version}/{name}.img"
+    if admission.get("artifact") != artifact_rel:
+        raise SafeFailure("catalog-readiness-invalid")
+    artifact_digest = admission.get("artifact_sha256")
+    identity_digest = admission.get("identity_manifest_sha256")
+    identity_rel = admission.get("identity_manifest")
+    if (not isinstance(artifact_digest, str) or not DIGEST_RE.fullmatch(artifact_digest)
+            or not isinstance(identity_digest, str) or not DIGEST_RE.fullmatch(identity_digest)
+            or not isinstance(identity_rel, str)
+            or identity_rel.startswith("/") or ".." in identity_rel.split("/")
+            or not identity_rel.startswith(f"images/{name}/{version}/")):
+        raise SafeFailure("catalog-readiness-invalid")
+    artifact = os.path.join(root, artifact_rel)
+    identity = os.path.join(root, identity_rel)
+    artifact_metadata = regular_catalog_file(artifact, 128 * 1024**3, "Browser image")
+    regular_catalog_file(identity, 64 * 1024, "Browser identity manifest")
+    artifact_bytes = admission.get("artifact_bytes")
+    if (isinstance(artifact_bytes, bool) or not isinstance(artifact_bytes, int)
+            or artifact_bytes != artifact_metadata.st_size):
+        raise SafeFailure("catalog-readiness-invalid")
+    identity_value = bounded_json(identity, 64 * 1024)
+    identity_artifact = identity_value.get("artifact") if isinstance(identity_value, dict) else None
+    if (not isinstance(identity_artifact, dict)
+            or identity_artifact.get("sha256") != artifact_digest
+            or identity_artifact.get("bytes") != artifact_bytes):
+        raise SafeFailure("catalog-readiness-invalid")
+    if file_sha256(identity) != identity_digest or file_sha256(artifact) != artifact_digest:
+        raise SafeFailure("catalog-readiness-invalid")
+    return artifact_digest
 
 
 def read_arm_key(path, expected_uid):
@@ -373,11 +485,12 @@ def wait_for(bus, root, node, request_receipt, request_id, action):
     raise SafeFailure("browser-rdp-ready-timeout" if saw_reply else "operation-reply-timeout")
 
 
-def live(credential_path, node, action, image_ref, bus, root):
+def live(credential_path, node, action, image_ref, catalog_root, bus, root):
     validate_node(node)
     validate_action(action)
     if action in IMAGE_REQUIRED_ACTIONS:
         validate_image_ref(image_ref)
+        validate_catalog_readiness(catalog_root, image_ref)
     elif image_ref:
         validate_image_ref(image_ref)
     check_bus_paths(bus, root)
@@ -439,6 +552,39 @@ def self_test():
             pass
         else:
             raise AssertionError("unsafe image reference accepted")
+    with tempfile.TemporaryDirectory() as directory:
+        catalog = os.path.join(directory, "catalog")
+        version_dir = os.path.join(catalog, "images", "browser-vm-chromium", "20260806")
+        os.makedirs(version_dir)
+        image = os.path.join(version_dir, "browser-vm-chromium.img")
+        with open(image, "wb") as handle:
+            handle.write(b"exact-promoted-browser-image\n")
+        image_digest = file_sha256(image)
+        identity = os.path.join(version_dir, "disk.qcow2.mcnf-manifest.json")
+        with open(identity, "w", encoding="utf-8") as handle:
+            json.dump({"artifact": {"bytes": os.path.getsize(image), "sha256": image_digest}}, handle)
+        identity_digest = file_sha256(identity)
+        admission = {
+            "schema_version": 1, "kind": "browser_vm_catalog_admission",
+            "name": "browser-vm-chromium", "version": "20260806",
+            "artifact": "images/browser-vm-chromium/20260806/browser-vm-chromium.img",
+            "artifact_bytes": os.path.getsize(image), "artifact_sha256": image_digest,
+            "identity_manifest": "images/browser-vm-chromium/20260806/disk.qcow2.mcnf-manifest.json",
+            "identity_manifest_sha256": identity_digest, "profile": "browser-vm-chromium",
+        }
+        with open(os.path.join(version_dir, "catalog-admission.json"), "w", encoding="utf-8") as handle:
+            json.dump(admission, handle)
+        with open(os.path.join(catalog, "images", "browser-vm-chromium", "PROMOTED"), "w", encoding="ascii") as handle:
+            handle.write("20260806\n")
+        assert validate_catalog_readiness(catalog, image_ref) == image_digest
+        with open(image, "ab") as handle:
+            handle.write(b"hostile-substitution\n")
+        try:
+            validate_catalog_readiness(catalog, image_ref)
+        except SafeFailure as error:
+            assert error.reason == "catalog-readiness-invalid"
+        else:
+            raise AssertionError("digest-substituted promoted Browser image accepted")
     key = bytearray.fromhex("00" * 32)
     request = build_request(key, node, image_ref, 7, "00112233445566778899aabbccddeeff", 1_893_456_000_000, DEFAULT_ACTION)
     assert request["workload_id"] == "browser-vm"
@@ -506,7 +652,7 @@ def main():
     if sys.argv[1:] == ["self-test"]:
         self_test()
         return
-    if len(sys.argv) == 8 and sys.argv[1] == "live":
+    if len(sys.argv) == 9 and sys.argv[1] == "live":
         live(*sys.argv[2:])
         return
     raise SafeFailure("invalid-invocation")
@@ -539,12 +685,14 @@ node=
 action=$DEFAULT_ACTION
 action_seen=0
 image_ref=
+catalog_root=$DEFAULT_CATALOG_ROOT
 credential_path="${CREDENTIALS_DIRECTORY:+${CREDENTIALS_DIRECTORY}/cloud-arm-key}"
 while (($#)); do
   case "$1" in
     --node) (($# >= 2)) || { usage; exit 2; }; [[ -z "$node" ]] || fail duplicate-node; node=$2; shift 2 ;;
     --action) (($# >= 2)) || { usage; exit 2; }; ((action_seen == 0)) || fail duplicate-action; action=$2; action_seen=1; shift 2 ;;
     --image-ref) (($# >= 2)) || { usage; exit 2; }; [[ -z "$image_ref" ]] || fail duplicate-image-ref; image_ref=$2; shift 2 ;;
+    --catalog-root) (($# >= 2)) || { usage; exit 2; }; catalog_root=$2; shift 2 ;;
     --credential-path) (($# >= 2)) || { usage; exit 2; }; credential_path=$2; shift 2 ;;
     *) usage; exit 2 ;;
   esac
@@ -560,4 +708,4 @@ fi
 [[ "$(id -u)" == 0 ]] || fail root-required
 [[ -x "$PYTHON_BIN" && -x "$MDE_BUS_BIN" ]] || fail bus-unavailable
 [[ -n "$credential_path" ]] || fail credential-directory-required
-run_python live "$credential_path" "$node" "$action" "$image_ref" "$MDE_BUS_BIN" "$BUS_ROOT"
+run_python live "$credential_path" "$node" "$action" "$image_ref" "$catalog_root" "$MDE_BUS_BIN" "$BUS_ROOT"

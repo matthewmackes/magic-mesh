@@ -6,6 +6,14 @@ PipeWire/WirePlumber, libinput, and the image-owned runtime are installed in a
 dedicated `browser-vm-chromium` image. The image verifier is a static contents
 gate; it does not claim that a VM has booted or that a VDI endpoint is live.
 
+`request-browser-vm-workload` now admits a start only after the selected
+`browser-vm-chromium:VERSION` is the exact `PROMOTED` catalog generation and
+its bounded catalog admission receipt, identity-manifest digest, artifact byte
+count, and complete image SHA-256 all agree. Missing, stale, symlinked,
+group/other-writable, or substituted catalog inputs fail before a signed
+Workloads request is authored. Stop/restart/resume/destroy remain bound to the
+existing Workload generation and do not accept a replacement image.
+
 Build a signed/recorded ext4-rootfs disk artifact on the build farm with exactly
 one Fedora-44 `magic-mesh-lighthouse` guest RPM passed through `--rpm`. The
 builder refuses the mutable repository-latest lane, hashes the selected regular
