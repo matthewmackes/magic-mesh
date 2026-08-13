@@ -13,6 +13,7 @@ BROWSER_BUILDER=${MCNF_DERIVATIVE_BROWSER_BUILDER:-$ROOT/packaging/browser-vm/bu
 APP_RPM_VERIFY=${MCNF_DERIVATIVE_APP_RPM_VERIFY:-$ROOT/packaging/app-vm/verify-rpm-supply.sh}
 BROWSER_RPM_VERIFY=${MCNF_DERIVATIVE_BROWSER_RPM_VERIFY:-$ROOT/packaging/browser-vm/produce-lighthouse-rpm-candidate.py}
 BROWSER_MANIFEST_VERIFY=${MCNF_DERIVATIVE_BROWSER_MANIFEST_VERIFY:-$ROOT/packaging/browser-vm/verify-image-manifest.py}
+APP_MANIFEST_VERIFY=${MCNF_DERIVATIVE_APP_MANIFEST_VERIFY:-$ROOT/packaging/app-vm/verify-qcow2-manifest.py}
 RELEASE_KEY=${MCNF_DERIVATIVE_RELEASE_KEY:-$ROOT/packaging/repo/RPM-GPG-KEY-magic-mesh}
 PROFILE=${MCNF_DERIVATIVE_BROWSER_PROFILE:-$ROOT/packaging/browser-vm/profile.env}
 
@@ -184,6 +185,11 @@ with os.fdopen(fd, "wb") as stream:
     stream.write((json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode())
     stream.flush(); os.fsync(stream.fileno())
 PY
+
+python3 "$APP_MANIFEST_VERIFY" --image "$collection/app-vm-wayland-standard.qcow2" \
+    --manifest "$collection/app-vm-wayland-standard.mcnf-manifest.json" \
+    --source-revision "$source_revision" >/dev/null \
+    || refuse 'App VM emitted manifest re-verification failed'
 
 mv -T -- "$collection" "$output" || refuse 'atomic derivative collection publication failed'
 chmod 0500 "$output"

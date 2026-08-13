@@ -35,7 +35,7 @@ set -eu
 printf 'app-builder %s\n' "$*" >>"$CALLS"
 [ "${FAIL_APP_BUILD:-0}" -eq 0 ] || exit 7
 while [ "$#" -gt 0 ]; do [ "$1" = --out ] && { out=$2; break; }; shift; done
-mkdir -p "$out/qcow2"; printf 'app-disk\n' >"$out/qcow2/disk.qcow2"; chmod 0400 "$out/qcow2/disk.qcow2"
+mkdir -p "$out/qcow2"; printf 'QFI\373app-disk\n' >"$out/qcow2/disk.qcow2"; chmod 0400 "$out/qcow2/disk.qcow2"
 EOF
 cat >"$work/bin/browser-builder" <<'EOF'
 #!/bin/sh
