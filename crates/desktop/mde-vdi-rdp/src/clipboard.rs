@@ -10,7 +10,8 @@ use ironrdp_cliprdr::pdu::{
 };
 use ironrdp_core::impl_as_any;
 use mackes_mesh_types::vdi_clipboard::{
-    MAX_VDI_CLIPBOARD_TEXT_BYTES, MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES, MAX_VDI_CLIPBOARD_TEXT_BYTES,
+    MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES,
 };
 
 /// The standard CLIPRDR text format supported by this backend.
@@ -28,6 +29,7 @@ pub const DIB_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId(8
 pub const DIBV5_FORMAT: ClipboardFormat = ClipboardFormat::new(ClipboardFormatId(17));
 
 const MAX_REMOTE_FORMATS: usize = 256;
+const MAX_REMOTE_FILES: usize = 4_096;
 const CF_HTML_HEADER_SLACK_BYTES: usize = 1024;
 const CF_HTML_PREFIX: &str = "<html><body><!--StartFragment-->";
 const CF_HTML_SUFFIX: &str = "<!--EndFragment--></body></html>";
@@ -44,6 +46,7 @@ enum RemoteFormat {
     Html(ClipboardFormatId),
     Dib,
     DibV5,
+    Files(ClipboardFormatId),
 }
 
 impl RemoteFormat {
@@ -53,8 +56,37 @@ impl RemoteFormat {
             Self::Html(id) => id,
             Self::Dib => DIB_FORMAT.id(),
             Self::DibV5 => DIBV5_FORMAT.id(),
+            Self::Files(id) => id,
         }
     }
+}
+
+fn negotiated_file_list_format(available_formats: &[ClipboardFormat]) -> Option<RemoteFormat> {
+    let is_file_list = |format: &ClipboardFormat| {
+        format.id().is_registered()
+            && format
+                .name()
+                .is_some_and(|name| name.value() == ClipboardFormatName::FILE_LIST.value())
+    };
+    let mut negotiated_id = None;
+    for format in available_formats
+        .iter()
+        .filter(|format| is_file_list(format))
+    {
+        match negotiated_id {
+            None => negotiated_id = Some(format.id()),
+            Some(id) if id == format.id() => {}
+            Some(_) => return None,
+        }
+    }
+    let id = negotiated_id?;
+    if available_formats
+        .iter()
+        .any(|format| format.id() == id && !is_file_list(format))
+    {
+        return None;
+    }
+    Some(RemoteFormat::Files(id))
 }
 
 fn negotiated_html_format(available_formats: &[ClipboardFormat]) -> Option<RemoteFormat> {
@@ -110,6 +142,59 @@ pub struct RemoteClipboardImage {
     data: Vec<u8>,
 }
 
+/// Bounded guest file metadata admitted from `FileGroupDescriptorW`.
+///
+/// This type deliberately carries metadata only. Raw guest paths and payloads
+/// never become host paths at the CLIPRDR boundary; the Files authority decides
+/// where a later, chunked transfer is materialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteClipboardFile {
+    name: String,
+    relative_path: Option<String>,
+    size: u64,
+}
+
+impl RemoteClipboardFile {
+    /// Sanitized basename supplied by IronRDP and re-attested by this boundary.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Sanitized relative directory, never an absolute or parent path.
+    #[must_use]
+    pub fn relative_path(&self) -> Option<&str> {
+        self.relative_path.as_deref()
+    }
+
+    /// Declared byte size admitted under the rich-envelope aggregate ceiling.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// One negotiated, bounded guest file-list snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteClipboardFileList {
+    files: Vec<RemoteClipboardFile>,
+    clip_data_id: Option<u32>,
+}
+
+impl RemoteClipboardFileList {
+    /// Admitted file metadata in guest order.
+    #[must_use]
+    pub fn files(&self) -> &[RemoteClipboardFile] {
+        &self.files
+    }
+
+    /// IronRDP lock identity binding later chunks to this exact clipboard snapshot.
+    #[must_use]
+    pub const fn clip_data_id(&self) -> Option<u32> {
+        self.clip_data_id
+    }
+}
+
 impl RemoteClipboardImage {
     fn new(format: RemoteClipboardImageFormat, data: &[u8]) -> Self {
         Self {
@@ -144,11 +229,13 @@ struct ClipboardState {
     remote_unicode_offer: Option<RemoteFormat>,
     remote_html_offer: Option<RemoteFormat>,
     remote_image_offer: Option<RemoteFormat>,
+    remote_file_offer: Option<RemoteFormat>,
     pending_remote_request: Option<RemoteFormat>,
     discard_replaced_response: bool,
     remote_text: Option<String>,
     remote_html: Option<String>,
     remote_image: Option<RemoteClipboardImage>,
+    remote_files: Option<Result<RemoteClipboardFileList, ClipboardBridgeError>>,
 }
 
 /// Thread-local connection handle used by the wire pump to service CLIPRDR
@@ -289,7 +376,8 @@ impl ClipboardBridge {
             .remote_unicode_offer
             .take()
             .or_else(|| state.remote_html_offer.take())
-            .or_else(|| state.remote_image_offer.take())?;
+            .or_else(|| state.remote_image_offer.take())
+            .or_else(|| state.remote_file_offer.take())?;
         state.pending_remote_request = Some(format);
         Some(format.id())
     }
@@ -307,6 +395,16 @@ impl ClipboardBridge {
     /// Take the latest bounded guest image with its negotiated wire format.
     pub fn take_remote_image(&self) -> Option<RemoteClipboardImage> {
         self.lock().remote_image.take()
+    }
+
+    /// Take a guest file-list admission result exactly once.
+    ///
+    /// A rejected list is surfaced as a typed failure rather than silently
+    /// disappearing or causing the transport to allocate from hostile sizes.
+    pub fn take_remote_file_list(
+        &self,
+    ) -> Option<Result<RemoteClipboardFileList, ClipboardBridgeError>> {
+        self.lock().remote_files.take()
     }
 
     /// Whether CLIPRDR completed its capability handshake.
@@ -342,6 +440,8 @@ pub enum ClipboardBridgeError {
     },
     /// The image was not a bounded, self-consistent CF_DIB/CF_DIBV5 payload.
     InvalidImage,
+    /// Guest file-list metadata was unsafe, incomplete, or exceeded a bound.
+    InvalidFileList,
 }
 
 impl core::fmt::Display for ClipboardBridgeError {
@@ -352,6 +452,9 @@ impl core::fmt::Display for ClipboardBridgeError {
                 "RDP clipboard payload is {bytes} bytes; maximum is {max_bytes}"
             ),
             Self::InvalidImage => formatter.write_str("RDP clipboard DIB is malformed or unsafe"),
+            Self::InvalidFileList => {
+                formatter.write_str("RDP clipboard file list is malformed or unsafe")
+            }
         }
     }
 }
@@ -408,9 +511,11 @@ impl CliprdrBackend for TextCliprdrBackend {
             state.remote_unicode_offer = None;
             state.remote_html_offer = None;
             state.remote_image_offer = None;
+            state.remote_file_offer = None;
             state.remote_text = None;
             state.remote_html = None;
             state.remote_image = None;
+            state.remote_files = None;
 
             if available_formats.len() > MAX_REMOTE_FORMATS {
                 return;
@@ -433,6 +538,7 @@ impl CliprdrBackend for TextCliprdrBackend {
             } else {
                 None
             };
+            state.remote_file_offer = negotiated_file_list_format(available_formats);
         });
     }
 
@@ -460,6 +566,7 @@ impl CliprdrBackend for TextCliprdrBackend {
                     RemoteFormat::UnicodeText => state.remote_text = None,
                     RemoteFormat::Html(_) => state.remote_html = None,
                     RemoteFormat::Dib | RemoteFormat::DibV5 => state.remote_image = None,
+                    RemoteFormat::Files(_) => state.remote_files = None,
                 }
                 return;
             }
@@ -491,6 +598,12 @@ impl CliprdrBackend for TextCliprdrBackend {
                             )
                         });
                 }
+                RemoteFormat::Files(_) => {
+                    // IronRDP decodes file-list responses through
+                    // `on_remote_file_list`; a generic response here is not
+                    // authoritative file metadata.
+                    state.remote_files = Some(Err(ClipboardBridgeError::InvalidFileList));
+                }
             }
         });
     }
@@ -503,7 +616,92 @@ impl CliprdrBackend for TextCliprdrBackend {
 
     fn on_unlock(&mut self, _data_id: LockDataId) {}
 
-    fn on_remote_file_list(&mut self, _files: &[FileDescriptor], _clip_data_id: Option<u32>) {}
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        self.with_state(|state| {
+            if state.discard_replaced_response {
+                state.discard_replaced_response = false;
+                return;
+            }
+            if !matches!(
+                state.pending_remote_request.take(),
+                Some(RemoteFormat::Files(_))
+            ) {
+                state.remote_files = Some(Err(ClipboardBridgeError::InvalidFileList));
+                return;
+            }
+            let result = admit_remote_file_list(files, clip_data_id);
+            state.remote_files = Some(result);
+        });
+    }
+
+    fn on_outgoing_locks_cleared(&mut self, clip_data_ids: &[LockDataId]) {
+        self.with_state(|state| {
+            let cleared = state
+                .remote_files
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(RemoteClipboardFileList::clip_data_id)
+                .is_some_and(|id| clip_data_ids.iter().any(|cleared| cleared.0 == id));
+            if cleared {
+                state.remote_files = None;
+            }
+        });
+    }
+}
+
+fn admit_remote_file_list(
+    files: &[FileDescriptor],
+    clip_data_id: Option<u32>,
+) -> Result<RemoteClipboardFileList, ClipboardBridgeError> {
+    if files.is_empty() || files.len() > MAX_REMOTE_FILES {
+        return Err(ClipboardBridgeError::InvalidFileList);
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut admitted = Vec::with_capacity(files.len());
+    for file in files {
+        let size = file
+            .file_size
+            .ok_or(ClipboardBridgeError::InvalidFileList)?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES)
+            .ok_or(ClipboardBridgeError::InvalidFileList)?;
+        if !safe_file_component(&file.name)
+            || file
+                .relative_path
+                .as_deref()
+                .is_some_and(|path| !safe_relative_path(path))
+        {
+            return Err(ClipboardBridgeError::InvalidFileList);
+        }
+        admitted.push(RemoteClipboardFile {
+            name: file.name.clone(),
+            relative_path: file.relative_path.clone(),
+            size,
+        });
+    }
+    Ok(RemoteClipboardFileList {
+        files: admitted,
+        clip_data_id,
+    })
+}
+
+fn safe_file_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':' | '\0'))
+}
+
+fn safe_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['/', '\\'])
+        && value.len() <= 1_024
+        && value.split(['/', '\\']).all(safe_file_component)
 }
 
 fn decode_unicode_text(data: &[u8]) -> Option<String> {
@@ -702,8 +900,16 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
         let name = &tag[..name_end];
         if matches!(
             name,
-            "base" | "embed" | "form" | "iframe" | "link" | "meta" | "object" | "script"
-                | "style" | "svg"
+            "base"
+                | "embed"
+                | "form"
+                | "iframe"
+                | "link"
+                | "meta"
+                | "object"
+                | "script"
+                | "style"
+                | "svg"
         ) {
             return false;
         }
@@ -729,9 +935,7 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
                 .unwrap_or(attribute.len());
             let name = &attribute[..end];
             let after_name = &attribute[end..];
-            if name.starts_with("on")
-                && name.len() > 2
-                && after_name.trim_start().starts_with('=')
+            if name.starts_with("on") && name.len() > 2 && after_name.trim_start().starts_with('=')
             {
                 return false;
             }
@@ -750,8 +954,8 @@ mod tests {
         DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, UNICODE_TEXT_FORMAT,
     };
     use ironrdp_cliprdr::pdu::{
-        ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FormatDataRequest,
-        FormatDataResponse,
+        ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FileDescriptor, FormatDataRequest,
+        FormatDataResponse, LockDataId,
     };
     use mackes_mesh_types::vdi_clipboard::MAX_VDI_CLIPBOARD_TEXT_BYTES;
 
@@ -873,14 +1077,17 @@ mod tests {
         backend.on_remote_copy(&[html_format()]);
         assert_eq!(bridge.take_remote_format_request(), Some(HTML_FORMAT_ID));
 
-        let hostile = encode_cf_html(r#"<div onclick="javascript:alert(1)"><script>alert(1)</script></div>"#);
+        let hostile =
+            encode_cf_html(r#"<div onclick="javascript:alert(1)"><script>alert(1)</script></div>"#);
         backend.on_format_data_response(FormatDataResponse::new_data(hostile));
 
         assert_eq!(bridge.take_remote_html(), None);
         assert!(!guest_html_fragment_is_safe(
             r#"<div onclick="javascript:alert(1)"><script>alert(1)</script></div>"#
         ));
-        assert!(guest_html_fragment_is_safe("<p><strong>safe</strong> guest</p>"));
+        assert!(guest_html_fragment_is_safe(
+            "<p><strong>safe</strong> guest</p>"
+        ));
     }
 
     #[test]
@@ -894,7 +1101,11 @@ mod tests {
             assert_eq!(bridge.take_remote_format_request(), Some(HTML_FORMAT_ID));
 
             backend.on_format_data_response(FormatDataResponse::new_data(encode_cf_html(fragment)));
-            assert_eq!(bridge.take_remote_html(), None, "active resource URL must not cross the guest boundary");
+            assert_eq!(
+                bridge.take_remote_html(),
+                None,
+                "active resource URL must not cross the guest boundary"
+            );
         }
     }
 
@@ -1164,6 +1375,85 @@ mod tests {
                 .map(|image| (image.format(), image.data().to_vec())),
             Some((RemoteClipboardImageFormat::DibV5, admitted)),
             "unsolicited replay cannot replace the admitted image"
+        );
+    }
+
+    #[test]
+    fn guest_file_list_is_format_bound_bounded_and_lock_scoped() {
+        let (bridge, mut backend) = ClipboardBridge::pair();
+        let file_format_id = ClipboardFormatId(0xC321);
+        let file_format =
+            ClipboardFormat::new(file_format_id).with_name(ClipboardFormatName::FILE_LIST);
+
+        backend.on_remote_copy(&[file_format.clone()]);
+        assert_eq!(bridge.take_remote_format_request(), Some(file_format_id));
+        backend.on_remote_file_list(
+            &[
+                FileDescriptor::new("report.pdf").with_file_size(12_345),
+                FileDescriptor::new("chart.png")
+                    .with_relative_path("quarter-1\\figures")
+                    .with_file_size(54_321),
+            ],
+            Some(77),
+        );
+        let admitted = bridge
+            .take_remote_file_list()
+            .expect("file-list callback")
+            .expect("bounded metadata");
+        assert_eq!(admitted.clip_data_id(), Some(77));
+        assert_eq!(admitted.files()[0].name(), "report.pdf");
+        assert_eq!(
+            admitted.files()[1].relative_path(),
+            Some("quarter-1\\figures")
+        );
+        assert_eq!(admitted.files()[1].size(), 54_321);
+
+        backend.on_remote_copy(&[file_format.clone()]);
+        assert_eq!(bridge.take_remote_format_request(), Some(file_format_id));
+        backend.on_remote_file_list(
+            &[FileDescriptor::new("escape.txt")
+                .with_relative_path("..\\host")
+                .with_file_size(1)],
+            Some(78),
+        );
+        assert_eq!(
+            bridge.take_remote_file_list(),
+            Some(Err(ClipboardBridgeError::InvalidFileList))
+        );
+
+        backend.on_remote_copy(&[file_format.clone()]);
+        assert_eq!(bridge.take_remote_format_request(), Some(file_format_id));
+        backend.on_remote_file_list(
+            &[
+                FileDescriptor::new("first.bin").with_file_size(3 * 1024 * 1024 * 1024),
+                FileDescriptor::new("second.bin").with_file_size(2 * 1024 * 1024 * 1024),
+            ],
+            Some(79),
+        );
+        assert_eq!(
+            bridge.take_remote_file_list(),
+            Some(Err(ClipboardBridgeError::InvalidFileList))
+        );
+
+        backend.on_remote_copy(&[file_format.clone()]);
+        assert_eq!(bridge.take_remote_format_request(), Some(file_format_id));
+        backend.on_remote_file_list(
+            &[FileDescriptor::new("locked.txt").with_file_size(9)],
+            Some(80),
+        );
+        backend.on_outgoing_locks_cleared(&[LockDataId(80)]);
+        assert_eq!(
+            bridge.take_remote_file_list(),
+            None,
+            "expired CLIPRDR lock must revoke its file-list snapshot"
+        );
+
+        let equivocated = ClipboardFormat::new(file_format_id);
+        backend.on_remote_copy(&[file_format, equivocated]);
+        assert_eq!(
+            bridge.take_remote_format_request(),
+            None,
+            "one registered ID cannot mean both files and unnamed bytes"
         );
     }
 }
