@@ -91,6 +91,14 @@ pub const RECONCILE_INTERVAL_S: u64 = 30;
 /// exit lands in well under the limit.
 pub const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
+/// Longest delay between reconcile attempts after consecutive failures.
+///
+/// A broken store or persistently unavailable substrate must not keep waking the
+/// process at the healthy cadence forever. The first failure retains the normal
+/// cadence; later failures back off exponentially to this bound. A successful
+/// tick resets the failure generation immediately.
+pub const MAX_RECONCILE_RETRY_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
 /// Process-local ownership for the reconcile loop.
 ///
 /// The six systemd process groups already provide cross-process ownership, but
@@ -278,9 +286,11 @@ pub fn spawn_reconcile_worker(
 /// systemd's `Type=simple` unit. Same shutdown semantics as the
 /// spawned variant.
 pub fn run_loop(workgroup_root: &Path, node_id: &str, db_path: &Path, shutdown: &Arc<AtomicBool>) {
+    let mut consecutive_failures = 0_u32;
     while !shutdown.load(Ordering::Relaxed) {
-        match tick(workgroup_root, node_id, db_path) {
+        let delay = match tick(workgroup_root, node_id, db_path) {
             Ok(outcome) => {
+                consecutive_failures = 0;
                 // PERF-8: a converged idle mesh reconciles to a no-op every tick —
                 // logging that at INFO is a guaranteed 1-line/tick journald firehose
                 // across the whole fleet. Log INFO only when the tick actually did
@@ -305,17 +315,33 @@ pub fn run_loop(workgroup_root: &Path, node_id: &str, db_path: &Path, shutdown: 
                         "reconcile tick complete (no-op)",
                     );
                 }
+                Duration::from_secs(RECONCILE_INTERVAL_S)
             }
             Err(e) => {
                 // WL-RUN-002 — the reconcile loop's real failure path.
                 // Bump the process-wide `mackesd_reconcile_failures_total`
                 // counter the metrics exporter renders each tick.
                 crate::metrics::record_reconcile_failure();
-                warn!(error = %e, "reconcile tick failed; will retry next interval");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let delay = reconcile_retry_delay(consecutive_failures);
+                warn!(
+                    error = %e,
+                    consecutive_failures,
+                    retry_delay_s = delay.as_secs(),
+                    "reconcile tick failed; retrying with bounded backoff",
+                );
+                delay
             }
-        }
-        interruptible_sleep(Duration::from_secs(RECONCILE_INTERVAL_S), shutdown);
+        };
+        interruptible_sleep(delay, shutdown);
     }
+}
+
+fn reconcile_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(63);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    Duration::from_secs(RECONCILE_INTERVAL_S.saturating_mul(multiplier))
+        .min(MAX_RECONCILE_RETRY_BACKOFF)
 }
 
 /// Sleep up to `total`, waking every [`SHUTDOWN_POLL`] to check the
@@ -1256,6 +1282,22 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "interruptible_sleep took {elapsed:?}; should have exited near 350 ms",
         );
+    }
+
+    #[test]
+    fn reconcile_failure_backoff_is_exponential_bounded_and_restart_safe() {
+        assert_eq!(reconcile_retry_delay(0), Duration::from_secs(30));
+        assert_eq!(reconcile_retry_delay(1), Duration::from_secs(30));
+        assert_eq!(reconcile_retry_delay(2), Duration::from_secs(60));
+        assert_eq!(reconcile_retry_delay(3), Duration::from_secs(120));
+        assert_eq!(reconcile_retry_delay(4), Duration::from_secs(240));
+        assert_eq!(reconcile_retry_delay(5), MAX_RECONCILE_RETRY_BACKOFF);
+        assert_eq!(reconcile_retry_delay(u32::MAX), MAX_RECONCILE_RETRY_BACKOFF);
+
+        // The production loop resets its counter after any successful tick;
+        // the next failure therefore starts a fresh generation at normal
+        // cadence rather than inheriting a stale outage delay.
+        assert_eq!(reconcile_retry_delay(1), Duration::from_secs(30));
     }
 
     #[test]
