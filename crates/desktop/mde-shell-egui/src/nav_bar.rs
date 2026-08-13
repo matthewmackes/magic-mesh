@@ -696,15 +696,53 @@ impl State {
             )
     }
 
-    fn complete_first_boot(&mut self) {
+    fn complete_first_boot(&mut self) -> bool {
+        let candidate = self.bounded_first_boot_selection();
+        self.commit_first_boot_selection(candidate, |state, pins| {
+            let path = Self::default_path().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "navigation preference directory is unavailable",
+                )
+            })?;
+            state.save_with_profile_to(
+                &path,
+                state.mode,
+                pins,
+                ProfileState::Configured,
+            )
+        })
+    }
+
+    /// Publish first-boot pins and dismiss personalization only after the exact
+    /// configured profile is durable. Unlike later pin edits, this transition
+    /// changes both the ordered pins and the profile lifecycle marker; writing
+    /// either one from live state first can strand a restart back in the
+    /// selector or advertise pins that were never committed.
+    fn commit_first_boot_selection<F>(&mut self, candidate: Vec<Surface>, persist: F) -> bool
+    where
+        F: FnOnce(&Self, &[Surface]) -> std::io::Result<()>,
+    {
         // An empty result is an explicit user choice. Never substitute the
         // deterministic headless defaults here: migrated pins remain intact
         // when carried through the selector, while a new profile may choose
         // no taskbar apps at all.
-        self.pinned_surfaces = self.bounded_first_boot_selection();
+        if candidate.len() > MAX_PINNED_SURFACES
+            || candidate
+                .iter()
+                .any(|surface| !pin_catalog_contains(*surface))
+            || candidate
+                .iter()
+                .enumerate()
+                .any(|(index, surface)| candidate[..index].contains(surface))
+            || persist(self, &candidate).is_err()
+        {
+            return false;
+        }
+        self.pinned_surfaces = candidate;
         self.profile_state = ProfileState::Configured;
         self.pin_selector = PinSelectorState::default();
-        self.save();
+        true
     }
 
     fn toggle_mode(&mut self, now: Instant, motion: MotionMode) {
@@ -1205,7 +1243,7 @@ impl State {
             self.toggle_pin_selector_surface(surface);
         }
         if complete {
-            self.complete_first_boot();
+            let _ = self.complete_first_boot();
         }
     }
 
@@ -1338,6 +1376,16 @@ impl State {
         mode: DockMode,
         pinned_surfaces: &[Surface],
     ) -> std::io::Result<()> {
+        self.save_with_profile_to(path, mode, pinned_surfaces, self.profile_state)
+    }
+
+    fn save_with_profile_to(
+        &self,
+        path: &Path,
+        mode: DockMode,
+        pinned_surfaces: &[Surface],
+        profile_state: ProfileState,
+    ) -> std::io::Result<()> {
         let prefs = NavBarPrefs {
             schema_version: NAV_PREFS_SCHEMA_VERSION,
             mode,
@@ -1345,7 +1393,7 @@ impl State {
                 .iter()
                 .map(|surface| surface_key(*surface).to_owned())
                 .collect(),
-            profile_state: self.profile_state,
+            profile_state,
             peer_app_favorites: self.peer_app_favorites.clone(),
         };
         save_to(path, prefs)
@@ -3392,7 +3440,9 @@ mod tests {
     }
 
     #[test]
-    fn new_profile_selection_is_empty_and_commits_in_catalog_order() {
+    fn new_profile_selection_publishes_only_after_configured_pins_are_durable() {
+        let dir = tempfile_dir();
+        let path = dir.join(CONFIG_FILE);
         let mut state = State::new_profile(DockMode::Floating);
         assert!(state.is_new_profile());
         assert!(state.pinned_surfaces().is_empty());
@@ -3402,10 +3452,41 @@ mod tests {
         state.toggle_pin_selector_surface(Surface::Browser);
         assert_eq!(state.pin_selector.selected, vec![Surface::Browser]);
 
-        state.complete_first_boot();
+        let failed = state.commit_first_boot_selection(
+            state.bounded_first_boot_selection(),
+            |_, _| Err(std::io::Error::other("simulated durable write failure")),
+        );
+        assert!(!failed);
+        assert!(state.is_new_profile());
+        assert!(state.pinned_surfaces().is_empty());
+        assert_eq!(state.pin_selector.selected, vec![Surface::Browser]);
+
+        let committed = state.commit_first_boot_selection(
+            state.bounded_first_boot_selection(),
+            |state, pins| {
+                state.save_with_profile_to(
+                    &path,
+                    state.mode,
+                    pins,
+                    ProfileState::Configured,
+                )
+            },
+        );
+        assert!(committed);
         assert!(!state.is_new_profile());
         assert_eq!(state.pinned_surfaces(), &[Surface::Browser]);
         assert!(state.pin_selector.selected.is_empty());
+
+        let saved: NavBarPrefs = serde_json::from_str(
+            &read_bounded_config(&path).expect("read configured taskbar preferences"),
+        )
+        .expect("decode configured taskbar preferences");
+        assert_eq!(saved.profile_state, ProfileState::Configured);
+        assert_eq!(saved.pinned_surfaces, vec!["browser"]);
+        let restarted = State::from_prefs(saved);
+        assert!(!restarted.is_new_profile());
+        assert_eq!(restarted.pinned_surfaces(), &[Surface::Browser]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3422,7 +3503,10 @@ mod tests {
             vec![Surface::Browser, Surface::MapsLocation]
         );
 
-        state.complete_first_boot();
+        assert!(state.commit_first_boot_selection(
+            state.bounded_first_boot_selection(),
+            |_, _| Ok(())
+        ));
 
         assert!(!state.is_new_profile());
         assert_eq!(
@@ -3434,7 +3518,10 @@ mod tests {
     #[test]
     fn first_boot_empty_selection_does_not_restore_defaults() {
         let mut state = State::new_profile(DockMode::Floating);
-        state.complete_first_boot();
+        assert!(state.commit_first_boot_selection(
+            state.bounded_first_boot_selection(),
+            |_, _| Ok(())
+        ));
 
         assert!(!state.is_new_profile());
         assert!(state.pinned_surfaces().is_empty());
@@ -3452,7 +3539,10 @@ mod tests {
             Surface::AutoHome,
         ];
 
-        state.complete_first_boot();
+        assert!(state.commit_first_boot_selection(
+            state.bounded_first_boot_selection(),
+            |_, _| Ok(())
+        ));
 
         assert_eq!(
             state.pinned_surfaces(),
