@@ -786,8 +786,8 @@ impl SelfTestWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surfaces::Surface;
     use crate::toast_bridge::{resolve_action, Navigate};
+    use crate::workers_catalog::WorkersDestination;
     use mde_egui::egui::{pos2, vec2, Rect};
     use mde_egui::Style;
 
@@ -1097,15 +1097,17 @@ mod tests {
     }
 
     #[test]
-    fn the_all_green_edge_opens_the_mesh_view_surface() {
+    fn the_all_green_edge_opens_the_workers_mesh_map_leaf() {
         // The shell drives the auto-open through the SAME `shell/goto/<surface>` nav
         // grammar the chrome unread indicator + the KIRON chyron use — the verb the
         // all-green edge fires resolves to the Mesh Map surface, so opening it needs no
         // second navigation path.
         assert!(matches!(
             resolve_action("shell/goto/mesh-map"),
-            Some(Navigate::Surface(Surface::MeshView))
+            Some(Navigate::Workers(WorkersDestination::MeshMap))
         ));
+        assert!(resolve_action("shell/goto/meshview").is_none());
+        assert!(resolve_action("shell/goto/mesh").is_none());
     }
 
     // ── the co-editing presence watch (EDITOR-COLLAB-3) ──

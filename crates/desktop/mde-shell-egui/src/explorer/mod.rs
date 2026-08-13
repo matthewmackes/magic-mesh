@@ -836,7 +836,7 @@ fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
             unit.kind.label()
         )),
         Verb::OpenInFleet => Ok(HeroAction::Goto {
-            verb: "shell/goto/mesh".to_string(),
+            verb: "shell/goto/mesh-map".to_string(),
             headline: format!("Open {} in the Fleet mesh view.", unit.name),
         }),
         Verb::HealthCheck => Ok(HeroAction::Refresh),

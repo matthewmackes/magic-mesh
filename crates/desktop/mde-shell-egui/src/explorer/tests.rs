@@ -848,13 +848,13 @@ fn peer_verbs_reach_the_fleet_and_the_live_stream() {
     let fake = s.recording();
     let peer = unit("peer:zeta", UnitKind::Peer, "zeta", now_ms());
 
-    // Open in Fleet → a nav chyron carrying shell/goto/mesh.
+    // Open in Fleet → the canonical typed Workers mesh-map route.
     s.fire(Verb::OpenInFleet, &peer);
     {
         let calls = fake.calls.borrow();
         assert_eq!(calls[0].0, TOAST_TOPIC);
         assert!(
-            calls[0].1.contains("shell/goto/mesh"),
+            calls[0].1.contains("shell/goto/mesh-map"),
             "open-in-Fleet routes to the mesh view: {}",
             calls[0].1
         );

@@ -42,6 +42,7 @@ use crate::timers::{
     clock_banner_projection, request_clock_banner_action, ClockBannerKind, ClockBannerProjection,
 };
 use crate::workbench::Plane;
+use crate::workers_catalog::WorkersDestination;
 
 /// The typed Bus lane any node / worker raises an alert on (lock 7). Flat — the
 /// originating host rides the body's `source_host`, never the topic.
@@ -550,6 +551,8 @@ impl Chime for SystemChime {
 pub(crate) enum Navigate {
     /// Switch the shell to this dock surface.
     Surface(Surface),
+    /// Open one leaf owned by the unified Workers workspace.
+    Workers(WorkersDestination),
     /// Open the Workbench on this plane.
     Plane(Plane),
 }
@@ -571,6 +574,9 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
         if matches!(name.to_ascii_lowercase().as_str(), "instances" | "cloud") {
             return Some(Navigate::Surface(Surface::InfraCode));
         }
+        if name.eq_ignore_ascii_case("mesh-map") {
+            return Some(Navigate::Workers(WorkersDestination::MeshMap));
+        }
         return surface_by_name(name).map(Navigate::Surface);
     }
     if let Some(name) = rest.strip_prefix("plane/") {
@@ -585,9 +591,6 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "workers" | "worker" => Some(Surface::Workers),
         "fleet-mesh" | "fleetmesh" | "fleet" => Some(Surface::FleetMesh),
         "workbench" => Some(Surface::Workbench),
-        // OW-10 — the live Mesh Map. An all-green onboard self-test auto-opens it
-        // through this same grammar (accepting the `mde-mesh-view` variant name too).
-        "mesh-map" | "meshview" | "mesh" => Some(Surface::MeshView),
         "desktop" => Some(Surface::Desktop),
         // The Infra as Code (IaC) cloud control plane (IAC-2).
         "iac" | "infra-code" | "infracode" | "infra" => Some(Surface::InfraCode),
@@ -1040,6 +1043,7 @@ mod tests {
     use mde_bus::persist::Persist;
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::{Style, Tier, Toast, ToastHost};
+    use crate::workers_catalog::WorkersDestination;
 
     use super::{
         alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
@@ -1635,6 +1639,16 @@ mod tests {
             resolve_action("shell/plane/fleet"),
             Some(Navigate::Plane(Plane::Fleet))
         ));
+        assert!(matches!(
+            resolve_action("shell/goto/mesh-map"),
+            Some(Navigate::Workers(WorkersDestination::MeshMap))
+        ));
+        for retired in ["meshview", "mesh"] {
+            assert!(
+                resolve_action(&format!("shell/goto/{retired}")).is_none(),
+                "retired Mesh View alias {retired:?} bypassed Workers routing"
+            );
+        }
         // Unknown verbs are a no-op, not a panic.
         assert!(resolve_action("shell/goto/nope").is_none());
         assert!(resolve_action("chat/open/peer").is_none());

@@ -1378,6 +1378,9 @@ impl Shell {
                     self.communications.open_editor();
                 }
             }
+            toast_bridge::Navigate::Workers(destination) => {
+                self.open_workers_destination(destination);
+            }
             toast_bridge::Navigate::Plane(plane) => {
                 self.nav.surface = Surface::Workers;
                 self.workers_tab = WorkersTab::Control;
@@ -2182,6 +2185,9 @@ impl Shell {
                 self.nav.surface = surface;
                 self.normalize_surface_aliases();
             }
+            toast_bridge::Navigate::Workers(destination) => {
+                self.open_workers_destination(destination);
+            }
             toast_bridge::Navigate::Plane(plane) => {
                 self.nav.surface = Surface::Workers;
                 self.workers_tab = WorkersTab::Control;
@@ -2189,6 +2195,28 @@ impl Shell {
                 self.nav.plane = plane;
             }
         }
+    }
+
+    /// Route an external navigation request through the same typed leaf model
+    /// used by the Workers catalog. No legacy sibling surface is activated.
+    fn open_workers_destination(&mut self, destination: WorkersDestination) {
+        self.nav.surface = Surface::Workers;
+        self.workers_destination = destination;
+        self.workers_tab = match destination {
+            WorkersDestination::MeshMap | WorkersDestination::Network => WorkersTab::Network,
+            WorkersDestination::Discovery => WorkersTab::Discovery,
+            WorkersDestination::Phones
+            | WorkersDestination::PhoneFiles
+            | WorkersDestination::PhoneServices
+            | WorkersDestination::PhoneCommands
+            | WorkersDestination::PhonePair => WorkersTab::Phones,
+            WorkersDestination::ThisNode | WorkersDestination::ThisNodePage(_) => {
+                WorkersTab::LocalNode
+            }
+            WorkersDestination::Fleet
+            | WorkersDestination::Provisioning
+            | WorkersDestination::ActionConsole => WorkersTab::Control,
+        };
     }
 
     /// `Super`+`1`…`9`/`0` jumps into the Springboard's canonical tile order.
@@ -4773,8 +4801,9 @@ mod tests {
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
         this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
-        MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
-        WorkersDestination, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
+        toast_bridge, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
+        VideoTextureCache, WorkersDestination, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT,
+        LAYOUT_MODE_BUTTON_TOUCH,
         LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
         LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
     };
@@ -5813,6 +5842,29 @@ mod tests {
                 "{legacy:?} local-node tab"
             );
         }
+    }
+
+    #[test]
+    fn mesh_map_action_enters_typed_workers_leaf_without_legacy_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.surface = Surface::Desktop;
+        shell.nav.expanded = false;
+
+        let action = toast_bridge::resolve_action("shell/goto/mesh-map")
+            .expect("canonical Network Operations route");
+        shell.apply_nav(action);
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Workers);
+        assert_eq!(shell.workers_tab, WorkersTab::Network);
+        assert_eq!(
+            shell.workers_destination,
+            WorkersDestination::MeshMap
+        );
+        assert!(toast_bridge::resolve_action("shell/goto/meshview").is_none());
+        assert!(toast_bridge::resolve_action("shell/goto/mesh").is_none());
     }
 
     #[test]
