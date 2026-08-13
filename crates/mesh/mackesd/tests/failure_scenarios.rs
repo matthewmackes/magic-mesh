@@ -249,12 +249,18 @@ fn invalid_config_returns_specific_errors_then_accepts_fixed_payload() {
         "expected DuplicateNodeId(peer:dup): {errors:?}"
     );
     assert!(
-        any(|e| matches!(e, ValidationError::EmptyRequiredField { path } if path.ends_with(".id"))),
+        any(|e| matches!(e, ValidationError::EmptyRequiredField { path }
+            if std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("id")))),
         "expected EmptyRequiredField for an id"
     );
     assert!(
         any(
-            |e| matches!(e, ValidationError::EmptyRequiredField { path } if path.ends_with(".region"))
+            |e| matches!(e, ValidationError::EmptyRequiredField { path }
+                if std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("region")))
         ),
         "expected EmptyRequiredField for a region"
     );

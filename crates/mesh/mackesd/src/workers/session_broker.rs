@@ -725,6 +725,10 @@ fn transition(
 /// One convergence step the leader applies to the shared session plane through
 /// the [`SessionStore`] seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the public convergence API has exposed Publish(VdiSession) by value since its introduction"
+)]
 pub enum SessionAction {
     /// Publish (create or update) this session's record in mesh state.
     Publish(VdiSession),

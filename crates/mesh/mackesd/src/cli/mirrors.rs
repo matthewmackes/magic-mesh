@@ -94,7 +94,7 @@ pub fn run(
                 .collect();
             println!("{}", serde_json::to_string(&rows)?);
         } else {
-            println!("{:<14} {:<8} {}", "MIRROR", "ENABLED", "UPSTREAM");
+            println!("{:<14} {:<8} UPSTREAM", "MIRROR", "ENABLED");
             for m in &list {
                 let synced = m
                     .last_sync_ms(&root)

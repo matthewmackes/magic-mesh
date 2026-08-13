@@ -50,6 +50,7 @@ impl FleetReconcileWorker {
             .await
     }
 
+    #[cfg(test)]
     async fn run_reconcile_with(&self, program: &Path) -> bool {
         self.run_reconcile_with_timeout(program, RECONCILE_TIMEOUT)
             .await

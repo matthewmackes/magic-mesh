@@ -163,8 +163,12 @@ fn validate_official_url(value: &str) -> io::Result<reqwest::Url> {
         ));
     }
     let path = url.path();
-    if !(path.starts_with("/data/gis/images/4326/USCOMP/n0q_") && path.ends_with(".json")
-        || path.starts_with("/cache/tile.py/1.0.0/nexrad-n0q-900913") && path.ends_with(".png"))
+    let extension = Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str);
+    if !(path.starts_with("/data/gis/images/4326/USCOMP/n0q_") && extension == Some("json")
+        || path.starts_with("/cache/tile.py/1.0.0/nexrad-n0q-900913")
+            && extension == Some("png"))
     {
         return Err(io::Error::other("IEM URL path is not canonical"));
     }
@@ -891,15 +895,18 @@ mod tests {
     impl IemRadarProbe for RaceProbe {
         fn fetch_metadata(&self, index: u8) -> io::Result<String> {
             if index == 0 {
-                if let Some(started) = self.started.lock().unwrap().take() {
+                let started = self.started.lock().unwrap().take();
+                if let Some(started) = started {
                     started
                         .send(())
                         .map_err(|_| io::Error::other("race observer dropped"))?;
-                    self.release
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .ok_or_else(|| io::Error::other("race release missing"))?
+                    let release = {
+                        let mut release = self.release.lock().unwrap();
+                        release
+                            .take()
+                            .ok_or_else(|| io::Error::other("race release missing"))?
+                    };
+                    release
                         .recv()
                         .map_err(|_| io::Error::other("race release dropped"))?;
                 }

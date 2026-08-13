@@ -909,13 +909,14 @@ impl SchedulerWorker {
         };
         let persist = Persist::open(root.clone()).map_err(io_other)?;
         #[cfg(test)]
-        if let Some(replacement) = self
+        let replacement = self
             .bus_faults
             .replace_index_after_open
             .lock()
             .expect("scheduler open replacement mutex")
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        if let Some(replacement) = replacement {
             install_replacement_index(&root, &replacement)?;
         }
         let identity_after = bus_identity(&root)?;

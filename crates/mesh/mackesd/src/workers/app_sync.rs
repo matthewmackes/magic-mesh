@@ -204,7 +204,7 @@ fn apps() -> Vec<Box<dyn MediaApp>> {
 fn desktop_entry(title: &str, exec: &str, icon: &str, url: &str) -> (String, String) {
     let filename = format!(
         "{}.desktop",
-        title.replace(' ', "_").replace('/', "_").replace('—', "-")
+        title.replace([' ', '/'], "_").replace('—', "-")
     );
     let body = format!(
         "[Desktop Entry]\n\

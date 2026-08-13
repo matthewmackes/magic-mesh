@@ -2068,6 +2068,7 @@ impl ClipboardSyncWorker {
         admitted
     }
 
+    #[cfg(test)]
     fn drain_clipboard_consents(
         &self,
         persist: &mut Persist,
@@ -2202,6 +2203,7 @@ impl ClipboardSyncWorker {
         materialized
     }
 
+    #[cfg(test)]
     fn drain_clipboard_envelopes(
         &self,
         persist: &mut Persist,
@@ -2311,24 +2313,6 @@ impl ClipboardSyncWorker {
         sent
     }
 
-    fn drain_mesh_send_requests(
-        &self,
-        persist: &mut Persist,
-        cursor: &mut Option<String>,
-        checkpoint: &Path,
-        now_ms: u64,
-    ) -> usize {
-        persist.reopen_if_index_changed();
-        let Ok(messages) = persist.list_since_limit(
-            mesh::MESH_SEND_TOPIC,
-            cursor.as_deref(),
-            mesh::MAX_MESH_FRAMES_PER_TICK,
-        ) else {
-            return 0;
-        };
-        self.process_mesh_send_requests(persist, messages, cursor, checkpoint, now_ms)
-    }
-
     /// Drain only this node's target-specific authenticated frame lane and
     /// forward admitted canonical envelopes to the existing collaboration
     /// authority. Replay state is payload-free and expiry-cleaned each tick.
@@ -2389,24 +2373,6 @@ impl ClipboardSyncWorker {
             *cursor = Some(message.ulid);
         }
         admitted
-    }
-
-    fn drain_mesh_receive_frames(
-        &self,
-        persist: &mut Persist,
-        cursor: &mut Option<String>,
-        checkpoint: &Path,
-        ledger: &mut mesh::ClipboardMeshReplayLedger,
-        now_ms: u64,
-    ) -> usize {
-        persist.reopen_if_index_changed();
-        let topic = mesh::mesh_frame_topic(&self.target_node);
-        let Ok(messages) =
-            persist.list_since_limit(&topic, cursor.as_deref(), mesh::MAX_MESH_FRAMES_PER_TICK)
-        else {
-            return 0;
-        };
-        self.process_mesh_receive_frames(persist, messages, cursor, checkpoint, ledger, now_ms)
     }
 
     /// Drain signed collaboration clipboard envelopes through bounded decode,
@@ -2520,6 +2486,7 @@ impl ClipboardSyncWorker {
         materialized
     }
 
+    #[cfg(test)]
     fn drain_collab_clipboard_envelopes(
         &self,
         persist: &mut Persist,
@@ -2611,6 +2578,7 @@ impl ClipboardSyncWorker {
         applied
     }
 
+    #[cfg(test)]
     fn drain_clip_events(
         &self,
         persist: &mut Persist,

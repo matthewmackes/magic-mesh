@@ -597,7 +597,10 @@ mod tests {
     #[test]
     fn dearmor_accepts_exact_input_limit_and_rejects_one_byte_over() {
         let mut exact = armor(&[1, 2, 3], 0);
-        exact.extend(std::iter::repeat(' ').take(MAX_ARMORED_INPUT_BYTES - exact.len()));
+        exact.extend(std::iter::repeat_n(
+            ' ',
+            MAX_ARMORED_INPUT_BYTES - exact.len(),
+        ));
         assert_eq!(exact.len(), MAX_ARMORED_INPUT_BYTES);
         assert_eq!(
             dearmor(&exact).expect("exact armor limit must decode"),
@@ -661,7 +664,7 @@ mod tests {
             .len();
         plaintext
             .mesh_id
-            .extend(std::iter::repeat('x').take(target_len - current_len));
+            .extend(std::iter::repeat_n('x', target_len - current_len));
         assert_eq!(
             serde_json::to_vec(&plaintext)
                 .expect("sized plaintext must serialize")

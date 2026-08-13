@@ -114,13 +114,10 @@ pub fn try_acquire(lock_path: &Path, node_id: &str) -> std::io::Result<AcquireRe
         // churn seen on .13). On SUBSTRATE-V2 nodes leadership runs on the etcd
         // lease (`crate::substrate::leader`); this fs lock is the non-etcd path.
         if !crate::shared_root_writable(parent) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "shared dir {} is down — refusing to take leadership on a missing volume",
-                    parent.display()
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "shared dir {} is down — refusing to take leadership on a missing volume",
+                parent.display()
+            )));
         }
         std::fs::create_dir_all(parent)?;
     }
@@ -202,13 +199,10 @@ pub fn read_current_lease(lock_path: &Path) -> Option<Lease> {
 pub fn force_take(lock_path: &Path, node_id: &str) -> std::io::Result<Lease> {
     if let Some(parent) = lock_path.parent() {
         if !crate::shared_root_writable(parent) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "shared dir {} is down — refusing to take leadership on a missing volume",
-                    parent.display()
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "shared dir {} is down — refusing to take leadership on a missing volume",
+                parent.display()
+            )));
         }
         std::fs::create_dir_all(parent)?;
     }

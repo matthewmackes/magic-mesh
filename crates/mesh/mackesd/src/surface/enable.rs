@@ -773,7 +773,7 @@ pub(crate) fn is_armed(provided: Option<&str>, expected: &str) -> bool {
 /// the manual firmware step"). Pure; the Install tab shows it verbatim.
 #[must_use]
 pub fn mok_firmware_prompt() -> String {
-    format!(
+    String::from(
         "After the reboot the firmware shows a blue \"Shim UEFI key management\" \
 screen (MOK Manager). It will NOT continue to the desktop on its own:\n\
   1. Select \"Enroll MOK\"  →  \"Continue\".\n\
@@ -1211,7 +1211,8 @@ mod worker {
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::action_journal::{
         ActionClaim, CancelDisposition, CancelIntent, ClaimDisposition, JournalAction,
-        JournalDecision, JournalKey, JournalOutcome, JournalPhase, SurfaceActionJournal,
+        JournalDecision, JournalKey, JournalOutcome, JournalPhase, JournalRecord,
+        SurfaceActionJournal,
     };
     use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
@@ -1358,7 +1359,23 @@ mod worker {
                             action: JournalAction::Enable,
                             target_request_id: request.header.request_id.clone(),
                         };
-                        let allow_historical = journal.get(&key).ok().flatten().is_some();
+                        let existing = journal.get(&key).ok().flatten();
+                        let allow_historical = existing
+                            .as_ref()
+                            .is_some_and(|record| retained_action_matches(record, &msg.ulid, body));
+                        if existing.is_some() && !allow_historical {
+                            let result = self.refused_result(
+                                EnableRefusal::Authorization,
+                                "surface enable authorization refused: request id is already bound to another Bus message",
+                            );
+                            self.publish(
+                                persist,
+                                Some(&request.header.request_id),
+                                wall_now_ms(),
+                                &result,
+                            );
+                            continue;
+                        }
                         if let Some(token) = self.verified_token(
                             body,
                             context,
@@ -2158,6 +2175,16 @@ mod worker {
 
     fn exact_sha256(body: &str) -> String {
         format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    fn retained_action_matches(record: &JournalRecord, source_ulid: &str, body: &str) -> bool {
+        let action = match &record.phase {
+            JournalPhase::ActionClaimed { action }
+            | JournalPhase::ActionClaimedCancel { action, .. }
+            | JournalPhase::CancelClaimed { action, .. }
+            | JournalPhase::Closed { action, .. } => action,
+        };
+        action.source_ulid == source_ulid && action.exact_body_sha256 == exact_sha256(body)
     }
 
     fn generation_label(generation: SurfaceProGeneration) -> &'static str {

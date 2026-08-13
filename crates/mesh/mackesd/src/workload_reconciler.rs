@@ -145,6 +145,19 @@ impl WorkloadOperationLedger {
                 .status
                 .validate(status_validation_now)
                 .map_err(WorkloadLedgerError::Contract)?;
+            // The request and status are one durable authority record.  The
+            // wire validators intentionally validate each object in
+            // isolation, so replay must also reject a structurally valid
+            // status that was paired with another request's identity or
+            // placement contract.
+            if record.status.request_id != record.request.request_id
+                || record.status.workload_id != record.request.workload_id
+                || record.status.backend != record.request.backend
+                || record.status.resources != record.request.resources
+                || record.status.image_ref != record.request.image_ref
+            {
+                return Err(WorkloadLedgerError::Malformed);
+            }
             if operations.insert(request_id, record).is_some() {
                 return Err(WorkloadLedgerError::Malformed);
             }
@@ -684,6 +697,20 @@ mod tests {
             1,
         );
         std::fs::write(temp.path().join(WORKLOAD_LEDGER_FILENAME), hostile).expect("write hostile");
+
+        assert!(matches!(
+            WorkloadOperationLedger::open(temp.path()),
+            Err(WorkloadLedgerError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn recovered_status_must_remain_bound_to_its_request_authority() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut record = queued_record("req-1", "seat15-browser");
+        record.status.workload_id =
+            mackes_mesh_types::workloads::WorkloadId::new("seat16-browser").expect("id");
+        write_document(temp.path(), vec![record]);
 
         assert!(matches!(
             WorkloadOperationLedger::open(temp.path()),

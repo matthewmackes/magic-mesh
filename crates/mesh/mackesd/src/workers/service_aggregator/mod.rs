@@ -605,10 +605,10 @@ impl ServiceAggregatorWorker {
         }
     }
 
-    fn gate_bus_read(&self, topic: &str, index: usize) -> Result<(), String> {
+    fn gate_bus_read(&self, _topic: &str, _index: usize) -> Result<(), String> {
         #[cfg(test)]
         if let Some(gate) = self.bus_read_gate.as_ref() {
-            return gate(topic, index);
+            return gate(_topic, _index);
         }
         Ok(())
     }
@@ -826,10 +826,15 @@ impl ServiceAggregatorWorker {
     ) -> Result<(), String> {
         persist.reopen_if_index_changed();
         require_live_bus_index(persist, &self.bus_root)?;
-        for (index, (topic, body)) in staged.outputs.iter().enumerate() {
+        let outputs = staged.outputs.iter();
+        #[cfg(test)]
+        let outputs = outputs.enumerate();
+        #[cfg(not(test))]
+        let outputs = outputs.map(|output| ((), output));
+        for (_index, (topic, body)) in outputs {
             #[cfg(test)]
             if let Some(gate) = self.bus_write_gate.as_ref() {
-                gate(topic, index)?;
+                gate(topic, _index)?;
             }
             persist
                 .write(topic, Priority::Default, None, Some(body))

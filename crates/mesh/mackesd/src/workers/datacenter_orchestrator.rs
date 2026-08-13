@@ -1275,8 +1275,8 @@ impl DatacenterOrchestratorWorker {
         // DO (prod) zone — any eligible node may lead it.
         if Zone::Do.eligible(on_lan) && self.leads(Zone::Do) {
             let current = gather_do();
-            let mut events = self.do_core.reconcile(&with_rollup(current));
-            for ev in events.drain(..) {
+            let events = self.do_core.reconcile(&with_rollup(current));
+            for ev in events {
                 publish(&ev);
             }
         }
@@ -1285,8 +1285,8 @@ impl DatacenterOrchestratorWorker {
         if Zone::Xen.eligible(on_lan) && self.leads(Zone::Xen) {
             let mut current = gather_xen();
             current.extend(gather_gateway());
-            let mut events = self.xen_core.reconcile(&with_rollup(current));
-            for ev in events.drain(..) {
+            let events = self.xen_core.reconcile(&with_rollup(current));
+            for ev in events {
                 publish(&ev);
             }
         }

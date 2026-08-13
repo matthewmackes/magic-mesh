@@ -136,6 +136,7 @@ impl NebulaCsrWatcher {
     /// Override the cert backend — used by tests to inject
     /// `MockBackend` so the worker can run without nebula-cert
     /// on PATH.
+    #[must_use]
     pub fn with_backend(mut self, backend: Arc<dyn NebulaCertBackend>) -> Self {
         self.backend = backend;
         self
@@ -403,12 +404,6 @@ mod tests {
         build_pending_with_nebula_key, parse_join_token, publish_enrollment_request,
     };
     use tempfile::tempdir;
-
-    fn fresh_store() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
-        crate::store::migrate(&conn).expect("migrate");
-        conn
-    }
 
     fn make_test_ca(tmp_dir: &Path, conn: &rusqlite::Connection) -> (PathBuf, PathBuf) {
         let ca_crt = tmp_dir.join("ca.crt");

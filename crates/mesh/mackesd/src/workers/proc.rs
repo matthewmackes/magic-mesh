@@ -69,8 +69,7 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
         Some(stdout) => stdout,
         None => {
             reap_child(&mut child);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "subprocess stdout pipe was not available",
             ));
         }
@@ -79,8 +78,7 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
         Some(stderr) => stderr,
         None => {
             reap_child(&mut child);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "subprocess stderr pipe was not available",
             ));
         }
@@ -173,10 +171,7 @@ where
 fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
     match reader.join() {
         Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::Other,
-            "subprocess output reader panicked",
-        )),
+        Err(_) => Err(io::Error::other("subprocess output reader panicked")),
     }
 }
 

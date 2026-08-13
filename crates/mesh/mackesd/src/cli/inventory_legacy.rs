@@ -2,7 +2,6 @@
 //!
 //! Extracted verbatim from `main()` in `bin/mackesd.rs` (arch-1 SLICE 1:
 //! CLI verb handlers). Behaviour is unchanged; only the location moved.
-use crate::*;
 
 /// Handle the `inventory-legacy` subcommand.
 #[allow(unreachable_code)]

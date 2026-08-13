@@ -80,7 +80,12 @@ mod tests {
     #[test]
     fn activity_filename_is_colon_free_with_hash() {
         let name = activity_filename("20260531T093000", "{\"x\":1}");
-        assert!(name.ends_with(".json"));
+        assert_eq!(
+            std::path::Path::new(&name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("json")
+        );
         assert!(!name.contains(':'));
         assert!(name.starts_with("20260531T093000-"));
     }
@@ -95,7 +100,13 @@ mod tests {
             "under the audit/ type dir"
         );
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(name.ends_with(".json") && !name.contains(':'));
+        assert_eq!(
+            std::path::Path::new(name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("json")
+        );
+        assert!(!name.contains(':'));
         let entry: AuditEntry =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(entry.kind, "audit");

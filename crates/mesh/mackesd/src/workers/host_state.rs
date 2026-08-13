@@ -814,7 +814,7 @@ impl HostStateWorker {
                 let current = publisher
                     .current_intent()
                     .map_err(|error| error.to_string())?;
-                if !current.is_some_and(|intent| intent.state == NodeAvailabilityState::Maintenance)
+                if current.is_none_or(|intent| intent.state != NodeAvailabilityState::Maintenance)
                 {
                     return Err("maintenance end has no active maintenance intent".to_string());
                 }
@@ -1437,7 +1437,29 @@ mod tests {
         std::fs::rename(&prepared_bus, &blocked_bus).unwrap();
 
         let persist = Persist::open(blocked_bus.clone()).expect("open activated Bus");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fresh_snapshot = serde_json::to_string(&mirror_two_lit()).expect("fresh snapshot");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                persist
+                    .write(
+                        LOCAL_SNAPSHOT_TOPIC,
+                        Priority::Default,
+                        None,
+                        Some(&fresh_snapshot),
+                    )
+                    .expect("publish post-activation snapshot");
+                if persist
+                    .list_since(&mirror_topic("nodeA"), None)
+                    .is_ok_and(|messages| !messages.is_empty())
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before Bus activation");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovered worker must publish a fresh host mirror");
         assert!(
             persist
                 .list_since(&result_topic("nodeA"), None)

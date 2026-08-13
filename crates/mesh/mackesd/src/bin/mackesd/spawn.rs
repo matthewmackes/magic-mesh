@@ -457,7 +457,7 @@ pub(crate) fn start_worker_runtime_status_publisher(
                         delay
                     }
                 };
-                let sleep_cycles = (delay.as_millis() + 99) / 100;
+                let sleep_cycles = delay.as_millis().div_ceil(100);
                 for _ in 0..sleep_cycles {
                     if stop.load(Ordering::Relaxed) {
                         return;

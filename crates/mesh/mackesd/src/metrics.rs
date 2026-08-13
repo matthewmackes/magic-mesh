@@ -284,6 +284,7 @@ fn render_counter_series(out: &mut String, c: &Counter) {
 /// Render a counter as Prometheus text-format (header + single series).
 /// Used for lone counters; [`write_textfile`] instead de-dupes headers
 /// across same-named series.
+#[cfg(test)]
 fn render_counter(out: &mut String, c: &Counter) {
     render_counter_header(out, c);
     render_counter_series(out, c);

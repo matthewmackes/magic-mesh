@@ -663,7 +663,6 @@ fn wifi_channel(line: &str) -> Option<u16> {
     }
     let freq = line
         .strip_prefix("freq:")?
-        .trim()
         .split_whitespace()
         .next()?
         .parse::<u32>()

@@ -1365,10 +1365,15 @@ impl VoiceProvisionWorker {
     > {
         let mut candidate_cursors = self.action_cursors.clone();
         let mut actions = Vec::new();
-        for (index, topic) in ACTION_TOPICS.into_iter().enumerate() {
+        let topics = ACTION_TOPICS.into_iter();
+        #[cfg(test)]
+        let topics = topics.enumerate();
+        #[cfg(not(test))]
+        let topics = topics.map(|topic| ((), topic));
+        for (_index, topic) in topics {
             #[cfg(test)]
             if let Some(gate) = self.action_read_gate.as_ref() {
-                gate(topic, index)?;
+                gate(topic, _index)?;
             }
             let cursor = self.action_cursors.get(topic).and_then(Option::as_deref);
             let messages = persist

@@ -296,6 +296,7 @@ impl CollabWorker {
     }
 
     /// Override the Bus capability verifier for deterministic hostile fixtures.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
@@ -312,6 +313,7 @@ impl CollabWorker {
 
     /// Register bounded real-media proof providers for tests or future
     /// in-daemon WebRTC/SIP/LiveKit adapters.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_call_media_providers(
         mut self,
@@ -2362,7 +2364,7 @@ mod tests {
         let line = serde_json::to_string(&env).expect("serialize event");
         {
             let mut file = File::create(&log_path).expect("create actor log");
-            for _ in 0..(LOG_BACKFILL_SLICE_EVENTS * 4 + 1) {
+            for _ in 0..=(LOG_BACKFILL_SLICE_EVENTS * 4) {
                 writeln!(file, "{line}").expect("write actor log line");
             }
         }
@@ -2504,7 +2506,7 @@ mod tests {
         std::fs::create_dir_all(fresh_path.parent().expect("fresh parent")).expect("fresh mkdir");
         let old_line = serde_json::to_string(&old).expect("serialize old");
         let mut old_file = File::create(&old_path).expect("create old log");
-        for _ in 0..(LOG_BACKFILL_SLICE_EVENTS + 1) {
+        for _ in 0..=LOG_BACKFILL_SLICE_EVENTS {
             writeln!(old_file, "{old_line}").expect("write old log");
         }
         writeln!(
@@ -2597,7 +2599,7 @@ mod tests {
         let fresh_line = serde_json::to_string(&fresh).expect("serialize fresh");
         {
             let mut file = File::create(&fresh_path).expect("create fresh log");
-            for _ in 0..(LOG_BACKFILL_SLICE_EVENTS + 1) {
+            for _ in 0..=LOG_BACKFILL_SLICE_EVENTS {
                 writeln!(file, "{fresh_line}").expect("write fresh row");
             }
         }

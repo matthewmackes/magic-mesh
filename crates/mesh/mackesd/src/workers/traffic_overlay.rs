@@ -318,7 +318,6 @@ fn classify_arcgis_error(body: &str) -> Option<ProbeFailure> {
             .split_once("Retry after")
             .and_then(|(_, suffix)| {
                 suffix
-                    .trim_start()
                     .split_whitespace()
                     .next()
                     .and_then(|value| value.parse::<u64>().ok())

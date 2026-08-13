@@ -116,10 +116,7 @@ async fn read_bounded_ssh_key_material(path: &Path) -> std::io::Result<String> {
     tokio::task::spawn_blocking(move || read_bounded_ssh_key_material_sync(&path))
         .await
         .map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("SSH key material reader task failed: {error}"),
-            )
+            std::io::Error::other(format!("SSH key material reader task failed: {error}"))
         })?
 }
 
@@ -653,7 +650,7 @@ mod tests {
             verified_published_key(&envelope, "peer:pine", "").as_deref(),
             Some(KEY_A)
         );
-        assert!(verified_published_key(&KEY_A.to_string(), "peer:pine", "").is_none());
+        assert!(verified_published_key(KEY_A, "peer:pine", "").is_none());
         assert!(verified_published_key(&envelope, "peer:oak", "").is_none());
         assert!(verified_published_key(&envelope, "peer:pine", "mm").is_none());
         let tampered = envelope.replace("mde-mesh@pine", "mde-mesh@oak");

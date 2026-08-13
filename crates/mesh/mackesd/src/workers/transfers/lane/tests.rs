@@ -1,6 +1,5 @@
 use super::*;
 use crate::workers::transfers::job::{Method, TransferPolicy};
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -769,48 +768,6 @@ fn fixture_http_server(body: Vec<u8>) -> (String, mpsc::Receiver<String>, thread
         }
     });
     (format!("http://{addr}/payload.bin"), rx, join)
-}
-
-fn fixture_http_routes_server(
-    routes: Vec<(&'static str, Vec<u8>)>,
-) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let routes = routes.into_iter().collect::<BTreeMap<_, _>>();
-    let expected = routes.len();
-    let (tx, rx) = mpsc::channel();
-    let join = thread::spawn(move || {
-        let mut seen = Vec::new();
-        for _ in 0..expected {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_request(&mut stream);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/")
-                .to_string();
-            seen.push(path.clone());
-            if let Some(body) = routes.get(path.as_str()) {
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(head.as_bytes()).unwrap();
-                stream.write_all(body).unwrap();
-            } else {
-                let body = b"not found";
-                let head = format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(head.as_bytes()).unwrap();
-                stream.write_all(body).unwrap();
-            }
-        }
-        let _ = tx.send(seen);
-    });
-    (format!("http://{addr}"), rx, join)
 }
 
 fn read_request(stream: &mut TcpStream) -> String {

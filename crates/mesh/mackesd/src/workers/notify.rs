@@ -543,6 +543,7 @@ impl NotifyWorker {
         Ok(staged)
     }
 
+    #[cfg(test)]
     fn tick_once(&self, persist: &Persist, state: &mut SourceState, tick: u64, now_ms: i64) {
         match self.stage_tick(persist, state, tick, now_ms) {
             Ok(staged) => *state = staged,

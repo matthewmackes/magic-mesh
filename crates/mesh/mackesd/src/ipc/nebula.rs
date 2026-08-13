@@ -501,7 +501,7 @@ impl NebulaStatusService {
         let mut conn = self.store.lock().await;
         match epoch::bump_epoch_into(
             &SubprocessBackend,
-            &mut *conn,
+            &mut conn,
             &mesh_id,
             Some(&self.ca_crt_path),
             Some(&self.ca_key_path),

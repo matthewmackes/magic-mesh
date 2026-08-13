@@ -296,7 +296,6 @@ mod tests {
         // R5-Q3 lock — exactly 12 named fields. This is a structural
         // assertion: bumping the count is a schema-version bump.
         let c = Card::new(CardKind::Note, "x", 0);
-        let raw = serde_json::to_value(&c).unwrap();
         // The default serialization elides empty optionals; force them
         // all to non-empty so we count every field.
         let mut full = c.clone();

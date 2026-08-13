@@ -967,6 +967,7 @@ fn shared_inventory(
 /// Empty fwupd envelope used by parser/provider test fixtures. Production
 /// treats an unavailable updates read as unavailable inventory; it never uses
 /// this value to infer that devices are up to date.
+#[cfg(test)]
 const EMPTY_DEVICE_LIST: &str = r#"{"Devices":[]}"#;
 
 // ─────────────────────────── the apply verb (typed-armed) ───────────────────
@@ -1235,7 +1236,8 @@ mod worker {
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::action_journal::{
         ActionClaim, CancelDisposition, CancelIntent, ClaimDisposition, JournalAction,
-        JournalDecision, JournalKey, JournalOutcome, JournalPhase, SurfaceActionJournal,
+        JournalDecision, JournalKey, JournalOutcome, JournalPhase, JournalRecord,
+        SurfaceActionJournal,
     };
     use crate::surface::verify::{
         board_topic, run_verify, shared_board, shared_summary, summary_topic, LiveSurfaceProbes,
@@ -1396,46 +1398,63 @@ mod worker {
                 let body = msg.body.as_deref();
                 let mut claimed_key = None;
                 if let Some(body) = body {
-                    if let Some(request) = decode_historical_apply(body, &self.node_id) {
-                        let context = MutationContext {
-                            verb: FW_ACTION_AUTH_VERB,
-                            node: &self.node_id,
-                            target: &request.device_id,
-                        };
-                        let key = JournalKey {
-                            node: self.node_id.clone(),
-                            action: JournalAction::FirmwareApply,
-                            target_request_id: request.header.request_id.clone(),
-                        };
-                        let allow_historical = journal.get(&key).ok().flatten().is_some();
-                        if let Some(token) = self.verified_token(
-                            body,
-                            context,
-                            request.header.issued_at_ms,
-                            allow_historical,
-                        ) {
-                            if let Ok(claim) = self.action_claim(&msg.ulid, body, &request, &token)
-                            {
-                                match journal.claim_action(&claim) {
-                                    Ok(ClaimDisposition::Claimed) => {
-                                        claimed_key = Some(claim.key.clone());
-                                    }
-                                    Ok(ClaimDisposition::AlreadyClaimed) => {
-                                        self.record_interrupted_action(&journal, &claim);
-                                        self.retry_unpublished_results(persist, &journal);
-                                        continue;
-                                    }
-                                    Ok(
-                                        ClaimDisposition::CancellationWon
-                                        | ClaimDisposition::Closed,
-                                    )
-                                    | Err(_) => {
-                                        self.retry_unpublished_results(persist, &journal);
-                                        continue;
-                                    }
-                                }
-                            } else {
+                    if matches!(
+                        self.shared_model().generation,
+                        SurfaceProGeneration::Pro5 | SurfaceProGeneration::Pro6
+                    ) {
+                        if let Some(request) = decode_historical_apply(body, &self.node_id) {
+                            let context = MutationContext {
+                                verb: FW_ACTION_AUTH_VERB,
+                                node: &self.node_id,
+                                target: &request.device_id,
+                            };
+                            let key = JournalKey {
+                                node: self.node_id.clone(),
+                                action: JournalAction::FirmwareApply,
+                                target_request_id: request.header.request_id.clone(),
+                            };
+                            let existing = journal.get(&key).ok().flatten();
+                            let allow_historical = existing.as_ref().is_some_and(|record| {
+                                retained_action_matches(record, &msg.ulid, body)
+                            });
+                            if existing.is_some() && !allow_historical {
+                                let result = self.refused_result(
+                                    &request.device_id,
+                                    "firmware apply authorization refused: request id is already bound to another Bus message",
+                                );
+                                self.publish_result(persist, Some(&request), &result);
                                 continue;
+                            }
+                            if let Some(token) = self.verified_token(
+                                body,
+                                context,
+                                request.header.issued_at_ms,
+                                allow_historical,
+                            ) {
+                                if let Ok(claim) =
+                                    self.action_claim(&msg.ulid, body, &request, &token)
+                                {
+                                    match journal.claim_action(&claim) {
+                                        Ok(ClaimDisposition::Claimed) => {
+                                            claimed_key = Some(claim.key.clone());
+                                        }
+                                        Ok(ClaimDisposition::AlreadyClaimed) => {
+                                            self.record_interrupted_action(&journal, &claim);
+                                            self.retry_unpublished_results(persist, &journal);
+                                            continue;
+                                        }
+                                        Ok(
+                                            ClaimDisposition::CancellationWon
+                                            | ClaimDisposition::Closed,
+                                        )
+                                        | Err(_) => {
+                                            self.retry_unpublished_results(persist, &journal);
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -2309,6 +2328,16 @@ mod worker {
 
     fn exact_sha256(body: &str) -> String {
         format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    fn retained_action_matches(record: &JournalRecord, source_ulid: &str, body: &str) -> bool {
+        let action = match &record.phase {
+            JournalPhase::ActionClaimed { action }
+            | JournalPhase::ActionClaimedCancel { action, .. }
+            | JournalPhase::CancelClaimed { action, .. }
+            | JournalPhase::Closed { action, .. } => action,
+        };
+        action.source_ulid == source_ulid && action.exact_body_sha256 == exact_sha256(body)
     }
 
     fn generation_label(generation: SurfaceProGeneration) -> &'static str {

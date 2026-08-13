@@ -358,8 +358,6 @@ struct CollabFilesResolver {
     #[cfg(test)]
     fail_publications: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
-    after_bus_open: Option<TransferBusHook>,
-    #[cfg(test)]
     after_registry_read: Option<TransferBusHook>,
     #[cfg(test)]
     after_command_write: Option<TransferBusHook>,
@@ -368,6 +366,7 @@ struct CollabFilesResolver {
 }
 
 impl CollabFilesResolver {
+    #[cfg(test)]
     fn new(bus_root: Option<PathBuf>, content_root: PathBuf) -> Self {
         Self::with_bus_selection(TransferBusRoot::from_override(bus_root), content_root)
     }
@@ -387,8 +386,6 @@ impl CollabFilesResolver {
             projection_confirm_timeout: FILES_PROJECTION_CONFIRM_TIMEOUT,
             #[cfg(test)]
             fail_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            after_bus_open: None,
             #[cfg(test)]
             after_registry_read: None,
             #[cfg(test)]
@@ -418,12 +415,6 @@ impl CollabFilesResolver {
     }
 
     #[cfg(test)]
-    fn with_after_bus_open(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
-        self.after_bus_open = Some(Arc::new(hook));
-        self
-    }
-
-    #[cfg(test)]
     fn with_after_registry_read(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
         self.after_registry_read = Some(Arc::new(hook));
         self
@@ -446,14 +437,8 @@ impl CollabFilesResolver {
         object: FileRefId,
         mesh_node: Option<&str>,
     ) -> Result<(SpaceId, FileRef, u64), FilesResolveFailure> {
-        let transaction = TransferBusTransaction::open(
-            &self.bus_root,
-            #[cfg(test)]
-            self.after_bus_open.as_ref(),
-            #[cfg(not(test))]
-            None,
-        )
-        .map_err(|_| FilesResolveFailure::RegistryFailure)?;
+        let transaction = TransferBusTransaction::open(&self.bus_root, None)
+            .map_err(|_| FilesResolveFailure::RegistryFailure)?;
         let topics = transaction
             .persist
             .list_topics()
@@ -661,13 +646,7 @@ impl CollabFilesResolver {
         topic: &str,
         body: &str,
     ) -> Result<(), FilesCommitFailure> {
-        let transaction = TransferBusTransaction::open(
-            &self.bus_root,
-            #[cfg(test)]
-            self.after_bus_open.as_ref(),
-            #[cfg(not(test))]
-            None,
-        )
+        let transaction = TransferBusTransaction::open(&self.bus_root, None)
         .map_err(|_| FilesCommitFailure::Publication)?;
         transaction
             .persist
@@ -699,13 +678,7 @@ impl CollabFilesResolver {
             space,
         );
         loop {
-            if let Ok(transaction) = TransferBusTransaction::open(
-                &self.bus_root,
-                #[cfg(test)]
-                self.after_bus_open.as_ref(),
-                #[cfg(not(test))]
-                None,
-            ) {
+            if let Ok(transaction) = TransferBusTransaction::open(&self.bus_root, None) {
                 if let Ok(Some(message)) = transaction.persist.read_latest(&topic) {
                     #[cfg(test)]
                     if let Some(hook) = &self.after_projection_read {
@@ -1040,28 +1013,34 @@ impl Worker for TransfersWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let mut engine = self.engine()?;
-        let mut clipboard_materializer = if self.bus_root.enabled() {
-            match self.bus_root.resolve().and_then(|root| {
-                clipboard_materializer::ClipboardFilesMaterializer::bind(
-                    root,
-                    Arc::clone(&self.files_resolver),
-                )
-            }) {
-                Ok(materializer) => Some(materializer),
-                Err(error) => {
-                    tracing::warn!(%error, "clipboard materializer Bus unavailable; deferring bind");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let mut clipboard_materializer = None;
+        let mut clipboard_bind_deferred = false;
         tracing::info!(
             target: "mackesd::transfers",
             store = %self.store_root.display(), cap = self.cap,
             "transfers worker up (queue/ledger/verb spine; http lane wired, remaining lanes honestly gated)",
         );
         loop {
+            if clipboard_materializer.is_none() && self.bus_root.enabled() {
+                match self.bus_root.resolve().and_then(|root| {
+                    clipboard_materializer::ClipboardFilesMaterializer::bind(
+                        root,
+                        Arc::clone(&self.files_resolver),
+                    )
+                }) {
+                    Ok(materializer) => {
+                        if clipboard_bind_deferred {
+                            tracing::info!("clipboard materializer Bus bind recovered");
+                        }
+                        clipboard_materializer = Some(materializer);
+                    }
+                    Err(error) if !clipboard_bind_deferred => {
+                        tracing::warn!(%error, "clipboard materializer Bus unavailable; deferring bind");
+                        clipboard_bind_deferred = true;
+                    }
+                    Err(_) => {}
+                }
+            }
             if let Some(materializer) = &mut clipboard_materializer {
                 materializer.drain(now_ms());
             }
@@ -1097,7 +1076,7 @@ struct V2Task {
 
 enum V2TaskResult {
     Terminal {
-        job: TransferJobV2,
+        job: Box<TransferJobV2>,
         checksum_sha256: Option<String>,
     },
     Superseded,
@@ -1743,7 +1722,7 @@ fn run_v2_copy_attempt(
             typed_transfer_error(TransferErrorCode::Unsupported, false, provider),
         )
         .map_or(V2TaskResult::Superseded, |job| V2TaskResult::Terminal {
-            job,
+            job: Box::new(job),
             checksum_sha256: None,
         });
     }
@@ -1758,7 +1737,7 @@ fn run_v2_copy_attempt(
                 resolution_failure(&error),
             )
             .map_or(V2TaskResult::Superseded, |job| V2TaskResult::Terminal {
-                job,
+                job: Box::new(job),
                 checksum_sha256: None,
             });
         }
@@ -1794,7 +1773,7 @@ fn run_v2_copy_attempt(
                 job.progress.error = None;
             })
             .map_or(V2TaskResult::Superseded, |job| V2TaskResult::Terminal {
-                job,
+                job: Box::new(job),
                 checksum_sha256: Some(outcome.sha256_hex),
             })
         }
@@ -1806,7 +1785,7 @@ fn run_v2_copy_attempt(
             copy_failure(&error),
         )
         .map_or(V2TaskResult::Superseded, |job| V2TaskResult::Terminal {
-            job,
+            job: Box::new(job),
             checksum_sha256: None,
         }),
     }
@@ -1853,6 +1832,7 @@ impl TransferBusPublication {
 }
 
 impl TransferNotifier {
+    #[cfg(test)]
     fn new(bus_root: PathBuf) -> Self {
         Self::with_bus_selection(TransferBusRoot::Explicit(bus_root))
     }
@@ -3273,18 +3253,22 @@ mod tests {
         let job = v2_clipboard_job();
         let id = job.transfer;
         write_verb(tmp.path(), &TransferVerb::SubmitV2(job)).unwrap();
-        for _ in 0..100 {
-            engine.tick().await;
-            if engine
-                .v2_ledger
-                .get(id)
-                .is_some_and(|job| job.state == V2State::Failed)
-                && engine.v2_tasks.is_empty()
-            {
-                break;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                engine.tick().await;
+                if engine
+                    .v2_ledger
+                    .get(id)
+                    .is_some_and(|job| job.state == V2State::Failed)
+                    && engine.v2_tasks.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("clipboard admission timeout");
 
         let failed = engine.v2_ledger.get(id).expect("durable blocked row");
         let error = failed.progress.error.expect("named provider blocker");

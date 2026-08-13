@@ -117,6 +117,7 @@ impl NetstateApplyWorker {
     }
 
     /// One converge pass. Returns the outcome (for tests / logging).
+    #[cfg(test)]
     fn converge(&self, ops: &dyn NetOps) -> ApplyOutcome {
         let dir = magic_fleet::store::revisions_dir(&self.workgroup_root);
         let Some(head) = magic_fleet::store::elect_head(&dir) else {

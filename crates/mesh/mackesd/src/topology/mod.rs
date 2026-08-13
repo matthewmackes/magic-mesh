@@ -293,7 +293,7 @@ mod tests {
         let topo = calculate(&snap);
         assert_eq!(topo.edges.len(), 3);
         assert_eq!(topo.routes.len(), 3);
-        for (_, table) in &topo.routes {
+        for table in topo.routes.values() {
             assert_eq!(table.len(), 2);
         }
     }

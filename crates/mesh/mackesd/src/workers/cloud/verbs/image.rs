@@ -240,7 +240,7 @@ fn valid_registry_component(component: &str) -> bool {
     let Some(colon) = component.rfind(':') else {
         return valid_image_name_component(component);
     };
-    component[..colon].contains(':') == false
+    !component[..colon].contains(':')
         && valid_image_name_component(&component[..colon])
         && valid_registry_port(&component[colon + 1..])
 }

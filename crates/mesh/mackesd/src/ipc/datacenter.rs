@@ -1564,7 +1564,7 @@ mod tests {
         let svc = DatacenterService::new(tmp.path().to_path_buf());
         let topic = action_topic("genesis-plan");
         let mut requests = Vec::new();
-        for index in 0..(MAX_MESSAGES_PER_POLL + 1) {
+        for index in 0..=MAX_MESSAGES_PER_POLL {
             let body = json!({
                 "mesh_id": format!("mesh-{index}"),
                 "region": "nyc3"

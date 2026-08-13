@@ -352,6 +352,7 @@ impl LocalApplier {
         }
     }
 
+    #[cfg(test)]
     fn with_bus_root(mut self, bus_root: PathBuf) -> Self {
         self.bus_root = Some(bus_root);
         self
@@ -719,7 +720,7 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(feature = "async-services")]
+#[cfg(all(test, feature = "async-services"))]
 fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     if value.len() != N * 2 {
         return None;

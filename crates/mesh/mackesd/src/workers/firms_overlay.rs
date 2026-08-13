@@ -687,23 +687,6 @@ impl FirmsOverlayWorker {
         }
     }
 
-    fn publish_no_context_degraded(
-        &self,
-        last_good: &mut Option<FirmsSnapshot>,
-        reason: &str,
-    ) -> io::Result<()> {
-        self.publish(&self.status_snapshot(
-            FirmsAvailability::Ready,
-            None,
-            format!("NASA FIRMS paused: {reason}"),
-        ))?;
-        // Thermal anomalies are vehicle-scoped. Once the same-host fix
-        // disappears, keep the retained Bus topic present but do not allow a
-        // later failure to replay hotspots from the stale prior query origin.
-        *last_good = None;
-        Ok(())
-    }
-
     /// A process-local suppression flag is only a hint to inspect the current
     /// Bus. Suppress only while this exact status (apart from its publication
     /// time) is retained in the current index; a cleared or replaced index
@@ -1195,7 +1178,10 @@ mod tests {
             "N20".to_string(),
             "nominal".to_string(),
         ];
-        excessive_fields.extend(std::iter::repeat(String::from("unexpected")).take(MAX_CSV_FIELDS));
+        excessive_fields.extend(std::iter::repeat_n(
+            String::from("unexpected"),
+            MAX_CSV_FIELDS,
+        ));
         let body = format!(
             "latitude,longitude,bright_ti4,frp,acq_date,acq_time,satellite,confidence\n{}\n35.80,-78.60,331.0,17.0,2026-07-23,124000,N20,low\n",
             excessive_fields.join(",")
@@ -1655,11 +1641,13 @@ mod tests {
         .expect("snapshot");
         assert!(!original.hotspots.is_empty());
         let mut last_good = Some(original);
+        let mut no_fix_published = false;
 
         worker
-            .publish_no_context_degraded(&mut last_good, "fresh same-host vehicle fix unavailable")
+            .ensure_no_context_published(&mut last_good, &mut no_fix_published)
             .expect("publish retraction");
 
+        assert!(no_fix_published, "no-fix status must be recorded as published");
         assert!(
             last_good.is_none(),
             "old vehicle-scoped FIRMS hotspot cache must not survive fix loss"

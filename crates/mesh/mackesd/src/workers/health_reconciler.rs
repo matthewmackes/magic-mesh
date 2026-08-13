@@ -1233,8 +1233,8 @@ fn atomic_replace_bytes(
         file.write_all(&body)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary, &target)?;
-        std::fs::File::open(&parent)?.sync_all()
+        std::fs::rename(&temporary, target)?;
+        std::fs::File::open(parent)?.sync_all()
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -2055,7 +2055,7 @@ mod tests {
         .expect("failed projection pass");
         assert_eq!(failed.projection_failures, 1);
         assert!(ingress.ledger.retained("node-a").is_none());
-        assert!(ingress.bus_cursors.get("node-a").is_none());
+        assert!(!ingress.bus_cursors.contains_key("node-a"));
 
         std::fs::remove_file(health_nodes_dir(workgroup.path())).expect("unblock projection");
         let retried = ingest_health_publications(
@@ -2186,7 +2186,7 @@ mod tests {
         );
         assert!(after_restart.ledger.retained("node-a").is_some());
         assert!(after_restart.ledger.retained("node-b").is_none());
-        assert!(after_restart.bus_cursors.get("node-b").is_none());
+        assert!(!after_restart.bus_cursors.contains_key("node-b"));
         assert!(
             !departed_projection.exists(),
             "decommissioned publisher cannot retain a visible health projection"

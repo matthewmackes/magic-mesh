@@ -704,7 +704,7 @@ mod tests {
         assert!(decode_sha256_hex("").is_none());
         assert!(decode_sha256_hex("xx").is_none());
         // 64 chars but bogus alphabet.
-        let bogus: String = std::iter::repeat('z').take(64).collect();
+        let bogus = "z".repeat(64);
         assert!(decode_sha256_hex(&bogus).is_none());
     }
 }

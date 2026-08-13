@@ -108,32 +108,9 @@ pub(crate) trait AndroidGuestProvider: Send + Sync {
     /// Dispatch the canonical launcher intent for one governed starter app.
     fn launch(&self, request: &AndroidGuestLaunchRequest) -> AndroidGuestLaunchOutcome;
 
-    /// Observe inventory for the exact lifecycle generation.
-    fn inventory_at(
-        &self,
-        request: &AndroidGuestInventoryRequest,
-        _generation: u64,
-    ) -> AndroidAppInventory {
-        self.inventory(request)
-    }
-
-    /// Launch only within the exact lifecycle generation.
-    fn launch_at(
-        &self,
-        request: &AndroidGuestLaunchRequest,
-        _generation: u64,
-    ) -> AndroidGuestLaunchOutcome {
-        self.launch(request)
-    }
-
     /// Return a truthful guest-owned display source for one generation.
     fn vdi_source(&self, _generation: u64) -> Option<AndroidVdiSource> {
         None
-    }
-
-    /// Revoke the guest app/session for one generation before outer-VM cleanup.
-    fn cleanup(&self, _request_id: &str, _generation: u64) -> bool {
-        false
     }
 }
 
@@ -178,6 +155,7 @@ pub(super) fn dispatch_guest_request<P: AndroidGuestProvider + ?Sized>(
 /// Run a guest request through the current provider seam without touching a
 /// live seat or host command runner. This is intentionally fail-closed until a
 /// real Cuttlefish provider is wired into the cloud worker.
+#[cfg(test)]
 pub(super) fn handle_guest_request(
     request: AndroidGuestRequest,
 ) -> Result<AndroidGuestResponse, AndroidGuestBoundaryError> {
@@ -288,15 +266,10 @@ impl AndroidGuestProviderRegistry {
     }
 
     /// Number of registered workload providers.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.providers.len()
-    }
-
-    /// Whether no workload-scoped providers are registered.
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.providers.is_empty()
     }
 
     /// Dispatch through the provider selected by the request's admitted
@@ -314,28 +287,6 @@ impl AndroidGuestProviderRegistry {
         dispatch_guest_request(provider, request)
     }
 
-    pub(crate) fn inventory_at(
-        &self,
-        request: &AndroidGuestInventoryRequest,
-        generation: u64,
-    ) -> AndroidAppInventory {
-        self.provider(&request.workload_id).map_or_else(
-            |_| AndroidAppInventory::pending(request.workload_id.clone()),
-            |provider| provider.inventory_at(request, generation),
-        )
-    }
-
-    pub(crate) fn launch_at(
-        &self,
-        request: &AndroidGuestLaunchRequest,
-        generation: u64,
-    ) -> AndroidGuestLaunchOutcome {
-        self.provider(&request.workload_id)
-            .map_or(AndroidGuestLaunchOutcome::Unavailable, |provider| {
-                provider.launch_at(request, generation)
-            })
-    }
-
     pub(crate) fn vdi_source(
         &self,
         workload_id: &str,
@@ -344,11 +295,6 @@ impl AndroidGuestProviderRegistry {
         self.provider(workload_id)
             .ok()
             .and_then(|provider| provider.vdi_source(generation))
-    }
-
-    pub(crate) fn cleanup(&self, workload_id: &str, request_id: &str, generation: u64) -> bool {
-        self.provider(workload_id)
-            .is_ok_and(|provider| provider.cleanup(request_id, generation))
     }
 }
 
@@ -701,6 +647,7 @@ impl AndroidInventoryLedger {
     }
 
     /// Number of retained workload inventories.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.inventories.len()

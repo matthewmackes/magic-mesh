@@ -1304,9 +1304,10 @@ mod tests {
 
     impl PassReader for PanicOnceReader {
         fn stage(&self, _persist: &Persist) -> Result<StagedPass, String> {
-            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("injected blocking-pass panic");
-            }
+            assert!(
+                self.attempts.fetch_add(1, Ordering::SeqCst) != 0,
+                "injected blocking-pass panic"
+            );
             Err("defer after injected panic".into())
         }
     }

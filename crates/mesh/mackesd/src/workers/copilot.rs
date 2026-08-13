@@ -1209,6 +1209,7 @@ impl CopilotWorker {
 
     /// Override the Copilot capability verifier for deterministic hostile
     /// fixtures. Production always uses the root/systemd credential verifier.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;

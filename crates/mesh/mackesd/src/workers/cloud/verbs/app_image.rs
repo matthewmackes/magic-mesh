@@ -61,10 +61,6 @@ pub(super) enum AppVmImageAdmission {
 }
 
 impl AppVmImageAdmission {
-    pub(super) fn is_admitted(&self) -> bool {
-        matches!(self, Self::Admitted { .. })
-    }
-
     pub(super) fn reason(&self) -> String {
         match self {
             Self::Unavailable(reason) => format!("unavailable: {reason}"),

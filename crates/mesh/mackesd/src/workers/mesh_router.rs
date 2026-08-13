@@ -532,7 +532,8 @@ impl MeshRouterWorker {
                 }
             }
         });
-        if let Some(old) = self.https_readers.write().await.insert(peer_id, task) {
+        let old = self.https_readers.write().await.insert(peer_id, task);
+        if let Some(old) = old {
             old.abort();
         }
     }
@@ -571,7 +572,8 @@ impl MeshRouterWorker {
     async fn remove_https_connection(&self, peer_id: &str) {
         self.https_connections.write().await.remove(peer_id);
         self.https_inboxes.write().await.remove(peer_id);
-        if let Some(reader) = self.https_readers.write().await.remove(peer_id) {
+        let reader = self.https_readers.write().await.remove(peer_id);
+        if let Some(reader) = reader {
             reader.abort();
         }
     }
@@ -619,7 +621,8 @@ impl MeshRouterWorker {
                 &connection,
             )
             .await;
-            if let Some(reader) = self.https_readers.write().await.remove(peer_id) {
+            let reader = self.https_readers.write().await.remove(peer_id);
+            if let Some(reader) = reader {
                 reader.abort();
             }
             return Err(e);
@@ -1132,7 +1135,8 @@ mod tests {
                     code: "mock_stream_lost",
                 });
             }
-            if let Some(payload) = self.first_payload.lock().await.take() {
+            let payload = self.first_payload.lock().await.take();
+            if let Some(payload) = payload {
                 return Ok(payload);
             }
             std::future::pending().await

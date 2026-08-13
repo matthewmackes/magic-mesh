@@ -207,13 +207,14 @@ impl NwsAlertProbe for NwsHttpProbe {
 
     fn fetch_zone(&self, url: &str) -> io::Result<String> {
         validate_zone_url(url)?;
-        if let Some(body) = self
-            .zone_cache
-            .lock()
-            .map_err(|_| io::Error::other("NWS zone cache lock poisoned"))?
-            .get(url)
-            .cloned()
-        {
+        let cached_body = {
+            let cache = self
+                .zone_cache
+                .lock()
+                .map_err(|_| io::Error::other("NWS zone cache lock poisoned"))?;
+            cache.get(url).cloned()
+        };
+        if let Some(body) = cached_body {
             return Ok(body);
         }
         // An api.weather.gov affected-zone URL must never redirect this worker

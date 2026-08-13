@@ -375,7 +375,12 @@ fn take_pending_requests(workgroup_root: &Path, self_host: &str) -> Vec<RouterAc
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        if !name.ends_with(".json") || name.ends_with(".result.json") || name.starts_with('.') {
+        if !std::path::Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            || name.ends_with(".result.json")
+            || name.starts_with('.')
+        {
             continue;
         }
         let Some(file_id) = name.strip_suffix(".json") else {

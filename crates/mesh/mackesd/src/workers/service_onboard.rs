@@ -1144,14 +1144,15 @@ mod tests {
             .expect("forward command must execute");
         }
 
-        let sent_guard = sent.lock().unwrap();
-        assert_eq!(sent_guard.len(), 2, "each forward command executes once");
-        let ids = sent_guard
-            .iter()
-            .map(|(_, body)| serde_json::from_str::<ServiceAddEvent>(body).unwrap().id)
-            .collect::<Vec<_>>();
+        let ids = {
+            let sent_guard = sent.lock().unwrap();
+            assert_eq!(sent_guard.len(), 2, "each forward command executes once");
+            sent_guard
+                .iter()
+                .map(|(_, body)| serde_json::from_str::<ServiceAddEvent>(body).unwrap().id)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids, ["svc-forward-one", "svc-forward-two"]);
-        drop(sent_guard);
 
         shutdown_tx.send(true).expect("request shutdown");
         tokio::time::timeout(Duration::from_secs(3), task)

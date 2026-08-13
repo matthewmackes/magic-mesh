@@ -36,7 +36,6 @@ const GUEST_SOCKET_ROOT_ENV: &str = "MDE_CUTTLEFISH_GUEST_SOCKET_DIR";
 enum GuestOperation {
     Observe,
     Launch(AndroidGuestLaunchRequest),
-    Cleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,15 +94,6 @@ pub(super) trait CuttlefishGuestTransport: Send + Sync {
         package_manifest: &AndroidImagePackageManifest,
         generation: u64,
     ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError>;
-
-    fn cleanup(
-        &self,
-        request_id: &str,
-        target: &CuttlefishVmTarget,
-        catalog_digest: &str,
-        package_manifest: &AndroidImagePackageManifest,
-        generation: u64,
-    ) -> Result<(), CuttlefishProviderError>;
 }
 
 /// Production framed transport to the workload-scoped guest relay.
@@ -280,28 +270,6 @@ impl CuttlefishGuestTransport for UnixCuttlefishGuestTransport {
         .launch_outcome
         .ok_or(CuttlefishProviderError::ProviderRejected)
     }
-
-    fn cleanup(
-        &self,
-        request_id: &str,
-        target: &CuttlefishVmTarget,
-        catalog_digest: &str,
-        package_manifest: &AndroidImagePackageManifest,
-        generation: u64,
-    ) -> Result<(), CuttlefishProviderError> {
-        let response = self.exchange(Self::request(
-            request_id,
-            target,
-            catalog_digest,
-            package_manifest,
-            generation,
-            GuestOperation::Cleanup,
-        ))?;
-        response
-            .cleanup_complete
-            .then_some(())
-            .ok_or(CuttlefishProviderError::ProviderRejected)
-    }
 }
 
 fn validate_request(request: &GuestRequest) -> Result<(), CuttlefishProviderError> {
@@ -406,15 +374,6 @@ fn validate_response(
                 || response.inventory.is_some()
                 || response.vdi_source.is_some()
                 || response.cleanup_complete
-            {
-                return Err(CuttlefishProviderError::ProviderRejected);
-            }
-        }
-        GuestOperation::Cleanup => {
-            if !response.cleanup_complete
-                || response.inventory.is_some()
-                || response.vdi_source.is_some()
-                || response.launch_outcome.is_some()
             {
                 return Err(CuttlefishProviderError::ProviderRejected);
             }
@@ -734,42 +693,5 @@ mod tests {
             0,
             "an unauthenticated relay must receive no governed request bytes"
         );
-    }
-
-    #[test]
-    fn transport_reconnects_and_cleanup_revokes_the_session() {
-        let temporary = tempfile::tempdir().expect("socket root");
-        let socket = temporary.path().join("android-one.sock");
-        let listener = UnixListener::bind(&socket).expect("guest listener");
-        let server = thread::spawn(move || {
-            for index in 0..2 {
-                let (mut stream, _) = listener.accept().expect("guest connection");
-                let request = read_request(&mut stream);
-                let cleanup = index == 1;
-                assert_eq!(cleanup, request.operation == GuestOperation::Cleanup);
-                write_response(
-                    &mut stream,
-                    &GuestResponse {
-                        schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
-                        request_id: request.request_id,
-                        target: request.target,
-                        catalog_digest: request.catalog_digest,
-                        generation: request.generation,
-                        inventory: (!cleanup).then(ready_inventory),
-                        launch_outcome: None,
-                        vdi_source: (!cleanup).then(vdi_source),
-                        cleanup_complete: cleanup,
-                    },
-                );
-            }
-        });
-        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
-        transport
-            .observe("observe-7", &target(), CATALOG_DIGEST, &manifest(), 7)
-            .expect("first connection");
-        transport
-            .cleanup("cleanup-7", &target(), CATALOG_DIGEST, &manifest(), 7)
-            .expect("reconnected cleanup");
-        server.join().expect("guest server");
     }
 }

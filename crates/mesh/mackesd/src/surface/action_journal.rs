@@ -161,6 +161,7 @@ pub enum DecisionDisposition {
 
 #[derive(Debug)]
 pub struct SurfaceActionJournal {
+    #[cfg(test)]
     root: PathBuf,
     directory: File,
     trusted_uid: u32,
@@ -185,6 +186,7 @@ impl SurfaceActionJournal {
         .into();
         validate_directory(&directory, trusted_uid)?;
         let journal = Self {
+            #[cfg(test)]
             root,
             directory,
             trusted_uid,
@@ -459,19 +461,20 @@ impl SurfaceActionJournal {
             Ok(this
                 .scan_locked()?
                 .into_iter()
-                .filter(|record| match &record.phase {
-                    JournalPhase::ActionClaimedCancel {
-                        late_cancel_decision: Some(_),
-                        late_cancel_published: false,
-                        ..
-                    }
-                    | JournalPhase::Closed {
-                        winner: JournalWinner::Action,
-                        late_cancel_decision: Some(_),
-                        late_cancel_published: false,
-                        ..
-                    } => true,
-                    _ => false,
+                .filter(|record| {
+                    matches!(
+                        &record.phase,
+                        JournalPhase::ActionClaimedCancel {
+                            late_cancel_decision: Some(_),
+                            late_cancel_published: false,
+                            ..
+                        } | JournalPhase::Closed {
+                            winner: JournalWinner::Action,
+                            late_cancel_decision: Some(_),
+                            late_cancel_published: false,
+                            ..
+                        }
+                    )
                 })
                 .collect())
         })
@@ -670,7 +673,9 @@ impl SurfaceActionJournal {
                 continue;
             }
             if name.len() != 69
-                || !name.ends_with(".json")
+                || !std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
                 || !name[..64]
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())

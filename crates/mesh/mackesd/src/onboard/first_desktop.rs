@@ -1532,9 +1532,10 @@ mod tests {
                         .expect("write Workload projection");
                     return;
                 }
-                if Instant::now() >= deadline {
-                    panic!("timed out waiting for Workload operation");
-                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for Workload operation"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
         });

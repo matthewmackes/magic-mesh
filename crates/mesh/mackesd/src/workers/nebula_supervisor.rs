@@ -163,6 +163,7 @@ impl NebulaSupervisor {
     }
 
     /// Override the root-local relay authority pin — used by tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_relay_trust_authority_pin(mut self, path: PathBuf) -> Self {
         self.relay_trust_authority_pin_path = path;
@@ -185,6 +186,7 @@ impl NebulaSupervisor {
     }
 
     /// Override the coordination-plane authority — used by isolated tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_leadership_endpoints(mut self, endpoints: Vec<String>) -> Self {
         self.leadership_endpoints = endpoints;
@@ -193,6 +195,7 @@ impl NebulaSupervisor {
 
     /// Override the systemctl executable — used by deterministic runtime
     /// retry tests without requiring a live systemd instance.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_systemctl_path(mut self, path: PathBuf) -> Self {
         self.systemctl_path = path;
@@ -3221,6 +3224,7 @@ exit 0
         )
         .with_workgroup_root(tmp.path().to_path_buf())
         .with_role_marker(marker.clone())
+        .with_overlay_ip_path(tmp.path().join("overlay-ip"))
         .with_leadership_endpoints(Vec::new());
 
         assert!(!marker.exists(), "test starts without a role marker");

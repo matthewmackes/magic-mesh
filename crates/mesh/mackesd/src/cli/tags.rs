@@ -42,7 +42,7 @@ pub fn run(json: bool, db_path: PathBuf) -> anyhow::Result<()> {
         if json {
             println!("{}", serde_json::to_string(&rows)?);
         } else {
-            println!("{:<12} {}", "TAG", "NODES");
+            println!("{:<12} NODES", "TAG");
             for r in &rows {
                 let nodes = r["nodes"]
                     .as_array()

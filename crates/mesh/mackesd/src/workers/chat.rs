@@ -2548,19 +2548,10 @@ mod tests {
         let mut w = worker(root);
         let persist = persist_at(root);
         let mut state = ChatState::default();
-        // A lane is discovered only once it already has a message; on first
-        // sight the worker seeds its cursor to head (forward-only — the startup
-        // backlog isn't replayed). Prime the lane, tick to discover+seed, THEN
-        // the real alert folds like a live one.
-        persist
-            .write(
-                "event/security/alert",
-                Priority::Min,
-                None,
-                Some(r#"{"severity":"info","host":"nyc3","summary":"pre-existing"}"#),
-            )
-            .unwrap();
-        w.tick_once(&persist, &mut state, 100); // discovers + seeds the lane
+        // Start before the durable alert lane exists, then discover its first
+        // live message. Durable lanes replay from their exact cursor rather than
+        // discarding the first row as transient action lanes do.
+        w.tick_once(&persist, &mut state, 100);
 
         persist
             .write(
@@ -2751,15 +2742,8 @@ mod tests {
         let persist = persist_at(root);
         let mut state = ChatState::default();
         state.notify.mute_contact("nyc3");
-        // Prime + seed the lane (forward-only), then land a Critical from nyc3.
-        persist
-            .write(
-                "event/security/alert",
-                Priority::Min,
-                None,
-                Some(r#"{"severity":"info","host":"nyc3","summary":"pre"}"#),
-            )
-            .unwrap();
+        // Start before the durable alert lane exists, then land a Critical from
+        // nyc3. There is no synthetic priming alert to pollute the conversation.
         w.tick_once(&persist, &mut state, 100);
         persist
             .write(

@@ -88,9 +88,11 @@ use runner::{
 };
 #[cfg(test)]
 use verbs::AndroidInventoryLedgerError;
+#[cfg(test)]
+pub(crate) use verbs::{AndroidGuestProvider, AndroidGuestProviderRegistryError};
 pub(crate) use verbs::{
-    AndroidGuestProvider, AndroidGuestProviderRegistry, AndroidGuestProviderRegistryError,
-    CuttlefishOuterWorkloadObservation, WorkloadCuttlefishProviderClient,
+    AndroidGuestProviderRegistry, CuttlefishOuterWorkloadObservation,
+    WorkloadCuttlefishProviderClient,
 };
 use verbs::{AndroidInventoryLedger, AndroidInventoryLedgerAdmission, CloudActionBody, CloudVerb};
 
@@ -336,7 +338,7 @@ impl CloudWorker {
                 );
                 None
             })
-            .unwrap_or_else(AndroidInventoryLedger::new);
+            .unwrap_or_default();
 
         Self {
             host,
@@ -391,10 +393,10 @@ impl CloudWorker {
         self
     }
 
-    /// Register one typed Android guest provider for a stable workload identity.
-    /// A missing registration is intentionally left as the pending Workloads
-    /// projection; this builder is the explicit seam for a real Cuttlefish
-    /// adapter, not a discovery or shell-execution shortcut.
+    /// Register one typed Android guest provider in focused worker tests.
+    /// Production discovers and admits Cuttlefish adapters during inventory
+    /// refresh rather than relying on startup-only injection.
+    #[cfg(test)]
     pub(crate) fn with_android_guest_provider(
         mut self,
         workload_id: impl Into<String>,
@@ -424,6 +426,7 @@ impl CloudWorker {
     /// worker tests. Disabling it also clears constructor-loaded observations so
     /// a shared test root cannot leak evidence between cases. Production keeps
     /// the host-scoped path selected by `new`.
+    #[cfg(test)]
     pub(crate) fn with_android_inventory_path(mut self, path: Option<PathBuf>) -> Self {
         self.android_inventory_path = path;
         if self.android_inventory_path.is_none() {
@@ -543,6 +546,23 @@ impl CloudWorker {
         }
         if let Some(reply) = self.reject_nonlocal_placement(verb_name, body) {
             return reply;
+        }
+        if matches!(
+            CloudVerb::from_verb(verb_name),
+            Some(CloudVerb::AndroidLifecycle)
+        ) {
+            let Ok(_lifecycle) = self.android_lifecycle_lock.lock() else {
+                return CloudReply {
+                    ok: false,
+                    verb: verb_name.to_owned(),
+                    error: Some(
+                        "Android lifecycle serialization is unavailable; nothing changed"
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                };
+            };
+            return verbs::dispatch(self, verb_name, body);
         }
         verbs::dispatch(self, verb_name, body)
     }
@@ -1038,7 +1058,8 @@ impl CloudWorker {
         self.apply_staged_actions(persist, cursors, staged)
     }
 
-    /// Compatibility seam retained for focused tests and direct adapters.
+    /// Compatibility seam retained for focused tests.
+    #[cfg(test)]
     fn drain_actions(&self, cursors: &mut HashMap<String, String>) -> bool {
         let result = self.open_bus().and_then(|opened| match opened {
             Some((persist, _)) => self.drain_actions_on(&persist, cursors),
@@ -1055,6 +1076,7 @@ impl CloudWorker {
 
     /// Atomically seed all existing Cloud action lanes. A failure leaves the
     /// caller's prior cursor set untouched.
+    #[cfg(test)]
     fn prime_cursors(&self, cursors: &mut HashMap<String, String>) {
         let Ok(Some((persist, identity))) = self.open_bus() else {
             return;
@@ -1168,7 +1190,7 @@ impl CloudWorker {
     /// verified package manifest is present. A missing manifest leaves the
     /// workload on the existing pending projection; it never gets a guessed
     /// image provenance or a fake provider.
-    fn ensure_configured_cuttlefish_providers(&mut self) {
+    fn ensure_configured_cuttlefish_providers(&mut self) -> HashMap<String, u64> {
         let catalog = self.load_admitted_android_catalog();
         let artifact = configured_image_path();
         // One validated typed snapshot feeds every Cuttlefish adapter in this
@@ -1180,6 +1202,7 @@ impl CloudWorker {
             self.runner.probe_tool(runner::TOOL_LIBVIRT).state == HealthState::Up;
         let observed_at = u64::try_from(now_ms()).unwrap_or(1).max(1);
         let mut admissions = Vec::new();
+        let mut provider_generations = HashMap::new();
         for spec in reconcile::read_desired_slice(&self.state_root, &self.host)
             .into_iter()
             .filter(|spec| spec.delivery_type == DeliveryType::AndroidVm)
@@ -1239,16 +1262,19 @@ impl CloudWorker {
             else {
                 continue;
             };
-            let outer_workload = match workload_snapshot.as_ref() {
-                Err(_) => None,
+            let (outer_workload, generation) = match workload_snapshot.as_ref() {
+                Err(_) => (None, 0),
                 Ok(snapshot) => match snapshot
                     .workloads
                     .iter()
                     .find(|status| status.workload_id.as_str() == spec.name)
                 {
-                    None => Some(CuttlefishOuterWorkloadObservation::absent(&spec.name)),
+                    None => (
+                        Some(CuttlefishOuterWorkloadObservation::absent(&spec.name)),
+                        0,
+                    ),
                     Some(status) => match CuttlefishOuterWorkloadObservation::from_status(status) {
-                        Ok(observation) => Some(observation),
+                        Ok(observation) => (Some(observation), status.generation),
                         Err(error) => {
                             tracing::warn!(target: "mackesd::cloud", workload = %spec.name, ?error, "non-VM Workload row refused by Cuttlefish provider");
                             continue;
@@ -1263,6 +1289,7 @@ impl CloudWorker {
             ) else {
                 continue;
             };
+            let workload_id = spec.name.clone();
             if let Err(error) = self.android_guest_providers.register_cuttlefish_provider(
                 spec.name,
                 target,
@@ -1275,12 +1302,15 @@ impl CloudWorker {
                     ?error,
                     "configured Cuttlefish provider was not admitted"
                 );
+            } else if generation > 0 {
+                provider_generations.insert(workload_id, generation);
             }
         }
         admissions.sort_by(|left, right| left.workload_id.cmp(&right.workload_id));
         if let Ok(mut retained) = self.android_provider_admissions.lock() {
             *retained = admissions;
         }
+        provider_generations
     }
 
     fn load_admitted_android_catalog(&self) -> Option<AndroidSignedCatalog> {
@@ -1300,7 +1330,7 @@ impl CloudWorker {
     /// last valid observation; an absent provider is not converted into false
     /// readiness and remains represented by the pending Workloads projection.
     fn refresh_android_inventories(&mut self) -> bool {
-        self.ensure_configured_cuttlefish_providers();
+        let provider_generations = self.ensure_configured_cuttlefish_providers();
         let workload_ids = self
             .drift
             .lock()
@@ -1319,6 +1349,7 @@ impl CloudWorker {
             })
             .unwrap_or_default();
         let mut changed = false;
+        let mut vdi_sources = Vec::new();
 
         for workload_id in workload_ids {
             if self.android_guest_providers.provider(&workload_id).is_err() {
@@ -1356,10 +1387,14 @@ impl CloudWorker {
                     continue;
                 }
             };
-            match self.admit_android_inventory_response(&request, response) {
+            let inventory_admitted = match self.admit_android_inventory_response(&request, response)
+            {
                 Ok(AndroidInventoryLedgerAdmission::Inserted
-                    | AndroidInventoryLedgerAdmission::Replaced) => changed = true,
-                Ok(AndroidInventoryLedgerAdmission::Unchanged) => {}
+                    | AndroidInventoryLedgerAdmission::Replaced) => {
+                        changed = true;
+                        true
+                    }
+                Ok(AndroidInventoryLedgerAdmission::Unchanged) => true,
                 Err(error) => {
                     tracing::warn!(
                         target: "mackesd::cloud",
@@ -1367,7 +1402,27 @@ impl CloudWorker {
                         ?error,
                         "Android inventory observation was not retained"
                     );
+                    false
                 }
+            };
+            if !inventory_admitted {
+                continue;
+            }
+            if let Some(source) = provider_generations
+                .get(&workload_id)
+                .and_then(|generation| {
+                    self.android_guest_providers
+                        .vdi_source(&workload_id, *generation)
+                })
+            {
+                vdi_sources.push(source);
+            }
+        }
+        vdi_sources.sort_by(|left, right| left.workload_id.cmp(&right.workload_id));
+        if let Ok(mut retained) = self.android_vdi_sources.lock() {
+            if *retained != vdi_sources {
+                *retained = vdi_sources;
+                changed = true;
             }
         }
         changed
@@ -1615,10 +1670,12 @@ impl Worker for CloudWorker {
                             last_drift = Instant::now();
                             state_dirty = true;
                         }
-                        let inventory_due = !self.android_guest_providers.is_empty()
-                            && (drift_due
-                                || last_android_inventory.elapsed()
-                                    >= self.android_inventory_interval);
+                        // Provider discovery is the first step of the refresh, so
+                        // an empty registry cannot be used as its own scheduling
+                        // prerequisite. Production starts empty by design.
+                        let inventory_due = drift_due
+                            || last_android_inventory.elapsed()
+                                >= self.android_inventory_interval;
                         if inventory_due {
                             last_android_inventory = Instant::now();
                             state_dirty |= self.refresh_android_inventories();
@@ -1751,18 +1808,189 @@ mod tests {
     use super::runner::fake::{instance, FakeRunner};
     use super::runner::{TOOL_LIBVIRT, TOOL_TOFU};
     use super::*;
+    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
-        AndroidAppAvailability, AndroidAppInventoryEntry, AndroidAppReadiness,
-        AndroidGuestBootState, AndroidGuestInventoryRequest, AndroidGuestInventoryResponse,
-        AndroidGuestLaunchOutcome, AndroidGuestLaunchRequest, AndroidImagePackage,
+        AndroidAppAvailability, AndroidAppCapability, AndroidAppInventoryEntry,
+        AndroidAppPermission, AndroidAppReadiness, AndroidCatalogAppPolicy,
+        AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidGuestBootState,
+        AndroidGuestInventoryRequest, AndroidGuestInventoryResponse, AndroidGuestLaunchOutcome,
+        AndroidGuestLaunchRequest, AndroidImageManifest, AndroidImagePackage,
         AndroidImagePackageManifest, AndroidImageProvenance, AndroidLaunchReadiness,
-        AndroidLauncherResolvability, AndroidPackageVersion, AndroidUnavailableReason,
-        AospStarterApp,
+        AndroidLauncherResolvability, AndroidPackageVersion, AndroidResourceClass,
+        AndroidResourceProfile, AndroidUnavailableReason, AospStarterApp, AospStarterCatalog,
+        ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
     };
     use mackes_mesh_types::cloud::{CloudProviderAdapter, HealthState};
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"test-mesh-arming-key";
+    static ANDROID_RELEASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[derive(Default)]
+    struct ScopedEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl ScopedEnvironment {
+        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            self.0.push((name, std::env::var_os(name)));
+            std::env::set_var(name, value);
+        }
+    }
+
+    impl Drop for ScopedEnvironment {
+        fn drop(&mut self) {
+            for (name, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    struct ReadyAndroidHostProbe {
+        digest: String,
+    }
+
+    impl AndroidHostProbe for ReadyAndroidHostProbe {
+        fn facts(&self, _artifact: Option<&Path>) -> android_provider::AndroidHostFacts {
+            android_provider::AndroidHostFacts {
+                kvm_available: true,
+                nested_virtualization: true,
+                available_vcpus: 16,
+                available_memory_mib: 32 * 1_024,
+                available_disk_mib: 256 * 1_024,
+            }
+        }
+
+        fn image_digest(&self, _artifact: &Path) -> io::Result<String> {
+            Ok(self.digest.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct AndroidProvisionRunner {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CloudRunner for AndroidProvisionRunner {
+        fn probe_tool(&self, tool: &str) -> ServiceHealth {
+            ServiceHealth {
+                service_type: tool.to_owned(),
+                interface: mackes_mesh_types::cloud::EndpointInterface::Internal,
+                url: "(test)".to_owned(),
+                state: if tool == TOOL_LIBVIRT {
+                    HealthState::Up
+                } else {
+                    HealthState::Absent
+                },
+                latency_ms: Some(1),
+                microversion: None,
+                version_id: None,
+                detail: Some("Android provision fixture".to_owned()),
+            }
+        }
+
+        fn configure(&self) -> runner::CloudRunOutcome {
+            self.calls.lock().unwrap().push("configure".to_owned());
+            runner::CloudRunOutcome::failed("unexpected configure call")
+        }
+
+        fn plan_json(&self, _tfvars_json: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push("plan".to_owned());
+            Err("unexpected plan call".to_owned())
+        }
+    }
+
+    fn install_android_release_fixture(
+        root: &Path,
+        now: u64,
+    ) -> (ScopedEnvironment, Arc<dyn AndroidHostProbe>) {
+        use sha2::{Digest, Sha256};
+
+        let image_bytes = b"android-provision-test-image";
+        let digest = format!("sha256:{:x}", Sha256::digest(image_bytes));
+        let image_manifest = AndroidImageManifest::new(
+            "android-test-image",
+            digest.clone(),
+            "aosp-source-test",
+            "starter-catalog-v1",
+            now.saturating_sub(2_000),
+            now.saturating_sub(1_000),
+            AospStarterCatalog::v1(),
+        )
+        .unwrap();
+        let package_manifest = AndroidImagePackageManifest::new(
+            AndroidImageProvenance::from_manifest(&image_manifest).unwrap(),
+            AospStarterApp::ALL
+                .into_iter()
+                .map(|app| {
+                    AndroidImagePackage::for_app(
+                        app,
+                        AndroidPackageVersion::new("2026.08.12", 1).unwrap(),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let app_policies = AospStarterApp::ALL
+            .into_iter()
+            .map(|app| AndroidCatalogAppPolicy {
+                app,
+                permissions: vec![AndroidAppPermission::Network],
+                capabilities: vec![AndroidAppCapability::VdiDisplay],
+                resources: AndroidResourceProfile {
+                    class: AndroidResourceClass::Standard,
+                    vcpus: 4,
+                    memory_mib: 8_192,
+                    disk_mib: 80 * 1_024,
+                },
+                guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
+            })
+            .collect();
+        let key = SigningKey::from_bytes(&[41; 32]);
+        let catalog = AndroidSignedCatalog::sign(
+            "android-release-v1",
+            AndroidCatalogPayload {
+                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+                catalog_id: "android-provision-test".to_owned(),
+                revision: 1,
+                issued_at_unix_ms: now.saturating_sub(500),
+                expires_at_unix_ms: now.saturating_add(60_000),
+                image_manifest,
+                package_manifest,
+                app_policies,
+            },
+            &key,
+        )
+        .unwrap();
+
+        let trust_key = root.join("android-catalog-trust.hex");
+        let state_file = root.join("android-catalog-state.json");
+        let artifact = root.join("android-test-image.raw");
+        let trust_key_hex = key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        fs::write(&trust_key, trust_key_hex).unwrap();
+        fs::write(
+            &state_file,
+            serde_json::json!({"schema_version": 1, "catalog": catalog}).to_string(),
+        )
+        .unwrap();
+        fs::write(&artifact, image_bytes).unwrap();
+
+        let mut environment = ScopedEnvironment::default();
+        environment.set("MDE_ANDROID_CATALOG_SIGNER_ID", "android-release-v1");
+        environment.set("MDE_ANDROID_CATALOG_TRUST_KEY_FILE", &trust_key);
+        environment.set("MDE_ANDROID_CATALOG_STATE_FILE", &state_file);
+        environment.set("MDE_ANDROID_IMAGE_FILE", &artifact);
+        (
+            environment,
+            Arc::new(ReadyAndroidHostProbe { digest }),
+        )
+    }
 
     fn signer() -> HmacTokenSigner {
         HmacTokenSigner::new(KEY.to_vec())
@@ -2067,10 +2295,14 @@ mod tests {
 
     #[test]
     fn android_provision_retains_desired_state_without_live_apply() {
+        let _environment_lock = ANDROID_RELEASE_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let runner = Arc::new(FakeRunner::default());
+        let now = u64::try_from(now_ms()).unwrap();
+        let (_environment, host_probe) = install_android_release_fixture(tmp.path(), now);
+        let runner = Arc::new(AndroidProvisionRunner::default());
         let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
             .with_runner(runner.clone())
+            .with_android_host_probe(host_probe)
             .with_signer(Arc::new(signer()))
             .with_bus_root(None);
 
@@ -2698,7 +2930,8 @@ mod tests {
     #[test]
     fn a_drift_tick_folds_workload_rows_and_the_rollup_into_the_mirror() {
         use mackes_mesh_types::cloud::{DeliveryType, DriftFlag, WorkloadSpec};
-        let tmp = tempfile::tempdir().unwrap();
+        use mackes_mesh_types::workloads::WorkloadBackend;
+
         // Declare a workload on this node in its per-node desired slice.
         let spec = WorkloadSpec {
             name: "web".into(),
@@ -2714,7 +2947,6 @@ mod tests {
             raw_hcl: None,
             app: None,
         };
-        super::reconcile::write_desired_doc(tmp.path(), &spec).unwrap();
         // A plan that reports pending changes ⇒ the workload is drifted.
         let runner = Arc::new(FakeRunner {
             roster: vec![instance("web", "ACTIVE")],
@@ -2723,9 +2955,17 @@ mod tests {
             ),
             ..Default::default()
         });
-        let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
-            .with_runner(runner)
-            .with_bus_root(None);
+        let (_temp, w) = projection_worker(
+            runner,
+            vec![workload_status(
+                "web",
+                WorkloadBackend::LibvirtVirtqemud,
+                WorkloadPowerState::Running,
+            )],
+            u64::try_from(now_ms()).unwrap(),
+            false,
+        );
+        super::reconcile::write_desired_doc(&w.state_root, &spec).unwrap();
         // Before a tick the mirror carries no workloads (never fabricated).
         assert!(w.build_state().workloads.is_empty());
         w.refresh_drift();

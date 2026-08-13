@@ -1076,15 +1076,16 @@ mod tests {
         .expect("post-activation command must execute after a complete read");
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(applied.load(Ordering::SeqCst), 2);
-        let events = published.lock().unwrap();
-        assert_eq!(
-            events.len(),
-            1,
-            "outage-delayed command emits one history event"
-        );
-        let event: ApplyResultEvent = serde_json::from_str(&events[0].1).unwrap();
+        let event: ApplyResultEvent = {
+            let events = published.lock().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "outage-delayed command emits one history event"
+            );
+            serde_json::from_str(&events[0].1).unwrap()
+        };
         assert_eq!(event.nonce, "onboard-apply-forward");
-        drop(events);
 
         shutdown_tx.send(true).expect("request shutdown");
         tokio::time::timeout(Duration::from_secs(3), task)

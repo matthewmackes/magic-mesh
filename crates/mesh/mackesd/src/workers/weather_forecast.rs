@@ -1572,6 +1572,7 @@ fn blocking_provider_refresh(
     })
 }
 
+#[cfg(test)]
 fn publish_json<T: serde::Serialize>(persist: &Persist, topic: &str, value: &T) -> io::Result<()> {
     let body = serde_json::to_string(value).map_err(io_other)?;
     publish_body(persist, topic, &body)

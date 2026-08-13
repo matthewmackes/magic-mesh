@@ -103,7 +103,7 @@ pub(crate) fn render_tfvars(
             }),
         );
     }
-    let pool = selected_pool.unwrap_or(StoragePool::default()).pool_name();
+    let pool = selected_pool.unwrap_or_default().pool_name();
     let doc = serde_json::json!({
         TFVARS_LIBVIRT_URI: libvirt_uri,
         TFVARS_POOL: pool,

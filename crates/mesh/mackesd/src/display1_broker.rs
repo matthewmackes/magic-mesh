@@ -412,6 +412,7 @@ pub struct Display1AttachHello {
 }
 
 impl Display1AttachHello {
+    #[cfg(test)]
     fn from_lease(lease: &WorkloadAttachmentLease) -> Self {
         Self {
             schema_version: DISPLAY1_HANDSHAKE_SCHEMA_VERSION,
@@ -1824,7 +1825,6 @@ mod tests {
     };
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
-    use std::sync::Mutex;
     use std::time::Instant;
 
     fn seqpacket_pair() -> (UnixStream, UnixStream) {
@@ -1848,36 +1848,6 @@ mod tests {
         reject_truncated_packet(packet.flags, "test damage").expect("complete packet");
         assert!(ancillary.drain().next().is_none());
         serde_json::from_slice(&bytes[..packet.bytes]).expect("damage envelope")
-    }
-
-    #[derive(Default)]
-    struct Sink {
-        frames: Mutex<Vec<(u32, u32, u32, u32)>>,
-        damages: Mutex<Vec<Display1Damage>>,
-        disabled: Mutex<u32>,
-    }
-
-    impl Display1FrameSink for Sink {
-        fn accept(&self, frame: Display1DmaBufFrame) -> Result<(), Display1Error> {
-            let _fd = frame.dmabuf.as_fd();
-            self.frames.lock().expect("frames").push((
-                frame.width,
-                frame.height,
-                frame.stride,
-                frame.fourcc,
-            ));
-            Ok(())
-        }
-
-        fn damage(&self, damage: Display1Damage) -> Result<(), Display1Error> {
-            self.damages.lock().expect("damages").push(damage);
-            Ok(())
-        }
-
-        fn disable(&self) -> Result<(), Display1Error> {
-            *self.disabled.lock().expect("disabled") += 1;
-            Ok(())
-        }
     }
 
     #[test]
@@ -2226,6 +2196,7 @@ mod tests {
 
     #[test]
     fn relay_replacement_disconnect_and_revoke_advance_input_epoch_once() {
+        let now_ms = display1_now_ms();
         let lease = WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
             lease_id: "lease-input-epoch".into(),
@@ -2233,7 +2204,7 @@ mod tests {
             workload_id: WorkloadId::new("browser-input-epoch").expect("workload id"),
             generation: 3,
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
-            expires_at_ms: 2_000,
+            expires_at_ms: now_ms.saturating_add(60_000),
         };
         let sink = Display1AttachmentSink::new();
         let (first_daemon, first_shell) = seqpacket_pair();
@@ -2245,7 +2216,7 @@ mod tests {
                 lease.clone(),
                 &lease.nonce,
                 &lease.nonce,
-                1_000,
+                now_ms,
             )
             .expect("first relay"),
         )
@@ -2261,7 +2232,7 @@ mod tests {
                 lease.clone(),
                 &lease.nonce,
                 &lease.nonce,
-                1_001,
+                now_ms.saturating_add(1),
             )
             .expect("second relay"),
         )
@@ -2271,7 +2242,12 @@ mod tests {
 
         sink.first_frame.store(true, Ordering::Release);
         drop(second_shell);
-        assert_eq!(sink.poll_input(), Ok(Display1InputPoll::Disconnected));
+        assert_eq!(
+            sink.poll_input(),
+            Ok(Display1InputPoll::Idle),
+            "presentation liveness revokes the disconnected relay before input polling"
+        );
+        assert!(sink.relay.lock().expect("relay store").is_none());
         assert_eq!(sink.input_epoch.load(Ordering::Acquire), 2);
         sink.disable().expect("idempotent revoke");
         assert_eq!(
@@ -2464,9 +2440,10 @@ mod tests {
         let socket_path = stale.socket_path().to_path_buf();
         let deadline = Instant::now() + Duration::from_secs(2);
         while socket_path.exists() {
-            if Instant::now() >= deadline {
-                panic!("stale-generation broker did not retire its endpoint");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "stale-generation broker did not retire its endpoint"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -2567,9 +2544,10 @@ mod tests {
             if sink.accept(frame).is_ok() {
                 break;
             }
-            if Instant::now() >= deadline {
-                panic!("broker did not accept the authenticated shell handshake");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "broker did not accept the authenticated shell handshake"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let peer = peer_credentials(&stream).expect("peer credentials");
@@ -2586,9 +2564,10 @@ mod tests {
             1
         );
         while !server.first_frame_seen() {
-            if Instant::now() >= deadline {
-                panic!("broker did not observe the KMS presentation acknowledgement");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "broker did not observe the KMS presentation acknowledgement"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2630,9 +2609,10 @@ mod tests {
             if sink.accept(frame).is_ok() {
                 break;
             }
-            if Instant::now() >= deadline {
-                panic!("broker did not install the authenticated relay");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "broker did not install the authenticated relay"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let peer = peer_credentials(&stream).expect("peer credentials");
@@ -2643,15 +2623,17 @@ mod tests {
             1
         );
         while !server.first_frame_seen() {
-            if Instant::now() >= deadline {
-                panic!("broker did not observe readiness before expiry");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "broker did not observe readiness before expiry"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         while socket_path.exists() || server.first_frame_seen() {
-            if Instant::now() >= deadline {
-                panic!("expired broker did not revoke its socket and readiness");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "expired broker did not revoke its socket and readiness"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }

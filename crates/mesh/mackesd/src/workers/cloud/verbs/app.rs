@@ -76,6 +76,7 @@ pub(super) fn authorization_target(body: &CloudActionBody) -> Result<String, Str
     ))
 }
 
+#[cfg(test)]
 fn build_reply(
     state_root: &std::path::Path,
     verb_name: &str,
@@ -91,6 +92,7 @@ fn build_reply(
     )
 }
 
+#[cfg(test)]
 fn build_reply_with_runtime_bus(
     state_root: &std::path::Path,
     runtime_bus_root: Option<&std::path::Path>,
@@ -333,7 +335,7 @@ fn persist_declaration(
         || existing_app.session_id != requested_app.session_id
     {
         return Err(format!(
-            "workload `{}` is bound to App VM session `{}` at catalog revision `{}`; refusing conflicting session/revision replay `{}` at `{}`",
+            "workload `{}` is bound to App VM session `{}` at catalog revision `{}`; refusing stale session replay with conflicting session/revision `{}` at `{}`",
             spec.name,
             existing_app.session_id,
             existing_app.catalog_revision,
@@ -591,7 +593,7 @@ fn admit_open_app_replay(
             || guest_profile != *requested_guest_profile
         {
             return Err(format!(
-                "session `{requested_id}` is durably bound to client `{client_peer}` and VM `{vm_id}`; refusing substituted client/identity replay"
+                "session `{requested_id}` is durably bound to client `{client_peer}`, VM `{vm_id}`, app `{app_id}`, catalog revision `{catalog_revision}`, and guest profile `{guest_profile}`; refusing substituted client/identity replay for client `{requested_client_peer}`, VM `{requested_vm_id}`, app `{requested_app_id}`, catalog revision `{requested_catalog_revision}`, and guest profile `{requested_guest_profile}`"
             ));
         }
     }
@@ -641,8 +643,8 @@ fn validated_request(
         body.resume,
     )
     .map_err(|error| format!("invalid App VM declaration: {error}"))?;
-    request
-        .validate_admitted()
+    AppVmProfile::default()
+        .admit(&request)
         .map_err(|error| format!("App VM declaration failed admission: {error}"))?;
     Ok((node, name, client_peer, request))
 }

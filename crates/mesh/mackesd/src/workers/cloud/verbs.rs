@@ -75,12 +75,14 @@ mod app; // WL-FUNC-018 · app-provision
 mod browser; // WL-ARCH-008 · browser-provision
 mod inventory; // U10 · inventory + output
 
-#[allow(unused_imports)] // Re-exported for the sibling test module's provider fixtures.
-pub(crate) use android::CuttlefishProviderError;
+#[allow(unused_imports)] // Re-exported for sibling-module provider fixtures.
 pub(crate) use android::{
-    AndroidGuestProvider, AndroidGuestProviderRegistry, AndroidGuestProviderRegistryError,
-    AndroidInventoryLedger, AndroidInventoryLedgerAdmission, AndroidInventoryLedgerError,
-    CuttlefishOuterWorkloadObservation, WorkloadCuttlefishProviderClient,
+    AndroidGuestProvider, AndroidGuestProviderRegistryError, CuttlefishProviderError,
+};
+pub(crate) use android::{
+    AndroidGuestProviderRegistry, AndroidInventoryLedger, AndroidInventoryLedgerAdmission,
+    AndroidInventoryLedgerError, CuttlefishOuterWorkloadObservation,
+    WorkloadCuttlefishProviderClient,
 };
 
 impl CloudWorker {

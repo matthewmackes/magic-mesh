@@ -162,7 +162,7 @@ enum TypedAuthorityRequest {
     Clipboard {
         direction: ClipboardDirection,
         lease: VdiClipboardLeaseV2,
-        message: VdiClipboardMessageV2,
+        message: Box<VdiClipboardMessageV2>,
     },
     /// Resource-authority cancellation request for Clipboard V2. Clipboard V2
     /// has no downstream cancellation wire operation, so this shape can only
@@ -682,7 +682,14 @@ fn plan(
             direction,
             lease,
             message,
-        } => plan_clipboard(card, invocation, *direction, lease, message, now_ms),
+        } => plan_clipboard(
+            card,
+            invocation,
+            *direction,
+            lease,
+            message.as_ref(),
+            now_ms,
+        ),
         TypedAuthorityRequest::ClipboardCancellation {
             direction,
             session_id,
@@ -1319,9 +1326,9 @@ fn plan_android(
                 || cancellation_target.is_none()
                 || cancellation_target == Some(request.request_id.as_str())))
         || (!is_cancellation
-            && (!request
+            && (request
                 .app
-                .is_some_and(|app| app.package_id().as_str() == card_package)
+                .is_none_or(|app| app.package_id().as_str() != card_package)
                 || cancellation_target.is_some()))
     {
         return Err(RefusalCode::TargetMismatch);

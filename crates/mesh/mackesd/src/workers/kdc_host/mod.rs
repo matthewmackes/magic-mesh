@@ -207,7 +207,7 @@ const TICK: Duration = Duration::from_secs(30);
 
 /// The CHAT-FIX-2 producer lane a relayed phone notification republishes onto so
 /// the chat worker folds it into this node's `alert:<self>` desktop feed. Mirrors
-/// [`crate::workers::notify::NOTIFY_TOPIC_PREFIX`]`+ "phone"`.
+/// [`crate::workers::notify::NOTIFY_TOPIC_PREFIX`] with the `phone` suffix.
 const NOTIFY_TOPIC_PHONE: &str = "event/notify/phone";
 
 /// The `event/notify/<source>` lanes the CHAT-FIX-2 producer emits that we forward
@@ -2619,7 +2619,7 @@ fn has_default_route() -> bool {
             t.lines().skip(1).any(|l| {
                 let mut cols = l.split_whitespace();
                 cols.next(); // iface
-                cols.next().map(|dest| dest == "00000000") == Some(true)
+                cols.next().is_some_and(|dest| dest == "00000000")
             })
         })
         .unwrap_or(false);

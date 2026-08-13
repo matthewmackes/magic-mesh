@@ -595,14 +595,13 @@ mod tests {
             !script.contains("/usr/libexec/mackesd/setup-selinux-policy >/dev/null"),
             "setup-selinux-policy must not run synchronously from dnf %post"
         );
-        for unit in ["/usr/lib/systemd/system/magic-mesh-selinux-policy.service"] {
-            assert!(
-                assets
-                    .iter()
-                    .any(|asset| asset["dest"].as_str() == Some(unit)),
-                "base RPM must ship the async SELinux loader unit {unit}"
-            );
-        }
+        let unit = "/usr/lib/systemd/system/magic-mesh-selinux-policy.service";
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset["dest"].as_str() == Some(unit)),
+            "base RPM must ship the async SELinux loader unit {unit}"
+        );
     }
 
     #[test]
@@ -938,18 +937,17 @@ mod tests {
         let script = rpm["post_install_script"]
             .as_str()
             .expect("base post install script");
+        let retired_service_cleanup = script
+            .split_once("rm -f /etc/systemd/system/mackesd.service")
+            .and_then(|(_, cleanup)| cleanup.split_once(" || :"))
+            .map(|(cleanup, _)| cleanup)
+            .expect("base postinstall must remove the retired monolithic service");
 
         assert!(
-            script.contains("/etc/systemd/system/mackesd.service.d/watchdog.conf"),
-            "postinstall must inspect the legacy local watchdog drop-in"
-        );
-        assert!(
-            script.contains("TimeoutStop(FailureMode=abort|USec=20s|Sec=20)"),
-            "postinstall must only match the stale 20s/abort stop policy"
-        );
-        assert!(
-            script.contains("rm -f /etc/systemd/system/mackesd.service.d/watchdog.conf"),
-            "postinstall must remove the stale local drop-in so the packaged REL-2 stop policy wins"
+            retired_service_cleanup
+                .split_ascii_whitespace()
+                .any(|path| path == "/etc/systemd/system/mackesd.service.d/watchdog.conf"),
+            "postinstall must remove the legacy local watchdog drop-in"
         );
     }
 

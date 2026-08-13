@@ -1253,7 +1253,7 @@ mod tests {
 
         fail_publication.store(false, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(3), async {
-            while persist.list_since(EVENT_TOPIC, None).unwrap().len() < 1 {
+            while persist.list_since(EVENT_TOPIC, None).unwrap().is_empty() {
                 assert!(
                     !task.is_finished(),
                     "worker exited before durable publication"

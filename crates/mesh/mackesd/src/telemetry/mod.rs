@@ -895,13 +895,10 @@ pub fn write_heartbeat(workgroup_root: &Path, hb: &Heartbeat) -> std::io::Result
     // Guard: never write into the canonical shared dir when it doesn't exist —
     // the heartbeat would land on a bare local dir instead of the replicated one.
     if !crate::shared_root_writable(workgroup_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "shared dir {} is down — skipping heartbeat write (would land on a bare local dir)",
-                workgroup_root.display()
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "shared dir {} is down — skipping heartbeat write (would land on a bare local dir)",
+            workgroup_root.display()
+        )));
     }
     let path = heartbeat_path(workgroup_root, &hb.node_id);
     if let Some(parent) = path.parent() {

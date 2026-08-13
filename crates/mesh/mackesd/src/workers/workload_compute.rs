@@ -2711,18 +2711,22 @@ fn semantic_workload_replay(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HandleResult {
-    Accepted(WorkloadOperationStatus),
+    Accepted(Box<WorkloadOperationStatus>),
     Rejected(WorkloadOperationErrorCode),
 }
 
 impl HandleResult {
+    fn accepted(status: WorkloadOperationStatus) -> Self {
+        Self::Accepted(Box::new(status))
+    }
+
     fn reply(self, request_id: String) -> WorkloadOperationReply {
         match self {
             Self::Accepted(status) => WorkloadOperationReply {
                 schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
                 request_id,
                 accepted: true,
-                status: Some(status),
+                status: Some(*status),
                 error_code: None,
             },
             Self::Rejected(error_code) => WorkloadOperationReply {
@@ -2829,13 +2833,14 @@ impl WorkloadComputeWorker {
         };
         let persist = Persist::open(root.clone()).map_err(io_other)?;
         #[cfg(test)]
-        if let Some(replacement) = self
+        let replacement = self
             .bus_faults
             .replace_index_after_open
             .lock()
             .expect("open replacement fault mutex")
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        if let Some(replacement) = replacement {
             install_replacement_index(&root, &replacement)?;
         }
         let identity_after = bus_identity(&root)?;
@@ -2898,7 +2903,7 @@ impl WorkloadComputeWorker {
                     HandleResult::Rejected(WorkloadOperationErrorCode::JournalUnavailable)
                         .reply(record.request_id.clone())
                 },
-                |status| HandleResult::Accepted(status).reply(record.request_id.clone()),
+                |status| HandleResult::accepted(status).reply(record.request_id.clone()),
             );
             record.phase = ReplyOutboxPhase::Completed;
             record.reply = Some(reply);
@@ -3193,7 +3198,7 @@ impl WorkloadComputeWorker {
             if semantic_workload_replay(existing, &request) {
                 return ledger.status(&request.request_id).cloned().map_or(
                     HandleResult::Rejected(WorkloadOperationErrorCode::JournalUnavailable),
-                    HandleResult::Accepted,
+                    HandleResult::accepted,
                 );
             }
             tracing::warn!(node = %self.node_id, request_id = %request.request_id, "conflicting workload replay refused");
@@ -3233,7 +3238,7 @@ impl WorkloadComputeWorker {
         self.drive_accepted(ledger, request, status, now_ms);
         ledger.status(&request_id).cloned().map_or(
             HandleResult::Rejected(WorkloadOperationErrorCode::JournalUnavailable),
-            HandleResult::Accepted,
+            HandleResult::accepted,
         )
     }
 
@@ -4246,13 +4251,14 @@ impl WorkloadComputeWorker {
             )
             .map_err(io_other)?;
         #[cfg(test)]
-        if let Some(replacement) = self
+        let replacement = self
             .bus_faults
             .replace_reply_index_after_write
             .lock()
             .expect("replacement fault mutex")
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        if let Some(replacement) = replacement {
             install_replacement_index(transaction.root, &replacement)?;
         }
         Ok(())
@@ -4410,6 +4416,7 @@ impl WorkloadComputeWorker {
         self.publish(transaction, ledger, now)
     }
 
+    #[cfg(test)]
     fn tick_once(
         &mut self,
         ledger: &mut WorkloadOperationLedger,
@@ -7682,7 +7689,7 @@ mod tests {
             .with_capacity(test_capacity());
         let mut ledger = WorkloadOperationLedger::open(temp.path().join("state")).expect("ledger");
         let mut actions = Vec::new();
-        for index in 0..(MAX_OPERATION_MESSAGES_PER_TICK + 1) {
+        for index in 0..=MAX_OPERATION_MESSAGES_PER_TICK {
             actions.push(
                 persist
                     .write(

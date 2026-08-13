@@ -53,6 +53,7 @@ pub(crate) fn desired_dir(state_root: &Path, node: &str) -> Result<PathBuf, Stri
 }
 
 /// The path of workload `name`'s desired-state doc on node `node`.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn desired_doc_path(
     state_root: &Path,

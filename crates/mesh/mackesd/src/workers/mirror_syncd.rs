@@ -74,6 +74,7 @@ impl MirrorSyncd {
     }
 
     /// Override the local node identity — used by isolated authority tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
         self.node_id = node_id.into();
@@ -81,6 +82,7 @@ impl MirrorSyncd {
     }
 
     /// Override the coordination-plane authority — used by isolated tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_leadership_endpoints(mut self, endpoints: Vec<String>) -> Self {
         self.leadership_endpoints = endpoints;

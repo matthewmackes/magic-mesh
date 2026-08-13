@@ -686,7 +686,7 @@ fn push_gap(gaps: &mut Vec<String>, gap: String) {
 
 #[derive(Clone)]
 enum PreparedResponse {
-    Modified(TransitSnapshot),
+    Modified(Box<TransitSnapshot>),
     NotModified,
 }
 
@@ -832,7 +832,7 @@ impl TransitOverlayWorker {
         match result {
             Ok(PreparedResponse::Modified(snapshot)) => {
                 self.publish(bus, &snapshot)?;
-                *last_good = Some(snapshot);
+                *last_good = Some(*snapshot);
                 Ok(true)
             }
             Ok(PreparedResponse::NotModified) => {
@@ -999,7 +999,7 @@ impl TransitOverlayWorker {
         let host = self.host.clone();
         let task = tokio::task::spawn_blocking(move || match probe.fetch(point)? {
             ProbeResponse::Modified(body) => build_snapshot(&host, point, &body, now_ms())
-                .map(PreparedResponse::Modified)
+                .map(|snapshot| PreparedResponse::Modified(Box::new(snapshot)))
                 .map_err(|error| io::Error::other(format!("MBTA payload invalid: {error}"))),
             ProbeResponse::NotModified => Ok(PreparedResponse::NotModified),
         });
@@ -1376,15 +1376,18 @@ mod tests {
         fn fetch(&self, _point: TransitPoint) -> io::Result<ProbeResponse> {
             let call = self.fetches.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                if let Some(started) = self.started.lock().unwrap().take() {
+                let started = self.started.lock().unwrap().take();
+                if let Some(started) = started {
                     started
                         .send(())
                         .map_err(|_| io::Error::other("race observer dropped"))?;
-                    self.release
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .ok_or_else(|| io::Error::other("race release missing"))?
+                    let release = {
+                        let mut release = self.release.lock().unwrap();
+                        release
+                            .take()
+                            .ok_or_else(|| io::Error::other("race release missing"))?
+                    };
+                    release
                         .recv()
                         .map_err(|_| io::Error::other("race release dropped"))?;
                 }
@@ -1585,9 +1588,9 @@ mod tests {
         let probe = LiveProbe::default();
         let response = probe.fetch(point()).expect("single provider fetch");
         let prepared = match response {
-            ProbeResponse::Modified(body) => Ok(PreparedResponse::Modified(
+            ProbeResponse::Modified(body) => Ok(PreparedResponse::Modified(Box::new(
                 build_snapshot("rig-1", point(), &body, now_ms()).expect("prepared snapshot"),
-            )),
+            ))),
             ProbeResponse::NotModified => panic!("fixture unexpectedly returned 304"),
         };
         let mut bus = FixtureBus {
@@ -1921,7 +1924,7 @@ mod tests {
         assert!(worker
             .apply_result(
                 &mut bus,
-                Ok(PreparedResponse::Modified(original)),
+                Ok(PreparedResponse::Modified(Box::new(original))),
                 point(),
                 &mut last,
             )
@@ -1979,7 +1982,7 @@ mod tests {
         assert!(worker
             .apply_result(
                 &mut bus,
-                Ok(PreparedResponse::Modified(original)),
+                Ok(PreparedResponse::Modified(Box::new(original))),
                 point(),
                 &mut last,
             )
@@ -2067,7 +2070,7 @@ mod tests {
         assert!(seed_worker
             .apply_result(
                 &mut bus,
-                Ok(PreparedResponse::Modified(original.clone())),
+                Ok(PreparedResponse::Modified(Box::new(original.clone()))),
                 point(),
                 &mut seed_cache,
             )

@@ -652,7 +652,7 @@ impl WeatherLocationWorker {
             schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
             host: self.host.clone(),
             location_generation: authority.effective.generation,
-            location_point: point.cloned(),
+            location_point: point.copied(),
             producer_at_ms: now_ms,
             fetched_at_ms: now_ms,
             availability: WeatherAvailability::Unavailable {
@@ -666,7 +666,7 @@ impl WeatherLocationWorker {
             schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
             host: self.host.clone(),
             location_generation: authority.effective.generation,
-            location_point: point.cloned(),
+            location_point: point.copied(),
             time_zone: time_zone.to_string(),
             producer_at_ms: now_ms,
             fetched_at_ms: now_ms,

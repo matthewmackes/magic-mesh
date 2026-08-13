@@ -247,7 +247,12 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "one snapshot written");
         let name = entries[0].file_name().into_string().unwrap();
-        assert!(name.ends_with(".json"), "snapshot is JSON");
+        assert!(
+            std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == std::ffi::OsStr::new("json")),
+            "snapshot is JSON"
+        );
         assert!(!name.contains(':'), "filename is colon-free");
         let body = std::fs::read_to_string(entries[0].path()).unwrap();
         let back: Vec<SurroundingHost> = serde_json::from_str(&body).unwrap();

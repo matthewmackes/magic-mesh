@@ -4,11 +4,10 @@
 //! (`action/<domain>/<verb>`) and the replicated QNM-Shared volume —
 //! no MDE-private D-Bus, no central server (§1/§2/§6).
 //!
-//! The durable tracker is `docs/WORKLIST.md`; modules land only when
+//! The durable tracker is `docs/platform/WORKLIST.md`; modules land only when
 //! runtime-reachable per the §7 Definition of Done.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 pub mod audit;
 /// QC-15 cutover audit for retired VM-stack deletion and Q58 rebuild evidence.

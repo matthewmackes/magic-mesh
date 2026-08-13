@@ -565,12 +565,15 @@ impl ClockWorker {
             .expect("Clock snapshot loaded")
             .revision;
         let peer_origin = command.origin_node_id != self.node_id;
-        if (!peer_origin && command.expected_revision != expected)
-            || (peer_origin && command.expected_revision > expected)
-            || (peer_origin
-                && (!self.approved_peer_ids.contains(&command.origin_node_id)
-                    || self.blocked_origin_ids.contains(&command.origin_node_id)))
-        {
+        let revision_is_invalid = if peer_origin {
+            command.expected_revision > expected
+        } else {
+            command.expected_revision != expected
+        };
+        let peer_is_untrusted = peer_origin
+            && (!self.approved_peer_ids.contains(&command.origin_node_id)
+                || self.blocked_origin_ids.contains(&command.origin_node_id));
+        if revision_is_invalid || peer_is_untrusted {
             return self.persist_cursor_only(transaction, now_ms);
         }
         let prior_snapshot = self
@@ -1063,6 +1066,7 @@ impl ClockWorker {
         Ok(changed)
     }
 
+    #[cfg(test)]
     fn tick_once(&mut self) -> anyhow::Result<()> {
         self.ensure_loaded()?;
         let transaction = self.open_bus_transaction()?;

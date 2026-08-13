@@ -68,7 +68,7 @@ pub fn render_bindings_conf(map: &KeybindsMap) -> String {
     out.push_str("# Source of truth is the org.mackes.MDE.Settings\n");
     out.push_str("# `keybinds.map` key; user edits made here will be\n");
     out.push_str("# overwritten on the next apply.\n");
-    out.push_str("\n");
+    out.push('\n');
     for (key, cmd) in &map.bindings {
         out.push_str(&format!("bindsym {key} {cmd}\n"));
     }

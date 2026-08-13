@@ -359,6 +359,7 @@ impl CallMediaProviderRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn register<P>(
         &mut self,
         adapter: CallMediaAdapter,
@@ -431,6 +432,7 @@ impl CallMediaProviderRegistry {
         provider.prove_advancing_frames(session, adapter)
     }
 
+    #[cfg(test)]
     fn slot_mut(
         &mut self,
         adapter: CallMediaAdapter,
@@ -495,6 +497,7 @@ fn missing_provider_error(adapter: CallMediaAdapter) -> CallMediaProviderError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum CallMediaProviderRegistrationError {
     AlreadyRegistered { adapter: CallMediaAdapter },
 }

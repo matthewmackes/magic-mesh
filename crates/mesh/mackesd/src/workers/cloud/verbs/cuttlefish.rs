@@ -97,16 +97,6 @@ pub(crate) trait CuttlefishProviderClient: Send + Sync {
     fn vdi_source(&self, _generation: u64) -> Option<AndroidVdiSource> {
         None
     }
-
-    fn cleanup(
-        &self,
-        _request_id: &str,
-        _target: &CuttlefishVmTarget,
-        _package_manifest: &AndroidImagePackageManifest,
-        _generation: u64,
-    ) -> Result<(), CuttlefishProviderError> {
-        Err(CuttlefishProviderError::ProviderUnavailable)
-    }
 }
 
 struct GuestContract {
@@ -189,6 +179,7 @@ pub(crate) struct WorkloadCuttlefishProviderClient {
 impl WorkloadCuttlefishProviderClient {
     /// Bind one workload-scoped provider client to a typed outer observation.
     /// `None` means the Workloads authority itself is unavailable, not absence.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(outer_workload: Option<CuttlefishOuterWorkloadObservation>) -> Self {
         Self {
@@ -417,34 +408,6 @@ impl CuttlefishProviderClient for WorkloadCuttlefishProviderClient {
                 (retained_generation == generation).then_some(snapshot.vdi_source)
             })
     }
-
-    fn cleanup(
-        &self,
-        request_id: &str,
-        target: &CuttlefishVmTarget,
-        package_manifest: &AndroidImagePackageManifest,
-        generation: u64,
-    ) -> Result<(), CuttlefishProviderError> {
-        let guest = self
-            .guest
-            .as_ref()
-            .ok_or(CuttlefishProviderError::ProviderUnavailable)?;
-        if package_manifest != &guest.package_manifest {
-            return Err(CuttlefishProviderError::ImagePackageProvenanceMismatch);
-        }
-        guest.transport.cleanup(
-            request_id,
-            target,
-            &guest.catalog_digest,
-            package_manifest,
-            generation,
-        )?;
-        *self
-            .guest_snapshot
-            .lock()
-            .map_err(|_| CuttlefishProviderError::StatePoisoned)? = None;
-        Ok(())
-    }
 }
 
 /// A workload-scoped Cuttlefish adapter reachable through the existing Android
@@ -506,12 +469,6 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
             client,
             observation: Mutex::new(observation),
         })
-    }
-
-    /// Borrow the immutable package provenance retained by this adapter.
-    #[must_use]
-    pub(crate) fn package_manifest(&self) -> &AndroidImagePackageManifest {
-        &self.package_manifest
     }
 
     /// Return the last locally admitted provider observation.
@@ -646,12 +603,6 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
         }
         Ok(inventory)
     }
-
-    fn generation_is_guest_ready(&self, generation: u64) -> bool {
-        self.observation.lock().is_ok_and(|observation| {
-            observation.generation == generation && observation.is_guest_ready()
-        })
-    }
 }
 
 impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAdapter<C> {
@@ -712,42 +663,6 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
         }
     }
 
-    fn inventory_at(
-        &self,
-        request: &AndroidGuestInventoryRequest,
-        generation: u64,
-    ) -> AndroidAppInventory {
-        if request.workload_id != self.workload_id
-            || generation == 0
-            || !self.generation_is_guest_ready(generation)
-        {
-            return AndroidAppInventory::pending(request.workload_id.clone());
-        }
-        self.client
-            .inventory_at(&self.target, &self.package_manifest, generation)
-            .and_then(|inventory| self.admit_guest_inventory(inventory))
-            .unwrap_or_else(|_| AndroidAppInventory::pending(self.workload_id.clone()))
-    }
-
-    fn launch_at(
-        &self,
-        request: &AndroidGuestLaunchRequest,
-        generation: u64,
-    ) -> AndroidGuestLaunchOutcome {
-        if request.workload_id != self.workload_id || request.validate().is_err() || generation == 0
-        {
-            return AndroidGuestLaunchOutcome::Rejected;
-        }
-        if !self.generation_is_guest_ready(generation) {
-            return AndroidGuestLaunchOutcome::Unavailable;
-        }
-        match self.client.launch_at(&self.target, request, generation) {
-            Ok(outcome) => outcome,
-            Err(CuttlefishProviderError::ProviderRejected) => AndroidGuestLaunchOutcome::Rejected,
-            Err(_) => AndroidGuestLaunchOutcome::Unavailable,
-        }
-    }
-
     fn vdi_source(&self, generation: u64) -> Option<AndroidVdiSource> {
         let observation = self.observation.lock().ok()?;
         if observation.generation != generation || !observation.is_guest_ready() {
@@ -762,23 +677,6 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
             return None;
         }
         Some(source)
-    }
-
-    fn cleanup(&self, request_id: &str, generation: u64) -> bool {
-        // Cleanup is still a destructive lifecycle operation. Do not let a
-        // delayed request from an older generation reach the provider after
-        // the workload has been replaced.
-        let generation_matches = self
-            .observation
-            .lock()
-            .map(|observation| observation.generation == generation)
-            .unwrap_or(false);
-        if generation == 0 || !generation_matches {
-            return false;
-        }
-        self.client
-            .cleanup(request_id, &self.target, &self.package_manifest, generation)
-            .is_ok()
     }
 }
 
@@ -903,9 +801,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeClient {
         observe_calls: Arc<AtomicUsize>,
-        inventory_calls: Arc<AtomicUsize>,
         launch_calls: Arc<AtomicUsize>,
-        cleanup_calls: Arc<AtomicUsize>,
         observe_result:
             Arc<Mutex<Option<Result<CuttlefishVmObservation, CuttlefishProviderError>>>>,
         launch_result:
@@ -917,9 +813,7 @@ mod tests {
         fn new(observe_result: Result<CuttlefishVmObservation, CuttlefishProviderError>) -> Self {
             Self {
                 observe_calls: Arc::new(AtomicUsize::new(0)),
-                inventory_calls: Arc::new(AtomicUsize::new(0)),
                 launch_calls: Arc::new(AtomicUsize::new(0)),
-                cleanup_calls: Arc::new(AtomicUsize::new(0)),
                 observe_result: Arc::new(Mutex::new(Some(observe_result))),
                 launch_result: Arc::new(Mutex::new(Some(Ok(AndroidGuestLaunchOutcome::Started)))),
                 vdi_source_result: Arc::new(Mutex::new(None)),
@@ -953,24 +847,12 @@ mod tests {
                 .expect("one launch call")
         }
 
-        fn cleanup(
-            &self,
-            _request_id: &str,
-            _target: &CuttlefishVmTarget,
-            _package_manifest: &AndroidImagePackageManifest,
-            _generation: u64,
-        ) -> Result<(), CuttlefishProviderError> {
-            self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
         fn inventory_at(
             &self,
             _target: &CuttlefishVmTarget,
             _package_manifest: &AndroidImagePackageManifest,
             _generation: u64,
         ) -> Result<AndroidAppInventory, CuttlefishProviderError> {
-            self.inventory_calls.fetch_add(1, Ordering::Relaxed);
             Ok(AndroidAppInventory::pending("android-t480"))
         }
 
@@ -1235,62 +1117,6 @@ mod tests {
             AndroidGuestLaunchOutcome::Started
         );
         assert_eq!(launch_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn stale_generation_operations_stop_before_backend_contact() {
-        let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
-        let client = FakeClient::new(Ok(initial.clone()));
-        let inventory_calls = client.inventory_calls.clone();
-        let launch_calls = client.launch_calls.clone();
-        let adapter = CuttlefishProviderAdapter::new(
-            "android-t480",
-            target(),
-            package_manifest(),
-            initial,
-            client,
-        )
-        .expect("adapter");
-        let inventory_request =
-            AndroidGuestInventoryRequest::new("inventory-stale-generation", "android-t480")
-                .expect("inventory request");
-        let launch_request = AndroidGuestLaunchRequest::for_app(
-            "launch-stale-generation",
-            "android-t480",
-            AospStarterApp::Browser,
-        )
-        .expect("launch request");
-
-        let inventory = adapter.inventory_at(&inventory_request, 6);
-        assert_eq!(inventory.guest_boot_state, AndroidGuestBootState::Pending);
-        assert_eq!(
-            adapter.launch_at(&launch_request, 6),
-            AndroidGuestLaunchOutcome::Unavailable
-        );
-        assert_eq!(inventory_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(launch_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn stale_cleanup_cannot_reach_the_provider() {
-        let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
-        let client = FakeClient::new(Ok(initial.clone()));
-        let cleanup_calls = client.cleanup_calls.clone();
-        let adapter = CuttlefishProviderAdapter::new(
-            "android-t480",
-            target(),
-            package_manifest(),
-            initial,
-            client,
-        )
-        .expect("adapter");
-
-        assert!(!adapter.cleanup("cleanup-stale-generation", 6));
-        assert!(!adapter.cleanup("cleanup-zero-generation", 0));
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 0);
-
-        assert!(adapter.cleanup("cleanup-current-generation", 7));
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -395,6 +395,7 @@ impl EarthquakeOverlayWorker {
         Ok(())
     }
 
+    #[cfg(test)]
     fn poll_once(
         &self,
         probe: &dyn EarthquakeProbe,

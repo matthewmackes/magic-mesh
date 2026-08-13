@@ -3262,11 +3262,10 @@ mod tests {
         // must name `mackesd role pin`. Pin the strings.
         // (The fail-closed behavior itself is smoked in CI via
         // `mackesd serve` on a roleless container — OBS-2 scope.)
-        let unpinned_msg =
-            match mde_role::load_from(std::path::Path::new("/nonexistent/ent2/role.toml")) {
-                Err(mde_role::LoadError::NotPinned) => true,
-                _ => false,
-            };
+        let unpinned_msg = matches!(
+            mde_role::load_from(std::path::Path::new("/nonexistent/ent2/role.toml")),
+            Err(mde_role::LoadError::NotPinned)
+        );
         assert!(unpinned_msg, "absent file reads NotPinned");
     }
 

@@ -92,10 +92,11 @@ use mackes_mesh_types::workloads::{
 };
 
 use super::cloud::{
-    claim_nonce, verify_token, AndroidGuestProvider, AndroidGuestProviderRegistry,
-    AndroidGuestProviderRegistryError, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
-    DEFAULT_AUTH_ROOT,
+    claim_nonce, verify_token, AndroidGuestProviderRegistry, HmacTokenSigner, NullSigner,
+    TokenSigner, TokenVerdict, DEFAULT_AUTH_ROOT,
 };
+#[cfg(test)]
+use super::cloud::{AndroidGuestProvider, AndroidGuestProviderRegistryError};
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains.
@@ -735,9 +736,10 @@ impl ActionWorker {
         self
     }
 
-    /// Register one workload-scoped Android guest provider during startup or
-    /// test construction. Duplicate, invalid, and over-capacity identities
-    /// are returned as typed errors before the worker can run.
+    /// Register one workload-scoped Android guest provider in focused tests.
+    /// Duplicate, invalid, and over-capacity identities are returned as typed
+    /// errors before the worker can run.
+    #[cfg(test)]
     pub(crate) fn with_android_guest_provider(
         mut self,
         workload_id: impl Into<String>,

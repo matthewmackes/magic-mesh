@@ -785,7 +785,7 @@ mod tests {
         // peer-suffixed instance name + the relay-origin TXT (anti-loop).
         assert!(info.get_fullname().starts_with("Jellyfin-10-42-0-9."));
         assert_eq!(
-            info.get_property_val_str(RELAY_ORIGIN_TXT).as_deref(),
+            info.get_property_val_str(RELAY_ORIGIN_TXT),
             Some("10.42.0.9")
         );
         // advertised at the peer's mesh IP, not our LAN address.

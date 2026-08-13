@@ -1691,7 +1691,7 @@ mod tests {
     #[test]
     fn hostile_arm_controls_cannot_change_arm_or_indicator_state() {
         let bus = tempfile::tempdir().expect("bus");
-        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
             .with_now_fn(Arc::new(|| 1_000))

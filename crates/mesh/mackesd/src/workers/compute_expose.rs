@@ -1739,6 +1739,7 @@ mod tests {
         let runtime_seam: Arc<dyn ComputeExposeRuntime> = runtime.clone();
         let mut worker = ComputeExposeWorker::new()
             .with_runtime(runtime_seam)
+            .with_nebula_addr_hint("10.42.0.15".to_string())
             .with_poll_interval(Duration::from_millis(10));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task =
@@ -1746,7 +1747,17 @@ mod tests {
                 async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
             );
 
-        tokio::time::sleep(Duration::from_millis(35)).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if runtime.resolve_calls.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                assert!(!task.is_finished(), "missing Bus root must remain retryable");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("worker must retry unresolved Bus discovery");
         assert!(
             !task.is_finished(),
             "missing Bus root must remain retryable"
@@ -1839,13 +1850,14 @@ mod tests {
 
         assert!(runtime.resolve_calls.load(Ordering::SeqCst) >= 3);
         assert!(runtime.open_calls.load(Ordering::SeqCst) >= 2);
-        let calls = firewall.calls.lock().expect("calls");
-        assert_eq!(calls.len(), 2, "one add plus one reload expected");
-        assert!(calls[0]
-            .iter()
-            .any(|arg| arg.starts_with("--add-rich-rule=")));
-        assert_eq!(calls[1], vec!["--reload"]);
-        drop(calls);
+        {
+            let calls = firewall.calls.lock().expect("calls");
+            assert_eq!(calls.len(), 2, "one add plus one reload expected");
+            assert!(calls[0]
+                .iter()
+                .any(|arg| arg.starts_with("--add-rich-rule=")));
+            assert_eq!(calls[1], vec!["--reload"]);
+        }
 
         shutdown_tx.send(true).expect("request shutdown");
         tokio::time::timeout(Duration::from_millis(250), task)
@@ -2000,12 +2012,13 @@ mod tests {
             .read_latest(&action_result_topic(&retained_message.ulid))
             .expect("retained result query")
             .is_none());
-        let calls = firewall.calls.lock().expect("calls");
-        assert_eq!(calls.len(), 4, "exactly two add/reload transactions");
-        assert!(calls.iter().all(|call| !call
-            .iter()
-            .any(|arg| { arg.starts_with("--add-rich-rule=") && arg.contains("10.42.128.2") })));
-        drop(calls);
+        {
+            let calls = firewall.calls.lock().expect("calls");
+            assert_eq!(calls.len(), 4, "exactly two add/reload transactions");
+            assert!(calls.iter().all(|call| !call.iter().any(|arg| {
+                arg.starts_with("--add-rich-rule=") && arg.contains("10.42.128.2")
+            })));
+        }
 
         shutdown_tx.send(true).expect("request shutdown");
         tokio::time::timeout(Duration::from_millis(250), task)

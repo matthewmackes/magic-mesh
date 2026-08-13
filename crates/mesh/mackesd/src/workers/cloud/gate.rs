@@ -407,8 +407,6 @@ pub(crate) enum TokenVerdict {
     /// The token is validly signed but remains usable beyond the narrow
     /// privileged-mutation window accepted by the consumer.
     LifetimeTooLong,
-    /// The mutation envelope does not use the one supported wire schema.
-    UnsupportedSchema,
     /// The token authorizes a different verb or node than this request.
     Mismatch,
     /// The request body differs from the frozen body the shell authorized.
@@ -437,7 +435,6 @@ impl TokenVerdict {
             Self::Malformed => "armed token is malformed",
             Self::Expired => "armed token has expired",
             Self::LifetimeTooLong => "armed token exceeds the 30-second lifetime",
-            Self::UnsupportedSchema => "unsupported mutation schema version",
             Self::Mismatch => "armed token does not authorize this verb/node/target",
             Self::RequestMismatch => "armed token does not authorize this request body",
             Self::BadSignature => "armed token signature did not verify",

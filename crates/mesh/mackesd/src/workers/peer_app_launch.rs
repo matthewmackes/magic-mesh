@@ -604,10 +604,7 @@ impl LaunchJournal {
                 _ => None,
             })
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "peer-app launch journal is full of undelivered records",
-                )
+                io::Error::other("peer-app launch journal is full of undelivered records")
             })?;
         self.state.records.remove(&removable);
         Ok(())
@@ -672,8 +669,7 @@ impl LaunchJournal {
         require_safe_directory(&self.root)?;
         let body = serde_json::to_vec(&self.state).map_err(io_other)?;
         if body.len() > MAX_JOURNAL_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "peer-app launch journal exceeds its byte bound",
             ));
         }
@@ -950,6 +946,7 @@ impl PeerAppLaunchWorker {
     /// Handle one parsed request: enforce the node-target gate and the catalog
     /// allowlist, then launch. Returns `true` iff an app was actually launched.
     /// Pure over the injected launcher, so it is fully unit-tested.
+    #[cfg(test)]
     fn handle_request(&self, req: &LaunchRequest) -> bool {
         if !req.targets(&self.node_id) {
             // Not addressed to this node — silently advance (another node's worker
@@ -1008,6 +1005,7 @@ impl PeerAppLaunchWorker {
     /// Authenticate and handle one raw Bus body. Authorization intentionally
     /// precedes catalog resolution and the launcher seam: a shared-spool
     /// publisher cannot turn a transport write into a process spawn.
+    #[cfg(test)]
     fn handle_body(&self, body: &str) -> bool {
         let Some(req) = parse_launch_request(body) else {
             tracing::warn!(

@@ -73,12 +73,6 @@ impl JobExecWorker {
         }
     }
 
-    #[cfg(test)]
-    fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
-        self.authorizer = authorizer;
-        self
-    }
-
     /// Every run with a pending target slot for this box.
     fn pending_runs(&self) -> Vec<JobRun> {
         let Ok(entries) = std::fs::read_dir(runs_dir(&self.workgroup_root)) else {

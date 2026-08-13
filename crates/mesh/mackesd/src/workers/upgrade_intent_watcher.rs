@@ -222,7 +222,12 @@ fn intent_auth_target(path: &Path) -> std::io::Result<String> {
     let name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .filter(|name| name.len() > 5 && name.ends_with(".json"))
+        .filter(|name| {
+            name.len() > 5
+                && std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

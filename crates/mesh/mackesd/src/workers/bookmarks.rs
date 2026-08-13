@@ -1051,6 +1051,7 @@ impl BookmarksWorker {
     }
 
     /// Override the production capability verifier for isolated tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;

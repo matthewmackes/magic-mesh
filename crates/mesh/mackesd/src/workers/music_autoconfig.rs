@@ -285,7 +285,7 @@ enum WriteDecision {
 ///   * absent           → write (first auto-config),
 ///   * live == desired  → skip (already configured; nothing to do),
 ///   * live == marker    → write (WE wrote it last + the desired creds changed,
-///                         e.g. the shared password rotated — safe to update),
+///     e.g. the shared password rotated — safe to update),
 ///   * else             → skip (the USER set/changed it — their choice wins).
 fn decide(desired: &str, current: Option<&str>, marker: Option<&str>) -> WriteDecision {
     match current {

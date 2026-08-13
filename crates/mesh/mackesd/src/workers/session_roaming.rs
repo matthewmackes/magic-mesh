@@ -1079,7 +1079,7 @@ fn read_bounded_layout_record(path: &Path) -> std::io::Result<String> {
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?
+        .map_err(|e| Error::other(e.to_string()))?
         .into()
     };
     #[cfg(not(unix))]
@@ -1436,6 +1436,7 @@ impl RoamingFold {
 /// open-read-drop (never crosses an `.await`), mirroring the broker / scheduler.
 /// Requests are authenticated against their exact wire body before they reach
 /// the roaming fold or any layout/session store write.
+#[cfg(test)]
 fn read_new_actions_from(
     persist: &Persist,
     cursor: &mut Option<String>,

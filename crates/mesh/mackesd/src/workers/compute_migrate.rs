@@ -818,6 +818,7 @@ fn build_authorized_migrate_event_body<T: serde::Serialize>(
     Ok(document.to_string())
 }
 
+#[cfg(test)]
 fn publish_authorized_migrate_event<T: serde::Serialize>(
     persist: &Persist,
     topic: &str,
@@ -1188,6 +1189,7 @@ fn wall_now_ms() -> i64 {
 /// `cursor` past every message (same at-least-once semantics as the
 /// other drains) and returns the parsed events; the run loop correlates
 /// them to its own pending commits by `request_ulid`.
+#[cfg(test)]
 fn drain_committed_events(
     persist: &Persist,
     cursor: &mut Option<String>,
@@ -1236,6 +1238,7 @@ fn drain_committed_events(
 /// `cursor` past every message and returns the parsed events; the run
 /// loop rolls back any pending commit whose `request_ulid` matches
 /// (vdi-vm-5).
+#[cfg(test)]
 fn drain_failed_events(
     persist: &Persist,
     cursor: &mut Option<String>,
@@ -1498,7 +1501,7 @@ impl ComputeMigrateWorker {
         }
     }
 
-    fn gate_bus_read(&self, lane: &str) -> Result<(), String> {
+    fn gate_bus_read(&self, _lane: &str) -> Result<(), String> {
         #[cfg(test)]
         if self
             .bus_read_failure_at
@@ -1509,7 +1512,7 @@ impl ComputeMigrateWorker {
             )
             .is_ok_and(|remaining| remaining == 1)
         {
-            return Err(format!("injected migration Bus {lane} read failure"));
+            return Err(format!("injected migration Bus {_lane} read failure"));
         }
         Ok(())
     }
@@ -1602,6 +1605,7 @@ fn resolve_nebula_addr(worker: &ComputeMigrateWorker) -> String {
 /// multi-GiB disk) runs on `spawn_blocking` in the run loop instead of inline on
 /// the async runtime, and `Persist` (which is `!Sync`) never crosses an `.await`
 /// (mackesd-02).
+#[cfg(test)]
 fn drain_source_jobs(
     persist: &Persist,
     worker: &ComputeMigrateWorker,
@@ -1654,6 +1658,7 @@ fn drain_source_jobs(
 /// (`target_peer == own`). The heavy define/start (`run_migrate_target`) then
 /// runs on `spawn_blocking` in the run loop (mackesd-02), keeping `Persist` off
 /// the `.await`.
+#[cfg(test)]
 fn drain_target_jobs(
     persist: &Persist,
     worker: &ComputeMigrateWorker,
@@ -2013,6 +2018,7 @@ fn admit_source_messages(
     Ok(())
 }
 
+#[cfg(test)]
 fn admit_source_jobs(
     persist: &Persist,
     worker: &ComputeMigrateWorker,
@@ -2085,6 +2091,7 @@ fn admit_target_messages(
     Ok(())
 }
 
+#[cfg(test)]
 fn admit_target_jobs(
     persist: &Persist,
     worker: &ComputeMigrateWorker,
@@ -2212,6 +2219,7 @@ fn admit_ack_messages(
     Ok(())
 }
 
+#[cfg(test)]
 fn admit_ack_jobs(
     persist: &Persist,
     worker: &ComputeMigrateWorker,
@@ -2267,10 +2275,12 @@ fn apply_ack_jobs(ledger: &mut MigrationLedger, now_ms: i64) -> Result<(), Strin
 /// Resolve the shared Bus spool. System workers do not necessarily have HOME
 /// or XDG state during early boot, so the canonical `/run/mde-bus` root is the
 /// final authority when the environment resolver is unavailable.
+#[cfg(test)]
 fn compute_migrate_bus_root(override_root: Option<PathBuf>) -> PathBuf {
     compute_migrate_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
 }
 
+#[cfg(test)]
 fn compute_migrate_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
@@ -2281,6 +2291,7 @@ fn compute_migrate_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
 /// migration, target apply, commit relinquish, timeout rollback, or retry.
 /// Partial admissions are safe: their durable cursors prevent duplication on
 /// the next successful sweep.
+#[cfg(test)]
 fn admit_bus_jobs(
     persist: &Persist,
     worker: &ComputeMigrateWorker,
@@ -2944,7 +2955,7 @@ mod tests {
     #[test]
     fn is_source_peer_false_when_own_ip_empty() {
         let req = MigrateRequest {
-            source_peer: "".into(),
+            source_peer: String::new(),
             target_peer: "10.42.0.2".into(),
             vm_id: "abc".into(),
             disk_path: "/d".into(),

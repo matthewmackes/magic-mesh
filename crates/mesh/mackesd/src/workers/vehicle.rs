@@ -401,14 +401,11 @@ impl SshHttpProbe {
             crate::workers::proc::DEFAULT_CMD_TIMEOUT,
         )?;
         if !out.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "curl exited {}: {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "curl exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -547,14 +544,11 @@ impl SshHttpProbe {
         }
         let out = child.wait_with_output()?;
         if !out.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "ssh exited {}: {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "ssh exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -1255,7 +1249,7 @@ pub struct VehicleManagerRoute {
     source_id: VehicleSourceId,
     manager_id: String,
     topic: String,
-    snapshot: VehicleStateV2,
+    snapshot: Box<VehicleStateV2>,
 }
 
 impl VehicleManagerRoute {
@@ -1281,7 +1275,7 @@ impl VehicleManagerRoute {
     /// any of its domains.
     #[must_use]
     pub fn snapshot(&self) -> &VehicleStateV2 {
-        &self.snapshot
+        self.snapshot.as_ref()
     }
 }
 
@@ -1337,7 +1331,7 @@ fn manager_route_rejection(
 pub struct VehicleRosterSnapshot {
     source_id: VehicleSourceId,
     manager_id: String,
-    snapshot: VehicleStateV2,
+    snapshot: Box<VehicleStateV2>,
 }
 
 impl VehicleRosterSnapshot {
@@ -1375,7 +1369,7 @@ impl VehicleRosterSnapshot {
         Ok(Self {
             source_id,
             manager_id,
-            snapshot,
+            snapshot: Box::new(snapshot),
         })
     }
 
@@ -1394,7 +1388,7 @@ impl VehicleRosterSnapshot {
     /// Borrow the accepted v2 snapshot for publication or read-only rendering.
     #[must_use]
     pub fn snapshot(&self) -> &VehicleStateV2 {
-        &self.snapshot
+        self.snapshot.as_ref()
     }
 
     fn freshness_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -2010,7 +2004,7 @@ impl VehicleRoster {
             let selected = VehicleRosterSnapshot::from_v2(
                 source_id.clone(),
                 route.manager_id.clone(),
-                route.snapshot,
+                *route.snapshot,
             )
             .expect("roster route preserves its admitted identity");
             let heartbeat = self
@@ -2045,7 +2039,7 @@ impl VehicleRoster {
                     source_id,
                     manager_id: selected.manager_id.clone(),
                     reason,
-                    snapshot: selected.snapshot,
+                    snapshot: *selected.snapshot,
                 });
             } else if let Some(previous) = self.published.get_mut(&source_id) {
                 // Preserve the publication clock while retaining the newest
@@ -4231,8 +4225,11 @@ impl VehicleActionBody {
 /// Whether `name` is a safe bare `*.yaml` config-file name — no path components, no
 /// `..` traversal, only sane filename chars. Guards the `get-config` SSH arg.
 fn is_safe_yaml_name(name: &str) -> bool {
+    let has_yaml_extension = Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension == std::ffi::OsStr::new("yaml"));
     name.len() > ".yaml".len()
-        && name.ends_with(".yaml")
+        && has_yaml_extension
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains("..")
@@ -4449,7 +4446,7 @@ impl Worker for VehicleWorker {
                                 roster: staged_roster,
                                 kind: VehiclePendingCommitKind::Current { healthy, was_online },
                                 publish_roster: changed || healthy,
-                                publish_unavailable: (changed || healthy) && !healthy,
+                                publish_unavailable: changed && !healthy,
                             };
                             match self.publish_pending_commit(&mut pending) {
                                 Ok(()) => {
@@ -4809,7 +4806,7 @@ fn status_beacon_gps(beacon: &Mg90StatusBeacon, gaps: &mut Vec<String>) -> Optio
         }
     };
     let has_position = fix && beacon.location.is_some();
-    if fix && !has_position {
+    if fix && beacon.location.is_none() {
         gaps.push("status broadcast GNSS fix has no valid location".to_string());
         return None;
     }
@@ -5256,8 +5253,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     fn to_io(r: &Result<String, String>) -> io::Result<String> {
-        r.clone()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        r.clone().map_err(io::Error::other)
     }
 
     impl VehicleProbe for FakeProbe {
@@ -5281,9 +5277,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         }
         fn read_obd_status(&self) -> io::Result<Option<String>> {
             *self.obd_calls.lock().unwrap() += 1;
-            self.obd_status
-                .clone()
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+            self.obd_status.clone().map_err(io::Error::other)
         }
         fn run_ssh(&self, cmd: &str) -> io::Result<String> {
             self.ssh_calls.lock().unwrap().push(cmd.to_string());
@@ -6318,8 +6312,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         symlink(&target, &link).unwrap();
 
         let error = open_private_cookie_runtime_directory(&link)
-            .err()
-            .expect("symlinked cookie runtime must fail closed");
+            .expect_err("symlinked cookie runtime must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -6528,16 +6521,24 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { worker.run(token).await });
 
-        tokio::time::sleep(Duration::from_millis(45)).await;
         let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
-        let messages = persist
-            .list_since(&vehicle_state_topic("rig-1"), None)
-            .unwrap();
-        assert!(
-            messages.len() >= 4,
-            "initial pending publication plus independent heartbeats expected, got {}",
-            messages.len()
-        );
+        let messages = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let messages = persist
+                    .list_since(&vehicle_state_topic("rig-1"), None)
+                    .unwrap();
+                if messages.len() >= 4 {
+                    break messages;
+                }
+                assert!(
+                    !handle.is_finished(),
+                    "worker exited before publishing independent heartbeats"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial pending publication and independent heartbeats must arrive");
         let states = messages
             .iter()
             .map(|message| {
@@ -6972,13 +6973,13 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].source_id, source_b);
         assert_eq!(changed[0].reason, VehiclePublicationReason::Changed);
-        assert_eq!(changed[0].snapshot, changed_b.snapshot);
+        assert_eq!(&changed[0].snapshot, changed_b.snapshot());
 
         let heartbeat = roster.take_publications(t0 + ROSTER_HEARTBEAT);
         assert_eq!(heartbeat.len(), 1);
         assert_eq!(heartbeat[0].source_id, source_a);
         assert_eq!(heartbeat[0].reason, VehiclePublicationReason::Heartbeat);
-        assert_eq!(heartbeat[0].snapshot, metadata_only_a.snapshot);
+        assert_eq!(&heartbeat[0].snapshot, metadata_only_a.snapshot());
     }
 
     #[test]
@@ -7384,6 +7385,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             "../etc/passwd.yaml",
             "/etc/wan.yaml",
             "sub/wan.yaml",
+            "wan.YAML",
             "wan.txt",
             "wan",
             "..yaml",

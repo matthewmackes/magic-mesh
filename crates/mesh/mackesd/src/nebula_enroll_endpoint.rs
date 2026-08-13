@@ -662,8 +662,7 @@ mod tests {
     // ---- handler: the ONBOARD-2 acceptance core -------------
 
     fn fresh_store_at(path: &Path) -> rusqlite::Connection {
-        let conn = crate::store::open(path).expect("open");
-        conn
+        crate::store::open(path).expect("open")
     }
 
     /// Stand up a lighthouse fixture: a real (mock-backed) CA at

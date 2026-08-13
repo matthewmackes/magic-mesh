@@ -143,9 +143,9 @@ impl StunGatherWorker {
         // equivalent via a Vec drain. Tokio's `JoinSet` would be
         // more elegant but pulls a dependency feature we'd have
         // to enable workspace-wide.
-        let mut handles: Vec<_> = futs.into_iter().map(tokio::spawn).collect();
+        let handles: Vec<_> = futs.into_iter().map(tokio::spawn).collect();
         let mut out = Vec::new();
-        for h in handles.drain(..) {
+        for h in handles {
             if let Ok((server, Ok(candidate))) = h.await {
                 out.push(StunCandidate {
                     reflexive: candidate.reflexive,

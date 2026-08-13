@@ -244,7 +244,7 @@ impl Worker for FirewallPresetWorker {
 /// All peers: UDP/4242. Lighthouses additionally: TCP/443.
 #[must_use]
 pub fn desired_ports(is_lighthouse: bool) -> Vec<(u16, &'static str)> {
-    let mut out: Vec<(u16, &'static str)> = NEBULA_PORTS_ALL_PEERS.iter().copied().collect();
+    let mut out: Vec<(u16, &'static str)> = NEBULA_PORTS_ALL_PEERS.to_vec();
     if is_lighthouse {
         out.extend(NEBULA_PORTS_LIGHTHOUSE_EXTRA.iter().copied());
     }

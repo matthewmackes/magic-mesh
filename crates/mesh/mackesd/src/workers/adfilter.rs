@@ -847,14 +847,17 @@ impl AdfilterWorker {
         };
         let mut candidate_cursors = self.cursors.clone();
         let mut requests = Vec::new();
-        for (index, topic) in topics
+        let topics = topics
             .into_iter()
-            .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
-            .enumerate()
-        {
+            .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len());
+        #[cfg(test)]
+        let topics = topics.enumerate();
+        #[cfg(not(test))]
+        let topics = topics.map(|topic| ((), topic));
+        for (_index, topic) in topics {
             #[cfg(test)]
             if let Some(gate) = self.request_read_gate.as_ref() {
-                if let Err(error) = gate(&topic, index) {
+                if let Err(error) = gate(&topic, _index) {
                     tracing::debug!(target: "mackesd::adfilter", topic, %error, "injected list_since failure");
                     return false;
                 }

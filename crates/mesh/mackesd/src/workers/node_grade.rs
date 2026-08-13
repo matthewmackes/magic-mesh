@@ -1318,7 +1318,12 @@ fn read_canonical_states(workgroup_root: &Path) -> Vec<NodeHealthState> {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
-            if name.starts_with('.') || name.contains("sync-conflict") || !name.ends_with(".json") {
+            if name.starts_with('.')
+                || name.contains("sync-conflict")
+                || !std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
                 return None;
             }
             let state = read_state(&entry.path())?;
@@ -2133,12 +2138,16 @@ impl NodeGradeWorker {
         // A replacement Bus has no retained health row. Force the next
         // projection to republish even when the semantic health state is
         // unchanged from the retired Bus.
+        self.invalidate_publication_acknowledgements();
+        self.active_bus = Some(identity.clone());
+        Ok(())
+    }
+
+    fn invalidate_publication_acknowledgements(&mut self) {
         self.last_health_publication = None;
         self.last_health_file_publication = None;
         self.last_snapshot_file_publication = None;
         self.last_snapshot_bus_publication = None;
-        self.active_bus = Some(identity.clone());
-        Ok(())
     }
 
     fn action_transaction(&mut self) -> Result<(), String> {
@@ -2153,9 +2162,14 @@ impl NodeGradeWorker {
         self.cycle(Some(&mut persist))
     }
 
-    fn cycle(
+    fn cycle(&mut self, persist: Option<&mut Persist>) -> Result<SystemMeshHealthSnapshot, String> {
+        self.cycle_with_condition_update(persist, None)
+    }
+
+    fn cycle_with_condition_update(
         &mut self,
-        mut persist: Option<&mut Persist>,
+        persist: Option<&mut Persist>,
+        condition_update: Option<(&HealthActionRequest, u64)>,
     ) -> Result<SystemMeshHealthSnapshot, String> {
         let now = now_ms();
         let path = node_dir(&self.workgroup_root).join(format!("{}.json", self.host));
@@ -2182,6 +2196,21 @@ impl NodeGradeWorker {
         pressure.observe(observations.resources);
         let mut active = evaluate_conditions(&self.host, &observations, &pressure, generation, now);
         let resolved = merge_lifecycle(previous.as_ref(), &mut active, now);
+        if let Some((request, updated_at_ms)) = condition_update {
+            if let Some(condition) = active.iter_mut().find(|condition| {
+                condition.id == request.condition_id && condition.scope == request.target
+            }) {
+                match request.action {
+                    HealthAction::Acknowledge => {
+                        condition.acknowledged_at_ms = Some(updated_at_ms);
+                    }
+                    HealthAction::SnoozeOneHour => {
+                        condition.snoozed_until_ms = Some(updated_at_ms.saturating_add(3_600_000));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let grade_factors = factors(&self.host, &observations, now);
         let grade = NodeGrade::evaluate(
             &self.host,
@@ -2209,13 +2238,18 @@ impl NodeGradeWorker {
                     previous != &health_key
                         || now.saturating_sub(*published_at_ms) >= HEALTH_PUBLICATION_HEARTBEAT_MS
                 });
+        #[cfg(test)]
+        let inject_snapshot_file_failure = self.fail_snapshot_file_writes > 0;
+        #[cfg(not(test))]
+        let inject_snapshot_file_failure = false;
         let health_file_due =
             self.last_health_file_publication
                 .as_ref()
                 .is_none_or(|(previous, published_at_ms)| {
                     previous != &health_key
                         || now.saturating_sub(*published_at_ms) >= HEALTH_PUBLICATION_HEARTBEAT_MS
-                });
+                })
+                || inject_snapshot_file_failure;
         let previous_critical: BTreeSet<_> = previous
             .iter()
             .flat_map(|old| old.active_conditions.iter())
@@ -2239,21 +2273,16 @@ impl NodeGradeWorker {
             observations.reachable_lighthouses,
         );
         let snapshot_key = snapshot_publication_key(&snapshot);
+        // The injected failure exercises a real partial canonical transaction:
+        // the node row is durable, the snapshot write fails, and no Bus
+        // projection is acknowledged. The retry must therefore republish both
+        // files and both Bus rows at a strictly newer generation.
         let snapshot_file_due = self.last_snapshot_file_publication.as_ref().is_none_or(
             |(previous, published_at_ms)| {
                 previous != &snapshot_key
                     || now.saturating_sub(*published_at_ms) >= SNAPSHOT_PUBLICATION_HEARTBEAT_MS
             },
-        ) || {
-            #[cfg(test)]
-            {
-                self.fail_snapshot_file_writes > 0
-            }
-            #[cfg(not(test))]
-            {
-                false
-            }
-        };
+        ) || inject_snapshot_file_failure;
         let snapshot_bus_due = self.last_snapshot_bus_publication.as_ref().is_none_or(
             |(previous, published_at_ms)| {
                 previous != &snapshot_key
@@ -2266,16 +2295,21 @@ impl NodeGradeWorker {
             self.last_health_file_publication = Some((health_key.clone(), now));
         }
         if snapshot_file_due {
-            write_json_atomic(&snapshot_path(&self.workgroup_root, &self.host), &snapshot)
-                .map_err(|error| format!("health snapshot publication failed: {error}"))?;
             #[cfg(test)]
             if self.fail_snapshot_file_writes > 0 {
                 self.fail_snapshot_file_writes -= 1;
+                self.invalidate_publication_acknowledgements();
                 return Err("injected canonical snapshot publication failure".into());
+            }
+            if let Err(error) =
+                write_json_atomic(&snapshot_path(&self.workgroup_root, &self.host), &snapshot)
+            {
+                self.invalidate_publication_acknowledgements();
+                return Err(format!("health snapshot publication failed: {error}"));
             }
             self.last_snapshot_file_publication = Some((snapshot_key.clone(), now));
         }
-        if let Some(bus) = persist.as_deref_mut() {
+        if let Some(bus) = persist {
             if publish_health {
                 emit_json(bus, &node_health_topic(&self.host), &state)?;
                 self.last_health_publication = Some((health_key, now));
@@ -2509,12 +2543,6 @@ impl NodeGradeWorker {
                     {
                         self.action_execution_count += 1;
                     }
-                    if matches!(
-                        request.action,
-                        HealthAction::Acknowledge | HealthAction::SnoozeOneHour
-                    ) {
-                        self.update_condition_state(&request, now_ms())?;
-                    }
                     match execute_action(
                         request.action,
                         &self.host,
@@ -2527,7 +2555,12 @@ impl NodeGradeWorker {
                 }
             };
             let refreshed_snapshot = if outcome == HealthActionOutcome::Applied {
-                Some(self.cycle(Some(persist))?)
+                let condition_update = matches!(
+                    request.action,
+                    HealthAction::Acknowledge | HealthAction::SnoozeOneHour
+                )
+                .then(|| (&request, now_ms()));
+                Some(self.cycle_with_condition_update(Some(persist), condition_update)?)
             } else {
                 None
             };
@@ -2577,33 +2610,6 @@ impl NodeGradeWorker {
             };
             self.publish_action_result(persist, &staged)?;
             self.action_cursor = Some(source_ulid);
-        }
-        Ok(())
-    }
-
-    fn update_condition_state(
-        &self,
-        request: &HealthActionRequest,
-        now: u64,
-    ) -> Result<(), String> {
-        let path = node_dir(&self.workgroup_root).join(format!("{}.json", self.host));
-        let Some(mut state) = read_state(&path) else {
-            return Err("canonical node health state is unavailable".into());
-        };
-        if let Some(condition) = state
-            .active_conditions
-            .iter_mut()
-            .find(|condition| condition.id == request.condition_id)
-        {
-            match request.action {
-                HealthAction::Acknowledge => condition.acknowledged_at_ms = Some(now),
-                HealthAction::SnoozeOneHour => {
-                    condition.snoozed_until_ms = Some(now.saturating_add(3_600_000))
-                }
-                _ => {}
-            }
-            write_json_atomic(&path, &state)
-                .map_err(|error| format!("condition state publication failed: {error}"))?;
         }
         Ok(())
     }
@@ -3260,15 +3266,22 @@ mod tests {
         let nodes = node_dir(workgroup.path());
         std::fs::create_dir_all(&nodes).unwrap();
         let now = now_ms();
+        let published_at_ms = now.saturating_sub(1);
         let sample = observations("workstation");
         let stale_counter = NodeHealthState {
             schema_version: HEALTH_SCHEMA_VERSION,
             publisher: "node".into(),
             roster_revision: "r1".into(),
             generation: 136,
-            published_at_ms: now.saturating_sub(1),
-            valid_until_ms: now.saturating_add(PUBLICATION_VALIDITY_MS),
-            grade: NodeGrade::evaluate("node", 100, factors("node", &sample, now), &[], now),
+            published_at_ms,
+            valid_until_ms: published_at_ms.saturating_add(PUBLICATION_VALIDITY_MS),
+            grade: NodeGrade::evaluate(
+                "node",
+                100,
+                factors("node", &sample, published_at_ms),
+                &[],
+                published_at_ms,
+            ),
             active_conditions: Vec::new(),
             resolved_conditions: Vec::new(),
         };

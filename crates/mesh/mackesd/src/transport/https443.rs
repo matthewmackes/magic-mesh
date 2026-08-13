@@ -282,6 +282,7 @@ fn build_pinned_client_config(fingerprint: &str) -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
+#[cfg(test)]
 fn advertised_identity_for_host<'a>(
     lighthouses: &'a [crate::ca::bundle::LighthouseEntry],
     fallback: &FallbackHostConfig,
@@ -460,8 +461,7 @@ impl std::fmt::Debug for NebulaHttps443Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NebulaHttps443Connection")
             .field("id", &self.id)
-            .field("stream", &"<split TlsStream<TcpStream>>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
