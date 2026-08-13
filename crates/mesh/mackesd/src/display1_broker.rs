@@ -10,7 +10,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, OwnedFd as StdOwnedFd};
@@ -442,10 +442,9 @@ impl Display1AttachHello {
     }
 }
 
-/// A one-use, peer-credential-bound local attachment capability. Constructing
-/// a relay consumes the nonce; the resulting lease may carry multiple frames
-/// until expiry, but a second attach attempt with the same nonce is impossible
-/// for the caller because the broker does not retain it.
+/// A peer-credential-bound local attachment capability. The first attach binds
+/// the nonce to its kernel process. That process may reconnect after a dead
+/// transport, but a different process cannot replay the capability.
 #[derive(Debug)]
 pub struct Display1ScmRightsRelay {
     stream: UnixStream,
@@ -454,13 +453,14 @@ pub struct Display1ScmRightsRelay {
     scanout: Mutex<Option<(u32, u32)>>,
 }
 
-/// Node-local broker that consumes attachment nonces exactly once before it
-/// creates a peer-bound relay. The nonce store is deliberately process-local;
-/// the capability itself is already authenticated by the Workload worker and
-/// never crosses the mesh bus.
+/// Node-local broker that binds each attachment nonce to the first kernel peer
+/// that presents it. The same process may reconnect after transport loss, but
+/// another process can never replay the nonce or substitute itself as owner.
+/// The nonce store is deliberately process-local; the capability itself is
+/// already authenticated by the Workload worker and never crosses the mesh bus.
 #[derive(Debug, Default)]
 pub struct Display1ScmRightsBroker {
-    used_nonces: Mutex<HashSet<String>>,
+    nonce_owners: Mutex<HashMap<String, PeerCredentials>>,
 }
 
 impl Display1ScmRightsBroker {
@@ -484,15 +484,24 @@ impl Display1ScmRightsBroker {
         if presented_nonce.is_empty() || presented_nonce != expected_nonce {
             return Err(Display1Error::Attachment("one-use nonce rejected".into()));
         }
-        {
-            let mut used = self
-                .used_nonces
+        let claimed_nonce = {
+            let mut owners = self
+                .nonce_owners
                 .lock()
                 .map_err(|_| Display1Error::Attachment("nonce store poisoned".into()))?;
-            if !used.insert(presented_nonce.to_owned()) {
-                return Err(Display1Error::Attachment("one-use nonce replayed".into()));
+            match owners.get(presented_nonce) {
+                Some(owner) if *owner != expected_peer => {
+                    return Err(Display1Error::Attachment(
+                        "attachment nonce replayed by a different kernel peer".into(),
+                    ));
+                }
+                Some(_) => false,
+                None => {
+                    owners.insert(presented_nonce.to_owned(), expected_peer);
+                    true
+                }
             }
-        }
+        };
         match Display1ScmRightsRelay::attach(
             stream,
             expected_peer,
@@ -503,8 +512,10 @@ impl Display1ScmRightsBroker {
         ) {
             Ok(relay) => Ok(relay),
             Err(error) => {
-                if let Ok(mut used) = self.used_nonces.lock() {
-                    used.remove(presented_nonce);
+                if claimed_nonce {
+                    if let Ok(mut owners) = self.nonce_owners.lock() {
+                        owners.remove(presented_nonce);
+                    }
                 }
                 Err(error)
             }
@@ -851,6 +862,15 @@ impl Display1AttachmentSink {
             .relay
             .lock()
             .map_err(|_| Display1Error::Attachment("relay store poisoned".into()))?;
+        if current.as_ref().is_some_and(|existing| {
+            existing
+                .presentation_connected(display1_now_ms())
+                .unwrap_or(false)
+        }) {
+            return Err(Display1Error::Attachment(
+                "an authenticated Display1 relay is already active".into(),
+            ));
+        }
         if current.replace(relay).is_some() {
             self.input_epoch.fetch_add(1, Ordering::AcqRel);
         }
@@ -895,14 +915,11 @@ impl Display1AttachmentSink {
                 Ok(relay) => relay,
                 Err(_) => return false,
             };
-            if relay
-                .as_ref()
-                .is_some_and(|relay| {
-                    relay
-                        .presentation_connected(display1_now_ms())
-                        .unwrap_or(false)
-                })
-            {
+            if relay.as_ref().is_some_and(|relay| {
+                relay
+                    .presentation_connected(display1_now_ms())
+                    .unwrap_or(false)
+            }) {
                 return true;
             }
             relay.take();
@@ -2154,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_rejects_nonce_replay_before_socket_attachment() {
+    fn broker_rejects_nonce_replay_from_substituted_kernel_peer() {
         let broker = Display1ScmRightsBroker::new();
         let lease = WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -2179,23 +2196,27 @@ mod tests {
             .expect("first attach");
         drop(relay);
         let (second, _) = seqpacket_pair();
+        let substituted_peer = PeerCredentials {
+            pid: expected_peer.pid.saturating_add(1),
+            ..expected_peer
+        };
         let error = broker
             .attach(
                 second,
-                expected_peer,
+                substituted_peer,
                 lease,
                 "nonce-replay",
                 "nonce-replay",
                 1_000,
             )
-            .expect_err("nonce replay must fail");
+            .expect_err("substituted peer replay must fail");
         assert!(
             matches!(error, Display1Error::Attachment(message) if message.contains("replayed"))
         );
     }
 
     #[test]
-    fn relay_replacement_disconnect_and_revoke_advance_input_epoch_once() {
+    fn dead_transport_reconnect_requires_same_owner_and_rejects_live_takeover() {
         let now_ms = display1_now_ms();
         let lease = WorkloadAttachmentLease {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -2206,40 +2227,64 @@ mod tests {
             protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
             expires_at_ms: now_ms.saturating_add(60_000),
         };
+        let broker = Display1ScmRightsBroker::new();
         let sink = Display1AttachmentSink::new();
         let (first_daemon, first_shell) = seqpacket_pair();
         let first_peer = peer_credentials(&first_daemon).expect("first peer");
         sink.install(
-            Display1ScmRightsRelay::attach(
-                first_daemon,
-                first_peer,
-                lease.clone(),
-                &lease.nonce,
-                &lease.nonce,
-                now_ms,
-            )
-            .expect("first relay"),
+            broker
+                .attach(
+                    first_daemon,
+                    first_peer,
+                    lease.clone(),
+                    &lease.nonce,
+                    &lease.nonce,
+                    now_ms,
+                )
+                .expect("first relay"),
         )
         .expect("install first");
         assert_eq!(sink.input_epoch.load(Ordering::Acquire), 0);
 
+        let (live_takeover, _) = seqpacket_pair();
+        let live_peer = peer_credentials(&live_takeover).expect("live takeover peer");
+        let error = sink
+            .install(
+                broker
+                    .attach(
+                        live_takeover,
+                        live_peer,
+                        lease.clone(),
+                        &lease.nonce,
+                        &lease.nonce,
+                        now_ms.saturating_add(1),
+                    )
+                    .expect("candidate relay"),
+            )
+            .expect_err("a live relay cannot be replaced");
+        assert!(matches!(
+            error,
+            Display1Error::Attachment(message) if message.contains("already active")
+        ));
+        assert_eq!(sink.input_epoch.load(Ordering::Acquire), 0);
+
+        drop(first_shell);
         let (second_daemon, second_shell) = seqpacket_pair();
         let second_peer = peer_credentials(&second_daemon).expect("second peer");
         sink.install(
-            Display1ScmRightsRelay::attach(
-                second_daemon,
-                second_peer,
-                lease.clone(),
-                &lease.nonce,
-                &lease.nonce,
-                now_ms.saturating_add(1),
-            )
-            .expect("second relay"),
+            broker
+                .attach(
+                    second_daemon,
+                    second_peer,
+                    lease.clone(),
+                    &lease.nonce,
+                    &lease.nonce,
+                    now_ms.saturating_add(2),
+                )
+                .expect("second relay"),
         )
         .expect("replace relay");
         assert_eq!(sink.input_epoch.load(Ordering::Acquire), 1);
-        drop(first_shell);
-
         sink.first_frame.store(true, Ordering::Release);
         drop(second_shell);
         assert_eq!(
@@ -2497,8 +2542,7 @@ mod tests {
             Display1AttachmentServer::start_at(temp.path(), lease).expect("current broker");
 
         {
-            let _stale_cleanup_lock =
-                lock_display1_root(&socket_path).expect("stale cleanup lock");
+            let _stale_cleanup_lock = lock_display1_root(&socket_path).expect("stale cleanup lock");
             assert!(
                 !stale_identity.remove_if_owned(&socket_path),
                 "restart cleanup accepted a substituted socket inode"
