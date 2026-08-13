@@ -415,7 +415,7 @@ impl ClockWorker {
         }
         let now_ms = self.clock.now_ms();
         if let Some(record) = self.store.load(&self.node_id)? {
-            let mut snapshot = ClockSnapshotV1::from_persisted_json_at(
+            let snapshot = ClockSnapshotV1::from_persisted_json_at(
                 record.snapshot_json.as_bytes(),
                 &self.context(now_ms),
             )?;
@@ -426,34 +426,8 @@ impl ClockWorker {
             );
             validate_stopwatch_deadlines(&snapshot, now_ms)?;
             self.action_cursor = record.action_cursor;
-            // Music's alert authority is intentionally in-process. If both
-            // daemons restart after Start was acknowledged, its renderer and
-            // replay ledger are gone while this durable occurrence is still
-            // Ringing. Re-create the deterministic Start rows before touching
-            // the transient Bus. A surviving Music daemon recognizes the same
-            // request id as an exact replay; a restarted daemon restores the
-            // missing alert effect.
-            let audio_requests = clock_audio_recovery_requests(&snapshot, now_ms, &self.node_id)?;
-            if !audio_requests.is_empty() {
-                // This same-revision write is a fresh production of unchanged
-                // semantic state. It lets the writer validate recovery rows
-                // against the restart sample instead of the stale pre-crash
-                // snapshot timestamp.
-                snapshot.produced_at_utc_ms = now_ms;
-                anyhow::ensure!(
-                    self.store.commit(
-                        &self.node_id,
-                        snapshot.revision,
-                        &snapshot,
-                        None,
-                        None,
-                        self.action_cursor.as_deref(),
-                        &audio_requests,
-                    )?,
-                    "Clock ringing recovery was not persisted"
-                );
-            }
             self.snapshot = Some(snapshot);
+            self.recover_durable_authority(now_ms)?;
             return Ok(());
         }
         let snapshot = self.initial_snapshot(now_ms);
@@ -463,6 +437,67 @@ impl ClockWorker {
             "initial Clock authority was not persisted"
         );
         self.snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn recover_durable_authority(&mut self, now_ms: i64) -> anyhow::Result<()> {
+        let prior = self
+            .snapshot
+            .as_ref()
+            .expect("Clock snapshot loaded for recovery")
+            .clone();
+        let expected = prior.revision;
+        let changed = self.advance_deadlines(now_ms)?;
+        if changed {
+            let snapshot = self.snapshot.as_mut().expect("Clock snapshot loaded");
+            snapshot.revision = expected
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Clock revision exhausted"))?;
+            snapshot.produced_at_utc_ms = now_ms;
+            stamp_revision(snapshot, &self.node_id);
+            preserve_unchanged_occurrence_revisions(snapshot, &prior);
+        }
+
+        let snapshot = self.snapshot.as_ref().expect("Clock snapshot loaded");
+        let mut audio_requests = clock_audio_transitions(&prior, snapshot, now_ms, &self.node_id)?;
+        // Music's alert authority is intentionally in-process. Re-create Start
+        // rows for occurrences that remain Ringing after elapsed deadlines are
+        // recovered. Newly due occurrences produce the same deterministic row,
+        // so retain only one copy in this atomic authority/outbox transaction.
+        for request in clock_audio_recovery_requests(snapshot, now_ms, &self.node_id)? {
+            if !audio_requests
+                .iter()
+                .any(|candidate| candidate.request_id == request.request_id)
+            {
+                audio_requests.push(request);
+            }
+        }
+        if !changed && audio_requests.is_empty() {
+            return Ok(());
+        }
+
+        // Recovery is a fresh production even when semantic authority is
+        // unchanged. This binds reconstructed outbox rows to the restart sample
+        // instead of the stale pre-crash timestamp.
+        self.snapshot
+            .as_mut()
+            .expect("Clock snapshot loaded")
+            .produced_at_utc_ms = now_ms;
+        anyhow::ensure!(
+            self.store.commit(
+                &self.node_id,
+                expected,
+                self.snapshot.as_ref().expect("Clock snapshot loaded"),
+                None,
+                None,
+                self.action_cursor.as_deref(),
+                &audio_requests,
+            )?,
+            "Clock deadline recovery was not persisted"
+        );
+        // Durable scheduling must not wait for the transient Bus. Its next
+        // generation publishes this recovered snapshot and drains the outbox.
+        self.published_once = false;
         Ok(())
     }
 
@@ -1449,7 +1484,9 @@ impl ClockWorker {
                     .iter()
                     .find(|candidate| candidate.global_event_id == occurrence.global_event_id)
                     .and_then(|candidate| candidate.acknowledgement.as_ref())
-                    .is_some_and(|current| peer_acknowledgement_is_converged(current, acknowledgement));
+                    .is_some_and(|current| {
+                        peer_acknowledgement_is_converged(current, acknowledgement)
+                    });
                 if converged {
                     continue;
                 }
@@ -3295,11 +3332,7 @@ mod tests {
     fn command_commit_survives_publication_failure_and_bus_generation_loss() {
         let mut fixture = Fixture::new();
         fixture.worker.tick_once().unwrap();
-        fixture.publish(&fixture.timer_command(
-            "command-generation-loss",
-            1,
-            NOW + 60_000,
-        ));
+        fixture.publish(&fixture.timer_command("command-generation-loss", 1, NOW + 60_000));
 
         let state_root = fixture.bus.join("state");
         std::fs::remove_dir_all(&state_root).unwrap();
@@ -3344,7 +3377,10 @@ mod tests {
             recovered.schedules[0].schedule_id,
             "timer-command-generation-loss"
         );
-        assert_eq!(fixture.worker.active_bus_identity, Some(replacement_identity));
+        assert_eq!(
+            fixture.worker.active_bus_identity,
+            Some(replacement_identity)
+        );
         let published: ClockSnapshotV1 = serde_json::from_str(
             &Persist::open(fixture.bus.clone())
                 .unwrap()
@@ -3925,6 +3961,66 @@ mod tests {
                 ringing.revision,
                 auto_silence_acknowledgement_id(&ringing),
             )]
+        );
+    }
+
+    #[test]
+    fn restart_persists_elapsed_timer_before_bus_recovery() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let due_at = NOW + 5_000;
+        fixture.publish(&fixture.timer_command("late-bus", 1, due_at));
+        fixture.worker.tick_once().unwrap();
+
+        fixture.clock.0.store(due_at, Ordering::Relaxed);
+        let unavailable_bus = fixture._temp.path().join("unavailable-bus");
+        fs::write(&unavailable_bus, b"not a directory").unwrap();
+        let mut restarted = ClockWorker {
+            node_id: "seat-1".into(),
+            bus_root: Some(unavailable_bus),
+            poll: POLL,
+            clock: fixture.clock.clone(),
+            store: Arc::new(SqliteClockStore {
+                db_path: fixture.db.clone(),
+            }),
+            signer: fixture.worker.signer.clone(),
+            command_signing_key: fixture.worker.command_signing_key.clone(),
+            approved_peer_ids: fixture.worker.approved_peer_ids.clone(),
+            blocked_origin_ids: fixture.worker.blocked_origin_ids.clone(),
+            disabled_schedule_ids: fixture.worker.disabled_schedule_ids.clone(),
+            music_signing_seed: fixture.worker.music_signing_seed,
+            snapshot: None,
+            action_cursor: None,
+            active_bus_identity: None,
+            published_once: false,
+            audio_status_cursor: None,
+            audio_last_sent_ms: BTreeMap::new(),
+            peer_last_sent_ms: BTreeMap::new(),
+        };
+        assert!(restarted.open_bus_transaction().is_err());
+        restarted.ensure_loaded().unwrap();
+
+        let snapshot = restarted.snapshot.as_ref().unwrap();
+        let ClockScheduleKindV1::Timer(timer) = &snapshot.schedules[0].schedule else {
+            panic!("recovered schedule must remain a timer");
+        };
+        assert_eq!(timer.phase, ClockTimerPhase::Expired);
+        assert_eq!(snapshot.occurrences[0].phase, ClockOccurrencePhase::Ringing);
+        let durable = restarted.store.load("seat-1").unwrap().unwrap();
+        assert_eq!(durable.revision, snapshot.revision);
+        assert_eq!(
+            ClockSnapshotV1::from_persisted_json_at(
+                durable.snapshot_json.as_bytes(),
+                &restarted.context(due_at),
+            )
+            .unwrap(),
+            *snapshot
+        );
+        let pending = restarted.store.pending_audio("seat-1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].occurrence_id,
+            snapshot.occurrences[0].occurrence_id
         );
     }
 
