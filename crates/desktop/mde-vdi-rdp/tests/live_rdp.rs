@@ -118,14 +118,18 @@ fn maybe_write_capture(image: &ColorImage) {
 }
 
 fn maybe_write_capture_variant(image: &ColorImage, variant: &str) {
-    let Ok(path) = std::env::var("MDE_RDP_LIVE_CAPTURE_PPM") else {
+    let Ok(mut path) = std::env::var("MDE_RDP_LIVE_CAPTURE_PPM") else {
         return;
     };
     assert!(
-        path.starts_with('/') && path.ends_with(".ppm"),
+        path.starts_with('/')
+            && std::path::Path::new(&path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ppm")),
         "MDE_RDP_LIVE_CAPTURE_PPM must be an absolute .ppm path"
     );
-    let path = format!("{}-{variant}.ppm", path.trim_end_matches(".ppm"));
+    path.truncate(path.len() - ".ppm".len());
+    path.push_str(&format!("-{variant}.ppm"));
     write_capture(image, &path);
 }
 
