@@ -66,6 +66,9 @@ enum GuestFilesRequest {
     Begin {
         transaction_id: String,
         session_id: String,
+        generation: u64,
+        lease_id: String,
+        lease_expires_at_ms: u64,
         files: Vec<VdiClipboardFileDescriptorV1>,
         total_bytes: u64,
     },
@@ -78,10 +81,26 @@ enum GuestFilesRequest {
     },
     Commit {
         transaction_id: String,
+        session_id: String,
+        generation: u64,
+        lease_id: String,
     },
     Cancel {
         transaction_id: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestFilesDescriptor {
+    content_hash: String,
+    byte_count: u64,
+    files_reference: String,
+    mime: String,
+    session_id: String,
+    generation: u64,
+    lease_id: String,
+    lease_expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,9 +113,7 @@ enum GuestFilesResponse {
     },
     Staged {
         transaction_id: String,
-        content_hash: String,
-        byte_count: u64,
-        files_reference: String,
+        descriptor: GuestFilesDescriptor,
     },
     Committed {
         transaction_id: String,
@@ -113,6 +130,10 @@ enum GuestFilesResponse {
 }
 
 struct GuestFilesTransaction {
+    session_id: String,
+    generation: u64,
+    lease_id: String,
+    lease_expires_at_ms: u64,
     files: Vec<VdiClipboardFileDescriptorV1>,
     total_bytes: u64,
     next_file_index: usize,
@@ -256,9 +277,21 @@ impl GuestFilesAuthority {
             GuestFilesRequest::Begin {
                 transaction_id,
                 session_id,
+                generation,
+                lease_id,
+                lease_expires_at_ms,
                 files,
                 total_bytes,
-            } => self.begin(transaction_id, session_id, files, total_bytes, now_ms),
+            } => self.begin(
+                transaction_id,
+                session_id,
+                generation,
+                lease_id,
+                lease_expires_at_ms,
+                files,
+                total_bytes,
+                now_ms,
+            ),
             GuestFilesRequest::Chunk {
                 transaction_id,
                 file_index,
@@ -273,9 +306,19 @@ impl GuestFilesAuthority {
                 complete,
                 now_ms,
             ),
-            GuestFilesRequest::Commit { transaction_id } => {
-                self.commit(persist, transaction_id, now_ms)
-            }
+            GuestFilesRequest::Commit {
+                transaction_id,
+                session_id,
+                generation,
+                lease_id,
+            } => self.commit(
+                persist,
+                transaction_id,
+                session_id,
+                generation,
+                lease_id,
+                now_ms,
+            ),
             GuestFilesRequest::Cancel { transaction_id } => {
                 self.cancel(&transaction_id);
                 Ok(GuestFilesResponse::Cancelled { transaction_id })
@@ -291,13 +334,21 @@ impl GuestFilesAuthority {
         &mut self,
         transaction_id: String,
         session_id: String,
+        generation: u64,
+        lease_id: String,
+        lease_expires_at_ms: u64,
         files: Vec<VdiClipboardFileDescriptorV1>,
         total_bytes: u64,
         now_ms: u64,
     ) -> Result<GuestFilesResponse, (String, String)> {
         let refuse = |reason: &str| Err((transaction_id.clone(), reason.to_owned()));
-        if !safe_guest_identity(&transaction_id) || !safe_guest_identity(&session_id) {
-            return refuse("invalid transaction or session identity");
+        if !safe_guest_identity(&transaction_id)
+            || !safe_guest_identity(&session_id)
+            || !safe_guest_identity(&lease_id)
+            || generation == 0
+            || lease_expires_at_ms <= now_ms
+        {
+            return refuse("invalid or expired transaction authority");
         }
         if files.is_empty()
             || files.len() > MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS
@@ -346,6 +397,10 @@ impl GuestFilesAuthority {
         self.transactions.insert(
             transaction_id.clone(),
             GuestFilesTransaction {
+                session_id,
+                generation,
+                lease_id,
+                lease_expires_at_ms,
                 files,
                 total_bytes,
                 next_file_index: 0,
@@ -355,7 +410,8 @@ impl GuestFilesAuthority {
                 file_hashers: vec![Sha256::new(); file_count],
                 file_hashes: vec![None; file_count],
                 staging_root,
-                expires_at_ms: now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS),
+                expires_at_ms: lease_expires_at_ms
+                    .min(now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS)),
                 staged_hash: None,
                 file_references: (0..file_count).map(|_| FileRefId::new()).collect(),
                 space: SpaceId::new(),
@@ -428,7 +484,9 @@ impl GuestFilesAuthority {
         transaction.file_hashers[file_index].update(&data);
         transaction.next_offset = transaction.next_offset.saturating_add(data.len() as u64);
         transaction.bytes_received = transaction.bytes_received.saturating_add(data.len() as u64);
-        transaction.expires_at_ms = now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS);
+        transaction.expires_at_ms = transaction
+            .lease_expires_at_ms
+            .min(now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS));
         if complete != (transaction.next_offset == metadata.byte_count) {
             return Err(failure(
                 "chunk completion disagrees with admitted size".into(),
@@ -448,16 +506,24 @@ impl GuestFilesAuthority {
             }
             let hash = format!("{:x}", transaction.aggregate_hasher.clone().finalize());
             transaction.staged_hash = Some(hash.clone());
+            let first = &transaction.files[0];
             return Ok(GuestFilesResponse::Staged {
                 transaction_id: transaction_id.clone(),
-                content_hash: hash,
-                byte_count: transaction.total_bytes,
-                // The existing clipboard envelope carries one opaque identity.
-                // For a single image this is its exact Files identity. A
-                // multi-file transaction has one identity per descriptor in
-                // the daemon-owned projection; the first remains the bounded
-                // envelope handle for wire compatibility.
-                files_reference: transaction.file_references[0].to_string(),
+                descriptor: GuestFilesDescriptor {
+                    content_hash: hash,
+                    byte_count: transaction.total_bytes,
+                    // The existing clipboard envelope carries one opaque identity.
+                    // For a single image this is its exact Files identity. A
+                    // multi-file transaction has one identity per descriptor in
+                    // the daemon-owned projection; the first remains the bounded
+                    // envelope handle for wire compatibility.
+                    files_reference: transaction.file_references[0].to_string(),
+                    mime: first.mime.clone(),
+                    session_id: transaction.session_id.clone(),
+                    generation: transaction.generation,
+                    lease_id: transaction.lease_id.clone(),
+                    lease_expires_at_ms: transaction.lease_expires_at_ms,
+                },
             });
         }
         Ok(GuestFilesResponse::Ready {
@@ -471,11 +537,25 @@ impl GuestFilesAuthority {
         &mut self,
         persist: &Persist,
         transaction_id: String,
+        session_id: String,
+        generation: u64,
+        lease_id: String,
         now_ms: u64,
     ) -> Result<GuestFilesResponse, (String, String)> {
         let Some(transaction) = self.transactions.remove(&transaction_id) else {
             return Err((transaction_id, "unknown or expired transaction".to_owned()));
         };
+        if transaction.session_id != session_id
+            || transaction.generation != generation
+            || transaction.lease_id != lease_id
+            || now_ms >= transaction.lease_expires_at_ms
+        {
+            let _ = std::fs::remove_dir_all(&transaction.staging_root);
+            return Err((
+                transaction_id,
+                "transaction authority changed or expired before commit".to_owned(),
+            ));
+        }
         if transaction.staged_hash.is_none()
             || transaction.next_file_index != transaction.files.len()
         {
@@ -1718,6 +1798,9 @@ mod tests {
                 GuestFilesRequest::Begin {
                     transaction_id: "tx-atomic".into(),
                     session_id: "rdp-session".into(),
+                    generation: 7,
+                    lease_id: "rdp-lease-7".into(),
+                    lease_expires_at_ms: now + 60_000,
                     files: files.clone(),
                     total_bytes: 11,
                 },
@@ -1755,7 +1838,10 @@ mod tests {
         );
         assert!(matches!(
             staged,
-            GuestFilesResponse::Staged { byte_count: 11, .. }
+            GuestFilesResponse::Staged {
+                descriptor: GuestFilesDescriptor { byte_count: 11, .. },
+                ..
+            }
         ));
         assert!(
             !destination
@@ -1769,6 +1855,9 @@ mod tests {
                 &persist,
                 GuestFilesRequest::Commit {
                     transaction_id: "tx-atomic".into(),
+                    session_id: "rdp-session".into(),
+                    generation: 7,
+                    lease_id: "rdp-lease-7".into(),
                 },
                 now + 3,
             ),
@@ -1821,6 +1910,9 @@ mod tests {
                 GuestFilesRequest::Begin {
                     transaction_id: "tx-cancel".into(),
                     session_id: "rdp-session".into(),
+                    generation: 7,
+                    lease_id: "rdp-lease-7".into(),
+                    lease_expires_at_ms: now + 60_000,
                     files: vec![VdiClipboardFileDescriptorV1::new(
                         "partial.bin",
                         None,
@@ -1896,6 +1988,9 @@ mod tests {
                 GuestFilesRequest::Begin {
                     transaction_id: "tx-image-cas".into(),
                     session_id: "rdp-image-session".into(),
+                    generation: 17,
+                    lease_id: "rdp-image-lease-17".into(),
+                    lease_expires_at_ms: now + 60_000,
                     files: vec![descriptor],
                     total_bytes: bytes.len() as u64,
                 },
@@ -1915,11 +2010,13 @@ mod tests {
             now + 1,
         );
         let (digest, file_reference) = match staged {
-            GuestFilesResponse::Staged {
-                content_hash,
-                files_reference,
-                ..
-            } => (content_hash, files_reference),
+            GuestFilesResponse::Staged { descriptor, .. } => {
+                assert_eq!(descriptor.session_id, "rdp-image-session");
+                assert_eq!(descriptor.generation, 17);
+                assert_eq!(descriptor.lease_id, "rdp-image-lease-17");
+                assert_eq!(descriptor.mime, "application/x-rdp-cf-dibv5");
+                (descriptor.content_hash, descriptor.files_reference)
+            }
             other => panic!("expected staged CAS identity, got {other:?}"),
         };
         assert!(matches!(
@@ -1927,6 +2024,9 @@ mod tests {
                 &persist,
                 GuestFilesRequest::Commit {
                     transaction_id: "tx-image-cas".into(),
+                    session_id: "rdp-image-session".into(),
+                    generation: 17,
+                    lease_id: "rdp-image-lease-17".into(),
                 },
                 now + 2,
             ),
@@ -1977,6 +2077,9 @@ mod tests {
         let begin = GuestFilesRequest::Begin {
             transaction_id: "tx-multifile-fail".into(),
             session_id: "rdp-session".into(),
+            generation: 9,
+            lease_id: "rdp-lease-9".into(),
+            lease_expires_at_ms: now + 60_000,
             files,
             total_bytes: 6,
         };
@@ -2015,6 +2118,9 @@ mod tests {
                 &persist,
                 GuestFilesRequest::Commit {
                     transaction_id: "tx-multifile-fail".into(),
+                    session_id: "rdp-session".into(),
+                    generation: 9,
+                    lease_id: "rdp-lease-9".into(),
                 },
                 now + 4,
             ),

@@ -1171,6 +1171,9 @@ enum RdpGuestFilesRequest {
     Begin {
         transaction_id: String,
         session_id: String,
+        generation: u64,
+        lease_id: String,
+        lease_expires_at_ms: u64,
         files: Vec<VdiClipboardFileDescriptorV1>,
         total_bytes: u64,
     },
@@ -1183,10 +1186,27 @@ enum RdpGuestFilesRequest {
     },
     Commit {
         transaction_id: String,
+        session_id: String,
+        generation: u64,
+        lease_id: String,
     },
     Cancel {
         transaction_id: String,
     },
+}
+
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RdpGuestFilesDescriptor {
+    content_hash: String,
+    byte_count: u64,
+    files_reference: String,
+    mime: String,
+    session_id: String,
+    generation: u64,
+    lease_id: String,
+    lease_expires_at_ms: u64,
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1200,9 +1220,7 @@ enum RdpGuestFilesResponse {
     },
     Staged {
         transaction_id: String,
-        content_hash: String,
-        byte_count: u64,
-        files_reference: String,
+        descriptor: RdpGuestFilesDescriptor,
     },
     Committed {
         transaction_id: String,
@@ -1221,6 +1239,10 @@ enum RdpGuestFilesResponse {
 #[cfg(feature = "live-vdi")]
 struct RdpGuestFilesTransfer {
     transaction_id: String,
+    session_id: String,
+    generation: u64,
+    lease_id: String,
+    lease_expires_at_ms: u64,
     files: Vec<VdiClipboardFileDescriptorV1>,
     total_bytes: u64,
     next_file_index: usize,
@@ -1287,6 +1309,9 @@ impl RdpGuestFilesTransfer {
             &RdpGuestFilesRequest::Begin {
                 transaction_id: transaction_id.clone(),
                 session_id: lease.session_id.clone(),
+                generation: lease.generation,
+                lease_id: lease.lease_id.clone(),
+                lease_expires_at_ms: lease.expires_at_ms,
                 files: files.clone(),
                 total_bytes,
             },
@@ -1298,6 +1323,10 @@ impl RdpGuestFilesTransfer {
                 next_offset: 0,
             } if returned == transaction_id => Ok(Self {
                 transaction_id,
+                session_id: lease.session_id.clone(),
+                generation: lease.generation,
+                lease_id: lease.lease_id.clone(),
+                lease_expires_at_ms: lease.expires_at_ms,
                 files,
                 total_bytes,
                 next_file_index: 0,
@@ -1345,14 +1374,21 @@ impl RdpGuestFilesTransfer {
                     && next_offset == offset.saturating_add(data.len() as u64) => {}
                 RdpGuestFilesResponse::Staged {
                     transaction_id,
-                    content_hash,
-                    byte_count,
-                    files_reference,
+                    descriptor,
                 } if transaction_id == self.transaction_id
                     && complete
-                    && byte_count == self.total_bytes =>
+                    && descriptor.byte_count == self.total_bytes
+                    && descriptor.mime == self.files[0].mime
+                    && descriptor.session_id == self.session_id
+                    && descriptor.generation == self.generation
+                    && descriptor.lease_id == self.lease_id
+                    && descriptor.lease_expires_at_ms == self.lease_expires_at_ms =>
                 {
-                    staged = Some((content_hash, byte_count, files_reference));
+                    staged = Some((
+                        descriptor.content_hash,
+                        descriptor.byte_count,
+                        descriptor.files_reference,
+                    ));
                 }
                 RdpGuestFilesResponse::Refused { reason, .. } => {
                     return Err(format!("Files authority refused RDP guest image: {reason}"));
@@ -1408,15 +1444,21 @@ impl RdpGuestFilesTransfer {
             }
             RdpGuestFilesResponse::Staged {
                 transaction_id,
-                content_hash,
-                byte_count,
-                files_reference,
+                descriptor,
             } if transaction_id == self.transaction_id
                 && chunk.is_complete()
-                && byte_count == self.total_bytes =>
+                && descriptor.byte_count == self.total_bytes
+                && descriptor.session_id == self.session_id
+                && descriptor.generation == self.generation
+                && descriptor.lease_id == self.lease_id
+                && descriptor.lease_expires_at_ms == self.lease_expires_at_ms =>
             {
                 self.next_file_index = self.files.len();
-                Ok(Some((content_hash, byte_count, files_reference)))
+                Ok(Some((
+                    descriptor.content_hash,
+                    descriptor.byte_count,
+                    descriptor.files_reference,
+                )))
             }
             RdpGuestFilesResponse::Refused { reason, .. } => {
                 Err(format!("Files authority refused RDP guest chunk: {reason}"))
@@ -2336,6 +2378,9 @@ fn run_live_rdp(
                                     root,
                                     &RdpGuestFilesRequest::Commit {
                                         transaction_id: transfer.transaction_id.clone(),
+                                        session_id: transfer.session_id.clone(),
+                                        generation: transfer.generation,
+                                        lease_id: transfer.lease_id.clone(),
                                     },
                                 )?;
                                 match response {
