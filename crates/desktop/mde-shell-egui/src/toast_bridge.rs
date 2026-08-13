@@ -577,6 +577,9 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
         if name.eq_ignore_ascii_case("mesh-map") {
             return Some(Navigate::Workers(WorkersDestination::MeshMap));
         }
+        if name.eq_ignore_ascii_case("discovery") {
+            return Some(Navigate::Workers(WorkersDestination::Discovery));
+        }
         return surface_by_name(name).map(Navigate::Surface);
     }
     if let Some(name) = rest.strip_prefix("plane/") {
@@ -614,10 +617,6 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // `clock` alias keeps a "where did the clock go?" verb landing somewhere
         // honest (lock #5: the clock is now Timers & Alarms).
         "timers" | "alarms" | "clock" => Some(Surface::Clock),
-        // REACH-1 (2026-07-12) — the six surfaces that previously had no `shell/goto`
-        // verb, so an alert/chyron action targeting them silently no-op'd. Now every
-        // surface is reachable by name.
-        "explorer" => Some(Surface::Explorer),
         "media" | "video" => Some(Surface::Media),
         "terminal" | "term" => Some(Surface::Terminal),
         "phones" | "phone" => Some(Surface::Phones),
@@ -1039,11 +1038,11 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::workers_catalog::WorkersDestination;
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::{Style, Tier, Toast, ToastHost};
-    use crate::workers_catalog::WorkersDestination;
 
     use super::{
         alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
@@ -1656,6 +1655,20 @@ mod tests {
     }
 
     #[test]
+    fn discovery_route_uses_workers_and_retired_explorer_aliases_fail_closed() {
+        assert!(matches!(
+            resolve_action("shell/goto/discovery"),
+            Some(Navigate::Workers(WorkersDestination::Discovery))
+        ));
+        for retired in ["explorer", "Explorer", "fleet-explorer"] {
+            assert!(
+                resolve_action(&format!("shell/goto/{retired}")).is_none(),
+                "retired Explorer route {retired:?} bypassed Workers authority"
+            );
+        }
+    }
+
+    #[test]
     fn name_maps_are_case_insensitive() {
         assert_eq!(surface_by_name("SYSTEM"), Some(Surface::System));
         assert_eq!(surface_by_name("This-Node"), Some(Surface::ThisNode));
@@ -1672,7 +1685,7 @@ mod tests {
     fn reach1_every_surface_has_a_goto_verb() {
         // REACH-1 — the six surfaces that used to silently no-op a shell/goto now resolve.
         assert_eq!(surface_by_name("workers"), Some(Surface::Workers));
-        assert_eq!(surface_by_name("explorer"), Some(Surface::Explorer));
+        assert_eq!(surface_by_name("explorer"), None);
         assert_eq!(surface_by_name("media"), Some(Surface::Media));
         assert_eq!(surface_by_name("terminal"), Some(Surface::Terminal));
         assert_eq!(surface_by_name("phones"), Some(Surface::Phones));
@@ -1682,8 +1695,12 @@ mod tests {
             surface_by_name("collaboration"),
             Some(Surface::Communications)
         );
-        // and every Surface::ALL variant now resolves from its own (lowercased) name.
-        for s in Surface::ALL {
+        // Retired sibling surfaces are intentionally absent from the external
+        // grammar; the remaining surfaces resolve from their lowercased name.
+        for s in Surface::ALL
+            .into_iter()
+            .filter(|surface| *surface != Surface::Explorer)
+        {
             let verb = format!("{s:?}").to_ascii_lowercase();
             assert_eq!(
                 surface_by_name(&verb),
