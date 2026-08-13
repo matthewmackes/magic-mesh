@@ -366,9 +366,9 @@ struct ProviderRoutePoint {
 
 /// Provider-owned route geometry consumed by the map renderer.
 ///
-/// The model currently has no route-geometry field, so production call sites
-/// pass `None` until the routing adapter can return this payload. Keeping the
-/// seam typed here prevents the renderer from manufacturing a path meanwhile.
+/// Geometry comes only from the generation-validated daemon navigation
+/// projection. Keeping this render seam typed prevents the renderer from
+/// manufacturing a path when that authority is absent.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ProviderRouteGeometry {
     primary: Vec<ProviderRoutePoint>,

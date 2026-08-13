@@ -1040,6 +1040,10 @@ pub struct MapsLocationSurface {
     pub local_navigation: LocalNavigationState,
     /// Canonical daemon navigation consumer and immutable route projection.
     pub navigation: crate::navigation_ui::NavigationConsumer,
+    /// Exact daemon route for which the operator crossed the Start boundary.
+    /// A calculated/replacement route is preview-only until this identity is
+    /// explicitly selected; progress updates for the same route retain it.
+    started_navigation_route_id: Option<String>,
     /// MG90 local-management state.
     pub mg90: Mg90State,
     /// Location-source manager.
@@ -1118,6 +1122,7 @@ impl MapsLocationSurface {
             offline_maps,
             local_navigation: LocalNavigationState::live(),
             navigation: crate::navigation_ui::NavigationConsumer::default(),
+            started_navigation_route_id: None,
             mg90: Mg90State::live(),
             locations: LocationManager::live(),
             trips: TripRecorderState::live(),
@@ -1173,6 +1178,7 @@ impl MapsLocationSurface {
             offline_maps: OfflineMapManagerState::simulated_default(),
             local_navigation: LocalNavigationState::simulated(),
             navigation: crate::navigation_ui::NavigationConsumer::default(),
+            started_navigation_route_id: None,
             mg90: Mg90State::simulated(),
             locations: LocationManager::simulated(),
             trips: TripRecorderState::simulated(),
@@ -1385,6 +1391,8 @@ impl MapsLocationSurface {
         }
         let selected = self.local_navigation.selected_route;
         self.local_navigation.apply_route_option(selected);
+        self.started_navigation_route_id =
+            self.navigation.route().map(|route| route.route_id.clone());
         self.local_navigation.navigating = true;
         self.route_preview = false;
         self.arrived = false;
@@ -1407,6 +1415,7 @@ impl MapsLocationSurface {
     /// Leave any navigation-flow overlay and return to the idle Drive HUD.
     pub fn end_navigation(&mut self) {
         self.navigation.cancel();
+        self.started_navigation_route_id = None;
         self.arrived = false;
         self.destination_search = false;
         self.route_preview = false;
@@ -2155,6 +2164,9 @@ impl MapsLocationSurface {
         let Some((latitude, longitude)) = destination.geo() else {
             return;
         };
+        let destination_label = destination.label.clone();
+        self.started_navigation_route_id = None;
+        self.local_navigation.navigating = false;
         self.navigation.request_route(
             RouteEndpoint {
                 label: self.locations.primary.label().to_string(),
@@ -2164,7 +2176,7 @@ impl MapsLocationSurface {
                 },
             },
             RouteEndpoint {
-                label: destination.label.clone(),
+                label: destination_label,
                 point: GeoPoint {
                     latitude,
                     longitude,
@@ -2179,6 +2191,7 @@ impl MapsLocationSurface {
         use crate::navigation_ui::NavigationRouteStatus;
 
         let Some(route) = self.navigation.route() else {
+            self.started_navigation_route_id = None;
             self.local_navigation.route_options.clear();
             self.local_navigation.active_route = RoutePlan::none();
             self.local_navigation.navigating = false;
@@ -2189,6 +2202,11 @@ impl MapsLocationSurface {
             );
             return;
         };
+        let guidance_started =
+            self.started_navigation_route_id.as_deref() == Some(route.route_id.as_str());
+        if !guidance_started {
+            self.started_navigation_route_id = None;
+        }
         let miles = (route.distance_remaining_metres as f64 / 1_609.344) as f32;
         let minutes =
             u32::try_from(route.duration_remaining_seconds.div_ceil(60)).unwrap_or(u32::MAX);
@@ -2216,8 +2234,12 @@ impl MapsLocationSurface {
             traffic_alert: String::new(),
             weather_alert: String::new(),
         };
-        self.local_navigation.navigating = true;
-        self.route_preview = false;
+        // An Active daemon projection means calculation succeeded; it does not
+        // mean the operator crossed the Maps Start boundary. Keep a new or
+        // replacement route in preview, while same-route progress updates retain
+        // an already-started guidance session.
+        self.local_navigation.navigating = guidance_started;
+        self.route_preview = !guidance_started;
         self.off_route = route.off_route;
     }
 
@@ -5854,6 +5876,11 @@ impl EncryptedVaultState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::navigation::{
+        ManeuverKind, NavigationPhase, NavigationProgress, NavigationSnapshot, RouteAttribution,
+        RouteManeuver, RouteResult, NAVIGATION_SCHEMA_VERSION,
+    };
+    use mackes_mesh_types::nws_alert::GeoPoint;
 
     fn test_now_ms() -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -5861,6 +5888,62 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or_default()
+    }
+
+    fn active_navigation_snapshot(
+        host: &str,
+        generation: u64,
+        route_id: &str,
+        now_ms: i64,
+    ) -> NavigationSnapshot {
+        let start = GeoPoint {
+            latitude: 32.168,
+            longitude: -95.849,
+        };
+        let end = GeoPoint {
+            latitude: 32.178,
+            longitude: -95.839,
+        };
+        let route = RouteResult {
+            route_id: route_id.to_string(),
+            request_id: format!("request-{route_id}"),
+            calculated_at_ms: now_ms,
+            distance_metres: 1_609,
+            duration_seconds: 600,
+            geometry: vec![start.clone(), end],
+            maneuvers: vec![RouteManeuver {
+                sequence: 0,
+                kind: ManeuverKind::Depart,
+                instruction: "Depart north".to_string(),
+                point: start.clone(),
+                distance_metres: 1_609,
+                duration_seconds: 600,
+            }],
+            attribution: RouteAttribution {
+                provider_id: "offline-router".to_string(),
+                label: "Approved offline router".to_string(),
+                data_revision: "maps-7".to_string(),
+                offline: true,
+            },
+        };
+        NavigationSnapshot {
+            schema_version: NAVIGATION_SCHEMA_VERSION,
+            host: host.to_string(),
+            generation,
+            produced_at_ms: now_ms,
+            phase: NavigationPhase::Active {
+                progress: NavigationProgress {
+                    route_id: route_id.to_string(),
+                    position: start,
+                    observed_at_ms: now_ms,
+                    maneuver_index: 0,
+                    distance_remaining_metres: 1_609,
+                    duration_remaining_seconds: 600,
+                    off_route: false,
+                },
+                route,
+            },
+        }
     }
 
     #[test]
@@ -8305,6 +8388,74 @@ mod tests {
         s.start_navigation();
         assert!(!s.local_navigation.navigating);
         assert!(s.route_preview, "stays on the preview, honestly routeless");
+    }
+
+    #[test]
+    fn calculated_route_requires_explicit_start_and_same_route_progress_retains_guidance() {
+        let now_ms = test_now_ms();
+        let mut state = MapsLocationSurface::simulated();
+
+        assert!(state.navigation.fold(
+            "seat-1",
+            active_navigation_snapshot("seat-1", 1, "route-1", now_ms),
+            now_ms,
+        ));
+        state.apply_navigation_projection();
+
+        assert!(state.route_preview, "calculation opens route preview");
+        assert!(
+            !state.local_navigation.navigating,
+            "daemon calculation must not cross the operator Start boundary"
+        );
+
+        state.start_navigation();
+        assert!(state.local_navigation.navigating);
+        assert!(!state.route_preview);
+        assert_eq!(
+            state.started_navigation_route_id.as_deref(),
+            Some("route-1")
+        );
+
+        assert!(state.navigation.fold(
+            "seat-1",
+            active_navigation_snapshot("seat-1", 2, "route-1", now_ms + 1),
+            now_ms + 1,
+        ));
+        state.apply_navigation_projection();
+        assert!(
+            state.local_navigation.navigating,
+            "same-route progress retains explicitly started guidance"
+        );
+        assert!(!state.route_preview);
+    }
+
+    #[test]
+    fn replacement_route_returns_to_preview_until_started() {
+        let now_ms = test_now_ms();
+        let mut state = MapsLocationSurface::simulated();
+        assert!(state.navigation.fold(
+            "seat-1",
+            active_navigation_snapshot("seat-1", 1, "route-1", now_ms),
+            now_ms,
+        ));
+        state.apply_navigation_projection();
+        state.start_navigation();
+        assert!(state.local_navigation.navigating);
+
+        assert!(state.navigation.fold(
+            "seat-1",
+            active_navigation_snapshot("seat-1", 2, "route-2", now_ms + 1),
+            now_ms + 1,
+        ));
+        state.apply_navigation_projection();
+
+        assert!(!state.local_navigation.navigating);
+        assert!(state.route_preview);
+        assert_eq!(
+            state.started_navigation_route_id.as_deref(),
+            None,
+            "a replacement revokes the prior route's Start authority"
+        );
     }
 
     #[test]
