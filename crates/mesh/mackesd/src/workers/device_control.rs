@@ -405,7 +405,8 @@ impl DeviceControlExecWorker {
         if device.status == device_inventory::DeviceStatus::Unknown {
             return Err(format!(
                 "{}: provider state for `{}` is unavailable — refused before mutation",
-                op.as_str(), device.name
+                op.as_str(),
+                device.name
             ));
         }
         Ok(())
@@ -415,6 +416,15 @@ impl DeviceControlExecWorker {
     /// side-effecting the audit/notify (those wrap it in [`Self::process`]) so the
     /// gate + plan logic is unit-testable in isolation.
     async fn handle_request(&self, req: &DeviceControlRequest) -> DeviceControlResult {
+        if req.schema_version != DEVICE_CONTROL_SCHEMA_VERSION {
+            return DeviceControlResult::failed(
+                &req.id,
+                format!(
+                    "unsupported device-control request schema {} (expected {}) — refused before mutation",
+                    req.schema_version, DEVICE_CONTROL_SCHEMA_VERSION
+                ),
+            );
+        }
         if req.target_host != self.self_hostname {
             return DeviceControlResult::failed(
                 &req.id,
@@ -707,8 +717,8 @@ async fn execute_plan_with_timeout(
 /// allowed; the descriptor is also CLOEXEC because the worker may run other
 /// fixed command steps in the same action.
 fn write_sysfs_control(path: &Path, contents: &str) -> Result<(), String> {
-    use std::io::Write as _;
     use rustix::fs::{Mode, OFlags};
+    use std::io::Write as _;
 
     let fd = rustix::fs::open(
         path,
@@ -978,7 +988,10 @@ mod tests {
         }])
         .await;
 
-        assert!(result.is_err(), "a final symlink must not be a control target");
+        assert!(
+            result.is_err(),
+            "a final symlink must not be a control target"
+        );
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
     }
 
@@ -1240,10 +1253,22 @@ mod tests {
             request.id = format!("01UNKNOWN-PROBLEM-{}", op.as_str());
             request.op = op;
             let result = worker.handle_request(&request).await;
-            assert!(!result.ok, "unknown provider state must refuse {}", op.as_str());
-            assert!(result.error.contains("provider state"), "{} escaped admission: {}", op.as_str(), result.error);
+            assert!(
+                !result.ok,
+                "unknown provider state must refuse {}",
+                op.as_str()
+            );
+            assert!(
+                result.error.contains("provider state"),
+                "{} escaped admission: {}",
+                op.as_str(),
+                result.error
+            );
         }
-        assert_eq!(std::fs::read_to_string(dev_dir.join("authorized")).unwrap(), "1");
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1"
+        );
     }
 
     #[tokio::test]
@@ -1319,6 +1344,56 @@ mod tests {
             "1",
             "a replayed capability cannot mutate"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_unsupported_request_schema_never_reaches_hardware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        let authorized = dev_dir.join("authorized");
+        std::fs::write(&authorized, "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+        write_inventory(
+            tmp.path(),
+            "edge-2",
+            vec![DeviceRecord {
+                sysfs_path: Some(sysfs_path.clone()),
+                ..DeviceRecord::new("Webcam", DeviceStatus::Ok)
+            }],
+        );
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_authorizer(test_authorizer(tmp.path()));
+        let request = authorize_request(
+            &DeviceControlRequest {
+                schema_version: DEVICE_CONTROL_SCHEMA_VERSION + 1,
+                armed_token: None,
+                id: "01UNSUPPORTEDSCHEMA".into(),
+                op: DeviceControlOp::Disable,
+                target: DeviceTarget {
+                    name: "Webcam".into(),
+                    category: category::NETWORK_ADAPTERS.into(),
+                    sysfs_path: Some(sysfs_path),
+                    driver: None,
+                },
+                target_host: "edge-2".into(),
+                expected_inventory_published_at_ms: 1,
+                from: "peer:laptop-mm".into(),
+            },
+            "unsupported-schema",
+        );
+
+        let result = worker.handle_request(&request).await;
+
+        assert!(!result.ok);
+        assert!(result
+            .error
+            .contains("unsupported device-control request schema"));
+        assert_eq!(std::fs::read_to_string(authorized).unwrap(), "1");
     }
 
     #[tokio::test]
