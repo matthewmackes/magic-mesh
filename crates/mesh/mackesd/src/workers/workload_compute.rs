@@ -4169,17 +4169,7 @@ impl WorkloadComputeWorker {
         ledger: &WorkloadOperationLedger,
         now_ms: u64,
     ) -> io::Result<()> {
-        let mut latest = BTreeMap::<String, WorkloadOperationStatus>::new();
-        for status in ledger.statuses() {
-            let key = status.workload_id.as_str().to_string();
-            if latest
-                .get(&key)
-                .is_none_or(|current| current.generation <= status.generation)
-            {
-                latest.insert(key, status.clone());
-            }
-        }
-        let mut statuses: Vec<_> = latest.into_values().collect();
+        let mut statuses = latest_projection_statuses(ledger.statuses())?;
         // Leases are intentionally ephemeral. Expiration removes only the
         // descriptor from the projection; it never mutates the durable
         // operation or pretends the workload stopped.
@@ -4440,6 +4430,38 @@ impl WorkloadComputeWorker {
             tracing::warn!(target: "mackesd::workload_compute", %error, "Workload transaction deferred");
         }
     }
+}
+
+fn latest_projection_statuses<'a>(
+    statuses: impl Iterator<Item = &'a WorkloadOperationStatus>,
+) -> io::Result<Vec<WorkloadOperationStatus>> {
+    let mut latest = BTreeMap::<String, WorkloadOperationStatus>::new();
+    for status in statuses {
+        let key = status.workload_id.as_str().to_string();
+        match latest.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(status.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                match status.generation.cmp(&current.generation) {
+                    std::cmp::Ordering::Greater => {
+                        entry.insert(status.clone());
+                    }
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal if status == current => {}
+                    std::cmp::Ordering::Equal => {
+                        return Err(io::Error::other(format!(
+                            "Workload {} has conflicting lifecycle rows at generation {}",
+                            status.workload_id.as_str(),
+                            status.generation
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(latest.into_values().collect())
 }
 
 #[async_trait::async_trait]
@@ -8093,6 +8115,34 @@ mod tests {
             .admitted,
             "a same-generation stopped substitution must not release the running reservation"
         );
+    }
+
+    #[test]
+    fn same_generation_lifecycle_conflict_cannot_publish_an_order_dependent_projection() {
+        let mut running = queued_status(&request());
+        running.phase = WorkloadOperationPhase::Completed;
+        running.power = WorkloadPowerState::Running;
+        running.readiness = WorkloadReadiness::Ready;
+
+        let mut substituted = running.clone();
+        substituted.request_id = "substituted-stop".into();
+        substituted.power = WorkloadPowerState::Stopped;
+        substituted.readiness = WorkloadReadiness::Unavailable;
+
+        for rows in [[&running, &substituted], [&substituted, &running]] {
+            let error = latest_projection_statuses(rows.into_iter())
+                .expect_err("contradictory same-generation lifecycle rows must fail closed");
+            let reason = error.to_string();
+            assert!(reason.contains(running.workload_id.as_str()));
+            assert!(reason.contains("generation 1"));
+        }
+
+        let mut next_generation = running.clone();
+        next_generation.request_id = "next-generation".into();
+        next_generation.generation += 1;
+        let projection = latest_projection_statuses([&running, &next_generation].into_iter())
+            .expect("a unique newer generation remains authoritative");
+        assert_eq!(projection, vec![next_generation]);
     }
 
     #[test]
