@@ -3810,6 +3810,11 @@ pub(crate) struct VdiState {
     /// prior texture visible, but that stale presentation must never authorize
     /// control of the replacement transport.
     presentation_input_authorized: bool,
+    /// Pointer capture belongs to the current presentation generation. A press
+    /// that starts inside the guest keeps motion and its matching release
+    /// routed while the pointer leaves the framebuffer, preventing stuck guest
+    /// buttons without allowing unrelated shell-chrome clicks into the VM.
+    presentation_pointer_captured: bool,
     /// Local frame/texture/reconnect/repaint measurements. Guest hardware
     /// capability evidence remains a separate live-proof concern.
     metrics: VdiMetrics,
@@ -3988,6 +3993,7 @@ impl VdiState {
     /// input authority into the next transport generation.
     fn revoke_presentation_authority(&mut self, clear_frame: bool) {
         self.presentation_input_authorized = false;
+        self.presentation_pointer_captured = false;
         self.session = None;
         self.incoming = None;
         self.incoming_damage = None;
@@ -4968,7 +4974,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 u16::try_from(desktop_px[0]).unwrap_or(u16::MAX),
                 u16::try_from(desktop_px[1]).unwrap_or(u16::MAX),
             );
-            forward_input(ui, state, rect, desktop_size);
+            forward_input(ui, state, rect, desktop_size, resp.has_focus());
             // vdi-vm-8 — refine the live desktop geometry to the panel's REAL pixel size
             // (device px). On a MATERIAL panel resize (a seat / monitor resolution
             // change) an RDP/SPICE session is re-dialed at the true panel size so the
@@ -5221,7 +5227,13 @@ fn paint_session_overlay(
 /// receive identically-mapped coordinates (vdi-vm-2). Every other event is handed
 /// through unchanged; the session maps the ones it understands (pointer / button /
 /// wheel / key / text) and drops the rest.
-fn forward_input(ui: &egui::Ui, state: &mut VdiState, rect: egui::Rect, desktop_size: (u16, u16)) {
+fn forward_input(
+    ui: &egui::Ui,
+    state: &mut VdiState,
+    rect: egui::Rect,
+    desktop_size: (u16, u16),
+    keyboard_focused: bool,
+) {
     let has_live = {
         #[cfg(feature = "live-vdi")]
         {
@@ -5235,7 +5247,17 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState, rect: egui::Rect, desktop_
     if state.session.is_none() && !has_live {
         return;
     }
+    let pointer_position = ui.input(|input| input.pointer.hover_pos());
     for event in ui.input(|i| i.events.clone()) {
+        if !guest_input_event_admitted(
+            &event,
+            rect,
+            keyboard_focused,
+            pointer_position,
+            &mut state.presentation_pointer_captured,
+        ) {
+            continue;
+        }
         if matches!(
             event,
             egui::Event::Key {
@@ -5272,6 +5294,48 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState, rect: egui::Rect, desktop_
         if let Some(live) = state.live_spice.as_ref() {
             live.send_input(event);
         }
+    }
+}
+
+/// Admit only input owned by the guest framebuffer. Keyboard/text events need
+/// egui focus. Pointer presses must begin inside the framebuffer; after that,
+/// capture retains motion and the release outside its bounds so the guest
+/// cannot be left with a stuck button. Hover motion and wheel events outside
+/// the framebuffer remain shell input.
+fn guest_input_event_admitted(
+    event: &egui::Event,
+    rect: egui::Rect,
+    keyboard_focused: bool,
+    pointer_position: Option<egui::Pos2>,
+    pointer_captured: &mut bool,
+) -> bool {
+    match event {
+        egui::Event::PointerButton { pos, pressed, .. } => {
+            if *pressed {
+                if rect.contains(*pos) {
+                    *pointer_captured = true;
+                    true
+                } else {
+                    false
+                }
+            } else if *pointer_captured {
+                *pointer_captured = false;
+                true
+            } else {
+                rect.contains(*pos)
+            }
+        }
+        egui::Event::PointerMoved(pos) => *pointer_captured || rect.contains(*pos),
+        egui::Event::MouseWheel { .. } => {
+            *pointer_captured || pointer_position.is_some_and(|pos| rect.contains(pos))
+        }
+        egui::Event::Key { .. }
+        | egui::Event::Text(_)
+        | egui::Event::Ime(_)
+        | egui::Event::Copy
+        | egui::Event::Cut
+        | egui::Event::Paste(_) => keyboard_focused,
+        _ => false,
     }
 }
 

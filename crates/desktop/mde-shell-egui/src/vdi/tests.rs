@@ -2536,6 +2536,107 @@ fn has_live_transport_stays_false_for_an_idle_or_requested_only_session() {
     );
 }
 
+#[test]
+fn guest_input_requires_framebuffer_ownership_and_releases_pointer_capture() {
+    let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(210.0, 120.0));
+    let inside = egui::pos2(40.0, 60.0);
+    let outside = egui::pos2(400.0, 300.0);
+    let mut captured = false;
+
+    let key = egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    assert!(!guest_input_event_admitted(
+        &key,
+        rect,
+        false,
+        Some(inside),
+        &mut captured
+    ));
+    assert!(guest_input_event_admitted(
+        &key,
+        rect,
+        true,
+        Some(inside),
+        &mut captured
+    ));
+
+    let outside_press = egui::Event::PointerButton {
+        pos: outside,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    };
+    assert!(!guest_input_event_admitted(
+        &outside_press,
+        rect,
+        true,
+        Some(outside),
+        &mut captured
+    ));
+    assert!(!captured);
+
+    let inside_press = egui::Event::PointerButton {
+        pos: inside,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    };
+    assert!(guest_input_event_admitted(
+        &inside_press,
+        rect,
+        false,
+        Some(inside),
+        &mut captured
+    ));
+    assert!(captured);
+    assert!(guest_input_event_admitted(
+        &egui::Event::PointerMoved(outside),
+        rect,
+        false,
+        Some(outside),
+        &mut captured
+    ));
+
+    let outside_release = egui::Event::PointerButton {
+        pos: outside,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    assert!(guest_input_event_admitted(
+        &outside_release,
+        rect,
+        false,
+        Some(outside),
+        &mut captured
+    ));
+    assert!(!captured);
+    assert!(!guest_input_event_admitted(
+        &egui::Event::PointerMoved(outside),
+        rect,
+        false,
+        Some(outside),
+        &mut captured
+    ));
+}
+
+#[test]
+fn revoked_browser_presentation_drops_pointer_capture() {
+    let mut state = VdiState {
+        presentation_input_authorized: true,
+        presentation_pointer_captured: true,
+        ..VdiState::default()
+    };
+    state.revoke_presentation_authority(false);
+    assert!(!state.presentation_input_authorized);
+    assert!(!state.presentation_pointer_captured);
+}
+
 #[cfg(feature = "live-vdi")]
 fn color_image_fnv1a64(image: &egui::ColorImage) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
