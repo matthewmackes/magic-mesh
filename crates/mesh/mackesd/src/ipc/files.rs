@@ -118,11 +118,13 @@ struct GuestFilesTransaction {
     next_file_index: usize,
     next_offset: u64,
     bytes_received: u64,
-    hasher: Sha256,
+    aggregate_hasher: Sha256,
+    file_hashers: Vec<Sha256>,
+    file_hashes: Vec<Option<String>>,
     staging_root: PathBuf,
     expires_at_ms: u64,
     staged_hash: Option<String>,
-    file_reference: FileRefId,
+    file_references: Vec<FileRefId>,
     space: SpaceId,
 }
 
@@ -340,6 +342,7 @@ impl GuestFilesAuthority {
                 format!("payload staging failed: {error}"),
             )
         })?;
+        let file_count = files.len();
         self.transactions.insert(
             transaction_id.clone(),
             GuestFilesTransaction {
@@ -348,11 +351,13 @@ impl GuestFilesAuthority {
                 next_file_index: 0,
                 next_offset: 0,
                 bytes_received: 0,
-                hasher: Sha256::new(),
+                aggregate_hasher: Sha256::new(),
+                file_hashers: vec![Sha256::new(); file_count],
+                file_hashes: vec![None; file_count],
                 staging_root,
                 expires_at_ms: now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS),
                 staged_hash: None,
-                file_reference: FileRefId::new(),
+                file_references: (0..file_count).map(|_| FileRefId::new()).collect(),
                 space: SpaceId::new(),
             },
         );
@@ -419,7 +424,8 @@ impl GuestFilesAuthority {
         file.write_all(&data)
             .and_then(|()| file.sync_data())
             .map_err(|error| failure(format!("staging write failed: {error}")))?;
-        transaction.hasher.update(&data);
+        transaction.aggregate_hasher.update(&data);
+        transaction.file_hashers[file_index].update(&data);
         transaction.next_offset = transaction.next_offset.saturating_add(data.len() as u64);
         transaction.bytes_received = transaction.bytes_received.saturating_add(data.len() as u64);
         transaction.expires_at_ms = now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS);
@@ -429,6 +435,10 @@ impl GuestFilesAuthority {
             ));
         }
         if complete {
+            transaction.file_hashes[file_index] = Some(format!(
+                "{:x}",
+                transaction.file_hashers[file_index].clone().finalize()
+            ));
             transaction.next_file_index += 1;
             transaction.next_offset = 0;
         }
@@ -436,13 +446,18 @@ impl GuestFilesAuthority {
             if transaction.bytes_received != transaction.total_bytes {
                 return Err(failure("completed aggregate size mismatch".into()));
             }
-            let hash = format!("{:x}", transaction.hasher.clone().finalize());
+            let hash = format!("{:x}", transaction.aggregate_hasher.clone().finalize());
             transaction.staged_hash = Some(hash.clone());
             return Ok(GuestFilesResponse::Staged {
                 transaction_id: transaction_id.clone(),
                 content_hash: hash,
                 byte_count: transaction.total_bytes,
-                files_reference: transaction.file_reference.to_string(),
+                // The existing clipboard envelope carries one opaque identity.
+                // For a single image this is its exact Files identity. A
+                // multi-file transaction has one identity per descriptor in
+                // the daemon-owned projection; the first remains the bounded
+                // envelope handle for wire compatibility.
+                files_reference: transaction.file_references[0].to_string(),
             });
         }
         Ok(GuestFilesResponse::Ready {
@@ -484,15 +499,14 @@ impl GuestFilesAuthority {
             let _ = std::fs::remove_dir_all(&transaction.staging_root);
             return Err((transaction_id, format!("atomic commit failed: {error}")));
         }
-        if transaction.files.len() == 1 {
-            let metadata = &transaction.files[0];
+        let mut reference_views = Vec::with_capacity(transaction.files.len());
+        for (index, metadata) in transaction.files.iter().enumerate() {
             let source = destination.join(guest_staged_relative_path(metadata));
-            let digest = transaction.staged_hash.as_deref().ok_or_else(|| {
-                (
-                    transaction_id.clone(),
-                    "staged digest disappeared".to_owned(),
-                )
-            })?;
+            let Some(digest) = transaction.file_hashes[index].as_deref() else {
+                let _ = std::fs::remove_dir_all(&destination);
+                let _ = std::fs::remove_dir(&transaction.staging_root);
+                return Err((transaction_id, "per-file digest disappeared".to_owned()));
+            };
             if let Err(reason) =
                 publish_guest_cas_object(&self.content_root, digest, metadata.byte_count, &source)
             {
@@ -500,39 +514,40 @@ impl GuestFilesAuthority {
                 let _ = std::fs::remove_dir(&transaction.staging_root);
                 return Err((transaction_id, reason));
             }
-            let references = FileReferences {
-                space: transaction.space,
-                files: vec![FileReferenceView {
-                    file: transaction.file_reference,
-                    reference: FileRef {
-                        name: metadata.name.clone(),
-                        size: metadata.byte_count,
-                        sha256_hex: digest.to_owned(),
-                        mime: Some(metadata.mime.clone()),
-                    },
-                    linked_by: ActorId::new("vdi-guest"),
-                    linked_unix_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
-                }],
-            };
-            let references_body = serde_json::to_string(&references).map_err(|_| {
-                (
-                    transaction_id.clone(),
-                    "Files projection encoding failed".to_owned(),
-                )
-            })?;
-            if let Err(error) = persist.write(
-                &format!("state/collab/file-references/{}", transaction.space),
-                Priority::Default,
-                None,
-                Some(&references_body),
-            ) {
-                let _ = std::fs::remove_dir_all(&destination);
-                let _ = std::fs::remove_dir(&transaction.staging_root);
-                return Err((
-                    transaction_id,
-                    format!("Files projection publication failed: {error}"),
-                ));
-            }
+            reference_views.push(FileReferenceView {
+                file: transaction.file_references[index],
+                reference: FileRef {
+                    name: metadata.name.clone(),
+                    size: metadata.byte_count,
+                    sha256_hex: digest.to_owned(),
+                    mime: Some(metadata.mime.clone()),
+                },
+                linked_by: ActorId::new("vdi-guest"),
+                linked_unix_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
+            });
+        }
+        let references = FileReferences {
+            space: transaction.space,
+            files: reference_views,
+        };
+        let references_body = serde_json::to_string(&references).map_err(|_| {
+            (
+                transaction_id.clone(),
+                "Files projection encoding failed".to_owned(),
+            )
+        })?;
+        if let Err(error) = persist.write(
+            &format!("state/collab/file-references/{}", transaction.space),
+            Priority::Default,
+            None,
+            Some(&references_body),
+        ) {
+            let _ = std::fs::remove_dir_all(&destination);
+            let _ = std::fs::remove_dir(&transaction.staging_root);
+            return Err((
+                transaction_id,
+                format!("Files projection publication failed: {error}"),
+            ));
         }
         chown_guest_tree(&destination, self.owner);
         let _ = std::fs::remove_dir(&transaction.staging_root);
@@ -1768,6 +1783,37 @@ mod tests {
             std::fs::read(committed.join("nested/chart.csv")).unwrap(),
             b"chart"
         );
+        let topic = persist
+            .list_topics()
+            .unwrap()
+            .into_iter()
+            .find(|topic| topic.starts_with("state/collab/file-references/"))
+            .expect("multi-file Files projection topic");
+        let body = persist.read_latest(&topic).unwrap().unwrap().body.unwrap();
+        let references: FileReferences = serde_json::from_str(&body).unwrap();
+        assert_eq!(references.files.len(), 2);
+        assert_ne!(references.files[0].file, references.files[1].file);
+        for (reference, expected) in references
+            .files
+            .iter()
+            .zip([b"report".as_slice(), b"chart"])
+        {
+            assert_eq!(reference.reference.size, expected.len() as u64);
+            assert_eq!(
+                reference.reference.sha256_hex,
+                mde_collab_types::sha256_hex(expected)
+            );
+            assert_eq!(
+                std::fs::read(
+                    content
+                        .path()
+                        .join(&reference.reference.sha256_hex[..2])
+                        .join(&reference.reference.sha256_hex)
+                )
+                .unwrap(),
+                expected
+            );
+        }
 
         assert!(matches!(
             authority.handle(
@@ -1904,6 +1950,90 @@ mod tests {
         assert_eq!(references.files[0].reference.sha256_hex, digest);
         assert_eq!(references.files[0].reference.size, bytes.len() as u64);
         assert_eq!(references.files[0].linked_by.as_str(), "vdi-guest");
+    }
+
+    #[test]
+    fn guest_clipboard_multifile_cas_failure_has_no_partial_projection() {
+        use base64::Engine as _;
+
+        let bus = tempfile::tempdir().expect("bus root");
+        let destination = tempfile::tempdir().expect("Files destination");
+        let content = tempfile::tempdir().expect("CAS root");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open Bus");
+        let mut authority = GuestFilesAuthority::bind(
+            bus.path(),
+            destination.path().to_path_buf(),
+            content.path().to_path_buf(),
+        )
+        .expect("bind Files authority");
+        authority.owner = None;
+        let files = vec![
+            VdiClipboardFileDescriptorV1::new("one.bin", None, "application/octet-stream", 3)
+                .unwrap(),
+            VdiClipboardFileDescriptorV1::new("two.bin", None, "application/octet-stream", 3)
+                .unwrap(),
+        ];
+        let now = 1_700_000_000_000_u64;
+        let begin = GuestFilesRequest::Begin {
+            transaction_id: "tx-multifile-fail".into(),
+            session_id: "rdp-session".into(),
+            files,
+            total_bytes: 6,
+        };
+        assert!(matches!(
+            authority.handle(&persist, begin, now),
+            GuestFilesResponse::Ready { .. }
+        ));
+        for (file_index, bytes) in [b"one".as_slice(), b"two"].into_iter().enumerate() {
+            let response = authority.handle(
+                &persist,
+                GuestFilesRequest::Chunk {
+                    transaction_id: "tx-multifile-fail".into(),
+                    file_index,
+                    offset: 0,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    complete: true,
+                },
+                now + 1 + file_index as u64,
+            );
+            assert!(matches!(
+                response,
+                GuestFilesResponse::Ready { .. } | GuestFilesResponse::Staged { .. }
+            ));
+        }
+        std::fs::write(
+            destination
+                .path()
+                .join(VDI_GUEST_FILES_STAGING_DIR)
+                .join("tx-multifile-fail/payload/two.bin"),
+            b"bad",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            authority.handle(
+                &persist,
+                GuestFilesRequest::Commit {
+                    transaction_id: "tx-multifile-fail".into(),
+                },
+                now + 4,
+            ),
+            GuestFilesResponse::Refused { .. }
+        ));
+        assert!(persist
+            .list_topics()
+            .unwrap()
+            .iter()
+            .all(|topic| !topic.starts_with("state/collab/file-references/")));
+        assert!(!destination
+            .path()
+            .join("Clipboard from RDP tx-multifile-fail")
+            .exists());
+        assert!(!destination
+            .path()
+            .join(VDI_GUEST_FILES_STAGING_DIR)
+            .join("tx-multifile-fail")
+            .exists());
     }
 
     // AUD2-2 — the pre-FileXfer free reply builders were removed; the
