@@ -1556,7 +1556,7 @@ mod tests {
     fn min_messages_expire_under_six_hours() {
         let now = 1_000_000_000_000_i64;
         let seven_hours_ago = now - (7_i64 * 60 * 60 * 1000);
-        let recent = now - (1_i64 * 60 * 60 * 1000); // 1h ago
+        let recent = now - (60_i64 * 60 * 1000); // 1h ago
         let (_tmp, root) = open_tmp_with(&[
             ("t/old", Priority::Min, seven_hours_ago),
             ("t/new", Priority::Min, recent),
@@ -2006,7 +2006,7 @@ mod tests {
     fn default_messages_expire_under_six_hours() {
         let now = 1_000_000_000_000_i64;
         let seven_hours = now - (7_i64 * 60 * 60 * 1000);
-        let one_hour = now - (1_i64 * 60 * 60 * 1000);
+        let one_hour = now - (60_i64 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[
             ("t/old", Priority::Default, seven_hours),
             ("t/new", Priority::Default, one_hour),
@@ -2019,7 +2019,7 @@ mod tests {
     fn high_messages_expire_under_six_hours() {
         let now = 1_000_000_000_000_i64;
         let seven_hours = now - (7_i64 * 60 * 60 * 1000);
-        let one_hour = now - (1_i64 * 60 * 60 * 1000);
+        let one_hour = now - (60_i64 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[
             ("t/old", Priority::High, seven_hours),
             ("t/new", Priority::High, one_hour),
@@ -2301,8 +2301,10 @@ mod tests {
     fn default_quota_is_tmpfs_safe() {
         // Regression: the old 500 MB/2 GB defaults exceeded a ~190 MB
         // lighthouse /run, so the cap could never fire before ENOSPC.
-        assert!(DEFAULT_QUOTA_HARD_BYTES < 190 * 1024 * 1024);
-        assert!(DEFAULT_QUOTA_SOFT_BYTES < DEFAULT_QUOTA_HARD_BYTES);
+        const {
+            assert!(DEFAULT_QUOTA_HARD_BYTES < 190 * 1024 * 1024);
+            assert!(DEFAULT_QUOTA_SOFT_BYTES < DEFAULT_QUOTA_HARD_BYTES);
+        }
     }
 
     #[test]

@@ -294,8 +294,8 @@ mod tests {
             priority_default: Priority::High,
             retention_s: Some(86_400),
         };
-        assert_eq!(r.create(t.clone()).unwrap(), true);
-        assert_eq!(r.create(t).unwrap(), false);
+        assert!(r.create(t.clone()).unwrap());
+        assert!(!r.create(t).unwrap());
         assert_eq!(r.len(), 1);
     }
 
