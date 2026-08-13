@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{device_inventory, ShutdownToken, Worker};
+use super::{device_inventory, wifi_provider, ShutdownToken, Worker};
 use mackes_mesh_types::peer_probe::{
     BusTopology, Descriptors, KernelDriver, NatClass, PeerProbe, PowerThermal,
 };
@@ -386,7 +386,15 @@ impl Worker for HardwareProbeWorker {
             // publishing both neutral inventory artifacts.
             let outcome = tokio::task::spawn_blocking(move || {
                 publish(&root, &node);
-                device_inventory::publish_system(&root, &host)
+                let inventory = device_inventory::publish_system(&root, &host);
+                if let Err(error) = wifi_provider::publish_system(&root, &host) {
+                    tracing::warn!(
+                        target: "mackesd::hardware_probe",
+                        %error,
+                        "Wi-Fi provider publish failed",
+                    );
+                }
+                inventory
             })
             .await;
             match outcome {

@@ -453,6 +453,8 @@ pub mod probe;
 // hardware probe + writes it to the replicated directory so the
 // Workbench Hardware panel renders the fleet. Spawned in run_serve.
 pub mod hardware_probe;
+/// WL-UX-011 — read-only, fail-closed NetworkManager Wi-Fi provider.
+pub mod wifi_provider;
 // DEVMGR-1 — the device-inventory enumeration engine the `hardware_probe`
 // worker calls on its tick (NOT a new worker — lock #16). Walks the full Linux
 // hardware taxonomy sysfs-first + publishes `device-inventory/<host>.json` for
