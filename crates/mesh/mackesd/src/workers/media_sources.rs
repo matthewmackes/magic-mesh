@@ -484,6 +484,12 @@ struct MdnsBrowse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MdnsDrain {
+    changed: bool,
+    disconnected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MediaSourcesBusIdentity {
     device: u64,
     inode: u64,
@@ -541,13 +547,19 @@ impl MediaSourcesWorker {
     }
 
     /// Drain pending mDNS browse events into the live endpoint cache.
-    fn drain_mdns(&mut self, browse: Option<&MdnsBrowse>) -> bool {
-        let Some(browse) = browse else { return false };
+    fn drain_mdns(&mut self, browse: Option<&MdnsBrowse>) -> MdnsDrain {
+        let Some(browse) = browse else {
+            return MdnsDrain {
+                changed: false,
+                disconnected: false,
+            };
+        };
         let mut changed = false;
+        let mut disconnected = false;
         for (bare, rx) in &browse.browsers {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
+            loop {
+                match rx.try_recv() {
+                    Ok(ServiceEvent::ServiceResolved(info)) => {
                         if let Some(ep) = endpoint_from_service_info(bare, &info) {
                             let prev = self.mdns_seen.insert(ep.fullname.clone(), ep.clone());
                             if prev.as_ref() != Some(&ep) {
@@ -555,14 +567,29 @@ impl MediaSourcesWorker {
                             }
                         }
                     }
-                    ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                    Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
                         changed |= self.mdns_seen.remove(&fullname).is_some();
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(_) => {
+                        disconnected |= rx.is_disconnected();
+                        break;
+                    }
                 }
             }
         }
-        changed
+        MdnsDrain {
+            changed,
+            disconnected,
+        }
+    }
+
+    /// A disconnected browse generation can no longer expire lost services.
+    /// Revoke every endpoint learned from it before reconnecting so a dead
+    /// Spotify-class provider cannot remain advertised as reachable.
+    fn revoke_disconnected_mdns(&mut self) -> bool {
+        self.mdns_lane = "gated: mDNS browse disconnected; retrying".to_string();
+        !std::mem::take(&mut self.mdns_seen).is_empty()
     }
 
     /// Read the peers plane + fold both lanes into the merged roster.
@@ -706,7 +733,7 @@ impl Worker for MediaSourcesWorker {
                 () = tokio::time::sleep(retry_interval) => {}
             }
         };
-        let browse = self.start_mdns_browsers();
+        let mut browse = self.start_mdns_browsers();
 
         // Immediate first publish so the Sources panel doesn't wait a heartbeat.
         let sources = self.collect_sources();
@@ -720,7 +747,14 @@ impl Worker for MediaSourcesWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let mdns_changed = self.drain_mdns(browse.as_ref());
+                    let drained = self.drain_mdns(browse.as_ref());
+                    let mdns_changed = if drained.disconnected {
+                        self.revoke_disconnected_mdns();
+                        browse = self.start_mdns_browsers();
+                        true
+                    } else {
+                        drained.changed
+                    };
                     let due = last_pub.elapsed() >= self.heartbeat;
                     let Ok((persist, identity)) = open_current_media_sources_bus(&bus_root) else {
                         continue;
@@ -1304,6 +1338,40 @@ mod tests {
             media_sources_bus_root_or_system(None),
             PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
         );
+    }
+
+    #[tokio::test]
+    async fn disconnected_mdns_generation_revokes_stale_provider_before_retry() {
+        let daemon = ServiceDaemon::new().expect("test mDNS daemon");
+        let service_type = super::super::mdns_relay::browse_type(MEDIA_MDNS_TYPES[0].0);
+        let receiver = daemon.browse(&service_type).expect("test mDNS browse");
+        let browse = MdnsBrowse {
+            _daemon: daemon,
+            browsers: vec![(MEDIA_MDNS_TYPES[0].0, receiver)],
+        };
+        let mut worker = MediaSourcesWorker::new("node-mdns".into(), PathBuf::new());
+        let stale = svc(MEDIA_MDNS_TYPES[0].0, "stale-provider", 8096, &[]);
+        worker.mdns_seen.insert(
+            stale.get_fullname().to_string(),
+            endpoint_from_service_info(MEDIA_MDNS_TYPES[0].0, &stale).expect("resolved provider"),
+        );
+
+        browse._daemon.shutdown().expect("stop mDNS generation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if worker.drain_mdns(Some(&browse)).disconnected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("browse receiver must report generation loss");
+
+        assert!(worker.revoke_disconnected_mdns());
+        assert!(worker.mdns_seen.is_empty());
+        assert!(worker.mdns_lane.contains("disconnected"));
+        assert!(worker.collect_sources().is_empty());
     }
 
     #[tokio::test]
