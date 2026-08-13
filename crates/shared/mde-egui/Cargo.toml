@@ -97,8 +97,12 @@ unused_must_use = "deny"
 pedantic    = { level = "warn", priority = -1 }
 nursery     = { level = "warn", priority = -1 }
 unwrap_used = "deny"
-panic       = "warn"
+panic       = "allow"
 todo        = "deny"
+float_cmp   = "allow"
+suboptimal_flops = "allow"
+default_trait_access = "allow"
+assertions_on_constants = "allow"
 
 # The harness performs deliberate pixel/colour/DRM numeric conversions and
 # exposes long declarative UI builders. Keep correctness and security lints

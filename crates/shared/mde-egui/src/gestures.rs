@@ -815,7 +815,12 @@ mod tests {
         r.feed(down(0, 0.5, 0.99), &t, Duration::ZERO, &mut out);
         r.feed(mv(0, 0.5, 0.90), &t, Duration::ZERO, &mut out);
         // Before the dwell elapses the tick stays quiet…
-        r.tick(EDGE_HOLD_DWELL - Duration::from_millis(1), &mut out);
+        r.tick(
+            EDGE_HOLD_DWELL
+                .checked_sub(Duration::from_millis(1))
+                .expect("edge dwell exceeds one millisecond"),
+            &mut out,
+        );
         assert!(edge_events(&out).is_empty(), "no fire before the dwell");
         // …then the hold fires LIVE, under the still-held finger.
         r.tick(EDGE_HOLD_DWELL, &mut out);

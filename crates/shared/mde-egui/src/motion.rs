@@ -1770,7 +1770,7 @@ mod tests {
         );
         let under = Motion::rubber_band(-100_000.0, 0.0, 100.0);
         assert!(
-            under < 0.0 && under >= -Motion::RUBBER_SLACK,
+            (-Motion::RUBBER_SLACK..0.0).contains(&under),
             "bounded under-scroll: {under}"
         );
     }
