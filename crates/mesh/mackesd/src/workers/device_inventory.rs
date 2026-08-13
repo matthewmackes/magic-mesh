@@ -1232,8 +1232,11 @@ fn suppress_conflicting_sysfs_identities(
     let mut published = BTreeSet::new();
     for records in buckets.values_mut() {
         records.retain(|record| {
-            let Some(identity) = stable_sysfs_identity(record) else {
+            if record.sysfs_path.is_none() {
                 return true;
+            }
+            let Some(identity) = stable_sysfs_identity(record) else {
+                return false;
             };
             !conflicted.contains(&identity) && published.insert(identity)
         });
@@ -1242,7 +1245,12 @@ fn suppress_conflicting_sysfs_identities(
 
 fn stable_sysfs_identity(record: &DeviceRecord) -> Option<PathBuf> {
     let path = Path::new(record.sysfs_path.as_deref()?);
-    std::fs::canonicalize(path).ok().or_else(|| Some(path.to_path_buf()))
+    // Re-attest the kernel object at reconciliation time.  A hot-unplug can
+    // remove a class/bus node after its attributes were read but before this
+    // generation is assembled.  Falling back to the stale textual path would
+    // publish hardware that no longer exists and make that stale row look as
+    // authoritative as a live provider identity until the next worker tick.
+    std::fs::canonicalize(path).ok()
 }
 
 /// Build the full [`DeviceInventory`] for `hostname` from the injected roots +
@@ -2055,6 +2063,37 @@ mod tests {
             exact_buckets[category::INPUT].len(),
             1,
             "exact aliases must deduplicate without suppressing their identity"
+        );
+    }
+
+    #[test]
+    fn hot_unplugged_sysfs_identity_is_revoked_before_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let removed = roots.sys.join("class/input/input0");
+        let present = roots.sys.join("class/input/input1");
+        put(&removed.join("name"), "Removed keyboard\n");
+        put(&present.join("name"), "Present keyboard\n");
+
+        let records = input_devices(&roots);
+        assert_eq!(
+            records.len(),
+            2,
+            "both providers existed during enumeration"
+        );
+
+        // Model a physical unplug after provider attributes were captured but
+        // before the inventory generation is reconciled for publication.
+        fs::remove_dir_all(&removed).unwrap();
+        let mut buckets = BTreeMap::from([(category::INPUT.to_string(), records)]);
+        suppress_conflicting_sysfs_identities(&mut buckets);
+
+        let admitted = &buckets[category::INPUT];
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].name, "Present keyboard");
+        assert_eq!(
+            admitted[0].sysfs_path.as_deref(),
+            Some(present.to_string_lossy().as_ref())
         );
     }
 
