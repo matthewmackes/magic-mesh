@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MANIFEST_VERIFY="$ROOT/packaging/browser-vm/verify-image-manifest.py"
 SOURCE_MODE=0
+SOURCE_REVISION=
 MANIFEST=
 IMAGE=
 SELF_TEST=0
@@ -12,15 +13,16 @@ POSITIONAL=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --source) SOURCE_MODE=1; shift ;;
+        --source-revision) SOURCE_REVISION="${2:?--source-revision needs a revision}"; shift 2 ;;
         --manifest) MANIFEST="${2:?--manifest needs a path}"; shift 2 ;;
         --image) IMAGE="${2:?--image needs a path}"; shift 2 ;;
         --self-test) SELF_TEST=1; shift ;;
-        --*) echo "usage: $0 [--source] [--manifest MANIFEST --image IMAGE] [PROFILE]" >&2; exit 2 ;;
+        --*) echo "usage: $0 [--source [--source-revision REVISION]] [--manifest MANIFEST --image IMAGE] [PROFILE]" >&2; exit 2 ;;
         *) POSITIONAL+=("$1"); shift ;;
     esac
 done
 [ "${#POSITIONAL[@]}" -le 1 ] || {
-    echo "usage: $0 [--source] [--manifest MANIFEST --image IMAGE] [PROFILE]" >&2
+    echo "usage: $0 [--source [--source-revision REVISION]] [--manifest MANIFEST --image IMAGE] [PROFILE]" >&2
     exit 2
 }
 PROFILE="${1:-$ROOT/packaging/browser-vm/profile.env}"
@@ -28,10 +30,10 @@ if [ "${#POSITIONAL[@]}" -eq 1 ]; then
     PROFILE="${POSITIONAL[0]}"
 fi
 if [ "$SELF_TEST" -eq 1 ]; then
-    [ -z "$MANIFEST" ] && [ -z "$IMAGE" ] && [ "${#POSITIONAL[@]}" -eq 0 ] || {
+    if [ -n "$MANIFEST" ] || [ -n "$IMAGE" ] || [ "${#POSITIONAL[@]}" -ne 0 ]; then
         echo 'verify-browser-vm-profile: --self-test accepts no other input' >&2
         exit 2
-    }
+    fi
     "$MANIFEST_VERIFY" self-test --repo-root "$ROOT" --profile "$PROFILE"
     echo 'Browser VM profile/manifest self-tests passed'
     exit 0
@@ -40,6 +42,10 @@ if { [ -n "$MANIFEST" ] && [ -z "$IMAGE" ]; } || { [ -z "$MANIFEST" ] && [ -n "$
     echo 'verify-browser-vm-profile: --manifest and --image are required together' >&2
     exit 2
 fi
+[ -z "$SOURCE_REVISION" ] || [ "$SOURCE_MODE" -eq 1 ] || {
+    echo 'verify-browser-vm-profile: --source-revision requires --source' >&2
+    exit 2
+}
 
 die() {
     echo "verify-browser-vm-profile: $*" >&2
@@ -112,6 +118,31 @@ done
     || die "source commit must be a 40-character immutable Git revision"
 [[ "${values[BROWSER_VM_SOURCE_COMMIT]}" != 0000000000000000000000000000000000000000 ]] \
     || die "source commit must identify a real Git object"
+if [ -n "$SOURCE_REVISION" ]; then
+    [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+        || die "requested source revision must be one full lowercase Git commit ID"
+    [[ "${values[BROWSER_VM_SOURCE_COMMIT]}" == "$SOURCE_REVISION" ]] \
+        || die "profile source commit does not match the requested source revision"
+    [[ "$(git -C "$ROOT" cat-file -t "$SOURCE_REVISION" 2>/dev/null)" == commit ]] \
+        || die "requested source revision is not an available Git commit"
+
+    # The commit field is the release binding and therefore cannot be part of
+    # its own Git identity without a hash fixed-point. Compare every other byte
+    # against the governed blob at the requested commit. This admits only that
+    # one release-field substitution and rejects stale, dirty, or substituted
+    # configuration before an image builder mutates staging or output state.
+    freeze_work=$(mktemp -d)
+    trap 'rm -rf -- "$freeze_work"' EXIT
+    git -C "$ROOT" show "$SOURCE_REVISION:${values[BROWSER_VM_SOURCE_PATH]}" \
+        >"$freeze_work/committed" 2>/dev/null \
+        || die "profile path is absent from the requested source revision"
+    sed 's/^BROWSER_VM_SOURCE_COMMIT=.*/BROWSER_VM_SOURCE_COMMIT=@RELEASE_REVISION@/' \
+        "$freeze_work/committed" >"$freeze_work/committed.normalized"
+    sed 's/^BROWSER_VM_SOURCE_COMMIT=.*/BROWSER_VM_SOURCE_COMMIT=@RELEASE_REVISION@/' \
+        "$PROFILE" >"$freeze_work/supplied.normalized"
+    cmp -s -- "$freeze_work/supplied.normalized" "$freeze_work/committed.normalized" \
+        || die "profile bytes differ from the requested source revision"
+fi
 [[ "${values[BROWSER_VM_GUEST_OS]}" == fedora-bootc ]] || die "unsupported guest OS"
 [[ "${values[BROWSER_VM_COMPOSITOR]}" == sway ]] || die "unsupported guest compositor"
 [[ "${values[BROWSER_VM_BROWSER]}" == chromium ]] || die "guest browser must be Chromium"

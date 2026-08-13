@@ -23,6 +23,11 @@ SOURCE_COMMIT="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$DIR/profile.env")"
     echo 'FATAL: Browser VM profile source commit is not a 40-character revision' >&2
     exit 2
 }
+"$DIR/verify-profile.sh" --source --source-revision "$SOURCE_COMMIT" \
+    "$DIR/profile.env" >/dev/null || {
+    echo 'FATAL: Browser VM profile is not frozen to its requested source revision' >&2
+    exit 2
+}
 DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$DIR/profile.env")"
 [[ "$DISK_GB" =~ ^[0-9]+$ && "$DISK_GB" -ge 64 ]] || {
     echo 'FATAL: Browser VM profile disk floor must be at least 64 GiB' >&2
