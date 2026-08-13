@@ -152,6 +152,13 @@ impl DockMode {
             Self::Docked => "docked",
         }
     }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Floating => Self::Docked,
+            Self::Docked => Self::Floating,
+        }
+    }
 }
 
 fn default_taskbar_pins() -> Vec<Surface> {
@@ -558,10 +565,16 @@ impl State {
         }
     }
 
-    /// Toggle placement and start the slide/melt transition.
-    pub(crate) fn toggle(&mut self, now: Instant, motion: MotionMode) {
-        self.toggle_mode(now, motion);
-        self.save();
+    /// Persist the next placement before publishing it to layout or motion.
+    ///
+    /// The taskbar is display-owning chrome: advertising a placement that did
+    /// not reach durable seat preferences would make the running display and
+    /// the next shell generation disagree about which content edge is owned.
+    pub(crate) fn toggle(&mut self, now: Instant, motion: MotionMode) -> bool {
+        let candidate = self.mode.toggled();
+        self.commit_mode(candidate, now, motion, |state, mode| {
+            state.save_with_mode(mode)
+        })
     }
 
     /// The current ordered taskbar catalog, suitable for the Front Door's
@@ -696,10 +709,7 @@ impl State {
 
     fn toggle_mode(&mut self, now: Instant, motion: MotionMode) {
         let from = self.mode;
-        let to = match from {
-            DockMode::Floating => DockMode::Docked,
-            DockMode::Docked => DockMode::Floating,
-        };
+        let to = from.toggled();
         self.mode = to;
         self.transition = (motion != MotionMode::Disabled).then(|| TransitionState {
             from,
@@ -707,6 +717,24 @@ impl State {
             started: now,
             motion,
         });
+    }
+
+    fn commit_mode<F>(
+        &mut self,
+        candidate: DockMode,
+        now: Instant,
+        motion: MotionMode,
+        persist: F,
+    ) -> bool
+    where
+        F: FnOnce(&Self, DockMode) -> std::io::Result<()>,
+    {
+        if candidate == self.mode || persist(self, candidate).is_err() {
+            return false;
+        }
+        self.toggle_mode(now, motion);
+        debug_assert_eq!(self.mode, candidate);
+        true
     }
 
     /// Paint the dock and return the first clicked action, if any.
@@ -1286,14 +1314,33 @@ impl State {
         self.save_with_pinned_surfaces_to(&path, pinned_surfaces)
     }
 
+    fn save_with_mode(&self, mode: DockMode) -> std::io::Result<()> {
+        let path = Self::default_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "navigation preference directory is unavailable",
+            )
+        })?;
+        self.save_with_state_to(&path, mode, &self.pinned_surfaces)
+    }
+
     fn save_with_pinned_surfaces_to(
         &self,
         path: &Path,
         pinned_surfaces: &[Surface],
     ) -> std::io::Result<()> {
+        self.save_with_state_to(path, self.mode, pinned_surfaces)
+    }
+
+    fn save_with_state_to(
+        &self,
+        path: &Path,
+        mode: DockMode,
+        pinned_surfaces: &[Surface],
+    ) -> std::io::Result<()> {
         let prefs = NavBarPrefs {
             schema_version: NAV_PREFS_SCHEMA_VERSION,
-            mode: self.mode,
+            mode,
             pinned_surfaces: pinned_surfaces
                 .iter()
                 .map(|surface| surface_key(*surface).to_owned())
@@ -2640,6 +2687,42 @@ mod tests {
         assert!(state.is_docked());
         state.toggle_mode(now, MotionMode::Disabled);
         assert!(!state.is_docked());
+    }
+
+    #[test]
+    fn placement_publishes_only_after_exact_preferences_are_durable() {
+        let dir = tempfile_dir();
+        let path = dir.join(CONFIG_FILE);
+        let mut state = State::with_mode(DockMode::Floating);
+        let now = Instant::now();
+
+        let failed = state.commit_mode(DockMode::Docked, now, MotionMode::Normal, |_, _| {
+            Err(std::io::Error::other("simulated durable write failure"))
+        });
+        assert!(!failed);
+        assert_eq!(state.mode, DockMode::Floating);
+        assert!(state.transition.is_none());
+
+        let committed =
+            state.commit_mode(DockMode::Docked, now, MotionMode::Normal, |state, mode| {
+                state.save_with_state_to(&path, mode, &state.pinned_surfaces)
+            });
+        assert!(committed);
+        assert_eq!(state.mode, DockMode::Docked);
+        assert_eq!(
+            state.transition.expect("placement transition").to,
+            DockMode::Docked
+        );
+
+        let saved: NavBarPrefs = serde_json::from_str(
+            &read_bounded_config(&path).expect("read committed placement preferences"),
+        )
+        .expect("decode committed placement preferences");
+        let restarted = State::from_prefs(saved);
+        assert_eq!(restarted.mode, state.mode);
+        assert!(restarted.transition.is_none());
+        assert_eq!(restarted.pinned_surfaces(), state.pinned_surfaces());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1854,7 +1854,7 @@ impl Shell {
                 self.communications.open_editor();
             }
             nav_bar::Action::ToggleDock => {
-                self.nav_bar.toggle(Instant::now(), Motion::mode());
+                let _ = self.nav_bar.toggle(Instant::now(), Motion::mode());
             }
             nav_bar::Action::OpenSurface(surface) => {
                 self.nav.expanded = true;
