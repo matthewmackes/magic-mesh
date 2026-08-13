@@ -28,30 +28,34 @@ const MAX_HITS: usize = 12;
 // generous search-input budget; normal launcher queries are unaffected.
 const MAX_QUERY_CHARS: usize = 256;
 // PLATFORM-INTERFACES Q15 — Spotlight card width: min(640px, screen − 2×SP_XL).
-const PANEL_W: f32 = 640.0;
-const ROW_H: f32 = 42.0;
-const INPUT_H: f32 = 44.0;
-const FILTER_CHIP_H: f32 = 24.0;
-const FILTER_CHIP_GAP: f32 = 5.0;
-const ACTION_PANEL_H: f32 = 44.0;
+const PANEL_W: f32 = Style::SP_XL * 20.0;
+// Front Door is shell chrome, so its control geometry must stay on the shared
+// Quazar ladder. These expressions deliberately preserve the established
+// dimensions while making token drift propagate coherently instead of leaving
+// a second, local spacing/type system behind.
+const ROW_H: f32 = Style::CONTROL_H_L + Style::SP_XS + Style::STROKE_HAIRLINE * 2.0;
+const INPUT_H: f32 = Style::CONTROL_H_L + Style::SP_S;
+const FILTER_CHIP_H: f32 = Style::CONTROL_H_S;
+const FILTER_CHIP_GAP: f32 = Style::SP_XS + Style::STROKE_HAIRLINE;
+const ACTION_PANEL_H: f32 = INPUT_H;
 // PLATFORM-INTERFACES Q15 — the Spotlight card is a RADIUS_XL hero card; the
 // SP_M inset keeps inner RADIUS_M plates on the Q23 concentric rule
 // (RADIUS_XL − SP_M = RADIUS_M).
 const PANEL_RADIUS: f32 = Style::RADIUS_XL;
 const PANEL_INSET: f32 = Style::SP_M;
 // PLATFORM-INTERFACES Q15 — how far the summoned card drops into place.
-const SPOTLIGHT_DROP: f32 = 12.0;
+const SPOTLIGHT_DROP: f32 = Style::SP_S + Style::SP_XS;
 const SPOTLIGHT_MOTION_KEY: &str = "shell-front-door-spotlight-presence";
 const EXPANSION_BUTTON_W: f32 = INPUT_H;
-const EXPANDED_MIN_H: f32 = 320.0;
-const PANEL_MIN_W: f32 = 320.0;
+const EXPANDED_MIN_H: f32 = Style::SP_XL * 10.0;
+const PANEL_MIN_W: f32 = Style::SP_XL * 10.0;
 const ROW_ICON: f32 = Style::ICON_M;
-const DOMAIN_W: f32 = 82.0;
-const DOMAIN_MIN_W: f32 = 44.0;
-const RESULT_TEXT_MIN_W: f32 = 72.0;
-const SEARCH_MIN_W: f32 = 72.0;
-const TOOLTIP_W: f32 = 260.0;
-const ACTION_BUTTON_TEXT_MIN_W: f32 = 72.0;
+const DOMAIN_W: f32 = Style::SP_XL * 2.0 + Style::SP_M + Style::STROKE_HAIRLINE * 2.0;
+const DOMAIN_MIN_W: f32 = INPUT_H;
+const RESULT_TEXT_MIN_W: f32 = Style::SP_XL * 2.0 + Style::SP_S;
+const SEARCH_MIN_W: f32 = RESULT_TEXT_MIN_W;
+const TOOLTIP_W: f32 = Style::SP_XL * 8.0 + Style::SP_XS;
+const ACTION_BUTTON_TEXT_MIN_W: f32 = RESULT_TEXT_MIN_W;
 const SEARCH_HINT: &str = "Search apps, workloads, services, commands, files, mesh, Browser";
 
 /// Unified-search privacy policy (WL-FUNC-005): the omnibox is **ephemeral and
@@ -1967,7 +1971,7 @@ fn paint_front_door_panel_frame(ui: &egui::Ui, rect: egui::Rect) {
     ui.painter().rect_stroke(
         rect,
         PANEL_RADIUS,
-        egui::Stroke::new(1.0, Style::BORDER),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER),
         egui::StrokeKind::Inside,
     );
 }
@@ -2000,8 +2004,8 @@ fn install_expansion_accessibility(ctx: &egui::Context, rect: egui::Rect, expand
 fn front_door_tooltip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
         .fill(Style::SURFACE)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
-        .corner_radius(8.0)
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(TOOLTIP_W);
@@ -2035,9 +2039,9 @@ fn expansion_toggle_button(ui: &mut egui::Ui, expanded: bool) -> bool {
         Style::SURFACE
     };
     let stroke = if selected {
-        egui::Stroke::new(1.0, Style::ACCENT)
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT)
     } else {
-        egui::Stroke::new(1.0, Style::BORDER)
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER)
     };
     ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
     ui.painter()
@@ -2106,9 +2110,9 @@ fn front_door_search_field(
         Style::SURFACE
     };
     let stroke = if focused {
-        egui::Stroke::new(1.0, Style::ACCENT)
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT)
     } else {
-        egui::Stroke::new(1.0, Style::BORDER)
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER)
     };
     ui.painter().rect_filled(rect, Style::RADIUS_M, fill);
     ui.painter()
@@ -2271,15 +2275,18 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
             Style::SURFACE
         };
         let stroke = if selected {
-            egui::Stroke::new(1.0, Style::ACCENT)
+            egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT)
         } else {
-            egui::Stroke::new(1.0, Style::BORDER)
+            egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER)
         };
         ui.painter().rect_filled(rect, Style::RADIUS_M, fill);
         ui.painter()
             .rect_stroke(rect, Style::RADIUS_M, stroke, egui::StrokeKind::Inside);
         ui.painter()
-            .with_clip_rect(rect.shrink2(egui::vec2(3.0, 0.0)))
+            .with_clip_rect(rect.shrink2(egui::vec2(
+                Style::SP_XS - Style::STROKE_HAIRLINE,
+                0.0,
+            )))
             .text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -2375,7 +2382,10 @@ fn source_status_note(ui: &mut egui::Ui, note: FrontDoorSourceNote) {
     ui.painter().rect_stroke(
         row_rect,
         5.0,
-        egui::Stroke::new(1.0, Style::WARN.linear_multiply(0.55)),
+        egui::Stroke::new(
+            Style::STROKE_HAIRLINE,
+            Style::WARN.linear_multiply(0.55),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -2458,11 +2468,14 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
     ui.painter().rect_stroke(
         domain_rect,
         4.0,
-        egui::Stroke::new(1.0, Style::BORDER),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER),
         egui::StrokeKind::Inside,
     );
     ui.painter()
-        .with_clip_rect(domain_rect.shrink2(egui::vec2(3.0, 0.0)))
+        .with_clip_rect(domain_rect.shrink2(egui::vec2(
+            Style::SP_XS - Style::STROKE_HAIRLINE,
+            0.0,
+        )))
         .text(
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -2546,11 +2559,14 @@ fn option_row(
     painter.rect_stroke(
         domain_rect,
         4.0,
-        egui::Stroke::new(1.0, Style::BORDER),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER),
         egui::StrokeKind::Inside,
     );
     painter
-        .with_clip_rect(domain_rect.shrink2(egui::vec2(3.0, 0.0)))
+        .with_clip_rect(domain_rect.shrink2(egui::vec2(
+            Style::SP_XS - Style::STROKE_HAIRLINE,
+            0.0,
+        )))
         .text(
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -3502,7 +3518,7 @@ fn action_button(
             rect.right_bottom(),
         );
         ui.painter()
-            .with_clip_rect(text_rect.shrink2(egui::vec2(4.0, 0.0)))
+            .with_clip_rect(text_rect.shrink2(egui::vec2(Style::SP_XS, 0.0)))
             .text(
                 text_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -3533,7 +3549,10 @@ fn result_action_panel(
     ui.painter().rect_stroke(
         panel_rect,
         5.0,
-        egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.42)),
+        egui::Stroke::new(
+            Style::STROKE_HAIRLINE,
+            Style::ACCENT.linear_multiply(0.42),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -3965,8 +3984,8 @@ fn apply_front_door_context_style(style: &mut egui::Style) {
     visuals.widgets.active.fg_stroke.color = Style::TEXT;
     visuals.widgets.open.bg_fill = Style::SURFACE_HI;
     visuals.widgets.open.weak_bg_fill = Style::SURFACE_HI;
-    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(Style::STROKE_HAIRLINE, Style::TEXT);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER);
 }
 
 fn run_command_accesskit_id() -> egui::Id {
@@ -4021,7 +4040,10 @@ fn run_command_action_panel(ui: &mut egui::Ui, command: &str) -> egui::Response 
     ui.painter().rect_stroke(
         panel_rect,
         5.0,
-        egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.42)),
+        egui::Stroke::new(
+            Style::STROKE_HAIRLINE,
+            Style::ACCENT.linear_multiply(0.42),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -4049,11 +4071,11 @@ fn run_command_action_panel(ui: &mut egui::Ui, command: &str) -> egui::Response 
     ui.painter().rect_stroke(
         button_rect,
         5.0,
-        egui::Stroke::new(1.0, Style::ACCENT),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT),
         egui::StrokeKind::Inside,
     );
     ui.painter()
-        .with_clip_rect(button_rect.shrink2(egui::vec2(4.0, 0.0)))
+        .with_clip_rect(button_rect.shrink2(egui::vec2(Style::SP_XS, 0.0)))
         .text(
             button_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -6414,6 +6436,40 @@ mod tests {
         );
 
         assert_rects_inside_viewport(&out, 280.0, "narrow Front Door panel");
+    }
+
+    #[test]
+    fn front_door_geometry_is_shared_style_derived_and_responsive() {
+        assert_eq!(PANEL_W, Style::SP_XL * 20.0);
+        assert_eq!(PANEL_INSET, Style::SP_M);
+        assert_eq!(PANEL_RADIUS, Style::RADIUS_XL);
+        assert_eq!(FILTER_CHIP_H, Style::CONTROL_H_S);
+        assert_eq!(INPUT_H, Style::CONTROL_H_L + Style::SP_S);
+        assert_eq!(ACTION_PANEL_H, INPUT_H);
+        assert_eq!(
+            ROW_H,
+            Style::CONTROL_H_L + Style::SP_XS + Style::STROKE_HAIRLINE * 2.0
+        );
+
+        for size in [
+            egui::vec2(220.0, 480.0),
+            egui::vec2(430.0, 900.0),
+            egui::vec2(1280.0, 800.0),
+        ] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for expanded in [false, true] {
+                let panel = front_door_panel_rect(screen, expanded);
+                assert!(
+                    panel.left() >= screen.left() - 0.01
+                        && panel.right() <= screen.right() + 0.01,
+                    "shared-token panel escaped horizontal bounds at {size:?}: {panel:?}"
+                );
+                assert!(
+                    panel.bottom() <= screen.bottom() + 0.01,
+                    "shared-token panel escaped vertical bounds at {size:?}: {panel:?}"
+                );
+            }
+        }
     }
 
     #[test]
