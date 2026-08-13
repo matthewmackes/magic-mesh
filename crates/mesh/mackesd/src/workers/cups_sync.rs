@@ -44,14 +44,15 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_bus::hooks::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_bus::rpc::reply_topic;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
@@ -76,6 +77,169 @@ const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Bound replies retained after an action effect completed but reply publication
 /// failed. This is an in-memory same-worker barrier, not crash-durable state.
 const MAX_PENDING_REPLIES: usize = 64;
+
+const MAX_PROVIDER_OBSERVATION_BYTES: usize = 64 * 1024;
+const MAX_PRINTER_FACTS: usize = 256;
+
+/// Credential-free readiness of the local printer provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PrinterReadiness {
+    Ready,
+    Disconnected,
+    Disabled,
+    Unknown,
+}
+
+/// Bounded projection. Queue identities and command output never cross this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrinterProviderSnapshot {
+    schema_version: u16,
+    node_id: String,
+    observed_unix_ms: u64,
+    readiness: PrinterReadiness,
+    configured_queues: u16,
+    kernel_printers: u16,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CupsServiceFact {
+    loaded: bool,
+    enabled: bool,
+    active: bool,
+}
+
+fn parse_cups_service(raw: &str) -> Option<CupsServiceFact> {
+    if raw.is_empty() || raw.len() > MAX_PROVIDER_OBSERVATION_BYTES || raw.contains('\0') {
+        return None;
+    }
+    let mut fields = HashMap::new();
+    for line in raw.lines() {
+        let (key, value) = line.split_once('=')?;
+        if !matches!(key, "LoadState" | "UnitFileState" | "ActiveState" | "SubState")
+            || value.is_empty()
+            || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    if fields.len() != 4 {
+        return None;
+    }
+    let loaded = match fields["LoadState"] {
+        "loaded" => true,
+        "not-found" => false,
+        _ => return None,
+    };
+    let enabled = match fields["UnitFileState"] {
+        "enabled" | "enabled-runtime" | "static" | "indirect" => true,
+        "disabled" | "masked" | "not-found" => false,
+        _ => return None,
+    };
+    let active = match (fields["ActiveState"], fields["SubState"]) {
+        ("active", "running") => true,
+        ("inactive" | "failed", "dead" | "failed") => false,
+        _ => return None,
+    };
+    Some(CupsServiceFact {
+        loaded,
+        enabled,
+        active,
+    })
+}
+
+fn parse_scheduler(raw: &str) -> Option<bool> {
+    if raw.len() > MAX_PROVIDER_OBSERVATION_BYTES || raw.contains('\0') {
+        return None;
+    }
+    match raw.trim() {
+        "scheduler is running" => Some(true),
+        "scheduler is not running" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_provider_queues(raw: &str) -> Option<usize> {
+    if raw.len() > MAX_PROVIDER_OBSERVATION_BYTES || raw.contains('\0') {
+        return None;
+    }
+    let mut queues = BTreeSet::new();
+    for name in raw.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        if name.len() > 127
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@')
+            })
+            || !queues.insert(name)
+            || queues.len() > MAX_PRINTER_FACTS
+        {
+            return None;
+        }
+    }
+    Some(queues.len())
+}
+
+fn classify_printer_provider(
+    service: Option<CupsServiceFact>,
+    scheduler: Option<bool>,
+    queues: Option<usize>,
+    kernel_printers: Option<Vec<String>>,
+) -> (PrinterReadiness, usize, usize, &'static str) {
+    let (Some(service), Some(scheduler), Some(queue_count), Some(mut kernel)) =
+        (service, scheduler, queues, kernel_printers)
+    else {
+        return (PrinterReadiness::Unknown, 0, 0, "printer facts unavailable or malformed");
+    };
+    if kernel.len() > MAX_PRINTER_FACTS
+        || kernel.iter().any(|name| {
+            !name.strip_prefix("lp").is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+    {
+        return (PrinterReadiness::Unknown, 0, 0, "kernel printer inventory malformed");
+    }
+    kernel.sort_unstable();
+    if kernel.windows(2).any(|pair| pair[0] == pair[1]) {
+        return (PrinterReadiness::Unknown, 0, 0, "kernel printer identities are duplicated");
+    }
+    if service.active != scheduler
+        || (!service.loaded && (service.enabled || service.active))
+        || (!service.active && queue_count > 0)
+    {
+        return (PrinterReadiness::Unknown, 0, 0, "CUPS and system facts contradict");
+    }
+    if !service.loaded || (!service.enabled && !service.active) {
+        return (
+            PrinterReadiness::Disabled,
+            queue_count,
+            kernel.len(),
+            "CUPS is not enabled",
+        );
+    }
+    if service.active && queue_count == 0 {
+        return (
+            PrinterReadiness::Disconnected,
+            0,
+            kernel.len(),
+            "CUPS is running without a configured queue",
+        );
+    }
+    if service.active {
+        return (
+            PrinterReadiness::Ready,
+            queue_count,
+            kernel.len(),
+            "CUPS service, scheduler, and queue facts agree",
+        );
+    }
+    (
+        PrinterReadiness::Disconnected,
+        queue_count,
+        kernel.len(),
+        "CUPS is enabled but not running",
+    )
+}
 
 /// Tick cadence — five seconds, matching the other mesh workers.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -485,6 +649,115 @@ impl CupsSyncWorker {
         self.mesh_home.join("printers")
     }
 
+    fn printer_provider_path(&self) -> PathBuf {
+        self.mesh_home
+            .join("printer-provider")
+            .join(format!("{}.json", self.hostname))
+    }
+
+    fn provider_capture(&self, bin: &str, args: &[&str]) -> Option<String> {
+        let mut command = Command::new(bin);
+        command.env("LC_ALL", "C").args(args);
+        let output = crate::workers::proc::output_with_timeout(
+            command,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        )
+        .ok()?;
+        if !output.status.success() || output.stdout.len() > MAX_PROVIDER_OBSERVATION_BYTES {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()
+    }
+
+    fn kernel_printers(root: &Path) -> Option<Vec<String>> {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        let mut printers = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("lp"))
+            .collect::<Vec<_>>();
+        if printers.len() > MAX_PRINTER_FACTS {
+            printers.truncate(MAX_PRINTER_FACTS + 1);
+        }
+        Some(printers)
+    }
+
+    /// Publish only bounded readiness and counts; this adds no printer mutation path.
+    fn publish_provider_readiness(&self) {
+        let service = self
+            .provider_capture(
+                "systemctl",
+                &[
+                    "show",
+                    "cups.service",
+                    "--property=LoadState",
+                    "--property=UnitFileState",
+                    "--property=ActiveState",
+                    "--property=SubState",
+                    "--no-pager",
+                ],
+            )
+            .as_deref()
+            .and_then(parse_cups_service);
+        let disabled = service.is_some_and(|fact| !fact.loaded);
+        let scheduler = if disabled {
+            Some(false)
+        } else {
+            self.provider_capture(&self.lpstat, &["-r"])
+                .as_deref()
+                .and_then(parse_scheduler)
+        };
+        let queues = if disabled {
+            Some(0)
+        } else {
+            self.provider_capture(&self.lpstat, &["-e"])
+                .as_deref()
+                .and_then(parse_provider_queues)
+        };
+        let kernel = Self::kernel_printers(Path::new("/sys/class/usb"));
+        let (readiness, queue_count, kernel_count, reason) =
+            classify_printer_provider(service, scheduler, queues, kernel);
+        let snapshot = PrinterProviderSnapshot {
+            schema_version: 1,
+            node_id: self.hostname.clone(),
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            readiness,
+            configured_queues: queue_count.try_into().unwrap_or(u16::MAX),
+            kernel_printers: kernel_count.try_into().unwrap_or(u16::MAX),
+            reason: reason.to_owned(),
+        };
+        if self.hostname.is_empty()
+            || self.hostname.len() > 128
+            || !self
+                .hostname
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return;
+        }
+        let path = self.printer_provider_path();
+        let Some(parent) = path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let temporary = parent.join(format!(".{}.json.tmp", self.hostname));
+        if serde_json::to_vec_pretty(&snapshot)
+            .ok()
+            .is_some_and(|bytes| std::fs::write(&temporary, bytes).is_ok())
+        {
+            let _ = std::fs::rename(temporary, path);
+        }
+    }
+
     /// One tick. Guarded no-op when cups/lpadmin absent or unenrolled.
     fn tick_once(&self) {
         if which(&self.lpstat).is_none() || which(&self.lpadmin).is_none() {
@@ -851,6 +1124,7 @@ impl Worker for CupsSyncWorker {
         // filesystem/subprocess convergence. Bus list/actions remain available;
         // an explicit sync request still performs the existing guarded no-op.
         let cups_enabled = which(&self.lpstat).is_some() && which(&self.lpadmin).is_some();
+        self.publish_provider_readiness();
         if cups_enabled {
             self.tick_once();
         }
@@ -906,7 +1180,12 @@ impl Worker for CupsSyncWorker {
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
                 () = tokio::time::sleep(bus_delay) => {}
-                _ = cups_tick.tick(), if cups_enabled => self.tick_once(),
+                _ = cups_tick.tick() => {
+                    self.publish_provider_readiness();
+                    if cups_enabled {
+                        self.tick_once();
+                    }
+                },
             }
         }
     }
@@ -985,6 +1264,80 @@ mod tests {
 
     const AUTH_KEY: &[u8] = b"cups-sync-action-auth-key";
     const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn hostile_printer_provider_facts_fail_unknown_without_exposing_identifiers() {
+        let service = Some(CupsServiceFact {
+            loaded: true,
+            enabled: true,
+            active: true,
+        });
+        let oversized = "x".repeat(MAX_PROVIDER_OBSERVATION_BYTES + 1);
+        assert!(parse_cups_service(
+            "LoadState=loaded\nLoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\n"
+        )
+        .is_none());
+        assert!(parse_cups_service(
+            "LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=substituted\n"
+        )
+        .is_none());
+        assert!(parse_provider_queues("office-secret\noffice-secret\n").is_none());
+        assert!(parse_provider_queues(&oversized).is_none());
+
+        let cases = [
+            classify_printer_provider(service, Some(false), Some(1), Some(vec!["lp0".into()])),
+            classify_printer_provider(service, Some(true), None, Some(vec!["lp0".into()])),
+            classify_printer_provider(
+                service,
+                Some(true),
+                Some(1),
+                Some(vec!["lp0".into(), "lp0".into()]),
+            ),
+            classify_printer_provider(
+                service,
+                Some(true),
+                Some(1),
+                Some(vec!["lp-secret".into()]),
+            ),
+        ];
+        for (readiness, queues, kernel, reason) in cases {
+            assert_eq!(readiness, PrinterReadiness::Unknown);
+            assert_eq!((queues, kernel), (0, 0));
+            assert!(!reason.contains("office-secret"));
+            assert!(!reason.contains("lp-secret"));
+        }
+    }
+
+    #[test]
+    fn printer_provider_distinguishes_ready_disconnected_and_disabled() {
+        let active = Some(CupsServiceFact {
+            loaded: true,
+            enabled: true,
+            active: true,
+        });
+        assert_eq!(
+            classify_printer_provider(active, Some(true), Some(1), Some(vec![])).0,
+            PrinterReadiness::Ready
+        );
+        assert_eq!(
+            classify_printer_provider(active, Some(true), Some(0), Some(vec!["lp0".into()])).0,
+            PrinterReadiness::Disconnected
+        );
+        assert_eq!(
+            classify_printer_provider(
+                Some(CupsServiceFact {
+                    loaded: false,
+                    enabled: false,
+                    active: false,
+                }),
+                Some(false),
+                Some(0),
+                Some(vec![]),
+            )
+            .0,
+            PrinterReadiness::Disabled
+        );
+    }
 
     struct LateBusFactory {
         root: PathBuf,
