@@ -122,6 +122,12 @@ pub struct MotionSpec {
 }
 
 impl MotionSpec {
+    /// Hard upper bound for any caller-supplied transition. Besides keeping
+    /// interaction feedback responsive, this is the render-policy boundary
+    /// that prevents a bespoke or corrupted spec from holding the event-driven
+    /// DRM runner in a repaint loop indefinitely.
+    pub const MAX_DURATION_SECS: f32 = 1.0;
+
     /// Build a concrete motion spec.
     #[must_use]
     pub const fn new(
@@ -189,12 +195,16 @@ impl MotionSpec {
     /// Duration in seconds for a runtime mode.
     #[must_use]
     pub const fn duration_for(self, mode: MotionMode) -> f32 {
-        match mode {
+        let duration = match mode {
             MotionMode::Normal => self.normal_secs,
             MotionMode::Reduced => self.reduced_secs,
             MotionMode::Disabled => 0.0,
+        };
+        if duration.is_finite() && duration > 0.0 {
+            duration.min(Self::MAX_DURATION_SECS)
+        } else {
+            0.0
         }
-        .max(0.0)
     }
 
     /// Eased progress for `elapsed` seconds in `mode`.
@@ -1491,6 +1501,47 @@ mod tests {
         value.advance(100.0, zero, MotionMode::Normal, 0.0);
         assert_eq!(value.value(), 100.0);
         assert!(value.is_settled());
+    }
+
+    #[test]
+    fn hostile_motion_durations_cannot_hold_the_renderer_awake() {
+        for duration in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            let spec = MotionSpec::new(
+                MotionPreset::Page,
+                duration,
+                duration,
+                MotionEasing::SmoothStep,
+                None,
+            );
+            for mode in [MotionMode::Normal, MotionMode::Reduced] {
+                let mut value = AnimatedScalar::settled(0.0);
+                value.advance(100.0, spec, mode, 1.0 / 60.0);
+                assert_eq!(value.value(), 100.0, "{mode:?} did not fail closed");
+                assert!(value.is_settled(), "{mode:?} retained repaint authority");
+            }
+        }
+
+        let spec = MotionSpec::new(
+            MotionPreset::Page,
+            f32::MAX,
+            f32::MAX,
+            MotionEasing::Linear,
+            None,
+        );
+        assert_eq!(
+            spec.duration_for(MotionMode::Normal),
+            MotionSpec::MAX_DURATION_SECS,
+            "finite caller timing must remain bounded by shared render policy"
+        );
+        let mut value = AnimatedScalar::settled(0.0);
+        for _ in 0..31 {
+            value.advance(100.0, spec, MotionMode::Normal, 1.0 / 30.0);
+        }
+        assert_eq!(value.value(), 100.0);
+        assert!(
+            value.is_settled(),
+            "bounded timeline must release repaint authority"
+        );
     }
 
     #[test]
