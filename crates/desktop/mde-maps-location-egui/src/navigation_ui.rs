@@ -74,6 +74,8 @@ enum NavigationIntent {
     RequestRoute {
         origin: RouteEndpoint,
         destination: RouteEndpoint,
+        kind: RouteRequestKind,
+        replaces_route_id: Option<String>,
     },
     Cancel,
 }
@@ -119,9 +121,17 @@ impl Default for NavigationConsumer {
 impl NavigationConsumer {
     /// Queue a route intent from already-admitted model data. No clock or I/O.
     pub fn request_route(&mut self, origin: RouteEndpoint, destination: RouteEndpoint) {
+        let replaces_route_id = self.route.as_ref().map(|route| route.route_id.clone());
+        let kind = if replaces_route_id.is_some() {
+            RouteRequestKind::Reroute
+        } else {
+            RouteRequestKind::Route
+        };
         self.intent = Some(NavigationIntent::RequestRoute {
             origin,
             destination,
+            kind,
+            replaces_route_id,
         });
         self.wire_action = None;
         // A replacement destination invalidates the prior route immediately.
@@ -164,6 +174,8 @@ impl NavigationConsumer {
             NavigationIntent::RequestRoute {
                 origin,
                 destination,
+                kind,
+                replaces_route_id,
             } => {
                 let request = RouteRequest {
                     schema_version: NAVIGATION_SCHEMA_VERSION,
@@ -171,8 +183,8 @@ impl NavigationConsumer {
                     host: host.to_string(),
                     expected_generation: self.generation,
                     issued_at_ms: now_ms,
-                    kind: RouteRequestKind::Route,
-                    replaces_route_id: None,
+                    kind: *kind,
+                    replaces_route_id: replaces_route_id.clone(),
                     profile: RouteProfile::Car,
                     origin: origin.clone(),
                     destination: destination.clone(),
@@ -443,6 +455,8 @@ mod tests {
         let action = state.prepare_action("seat-1", NOW + 1).unwrap();
         let request = RouteRequest::from_json_at(action.body.as_bytes(), NOW + 1).unwrap();
         assert_eq!(request.expected_generation, 4);
+        assert_eq!(request.kind, RouteRequestKind::Reroute);
+        assert_eq!(request.replaces_route_id.as_deref(), Some("route-1"));
         assert_eq!(request.destination.label, "New stop");
     }
 
