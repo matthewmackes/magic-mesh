@@ -26,6 +26,12 @@ exit "${FAKE_VERIFIER_RC:-0}"
 EOF
   chmod 0755 "$fixture/$verifier"
 done
+cat >"$fixture/maps-verifier" <<'EOF'
+#!/usr/bin/env bash
+[[ ${FAKE_VERIFIER_RC:-0} -eq 0 ]] || exit "${FAKE_VERIFIER_RC}"
+[[ -f ${1:?}/manifest.json && -f $1/catalog.json && -f $1/payload/index.json ]]
+EOF
+chmod 0755 "$fixture/maps-verifier"
 cat >"$fixture/cuttlefish" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -86,6 +92,38 @@ printf 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n'
 EOF
 chmod 0755 "$fixture/bin/gpg"
 touch "$fixture/receipt" "$fixture/key" "$fixture/signature" "$fixture/relay" "$fixture/agent" "$fixture/signing-receipt.json"
+mkdir "$fixture/maps-tiles"
+printf 'governed release tile\n' >"$fixture/maps-tiles/tile.bin"
+chmod 0444 "$fixture/maps-tiles/tile.bin"
+tile_sha=$(sha256sum "$fixture/maps-tiles/tile.bin" | cut -d' ' -f1)
+python3 - "$fixture/maps-approval.json" "$source_revision" "$source_epoch" "$tile_sha" <<'PY'
+import json
+import sys
+
+path, revision, epoch, tile_sha = sys.argv[1:]
+approval = {
+    "schema": 1,
+    "provider": "openstreetmap-derived",
+    "attribution": "© OpenStreetMap contributors",
+    "license": "ODbL-1.0",
+    "source_revision": revision,
+    "source_epoch": int(epoch),
+    "quota_bytes": 1024,
+    "regions": [{
+        "region_id": "release-fixture",
+        "revision": "2026.08",
+        "bounds": {"west": -96.0, "south": 29.0, "east": -93.0, "north": 34.0},
+        "min_zoom": 1,
+        "max_zoom": 1,
+        "expires_at_ms": (int(epoch) + 31_536_000) * 1000,
+        "tiles": [{"z": 1, "x": 0, "y": 0, "source": "tile.bin", "sha256": tile_sha}],
+    }],
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(approval, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+chmod 0444 "$fixture/maps-approval.json"
 mkdir "$fixture/guest-debs-input"
 touch "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
 touch "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
@@ -132,6 +170,10 @@ with open(path, "w", encoding="ascii") as stream:
 PY
 
 args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
+  --maps-approval "$fixture/maps-approval.json"
+  --maps-tile-source-root "$fixture/maps-tiles"
+  --maps-quota-bytes 1024
+  --maps-verifier "$fixture/maps-verifier"
   --app-vm-catalog-trust-receipt "$fixture/receipt" --app-vm-catalog-trust-key "$fixture/key"
   --cuttlefish-declaration "$fixture/declaration" --cuttlefish-signature "$fixture/signature"
   --cuttlefish-readiness-relay "$fixture/relay" --cuttlefish-vdi-agent "$fixture/agent"
@@ -170,6 +212,47 @@ run_release "${args[@]}"
 [[ -e "$fixture/guest-debs-verified" ]] || { echo 'preflight self-test: deterministic guest DEB verifier was not invoked' >&2; exit 1; }
 echo 'release-input-preflight: bootc receipt integration PASS (revision, epoch, architecture, role, and image reference matched)'
 rm -f "$marker"
+
+missing_maps=()
+for ((index = 0; index < ${#args[@]}; index++)); do
+  if [[ ${args[index]} == --maps-approval ]]; then
+    index=$((index + 1))
+    continue
+  fi
+  missing_maps+=("${args[index]}")
+done
+if run_release "${missing_maps[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: missing Maps approval reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: missing Maps input mutated build state' >&2; exit 1; }
+
+chmod 0644 "$fixture/maps-approval.json"
+python3 - "$fixture/maps-approval.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["source_revision"] = "f" * 40
+json.dump(value, open(path, "w", encoding="utf-8"), sort_keys=True, separators=(",", ":"))
+PY
+chmod 0444 "$fixture/maps-approval.json"
+if run_release "${args[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: wrong-revision Maps approval reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: wrong-revision Maps approval mutated build state' >&2; exit 1; }
+chmod 0644 "$fixture/maps-approval.json"
+sed -i "s/ffffffffffffffffffffffffffffffffffffffff/$source_revision/" "$fixture/maps-approval.json"
+chmod 0444 "$fixture/maps-approval.json"
+
+chmod 0644 "$fixture/maps-tiles/tile.bin"
+printf 'substituted release tile\n' >"$fixture/maps-tiles/tile.bin"
+chmod 0444 "$fixture/maps-tiles/tile.bin"
+if run_release "${args[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: substituted Maps tile reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: substituted Maps tile mutated build state' >&2; exit 1; }
+chmod 0644 "$fixture/maps-tiles/tile.bin"
+printf 'governed release tile\n' >"$fixture/maps-tiles/tile.bin"
+chmod 0444 "$fixture/maps-tiles/tile.bin"
 
 missing_deb=()
 for ((index = 0; index < ${#args[@]}; index++)); do

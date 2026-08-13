@@ -463,7 +463,9 @@ payload_compress = "xz"
 # correct taskbar/health presentation truth.
 # -32 (2026-08-10): admit RDP-only Windows discovery, enforce one kernel-leased
 # owner per grouped worker process, and revoke stale terminal Display1 leases.
-release = "34"
+# -35 (2026-08-13): ship the governed offline Maps producer, materializer, and
+# production verifier in Workstation and Server release payloads.
+release = "35"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -504,8 +506,12 @@ assets = [
     { source = "packaging/systemd/mde-remote-proofing-plan.service", dest = "/usr/lib/systemd/system/mde-remote-proofing-plan.service", mode = "644" },
     { source = "packaging/systemd/mde-remote-proofing-plan.path", dest = "/usr/lib/systemd/system/mde-remote-proofing-plan.path", mode = "644" },
     # Maps — install operator-provided offline MBTiles/gazetteer bundles into
-    # the persistent map-data root the shell reads (`/var/lib/mde/maps`).
+    # the persistent map-data root the shell reads (`/var/lib/mde/maps`), and
+    # carry the governed first-release producer/materializer/verifier boundary.
     { source = "install-helpers/install-offline-map-region.sh", dest = "/usr/libexec/mackesd/install-offline-map-region", mode = "755" },
+    { source = "packaging/maps/produce-offline-catalog.py", dest = "/usr/libexec/mackesd/produce-offline-map-catalog", mode = "755" },
+    { source = "packaging/maps/materialize-offline-catalog.py", dest = "/usr/libexec/mackesd/materialize-offline-map-catalog", mode = "755" },
+    { source = "target/release/verify-offline-map-catalog", dest = "/usr/libexec/mackesd/verify-offline-map-catalog", mode = "755" },
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four Cosmic-era GUIs that
@@ -1563,6 +1569,11 @@ assets = [
     { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
     { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
+    # WL-FUNC-017 — headless release assembly owns the same governed offline
+    # Maps producer/materializer boundary as the Workstation package.
+    { source = "packaging/maps/produce-offline-catalog.py", dest = "/usr/libexec/mackesd/produce-offline-map-catalog", mode = "755" },
+    { source = "packaging/maps/materialize-offline-catalog.py", dest = "/usr/libexec/mackesd/materialize-offline-map-catalog", mode = "755" },
+    { source = "target/release/verify-offline-map-catalog", dest = "/usr/libexec/mackesd/verify-offline-map-catalog", mode = "755" },
     # WL-ARCH-009 — six independently supervised daemon process groups.
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
     { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },

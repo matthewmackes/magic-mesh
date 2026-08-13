@@ -35,6 +35,7 @@
 #   install-helpers/verify-rpm-payload.sh requirements            # pin source metadata for base VDI-host hard Requires
 #   install-helpers/verify-rpm-payload.sh requirements a.rpm      # also inspect a built RPM's actual Requires header
 #   install-helpers/verify-rpm-payload.sh music-package           # Music payload + fresh-install activation contract
+#   install-helpers/verify-rpm-payload.sh maps-package [a.rpm]    # governed offline Maps release payload
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
 #   install-helpers/verify-rpm-payload.sh candidate-payload # credential payload in base + lighthouse candidates
 #   install-helpers/verify-rpm-payload.sh app-vm-payload [a.rpm] # exact App VM guest bootstrap payload
@@ -159,6 +160,11 @@ readonly BUILT_RPM_KVM_REQUIRES=(
 )
 readonly SERVER_WORKLOAD_REQUIRES=("podman")
 readonly MAPS_WEATHER_REQUIRES=("ca-certificates")
+readonly MAPS_PACKAGE_ASSETS=(
+  "packaging/maps/produce-offline-catalog.py|/usr/libexec/mackesd/produce-offline-map-catalog"
+  "packaging/maps/materialize-offline-catalog.py|/usr/libexec/mackesd/materialize-offline-map-catalog"
+  "target/release/verify-offline-map-catalog|/usr/libexec/mackesd/verify-offline-map-catalog"
+)
 readonly APP_VM_BOOTSTRAP_SOURCE="infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 readonly APP_VM_BOOTSTRAP_DEST="/usr/share/mde/iac/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 readonly APP_VM_BOOTSTRAP_MARKERS=(
@@ -218,6 +224,9 @@ readonly BROWSER_VM_RUNTIME_MARKERS=(
   "User=mcnf-browser"
   "Restart=on-failure"
 )
+# These are literal shell fragments required in build-image.sh; variable
+# expansion here would destroy the contract being searched for.
+# shellcheck disable=SC2016
 readonly BROWSER_VM_BOOTSTRAP_MARKERS=(
   '"$DIR/verify-image.sh" "$IMAGE"'
   '"$MANIFEST_VERIFY" create'
@@ -472,6 +481,66 @@ check_vdi_host_requires() {
   done
 }
 
+# WL-FUNC-017 — extend the existing Maps package boundary beyond HTTPS trust:
+# both release-capable RPM roles own the exact governed producer, materializer,
+# and production verifier. Tile payloads remain release inputs and are
+# deliberately absent from source and RPM manifests.
+check_maps_package() {
+  local rpm="${1:-}" pair member install_path label parser source dest covered listing=""
+  hdr "Maps offline release boundary — exact package payload"
+  for pair in "${MAPS_PACKAGE_ASSETS[@]}"; do
+    member="${pair%%|*}"
+    install_path="${pair#*|}"
+    if [[ "$member" == target/release/* || -f "$REPO_ROOT/$member" ]]; then
+      ok "maps source    $member"
+    else
+      fail "maps source    $member MISSING"
+    fi
+    for label in base server; do
+      case "$label" in base) parser=parse_assets ;; server) parser=parse_server_assets ;; esac
+      covered=0
+      while IFS=$'\t' read -r source dest; do
+        [[ "$source" == "$member" && "$dest" == "$install_path" ]] && covered=1
+      done < <($parser "$CARGO_TOML")
+      if ((covered)); then
+        ok "maps $label manifest $member -> $install_path"
+      else
+        fail "maps $label manifest does not cover $member at $install_path"
+      fi
+    done
+  done
+  local manifest forbidden=0
+  for manifest in "$REPO_ROOT"/**/Cargo.toml; do
+    if grep -Eq 'source[[:space:]]*=[[:space:]]*"[^\"]*\.(mbtiles|pbf|tile)"' \
+        "$manifest"; then
+      forbidden=1
+      break
+    fi
+  done
+  if ((forbidden)); then
+    fail "maps arbitrary tile bytes are referenced by an RPM asset manifest"
+  else
+    ok "maps arbitrary tile bytes remain outside Git/RPM manifests"
+  fi
+  [[ -n "$rpm" ]] || return
+  if [[ -z "${MCNF_FAKE_RPM_LIST:-}" && ! -f "$rpm" ]]; then
+    fail "maps RPM not found: $rpm"
+    return
+  fi
+  if ! listing="$(rpm_file_list "$rpm")"; then
+    fail "maps could not read file list from $rpm"
+    return
+  fi
+  for pair in "${MAPS_PACKAGE_ASSETS[@]}"; do
+    install_path="${pair#*|}"
+    if grep -Fxq "$install_path" <<<"$listing"; then
+      ok "maps payload   $install_path present in rpm -qlp"
+    else
+      fail "maps payload   $install_path MISSING from the RPM payload"
+    fi
+  done
+}
+
 # WL-FUNC-018 — the App VM guest runtime is bootstrapped from one cloud-init
 # template. The generate-rpm manifest deliberately ships the cloud-init
 # directory through a glob, but a generic "destination has at least one file"
@@ -489,6 +558,9 @@ check_app_vm_payload() {
 
   while IFS=$'\t' read -r source dest; do
     [ -n "$source" ] || continue
+    # Asset sources may be cargo-generate-rpm globs; pattern matching is
+    # intentional here and canonical destination checks remain exact.
+    # shellcheck disable=SC2053
     if [[ "$APP_VM_BOOTSTRAP_SOURCE" == $source ]]; then
       case "$dest" in
         */) [ "${dest}${APP_VM_BOOTSTRAP_SOURCE##*/}" = "$APP_VM_BOOTSTRAP_DEST" ] && covered=1 ;;
@@ -639,24 +711,32 @@ check_browser_vm_payload() {
   done
 
   for marker in "${BROWSER_VM_IMAGE_MARKERS[@]}"; do
-    grep -Fq -- "$marker" "$REPO_ROOT/packaging/browser-vm/Containerfile" \
-      && ok "browser image $marker" \
-      || fail "browser image marker MISSING: $marker"
+    if grep -Fq -- "$marker" "$REPO_ROOT/packaging/browser-vm/Containerfile"; then
+      ok "browser image $marker"
+    else
+      fail "browser image marker MISSING: $marker"
+    fi
   done
   for marker in "${BROWSER_VM_PROFILE_MARKERS[@]}"; do
-    grep -Fqx -- "$marker" "$REPO_ROOT/packaging/browser-vm/profile.env" \
-      && ok "browser profile $marker" \
-      || fail "browser profile marker MISSING: $marker"
+    if grep -Fqx -- "$marker" "$REPO_ROOT/packaging/browser-vm/profile.env"; then
+      ok "browser profile $marker"
+    else
+      fail "browser profile marker MISSING: $marker"
+    fi
   done
   for marker in "${BROWSER_VM_RUNTIME_MARKERS[@]}"; do
-    grep -Fqx -- "$marker" "$REPO_ROOT/packaging/browser-vm/mcnf-browser-vm-runtime.service" \
-      && ok "browser runtime $marker" \
-      || fail "browser runtime marker MISSING: $marker"
+    if grep -Fqx -- "$marker" "$REPO_ROOT/packaging/browser-vm/mcnf-browser-vm-runtime.service"; then
+      ok "browser runtime $marker"
+    else
+      fail "browser runtime marker MISSING: $marker"
+    fi
   done
   for marker in "${BROWSER_VM_BOOTSTRAP_MARKERS[@]}"; do
-    grep -Fq -- "$marker" "$REPO_ROOT/packaging/browser-vm/build-image.sh" \
-      && ok "browser bootstrap $marker" \
-      || fail "browser bootstrap marker MISSING: $marker"
+    if grep -Fq -- "$marker" "$REPO_ROOT/packaging/browser-vm/build-image.sh"; then
+      ok "browser bootstrap $marker"
+    else
+      fail "browser bootstrap marker MISSING: $marker"
+    fi
   done
 
   for pair in "${BROWSER_VM_PAYLOAD_MEMBERS[@]}"; do
@@ -1460,6 +1540,24 @@ LISTING
     fail "self-test: missing Browser VM bootstrap escaped exact RPM verification"; st_fail=1
   fi
 
+  # An RPM containing generic Maps support is not the governed offline release
+  # boundary. Preserve the producer and materializer while omitting only the
+  # production verifier; the exact Maps payload gate must still reject it.
+  local maps_missing_verifier="$tmp/maps-missing-verifier-list"
+  cat >"$maps_missing_verifier" <<'LISTING'
+/usr/libexec/mackesd/produce-offline-map-catalog
+/usr/libexec/mackesd/materialize-offline-map-catalog
+/usr/libexec/mackesd/install-offline-map-region
+LISTING
+  out="$(MCNF_FAKE_RPM_LIST="$maps_missing_verifier" \
+      bash "$0" maps-package "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "/usr/libexec/mackesd/verify-offline-map-catalog MISSING" <<<"$out"; then
+    ok "self-test: generic Maps payload cannot hide a missing production verifier"
+  else
+    fail "self-test: missing Maps production verifier escaped exact RPM verification"; st_fail=1
+  fi
+
   # ---- fixture B: a SYNTHETICALLY-BROKEN manifest ---------------------------
   # Drops the shell key-bin, adds a bin nothing builds, adds a missing file.
   local bad="$tmp/bad.toml"
@@ -1601,6 +1699,7 @@ main() {
     grouped-process) check_grouped_mackesd_assets ;;
     candidate-payload) check_candidate_credential_assets ;;
     music-package) check_music_package ;;
+    maps-package) shift; check_maps_package "${1:-}" ;;
     app-vm-payload) shift; check_app_vm_payload "${1:-}" ;;
     android-vm-payload) shift; check_android_vm_payload "${1:-}" ;;
     browser-vm-payload) shift; check_browser_vm_payload "${1:-}" ;;

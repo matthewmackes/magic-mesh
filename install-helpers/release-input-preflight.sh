@@ -13,6 +13,8 @@ RPM_SIGNING_RECEIPT="${MCNF_RPM_SIGNING_RECEIPT_INSPECTOR:-$ROOT/install-helpers
 BOOTC_DIGEST_RECEIPT="${MCNF_BOOTC_DIGEST_RECEIPT_INSPECTOR:-$ROOT/install-helpers/produce-bootc-digest-receipt.py}"
 CUTTLEFISH_IMAGE_RECEIPT="${MCNF_CUTTLEFISH_IMAGE_RECEIPT_INSPECTOR:-$ROOT/packaging/android/produce-image-receipt.py}"
 CUTTLEFISH_IMAGE_REPO="${MCNF_CUTTLEFISH_IMAGE_REPO:-$ROOT}"
+MAPS_PRODUCER="${MCNF_MAPS_PRODUCER:-$ROOT/packaging/maps/produce-offline-catalog.py}"
+MAPS_MATERIALIZER="${MCNF_MAPS_MATERIALIZER:-$ROOT/packaging/maps/materialize-offline-catalog.py}"
 
 die() { printf 'release-input-preflight: REFUSED: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${2:-}" ]] || die "missing mandatory input: $1"; }
@@ -22,6 +24,7 @@ digest() {
 }
 
 source_revision='' source_epoch='' app_receipt='' app_key=''
+maps_approval='' maps_source_root='' maps_quota='' maps_verifier=''
 cuttlefish_declaration='' cuttlefish_signature='' cuttlefish_relay='' cuttlefish_agent=''
 rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
 app_vm_base_digest='' cuttlefish_image_receipt='' cuttlefish_image_source_kind=''
@@ -34,6 +37,10 @@ while (($#)); do
   case "$1" in
     --source-revision) source_revision=${2:-}; shift 2 ;;
     --source-epoch) source_epoch=${2:-}; shift 2 ;;
+    --maps-approval) maps_approval=${2:-}; shift 2 ;;
+    --maps-tile-source-root) maps_source_root=${2:-}; shift 2 ;;
+    --maps-quota-bytes) maps_quota=${2:-}; shift 2 ;;
+    --maps-verifier) maps_verifier=${2:-}; shift 2 ;;
     --app-vm-catalog-trust-receipt) app_receipt=${2:-}; shift 2 ;;
     --app-vm-catalog-trust-key) app_key=${2:-}; shift 2 ;;
     --cuttlefish-declaration) cuttlefish_declaration=${2:-}; shift 2 ;;
@@ -62,6 +69,8 @@ done
 
 for pair in \
   'source revision' "$source_revision" 'source epoch' "$source_epoch" \
+  'Maps approval' "$maps_approval" 'Maps tile source root' "$maps_source_root" \
+  'Maps quota bytes' "$maps_quota" 'Maps production verifier' "$maps_verifier" \
   'App VM catalog trust receipt' "$app_receipt" 'App VM catalog trust key' "$app_key" \
   'Cuttlefish declaration' "$cuttlefish_declaration" 'Cuttlefish signature' "$cuttlefish_signature" \
   'Cuttlefish readiness relay' "$cuttlefish_relay" 'Cuttlefish VDI agent' "$cuttlefish_agent" \
@@ -86,9 +95,32 @@ done
 trust_stage=$(mktemp -d)
 payload_parent=$(mktemp -d)
 deb_stage=$(mktemp -d)
+maps_stage=$(mktemp -d)
 image_identity=$(mktemp)
-cleanup() { rm -rf -- "$trust_stage" "$payload_parent" "$deb_stage"; rm -f -- "$image_identity"; }
+cleanup() {
+  # The Maps producer intentionally seals its bundle directories 0555. This is
+  # our private mktemp tree, so restore owner write permission solely to erase
+  # the preflight copy; approved source bytes are never modified.
+  chmod -R u+w -- "$maps_stage" 2>/dev/null || true
+  rm -rf -- "$trust_stage" "$payload_parent" "$deb_stage" "$maps_stage"
+  rm -f -- "$image_identity"
+}
 trap cleanup EXIT
+
+# WL-FUNC-017 — release engineering supplies an approval document plus its
+# immutable, content-addressed tile source outside Git. Reproduce the governed
+# bundle, then make the production Maps APIs admit a no-replace materialization
+# before any release build mutation. A caller-authored bundle cannot bypass the
+# producer.
+[[ "$maps_quota" =~ ^[1-9][0-9]*$ ]] || die 'Maps quota bytes must be a positive integer'
+python3 "$MAPS_PRODUCER" --approval "$maps_approval" \
+  --source-root "$maps_source_root" --output "$maps_stage/bundle" >/dev/null \
+  || die 'offline Maps approved bundle production failed'
+python3 "$MAPS_MATERIALIZER" --bundle "$maps_stage/bundle" \
+  --cache-root "$maps_stage/cache" --verifier "$maps_verifier" \
+  --source-revision "$source_revision" --source-epoch "$source_epoch" \
+  --quota-bytes "$maps_quota" >/dev/null \
+  || die 'offline Maps bundle admission/materialization failed'
 "$APP_TRUST_VERIFY" --receipt "$app_receipt" --key "$app_key" \
   --expected-source-revision "$source_revision" --stage-dir "$trust_stage" >/dev/null \
   || die 'App VM catalog trust admission failed'
