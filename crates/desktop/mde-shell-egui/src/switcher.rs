@@ -69,12 +69,14 @@ const SWITCHER_SCRIM: &str = "construct-switcher-scrim";
 /// rides egui memory exactly like the backdrop's wallpaper cache.
 const STATE_KEY: &str = "construct-switcher-state";
 
-/// Card width in logical points.
-const CARD_W: f32 = 256.0;
-/// Height of the label + glyph header band at the top of each card.
-const HEADER_H: f32 = 36.0;
+/// Card width on the shared spacing grid (eight extra-large steps).
+const CARD_W: f32 = Style::SP_XL * 8.0;
+/// Height of the label + glyph header band at the top of each card. The shared
+/// large-control rung gives the headline a full line plus vertical breathing
+/// room, including at the largest supported Construct text setting.
+const HEADER_H: f32 = Style::CONTROL_H_L;
 /// Height of the preview region under the header (16:10 of [`CARD_W`]).
-const PREVIEW_H: f32 = 160.0;
+const PREVIEW_H: f32 = CARD_W * 10.0 / 16.0;
 /// Preferred full card height. The grid compresses the preview region when a
 /// complete recents ring would otherwise extend below the viewport.
 const CARD_H: f32 = HEADER_H + PREVIEW_H;
@@ -86,11 +88,11 @@ const GRID_MARGIN: f32 = Style::SP_XL;
 /// removes the card from recents — the flick-up-to-close threshold.
 const FLICK_CLOSE_FRACTION: f32 = 0.30;
 /// Edge length of the big white plate glyph (the Q22 tile silhouette).
-const PLATE_GLYPH: f32 = 48.0;
+const PLATE_GLYPH: f32 = Style::ICON_XL + Style::SP_M;
 /// Edge length of the small header glyph beside the card label.
-const HEADER_GLYPH: f32 = 20.0;
+const HEADER_GLYPH: f32 = Style::ICON_M;
 /// Thickness of the current-surface accent bar on a card's bottom edge.
-const CURRENT_BAR_H: f32 = 3.0;
+const CURRENT_BAR_H: f32 = Style::FOCUS_RING_W + 1.0;
 
 /// The launcher-group accent for `surface` off the ONE shared taxonomy table
 /// (`dock::LAUNCHER_GROUPS`) — the plate's Q22 accent source. (The dock's own
@@ -1297,6 +1299,50 @@ mod tests {
         // One card sits dead-centre horizontally.
         let (_, rects) = grid_layout(screen, 1);
         assert!((rects[0].center().x - screen.center().x).abs() < 0.5);
+    }
+
+    #[test]
+    fn shared_style_palette_and_zoomed_compact_layout_remain_legible() {
+        use mde_egui::{Density, StyleColorScheme};
+
+        let (ctx, mut construct) = open_switcher();
+        let (_, dark) = frame(&ctx, &mut construct, Surface::Files, true, Vec::new());
+        let dark_fills = painted_fills(&dark.shapes);
+        assert!(
+            dark_fills.contains(&Style::resolve_color(&ctx, Style::SURFACE))
+                || dark_fills.contains(&Style::resolve_color(&ctx, Style::SURFACE_HI)),
+            "dark cards must use the active shared surface palette: {dark_fills:?}"
+        );
+
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let (_, light) = frame(&ctx, &mut construct, Surface::Files, true, Vec::new());
+        let light_fills = painted_fills(&light.shapes);
+        assert!(
+            light_fills.contains(&Style::resolve_color(&ctx, Style::SURFACE))
+                || light_fills.contains(&Style::resolve_color(&ctx, Style::SURFACE_HI)),
+            "light cards must resolve through the shared Quazar palette: {light_fills:?}"
+        );
+        assert_ne!(
+            dark_fills, light_fills,
+            "appearance must change rendered paint"
+        );
+
+        // A 2x text/zoom setting turns the 1280x800 fixture into an effective
+        // 640x400 logical viewport. The responsive grid must still keep every
+        // real card on-screen and produce paint instead of clipping away.
+        ctx.set_zoom_factor(2.0);
+        construct.switcher_open = true;
+        let (_, enlarged) = frame(&ctx, &mut construct, Surface::Files, true, Vec::new());
+        let effective_screen = ctx.screen_rect();
+        let (_, rects) = grid_layout(effective_screen, state_of(&ctx).ring.len());
+        assert!(rects
+            .iter()
+            .all(|rect| effective_screen.contains_rect(*rect)));
+        assert!(
+            !ctx.tessellate(enlarged.shapes, enlarged.pixels_per_point)
+                .is_empty(),
+            "largest-text compact rendering must retain real card geometry"
+        );
     }
 
     #[test]
