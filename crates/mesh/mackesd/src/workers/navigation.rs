@@ -7,16 +7,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use mackes_mesh_types::navigation::{
-    CancelNavigationRequest, NAVIGATION_SCHEMA_VERSION, NavigationPhase, NavigationProgress,
-    NavigationProgressRequest, NavigationSnapshot, NavigationUnavailableReason, RouteRequest,
-    RouteRequestKind, RouteResult, navigation_cancel_action_topic,
-    navigation_progress_action_topic, navigation_route_action_topic, navigation_state_topic,
+    navigation_cancel_action_topic, navigation_progress_action_topic,
+    navigation_route_action_topic, navigation_state_topic, CancelNavigationRequest,
+    NavigationPhase, NavigationProgress, NavigationProgressRequest, NavigationSnapshot,
+    NavigationUnavailableReason, RouteRequest, RouteRequestKind, RouteResult,
+    NAVIGATION_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
@@ -807,8 +808,7 @@ impl NavigationWorker {
             NavigationPhase::Active { route, progress } => {
                 request.route_id == route.route_id
                     && request.progress.observed_at_ms >= progress.observed_at_ms
-                    && now_ms.saturating_sub(request.progress.observed_at_ms)
-                        <= MAX_ACTION_AGE_MS
+                    && now_ms.saturating_sub(request.progress.observed_at_ms) <= MAX_ACTION_AGE_MS
                     && request.progress.validate_for(route, now_ms).is_ok()
             }
             _ => false,
@@ -977,11 +977,33 @@ fn next_bus_retry(current: Duration) -> Duration {
 }
 
 fn load_record(path: &Path) -> io::Result<Option<PersistedNavigation>> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_PERSISTED_BYTES as u64
+    {
+        return Err(io_invalid_data(
+            "navigation state is not a bounded unaliased regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(0o400_000 | 0o2_000_000); // O_NOFOLLOW | O_CLOEXEC
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.nlink() != 1
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+    {
+        return Err(io_invalid_data(
+            "navigation state changed during secure open",
+        ));
+    }
     let mut body = Vec::new();
     std::io::Read::by_ref(&mut file)
         .take((MAX_PERSISTED_BYTES + 1) as u64)
@@ -1432,7 +1454,13 @@ mod tests {
         );
         fixture.worker.tick_once().unwrap();
         assert_eq!(
-            fixture.worker.authority.as_ref().unwrap().snapshot.generation,
+            fixture
+                .worker
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .generation,
             1,
             "stale progress must not advance navigation authority"
         );
@@ -1527,6 +1555,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn restart_rejects_aliased_navigation_checkpoint() {
+        let mut fixture = Fixture::new(Arc::new(FixtureProvider));
+        fixture.worker.ensure_loaded().unwrap();
+        fixture.worker.authority = None;
+        let checkpoint = fixture.worker.state_path.clone();
+        let parent = checkpoint.parent().unwrap();
+
+        let symlink = parent.join("navigation-symlink.json");
+        std::os::unix::fs::symlink(&checkpoint, &symlink).unwrap();
+        fixture.worker.state_path = symlink;
+        assert!(fixture.worker.ensure_loaded().is_err());
+        assert!(fixture.worker.authority.is_none());
+
+        let hardlink = parent.join("navigation-hardlink.json");
+        fs::hard_link(checkpoint, &hardlink).unwrap();
+        fixture.worker.state_path = hardlink;
+        assert!(fixture.worker.ensure_loaded().is_err());
+        assert!(fixture.worker.authority.is_none());
     }
 
     #[test]
@@ -1634,13 +1683,11 @@ mod tests {
         assert_eq!(after.progress_cursor, before.progress_cursor);
         assert_eq!(after.cancel_cursor, before.cancel_cursor);
         assert_eq!(after.seen_request_ids, before.seen_request_ids);
-        assert!(
-            load_record(&fixture.worker.state_path)
-                .unwrap()
-                .unwrap()
-                .route_cursor
-                .is_none()
-        );
+        assert!(load_record(&fixture.worker.state_path)
+            .unwrap()
+            .unwrap()
+            .route_cursor
+            .is_none());
     }
 
     #[tokio::test]
