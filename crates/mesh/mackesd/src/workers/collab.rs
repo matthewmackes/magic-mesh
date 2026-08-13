@@ -365,6 +365,7 @@ impl CollabWorker {
     fn tick_once(&self, persist: &Persist, state: &mut CollabState, now_ms: i64) {
         let mut touched = std::mem::take(&mut state.pending_file_projection_spaces);
         let mut changed = false;
+        self.drain_inbound_sip_call(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_call_provider_revocations(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_commands(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_inbound(persist, state, &mut touched, &mut changed);
@@ -378,6 +379,74 @@ impl CollabWorker {
         self.drain_alert_lanes(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_clipboard_captures(persist, state, now_ms, &mut touched, &mut changed);
         self.publish_read_models(persist, state, &touched, changed);
+    }
+
+    /// Admit a provider-observed inbound SIP dialog into exactly one existing
+    /// signed Collaboration space. The provider identity is untrusted until it
+    /// normalizes to one current member alongside this node. The worker mints
+    /// the sole opaque CallId and authors the sole CallStarted event; the SIP
+    /// adapter only binds its exact still-pending dialog to that authority.
+    fn drain_inbound_sip_call(
+        &self,
+        persist: &Persist,
+        state: &mut CollabState,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) {
+        let Some(offer) = self.call_media_providers.pending_inbound_sip_call() else {
+            return;
+        };
+        let space = match admit_inbound_sip_identity(state.engine.state(), &self.self_actor, &offer)
+        {
+            Ok(space) => space,
+            Err(reason) => {
+                let _ = self
+                    .call_media_providers
+                    .bind_inbound_sip_call(&offer, None);
+                tracing::warn!(target: "mackesd::collab", reason, "inbound SIP identity refused");
+                return;
+            }
+        };
+        let call = mde_collab_types::CallId::new();
+        // This compare-and-consume is the stale-dialog boundary. A newer INVITE
+        // replacing the offer while membership was inspected cannot inherit the
+        // earlier identity's authority.
+        if !self
+            .call_media_providers
+            .bind_inbound_sip_call(&offer, Some(call))
+        {
+            tracing::warn!(target: "mackesd::collab", "inbound SIP dialog changed before authority binding");
+            return;
+        }
+        let signer = Ed25519Signer::new(self.signing_key.clone());
+        let command = CollabCommand::StartCall {
+            space,
+            call,
+            kind: mde_collab_types::CallKind::Audio,
+        };
+        let events = match state
+            .engine
+            .apply(&command, &signer, &mut state.ids, now_ms)
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(target: "mackesd::collab", %call, %error, "admitted inbound SIP call could not be authored");
+                return;
+            }
+        };
+        for env in &events {
+            match self.append_own(state, env) {
+                Ok(()) => {
+                    self.publish_event(persist, env);
+                    touched.insert(space);
+                    *changed = true;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::collab", %call, %error, "inbound SIP actor-log append failed; event not published")
+                }
+            }
+        }
     }
 
     fn drain_call_provider_revocations(
@@ -1268,6 +1337,78 @@ fn command_call_id(command: &CollabCommand) -> Option<mde_collab_types::CallId> 
         | CollabCommand::SetCallMuted { call, .. } => Some(*call),
         _ => None,
     }
+}
+
+fn admit_inbound_sip_identity(
+    domain: &mde_collab_core::DomainState,
+    local_actor: &ActorId,
+    offer: &super::collab_media::InboundCallOffer,
+) -> Result<SpaceId, &'static str> {
+    if offer.provider_call_id.is_empty()
+        || offer.provider_call_id.len() > 255
+        || offer
+            .provider_call_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("malformed provider call identity");
+    }
+    let identity = normalize_sip_identity(&offer.identity).ok_or("malformed SIP identity")?;
+    let mut matched = None;
+    for (space, aggregate) in &domain.spaces {
+        if aggregate.deleted
+            || !domain.is_member(*space, local_actor)
+            || !aggregate.members.iter().any(|(actor, member)| {
+                member.present
+                    && actor != local_actor
+                    && normalize_sip_identity(actor.as_str()).as_deref() == Some(identity.as_str())
+            })
+        {
+            continue;
+        }
+        if matched.replace(*space).is_some() {
+            return Err("ambiguous SIP identity authority");
+        }
+    }
+    matched.ok_or("SIP identity has no authorized Collaboration space")
+}
+
+/// Canonicalize the provider's identity into the same comparison form used for
+/// Collaboration actors. Display names, URI parameters, passwords, controls,
+/// and non-ASCII lookalikes are deliberately not accepted as authority.
+fn normalize_sip_identity(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if value.len() > 253 || value.is_empty() || !value.is_ascii() {
+        return None;
+    }
+    if value.starts_with('<') && value.ends_with('>') {
+        value = &value[1..value.len() - 1];
+    } else if value.contains(['<', '>']) {
+        return None;
+    }
+    if value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sip:"))
+    {
+        value = &value[4..];
+    } else if value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sips:"))
+    {
+        value = &value[5..];
+    }
+    if value.is_empty()
+        || value.contains([';', '?', ':'])
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+' | b'@'))
+        })
+        || value.starts_with('@')
+        || value.ends_with('@')
+        || value.matches('@').count() > 1
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
 }
 
 /// In-memory per-run worker state, carried across ticks.
@@ -2243,6 +2384,41 @@ mod tests {
         spaces[0]
     }
 
+    fn inbound_space(
+        domain: &mut mde_collab_core::DomainState,
+        local: &ActorId,
+        remote: &str,
+    ) -> SpaceId {
+        use mde_collab_core::domain::{MemberAgg, SpaceAgg};
+
+        let space = SpaceId::new();
+        domain.spaces.insert(
+            space,
+            SpaceAgg {
+                kind: SpaceKind::Direct,
+                name: "SIP direct".to_string(),
+                deleted: false,
+                members: BTreeMap::from([
+                    (
+                        local.clone(),
+                        MemberAgg {
+                            role: SpaceRole::Owner,
+                            present: true,
+                        },
+                    ),
+                    (
+                        ActorId::new(remote),
+                        MemberAgg {
+                            role: SpaceRole::Member,
+                            present: true,
+                        },
+                    ),
+                ]),
+            },
+        );
+        space
+    }
+
     // ── pure helpers ────────────────────────────────────────────────────
 
     #[test]
@@ -2309,6 +2485,50 @@ mod tests {
             COMMAND_VERBS.len(),
             43,
             "COMMAND_VERBS drifted from the taxonomy"
+        );
+    }
+
+    #[test]
+    fn inbound_sip_identity_admission_is_exact_unique_and_fail_closed() {
+        use super::super::collab_media::InboundCallOffer;
+
+        let local = ActorId::new("eagle");
+        let mut domain = mde_collab_core::DomainState::default();
+        let authorized = inbound_space(&mut domain, &local, "alice@example.com");
+        let offer = |identity: &str, provider_call_id: &str| InboundCallOffer {
+            identity: identity.to_string(),
+            provider_call_id: provider_call_id.to_string(),
+        };
+
+        assert_eq!(
+            admit_inbound_sip_identity(
+                &domain,
+                &local,
+                &offer("<SIP:Alice@Example.COM>", "dialog-1@example.com")
+            ),
+            Ok(authorized)
+        );
+        for hostile in [
+            offer("mallory@example.com", "dialog-2@example.com"),
+            offer("Alice <sip:alice@example.com>", "dialog-3@example.com"),
+            offer("sip:alice@example.com;user=phone", "dialog-4@example.com"),
+            offer("sip:alice@example.com", "stale dialog"),
+            offer("sip:alice@example.com", ""),
+        ] {
+            assert!(
+                admit_inbound_sip_identity(&domain, &local, &hostile).is_err(),
+                "hostile identity/dialog must not acquire call authority: {hostile:?}"
+            );
+        }
+
+        inbound_space(&mut domain, &local, "ALICE@EXAMPLE.COM");
+        assert_eq!(
+            admit_inbound_sip_identity(
+                &domain,
+                &local,
+                &offer("sip:alice@example.com", "dialog-5@example.com")
+            ),
+            Err("ambiguous SIP identity authority")
         );
     }
 

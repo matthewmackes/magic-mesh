@@ -54,6 +54,16 @@ struct SipGatewayProvider {
     health: Arc<Mutex<SipProviderHealth>>,
     active_call: Arc<Mutex<Option<mde_collab_types::CallId>>>,
     revoked_calls: Arc<Mutex<Vec<mde_collab_types::CallId>>>,
+    pending_inbound: Arc<Mutex<Option<InboundCallOffer>>>,
+}
+
+/// Provider-observed inbound dialog identity.  This is an untrusted offer, not
+/// call authority; the Collaboration worker must resolve it against signed
+/// membership and bind its exact provider dialog before authoring a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboundCallOffer {
+    pub(super) identity: String,
+    pub(super) provider_call_id: String,
 }
 
 impl SipGatewayProvider {
@@ -68,6 +78,8 @@ impl SipGatewayProvider {
         let monitor_active_call = Arc::clone(&active_call);
         let revoked_calls = Arc::new(Mutex::new(Vec::new()));
         let monitor_revoked_calls = Arc::clone(&revoked_calls);
+        let pending_inbound = Arc::new(Mutex::new(None));
+        let monitor_pending_inbound = Arc::clone(&pending_inbound);
         std::thread::Builder::new()
             .name("mcnf-collab-sip-agent".to_string())
             .spawn(move || {
@@ -86,18 +98,36 @@ impl SipGatewayProvider {
                             SipProviderHealth::Unavailable(bounded_health_detail(&detail))
                         }
                         AgentEvent::Registration(_) => SipProviderHealth::Starting,
-                        AgentEvent::Incoming { .. } | AgentEvent::Established => continue,
+                        AgentEvent::Incoming { from, call_id } => {
+                            if let Ok(mut pending) = monitor_pending_inbound.lock() {
+                                *pending = Some(InboundCallOffer {
+                                    identity: from,
+                                    provider_call_id: call_id,
+                                });
+                            }
+                            continue;
+                        }
+                        AgentEvent::Established => continue,
                         AgentEvent::RemoteHangup => {
+                            if let Ok(mut pending) = monitor_pending_inbound.lock() {
+                                pending.take();
+                            }
                             revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
                             continue;
                         }
                     };
                     if matches!(next, SipProviderHealth::Unavailable(_)) {
+                        if let Ok(mut pending) = monitor_pending_inbound.lock() {
+                            pending.take();
+                        }
                         revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
                     }
                     if let Ok(mut current) = monitor_health.lock() {
                         *current = next;
                     }
+                }
+                if let Ok(mut pending) = monitor_pending_inbound.lock() {
+                    pending.take();
                 }
                 revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
                 if let Ok(mut current) = monitor_health.lock() {
@@ -110,6 +140,7 @@ impl SipGatewayProvider {
             health,
             active_call,
             revoked_calls,
+            pending_inbound,
         })
     }
 
@@ -123,6 +154,7 @@ impl SipGatewayProvider {
             health: Arc::new(Mutex::new(health)),
             active_call: Arc::new(Mutex::new(None)),
             revoked_calls: Arc::new(Mutex::new(Vec::new())),
+            pending_inbound: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -313,6 +345,34 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             .lock()
             .map(|mut revoked| std::mem::take(&mut *revoked))
             .unwrap_or_default()
+    }
+
+    fn pending_inbound_call(&self) -> Option<InboundCallOffer> {
+        self.pending_inbound.lock().ok()?.clone()
+    }
+
+    fn bind_inbound_call(
+        &self,
+        offer: &InboundCallOffer,
+        call: Option<mde_collab_types::CallId>,
+    ) -> bool {
+        let Ok(mut pending) = self.pending_inbound.lock() else {
+            return false;
+        };
+        if pending.as_ref() != Some(offer) {
+            return false;
+        }
+        pending.take();
+        if let Some(call) = call {
+            let Ok(mut active) = self.active_call.lock() else {
+                return false;
+            };
+            if active.is_some() {
+                return false;
+            }
+            *active = Some(call);
+        }
+        true
     }
 }
 
@@ -687,6 +747,24 @@ pub(crate) trait CallMediaFrameVerifier: Send + Sync {
     fn take_revoked_calls(&self) -> Vec<mde_collab_types::CallId> {
         Vec::new()
     }
+
+    /// Return the currently ringing provider dialog without granting it any
+    /// Collaboration authority. Only the SIP adapter supplies this.
+    fn pending_inbound_call(&self) -> Option<InboundCallOffer> {
+        None
+    }
+
+    /// Consume exactly the offer previously returned by
+    /// [`Self::pending_inbound_call`]. A mismatch means the provider dialog was
+    /// replaced while signed-state admission was running and must fail stale.
+    /// `None` rejects an unauthorized offer without creating a call owner.
+    fn bind_inbound_call(
+        &self,
+        _offer: &InboundCallOffer,
+        _call: Option<mde_collab_types::CallId>,
+    ) -> bool {
+        false
+    }
 }
 
 /// One bounded in-process registration table for concrete call-media proof
@@ -841,6 +919,20 @@ impl CallMediaProviderRegistry {
             }
         }
         calls
+    }
+
+    pub(crate) fn pending_inbound_sip_call(&self) -> Option<InboundCallOffer> {
+        self.sip_gateway.as_deref()?.pending_inbound_call()
+    }
+
+    pub(crate) fn bind_inbound_sip_call(
+        &self,
+        offer: &InboundCallOffer,
+        call: Option<mde_collab_types::CallId>,
+    ) -> bool {
+        self.sip_gateway
+            .as_deref()
+            .is_some_and(|provider| provider.bind_inbound_call(offer, call))
     }
 
     fn provider_for_kind(
@@ -1242,6 +1334,31 @@ mod tests {
             unavailable,
             CallMediaProviderError::ProviderUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn inbound_sip_binding_rejects_replaced_and_replayed_dialogs() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let provider = SipGatewayProvider::with_channel(tx, SipProviderHealth::Ready);
+        let stale = InboundCallOffer {
+            identity: "alice@example.com".to_string(),
+            provider_call_id: "old@example.com".to_string(),
+        };
+        let current = InboundCallOffer {
+            identity: "bob@example.com".to_string(),
+            provider_call_id: "new@example.com".to_string(),
+        };
+        *provider.pending_inbound.lock().expect("pending lock") = Some(current.clone());
+
+        assert!(!provider.bind_inbound_call(&stale, Some(CallId::new())));
+        assert_eq!(provider.pending_inbound_call(), Some(current.clone()));
+        let call = CallId::new();
+        assert!(provider.bind_inbound_call(&current, Some(call)));
+        assert_eq!(
+            *provider.active_call.lock().expect("active lock"),
+            Some(call)
+        );
+        assert!(!provider.bind_inbound_call(&current, Some(CallId::new())));
     }
 
     fn empty_registry() -> CallMediaProviderRegistry {
