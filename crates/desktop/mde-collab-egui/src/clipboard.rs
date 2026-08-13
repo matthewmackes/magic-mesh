@@ -473,15 +473,45 @@ fn canonical_clip_source(source: &str) -> Option<&str> {
     .then_some(source)
 }
 
-/// Classify a clip's content: an `http(s)://` head is a shared URI, everything
-/// else is text (an honest, conservative guess — never a faked MIME).
+/// Classify a clip's content. Only a complete HTTP(S) URI with a non-empty
+/// authority receives URI attribution; prose that merely starts with a scheme,
+/// malformed links, and control-bearing values remain honest plain text.
 fn detect_kind(text: &str) -> ClipItemKind {
-    let t = text.trim_start();
-    if t.starts_with("http://") || t.starts_with("https://") {
+    if is_shared_http_uri(text) {
         ClipItemKind::Uri
     } else {
         ClipItemKind::Text
     }
+}
+
+/// Validate the small URI surface represented by [`ClipItemKind::Uri`] without
+/// turning clipboard admission into URL resolution. The exact clipboard bytes
+/// remain untouched; this seam only controls their typed presentation.
+fn is_shared_http_uri(text: &str) -> bool {
+    let candidate = text.trim();
+    if candidate.is_empty()
+        || candidate
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return false;
+    }
+
+    let Some(remainder) = candidate
+        .strip_prefix("https://")
+        .or_else(|| candidate.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = remainder
+        .split_once(['/', '?', '#'])
+        .map_or(remainder, |(authority, _)| authority);
+
+    !authority.is_empty()
+        && authority != "."
+        && authority != ".."
+        && !authority.starts_with('.')
+        && !authority.ends_with('.')
 }
 
 /// A single-line, capped preview of clip content (the row shows a recognisable
@@ -499,8 +529,9 @@ fn clip_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_clip_source, clip_fits_lane, clip_preview, clipboard_origin, ClipboardOrigin,
-        VdiClipboardCapability, MAX_CLIP_BYTES, MAX_CLIP_SOURCE_BYTES, PREVIEW_MAX,
+        canonical_clip_source, clip_fits_lane, clip_preview, clipboard_origin, detect_kind,
+        ClipboardOrigin, VdiClipboardCapability, MAX_CLIP_BYTES, MAX_CLIP_SOURCE_BYTES,
+        PREVIEW_MAX,
     };
     use crate::{CommandSink, CommunicationsSurface};
     use mde_collab_types::SpaceId;
@@ -680,6 +711,33 @@ mod tests {
 
         let long = "a".repeat(PREVIEW_MAX + 1);
         assert_eq!(clip_preview(&long), format!("{}…", "a".repeat(PREVIEW_MAX)));
+    }
+
+    #[test]
+    fn uri_kind_requires_one_complete_bounded_http_uri() {
+        use mde_collab_types::ClipItemKind;
+
+        for uri in [
+            "https://mesh.example/path?q=1#status",
+            " http://node.example:8080/health ",
+        ] {
+            assert_eq!(detect_kind(uri), ClipItemKind::Uri, "{uri:?}");
+        }
+
+        for ambiguous in [
+            "https://",
+            "https:///missing-authority",
+            "https://mesh.example copied from another seat",
+            "https://mesh.example\nspoofed text",
+            "https://.example/path",
+            "HTTPS://mesh.example/path",
+        ] {
+            assert_eq!(
+                detect_kind(ambiguous),
+                ClipItemKind::Text,
+                "ambiguous clipboard content {ambiguous:?} must not receive URI attribution"
+            );
+        }
     }
 
     #[test]
