@@ -345,6 +345,19 @@ impl WeatherUiState {
             self.pending_viewport = None;
             self.last_queued_tile = None;
         }
+        // A manual-location request is a compare-and-set against the exact
+        // location projection the operator selected from.  Once a newer (or
+        // missing/foreign) projection is folded, retrying that old request can
+        // no longer represent the selection the UI displayed.  Revoke it here
+        // instead of relying on the daemon to reject an obsolete generation on
+        // every subsequent refresh.
+        if self
+            .pending_location_action
+            .as_ref()
+            .is_some_and(|request| Some(request.expected_generation) != generation)
+        {
+            self.pending_location_action = None;
+        }
         self.refresh_decoded_fields();
         self.location = location;
     }
@@ -866,6 +879,33 @@ mod tests {
         assert_eq!(place.place_id, "offline-boston-ma");
         assert_eq!(place.time_zone, "America/New_York");
         action.validate_at(50).expect("typed request");
+    }
+
+    #[test]
+    fn location_generation_change_revokes_pending_manual_action() {
+        let mut state = WeatherUiState::default();
+        state.fold("rig-1", Some(location("rig-1", 7)), None, None, None, None);
+        state.manual_search_query = "Boston".into();
+        state.complete_manual_search(
+            "Boston",
+            crate::geocode::WeatherGeocodeOutcome {
+                results: vec![crate::geocode::WeatherGeoResult {
+                    place_id: "offline-boston-ma".into(),
+                    label: "Boston, MA".into(),
+                    latitude: 42.36,
+                    longitude: -71.06,
+                    time_zone: "America/New_York".into(),
+                    coverage: WeatherCoverage::NwsUnitedStates,
+                }],
+                note: None,
+            },
+        );
+        state.select_manual_result(0, 50);
+        assert!(state.pending_location_action().is_some());
+
+        state.fold("rig-1", Some(location("rig-1", 8)), None, None, None, None);
+
+        assert!(state.pending_location_action().is_none());
     }
 
     #[test]
