@@ -1957,6 +1957,69 @@ fn typed_android_vdi_handoff_preserves_the_proven_source_without_attaching() {
 }
 
 #[test]
+fn android_vdi_handoff_rejects_delayed_or_substituted_source_before_attachment() {
+    use mackes_mesh_types::android_provider::{
+        AndroidVdiProtocol, AndroidVdiSource, CuttlefishImageProvenanceRef,
+        ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+    };
+
+    let source = AndroidVdiSource {
+        schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+        workload_id: "android-eagle".to_owned(),
+        image_provenance: CuttlefishImageProvenanceRef::new(
+            "aosp-cuttlefish-x86_64",
+            format!("sha256:{}", "a".repeat(64)),
+            "aosp-2026-08-08",
+            "android-release-v1",
+        )
+        .expect("VDI provenance"),
+        catalog_digest: format!("sha256:{}", "b".repeat(64)),
+        generation: 7,
+        protocol: AndroidVdiProtocol::WebRtc,
+        mesh_host: "android-eagle.mesh".to_owned(),
+        port: 8443,
+        session_id: "android-session-7".to_owned(),
+        observed_at_unix_ms: ANDROID_NOW - 100,
+        expires_at_unix_ms: ANDROID_NOW + 60_000,
+    };
+    let ctx = egui::Context::default();
+    queue_android_vdi_handoff(
+        &ctx,
+        AndroidVdiHandoff {
+            placement_node: "eagle".to_owned(),
+            source: source.clone(),
+        },
+    );
+
+    let mut delayed = source.clone();
+    delayed.generation = 6;
+    delayed.session_id = "android-session-6".to_owned();
+    queue_android_vdi_handoff(
+        &ctx,
+        AndroidVdiHandoff {
+            placement_node: "eagle".to_owned(),
+            source: delayed,
+        },
+    );
+
+    let mut substituted = source.clone();
+    substituted.session_id = "attacker-session-7".to_owned();
+    substituted.mesh_host = "substitute.mesh".to_owned();
+    queue_android_vdi_handoff(
+        &ctx,
+        AndroidVdiHandoff {
+            placement_node: "eagle".to_owned(),
+            source: substituted,
+        },
+    );
+
+    let admitted = take_android_vdi_handoff(&ctx).expect("newest exact handoff retained");
+    assert_eq!(admitted.placement_node, "eagle");
+    assert_eq!(admitted.source, source);
+    assert!(take_android_vdi_handoff(&ctx).is_none());
+}
+
+#[test]
 fn labels_carry_no_legacy_backend_terminology() {
     // The lifecycle app is provider-neutral: zero OpenStack-family terms in its
     // user-facing copy (grep-clean, §6).

@@ -107,7 +107,26 @@ pub(crate) fn take_android_vdi_handoff(ctx: &egui::Context) -> Option<AndroidVdi
 }
 
 fn queue_android_vdi_handoff(ctx: &egui::Context, handoff: AndroidVdiHandoff) {
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new(ANDROID_VDI_HANDOFF_ID), Some(handoff)));
+    ctx.data_mut(|data| {
+        let id = egui::Id::new(ANDROID_VDI_HANDOFF_ID);
+        let pending = data.get_temp::<Option<AndroidVdiHandoff>>(id).flatten();
+
+        // Readiness can arrive again while the shell is between Workloads and
+        // Remote Sessions. For one exact workload, never let a delayed older
+        // source replace the generation/session the operator already selected.
+        // A different workload remains an intentional new selection and may
+        // replace the pending handoff regardless of its independent generation.
+        let stale_same_workload = pending.as_ref().is_some_and(|current| {
+            current.placement_node == handoff.placement_node
+                && current.source.workload_id == handoff.source.workload_id
+                && (handoff.source.generation < current.source.generation
+                    || (handoff.source.generation == current.source.generation
+                        && handoff.source != current.source))
+        });
+        if !stale_same_workload {
+            data.insert_temp(id, Some(handoff));
+        }
+    });
 }
 
 /// The systemd credential is a 32-byte HMAC key encoded as 64 hex characters.
