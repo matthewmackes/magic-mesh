@@ -732,7 +732,6 @@ fn plan_receipt_bound_vdi_close(
     if invocation.schema_version != SCHEMA_VERSION
         || invocation.verb != ResourceActionVerb::Connect
         || invocation.local_approval.is_some()
-        || invocation.armed_token.is_some()
         || !safe_id(&invocation.request_id)
         || !safe_id(&invocation.cancellation_id)
         || invocation.cancels_request_id.as_deref() != Some(id.as_str())
@@ -2365,6 +2364,74 @@ mod tests {
             plan_receipt_bound_vdi_close(&forged_receipt, &authority_signer, NOW + 3),
             Err(RefusalCode::Unauthorized)
         );
+    }
+
+    #[test]
+    fn signed_approval_gated_rdp_open_can_route_its_receipt_bound_close() {
+        let (catalog, open) = approval_gated_vdi();
+        let (_bus, _secrets, persist, worker) =
+            persisted_worker_fixture(&catalog, "action-auth-external-rdp-close");
+        let open_reply = worker.handle(
+            &persist,
+            &signed_ingress(&open, "external-rdp-open"),
+            NOW + 1,
+        );
+        assert!(open_reply.accepted, "signed RDP Open must be admitted");
+
+        let downstream = persist
+            .list_since(crate::workers::session_broker::ACTION_TOPIC, None)
+            .expect("RDP Open downstream row");
+        assert_eq!(downstream.len(), 1);
+        let completion_rows = persist
+            .list_since(&mde_bus::rpc::reply_topic(&downstream[0].ulid), None)
+            .expect("RDP Open completion rows");
+        let receipt: VdiAuthorityCompletionReply = serde_json::from_str(
+            completion_rows[0]
+                .body
+                .as_deref()
+                .expect("RDP Open completion body"),
+        )
+        .expect("typed RDP Open completion");
+
+        let mut close = open.clone();
+        close.request_id = "resource-rdp-close-signed-1".into();
+        close.cancellation_id = "cancel-resource-rdp-close-signed-1".into();
+        close.cancels_request_id = Some(open.request_id.clone());
+        close.issued_at_ms = NOW + 2;
+        close.deadline_at_ms = NOW + 20_000;
+        close.authority_request = TypedAuthorityRequest::Vdi(StrictSessionRequest::Close {
+            id: open.request_id.clone(),
+        });
+        close.local_approval = None;
+        close.vdi_open_receipt = Some(receipt);
+
+        let signed_close = signed_ingress(&close, "external-rdp-close");
+        let signed_close_invocation: ResourceActionInvocation =
+            serde_json::from_str(&signed_close).expect("signed close invocation");
+        assert!(
+            signed_close_invocation.armed_token.is_some(),
+            "the privileged ingress token must remain present for authorization"
+        );
+        let close_reply = worker.handle(&persist, &signed_close, NOW + 3);
+        assert!(
+            close_reply.accepted,
+            "the mandatory ingress token must not invalidate a receipt-bound close"
+        );
+
+        let downstream = persist
+            .list_since(crate::workers::session_broker::ACTION_TOPIC, None)
+            .expect("RDP lifecycle downstream rows");
+        assert_eq!(downstream.len(), 2);
+        let close_body: serde_json::Value = serde_json::from_str(
+            downstream[1]
+                .body
+                .as_deref()
+                .expect("RDP Close downstream body"),
+        )
+        .expect("typed RDP Close body");
+        assert_eq!(close_body["op"], "close");
+        assert_eq!(close_body["id"], open.request_id);
+        assert_eq!(close_body["resource_cancels_request_id"], open.request_id);
     }
 
     #[test]
