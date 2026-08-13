@@ -134,14 +134,30 @@ try:
 except (OSError, UnicodeError, json.JSONDecodeError) as error:
     reject(f"release declaration is invalid: {error}")
 
-exact(document, {"schema_version", "kind", "release_id", "compatibility_version", "artifacts"}, "declaration")
-if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+exact(document, {
+    "schema_version", "kind", "release_id", "compatibility_version",
+    "source_revision", "provider_identity", "image_identity", "artifacts",
+}, "declaration")
+if type(document["schema_version"]) is not int or document["schema_version"] != 2:
     reject("unsupported declaration schema_version")
 if document["kind"] != "cuttlefish_guest_payload_release":
     reject("unsupported declaration kind")
 for field in ("release_id", "compatibility_version"):
     if not isinstance(document[field], str) or not name_re.fullmatch(document[field]):
         reject(f"{field} is malformed")
+revision_re = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+if not isinstance(document["source_revision"], str) or not revision_re.fullmatch(document["source_revision"]):
+    reject("source_revision is not a full lowercase Git object ID")
+if not isinstance(document["provider_identity"], str) or not name_re.fullmatch(document["provider_identity"]):
+    reject("provider_identity is malformed")
+image_identity = document["image_identity"]
+exact(image_identity, {"id", "sha256"}, "image_identity")
+if not isinstance(image_identity["id"], str) or not name_re.fullmatch(image_identity["id"]):
+    reject("image_identity.id is malformed")
+if not isinstance(image_identity["sha256"], str) or not digest_re.fullmatch(image_identity["sha256"]):
+    reject("image_identity.sha256 is malformed")
+if image_identity["sha256"] == "sha256:" + "0" * 64:
+    reject("image_identity.sha256 is null")
 
 artifacts = document["artifacts"]
 exact(artifacts, {"readiness_relay", "vdi_agent", "guest_packages"}, "artifacts")
@@ -235,10 +251,16 @@ self_test() {
     python3 - "$fixture/release.json" "$relay_digest" "$agent_digest" "$package_digest" <<'PY'
 import json, sys
 document = {
-    "schema_version": 1,
+    "schema_version": 2,
     "kind": "cuttlefish_guest_payload_release",
     "release_id": "fixture-r1",
     "compatibility_version": "2026.08.1",
+    "source_revision": "0123456789abcdef0123456789abcdef01234567",
+    "provider_identity": "provider-fixture",
+    "image_identity": {
+        "id": "android-image-fixture",
+        "sha256": "sha256:" + "1" * 64,
+    },
     "artifacts": {
         "readiness_relay": {"name": "readiness-relay.sh", "sha256": sys.argv[2]},
         "vdi_agent": {"name": "mcnf-cuttlefish-vdi-agent", "sha256": sys.argv[3]},
@@ -308,6 +330,10 @@ PY
     done
     echo "Cuttlefish signed guest payload self-test passed"
 }
+
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+    return 0
+fi
 
 if [[ ${1:-} == --self-test ]]; then
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }
