@@ -1003,7 +1003,7 @@ fn projection_from(
                     && entry
                         .supported_actions
                         .iter()
-                        .any(|action| action == "launch")
+                        .any(|action| action.eq_ignore_ascii_case("launch"))
             })
             .map(project_entry)
             .collect()
@@ -1391,6 +1391,23 @@ mod tests {
 
         let projection = projection_from("node-01", &catalog, true).unwrap();
         assert!(projection.entries.is_empty());
+    }
+
+    #[test]
+    fn installed_row_with_canonicalized_launch_action_is_projected() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut catalog = signed_catalog(&key, "flatpak-production", 7);
+        catalog.payload.entries[0].supported_actions = vec!["LAUNCH".into()];
+        let catalog = SignedFlatpakAppCatalog::sign(
+            "flatpak-release-v1",
+            catalog.payload,
+            &key,
+        )
+        .unwrap();
+
+        let projection = projection_from("node-01", &catalog, true).unwrap();
+        assert_eq!(projection.entries.len(), 1);
+        assert_eq!(projection.entries[0].app_id, "org.example.Editor");
     }
 
     #[test]
