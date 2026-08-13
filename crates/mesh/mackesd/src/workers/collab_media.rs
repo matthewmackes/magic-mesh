@@ -122,7 +122,8 @@ fn verify_call_media_readiness(
     }
 
     let mut rows = Vec::new();
-    for session in &readiness.sessions {
+    for (session_index, session) in readiness.sessions.iter().enumerate() {
+        validate_session_provenance(readiness, session_index, session)?;
         for &adapter in &session.candidate_adapters {
             if rows.len() >= MAX_VERIFICATION_ROWS {
                 return Err(CallMediaVerificationError::TooManyRows {
@@ -138,6 +139,44 @@ fn verify_call_media_readiness(
         local_actor: readiness.local_actor.clone(),
         rows,
     })
+}
+
+fn validate_session_provenance(
+    readiness: &CallMediaReadiness,
+    session_index: usize,
+    session: &CallMediaSession,
+) -> Result<(), CallMediaVerificationError> {
+    if readiness.sessions[..session_index]
+        .iter()
+        .any(|prior| prior.call == session.call)
+    {
+        return Err(CallMediaVerificationError::DuplicateCall { call: session.call });
+    }
+
+    let local_count = session
+        .connected_participants
+        .iter()
+        .filter(|actor| *actor == &readiness.local_actor)
+        .count();
+    let has_duplicate_participant = session
+        .connected_participants
+        .iter()
+        .enumerate()
+        .any(|(index, actor)| session.connected_participants[..index].contains(actor));
+    let admission_matches = match session.admission {
+        CallMediaAdmission::AdapterReady => session.connected_participants.len() >= 2,
+        CallMediaAdmission::WaitingForConnectedPeer => session.connected_participants.len() == 1,
+    };
+    if local_count != 1 || has_duplicate_participant || !admission_matches {
+        return Err(CallMediaVerificationError::InvalidSessionProvenance {
+            call: session.call,
+            local_count,
+            participant_count: session.connected_participants.len(),
+            duplicate_participant: has_duplicate_participant,
+            admission: session.admission,
+        });
+    }
+    Ok(())
 }
 
 fn verify_candidate(
@@ -218,20 +257,14 @@ fn candidate_matches_session(session: &CallMediaSession, adapter: CallMediaAdapt
                     CallMediaRequirement::Microphone,
                     CallMediaRequirement::Camera,
                 ],
-                &[
-                    CallMediaAdapter::WebRtcP2p,
-                    CallMediaAdapter::LiveKitSfu,
-                ],
+                &[CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu],
             ),
             CallKind::Screen => (
                 &[
                     CallMediaRequirement::Microphone,
                     CallMediaRequirement::ScreenCapture,
                 ],
-                &[
-                    CallMediaAdapter::WebRtcP2p,
-                    CallMediaAdapter::LiveKitSfu,
-                ],
+                &[CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu],
             ),
             CallKind::CoEdit => (
                 &[CallMediaRequirement::DocumentSync],
@@ -536,6 +569,16 @@ enum CallMediaVerificationError {
         count: usize,
         max: usize,
     },
+    DuplicateCall {
+        call: mde_collab_types::CallId,
+    },
+    InvalidSessionProvenance {
+        call: mde_collab_types::CallId,
+        local_count: usize,
+        participant_count: usize,
+        duplicate_participant: bool,
+        admission: CallMediaAdmission,
+    },
     DetailTooLarge {
         len: usize,
         max: usize,
@@ -565,6 +608,19 @@ impl fmt::Display for CallMediaVerificationError {
                     "call media verification would publish {count} rows, over {max}"
                 )
             }
+            Self::DuplicateCall { call } => {
+                write!(f, "call media readiness repeats call {call}")
+            }
+            Self::InvalidSessionProvenance {
+                call,
+                local_count,
+                participant_count,
+                duplicate_participant,
+                admission,
+            } => write!(
+                f,
+                "call {call} has invalid local media provenance: local actor count {local_count}, participant count {participant_count}, duplicate participant {duplicate_participant}, admission {admission:?}"
+            ),
             Self::DetailTooLarge { len, max } => {
                 write!(
                     f,
@@ -1067,10 +1123,7 @@ mod tests {
         }
 
         let mut session = ready_audio_session();
-        session.candidate_adapters = vec![
-            CallMediaAdapter::WebRtcP2p,
-            CallMediaAdapter::WebRtcP2p,
-        ];
+        session.candidate_adapters = vec![CallMediaAdapter::WebRtcP2p, CallMediaAdapter::WebRtcP2p];
         let readiness = CallMediaReadiness {
             local_actor: ActorId::new("alice"),
             sessions: vec![session],
@@ -1178,6 +1231,78 @@ mod tests {
         assert_eq!(
             repaired.rows[0].status,
             CallMediaVerificationStatus::LiveMediaVerified
+        );
+    }
+
+    #[test]
+    fn invalid_session_provenance_revokes_live_proof_without_provider_probe() {
+        struct CountingProvider {
+            probes: Arc<AtomicUsize>,
+        }
+
+        impl CallMediaFrameVerifier for CountingProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                Ok(CallMediaFrameEvidence {
+                    audio_frames: 4,
+                    video_frames: 0,
+                    screen_frames: 0,
+                    data_messages: 0,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let mut session = ready_audio_session();
+        session.candidate_adapters = vec![CallMediaAdapter::WebRtcP2p];
+        let valid = CallMediaReadiness {
+            local_actor: ActorId::new("alice"),
+            sessions: vec![session.clone()],
+        };
+        write_readiness(&persist, &valid);
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut providers = empty_registry();
+        providers
+            .register(
+                CallMediaAdapter::WebRtcP2p,
+                CountingProvider {
+                    probes: Arc::clone(&probes),
+                },
+            )
+            .expect("register provider");
+        let mut last_published = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        session.connected_participants = vec![ActorId::new("mallory"), ActorId::new("bob")];
+        write_readiness(
+            &persist,
+            &CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: vec![session],
+            },
+        );
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "misattributed readiness must not reach the media provider"
+        );
+        let verification = persist
+            .read_latest(&topics::state_topic(proj::CALL_MEDIA_VERIFICATION))
+            .expect("read verification")
+            .expect("verification tombstone");
+        assert!(
+            verification.body.is_none(),
+            "misattributed readiness must revoke stale live proof"
         );
     }
 }
