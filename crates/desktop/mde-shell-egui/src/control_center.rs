@@ -86,6 +86,10 @@ const SESSION_DETAIL_ROW_H: f32 = 52.0;
 const HEADER_H: f32 = 18.0;
 /// Gap between grid cells / list rows.
 const GRID_GAP: f32 = Style::SP_S;
+/// Smallest width that keeps a tile's glyph, title, and bounded live caption
+/// readable without painting into its neighbour. Narrow cards collapse to one
+/// column instead of retaining a desktop-only two-column grid.
+const MIN_TILE_W: f32 = 164.0;
 /// Gap between the card's sections.
 const SECTION_GAP: f32 = Style::SP_M;
 /// Sessions shown before the header's total count carries the rest — keeps the
@@ -448,7 +452,7 @@ impl PanelModel {
 
     /// The card height for this frame's content.
     #[allow(clippy::cast_precision_loss)] // row counts are tiny
-    fn height(&self) -> f32 {
+    fn height_for_width(&self, content_width: f32) -> f32 {
         let mut h = PANEL_PAD * 2.0;
         if self.volume.is_some() {
             h += ROW_H;
@@ -457,7 +461,7 @@ impl PanelModel {
             h += ROW_H;
         }
         if !self.tiles.is_empty() {
-            let rows = self.tiles.len().div_ceil(2);
+            let rows = self.tiles.len().div_ceil(tile_grid_columns(content_width));
             h += rows as f32 * TILE_H + rows.saturating_sub(1) as f32 * GRID_GAP;
         }
         if !self.sessions.is_empty() {
@@ -542,7 +546,9 @@ pub(crate) fn mount(ctx: &egui::Context, mut deps: ControlCenterDeps<'_>) {
     );
 
     let screen = ctx.screen_rect();
-    let panel = panel_rect(screen, model.height(), reveal);
+    let width = panel_width(screen);
+    let content_width = (width - 2.0 * PANEL_PAD).max(0.0);
+    let panel = panel_rect(screen, model.height_for_width(content_width), reveal);
     let mut action: Option<CcAction> = None;
     let mut scrim_clicked = false;
     egui::Area::new(egui::Id::new(AREA_KEY))
@@ -573,7 +579,7 @@ pub(crate) fn mount(ctx: &egui::Context, mut deps: ControlCenterDeps<'_>) {
 /// is always kept inside the viewport so a short window cannot leave an
 /// invisible lower section with a live hit target.
 fn panel_rect(screen: egui::Rect, height: f32, reveal: f32) -> egui::Rect {
-    let width = PANEL_W.min((screen.width() - 2.0 * PANEL_MARGIN).max(0.0));
+    let width = panel_width(screen);
     let height = height.min((screen.height() - 2.0 * PANEL_MARGIN).max(0.0));
     let left = (screen.right() - PANEL_MARGIN - width).max(screen.left());
     let top = (screen.top() + PANEL_MARGIN)
@@ -584,6 +590,10 @@ fn panel_rect(screen: egui::Rect, height: f32, reveal: f32) -> egui::Rect {
         0.0,
         -(1.0 - reveal) * (height + PANEL_MARGIN * 2.0),
     ))
+}
+
+fn panel_width(screen: egui::Rect) -> f32 {
+    PANEL_W.min((screen.width() - 2.0 * PANEL_MARGIN).max(0.0))
 }
 
 // ──────────────────────────── the action drain ────────────────────────────
@@ -683,7 +693,7 @@ fn paint_panel(ui: &mut egui::Ui, rect: egui::Rect, model: &PanelModel) -> Optio
     );
 
     let inner = panel_inner_rect(rect);
-    let content_height = model.height();
+    let content_height = model.height_for_width(inner.width());
     ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
         egui::ScrollArea::vertical()
             .id_salt((AREA_KEY, "scroll"))
@@ -972,12 +982,14 @@ fn tile_grid(
     top: f32,
     tiles: &[Tile],
 ) -> (Option<CcAction>, f32) {
-    let tile_w = (inner.width() - GRID_GAP) / 2.0;
+    let columns = tile_grid_columns(inner.width());
+    let gaps = columns.saturating_sub(1) as f32 * GRID_GAP;
+    let tile_w = ((inner.width() - gaps) / columns as f32).max(0.0);
     let mut action = None;
     let mut bottom = top;
     for (idx, tile) in tiles.iter().enumerate() {
         #[allow(clippy::cast_precision_loss)] // tiny grid indices
-        let (col, row) = ((idx % 2) as f32, (idx / 2) as f32);
+        let (col, row) = ((idx % columns) as f32, (idx / columns) as f32);
         let rect = egui::Rect::from_min_size(
             egui::pos2(
                 col.mul_add(tile_w + GRID_GAP, inner.left()),
@@ -991,6 +1003,10 @@ fn tile_grid(
         bottom = bottom.max(rect.bottom());
     }
     (action, bottom)
+}
+
+fn tile_grid_columns(content_width: f32) -> usize {
+    usize::from(content_width >= MIN_TILE_W * 2.0 + GRID_GAP) + 1
 }
 
 /// One RADIUS_L tile cell; returns `true` on click.
@@ -1701,7 +1717,50 @@ mod tests {
             .expect("network tile");
         assert_eq!(network.caption, "Mesh not read yet");
         // The height math covers exactly the painted sections.
-        assert!(model.height() > PANEL_PAD * 2.0);
+        assert!(model.height_for_width(PANEL_W - 2.0 * PANEL_PAD) > PANEL_PAD * 2.0);
+    }
+
+    #[test]
+    fn a_narrow_control_center_collapses_tiles_without_hiding_rows() {
+        let mesh = MeshSummary::default();
+        let segments = StatusSegments::default();
+        let model = fold_model(
+            None,
+            None,
+            LayoutProfile::Construct,
+            &mesh,
+            &segments,
+            &[],
+            None,
+            None,
+        );
+        let narrow_width = 320.0 - 2.0 * PANEL_MARGIN - 2.0 * PANEL_PAD;
+        let desktop_width = PANEL_W - 2.0 * PANEL_PAD;
+
+        assert_eq!(tile_grid_columns(narrow_width), 1);
+        assert_eq!(tile_grid_columns(desktop_width), 2);
+        assert_eq!(
+            model.tiles.len(),
+            6,
+            "hostile absent state exercises every route tile"
+        );
+        assert!(
+            model.height_for_width(narrow_width) > model.height_for_width(desktop_width),
+            "one-column responsive layout must reserve all tile rows for scrolling"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut harness = Harness::new();
+        harness.construct.control_center_open = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
+        for _ in 0..10 {
+            let _ = frame_at(&ctx, &mut harness, screen, Vec::new());
+        }
+        assert!(
+            frame_at(&ctx, &mut harness, screen, Vec::new()) > 0,
+            "settled narrow responsive panel must remain renderable"
+        );
     }
 
     #[test]
