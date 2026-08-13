@@ -685,7 +685,7 @@ case "${1:-}" in
       --cuttlefish-signature "${MCNF_CUTTLEFISH_SIGNATURE:-}"
       --cuttlefish-readiness-relay "${MCNF_CUTTLEFISH_READINESS_RELAY:-}"
       --cuttlefish-vdi-agent "${MCNF_CUTTLEFISH_VDI_AGENT:-}"
-      --rpm-signing-fingerprint "${MCNF_RPM_SIGNING_FINGERPRINT:-}"
+      --rpm-signing-identity-receipt "${MCNF_RPM_SIGNING_IDENTITY_RECEIPT:-}"
       --bootc-base-digest "${MCNF_BOOTC_BASE_DIGEST:-}"
       --app-vm-base-digest "${MCNF_APP_VM_BASE_DIGEST:-}"
       --cuttlefish-image-digest "${MCNF_CUTTLEFISH_IMAGE_DIGEST:-}"

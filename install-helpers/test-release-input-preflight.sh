@@ -14,24 +14,31 @@ exit "${FAKE_VERIFIER_RC:-0}"
 EOF
   chmod 0755 "$fixture/$verifier"
 done
+cat >"$fixture/signing-receipt.py" <<'EOF'
+#!/usr/bin/env python3
+import os
+raise SystemExit(int(os.environ.get("FAKE_VERIFIER_RC", "0")))
+EOF
+chmod 0755 "$fixture/signing-receipt.py"
 cat >"$fixture/bin/gpg" <<'EOF'
 #!/usr/bin/env bash
 printf 'sec:-:4096:1:DEADBEEF:0:0:::::::23::0:\n'
 printf 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n'
 EOF
 chmod 0755 "$fixture/bin/gpg"
-touch "$fixture/receipt" "$fixture/key" "$fixture/declaration" "$fixture/signature" "$fixture/relay" "$fixture/agent"
+touch "$fixture/receipt" "$fixture/key" "$fixture/declaration" "$fixture/signature" "$fixture/relay" "$fixture/agent" "$fixture/signing-receipt.json"
 
 args=(--source-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --source-epoch 1700000000
   --app-vm-catalog-trust-receipt "$fixture/receipt" --app-vm-catalog-trust-key "$fixture/key"
   --cuttlefish-declaration "$fixture/declaration" --cuttlefish-signature "$fixture/signature"
   --cuttlefish-readiness-relay "$fixture/relay" --cuttlefish-vdi-agent "$fixture/agent"
-  --rpm-signing-fingerprint AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  --rpm-signing-identity-receipt "$fixture/signing-receipt.json"
   --bootc-base-digest "sha256:$(printf 'b%.0s' {1..64})"
   --app-vm-base-digest "sha256:$(printf 'c%.0s' {1..64})"
   --cuttlefish-image-digest "sha256:$(printf 'd%.0s' {1..64})")
 envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_VERIFY="$fixture/kiron"
-  MCNF_APP_TRUST_VERIFY="$fixture/app" MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish")
+  MCNF_APP_TRUST_VERIFY="$fixture/app" MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
+  MCNF_RPM_SIGNING_RECEIPT_INSPECTOR="$fixture/signing-receipt.py")
 
 run_release() { env "${envs[@]}" "$PRE" "$@" && : >"$marker"; }
 run_release "${args[@]}"
