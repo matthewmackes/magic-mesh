@@ -77,16 +77,22 @@ printf '\177ELF12.1.6Construct{REVISION}bounded\n'
         assert value["signing_fingerprint"] == FINGERPRINT
         assert stat.S_IMODE(manifest.stat().st_mode) == 0o400
 
-        def verify(candidate: Path, document: Path, extra: dict[str, str] | None = None):
+        def verify(candidate: Path, document: Path, extra: dict[str, str] | None = None,
+                   expected_signer: str | None = None):
             selected = dict(env)
             selected.update(extra or {})
+            command = [str(producer), "verify", "--rpm", str(candidate), "--source-revision", REVISION,
+                       "--release-key", str(key), "--manifest", str(document)]
+            if expected_signer is not None:
+                command.extend(("--expected-signing-fingerprint", expected_signer))
             return subprocess.run(
-                [str(producer), "verify", "--rpm", str(candidate), "--source-revision", REVISION,
-                 "--release-key", str(key), "--manifest", str(document)],
+                command,
                 text=True, capture_output=True, env=selected, check=False,
             )
 
         assert verify(rpm, manifest).returncode == 0
+        assert verify(rpm, manifest, expected_signer=FINGERPRINT).returncode == 0
+        assert verify(rpm, manifest, expected_signer="B" * 40).returncode == 2
         replacement = root / "replacement.rpm"
         replacement.write_bytes(rpm.read_bytes() + b"changed")
         replacement.chmod(0o400)

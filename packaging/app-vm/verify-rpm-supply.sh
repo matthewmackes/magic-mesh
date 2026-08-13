@@ -9,6 +9,7 @@ MAX_MANIFEST_BYTES="${MCNF_APP_VM_MAX_CANDIDATE_MANIFEST_BYTES:-1048576}"
 KEY=""
 SOURCE_COMMIT=""
 CANDIDATE_MANIFEST=""
+EXPECTED_SIGNING_FINGERPRINT=""
 
 refuse() {
     echo "FATAL: App VM RPM supply refused: $*" >&2
@@ -102,6 +103,10 @@ verify_supply() (
         || [ "$SOURCE_COMMIT" = 0000000000000000000000000000000000000000 ]; then
         refuse '--source-commit must be a non-null 40-character lowercase Git revision'
     fi
+    if [ -n "$EXPECTED_SIGNING_FINGERPRINT" ] \
+        && [[ ! "$EXPECTED_SIGNING_FINGERPRINT" =~ ^[0-9A-F]{40,64}$ ]]; then
+        refuse '--expected-signing-fingerprint must be one full uppercase fingerprint'
+    fi
     regular_bounded_file 'governed RPM key' "$KEY" 1048576
     regular_bounded_file 'candidate manifest' "$CANDIDATE_MANIFEST" "$MAX_MANIFEST_BYTES"
     regular_bounded_file 'local RPM' "$rpm" "$MAX_RPM_BYTES"
@@ -152,6 +157,10 @@ verify_supply() (
         || refuse 'RPM signing key ID does not resolve to one governed full fingerprint'
     [ "$resolved_signer" = "$manifest_signer" ] \
         || refuse 'RPM governed signing fingerprint does not match the candidate manifest'
+    if [ -n "$EXPECTED_SIGNING_FINGERPRINT" ]; then
+        [ "$resolved_signer" = "$EXPECTED_SIGNING_FINGERPRINT" ] \
+            || refuse 'RPM governed signing fingerprint does not match the explicitly expected release signer'
+    fi
     actual_rpm_digest=$(sha256sum -- "$rpm" | awk '{print $1}') \
         || refuse 'RPM whole-file digest cannot be measured'
     [ "$actual_rpm_digest" = "$manifest_rpm" ] \
@@ -315,6 +324,12 @@ PY
 
     supply=(--key "$fixture/key" --source-commit "$revision" --candidate-manifest "$manifest")
     PATH="$fixture/bin:/usr/bin:/bin" "$script" "${supply[@]}" "$good" >/dev/null
+    PATH="$fixture/bin:/usr/bin:/bin" "$script" "${supply[@]}" \
+        --expected-signing-fingerprint AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD0921C73 "$good" >/dev/null
+    if PATH="$fixture/bin:/usr/bin:/bin" "$script" "${supply[@]}" \
+        --expected-signing-fingerprint BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB "$good" >/dev/null 2>&1; then
+        refuse 'self-test admitted an explicitly mismatched release signing fingerprint'
+    fi
     if PATH="$fixture/bin:/usr/bin:/bin" "$script" "${supply[@]}" "$old" >/dev/null 2>&1; then
         refuse 'self-test admitted an older correctly signed RPM with a substituted payload digest'
     fi
@@ -367,6 +382,7 @@ while [ "$#" -gt 0 ]; do
         --key) KEY="${2:?--key needs a path}"; shift 2 ;;
         --source-commit) SOURCE_COMMIT="${2:?--source-commit needs a revision}"; shift 2 ;;
         --candidate-manifest) CANDIDATE_MANIFEST="${2:?--candidate-manifest needs a path}"; shift 2 ;;
+        --expected-signing-fingerprint) EXPECTED_SIGNING_FINGERPRINT="${2:?--expected-signing-fingerprint needs a fingerprint}"; shift 2 ;;
         --) shift; break ;;
         -*) refuse "unknown option: $1" ;;
         *) break ;;

@@ -148,6 +148,11 @@ def verify(args: argparse.Namespace, rpm: Path, manifest: Path) -> dict[str, obj
         raise Refusal("governed release public key must not be group/other writable")
     value = exact_json(manifest)
     artifact, expected_signer = validate_manifest(value, revision)
+    if args.expected_signing_fingerprint is not None:
+        if FINGERPRINT.fullmatch(args.expected_signing_fingerprint) is None:
+            raise Refusal("expected signing fingerprint must be one full uppercase fingerprint")
+        if expected_signer != args.expected_signing_fingerprint:
+            raise Refusal("candidate signer does not match the explicitly expected release signer")
     with tempfile.TemporaryDirectory(prefix="browser-lighthouse-verify-") as raw:
         snapshot, whole = SHARED.snapshot_rpm(rpm, Path(raw))
         signer = SHARED.verify_signature(snapshot, key, args.gpg, args.rpm_tool, args.rpmkeys)
@@ -212,6 +217,7 @@ def main() -> int:
     parser.add_argument("--release-key", required=True, type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--expected-signing-fingerprint")
     parser.add_argument("--gpg", default="gpg", help=argparse.SUPPRESS)
     parser.add_argument("--rpm-tool", default="rpm", help=argparse.SUPPRESS)
     parser.add_argument("--rpmkeys", default="rpmkeys", help=argparse.SUPPRESS)
@@ -219,8 +225,8 @@ def main() -> int:
     parser.add_argument("--cpio", default="cpio", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.mode == "produce":
-        if args.output is None or args.manifest is not None:
-            raise Refusal("produce requires --output and forbids --manifest")
+        if args.output is None or args.manifest is not None or args.expected_signing_fingerprint is not None:
+            raise Refusal("produce requires --output and forbids --manifest/--expected-signing-fingerprint")
         value = produce(args)
     else:
         if args.manifest is None or args.output is not None:
