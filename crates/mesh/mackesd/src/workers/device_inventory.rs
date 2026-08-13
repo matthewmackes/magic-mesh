@@ -614,14 +614,49 @@ pub fn block_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
             .to_string();
         let model = read_trim(&dir.join("device").join("model"));
         let vendor = read_trim(&dir.join("device").join("vendor"));
-        let size_bytes = read_trim(&dir.join("size"))
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|sectors| sectors.saturating_mul(512));
+        let sectors = read_trim(&dir.join("size")).and_then(|s| s.parse::<u64>().ok());
+        let size_bytes = sectors.map(|sectors| sectors.saturating_mul(512));
+        let kernel_state = read_trim(&dir.join("device").join("state"))
+            .filter(|state| BLOCK_DEVICE_STATES.contains(&state.as_str()));
+        let dev = read_trim(&dir.join("dev")).filter(|dev| admitted_block_dev(dev));
+        let read_only = read_trim(&dir.join("ro")).and_then(|value| match value.as_str() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        });
+        let (status, problem) = match kernel_state.as_deref() {
+            Some("running" | "live" | "active") => (DeviceStatus::Ok, None),
+            Some(state @ ("offline" | "blocked" | "quiesce" | "suspended")) => (
+                DeviceStatus::Degraded,
+                Some(format!("kernel block state: {state}")),
+            ),
+            // Some block classes do not export `device/state`. A registered
+            // major:minor with non-zero media is still kernel-owned evidence
+            // that the provider has usable block storage; neither fact alone is
+            // sufficient.
+            None if dev.is_some() && sectors.is_some_and(|sectors| sectors > 0) => {
+                (DeviceStatus::Ok, None)
+            }
+            _ => (
+                DeviceStatus::Unknown,
+                Some("block device readiness unavailable".to_string()),
+            ),
+        };
         let base = model.clone().unwrap_or(name);
         let name_disp = match size_bytes {
             Some(b) => format!("{base} ({})", human_bytes(b)),
             None => base,
         };
+        let mut events = Vec::with_capacity(3);
+        if let Some(state) = kernel_state {
+            events.push(format!("kernel state: {state}"));
+        }
+        if let Some(dev) = dev {
+            events.push(format!("device number: {dev}"));
+        }
+        if let Some(read_only) = read_only {
+            events.push(format!("read-only: {read_only}"));
+        }
         out.push(DeviceRecord {
             name: name_disp,
             vendor,
@@ -630,13 +665,35 @@ pub fn block_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
             sysfs_path: Some(dir.to_string_lossy().into_owned()),
             driver: None,
             driver_version: None,
-            status: DeviceStatus::Ok,
-            problem: None,
+            status,
+            problem,
             resources: DeviceResources::default(),
-            events: Vec::new(),
+            events,
         });
     }
     out
+}
+
+const BLOCK_DEVICE_STATES: &[&str] = &[
+    "running",
+    "live",
+    "active",
+    "offline",
+    "blocked",
+    "quiesce",
+    "suspended",
+];
+
+fn admitted_block_dev(value: &str) -> bool {
+    let Some((major, minor)) = value.split_once(':') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.len() <= 5
+        && minor.len() <= 7
+        && major.bytes().all(|byte| byte.is_ascii_digit())
+        && minor.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Maximum physical disks published by one inventory generation.
@@ -1627,6 +1684,7 @@ mod tests {
         put(&mouse.join("1-1:1.0").join("bInterfaceClass"), "03\n");
         // A physical NVMe drive + a virtual loop device (skipped).
         put(&sys.join("block/nvme0n1/size"), "1000215216\n");
+        put(&sys.join("block/nvme0n1/dev"), "259:0\n");
         put(&sys.join("block/nvme0n1/device/model"), "Samsung SSD 970\n");
         put(&sys.join("block/loop0/size"), "0\n");
         // CPU + memory + uptime.
@@ -2036,8 +2094,12 @@ mod tests {
         }
         for index in 0..(MAX_BLOCK_DEVICES + 8) {
             let disk = block.join(format!("nvme{index:04}"));
-            put(&disk.join("device").join("model"), &format!("Disk {index:04}\n"));
+            put(
+                &disk.join("device").join("model"),
+                &format!("Disk {index:04}\n"),
+            );
             put(&disk.join("size"), "2048\n");
+            put(&disk.join("dev"), &format!("259:{index}\n"));
         }
 
         let records = block_devices(&roots);
@@ -2050,6 +2112,61 @@ mod tests {
                 .as_deref()
                 .is_some_and(|path| !path.contains("loop"))
         }));
+    }
+
+    #[test]
+    fn physical_block_provider_reports_kernel_readiness_and_refuses_invented_health() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = SysfsRoots::under(tmp.path());
+        let block = roots.sys.join("block");
+
+        let healthy = block.join("nvme0n1");
+        put(&healthy.join("size"), "2048\n");
+        put(&healthy.join("dev"), "259:0\n");
+        put(&healthy.join("device/state"), "live\n");
+        put(&healthy.join("ro"), "0\n");
+
+        let blocked = block.join("sda");
+        put(&blocked.join("size"), "4096\n");
+        put(&blocked.join("dev"), "8:0\n");
+        put(&blocked.join("device/state"), "blocked\n");
+        put(&blocked.join("ro"), "1\n");
+
+        let unresolved = block.join("sdb");
+        put(&unresolved.join("size"), "0\n");
+        put(&unresolved.join("dev"), "credential-shaped-device-number\n");
+        put(
+            &unresolved.join("device/state"),
+            "credential-shaped-state\n",
+        );
+
+        let records = block_devices(&roots);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].status, DeviceStatus::Ok);
+        assert_eq!(
+            records[0].events,
+            [
+                "kernel state: live",
+                "device number: 259:0",
+                "read-only: false"
+            ]
+        );
+        assert_eq!(records[1].status, DeviceStatus::Degraded);
+        assert_eq!(
+            records[1].problem.as_deref(),
+            Some("kernel block state: blocked")
+        );
+        assert!(records[1]
+            .events
+            .iter()
+            .any(|event| event == "read-only: true"));
+        assert_eq!(records[2].status, DeviceStatus::Unknown);
+        assert_eq!(
+            records[2].problem.as_deref(),
+            Some("block device readiness unavailable")
+        );
+        let published = serde_json::to_string(&records).unwrap();
+        assert!(!published.contains("credential-shaped"));
     }
 
     #[test]
