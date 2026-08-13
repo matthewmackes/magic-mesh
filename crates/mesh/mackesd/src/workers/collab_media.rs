@@ -238,6 +238,13 @@ fn verify_candidate(
             None,
             Some(detail.as_str()),
         ),
+        Err(CallMediaProviderError::ExecutionRefused { detail }) => row(
+            session,
+            adapter,
+            CallMediaVerificationStatus::ProviderUnavailable,
+            None,
+            Some(detail.as_str()),
+        ),
     }
 }
 
@@ -363,6 +370,22 @@ fn missing_evidence_detail(
 }
 
 pub(crate) trait CallMediaFrameVerifier: Send + Sync {
+    /// Execute one already-authorized call command against the provider.
+    ///
+    /// Proof-only registrations deliberately fail closed here: observing frame
+    /// counters is not authority to start, answer, mutate, or signal a session.
+    /// Concrete providers must override this method before their registration
+    /// can drive signed call state.
+    fn execute_command(
+        &self,
+        _command: &CollabCommand,
+        adapter: CallMediaAdapter,
+    ) -> Result<(), CallMediaProviderError> {
+        Err(CallMediaProviderError::ExecutionRefused {
+            detail: format!("{adapter:?} provider is proof-only and cannot execute call commands"),
+        })
+    }
+
     /// Prove live media for `session` by returning frame/data deltas observed
     /// during a bounded provider-owned sampling window. Cumulative counters or
     /// desired-state readiness are not sufficient for a
@@ -439,6 +462,71 @@ impl CallMediaProviderRegistry {
         }
     }
 
+    /// Execute a call effect through exactly one deterministic provider.
+    ///
+    /// Start/answer/media-control commands fail closed when execution fails.
+    /// Decline/hang-up remain available with no provider (local revocation must
+    /// survive provider loss), but when a provider is still registered the
+    /// cleanup is sent to it before the signed revocation is authored.
+    pub(crate) fn execute_command(
+        &self,
+        command: &CollabCommand,
+        existing_kind: Option<CallKind>,
+    ) -> Result<(), CallMediaCommandExecutionError> {
+        let (kind, cleanup) = match command {
+            CollabCommand::StartCall { kind, .. } => (Some(*kind), false),
+            CollabCommand::AnswerCall { .. }
+            | CollabCommand::SendDtmf { .. }
+            | CollabCommand::SetCallMuted { .. } => (existing_kind, false),
+            CollabCommand::DeclineCall { .. } | CollabCommand::HangUpCall { .. } => {
+                (existing_kind, true)
+            }
+            _ => return Ok(()),
+        };
+        let Some(kind) = kind else {
+            // The collaboration core owns the authoritative CallNotFound
+            // result; do not send an unattributed command to any provider.
+            return Ok(());
+        };
+        let Some((adapter, provider)) = self.provider_for_kind(kind) else {
+            return if cleanup {
+                Ok(())
+            } else {
+                Err(CallMediaCommandExecutionError::NoProvider { kind })
+            };
+        };
+        provider
+            .execute_command(command, adapter)
+            .map_err(|source| CallMediaCommandExecutionError::ProviderFailed {
+                kind,
+                adapter,
+                detail: bounded_provider_error(source),
+            })
+    }
+
+    fn provider_for_kind(
+        &self,
+        kind: CallKind,
+    ) -> Option<(CallMediaAdapter, &dyn CallMediaFrameVerifier)> {
+        let candidates: &[CallMediaAdapter] = match kind {
+            CallKind::Audio => &[
+                CallMediaAdapter::WebRtcP2p,
+                CallMediaAdapter::LiveKitSfu,
+                CallMediaAdapter::SipGateway,
+            ],
+            CallKind::Video | CallKind::Screen => {
+                &[CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu]
+            }
+            CallKind::CoEdit => &[CallMediaAdapter::DocumentCollab],
+            CallKind::RemoteDesktop => &[CallMediaAdapter::VdiRemoteDesktop],
+        };
+        candidates.iter().find_map(|adapter| {
+            self.slot(*adapter)
+                .as_deref()
+                .map(|provider| (*adapter, provider))
+        })
+    }
+
     fn supports(&self, kind: CallKind) -> bool {
         match kind {
             CallKind::Audio => {
@@ -508,6 +596,54 @@ impl fmt::Display for CallMediaCommandAdmissionError {
 
 impl Error for CallMediaCommandAdmissionError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallMediaCommandExecutionError {
+    NoProvider {
+        kind: CallKind,
+    },
+    ProviderFailed {
+        kind: CallKind,
+        adapter: CallMediaAdapter,
+        detail: String,
+    },
+}
+
+impl fmt::Display for CallMediaCommandExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoProvider { kind } => {
+                write!(formatter, "no call-media provider can execute {kind:?}")
+            }
+            Self::ProviderFailed {
+                kind,
+                adapter,
+                detail,
+            } => write!(
+                formatter,
+                "{adapter:?} provider failed to execute {kind:?}: {detail}"
+            ),
+        }
+    }
+}
+
+impl Error for CallMediaCommandExecutionError {}
+
+fn bounded_provider_error(error: CallMediaProviderError) -> String {
+    let detail = match error {
+        CallMediaProviderError::TransportUnavailable { detail }
+        | CallMediaProviderError::ProviderUnavailable { detail }
+        | CallMediaProviderError::ExecutionRefused { detail } => detail,
+    };
+    if detail.len() <= MAX_DETAIL_BYTES {
+        return detail;
+    }
+    let mut end = MAX_DETAIL_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail[..end].to_string()
+}
+
 fn missing_provider_error(adapter: CallMediaAdapter) -> CallMediaProviderError {
     match adapter {
         CallMediaAdapter::LiveKitSfu => CallMediaProviderError::ProviderUnavailable {
@@ -538,6 +674,7 @@ pub(crate) enum CallMediaProviderRegistrationError {
 pub(crate) enum CallMediaProviderError {
     TransportUnavailable { detail: String },
     ProviderUnavailable { detail: String },
+    ExecutionRefused { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -758,6 +895,96 @@ mod tests {
                 None,
             )
             .is_ok());
+    }
+
+    #[test]
+    fn execution_is_single_provider_fail_closed_and_cleanup_survives_loss() {
+        struct ExecutingProvider {
+            commands: Arc<std::sync::Mutex<Vec<String>>>,
+            fail: bool,
+        }
+        impl CallMediaFrameVerifier for ExecutingProvider {
+            fn execute_command(
+                &self,
+                command: &CollabCommand,
+                adapter: CallMediaAdapter,
+            ) -> Result<(), CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                self.commands
+                    .lock()
+                    .expect("command recorder")
+                    .push(command.verb().to_string());
+                if self.fail {
+                    Err(CallMediaProviderError::ExecutionRefused {
+                        detail: "session transport rejected command".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                panic!("command execution must not claim frame proof")
+            }
+        }
+
+        let call = CallId::new();
+        let command = CollabCommand::StartCall {
+            space: SpaceId::new(),
+            call,
+            kind: CallKind::Audio,
+        };
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut providers = empty_registry();
+        providers
+            .register(
+                CallMediaAdapter::WebRtcP2p,
+                ExecutingProvider {
+                    commands: Arc::clone(&commands),
+                    fail: true,
+                },
+            )
+            .expect("register executor");
+        // A second compatible provider must not receive a duplicate start.
+        providers
+            .register(
+                CallMediaAdapter::LiveKitSfu,
+                ExecutingProvider {
+                    commands: Arc::clone(&commands),
+                    fail: false,
+                },
+            )
+            .expect("register fallback");
+
+        let error = providers
+            .execute_command(&command, None)
+            .expect_err("provider failure must refuse execution");
+        assert!(matches!(
+            error,
+            CallMediaCommandExecutionError::ProviderFailed {
+                adapter: CallMediaAdapter::WebRtcP2p,
+                ..
+            }
+        ));
+        assert_eq!(
+            commands.lock().expect("commands").as_slice(),
+            ["start_call"]
+        );
+
+        let absent = empty_registry();
+        assert!(absent
+            .execute_command(&CollabCommand::HangUpCall { call }, Some(CallKind::Audio))
+            .is_ok());
+        assert_eq!(
+            absent.execute_command(&command, None),
+            Err(CallMediaCommandExecutionError::NoProvider {
+                kind: CallKind::Audio
+            })
+        );
     }
 
     #[test]

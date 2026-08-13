@@ -691,6 +691,18 @@ impl CollabWorker {
                     );
                     continue;
                 }
+                if let Err(error) = self
+                    .call_media_providers
+                    .execute_command(&cmd, existing_call_kind)
+                {
+                    tracing::warn!(
+                        target: "mackesd::collab",
+                        verb,
+                        error = %error,
+                        "refused signed call-state mutation after provider execution failed",
+                    );
+                    continue;
+                }
                 let events = match &cmd {
                     CollabCommand::LinkFile {
                         space,
@@ -3086,6 +3098,15 @@ mod tests {
     fn registered_call_media_provider_proves_frames_through_worker_publish() {
         struct WebRtcAudioProof;
         impl super::super::collab_media::CallMediaFrameVerifier for WebRtcAudioProof {
+            fn execute_command(
+                &self,
+                _command: &CollabCommand,
+                adapter: CallMediaAdapter,
+            ) -> Result<(), super::super::collab_media::CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                Ok(())
+            }
+
             fn prove_advancing_frames(
                 &self,
                 session: &mde_collab_types::CallMediaSession,
@@ -3213,6 +3234,70 @@ mod tests {
             assert_eq!(row.status, CallMediaVerificationStatus::ProviderUnavailable);
             assert!(row.evidence.is_none());
         }
+    }
+
+    #[test]
+    fn proof_only_provider_failure_never_authors_call_state() {
+        struct ProofOnlyProvider;
+        impl super::super::collab_media::CallMediaFrameVerifier for ProofOnlyProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &mde_collab_types::CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, super::super::collab_media::CallMediaProviderError>
+            {
+                Ok(CallMediaFrameEvidence {
+                    audio_frames: 99,
+                    video_frames: 0,
+                    screen_frames: 0,
+                    data_messages: 0,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut providers = super::super::collab_media::CallMediaProviderRegistry::empty();
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, ProofOnlyProvider)
+            .expect("register proof-only provider");
+        let w = worker(dir.path(), "alice").with_call_media_providers(providers);
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100);
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        let events_before_call = state.engine.all_events().len();
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::StartCall {
+                space,
+                call: CallId::new(),
+                kind: CallKind::Audio,
+            },
+        );
+        w.tick_once(&persist, &mut state, 300);
+
+        assert!(state
+            .engine
+            .projection()
+            .call_state(Some(space))
+            .expect("call state")
+            .active
+            .is_empty());
+        assert_eq!(
+            state.engine.all_events().len(),
+            events_before_call,
+            "the failed provider command must not append a signed call event"
+        );
     }
 
     /// Create a space (this node becomes Owner) and link `reference` into it as
