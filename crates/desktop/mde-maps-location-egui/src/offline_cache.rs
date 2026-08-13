@@ -4,7 +4,7 @@
 //! worker. Rendering code receives owned verified bytes or an explicit miss;
 //! it never downloads, scans, or validates files during a paint pass.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -21,6 +21,7 @@ const INDEX_SCHEMA: u16 = 2;
 const INDEX_FILE: &str = "index.json";
 const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
+const MAX_CACHE_TREE_ENTRIES: usize = MAX_ENTRIES * 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachePolicy {
@@ -143,11 +144,13 @@ impl OfflineTileCache {
             Err(CacheError::CorruptIndex(_)) => recover_corrupt_regular_index(&root)?,
             Err(error) => return Err(error),
         };
-        Ok(Self {
+        let mut cache = Self {
             root,
             policy,
             entries,
-        })
+        };
+        cache.reconcile_payloads()?;
+        Ok(cache)
     }
 
     #[must_use]
@@ -195,6 +198,7 @@ impl OfflineTileCache {
             .filter(|entry| {
                 entry.tile != tile
                     && entry.verified_at_ms <= now_ms
+                    && entry.last_access_ms <= now_ms
                     && now_ms.saturating_sub(entry.verified_at_ms) <= self.policy.max_age_ms
             })
             .cloned()
@@ -359,6 +363,74 @@ impl OfflineTileCache {
         }
         write_atomic(&self.root.join(INDEX_FILE), &bytes)
     }
+
+    fn reconcile_payloads(&mut self) -> Result<(), CacheError> {
+        let mut referenced = HashSet::with_capacity(self.entries.len());
+        let mut retained = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let path = tile_path(&self.root, &entry.tile, &entry.sha256)?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && metadata.len() == entry.byte_len =>
+                {
+                    referenced.insert(path);
+                    retained.push(entry.clone());
+                }
+                Ok(_) => quarantine_then_remove(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(CacheError::Io(error.to_string())),
+            }
+        }
+
+        if retained != self.entries {
+            self.persist_entries(&retained)?;
+            self.entries = retained;
+        }
+
+        for path in cache_tree_files(&self.root)? {
+            if path != self.root.join(INDEX_FILE) && !referenced.contains(&path) {
+                quarantine_then_remove(&path);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn cache_tree_files(root: &Path) -> Result<Vec<PathBuf>, CacheError> {
+    let mut files = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0_u8)];
+    let mut visited = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        for entry in
+            std::fs::read_dir(&directory).map_err(|error| CacheError::Io(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| CacheError::Io(error.to_string()))?;
+            visited = visited
+                .checked_add(1)
+                .ok_or(CacheError::Policy("cache tree entry count overflow"))?;
+            if visited > MAX_CACHE_TREE_ENTRIES {
+                return Err(CacheError::Policy("cache tree exceeds entry bound"));
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|error| CacheError::Io(error.to_string()))?;
+            if file_type.is_file() {
+                files.push(entry.path());
+            } else if file_type.is_dir() {
+                if depth >= 4 {
+                    return Err(CacheError::Policy("cache tree exceeds depth bound"));
+                }
+                pending.push((entry.path(), depth + 1));
+            } else {
+                // Symlinks and device nodes do not contribute regular payload
+                // bytes and remain unusable through the path-checked tile API.
+                // Leaving them in place also preserves fail-closed parent
+                // admission rather than following or deleting an external path.
+                continue;
+            }
+        }
+    }
+    Ok(files)
 }
 
 enum ReadFailure {
@@ -733,6 +805,60 @@ mod tests {
             cache = OfflineTileCache::open(dir.path(), policy).unwrap();
             assert!(cache.used_bytes() <= policy.quota_bytes);
         }
+    }
+
+    #[test]
+    fn restart_reconciles_orphans_and_future_lru_before_quota_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CachePolicy::bounded(6, 10_000).unwrap();
+        let admitted = catalog();
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        for (id, bytes, now) in [
+            (tile(0), b"aaa".as_slice(), 1),
+            (tile(1), b"bbb".as_slice(), 2),
+        ] {
+            cache
+                .store_verified(&admitted, id, bytes, &sha256_hex(bytes), now)
+                .unwrap();
+        }
+
+        let orphan_digest = sha256_hex(b"old");
+        let orphan = tile_path(dir.path(), &tile(0), &orphan_digest).unwrap();
+        std::fs::write(&orphan, b"old").unwrap();
+        let index_path = dir.path().join(INDEX_FILE);
+        let mut index: CacheIndex =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.tile == tile(1))
+            .unwrap()
+            .last_access_ms = 1_000_000;
+        std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+        cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        assert_eq!(cache.used_bytes(), 6);
+        assert!(
+            !orphan.exists(),
+            "same-size retired payload survived restart"
+        );
+        cache
+            .store_verified(&admitted, tile(2), b"ccc", &sha256_hex(b"ccc"), 3)
+            .unwrap();
+        assert_eq!(cache.used_bytes(), 6);
+        assert!(matches!(
+            cache.lookup(&admitted, &tile(0), 4),
+            OfflineTile::Verified { .. }
+        ));
+        assert!(matches!(
+            cache.lookup(&admitted, &tile(1), 4),
+            OfflineTile::Unavailable(UnavailableReason::NotIndexed)
+        ));
+
+        std::fs::write(&index_path, br#"{"schema":2,"entries":["#).unwrap();
+        cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        assert!(cache.is_empty());
+        assert_eq!(cache_tree_files(dir.path()).unwrap(), vec![index_path]);
     }
 
     #[test]
