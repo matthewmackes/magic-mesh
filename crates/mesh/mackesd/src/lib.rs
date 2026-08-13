@@ -220,6 +220,9 @@ pub mod worker;
 pub mod workload_reconciler;
 /// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
 pub mod worker_role;
+/// WL-ARCH-009 — generation-bound Action Console change-set admission.
+#[cfg(feature = "async-services")]
+pub mod worker_change_set;
 
 /// OW-2 — the `mackesd onboard` engine core (the self-test + role-provision
 /// verbs both onboarding front-ends drive). Feature-agnostic (pure fold + thin

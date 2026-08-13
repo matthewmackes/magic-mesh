@@ -593,6 +593,16 @@ pub struct WorkerSpec {
     pub resources: ResourceBudget,
     /// State, health, action, and cleanup ownership.
     pub ownership: RuntimeOwnership,
+    /// Canonical typed mutations exposed through the Action Console. Empty is
+    /// an explicit refusal: the executor may preview no action for this worker.
+    pub actions: &'static [WorkerActionSpec],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerActionSpec {
+    pub action: runtime::WorkerAction,
+    pub label: &'static str,
+    pub arming: runtime::WorkerArmingRequirement,
 }
 
 impl WorkerSpec {
@@ -626,6 +636,7 @@ impl WorkerSpec {
                 actions: group,
                 cleanup: defaults.cleanup,
             },
+            actions: &[],
         }
     }
 
@@ -1872,9 +1883,15 @@ pub fn worker_contract(
     };
     contract.ownership = ownership;
 
-    // WorkerSpec does not declare typed topics, dependencies, or action
-    // descriptors. Leave those collections empty rather than manufacturing
-    // endpoints that the daemon has not actually implemented.
+    contract.actions = worker
+        .actions
+        .iter()
+        .map(|action| runtime::WorkerActionDescriptor {
+            action: action.action,
+            label: action.label.to_string(),
+            arming: action.arming,
+        })
+        .collect();
     contract.admitted()
 }
 
