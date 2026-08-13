@@ -53,7 +53,7 @@ pub(crate) struct ActivityRow<'a> {
 
 impl ActivityRow<'_> {
     #[cfg(test)]
-    pub(crate) fn entry(&self) -> &'a ActivityEntry {
+    pub(crate) fn entry(&self) -> &ActivityEntry {
         self.entry
     }
 
@@ -248,7 +248,7 @@ pub(crate) enum ActivityRows<'a> {
 }
 
 #[cfg(test)]
-impl<'a> ActivityRows<'a> {
+impl ActivityRows<'_> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::All(entries) => entries.len(),
