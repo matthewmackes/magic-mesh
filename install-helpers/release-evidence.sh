@@ -907,7 +907,7 @@ validate_file() {
 }
 
 write_evidence() {
-  local out="" source_commit="" preview="" production="" sbom_manifest="" gate_manifest="" ci_gate_status="" resource_publisher_attestation="" topology_evidence="" vdi_evidence="" arg parent tmp binding topology_verification topology_descriptor farm
+  local out="" source_commit="" preview="" production="" sbom_manifest="" gate_manifest="" ci_gate_status="" resource_publisher_attestation="" topology_evidence="" vdi_evidence="" arg parent parent_identity current_parent_identity tmp binding topology_verification topology_descriptor farm
   local -a topology_verify_args=()
   local -a artifacts=() checks=() farm_jobs=() farm_slots=() sbom=()
   local -a fedora=() live_gates=() unavailable=()
@@ -1017,9 +1017,16 @@ write_evidence() {
   fi
 
   parent="$(dirname -- "$out")"
-  [ -d "$parent" ] || die "output parent does not exist: $parent"
+  [ -d "$parent" ] && [ ! -L "$parent" ] \
+    || die "output parent is not a non-symlink directory: $parent"
+  parent_identity="$(stat -Lc '%d:%i' -- "$parent")" \
+    || die "could not identify output parent: $parent"
+  if [ -e "$out" ] || [ -L "$out" ]; then
+    [ -f "$out" ] && [ ! -L "$out" ] \
+      || die "evidence output is not a regular, non-symlink file: $out"
+  fi
   tmp="$(mktemp "$parent/.release-evidence.XXXXXX")"
-  trap 'rm -f -- "$tmp"' RETURN
+  trap 'rm -f -- "$tmp" "$tmp.bound" "$tmp.artifacts" "$tmp.sbom" "$tmp.gate" "$tmp.ci-gate" "$tmp.resource-publisher-attestation" "$tmp.vdi" "$tmp.topology"' RETURN
 
   {
     for arg in "${artifacts[@]}"; do artifact_json "$arg"; done
@@ -1098,7 +1105,15 @@ write_evidence() {
   jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' "$tmp" >"$tmp.bound"
   mv -f -- "$tmp.bound" "$tmp"
   validate_file "$tmp" >/dev/null
-  mv -f -- "$tmp" "$out"
+  chmod 0644 -- "$tmp"
+  current_parent_identity="$(stat -Lc '%d:%i' -- "$parent" 2>/dev/null || true)"
+  [ ! -L "$parent" ] && [ "$current_parent_identity" = "$parent_identity" ] \
+    || die "output parent was replaced while evidence was prepared: $parent"
+  if [ -e "$out" ] || [ -L "$out" ]; then
+    [ -f "$out" ] && [ ! -L "$out" ] \
+      || die "evidence output changed type while it was prepared: $out"
+  fi
+  mv -fT -- "$tmp" "$out"
   trap - RETURN
   echo "release-evidence: wrote deterministic evidence to $out"
 }
@@ -1605,6 +1620,29 @@ EOF
     --live-gate dell-install=unavailable --unavailable 'live Dell visual signoff unavailable' \
     --preview-verdict pass --production-verdict not-promoted >/dev/null
   cmp -s "$evidence_a" "$evidence_b" || die "self-test: equivalent inputs were not deterministic"
+  [ "$(stat -c '%a' -- "$evidence_b")" = 644 ] \
+    || die "self-test: published release evidence did not receive deterministic 0644 permissions"
+
+  # Publication must never follow a caller-controlled output symlink. Preserve
+  # the symlink target byte-for-byte and require failure before replacement.
+  printf '%s\n' 'preserve-symlink-target' >"$work/evidence-output-target"
+  ln -s -- "$work/evidence-output-target" "$work/evidence-output-link"
+  set +e
+  "$0" write --out "$work/evidence-output-link" \
+    --source-commit 0123456789abcdef0123456789abcdef01234567 \
+    --artifact "$work/a.rpm" --artifact "$work/browser.rpm" \
+    --check github-cargo-test=not-run --check github-policy=pass --check github-required=pass \
+    --farm-job farm-job-1 --farm-job farm-job-2 \
+    --farm-slot 172.20.0.90/1 --farm-slot 172.20.0.130/3 \
+    --sbom rpm=pass --sbom-manifest "$work/sbom.json" \
+    --gate-manifest "$work/gates.json" --ci-gate-status "$ci_status" --fedora-target fedora-44=pass \
+    --live-gate dell-install=unavailable --unavailable 'live Dell visual signoff unavailable' \
+    --preview-verdict pass --production-verdict not-promoted >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -L "$work/evidence-output-link" ] \
+    && [ "$(<"$work/evidence-output-target")" = preserve-symlink-target ] \
+    || die "self-test: release evidence followed or replaced a hostile output symlink"
   symlink_artifact="$work/linked.rpm"
   ln -s -- "$work/a.rpm" "$symlink_artifact"
   set +e
