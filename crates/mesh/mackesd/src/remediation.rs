@@ -25,6 +25,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy_engine::Violation;
 
+/// Maximum number of candidate plan files inspected in one load.
+pub const MAX_REMEDIATION_PLAN_FILES: usize = 128;
+/// Maximum encoded size of one remediation plan.
+pub const MAX_REMEDIATION_PLAN_BYTES: u64 = 16 * 1024;
+/// Maximum number of static bindings admitted from one plan.
+pub const MAX_REMEDIATION_BINDINGS: usize = 32;
+const MAX_REMEDIATION_ID_BYTES: usize = 96;
+const MAX_REMEDIATION_VALUE_BYTES: usize = 512;
+
 /// One remediation plan: when policy `policy` is violated, fire job
 /// template `template` with `bindings` (static vars) plus the event
 /// vars bound from the violation.
@@ -71,27 +80,82 @@ pub fn remediation_dir(workgroup_root: &Path) -> PathBuf {
     workgroup_root.join("remediation")
 }
 
-/// Read every plan TOML (junk-tolerant), plus the built-in core pack
-/// (the W50 core policies' stock remediations). On-disk plans with the
-/// same `name` as a core plan override it.
+/// Read bounded, regular plan TOML files plus the built-in core pack.
+///
+/// One uniquely named, valid on-disk plan may override a core plan. Duplicate
+/// names are refused as a group instead of making filesystem enumeration order
+/// recovery authority. Symlinks, non-regular files, oversized files, and
+/// malformed or unbounded contracts are ignored.
 #[must_use]
 pub fn load_plans(workgroup_root: &Path) -> Vec<RemediationPlan> {
     let mut by_name: BTreeMap<String, RemediationPlan> = core_pack()
         .into_iter()
         .map(|p| (p.name.clone(), p))
         .collect();
+    let mut candidates = Vec::new();
     if let Ok(entries) = std::fs::read_dir(remediation_dir(workgroup_root)) {
-        for e in entries.filter_map(Result::ok) {
-            if e.path().extension().is_some_and(|x| x == "toml") {
-                if let Ok(raw) = std::fs::read_to_string(e.path()) {
-                    if let Ok(p) = toml::from_str::<RemediationPlan>(&raw) {
-                        by_name.insert(p.name.clone(), p);
-                    }
-                }
-            }
+        candidates.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+    }
+    candidates.sort();
+    candidates.truncate(MAX_REMEDIATION_PLAN_FILES);
+
+    let mut admitted: BTreeMap<String, Option<RemediationPlan>> = BTreeMap::new();
+    for path in candidates {
+        if path.extension().is_none_or(|extension| extension != "toml") {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_REMEDIATION_PLAN_BYTES {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        if raw.len() as u64 > MAX_REMEDIATION_PLAN_BYTES {
+            continue;
+        }
+        let Ok(raw) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        let Ok(plan) = toml::from_str::<RemediationPlan>(raw) else {
+            continue;
+        };
+        if !valid_plan(&plan) {
+            continue;
+        }
+        admitted
+            .entry(plan.name.clone())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(plan));
+    }
+    for (name, plan) in admitted {
+        if let Some(plan) = plan {
+            by_name.insert(name, plan);
         }
     }
     by_name.into_values().collect()
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REMEDIATION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_plan(plan: &RemediationPlan) -> bool {
+    valid_identifier(&plan.name)
+        && (plan.policy == "*" || valid_identifier(&plan.policy))
+        && valid_identifier(&plan.template)
+        && plan.bindings.len() <= MAX_REMEDIATION_BINDINGS
+        && plan.bindings.iter().all(|(key, value)| {
+            valid_identifier(key)
+                && value.len() <= MAX_REMEDIATION_VALUE_BYTES
+                && !key.starts_with("drift_")
+        })
 }
 
 /// The platform's stock remediations for the W50 core policies — both
@@ -282,5 +346,51 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_duplicate_symlink_and_unbounded_plans_cannot_substitute_recovery_authority() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = remediation_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let substituted = "name = \"resync-behind-node\"\npolicy = \"*\"\n\
+             template = \"hostile-recovery\"\nauto = true\n";
+        std::fs::write(dir.join("a.toml"), substituted).unwrap();
+        std::fs::write(dir.join("b.toml"), substituted.replace("hostile", "second")).unwrap();
+
+        let outside = tmp.path().join("outside.toml");
+        std::fs::write(
+            &outside,
+            "name = \"symlink-plan\"\npolicy = \"*\"\ntemplate = \"escape\"\nauto = true\n",
+        )
+        .unwrap();
+        symlink(&outside, dir.join("symlink.toml")).unwrap();
+
+        let oversized = std::fs::File::create(dir.join("oversized.toml")).unwrap();
+        oversized
+            .set_len(MAX_REMEDIATION_PLAN_BYTES + 1)
+            .unwrap();
+        std::fs::write(
+            dir.join("reserved-binding.toml"),
+            "name = \"reserved\"\npolicy = \"*\"\ntemplate = \"safe\"\nauto = true\n\
+             [bindings]\ndrift_peer = \"substituted\"\n",
+        )
+        .unwrap();
+
+        let plans = load_plans(tmp.path());
+        let core = plans
+            .iter()
+            .find(|plan| plan.name == "resync-behind-node")
+            .expect("duplicate override must leave the core authority intact");
+        assert_eq!(core.template, "reconcile-config");
+        assert!(!core.auto);
+        assert!(!plans.iter().any(|plan| {
+            matches!(plan.name.as_str(), "symlink-plan" | "reserved")
+                || plan.template.contains("hostile")
+                || plan.template.contains("second")
+        }));
     }
 }
