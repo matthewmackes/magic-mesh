@@ -344,6 +344,15 @@ main() {
         publish "skipped-syncthing-unconfigured"
     fi
 
+    # A successful start is only a point-in-time result.  Either configured
+    # substrate service can fail immediately after its bounded start while the
+    # physical link remains online.  Re-attest the complete configured pair
+    # before grouped workers can observe or publish state from a partial mesh.
+    if ! configured_substrate_ready; then
+        publish "substrate-lost-before-grouped"
+        return 1
+    fi
+
     publish "restoring-grouped-mackesd"
     # During boot the target can already be activating its six notify children;
     # let that bounded job settle. If it does not settle, perform additive
@@ -362,6 +371,13 @@ main() {
     if ! physical_network_online; then
         publish "offline-before-desktop"
         return 0
+    fi
+    # Group startup can outlive an etcd or Syncthing crash.  Do not repair XDG,
+    # start a shell, or report peer-return convergence from stale substrate
+    # readiness merely because the physical network stayed online.
+    if ! configured_substrate_ready; then
+        publish "substrate-lost-before-desktop"
+        return 1
     fi
     # Desktop bind repair is the final local mutation.  Keep it behind the
     # grouped readiness gate so a failed daemon/session recovery cannot report

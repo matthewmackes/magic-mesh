@@ -78,6 +78,10 @@ case "$1" in
                         if [ -f "$state/drop-after-groups-ready" ]; then
                             rm -f "$state/drop-after-groups-ready" "$state/online"
                         fi
+                        if [ -f "$state/drop-substrate-after-groups-ready" ]; then
+                            rm -f "$state/drop-substrate-after-groups-ready" \
+                                "$state/active-etcd.service"
+                        fi
                     fi
                 fi
                 ;;
@@ -117,6 +121,9 @@ case "$1" in
                 rm -f "$state/drop-after-etcd-start" "$state/online"
             elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-after-syncthing-start" ]; then
                 rm -f "$state/drop-after-syncthing-start" "$state/online"
+            elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-etcd-after-syncthing-start" ]; then
+                rm -f "$state/drop-etcd-after-syncthing-start" \
+                    "$state/active-etcd.service"
             fi
         elif [ "${2:-}" = mde-shell-egui.service ]; then
             printf '%s\n' "$2" >>"$state/mutations"
@@ -386,6 +393,29 @@ grep -Fq 'status=offline-after-syncthing' "$STATE/notifies"
 echo 'PASS Syncthing boundary fixture: link loss prevents grouped mutation'
 rm -f "$STATE/drop-after-syncthing-start"
 
+# Coordination can fail after Syncthing starts while the physical link remains
+# online.  The complete configured substrate must be re-attested before grouped
+# workers are allowed to start against a partial mesh.
+rm -f "$STATE"/active-etcd.service "$STATE"/active-syncthing.service \
+    "$STATE"/active-mackesd-*.service
+: >"$STATE/online"
+: >"$STATE/drop-etcd-after-syncthing-start"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+if run_helper; then
+    echo 'lost coordination unexpectedly allowed grouped recovery' >&2
+    exit 1
+fi
+cat >"$STATE/expected-mutations" <<'EOF'
+etcd.service
+syncthing.service
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=substrate-lost-before-grouped' "$STATE/notifies"
+rm -f "$STATE/drop-etcd-after-syncthing-start"
+: >"$STATE/active-etcd.service"
+echo 'PASS pre-grouped substrate fixture: lost coordination blocks grouped mutation'
+
 rm -f "$STATE"/active-mackesd-*.service "$STATE/group-ready-checks"
 : >"$STATE/online"
 : >"$STATE/target-activating"
@@ -425,6 +455,31 @@ fi
 grep -Fq 'status=offline-before-desktop' "$STATE/notifies"
 rm -f "$STATE/delay-groups" "$STATE/drop-after-groups-ready"
 echo 'PASS late-network fixture: desktop mutation waits for final link attestation'
+
+# Group startup can race a substrate crash even when the physical link remains
+# online.  Desktop recovery and its success publication must remain behind a
+# fresh complete-substrate attestation.
+rm -f "$STATE"/active-mackesd-*.service "$STATE/group-ready-checks" \
+    "$STATE/target-active"
+: >"$STATE/active-etcd.service"
+: >"$STATE/active-syncthing.service"
+: >"$STATE/delay-groups"
+: >"$STATE/drop-substrate-after-groups-ready"
+: >"$STATE/online"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+if run_helper; then
+    echo 'lost substrate unexpectedly allowed desktop recovery' >&2
+    exit 1
+fi
+if grep -Fqx xdg-binds "$STATE/mutations"; then
+    echo 'lost substrate allowed desktop mutation' >&2
+    exit 1
+fi
+grep -Fq 'status=substrate-lost-before-desktop' "$STATE/notifies"
+rm -f "$STATE/delay-groups" "$STATE/drop-substrate-after-groups-ready"
+: >"$STATE/active-etcd.service"
+echo 'PASS pre-desktop substrate fixture: lost coordination blocks desktop mutation'
 
 : >"$STATE/online"
 : >"$STATE/mutations"
