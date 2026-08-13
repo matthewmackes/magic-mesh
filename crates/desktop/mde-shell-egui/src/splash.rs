@@ -121,13 +121,55 @@ fn boot_services() -> Vec<BootService> {
         .collect()
 }
 
-fn boot_service_style(service: &BootService, blink: bool) -> (char, Color32) {
+/// Token-derived geometry for the responsive boot-service roster. Keeping the
+/// fold pure makes compact/wide behavior deterministic without a render fixture
+/// having to rediscover the layout from painted pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BootServiceLayout {
+    compact: bool,
+    row_h: f32,
+    gap: f32,
+    meter_w: f32,
+    label_chars: usize,
+}
+
+fn boot_service_layout(width: f32) -> BootServiceLayout {
+    // Seventeen XL steps plus one M step preserves the established 560 pt collapse
+    // boundary while making its relationship to the shared spacing ladder
+    // explicit. The dimensions below likewise preserve the existing rendered
+    // geometry exactly, but no longer form a local spacing/type scale.
+    let compact = width < Style::SP_XL * 17.0 + Style::SP_M;
+    BootServiceLayout {
+        compact,
+        row_h: if compact {
+            Style::HEADING + Style::SP_XS * 0.25
+        } else {
+            Style::SP_L
+        },
+        gap: if compact {
+            Style::SP_XS * 0.75
+        } else {
+            Style::SP_XS
+        },
+        meter_w: if compact {
+            Style::HEADING * 2.0 + Style::SP_XS * 0.5
+        } else {
+            Style::SP_L * 3.0 + Style::SP_XS
+        },
+        label_chars: if compact { 24 } else { usize::MAX },
+    }
+}
+
+fn boot_service_style(ctx: &egui::Context, service: &BootService, blink: bool) -> (char, Color32) {
     match service.active.as_str() {
-        "active" => ('✓', Style::SUPPORT_SUCCESS),
-        "failed" if blink => ('✕', Style::SUPPORT_ERROR),
-        "failed" => ('✕', Style::SUPPORT_ERROR.gamma_multiply(0.65)),
-        "skipped" | "inactive" => ('·', Style::TEXT_DIM),
-        _ => ('◌', Style::SUPPORT_WARNING),
+        "active" => ('✓', Style::resolve_color(ctx, Style::SUPPORT_SUCCESS)),
+        "failed" if blink => ('✕', Style::resolve_color(ctx, Style::SUPPORT_ERROR)),
+        "failed" => (
+            '✕',
+            Style::resolve_color(ctx, Style::SUPPORT_ERROR).gamma_multiply(0.65),
+        ),
+        "skipped" | "inactive" => ('·', Style::resolve_color(ctx, Style::TEXT_DIM)),
+        _ => ('◌', Style::resolve_color(ctx, Style::SUPPORT_WARNING)),
     }
 }
 
@@ -141,23 +183,24 @@ fn paint_boot_services(
     if services.is_empty() {
         return;
     }
-    let compact = free.width() < 560.0;
-    let row_h = if compact { 21.0 } else { 24.0 };
-    let gap = if compact { 3.0 } else { 4.0 };
+    let layout = boot_service_layout(free.width());
+    let surface = Style::resolve_color(ctx, Style::SURFACE);
+    let background = Style::resolve_color(ctx, Style::BG);
+    let text = Style::resolve_color(ctx, Style::TEXT);
+    let text_dim = Style::resolve_color(ctx, Style::TEXT_DIM);
     let top = track.bottom() + Style::SP_M;
     let available_h = (free.bottom() - top - Style::SP_M).max(0.0);
-    let max_rows = (available_h / (row_h + gap)).floor() as usize;
+    let max_rows = (available_h / (layout.row_h + layout.gap)).floor() as usize;
     let count = services.len().min(max_rows.max(1));
     let blink = (ctx.input(|input| input.time) * 2.0) as u64 % 2 == 0;
-    let meter_w = if compact { 42.0 } else { 76.0 };
     for (index, service) in services.iter().take(count).enumerate() {
-        let y = top + index as f32 * (row_h + gap);
+        let y = top + index as f32 * (layout.row_h + layout.gap);
         let row = Rect::from_min_max(
             egui::pos2(free.left() + Style::SP_M, y),
-            egui::pos2(free.right() - Style::SP_M, y + row_h),
+            egui::pos2(free.right() - Style::SP_M, y + layout.row_h),
         );
-        painter.rect_filled(row, Style::RADIUS_S, Style::SURFACE);
-        let (glyph, color) = boot_service_style(service, blink);
+        painter.rect_filled(row, Style::RADIUS_S, surface);
+        let (glyph, color) = boot_service_style(ctx, service, blink);
         painter.text(
             egui::pos2(row.left() + Style::SP_S, row.center().y),
             Align2::LEFT_CENTER,
@@ -165,16 +208,20 @@ fn paint_boot_services(
             Style::typography_font(TypographyRole::Label),
             color,
         );
-        let label_max = (row.width() - meter_w - Style::SP_XL * 1.5).max(24.0);
-        let label = if compact {
-            service.label.chars().take(24).collect::<String>()
+        let label_max = (row.width() - layout.meter_w - Style::SP_XL * 1.5).max(Style::SP_L);
+        let label = if layout.compact {
+            service
+                .label
+                .chars()
+                .take(layout.label_chars)
+                .collect::<String>()
         } else {
             service.label.clone()
         };
         let galley = painter.layout_job(Style::typography_job(
             &label,
             TypographyRole::Caption,
-            Style::TEXT,
+            text,
             label_max,
         ));
         painter.galley(
@@ -183,17 +230,20 @@ fn paint_boot_services(
                 row.center().y - galley.size().y / 2.0,
             ),
             galley,
-            Style::TEXT,
+            text,
         );
         let meter = Rect::from_min_max(
             egui::pos2(
-                row.right() - meter_w - Style::SP_S,
-                row.top() + row_h * 0.33,
+                row.right() - layout.meter_w - Style::SP_S,
+                row.top() + layout.row_h * 0.33,
             ),
-            egui::pos2(row.right() - Style::SP_S, row.bottom() - row_h * 0.33),
+            egui::pos2(
+                row.right() - Style::SP_S,
+                row.bottom() - layout.row_h * 0.33,
+            ),
         );
         let filled = service.active == "active";
-        painter.rect_filled(meter, Style::RADIUS_S, Style::BG);
+        painter.rect_filled(meter, Style::RADIUS_S, background);
         if filled {
             painter.rect_filled(meter, Style::RADIUS_S, color.gamma_multiply(0.8));
         } else if service.active != "failed" && service.active != "skipped" {
@@ -219,7 +269,7 @@ fn paint_boot_services(
             Align2::CENTER_BOTTOM,
             format!("+{} more node services", services.len() - count),
             Style::typography_font(TypographyRole::Caption),
-            Style::TEXT_DIM,
+            text_dim,
         );
     }
 }
@@ -604,6 +654,67 @@ mod tests {
         s.complete(Milestone::MeshSnapshot);
         assert_eq!(s.progress(), 1.0);
         assert!(s.finished());
+    }
+
+    /// UX-009: the boot roster has one shared-style geometry fold at both
+    /// responsive widths, and semantic ink follows the installed appearance.
+    #[test]
+    fn splash_boot_service_layout_is_shared_style_responsive_and_appearance_aware() {
+        let compact = boot_service_layout(Style::SP_XL * 10.0);
+        let wide = boot_service_layout(Style::SP_XL * 20.0);
+
+        assert_eq!(
+            compact,
+            BootServiceLayout {
+                compact: true,
+                row_h: Style::HEADING + Style::SP_XS * 0.25,
+                gap: Style::SP_XS * 0.75,
+                meter_w: Style::HEADING * 2.0 + Style::SP_XS * 0.5,
+                label_chars: 24,
+            }
+        );
+        assert_eq!(
+            wide,
+            BootServiceLayout {
+                compact: false,
+                row_h: Style::SP_L,
+                gap: Style::SP_XS,
+                meter_w: Style::SP_L * 3.0 + Style::SP_XS,
+                label_chars: usize::MAX,
+            }
+        );
+        assert!(compact.meter_w < wide.meter_w);
+
+        let service = BootService {
+            unit: "mde-shell.service".to_owned(),
+            label: "Construct shell".to_owned(),
+            active: "active".to_owned(),
+            sub: "running".to_owned(),
+            result: "success".to_owned(),
+        };
+        let dark = egui::Context::default();
+        Style::install(&dark);
+        let light = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &light,
+            mde_egui::StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        let (_, dark_tone) = boot_service_style(&dark, &service, false);
+        let (_, light_tone) = boot_service_style(&light, &service, false);
+        assert_eq!(
+            dark_tone,
+            Style::resolve_color(&dark, Style::SUPPORT_SUCCESS)
+        );
+        assert_eq!(
+            light_tone,
+            Style::resolve_color(&light, Style::SUPPORT_SUCCESS)
+        );
+        assert_ne!(
+            Style::resolve_color(&dark, Style::SURFACE),
+            Style::resolve_color(&light, Style::SURFACE),
+            "the roster must not pin the dark surface in Light appearance"
+        );
     }
 
     /// Drive headless splash frames through the same `Context::run` →
