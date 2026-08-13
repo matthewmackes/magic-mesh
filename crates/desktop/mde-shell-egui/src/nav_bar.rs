@@ -48,6 +48,10 @@ const FLOATING_GAP: f32 = 4.0;
 const OVERFLOW_W: f32 = 256.0;
 /// Gap between the More anchor and its overflow surface.
 const OVERFLOW_GAP: f32 = 4.0;
+/// Vertical breathing room around a wrapped overflow label.  The taskbar
+/// itself remains the operator-locked 48px/icon-only chrome; only the textual
+/// More surface grows when the configured label face is enlarged.
+const OVERFLOW_LABEL_PAD_Y: f32 = 12.0;
 /// Maximum number of chooser-pinned sources shown in the dock. The full
 /// chooser remains the unbounded discovery surface; the dock is a quick rail.
 const MAX_PINNED_SOURCES: usize = 8;
@@ -1881,6 +1885,31 @@ fn docked_control_fits_before_pin(
     cursor_y + CONTROL_EDGE <= content_bottom
 }
 
+/// Fixed action order for a vertical rail.  A short/large-text logical
+/// viewport keeps the three orientation actions first; taller rails retain the
+/// familiar Bottom order.  Both profiles contain the exact same typed
+/// authorities, so responsive layout can neither duplicate nor silently
+/// replace an action.
+fn docked_fixed_controls(screen_height: f32) -> [(ControlKind, Option<Surface>); 5] {
+    if screen_height <= 400.0 {
+        [
+            (ControlKind::Start, None),
+            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
+            (ControlKind::Back, None),
+            (ControlKind::Search, None),
+            (ControlKind::Home, None),
+        ]
+    } else {
+        [
+            (ControlKind::Start, None),
+            (ControlKind::Search, None),
+            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
+            (ControlKind::Back, None),
+            (ControlKind::Home, None),
+        ]
+    }
+}
+
 fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     docked_geometry_for_catalog(screen, pinned_count, &default_taskbar_pins())
 }
@@ -1912,24 +1941,7 @@ fn docked_geometry_for_catalog_with_sessions(
     // remote viewport cannot strand the profile in Left mode after restart.
     let pin_rect = docked_pin_rect(screen, outer);
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
-    let fixed_controls = if screen.height() <= 400.0 {
-        [
-            (ControlKind::Start, None),
-            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
-            (ControlKind::Back, None),
-            (ControlKind::Search, None),
-            (ControlKind::Home, None),
-        ]
-    } else {
-        [
-            (ControlKind::Start, None),
-            (ControlKind::Search, None),
-            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
-            (ControlKind::Back, None),
-            (ControlKind::Home, None),
-        ]
-    };
-    for (kind, surface) in fixed_controls {
+    for (kind, surface) in docked_fixed_controls(screen.height()) {
         // A short portrait/remote viewport may not have room for the complete
         // fixed cluster. Admit controls one at a time so the Left rail never
         // paints a hit target outside its owned display rect; the remaining
@@ -2220,11 +2232,20 @@ fn overflow_layout_for(
     anchor: egui::Rect,
     screen: egui::Rect,
     item_count: usize,
+    label_font_size: f32,
 ) -> OverflowLayout {
     let width = OVERFLOW_W.min((screen.width() - 2.0 * Style::SP_S).max(CONTROL_EDGE));
     let row_gap = Style::SP_XS;
+    // A largest-text profile must not clip the only discoverable labels for
+    // overflowed apps/sessions.  Reject non-finite style input by falling back
+    // to the normal 40px target rather than publishing hostile geometry.
+    let row_height = if label_font_size.is_finite() && label_font_size > 0.0 {
+        CONTROL_EDGE.max((label_font_size + OVERFLOW_LABEL_PAD_Y).ceil())
+    } else {
+        CONTROL_EDGE
+    };
     let height = 2.0 * Style::SP_S
-        + item_count as f32 * CONTROL_EDGE
+        + item_count as f32 * row_height
         + item_count.saturating_sub(1) as f32 * row_gap;
     let top_margin = Style::SP_S;
     let bottom_margin = Style::SP_S;
@@ -2239,9 +2260,9 @@ fn overflow_layout_for(
             egui::Rect::from_min_size(
                 egui::pos2(
                     outer.left() + Style::SP_S,
-                    outer.top() + Style::SP_S + index as f32 * (CONTROL_EDGE + row_gap),
+                    outer.top() + Style::SP_S + index as f32 * (row_height + row_gap),
                 ),
-                egui::vec2((width - 2.0 * Style::SP_S).max(CONTROL_EDGE), CONTROL_EDGE),
+                egui::vec2((width - 2.0 * Style::SP_S).max(CONTROL_EDGE), row_height),
             )
         })
         .collect();
@@ -2257,7 +2278,12 @@ fn paint_overflow_popup(
     connected_sessions: &[SessionRailEntry],
     action: &mut Option<Action>,
 ) {
-    let layout = overflow_layout_for(anchor, ui.ctx().screen_rect(), items.len());
+    let layout = overflow_layout_for(
+        anchor,
+        ui.ctx().screen_rect(),
+        items.len(),
+        Style::typography_font(TypographyRole::Label).size * ui.ctx().zoom_factor().max(1.0),
+    );
     ui.set_min_width(layout.outer.width());
     ui.set_min_height(layout.outer.height() - 2.0 * Style::SP_S);
     let text = Style::resolve_color(ui.ctx(), Style::TEXT);
@@ -3406,7 +3432,12 @@ mod tests {
     fn overflow_layout_keeps_rows_inside_the_screen_at_40px() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
         let anchor = egui::Rect::from_min_size(egui::pos2(272.0, 192.0), egui::vec2(40.0, 40.0));
-        let layout = overflow_layout_for(anchor, screen, 3);
+        let layout = overflow_layout_for(
+            anchor,
+            screen,
+            3,
+            Style::typography_font(TypographyRole::Label).size,
+        );
         assert!(screen.contains(layout.outer.min));
         assert!(screen.contains(layout.outer.max));
         assert_eq!(layout.rows.len(), 3);
@@ -3416,6 +3447,102 @@ mod tests {
                 && layout.outer.contains(row.min)
                 && layout.outer.contains(row.max)
         }));
+    }
+
+    #[test]
+    fn responsive_bottom_left_and_largest_text_keep_one_of_every_required_action() {
+        let profiles = [
+            ("compact-bottom", DockMode::Floating, 480.0, 320.0, 1.0),
+            ("portrait-left", DockMode::Docked, 480.0, 800.0, 1.0),
+            ("desktop-bottom", DockMode::Floating, 1280.0, 800.0, 1.0),
+            // Text zoom reduces the logical viewport.  Model that exact
+            // constraint instead of claiming coverage from a larger physical
+            // framebuffer whose geometry never changed.
+            ("largest-text-left", DockMode::Docked, 480.0, 400.0, 2.0),
+        ];
+
+        for (name, mode, width, height, text_scale) in profiles {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+            let geometry = match mode {
+                DockMode::Floating => floating_geometry_for_catalog(screen, 0, &[]),
+                DockMode::Docked => docked_geometry_for_catalog(screen, 0, &[]),
+            };
+
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
+                    .filter(|control| control.kind == ControlKind::Start)
+                    .count(),
+                1,
+                "{name}: Start authority"
+            );
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
+                    .filter(|control| control.kind == ControlKind::Search)
+                    .count(),
+                1,
+                "{name}: Search authority"
+            );
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
+                    .filter(|control| control.kind == ControlKind::Back)
+                    .count(),
+                1,
+                "{name}: Back authority"
+            );
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
+                    .filter(|control| control.kind == ControlKind::Home)
+                    .count(),
+                1,
+                "{name}: Home authority"
+            );
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
+                    .filter(|control| {
+                        control.kind == ControlKind::SurfaceLauncher
+                            && control.surface == Some(Surface::InfraCode)
+                    })
+                    .count(),
+                1,
+                "{name}: Workloads authority"
+            );
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
+                    .filter(|control| control.kind == ControlKind::Pin)
+                    .count(),
+                1,
+                "{name}: placement authority"
+            );
+            assert_hit_targets_inside_backing(name.to_owned(), &geometry);
+
+            if text_scale > 1.0 {
+                let anchor = geometry
+                    .controls
+                    .iter()
+                    .find(|control| control.kind == ControlKind::Pin)
+                    .expect("placement anchor")
+                    .rect;
+                let font_size = Style::typography_font(TypographyRole::Label).size * text_scale;
+                let overflow = overflow_layout_for(anchor, screen, 2, font_size);
+                assert!(overflow
+                    .rows
+                    .iter()
+                    .all(|row| row.height() >= font_size + OVERFLOW_LABEL_PAD_Y));
+                assert!(screen.contains_rect(overflow.outer));
+            }
+        }
     }
 
     #[test]
