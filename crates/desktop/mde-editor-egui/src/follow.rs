@@ -81,12 +81,17 @@ pub fn apply_follow(update: &FollowUpdate, view: &mut EditorView, buffer: &Buffe
 /// follow at the session layer — the pill is the *discoverable* exit, not the
 /// only one.
 pub fn follow_banner(ui: &mut egui::Ui, name: &str) -> bool {
+    // A custom button does not inherit palette remapping for explicitly
+    // supplied colors, so resolve every semantic token at the render boundary.
+    let accent_hi = Style::resolve_color(ui.ctx(), Style::ACCENT_HI);
+    let surface_hi = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
+    let accent = Style::resolve_color(ui.ctx(), Style::ACCENT);
     let text = RichText::new(format!("Following {name} — click to stop"))
         .size(Style::SMALL)
-        .color(Style::ACCENT_HI);
+        .color(accent_hi);
     let pill = egui::Button::new(text)
-        .fill(Style::SURFACE_HI)
-        .stroke(Stroke::new(BANNER_STROKE_W, Style::ACCENT));
+        .fill(surface_hi)
+        .stroke(Stroke::new(BANNER_STROKE_W, accent));
     editor_hover_text(ui.add(pill), "Typing or editing also stops following").clicked()
 }
 
@@ -97,7 +102,34 @@ mod tests {
     use crate::collab_session::{CursorPos, FollowUpdate, Viewport};
     use crate::widget::EditorView;
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::Style;
+    use mde_egui::{Density, Style, StyleColorScheme};
+
+    fn painted_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, colors: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    colors.push(rect.fill);
+                    colors.push(rect.stroke.color);
+                }
+                egui::Shape::Text(text) => {
+                    colors.push(text.fallback_color);
+                    colors.extend(text.galley.job.sections.iter().map(|s| s.format.color));
+                }
+                egui::Shape::Vec(nested) => {
+                    for shape in nested {
+                        walk(shape, colors);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut colors = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut colors);
+        }
+        colors
+    }
 
     /// A follow update naming peer `p` with the given cursor/viewport.
     fn update(cursor: Option<CursorPos>, viewport: Option<Viewport>) -> FollowUpdate {
@@ -223,6 +255,50 @@ mod tests {
         assert!(
             !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
             "the banner produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_banner_resolves_every_custom_color_into_quazar_light() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = follow_banner(ui, "Ada");
+            });
+        });
+        let colors = painted_colors(&out.shapes);
+
+        assert!(
+            colors.contains(&palette.surface_hi),
+            "missing Light raised surface"
+        );
+        assert!(
+            colors.contains(&Style::resolve_color_for_scheme(
+                StyleColorScheme::Light,
+                Style::ACCENT,
+            )),
+            "missing Light accent outline"
+        );
+        assert!(
+            colors.contains(&Style::resolve_color_for_scheme(
+                StyleColorScheme::Light,
+                Style::ACCENT_HI,
+            )),
+            "missing Light high-accent label"
+        );
+        assert!(
+            !colors.contains(&Style::SURFACE_HI),
+            "retained Dark surface token"
+        );
+        assert!(
+            !colors.contains(&Style::ACCENT),
+            "retained Dark accent token"
         );
     }
 }
