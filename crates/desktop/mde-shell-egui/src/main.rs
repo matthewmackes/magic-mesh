@@ -2756,6 +2756,15 @@ impl Shell {
                     )
                     .map(|target| target.with_live_workloads_state(self.infra_code.states()));
                 self.web.sync_browser_vm_target(target);
+                if let Some(target) = self.web.browser_vm_target() {
+                    if self.vdi.sync_browser_rdp_attachment(
+                        target,
+                        &self.local_host,
+                        mde_bus::client_data_dir().as_deref(),
+                    ) {
+                        self.nav.surface = Surface::Desktop;
+                    }
+                }
                 self.web
                     .drive_browser_vm_lifecycle(mde_bus::client_data_dir().as_deref());
                 if self.web.take_browser_vm_projection_refresh_request() {

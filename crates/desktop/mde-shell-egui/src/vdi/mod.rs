@@ -3782,6 +3782,10 @@ pub(crate) struct VdiState {
     /// catalog. Snapshot ingestion happens outside [`vdi_panel`]; painting this
     /// model never reaches Bus, a backend, or the network.
     remote_sessions: RemoteSessionsModel,
+    /// Exact expiring Workloads authority for the Browser VM's released RDP
+    /// alternate. The adapter owns no VM lifecycle and is discarded as soon as
+    /// the authoritative projection stops reproducing the same lease.
+    browser_transport_authority: Option<browser_transport::BrowserTransportAuthority>,
     /// The connected desktop, or `None` when nothing is attached (the EmptyState).
     session: Option<Session>,
     /// The GPU texture the desktop framebuffer lives in — allocated on the first
@@ -3881,6 +3885,67 @@ pub(crate) struct VdiState {
 }
 
 impl VdiState {
+    /// Admit or revoke the Browser VM's typed RDP alternate from the current
+    /// Workloads projection. This never invents an endpoint or credential from
+    /// UI text: the workload node is the authenticated mesh endpoint and the
+    /// one-use lease is the presentation authority.
+    pub(crate) fn sync_browser_rdp_attachment(
+        &mut self,
+        target: &crate::web::BrowserVmTarget,
+        local_node: &str,
+        bus_root: Option<&Path>,
+    ) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+        let admitted = bus_root
+            .and_then(|root| Persist::open(root.to_path_buf()).ok())
+            .and_then(|persist| {
+                crate::workload_api::read_status(&persist, &target.serving_peer, &target.workload)
+            })
+            .and_then(|status| {
+                browser_transport::BrowserTransportAuthority::admit(
+                    target, local_node, &status, now_ms,
+                )
+                .ok()
+            });
+
+        if admitted == self.browser_transport_authority {
+            return false;
+        }
+
+        if self.browser_transport_authority.take().is_some() {
+            self.clear_target();
+        }
+        let Some(authority) = admitted else {
+            return false;
+        };
+        self.request_connect(authority.connect_request());
+        self.browser_transport_authority = Some(authority);
+        true
+    }
+
+    fn revalidate_browser_rdp_attachment(&mut self) {
+        let Some(authority) = self.browser_transport_authority.as_ref() else {
+            return;
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+        let still_authorized = mde_bus::client_data_dir()
+            .and_then(|root| Persist::open(root).ok())
+            .and_then(|persist| {
+                crate::workload_api::read_status(&persist, authority.node(), "browser-vm")
+            })
+            .is_some_and(|status| authority.still_authorized(&status, now_ms));
+        if !still_authorized {
+            self.clear_target();
+        }
+    }
     /// Replace the Remote Sessions browser input with one already bounded and
     /// semantically admitted universal resource-catalog snapshot.
     pub(crate) fn install_resource_catalog(
@@ -4314,6 +4379,7 @@ impl VdiState {
             self.negotiated_size = None;
         }
         self.requested = None;
+        self.browser_transport_authority = None;
         self.route_status = None;
     }
 
@@ -4838,6 +4904,7 @@ fn upload_frame(
 /// fill the body, and forward this frame's egui input to the guest. With no
 /// session attached it draws the honest "no desktop" EmptyState instead.
 pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
+    state.revalidate_browser_rdp_attachment();
     state.metrics.note_shell_repaint();
     #[cfg(feature = "live-vdi")]
     {
@@ -5405,6 +5472,8 @@ use pointer::*;
 
 mod resources;
 use resources::RemoteSessionsModel;
+
+mod browser_transport;
 
 #[cfg(test)]
 mod tests;

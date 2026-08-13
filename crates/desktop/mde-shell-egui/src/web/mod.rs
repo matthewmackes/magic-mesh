@@ -314,6 +314,11 @@ impl Default for WebState {
 }
 
 impl WebState {
+    /// Current governed Browser VM target, exposed only to the typed VDI
+    /// attachment adapter. It contains no endpoint or credential material.
+    pub(crate) const fn browser_vm_target(&self) -> Option<&BrowserVmTarget> {
+        self.latest_target.as_ref()
+    }
     /// Keep the shell's existing test seam without reinstating a Browser-owned
     /// transfer ledger. Transfers remain owned by Files/Transfers.
     #[cfg(test)]

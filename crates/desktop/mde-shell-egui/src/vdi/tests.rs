@@ -35,6 +35,14 @@ fn run_panel(state: &mut VdiState, input: egui::RawInput) -> bool {
 }
 
 fn write_browser_workload_status(root: &std::path::Path, node: &str) {
+    write_browser_workload_status_with_attachment(root, node, None);
+}
+
+fn write_browser_workload_status_with_attachment(
+    root: &std::path::Path,
+    node: &str,
+    attachment: Option<mackes_mesh_types::workloads::WorkloadAttachmentLease>,
+) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -60,7 +68,7 @@ fn write_browser_workload_status(root: &std::path::Path, node: &str) {
             next_retry_at_ms: 0,
             reason: None,
             remediation: None,
-            attachment: None,
+            attachment,
         }],
     };
     let body = serde_json::to_string(&snapshot).expect("typed Workloads snapshot");
@@ -73,6 +81,62 @@ fn write_browser_workload_status(root: &std::path::Path, node: &str) {
             Some(&body),
         )
         .expect("publish Workloads snapshot");
+}
+
+#[test]
+fn browser_rdp_alternate_requires_exact_live_workloads_lease_and_revokes_on_replacement() {
+    let bus = tempfile::tempdir().expect("Browser Workloads Bus");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let lease = mackes_mesh_types::workloads::WorkloadAttachmentLease {
+        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        lease_id: "browser-rdp-lease-7".into(),
+        nonce: "browser-rdp-nonce-7".into(),
+        workload_id: WorkloadId::new("browser-vm").expect("workload id"),
+        generation: 7,
+        protocol: WorkloadAttachmentProtocol::Rdp,
+        expires_at_ms: now_ms + 10_000,
+    };
+    write_browser_workload_status_with_attachment(bus.path(), "dell", Some(lease.clone()));
+    let target = crate::web::BrowserVmTarget {
+        serving_peer: "dell".into(),
+        workload: "browser-vm".into(),
+        status: "running".into(),
+        reachable: true,
+    };
+    let mut state = VdiState::default();
+
+    assert!(state.sync_browser_rdp_attachment(&target, "seat-170", Some(bus.path())));
+
+    let request = state.requested.as_ref().expect("admitted RDP alternate");
+    assert_eq!(request.protocol, VdiProtocol::Rdp);
+    assert_eq!(
+        request.target.endpoint.as_ref().map(|value| value.port),
+        Some(3389)
+    );
+    assert!(matches!(request.auth, DesktopAuth::MeshIdentity { .. }));
+    let session = request
+        .broker_session
+        .as_ref()
+        .expect("exact Workloads session identity");
+    assert!(session
+        .id
+        .contains("browser-existing:7:browser-rdp-lease-7"));
+
+    let mut replacement = lease;
+    replacement.lease_id = "hostile-replacement".into();
+    replacement.nonce = "hostile-replacement-nonce".into();
+    replacement.generation = 8;
+    write_browser_workload_status_with_attachment(bus.path(), "dell", Some(replacement));
+    assert!(!state.sync_browser_rdp_attachment(&target, "seat-170", Some(bus.path())));
+
+    assert!(
+        state.requested.is_none(),
+        "a generation-substituted lease must revoke the installed transport"
+    );
+    assert!(state.browser_transport_authority.is_none());
 }
 
 fn governed_android_handoff(now_ms: u64) -> crate::iac::AndroidVdiHandoff {
