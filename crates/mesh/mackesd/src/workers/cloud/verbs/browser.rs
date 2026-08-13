@@ -67,7 +67,7 @@ fn build_reply(
             return reject(
                 verb_name,
                 format!(
-                    "browser-provision could not verify the existing desired state for `{name}` on `{node}`; nothing changed: {error}"
+                    "browser-provision could not persist `{name}` on `{node}` because it could not verify the existing desired state; nothing changed: {error}"
                 ),
             );
         }

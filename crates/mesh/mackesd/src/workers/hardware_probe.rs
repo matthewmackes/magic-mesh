@@ -38,6 +38,7 @@ use mackes_mesh_types::peer_probe::{
 pub const TICK: Duration = Duration::from_secs(300);
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_POWER_SUPPLIES: usize = 64;
 
 /// Run one command, returning trimmed stdout lines (empty on any failure).
 fn cmd_lines(bin: &str, args: &[&str]) -> Vec<String> {
@@ -90,8 +91,53 @@ pub fn parse_first_pci_id(lspci_n: &str) -> (String, String) {
 }
 
 /// Read a `/sys/class/power_supply` integer file, if present.
-fn read_sys_u8(path: &str) -> Option<u8> {
+fn read_sys_u8(path: &Path) -> Option<u8> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Discover power state by the kernel's typed power-supply interface rather
+/// than assuming firmware-specific `BAT0`/`AC` names.
+///
+/// Entries are sorted and bounded before reads so a hostile or broken sysfs
+/// mount cannot make this credential-free observation provider unbounded. The
+/// first valid battery is the stable summary source; any online non-battery
+/// supply establishes external power.
+fn gather_power(power_supply_root: &Path) -> (Option<u8>, bool) {
+    let mut entries = std::fs::read_dir(power_supply_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .ok()
+                        .map(|name| (name, entry.path()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    entries.truncate(MAX_POWER_SUPPLIES);
+
+    let mut battery_pct = None;
+    let mut saw_battery = false;
+    let mut on_ac = false;
+    for (_, path) in entries {
+        let supply_type = std::fs::read_to_string(path.join("type")).unwrap_or_default();
+        if supply_type.trim() == "Battery" {
+            saw_battery = true;
+            if battery_pct.is_none() {
+                battery_pct = read_sys_u8(&path.join("capacity")).filter(|value| *value <= 100);
+            }
+        } else if read_sys_u8(&path.join("online")) == Some(1) {
+            on_ac = true;
+        }
+    }
+
+    // A machine with no battery is conventionally externally powered. When a
+    // battery exists, absence of an online supply must not fabricate AC power.
+    (battery_pct, on_ac || !saw_battery)
 }
 
 /// Gather this node's hardware probe. Pure-ish (shells read-only tools).
@@ -111,11 +157,7 @@ pub fn gather(node_id: &str) -> PeerProbe {
     let (vendor_id, product_id) = parse_first_pci_id(&cmd_lines("lspci", &["-n"]).join("\n"));
 
     // Power: best-effort sysfs read (laptop) — None on a server/desktop.
-    let battery_pct = read_sys_u8("/sys/class/power_supply/BAT0/capacity")
-        .or_else(|| read_sys_u8("/sys/class/power_supply/BAT1/capacity"));
-    let on_ac = read_sys_u8("/sys/class/power_supply/AC/online")
-        .or_else(|| read_sys_u8("/sys/class/power_supply/ACAD/online"))
-        .map_or_else(|| battery_pct.is_none(), |v| v == 1);
+    let (battery_pct, on_ac) = gather_power(Path::new("/sys/class/power_supply"));
 
     let sysfs_classes = std::fs::read_dir("/sys/class")
         .map(|rd| {
@@ -195,9 +237,9 @@ fn publish(workgroup_root: &Path, node_id: &str) {
 /// regular residue from an interrupted prior write may be reclaimed; every
 /// other occupant fails closed and leaves the prior `probe.json` untouched.
 fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
-    use rustix::fs::{Mode, OFlags};
 
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -224,11 +266,7 @@ fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
     let fd = rustix::fs::open(
         &temporary,
-        OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::WRONLY
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
     )?;
     let mut file = std::fs::File::from(fd);
@@ -343,16 +381,44 @@ mod tests {
         assert_eq!(back.peer_id, "peer:test-node");
     }
 
+    #[test]
+    fn power_probe_is_typed_deterministic_and_bounded() {
+        let sysfs = tempfile::tempdir().unwrap();
+        for index in 0..MAX_POWER_SUPPLIES + 8 {
+            let supply = sysfs.path().join(format!("z-noise-{index:03}"));
+            std::fs::create_dir(&supply).unwrap();
+            std::fs::write(supply.join("type"), "USB\n").unwrap();
+            std::fs::write(supply.join("online"), "0\n").unwrap();
+        }
+        let overflow_source = sysfs.path().join("zz-overflow-source");
+        std::fs::create_dir(&overflow_source).unwrap();
+        std::fs::write(overflow_source.join("type"), "USB_C\n").unwrap();
+        std::fs::write(overflow_source.join("online"), "1\n").unwrap();
+
+        let battery = sysfs.path().join("a-surface-battery");
+        std::fs::create_dir(&battery).unwrap();
+        std::fs::write(battery.join("type"), "Battery\n").unwrap();
+        std::fs::write(battery.join("capacity"), "73\n").unwrap();
+        let adapter = sysfs.path().join("b-usbc-source");
+        std::fs::create_dir(&adapter).unwrap();
+        std::fs::write(adapter.join("type"), "USB_C\n").unwrap();
+        std::fs::write(adapter.join("online"), "1\n").unwrap();
+
+        assert_eq!(gather_power(sysfs.path()), (Some(73), true));
+
+        std::fs::write(adapter.join("online"), "0\n").unwrap();
+        assert_eq!(gather_power(sysfs.path()), (Some(73), false));
+        std::fs::write(battery.join("capacity"), "255\n").unwrap();
+        assert_eq!(gather_power(sysfs.path()), (None, false));
+    }
+
     #[cfg(unix)]
     #[test]
     fn command_probe_times_out_a_hung_child() {
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "sleep 30"]);
         let started = std::time::Instant::now();
-        let result = crate::workers::proc::output_with_timeout(
-            command,
-            Duration::from_millis(150),
-        );
+        let result = crate::workers::proc::output_with_timeout(command, Duration::from_millis(150));
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
     }

@@ -21,10 +21,11 @@ fails closed without mutation.
 - `172.20.0.170`, slot `arch008-browser-immutable-fmt-r489`:
   `rustfmt --edition 2021 --check crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs`
   passed after explicit farm sync.
-- `172.20.0.196`, slot `arch008-browser-module-r489`: the broader Browser
-  module test was launched as an additional unique gate and remained in cold
-  compilation when the required focused gates completed; it is not used as
-  evidence for this commit.
+- `172.20.0.196`, slot `arch008-browser-module-r489`: the first broader Browser
+  module run exposed a public error-contract mismatch in the new strict-read
+  path (10 passed, 1 failed). The message was corrected to preserve the existing
+  `could not persist` contract; the exact failed test then passed 1/1 in the
+  warm slot with 4,928 filtered out.
 
 ## Changed files
 
