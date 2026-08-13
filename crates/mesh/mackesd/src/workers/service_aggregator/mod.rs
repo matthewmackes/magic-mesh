@@ -30,6 +30,7 @@
 pub mod aggregate;
 pub mod resource_actions;
 pub mod resource_adapters;
+pub mod service_provider;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -797,6 +798,11 @@ impl ServiceAggregatorWorker {
                     .map_err(|error| format!("encode services state: {error}"))?,
             ),
             (
+                service_provider::state_topic(&self.host),
+                serde_json::to_string(&service_provider::gather(&self.host))
+                    .map_err(|error| format!("encode service-provider state: {error}"))?,
+            ),
+            (
                 resource_adapters::RESOURCE_ADAPTER_STATUS_TOPIC.to_owned(),
                 serde_json::to_string(&adapter_status)
                     .map_err(|error| format!("encode resource adapter status: {error}"))?,
@@ -813,10 +819,7 @@ impl ServiceAggregatorWorker {
         };
         self.require_retained_inputs_current(persist, &identity)?;
 
-        Ok(StagedPublication {
-            identity,
-            outputs,
-        })
+        Ok(StagedPublication { identity, outputs })
     }
 
     fn publish_staged(
