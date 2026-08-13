@@ -43,7 +43,7 @@
 //! IO is the snapshot read + the vehicle-mirror fold, both in [`NetworkState::poll`].
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::vehicle::{CellLink, VehicleState, VEHICLE_STATE_PREFIX};
 use mde_egui::egui::{self, Color32, RichText};
@@ -67,6 +67,14 @@ const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 /// within this window. Matches the chrome bar + the This Node / Fleet poll; the
 /// read is a cheap local file scan, so the cadence can stay tight.
 const REFRESH: Duration = Duration::from_secs(5);
+
+/// The producer normally refreshes every ~30 seconds. Three missed publications
+/// revoke "live" presentation while retaining the last topology for diagnosis.
+const SNAPSHOT_STALE_AFTER_MS: i64 = 90_000;
+
+/// Small wall-clock disagreement is tolerated, but a materially future-dated
+/// producer timestamp cannot establish current authority.
+const MAX_FUTURE_SKEW_MS: i64 = 5_000;
 
 /// A filled-circle status dot — the shared glyph the datacenter rows / chrome pip
 /// / This Node use, so a link dot reads one `Style` size + colour.
@@ -111,6 +119,8 @@ struct NetStatus {
     /// `true` once a snapshot has been parsed — distinguishes "no snapshot yet"
     /// (the connecting state) from a parsed one.
     seen: bool,
+    /// Whether the producer timestamp establishes current source authority.
+    freshness: SnapshotFreshness,
     /// This node's hostname — the snapshot's `self` marker (local hostname when the
     /// snapshot omits it). Used to resolve the leader chip + the own-row services.
     hostname: String,
@@ -136,6 +146,30 @@ struct NetStatus {
     routes: Vec<String>,
     /// The node's default gateway, when known.
     default_gw: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SnapshotFreshness {
+    Fresh,
+    Stale,
+    InvalidFuture,
+    #[default]
+    Missing,
+}
+
+impl SnapshotFreshness {
+    fn is_fresh(self) -> bool {
+        self == Self::Fresh
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fresh => "live",
+            Self::Stale => "stale — producer updates stopped",
+            Self::InvalidFuture => "unavailable — invalid future timestamp",
+            Self::Missing => "unavailable — producer timestamp missing",
+        }
+    }
 }
 
 /// Read a non-empty string field off a JSON object, or `None`.
@@ -188,6 +222,10 @@ impl NetStatus {
     /// garbage / non-mesh snapshot yields the honest unseen status (drives the
     /// connecting state), never a panic — mirroring the chrome bar's tolerance.
     fn project(snapshot: &str, fallback_host: &str) -> Self {
+        Self::project_at(snapshot, fallback_host, unix_time_ms())
+    }
+
+    fn project_at(snapshot: &str, fallback_host: &str, now_ms: i64) -> Self {
         let Ok(v) = serde_json::from_str::<Value>(snapshot) else {
             return Self::default();
         };
@@ -202,6 +240,16 @@ impl NetStatus {
         let hostname = self_host.unwrap_or_else(|| fallback_host.to_string());
         let network = v.get("network");
         let lighthouse_ips = string_list(network, "lighthouse_ips");
+        let freshness = match v.get("generated_ms").and_then(Value::as_i64) {
+            Some(generated_ms) if generated_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS) => {
+                SnapshotFreshness::InvalidFuture
+            }
+            Some(generated_ms) if now_ms.saturating_sub(generated_ms) > SNAPSHOT_STALE_AFTER_MS => {
+                SnapshotFreshness::Stale
+            }
+            Some(_) => SnapshotFreshness::Fresh,
+            None => SnapshotFreshness::Missing,
+        };
 
         // The peer directory as network links. A lighthouse is an overlay anchor —
         // its IP is in `lighthouse_ips` OR its role is `lighthouse` (LIGHTHOUSE-9).
@@ -235,6 +283,7 @@ impl NetStatus {
 
         Self {
             seen: true,
+            freshness,
             // Prefer the network overview's locally-probed overlay address; fall
             // back to this node's directory-row overlay IP.
             overlay_ip: network
@@ -276,6 +325,14 @@ impl NetStatus {
     fn routing_empty(&self) -> bool {
         self.gateway_endpoints.is_empty() && self.routes.is_empty() && self.default_gw.is_none()
     }
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 /// Directory presence tier → tone: online is healthy, idle warns, offline is a
@@ -492,6 +549,16 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState])
         return;
     }
 
+    if !status.freshness.is_fresh() {
+        ui.colored_label(
+            Style::WARN,
+            RichText::new(format!("Network snapshot {}", status.freshness.label()))
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+    }
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -557,7 +624,7 @@ fn show_overlay(ui: &mut egui::Ui, status: &NetStatus) {
                 .size(Style::BODY)
                 .strong(),
         );
-        if status.is_leader() {
+        if status.is_leader() && status.freshness.is_fresh() {
             ui.add_space(Style::SP_S);
             ui.label(RichText::new(DOT).color(Style::OK).size(Style::SMALL));
             ui.colored_label(
@@ -623,7 +690,7 @@ fn show_links(ui: &mut egui::Ui, status: &NetStatus) {
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        let tone = if total == 0 {
+        let tone = if !status.freshness.is_fresh() || total == 0 {
             Style::TEXT_DIM
         } else if online == total {
             Style::OK
@@ -638,10 +705,13 @@ fn show_links(ui: &mut egui::Ui, status: &NetStatus) {
     ui.add_space(Style::SP_XS);
 
     for peer in &status.peers {
-        let tone = peer
-            .presence
-            .as_deref()
-            .map_or(Style::TEXT_DIM, presence_tone);
+        let tone = if status.freshness.is_fresh() {
+            peer.presence
+                .as_deref()
+                .map_or(Style::TEXT_DIM, presence_tone)
+        } else {
+            Style::TEXT_DIM
+        };
         ui.horizontal(|ui| {
             ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
             ui.add_space(Style::SP_XS);
@@ -681,7 +751,9 @@ fn show_services(ui: &mut egui::Ui, status: &NetStatus) {
     }
     for (label, up) in &status.services {
         ui.horizontal(|ui| {
-            let (dot, word, tone) = if *up {
+            let (dot, word, tone) = if !status.freshness.is_fresh() {
+                (Style::TEXT_DIM, "last reported", Style::WARN)
+            } else if *up {
                 (Style::OK, "up", Style::TEXT_DIM)
             } else {
                 (Style::TEXT_DIM, "down", Style::WARN)
@@ -1056,6 +1128,31 @@ mod tests {
             let s = NetStatus::project(bad, "this-node");
             assert!(!s.seen, "{bad:?} must not read as a live snapshot");
         }
+    }
+
+    #[test]
+    fn stale_missing_and_future_snapshots_lose_live_semantics() {
+        let stale =
+            NetStatus::project_at(&snapshot("this-node", "this-node"), "fallback", 1_090_001);
+        assert_eq!(stale.freshness, SnapshotFreshness::Stale);
+        assert!(!stale.freshness.is_fresh());
+        assert!(stale.seen, "stale topology remains available for diagnosis");
+
+        let future_body = snapshot("this-node", "this-node")
+            .replace("\"generated_ms\": 1000000", "\"generated_ms\": 1005001");
+        let future = NetStatus::project_at(&future_body, "fallback", 1_000_000);
+        assert_eq!(future.freshness, SnapshotFreshness::InvalidFuture);
+
+        let missing_body =
+            snapshot("this-node", "this-node").replace("\"generated_ms\": 1000000,", "");
+        let missing = NetStatus::project_at(&missing_body, "fallback", 1_000_000);
+        assert_eq!(missing.freshness, SnapshotFreshness::Missing);
+
+        let fresh =
+            NetStatus::project_at(&snapshot("this-node", "this-node"), "fallback", 1_090_000);
+        assert_eq!(fresh.freshness, SnapshotFreshness::Fresh);
+        assert!(fresh.freshness.is_fresh());
+        assert!(renders(&stale, &[]), "retained stale topology still paints");
     }
 
     #[test]
