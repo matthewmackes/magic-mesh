@@ -8,9 +8,9 @@
   positive observation; authority state does not cross providers.
 - Regression:
   `workers::node_grade::tests::lifecycle_provenance_substitution_starts_new_incident_and_preserves_history`.
-- Farm focused test: BigBoy `172.20.0.130`, slot 3. The exact selector was
-  discovered by the module-qualified test binary, but compilation stopped on
-  the initial patch because `RequirementClass` is not `Ord` and the fixture
+- Farm focused test: BigBoy `172.20.0.130`, slot 3. Compilation stopped before
+  the module-qualified test binary could report a discovery count because the
+  initial patch used `RequirementClass` in an ordered set and the fixture
   named a nonexistent `HealthComponent::Services`. Both defects were corrected
   by using bounded vector equality and `HealthComponent::System`; cadence
   prohibited a rerun, so this run is **not** claimed as passing evidence.
