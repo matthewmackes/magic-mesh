@@ -349,6 +349,32 @@ pub(crate) struct LiveWeatherStatus {
     icon: IconId,
     temperature: Option<String>,
     label: String,
+    tone: WeatherTone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeatherTone {
+    Live,
+    Stale,
+    Unavailable,
+}
+
+impl WeatherTone {
+    fn foreground(self, ctx: &egui::Context, normal: egui::Color32) -> egui::Color32 {
+        match self {
+            Self::Live => normal,
+            Self::Stale => Style::resolve_color(ctx, Style::TEXT_DIM),
+            Self::Unavailable => Style::resolve_color(ctx, Style::DISABLED),
+        }
+    }
+
+    fn taskbar_foreground(self) -> egui::Color32 {
+        match self {
+            Self::Live => Style::NAV_BAR_ICON,
+            Self::Stale => Style::NAV_BAR_ICON.gamma_multiply(0.68),
+            Self::Unavailable => Style::NAV_BAR_ICON.gamma_multiply(0.48),
+        }
+    }
 }
 
 impl LiveWeatherStatus {
@@ -357,6 +383,7 @@ impl LiveWeatherStatus {
             icon: IconId::WeatherUnavailable,
             temperature: None,
             label: "Weather unavailable — open Maps & Location".to_string(),
+            tone: WeatherTone::Unavailable,
         }
     }
 
@@ -401,9 +428,9 @@ impl LiveWeatherStatus {
             format!("{:.0}{unit}", value.value)
         });
         let condition = conditions.provider_text.as_deref().unwrap_or("Weather");
-        let freshness = match &current.availability {
-            WeatherAvailability::Fresh => "live",
-            WeatherAvailability::Stale { .. } => "stale",
+        let (freshness, tone) = match &current.availability {
+            WeatherAvailability::Fresh => ("live", WeatherTone::Live),
+            WeatherAvailability::Stale { .. } => ("stale", WeatherTone::Stale),
             WeatherAvailability::Unavailable { .. } => unreachable!("filtered above"),
         };
         let temperature_label = temperature
@@ -415,6 +442,7 @@ impl LiveWeatherStatus {
             label: format!(
                 "{condition}{temperature_label} · {freshness} — open Maps & Location Weather"
             ),
+            tone,
         }
     }
 }
@@ -1477,6 +1505,12 @@ fn paint_live_weather(
     });
     let response = response.on_hover_text(weather.label.clone());
     let painter = ui.painter();
+    let foreground = if placement == "bottom" {
+        weather.tone.taskbar_foreground()
+    } else {
+        weather.tone.foreground(ui.ctx(), foreground)
+    }
+    .gamma_multiply(opacity);
     if response.hovered() {
         painter.rect_filled(
             rect.shrink(2.0),
@@ -1535,13 +1569,17 @@ fn strip(
     weather: Option<&LiveWeatherStatus>,
 ) -> bool {
     let painter = ui.painter().clone();
+    let background = Style::resolve_color(ui.ctx(), Style::BG);
+    let border = Style::resolve_color(ui.ctx(), Style::BORDER);
+    let text = Style::resolve_color(ui.ctx(), Style::TEXT);
+    let surface_hi = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
     // The clean BG band + bottom hairline (module doc: persistent chrome, not
     // an overlay — no scrim, guaranteed contrast).
-    painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::BG);
+    painter.rect_filled(bar, egui::CornerRadius::ZERO, background);
     painter.hline(
         bar.left()..=bar.right(),
         bar.bottom(),
-        egui::Stroke::new(1.0, Style::BORDER),
+        egui::Stroke::new(1.0, border),
     );
     let cy = bar.center().y;
     // ── Center cluster: the one authoritative clock ────────────────────────
@@ -1552,7 +1590,7 @@ fn strip(
     let time_galley = painter.layout_job(status_text_job(
         time.clone(),
         TypographyRole::Label,
-        Style::TEXT,
+        text,
         bar.width(),
     ));
     let time_w = time_galley.size().x;
@@ -1588,7 +1626,7 @@ fn strip(
         )
     });
     if let (Some(status), Some(rect)) = (battery, battery_rect) {
-        paint_live_battery(ui, rect, status, Style::TEXT, 1.0, "top");
+        paint_live_battery(ui, rect, status, text, 1.0, "top");
     }
     let weather_right = battery_rect.map_or(clock_rect.left(), |rect| rect.left());
     let weather_available = (weather_right - bar.left()).max(0.0);
@@ -1601,9 +1639,9 @@ fn strip(
             egui::pos2(weather_right, bar.bottom()),
         )
     });
-    let weather_clicked = weather.zip(weather_rect).is_some_and(|(status, rect)| {
-        paint_live_weather(ui, rect, status, Style::TEXT, 1.0, "top")
-    });
+    let weather_clicked = weather
+        .zip(weather_rect)
+        .is_some_and(|(status, rect)| paint_live_weather(ui, rect, status, text, 1.0, "top"));
     let clock = ui.interact(clock_rect, status_bar_clock_id(), egui::Sense::click());
     clock.widget_info(|| {
         egui::WidgetInfo::labeled(
@@ -1613,7 +1651,7 @@ fn strip(
         )
     });
     if clock.hovered() {
-        painter.rect_filled(clock_rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
+        painter.rect_filled(clock_rect.shrink(2.0), Style::RADIUS_S, surface_hi);
     }
     // A narrow fallback lane may be smaller than the clock text. Clip the
     // paint as well as the interaction so text cannot visually enter the
@@ -1624,7 +1662,7 @@ fn strip(
             cy - time_galley.size().y / 2.0,
         ),
         time_galley,
-        Style::TEXT,
+        text,
     );
     if clock.clicked() {
         construct.request_workspace_tray(Surface::Clock);
@@ -1634,8 +1672,8 @@ fn strip(
         bell_rect,
         construct,
         crate::toast_bridge::unread_count(ui.ctx()),
-        Style::TEXT,
-        Style::SURFACE_HI,
+        text,
+        surface_hi,
         "left",
     );
 
@@ -1669,8 +1707,8 @@ fn strip(
         teams_rect,
         construct,
         active_surface == Some(Surface::Communications),
-        Style::TEXT,
-        Style::SURFACE_HI,
+        text,
+        surface_hi,
     );
 
     let workspace_rect = workspace_tray_rect(bar, teams_rect);
@@ -1681,7 +1719,7 @@ fn strip(
         construct,
         active_surface,
         "construct-status-bar",
-        Style::resolve_color(ui.ctx(), Style::TEXT),
+        text,
     );
 
     paint_status_menu(
@@ -1689,8 +1727,8 @@ fn strip(
         status_menu_rect(bar),
         construct,
         status_menu_id(),
-        Style::TEXT,
-        Style::SURFACE_HI,
+        text,
+        surface_hi,
         1.0,
     );
 
@@ -2041,6 +2079,7 @@ mod tests {
             icon: IconId::DarkMode,
             temperature: Some("72°F".to_string()),
             label: "Clear · 72°F · live — open Maps & Location Weather".to_string(),
+            tone: WeatherTone::Live,
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
 
@@ -2141,6 +2180,7 @@ mod tests {
             icon: IconId::Internet,
             temperature: Some("68°F".to_string()),
             label: "Cloudy · 68°F · live — open Maps & Location Weather".to_string(),
+            tone: WeatherTone::Live,
         };
         assert_eq!(
             weather_status_width(&weather, WEATHER_STATUS_W),
@@ -2392,6 +2432,39 @@ mod tests {
             egui::Color32::WHITE
         );
         assert_eq!(Style::NAV_BAR_ICON, egui::Color32::WHITE);
+    }
+
+    #[test]
+    fn stale_and_unavailable_weather_never_retain_the_live_status_tone() {
+        for scheme in [
+            mde_egui::StyleColorScheme::Dark,
+            mde_egui::StyleColorScheme::Light,
+        ] {
+            let ctx = egui::Context::default();
+            Style::install_color_scheme_with_density(&ctx, scheme, mde_egui::Density::Mouse);
+            let live = Style::resolve_color(&ctx, Style::TEXT);
+            let stale = WeatherTone::Stale.foreground(&ctx, live);
+            let unavailable = WeatherTone::Unavailable.foreground(&ctx, live);
+
+            assert_eq!(WeatherTone::Live.foreground(&ctx, live), live);
+            assert_ne!(
+                stale, live,
+                "stale weather retained the live {scheme:?} tone"
+            );
+            assert_ne!(
+                unavailable, live,
+                "unavailable weather retained the live {scheme:?} tone"
+            );
+        }
+
+        assert_ne!(
+            WeatherTone::Stale.taskbar_foreground(),
+            WeatherTone::Live.taskbar_foreground()
+        );
+        assert_ne!(
+            WeatherTone::Unavailable.taskbar_foreground(),
+            WeatherTone::Live.taskbar_foreground()
+        );
     }
 
     #[test]
