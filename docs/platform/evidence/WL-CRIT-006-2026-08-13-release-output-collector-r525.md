@@ -8,6 +8,13 @@ publication, promotion, or placeholder creation. It accepts exactly one of each
 required output role: Workstation RPM, Server RPM, Lighthouse RPM, Browser VM,
 App VM, Cuttlefish image, and bootc image.
 
+The registry-native bootc role collects its immutable, owning-verifier-checked
+digest receipt and labels those local bytes
+`application/vnd.mcnf.bootc-image-receipt+json`; it does not mislabel JSON
+receipt bytes as an OCI image. The receipt verifier separately binds the exact
+registry reference, resolved manifest digest, architecture, release role,
+revision, and epoch.
+
 Every output must be a bounded regular non-symlink file and must pass its owning
 verifier with the exact artifact path and source revision. RPM verifiers also
 receive the exact governed signing identity. The collector rejects missing or

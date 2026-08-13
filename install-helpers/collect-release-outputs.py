@@ -21,7 +21,7 @@ ROLES = {
     "browser-vm": "application/x-qemu-disk",
     "app-vm": "application/x-qemu-disk",
     "cuttlefish-image": "application/vnd.mcnf.cuttlefish-image",
-    "bootc-image": "application/vnd.oci.image",
+    "bootc-image": "application/vnd.mcnf.bootc-image-receipt+json",
 }
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 FINGERPRINT = re.compile(r"[0-9A-F]{40,64}\Z")

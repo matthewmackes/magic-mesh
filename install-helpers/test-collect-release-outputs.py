@@ -15,7 +15,7 @@ ROLES = {
     "browser-vm": ("application/x-qemu-disk", b"QFI\xfbbrowser"),
     "app-vm": ("application/x-qemu-disk", b"QFI\xfbapp"),
     "cuttlefish-image": ("application/vnd.mcnf.cuttlefish-image", b"cuttlefish"),
-    "bootc-image": ("application/vnd.oci.image", b"oci-image"),
+    "bootc-image": ("application/vnd.mcnf.bootc-image-receipt+json", b'{"resolved_digest":"sha256:fixture"}'),
 }
 
 def write(path: Path, data: bytes, mode: int = 0o400) -> None:
