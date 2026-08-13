@@ -11,6 +11,14 @@ StartLimitBurst=6
 Type=notify
 NotifyAccess=all
 ExecStart=/usr/libexec/mackesd/mesh-peer-recovery
+# A boot or resume event is edge-triggered.  If the bounded recovery helper
+# reaches a transient Nebula/substrate failure, no later dispatcher event is
+# guaranteed to arrive.  Retry failures within the unit's existing start-limit
+# window so the corrected next attempt can converge without an operator or a
+# duplicate peer-return event.  Offline/no-mutation exits remain successful and
+# therefore do not spin while the machine is intentionally disconnected.
+Restart=on-failure
+RestartSec=5s
 TimeoutStartSec=90
 RuntimeMaxSec=90
 TimeoutStopSec=10
