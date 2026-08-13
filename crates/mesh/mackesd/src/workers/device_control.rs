@@ -576,6 +576,7 @@ impl DeviceControlExecWorker {
             "action": "device-control-cancel",
             "cancellation_id": cancel.id,
             "target_request_id": cancel.target_request_id,
+            "result_id": result.id,
             "op": cancel.op.as_str(),
             "target_host": cancel.target_host,
             "device": cancel.target.name,
@@ -599,6 +600,8 @@ impl DeviceControlExecWorker {
     fn audit(&self, req: &DeviceControlRequest, result: &DeviceControlResult) {
         let detail = serde_json::json!({
             "action": "device-control",
+            "request_id": req.id,
+            "result_id": result.id,
             "op": req.op.as_str(),
             "target_host": req.target_host,
             "expected_inventory_published_at_ms": req.expected_inventory_published_at_ms,
@@ -606,6 +609,7 @@ impl DeviceControlExecWorker {
             "sysfs_path": req.target.sysfs_path,
             "driver": req.target.driver,
             "from": req.from,
+            "outcome": result.outcome,
             "ok": result.ok,
             "detail": result.detail,
             "error": result.error,
@@ -1110,6 +1114,57 @@ mod tests {
         let persist = Persist::open(tmp.path().join("bus")).unwrap();
         let alerts = persist.list_since(NOTIFY_TOPIC, None).unwrap();
         assert_eq!(alerts.len(), 1, "a failed op notifies");
+    }
+
+    #[test]
+    fn overlapping_controls_retain_exact_request_and_terminal_result_identity_in_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("audit.db");
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_db_path(db.clone());
+        let request = |id: &str| DeviceControlRequest {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: id.into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget::new("Shared NIC", category::NETWORK_ADAPTERS),
+            target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 7,
+            from: "peer:laptop-mm".into(),
+        };
+
+        let first = request("control-first");
+        let second = request("control-second");
+        worker.audit(
+            &first,
+            &DeviceControlResult::ok(&first.id, "disabled Shared NIC"),
+        );
+        worker.audit(
+            &second,
+            &DeviceControlResult::failed(&second.id, "provider disappeared"),
+        );
+
+        let conn = crate::store::open(&db).expect("open audit db");
+        let rows = crate::store::load_audit_rows(&conn).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            crate::audit::verify(&rows),
+            crate::audit::VerifyOutcome::Intact { verified: 2, .. }
+        ));
+        let first_event: crate::events::Event =
+            serde_json::from_slice(&rows[0].payload).expect("first audit event");
+        assert_eq!(first_event.detail["request_id"], "control-first");
+        assert_eq!(first_event.detail["result_id"], "control-first");
+        assert_eq!(first_event.detail["outcome"], "succeeded");
+        let second_event: crate::events::Event =
+            serde_json::from_slice(&rows[1].payload).expect("second audit event");
+        assert_eq!(second_event.detail["request_id"], "control-second");
+        assert_eq!(second_event.detail["result_id"], "control-second");
+        assert_eq!(second_event.detail["outcome"], "failed");
     }
 
     #[tokio::test]
