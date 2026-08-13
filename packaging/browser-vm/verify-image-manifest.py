@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ MAX_PROFILE_BYTES = 16 * 1024
 MAX_ASSET_BYTES = 32 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024**3
 HASH_CHUNK = 1024 * 1024
+SOURCE_REVISION = re.compile(r"[0-9a-f]{40}")
 
 PROFILE_KEYS = {
     "BROWSER_VM_PROFILE_SCHEMA",
@@ -237,7 +239,21 @@ def load_manifest(path: Path) -> dict[str, object]:
     )
 
 
-def verify_manifest(repo_root: Path, profile: Path, image: Path, manifest: Path) -> None:
+def verify_manifest(
+    repo_root: Path,
+    profile: Path,
+    image: Path,
+    manifest: Path,
+    expected_source_revision: str,
+) -> None:
+    if (
+        SOURCE_REVISION.fullmatch(expected_source_revision) is None
+        or expected_source_revision == "0" * 40
+    ):
+        fail("expected source revision must be one non-null lowercase Git commit ID")
+    profile_values, _ = parse_profile(profile)
+    if profile_values["BROWSER_VM_SOURCE_COMMIT"] != expected_source_revision:
+        fail("profile source revision does not match the requested release revision")
     if manifest.name != f"{image.name}.mcnf-manifest.json":
         fail("manifest does not use the canonical image sidecar name")
     value = load_manifest(manifest)
@@ -295,12 +311,23 @@ def self_test(repo_root: Path, profile: Path) -> None:
         image.write_bytes(b"bounded-browser-vm-image-fixture\n")
         image.chmod(0o644)
         write_manifest(build_manifest(repo_root, profile, image, "anaconda-iso"), manifest)
-        verify_manifest(repo_root, profile, image, manifest)
+        expected_revision = parse_profile(profile)[0]["BROWSER_VM_SOURCE_COMMIT"]
+        verify_manifest(repo_root, profile, image, manifest, expected_revision)
+
+        expect_reject(
+            lambda: verify_manifest(repo_root, profile, image, manifest, "not-a-revision"),
+            "a malformed requested source revision",
+        )
+        different_revision = ("0" if expected_revision[0] != "0" else "1") + expected_revision[1:]
+        expect_reject(
+            lambda: verify_manifest(repo_root, profile, image, manifest, different_revision),
+            "a requested source revision that differs from the profile and manifest",
+        )
 
         original = manifest.read_bytes()
         image.write_bytes(b"truncated\n")
         expect_reject(
-            lambda: verify_manifest(repo_root, profile, image, manifest),
+            lambda: verify_manifest(repo_root, profile, image, manifest, expected_revision),
             "a truncated image",
         )
         image.write_bytes(b"bounded-browser-vm-image-fixture\n")
@@ -309,7 +336,7 @@ def self_test(repo_root: Path, profile: Path) -> None:
         value["unknown"] = True
         manifest.write_text(json.dumps(value), encoding="utf-8")
         expect_reject(
-            lambda: verify_manifest(repo_root, profile, image, manifest),
+            lambda: verify_manifest(repo_root, profile, image, manifest, expected_revision),
             "an unknown manifest field",
         )
 
@@ -317,20 +344,20 @@ def self_test(repo_root: Path, profile: Path) -> None:
         value["profile"]["source_commit"] = "f" * 40
         manifest.write_text(json.dumps(value), encoding="utf-8")
         expect_reject(
-            lambda: verify_manifest(repo_root, profile, image, manifest),
+            lambda: verify_manifest(repo_root, profile, image, manifest, expected_revision),
             "stale profile identity",
         )
 
         manifest.write_bytes(original[: max(1, len(original) // 2)])
         expect_reject(
-            lambda: verify_manifest(repo_root, profile, image, manifest),
+            lambda: verify_manifest(repo_root, profile, image, manifest, expected_revision),
             "a truncated manifest",
         )
 
         manifest.unlink()
         manifest.symlink_to(root / "missing-manifest")
         expect_reject(
-            lambda: verify_manifest(repo_root, profile, image, manifest),
+            lambda: verify_manifest(repo_root, profile, image, manifest, expected_revision),
             "a symlinked manifest",
         )
 
@@ -360,6 +387,8 @@ def main() -> int:
         child.add_argument("--manifest", required=True, type=Path)
         if command == "create":
             child.add_argument("--format", required=True, choices=("qcow2", "raw", "anaconda-iso"))
+        else:
+            child.add_argument("--source-revision", required=True)
     test = subparsers.add_parser("self-test")
     test.add_argument("--repo-root", required=True, type=Path)
     test.add_argument("--profile", required=True, type=Path)
@@ -368,10 +397,23 @@ def main() -> int:
         if args.command == "create":
             value = build_manifest(args.repo_root, args.profile, args.image, args.format)
             write_manifest(value, args.manifest)
-            verify_manifest(args.repo_root, args.profile, args.image, args.manifest)
+            source_revision = parse_profile(args.profile)[0]["BROWSER_VM_SOURCE_COMMIT"]
+            verify_manifest(
+                args.repo_root,
+                args.profile,
+                args.image,
+                args.manifest,
+                source_revision,
+            )
             print(f"Browser VM image manifest written: {args.manifest}")
         elif args.command == "verify":
-            verify_manifest(args.repo_root, args.profile, args.image, args.manifest)
+            verify_manifest(
+                args.repo_root,
+                args.profile,
+                args.image,
+                args.manifest,
+                args.source_revision,
+            )
             print("Browser VM image manifest passed")
         else:
             self_test(args.repo_root, args.profile)
