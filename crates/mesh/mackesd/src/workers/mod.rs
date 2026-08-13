@@ -453,6 +453,8 @@ pub mod probe;
 // hardware probe + writes it to the replicated directory so the
 // Workbench Hardware panel renders the fleet. Spawned in run_serve.
 pub mod hardware_probe;
+/// WL-UX-011 — read-only, fail-closed PipeWire/WirePlumber audio provider.
+pub mod audio_provider;
 /// WL-UX-011 — read-only, fail-closed NetworkManager Wi-Fi provider.
 pub mod wifi_provider;
 // DEVMGR-1 — the device-inventory enumeration engine the `hardware_probe`
