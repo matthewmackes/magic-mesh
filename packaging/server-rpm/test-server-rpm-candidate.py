@@ -44,9 +44,9 @@ printf 'fpr:::::::::%s:\n' "$fingerprint"
         tool(tools / "rpm2cpio", "printf 'archive fixture'\n")
         tool(tools / "cpio", f"cat >/dev/null\nprintf '\\177ELF12.1.6Construct{REVISION}bounded\\n'\n")
         rpm = root / "magic-mesh-server.rpm"
-        rpm.write_bytes(b"\xed\xab\xee\xdbsigned server fixture\n"); rpm.chmod(0o400)
+        rpm.write_bytes(b"\xed\xab\xee\xdbsigned server fixture\n"); rpm.chmod(0o644)
         key = root / "RPM-GPG-KEY-magic-mesh"
-        key.write_text("governed release public key\n", encoding="utf-8"); key.chmod(0o400)
+        key.write_text("governed release public key\n", encoding="utf-8"); key.chmod(0o644)
         env = dict(os.environ); env["PATH"] = f"{tools}:/usr/bin:/bin"
 
         def produce(name: str, extra: dict[str, str] | None = None):
@@ -118,14 +118,14 @@ printf 'fpr:::::::::%s:\n' "$fingerprint"
             result = produce(name, hostile)
             assert result.returncode == 2 and not (root / name).exists(), (name, result.stderr)
 
-        rpm.chmod(0o600)
+        rpm.chmod(0o664)
         assert produce("writable-rpm").returncode == 2
-        rpm.chmod(0o400)
-        key.chmod(0o600)
+        rpm.chmod(0o644)
+        key.chmod(0o664)
         assert produce("writable-key").returncode == 2
-        key.chmod(0o400)
+        key.chmod(0o644)
         writable_manifest = root / "writable.json"
-        writable_manifest.write_bytes(manifest.read_bytes()); writable_manifest.chmod(0o600)
+        writable_manifest.write_bytes(manifest.read_bytes()); writable_manifest.chmod(0o660)
         assert verify(candidate, writable_manifest).returncode == 2
 
         rpm_link = root / "rpm-link"; rpm_link.symlink_to(rpm)

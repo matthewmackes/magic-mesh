@@ -23,6 +23,13 @@ authority. Generic safe RPM snapshot, signature, canonical JSON, and atomic
 publication primitives are reused from the existing governed RPM candidate
 module rather than duplicated.
 
+Input mode admission follows the repository-wide rule: canonical owner-writable
+`0644` signed RPMs and the tracked release key are accepted, while any
+group/other-writable authority is rejected. Stable snapshots and identity
+checks still detect mutation. The hostile suite covers both canonical `0644`
+inputs and `0664` refusal, preventing fixtures from hiding a real-key mode
+incompatibility.
+
 ## Farm evidence
 
 All commands ran from `/root/magic-mesh` with explicit host and isolated slot.

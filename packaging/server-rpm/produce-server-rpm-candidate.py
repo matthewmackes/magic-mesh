@@ -61,8 +61,8 @@ def immutable_regular(path: Path, label: str, maximum: int | None = None) -> os.
         metadata = os.stat(path, follow_symlinks=False)
     except OSError as exc:
         raise Refusal(f"{label} metadata is unavailable: {exc}") from exc
-    if not path.is_file() or metadata.st_nlink != 1 or metadata.st_mode & 0o222:
-        raise Refusal(f"{label} must be an immutable single-link regular file")
+    if not path.is_file() or metadata.st_nlink != 1 or metadata.st_mode & 0o022:
+        raise Refusal(f"{label} must be a single-link regular file not writable by group/other")
     if metadata.st_size <= 0 or (maximum is not None and metadata.st_size > maximum):
         raise Refusal(f"{label} violates its size bound")
     return metadata
