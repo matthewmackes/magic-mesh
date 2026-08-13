@@ -52,6 +52,8 @@ enum SipProviderHealth {
 struct SipGatewayProvider {
     commands: std::sync::mpsc::SyncSender<AgentCommand>,
     health: Arc<Mutex<SipProviderHealth>>,
+    active_call: Arc<Mutex<Option<mde_collab_types::CallId>>>,
+    revoked_calls: Arc<Mutex<Vec<mde_collab_types::CallId>>>,
 }
 
 impl SipGatewayProvider {
@@ -62,6 +64,10 @@ impl SipGatewayProvider {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let health = Arc::new(Mutex::new(SipProviderHealth::Starting));
         let monitor_health = Arc::clone(&health);
+        let active_call = Arc::new(Mutex::new(None));
+        let monitor_active_call = Arc::clone(&active_call);
+        let revoked_calls = Arc::new(Mutex::new(Vec::new()));
+        let monitor_revoked_calls = Arc::clone(&revoked_calls);
         std::thread::Builder::new()
             .name("mcnf-collab-sip-agent".to_string())
             .spawn(move || {
@@ -80,14 +86,20 @@ impl SipGatewayProvider {
                             SipProviderHealth::Unavailable(bounded_health_detail(&detail))
                         }
                         AgentEvent::Registration(_) => SipProviderHealth::Starting,
-                        AgentEvent::Incoming { .. }
-                        | AgentEvent::Established
-                        | AgentEvent::RemoteHangup => continue,
+                        AgentEvent::Incoming { .. } | AgentEvent::Established => continue,
+                        AgentEvent::RemoteHangup => {
+                            revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
+                            continue;
+                        }
                     };
+                    if matches!(next, SipProviderHealth::Unavailable(_)) {
+                        revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
+                    }
                     if let Ok(mut current) = monitor_health.lock() {
                         *current = next;
                     }
                 }
+                revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
                 if let Ok(mut current) = monitor_health.lock() {
                     *current = SipProviderHealth::Unavailable("SIP agent stopped".to_string());
                 }
@@ -96,6 +108,8 @@ impl SipGatewayProvider {
         Ok(Self {
             commands: command_tx,
             health,
+            active_call,
+            revoked_calls,
         })
     }
 
@@ -107,6 +121,8 @@ impl SipGatewayProvider {
         Self {
             commands,
             health: Arc::new(Mutex::new(health)),
+            active_call: Arc::new(Mutex::new(None)),
+            revoked_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -158,6 +174,20 @@ impl SipGatewayProvider {
     }
 }
 
+fn revoke_active_call(
+    active_call: &Mutex<Option<mde_collab_types::CallId>>,
+    revoked_calls: &Mutex<Vec<mde_collab_types::CallId>>,
+) {
+    let call = active_call.lock().ok().and_then(|mut active| active.take());
+    if let Some(call) = call {
+        if let Ok(mut revoked) = revoked_calls.lock() {
+            if !revoked.contains(&call) {
+                revoked.push(call);
+            }
+        }
+    }
+}
+
 fn bounded_health_detail(detail: &str) -> String {
     let mut end = detail.len().min(MAX_DETAIL_BYTES);
     while !detail.is_char_boundary(end) {
@@ -188,20 +218,51 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             return if cleanup { Ok(()) } else { Err(error) };
         }
         let command = match command {
-            CollabCommand::AnswerCall { .. } => AgentCommand::Answer,
-            CollabCommand::DeclineCall { .. } => AgentCommand::Decline,
-            CollabCommand::HangUpCall { .. } => AgentCommand::HangUp,
+            CollabCommand::AnswerCall { call } => {
+                self.commands
+                    .try_send(AgentCommand::Answer)
+                    .map_err(|error| CallMediaProviderError::ProviderUnavailable {
+                        detail: match error {
+                            std::sync::mpsc::TrySendError::Full(_) => {
+                                "SIP provider command queue is full".to_string()
+                            }
+                            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                                "SIP provider command queue is disconnected".to_string()
+                            }
+                        },
+                    })?;
+                if let Ok(mut active) = self.active_call.lock() {
+                    *active = Some(*call);
+                }
+                return Ok(());
+            }
+            CollabCommand::DeclineCall { .. } => {
+                if let Ok(mut active) = self.active_call.lock() {
+                    active.take();
+                }
+                AgentCommand::Decline
+            }
+            CollabCommand::HangUpCall { .. } => {
+                if let Ok(mut active) = self.active_call.lock() {
+                    active.take();
+                }
+                AgentCommand::HangUp
+            }
             CollabCommand::SendDtmf { digit, .. } => AgentCommand::Dtmf(*digit),
             CollabCommand::StartCall { .. } => {
                 return Err(CallMediaProviderError::ExecutionRefused {
                     detail: "outbound SIP execution requires an explicit dial target".to_string(),
                 });
             }
-            CollabCommand::StartOutboundCall { target, .. } => {
-                return self.send_acknowledged(|completion| AgentCommand::Dial {
+            CollabCommand::StartOutboundCall { call, target, .. } => {
+                self.send_acknowledged(|completion| AgentCommand::Dial {
                     target: target.clone(),
                     completion,
-                });
+                })?;
+                if let Ok(mut active) = self.active_call.lock() {
+                    *active = Some(*call);
+                }
+                return Ok(());
             }
             CollabCommand::SetCallMuted { muted, .. } => {
                 let observed = self.send_acknowledged(|completion| AgentCommand::SetMuted {
@@ -245,6 +306,13 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
         Err(CallMediaProviderError::ExecutionRefused {
             detail: "SIP/RTP frame counters are unavailable; live media is not proven".to_string(),
         })
+    }
+
+    fn take_revoked_calls(&self) -> Vec<mde_collab_types::CallId> {
+        self.revoked_calls
+            .lock()
+            .map(|mut revoked| std::mem::take(&mut *revoked))
+            .unwrap_or_default()
     }
 }
 
@@ -613,6 +681,12 @@ pub(crate) trait CallMediaFrameVerifier: Send + Sync {
         session: &CallMediaSession,
         adapter: CallMediaAdapter,
     ) -> Result<CallMediaFrameEvidence, CallMediaProviderError>;
+
+    /// Consume provider-observed call terminations that must revoke the
+    /// corresponding signed Collaboration call on the next worker tick.
+    fn take_revoked_calls(&self) -> Vec<mde_collab_types::CallId> {
+        Vec::new()
+    }
 }
 
 /// One bounded in-process registration table for concrete call-media proof
@@ -746,6 +820,27 @@ impl CallMediaProviderRegistry {
                 adapter,
                 detail: bounded_provider_error(source),
             })
+    }
+
+    pub(crate) fn take_revoked_calls(&self) -> Vec<mde_collab_types::CallId> {
+        let mut calls = Vec::new();
+        for provider in [
+            self.webrtc_p2p.as_deref(),
+            self.livekit_sfu.as_deref(),
+            self.sip_gateway.as_deref(),
+            self.document_collab.as_deref(),
+            self.vdi_remote_desktop.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for call in provider.take_revoked_calls() {
+                if !calls.contains(&call) {
+                    calls.push(call);
+                }
+            }
+        }
+        calls
     }
 
     fn provider_for_kind(

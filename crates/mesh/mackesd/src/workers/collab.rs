@@ -365,6 +365,7 @@ impl CollabWorker {
     fn tick_once(&self, persist: &Persist, state: &mut CollabState, now_ms: i64) {
         let mut touched = std::mem::take(&mut state.pending_file_projection_spaces);
         let mut changed = false;
+        self.drain_call_provider_revocations(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_commands(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_inbound(persist, state, &mut touched, &mut changed);
         self.backfill_logs(state, &mut touched, &mut changed);
@@ -377,6 +378,44 @@ impl CollabWorker {
         self.drain_alert_lanes(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_clipboard_captures(persist, state, now_ms, &mut touched, &mut changed);
         self.publish_read_models(persist, state, &touched, changed);
+    }
+
+    fn drain_call_provider_revocations(
+        &self,
+        persist: &Persist,
+        state: &mut CollabState,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) {
+        let signer = Ed25519Signer::new(self.signing_key.clone());
+        for call in self.call_media_providers.take_revoked_calls() {
+            let command = CollabCommand::HangUpCall { call };
+            let events = match state
+                .engine
+                .apply(&command, &signer, &mut state.ids, now_ms)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::collab", %call, %error, "provider call revocation no longer matched an active local call");
+                    continue;
+                }
+            };
+            for env in &events {
+                match self.append_own(state, env) {
+                    Ok(()) => {
+                        self.publish_event(persist, env);
+                        if !env.space_id.is_nil() {
+                            touched.insert(env.space_id);
+                        }
+                        *changed = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "mackesd::collab", %call, %error, "provider revocation actor-log append failed; event not published")
+                    }
+                }
+            }
+        }
     }
 
     /// The node's own **system space** id — derived deterministically from this
@@ -3238,6 +3277,114 @@ mod tests {
             assert_eq!(row.status, CallMediaVerificationStatus::ProviderUnavailable);
             assert!(row.evidence.is_none());
         }
+    }
+
+    #[test]
+    fn provider_observed_revocation_durably_ends_the_exact_call() {
+        struct RevokingProvider {
+            revoked: Arc<std::sync::Mutex<Vec<CallId>>>,
+        }
+
+        impl super::super::collab_media::CallMediaFrameVerifier for RevokingProvider {
+            fn execute_command(
+                &self,
+                _command: &CollabCommand,
+                adapter: CallMediaAdapter,
+            ) -> Result<(), super::super::collab_media::CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                Ok(())
+            }
+
+            fn prove_advancing_frames(
+                &self,
+                _session: &mde_collab_types::CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, super::super::collab_media::CallMediaProviderError>
+            {
+                Err(
+                    super::super::collab_media::CallMediaProviderError::TransportUnavailable {
+                        detail: "remote peer ended transport".into(),
+                    },
+                )
+            }
+
+            fn take_revoked_calls(&self) -> Vec<CallId> {
+                self.revoked
+                    .lock()
+                    .map(|mut calls| std::mem::take(&mut *calls))
+                    .unwrap_or_default()
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let revoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut providers = super::super::collab_media::CallMediaProviderRegistry::empty();
+        providers
+            .register(
+                CallMediaAdapter::WebRtcP2p,
+                RevokingProvider {
+                    revoked: Arc::clone(&revoked),
+                },
+            )
+            .expect("register revoking provider");
+        let w = worker(dir.path(), "alice").with_call_media_providers(providers);
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100);
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        let call = CallId::new();
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+        );
+        w.tick_once(&persist, &mut state, 300);
+        assert_eq!(
+            state
+                .engine
+                .projection()
+                .call_state(Some(space))
+                .expect("active call state")
+                .active
+                .len(),
+            1
+        );
+
+        revoked.lock().expect("revocation queue").push(call);
+        w.tick_once(&persist, &mut state, 400);
+        assert!(
+            state
+                .engine
+                .projection()
+                .call_state(Some(space))
+                .expect("revoked call state")
+                .active
+                .is_empty(),
+            "provider-observed termination must end the exact signed call"
+        );
+
+        let log_path = w
+            .log_root
+            .join(space.to_string())
+            .join(format!("{}.jsonl", w.self_actor.as_str()));
+        let log = std::fs::read_to_string(log_path).expect("durable actor log");
+        assert!(
+            log.contains("call_ended") && log.contains(&call.to_string()),
+            "provider revocation must be durable, not projection-only"
+        );
     }
 
     #[test]
