@@ -64,7 +64,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -90,6 +90,55 @@ pub const RECONCILE_INTERVAL_S: u64 = 30;
 /// overhead. 250 ms is the sweet spot — a systemd `TimeoutStopSec=5s`
 /// exit lands in well under the limit.
 pub const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// Process-local ownership for the reconcile loop.
+///
+/// The six systemd process groups already provide cross-process ownership, but
+/// callers inside one admitted process could previously start this worker more
+/// than once. Two loops would independently probe the same drift and append
+/// duplicate audit rows. Keep exactly one live generation and release the
+/// claim from the worker thread on every exit path, including unwind.
+static ACTIVE_RECONCILE_STORES: LazyLock<Mutex<BTreeSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+struct ReconcileWorkerLease {
+    store: PathBuf,
+}
+
+impl ReconcileWorkerLease {
+    fn acquire(store: &Path) -> Self {
+        let store = normalized_store_path(store);
+        let mut active = ACTIVE_RECONCILE_STORES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            active.insert(store.clone()),
+            "a reconcile worker generation is already active for {}",
+            store.display()
+        );
+        drop(active);
+        Self { store }
+    }
+}
+
+impl Drop for ReconcileWorkerLease {
+    fn drop(&mut self) {
+        ACTIVE_RECONCILE_STORES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.store);
+    }
+}
+
+fn normalized_store_path(store: &Path) -> PathBuf {
+    store.canonicalize().unwrap_or_else(|_| {
+        store
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| store.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| store.to_path_buf())
+    })
+}
 
 /// The auto-repair policy flag the worker passes into
 /// `reconcile::plan_tick`. True by default per the 12.5.3 lock —
@@ -206,9 +255,11 @@ pub fn spawn_reconcile_worker(
     db_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    let lease = ReconcileWorkerLease::acquire(&db_path);
     std::thread::Builder::new()
         .name("mackesd-reconcile".into())
         .spawn(move || {
+            let _lease = lease;
             info!(
                 node_id = %node_id,
                 workgroup_root = %workgroup_root.display(),
@@ -1148,6 +1199,43 @@ mod tests {
         // Watchdog has either already slept and returned, or hasn't —
         // join it for cleanliness.
         drop(watchdog);
+    }
+
+    #[test]
+    fn spawn_reconcile_worker_rejects_duplicate_live_generation_and_releases_on_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("mackesd.db");
+        crate::store::open(&db).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_reconcile_worker(
+            root.path().to_path_buf(),
+            "peer:test".to_owned(),
+            db.clone(),
+            Arc::clone(&shutdown),
+        );
+
+        let duplicate = std::panic::catch_unwind({
+            let root = root.path().to_path_buf();
+            let shutdown = Arc::clone(&shutdown);
+            move || spawn_reconcile_worker(root, "peer:test".to_owned(), db, shutdown)
+        });
+        assert!(
+            duplicate.is_err(),
+            "a second live generation must fail closed"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+
+        let stopped = Arc::new(AtomicBool::new(true));
+        spawn_reconcile_worker(
+            root.path().to_path_buf(),
+            "peer:test".to_owned(),
+            root.path().join("mackesd.db"),
+            stopped,
+        )
+        .join()
+        .unwrap();
     }
 
     #[test]
