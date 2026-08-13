@@ -31,6 +31,124 @@
 #        install-helpers/build-rpm-fedora43.sh --lighthouse # thin DO RPM, F43
 set -euo pipefail
 
+# WL-ARCH-010 — both the base and server RPMs run the sole typed Workloads
+# actuator.  cargo-generate-rpm cannot merge a variant's dependency table with
+# the base table: the server variant replaces it wholesale.  Keep the source
+# manifest human-readable, but promote the exact runtime providers into both
+# generated compute manifests before packaging.  This is a build transform,
+# committed here and performed only in the disposable farm checkout.
+WORKLOAD_RPM_REQUIRES=(
+  podman libvirt qemu-kvm qemu-ui-dbus libvirt-daemon-kvm
+  libvirt-daemon-driver-storage guestfs-tools genisoimage virtiofsd
+)
+
+prepare_workload_rpm_manifest() {
+  local input=$1 output=$2
+  awk -v required="${WORKLOAD_RPM_REQUIRES[*]}" '
+    BEGIN {
+      split(required, names, " ")
+      target["[package.metadata.generate-rpm.requires]"] = 1
+      target["[package.metadata.generate-rpm.variants.server.requires]"] = 1
+    }
+    function emit_missing(    i, name) {
+      if (!inside) return
+      for (i = 1; i <= length(names); i++) {
+        name = names[i]
+        if (!seen[name]) print name " = \"*\""
+      }
+    }
+    /^\[/ {
+      emit_missing()
+      inside = target[$0]
+      delete seen
+    }
+    {
+      if (inside && match($0, /^[A-Za-z0-9_-]+[[:space:]]*=/)) {
+        name = substr($0, RSTART, RLENGTH)
+        sub(/[[:space:]]*=.*/, "", name)
+        seen[name] = 1
+      }
+      print
+    }
+    END { emit_missing() }
+  ' "$input" >"$output"
+}
+
+workload_rpm_manifest_self_test() {
+  local fixture transformed dep section count
+  fixture=$(mktemp)
+  transformed=$(mktemp)
+  trap 'rm -f "$fixture" "$transformed"' RETURN
+  cat >"$fixture" <<'EOF'
+[package.metadata.generate-rpm.requires]
+libvirt = "*"
+[package.metadata.generate-rpm.recommends]
+podman = "*"
+[package.metadata.generate-rpm.variants.server.requires]
+qemu-img = "*"
+[package.metadata.generate-rpm.variants.server.recommends]
+libvirt = "*"
+EOF
+  prepare_workload_rpm_manifest "$fixture" "$transformed"
+  for section in \
+    '[package.metadata.generate-rpm.requires]' \
+    '[package.metadata.generate-rpm.variants.server.requires]'; do
+    for dep in "${WORKLOAD_RPM_REQUIRES[@]}"; do
+      count=$(awk -v section="$section" -v dep="$dep" '
+        /^\[/ { inside = ($0 == section) }
+        inside && $0 ~ ("^" dep "[[:space:]]*=") { count++ }
+        END { print count + 0 }
+      ' "$transformed")
+      [ "$count" -eq 1 ] || {
+        echo "workload RPM manifest self-test: $section has $count hard $dep entries" >&2
+        return 1
+      }
+    done
+  done
+  grep -Fqx 'podman = "*"' "$transformed" || {
+    echo "workload RPM manifest self-test: weak dependency fixture was corrupted" >&2
+    return 1
+  }
+  echo "workload RPM manifest self-test: both compute packages hard-require all ${#WORKLOAD_RPM_REQUIRES[@]} runtime providers"
+}
+
+verify_workload_rpm_requires() {
+  local rpm_path=$1 dep requires
+  command -v rpm >/dev/null || {
+    echo "workload RPM dependency gate: rpm query tool is unavailable" >&2
+    return 1
+  }
+  requires=$(rpm -qp --requires "$rpm_path") || return
+  for dep in "${WORKLOAD_RPM_REQUIRES[@]}"; do
+    grep -Eq "^${dep}([[:space:]]|$)" <<<"$requires" || {
+      echo "workload RPM dependency gate: $rpm_path lacks hard Requires: $dep" >&2
+      return 1
+    }
+  done
+  echo "workload RPM dependency gate: $rpm_path carries all ${#WORKLOAD_RPM_REQUIRES[@]} runtime providers"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  workload_rpm_manifest_self_test
+  exit
+fi
+if [ "${1:-}" = "--prepare-workload-rpm-manifest" ]; then
+  [ "$#" -eq 3 ] || {
+    echo "usage: $0 --prepare-workload-rpm-manifest INPUT OUTPUT" >&2
+    exit 2
+  }
+  prepare_workload_rpm_manifest "$2" "$3"
+  exit
+fi
+if [ "${1:-}" = "--verify-workload-rpm-requires" ]; then
+  [ "$#" -eq 2 ] || {
+    echo "usage: $0 --verify-workload-rpm-requires RPM" >&2
+    exit 2
+  }
+  verify_workload_rpm_requires "$2"
+  exit
+fi
+
 # The container RPM lane is farm-only. Keep direct invocations convenient, but
 # dispatch them through xcp-build so Podman and its storage never run locally.
 if [ "${MCNF_FARM_REMOTE:-0}" != 1 ]; then
@@ -170,6 +288,22 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 # from ONE canonical fragment, shared with xcp-build.sh, so the two RPM cut paths
 # cannot drift. The repo is bind-mounted at /src, so it is present in-container.
 source /src/install-helpers/rpm-features.sh
+# The server variant replaces the base Requires table, which previously left a
+# freshly installed headless compute node without its Quadlet/libvirt runtime.
+# Apply the committed deterministic transform in this disposable farm checkout;
+# restore the source manifest even when cargo-generate-rpm fails.
+RPM_MANIFEST=/src/crates/mesh/mackesd/Cargo.toml
+RPM_MANIFEST_ORIGINAL=$(mktemp)
+RPM_MANIFEST_GENERATED=$(mktemp)
+cp -- "$RPM_MANIFEST" "$RPM_MANIFEST_ORIGINAL"
+restore_rpm_manifest() {
+  cp -- "$RPM_MANIFEST_ORIGINAL" "$RPM_MANIFEST"
+  rm -f -- "$RPM_MANIFEST_ORIGINAL" "$RPM_MANIFEST_GENERATED"
+}
+trap restore_rpm_manifest EXIT
+/src/install-helpers/build-rpm-fedora43.sh --prepare-workload-rpm-manifest \
+  "$RPM_MANIFEST" "$RPM_MANIFEST_GENERATED"
+mv -- "$RPM_MANIFEST_GENERATED" "$RPM_MANIFEST"
 # XPA-6/DO-LIGHTHOUSE-THIN — MODE (full|server|lighthouse) is passed in via
 # `podman run -e MODE=…`.
 if [ "${MODE:-full}" = "lighthouse" ]; then
@@ -189,6 +323,8 @@ elif [ "${MODE:-full}" = "server" ]; then
   cargo generate-rpm -p crates/mesh/mackesd --variant server
   echo "[f43] generating thin lighthouse RPM (--variant lighthouse)"
   cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse
+  /src/install-helpers/build-rpm-fedora43.sh --verify-workload-rpm-requires \
+    /src/target-f43/generate-rpm/magic-mesh-server-*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-server-*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
 else
@@ -208,6 +344,8 @@ else
   cargo generate-rpm -p crates/mesh/mackesd
   echo "[f43] generating thin lighthouse RPM (--variant lighthouse)"
   cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse
+  /src/install-helpers/build-rpm-fedora43.sh --verify-workload-rpm-requires \
+    /src/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
 fi
