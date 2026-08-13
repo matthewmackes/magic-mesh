@@ -665,6 +665,16 @@ struct AtmosphericAuthority {
     viewport: WeatherMapViewportState,
 }
 
+#[derive(Debug, Serialize)]
+struct AtmosphericMapReset<'a> {
+    schema_version: u16,
+    host: &'a str,
+    location_generation: u64,
+    location_point: &'a GeoPoint,
+    cleared_at_ms: i64,
+    state: &'static str,
+}
+
 fn publish_viewport_state(
     persist: &Persist,
     host: &str,
@@ -874,6 +884,46 @@ impl WeatherAtmosphereWorker {
         Ok(AtmosphericAuthority { location, viewport })
     }
 
+    /// Revoke a previously published atmospheric image when its location
+    /// authority can no longer be admitted. The reset is written only while a
+    /// typed atmospheric snapshot is still the latest record, so the two-second
+    /// recovery poll cannot flood the Bus and cannot overwrite another
+    /// authority's newer reset.
+    fn revoke_projection_after_authority_loss(&self) -> io::Result<bool> {
+        let persist = self.open_bus()?;
+        let Some(body) = persist
+            .read_latest(&weather_map_state_topic(&self.host))
+            .map_err(io_other)?
+            .and_then(|message| message.body)
+        else {
+            return Ok(false);
+        };
+        let Ok(snapshot) = serde_json::from_str::<AtmosphericMapSnapshot>(&body) else {
+            return Ok(false);
+        };
+        if snapshot.host != self.host {
+            return Ok(false);
+        }
+        let reset = AtmosphericMapReset {
+            schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+            host: &self.host,
+            location_generation: snapshot.location_generation,
+            location_point: &snapshot.location_point,
+            cleared_at_ms: self.clock.now_ms(),
+            state: "location_authority_unavailable",
+        };
+        let body = serde_json::to_string(&reset).map_err(io_other)?;
+        persist
+            .write(
+                &weather_map_state_topic(&self.host),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(true)
+    }
+
     async fn refresh_once(&self, expected: AtmosphericAuthority) -> io::Result<bool> {
         let Some(location) = effective_location(&expected.location).cloned() else {
             return Ok(false);
@@ -1005,6 +1055,13 @@ impl Worker for WeatherAtmosphereWorker {
                 Ok(authority) => authority,
                 Err(error) => {
                     tracing::warn!(target: "mackesd::weather_atmosphere", %error, "effective location unavailable");
+                    if let Err(revoke_error) = self.revoke_projection_after_authority_loss() {
+                        tracing::warn!(
+                            target: "mackesd::weather_atmosphere",
+                            %revoke_error,
+                            "failed to revoke atmospheric projection after authority loss"
+                        );
+                    }
                     tokio::select! {
                         () = shutdown.wait() => break,
                         () = tokio::time::sleep(AUTHORITY_POLL) => continue,
@@ -1043,7 +1100,8 @@ mod tests {
     use super::*;
     use mackes_mesh_types::location::WeatherCoverage;
     use mackes_mesh_types::location::{
-        EffectiveLocationProvenance, WeatherLocationMode, WEATHER_LOCATION_SCHEMA_VERSION,
+        EffectiveLocationProvenance, LocationUnavailableReason, WeatherLocationMode,
+        WEATHER_LOCATION_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicBool, AtomicI64};
     use std::sync::Mutex;
@@ -1243,6 +1301,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn location_authority_loss_revokes_old_imagery_and_recovery_republishes() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        write_location(&root, &location(7, -71.0589));
+        let worker = worker_at(&temp, fixture_probe(), NOW);
+        assert!(worker
+            .refresh_once(authority(&worker))
+            .await
+            .expect("seed atmospheric projection"));
+
+        let mut unavailable = location(8, -72.0);
+        unavailable.state = EffectiveLocationState::Unavailable {
+            reason: LocationUnavailableReason::NoVerifiedFallback,
+        };
+        write_location(&root, &unavailable);
+        assert!(worker
+            .read_authority()
+            .expect_err("unavailable authority must fail closed")
+            .to_string()
+            .contains("unavailable"));
+        assert!(worker
+            .revoke_projection_after_authority_loss()
+            .expect("revoke stale imagery"));
+        assert!(
+            !worker
+                .revoke_projection_after_authority_loss()
+                .expect("repeated poll remains idempotent"),
+            "the authority recovery poll must not flood the Bus with resets"
+        );
+
+        let persist = Persist::open(root.clone()).expect("open Bus");
+        let reset = persist
+            .read_latest(&weather_map_state_topic("workstation-1"))
+            .expect("read reset")
+            .and_then(|message| message.body)
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .expect("decode reset");
+        assert_eq!(reset["state"], "location_authority_unavailable");
+        assert_eq!(reset["location_generation"], 7);
+        assert!(serde_json::from_value::<AtmosphericMapSnapshot>(reset).is_err());
+
+        write_location(&root, &location(8, -72.0));
+        assert!(worker
+            .refresh_once(authority(&worker))
+            .await
+            .expect("provider recovery"));
+        let recovered = latest(&root);
+        assert_eq!(recovered.location_generation, 8);
+        assert!(matches!(recovered.availability, WeatherAvailability::Fresh));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn late_and_replaced_bus_recovers_external_authority_and_shutdown() {
         assert_eq!(
             weather_atmosphere_bus_root(Some(Path::new("/explicit")), Some("/current".into())),
@@ -1385,10 +1495,19 @@ mod tests {
             &cache_path,
         );
 
-        assert!(result.fresh.is_err(), "provider outage must remain explicit");
+        assert!(
+            result.fresh.is_err(),
+            "provider outage must remain explicit"
+        );
         assert!(result.cache.is_none(), "corrupt cache must not be admitted");
-        assert!(result.cache_error.is_none(), "quarantine should recover the read");
-        assert!(!cache_path.exists(), "corrupt cache must leave the authority path");
+        assert!(
+            result.cache_error.is_none(),
+            "quarantine should recover the read"
+        );
+        assert!(
+            !cache_path.exists(),
+            "corrupt cache must leave the authority path"
+        );
         assert!(
             fs::read_dir(temp.path())
                 .expect("cache directory")
@@ -1721,11 +1840,7 @@ mod tests {
 
         let failed_probe = fixture_probe();
         failed_probe.fail.store(true, Ordering::SeqCst);
-        let restarted = worker_at(
-            &temp,
-            failed_probe,
-            NOW + MAX_ATMOSPHERIC_FRESH_AGE_MS + 1,
-        );
+        let restarted = worker_at(&temp, failed_probe, NOW + MAX_ATMOSPHERIC_FRESH_AGE_MS + 1);
         let restarted_authority = authority(&restarted);
         assert!(!restarted
             .refresh_once(restarted_authority)
