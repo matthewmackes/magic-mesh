@@ -399,6 +399,13 @@ pub struct ToastHost {
     current: Option<Active>,
     /// Alerts waiting their turn — the "N more" backlog.
     pending: VecDeque<Toast>,
+    /// The exact alert interrupted by an operator notice.
+    ///
+    /// This single bounded slot is deliberately separate from `pending`: an
+    /// acknowledgement-held F-grade scene must remain recoverable even when the
+    /// critical backlog is full, and a timed scene must resume with its original
+    /// countdown rather than receiving a fresh dwell.
+    interrupted: Option<Active>,
     /// The separate OSD level flash (never queued behind alerts).
     osd: Option<ActiveOsd>,
     /// Whether the band is hovered — pauses the alert countdown.
@@ -419,6 +426,7 @@ impl ToastHost {
         Self {
             current: None,
             pending: VecDeque::new(),
+            interrupted: None,
             osd: None,
             hovered: false,
             chyron_fade: None,
@@ -502,6 +510,14 @@ impl ToastHost {
 
         self.pending.retain(|candidate| !same_authority(candidate));
         if self
+            .interrupted
+            .as_ref()
+            .is_some_and(|active| same_authority(&active.toast))
+        {
+            self.interrupted = Some(Active::new(toast.clone()));
+            return false;
+        }
+        if self
             .current
             .as_ref()
             .is_some_and(|active| same_authority(&active.toast))
@@ -567,11 +583,18 @@ impl ToastHost {
         let incoming_operator_notice = toast.is_ai_generated_alert();
         match &self.current {
             None => self.current = Some(Active::new(toast)),
+            Some(_) if incoming_operator_notice && self.interrupted.is_none() => {
+                // Preserve the complete active state outside the bounded queue.
+                // In particular, this cannot drop a held F-grade scene merely
+                // because all 64 waiting slots are already critical, and it does
+                // not reset a timed scene's remaining dwell on resume.
+                self.interrupted = self.current.take();
+                self.current = Some(Active::new(toast));
+            }
             Some(cur)
-                if incoming_operator_notice
-                    || (incoming_critical
-                        && !cur.is_critical()
-                        && !cur.toast.is_ai_generated_alert()) =>
+                if incoming_critical
+                    && !cur.is_critical()
+                    && !cur.toast.is_ai_generated_alert() =>
             {
                 if let Some(displaced) = self.current.take() {
                     let displaced_critical = displaced.is_critical();
@@ -611,7 +634,10 @@ impl ToastHost {
 
     /// Drop the showing alert and promote the next from the backlog (if any).
     pub fn advance(&mut self) {
-        self.current = self.pending.pop_front().map(Active::new);
+        self.current = self
+            .interrupted
+            .take()
+            .or_else(|| self.pending.pop_front().map(Active::new));
     }
 
     /// Dismiss the showing alert (a click / "X" / swipe). A **Critical** is *not*
@@ -674,7 +700,14 @@ impl ToastHost {
                 break;
             }
             alert_elapsed = alert_elapsed.saturating_sub(*remaining);
+            let resumes_interrupted = self.interrupted.is_some();
             self.advance();
+            if resumes_interrupted {
+                // The interrupted scene was not visible while the operator
+                // notice owned the surface, so none of the notice's excess
+                // elapsed time may drain its preserved countdown.
+                break;
+            }
         }
     }
 
@@ -689,7 +722,7 @@ impl ToastHost {
     /// The "N more" backlog count — alerts waiting behind the current one.
     #[must_use]
     pub fn backlog(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + usize::from(self.interrupted.is_some())
     }
 
     /// Whether the showing alert uses Critical presentation/preemption. Its
@@ -756,7 +789,7 @@ impl ToastHost {
             return ChyronInteraction::default();
         };
 
-        let backlog = self.pending.len();
+        let backlog = self.backlog();
         let remaining = self.remaining();
         let mut band = BandOutcome::default();
         egui::Area::new(egui::Id::new(CHYRON_AREA_ID))
@@ -1953,6 +1986,60 @@ mod tests {
             Some("health-monitor")
         );
         assert_eq!(host.remaining(), None, "the Critical must retain UntilAck");
+    }
+
+    #[test]
+    fn operator_interruption_preserves_saturated_f_grade_and_timed_scene_state() {
+        let mut saturated = ToastHost::new();
+        saturated.enqueue(crit("visible-f-grade"));
+        for index in 0..MAX_ALERT_BACKLOG {
+            saturated.enqueue(crit(&format!("queued-f-grade-{index}")));
+        }
+        saturated.enqueue(Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "Update begins in 5 seconds",
+        ));
+
+        assert!(
+            saturated
+                .current()
+                .is_some_and(Toast::is_ai_generated_alert),
+            "the interruption must remain visible even with a full F-grade backlog"
+        );
+        assert_eq!(
+            saturated.backlog(),
+            MAX_ALERT_BACKLOG + 1,
+            "the one suspended scene is reported in addition to the bounded queue"
+        );
+        saturated.tick(DWELL_WARNING);
+        assert_eq!(
+            saturated.current().map(|toast| toast.source_host.as_str()),
+            Some("visible-f-grade")
+        );
+        assert_eq!(saturated.remaining(), None);
+        assert_eq!(saturated.pending.len(), MAX_ALERT_BACKLOG);
+
+        let mut timed = ToastHost::new();
+        timed.enqueue(info("timed-scene"));
+        timed.tick(Duration::from_secs(2));
+        timed.enqueue(Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "Renderer interruption",
+        ));
+        timed.tick(DWELL_WARNING + Duration::from_secs(30));
+        assert_eq!(
+            timed.current().map(|toast| toast.source_host.as_str()),
+            Some("timed-scene")
+        );
+        assert_eq!(
+            timed.remaining(),
+            Some(Duration::from_secs(3)),
+            "interruption must resume the exact countdown instead of resetting or draining it"
+        );
     }
 
     #[test]
