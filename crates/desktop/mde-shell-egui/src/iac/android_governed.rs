@@ -499,11 +499,21 @@ fn lifecycle_availability(
                 "Android is running but no typed WebRTC source was published".to_owned(),
             );
         };
+        let Some(receipt) = input.receipt.filter(|receipt| {
+            receipt.workload_id == input.workload.workload_id
+                && receipt.phase == LifecyclePhase::Running
+                && receipt.last_ok
+        }) else {
+            return WorkloadAvailability::Unavailable(
+                "the WebRTC source has no matching successful running lifecycle receipt".to_owned(),
+            );
+        };
         let catalog_digest = input
             .catalog
             .and_then(|snapshot| snapshot.catalog.payload.content_digest().ok());
         let exact_source = source.validate().is_ok()
             && source.workload_id == input.workload.workload_id
+            && source.generation == receipt.generation
             && source.protocol == AndroidVdiProtocol::WebRtc
             && source.observed_at_unix_ms <= input.now_unix_ms
             && source.expires_at_unix_ms > input.now_unix_ms

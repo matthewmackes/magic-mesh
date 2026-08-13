@@ -1660,6 +1660,35 @@ fn governed_android_projection() -> android_governed::WorkloadProjection {
     })
 }
 
+fn governed_android_vdi_source(generation: u64) -> AndroidVdiSource {
+    use mackes_mesh_types::android_provider::{
+        AndroidVdiProtocol, CuttlefishImageProvenanceRef, ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+    };
+
+    let catalog = governed_android_catalog();
+    let catalog_digest = catalog.payload.content_digest().expect("catalog digest");
+    let provenance = catalog.payload.package_manifest.image_provenance;
+    AndroidVdiSource {
+        schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+        workload_id: "android-eagle".to_owned(),
+        image_provenance: CuttlefishImageProvenanceRef::new(
+            provenance.image_id,
+            provenance.image_digest,
+            provenance.source_revision,
+            provenance.catalog_revision,
+        )
+        .expect("VDI provenance"),
+        catalog_digest,
+        generation,
+        protocol: AndroidVdiProtocol::WebRtc,
+        mesh_host: "android-eagle.mesh".to_owned(),
+        port: 8443,
+        session_id: format!("android-session-{generation}"),
+        observed_at_unix_ms: ANDROID_NOW - 100,
+        expires_at_unix_ms: ANDROID_NOW + 60_000,
+    }
+}
+
 #[test]
 fn governed_android_model_uses_exact_signed_permissions_and_refuses_missing_preflight() {
     let projection = governed_android_projection();
@@ -1796,6 +1825,72 @@ fn governed_android_model_projects_cancel_and_retry_from_exact_generation_state(
     ));
     assert_eq!(retry.expected_generation, 1);
     assert!(retry.cards.iter().all(|card| card.can_retry));
+}
+
+#[test]
+fn governed_android_input_attachment_requires_exact_running_generation() {
+    let workload = android_governed::WorkloadInput {
+        node: "eagle".to_owned(),
+        workload_id: "android-eagle".to_owned(),
+        runtime_status: "running".to_owned(),
+    };
+    let catalog = governed_catalog_snapshot();
+    let catalog_digest = catalog
+        .catalog
+        .payload
+        .content_digest()
+        .expect("catalog digest");
+    let admission = governed_android_admission();
+    let inventory = governed_android_inventory();
+    let receipt = android_governed::LifecycleReceipt {
+        schema_version: 1,
+        workload_id: "android-eagle".to_owned(),
+        generation: 8,
+        phase: android_governed::LifecyclePhase::Running,
+        app: Some(AospStarterApp::Camera),
+        last_request_id: Some("start-8".to_owned()),
+        last_operation: Some(android_governed::LifecycleOperation::Start),
+        last_ok: true,
+        failure: None,
+    };
+
+    let stale_source = governed_android_vdi_source(7);
+    let stale = android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: Some(&catalog_digest),
+        admission: Some(&admission),
+        inventory: Some(&inventory),
+        vdi_source: Some(&stale_source),
+        receipt: Some(&receipt),
+        pending: None,
+        now_unix_ms: ANDROID_NOW,
+    });
+    assert!(matches!(
+        stale.availability,
+        android_governed::WorkloadAvailability::Unavailable(ref reason)
+            if reason.contains("generation identity")
+    ));
+    assert!(stale.vdi_source.is_none());
+    assert!(stale.can_stop);
+
+    let exact_source = governed_android_vdi_source(8);
+    let exact = android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: Some(&catalog_digest),
+        admission: Some(&admission),
+        inventory: Some(&inventory),
+        vdi_source: Some(&exact_source),
+        receipt: Some(&receipt),
+        pending: None,
+        now_unix_ms: ANDROID_NOW,
+    });
+    assert_eq!(
+        exact.availability,
+        android_governed::WorkloadAvailability::Running
+    );
+    assert_eq!(exact.vdi_source, Some(exact_source));
 }
 
 #[test]
