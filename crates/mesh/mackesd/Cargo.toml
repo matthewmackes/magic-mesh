@@ -1229,6 +1229,11 @@ openssh-clients = "*"
 #     firewall worker).
 NetworkManager = "*"
 firewalld = "*"
+# WL-ARCH-010 — containers are a first-class Workloads actuator, not an
+# optional host probe.  The reconciler invokes podman to admit/load images and
+# materializes Quadlets for systemd; a weak-dependency-disabled installation
+# must therefore still carry the sole container runtime authority.
+podman = "*"
 #   Editor/terminal/shell utils: ripgrep (rg, editor find-in-files), tmux (terminal
 #     session multiplexing), xdg-utils (xdg-open, external URLs).
 ripgrep = "*"
@@ -1295,7 +1300,6 @@ openssh-clients = "*"
 # systemd.
 NetworkManager = "*"
 firewalld = "*"
-podman = "*"
 rsync = "*"
 # SURFACE-1 (surface-tablet-enablement.md locks 1 + 10) — the `surface-tools`
 # bits that live ONLY in the linux-surface repo (pkg.surfacelinux.com), NOT the
@@ -1675,6 +1679,9 @@ ntfsprogs = "*"
 cryptsetup = "*"
 parted = "*"
 qemu-img = "*"
+# WL-ARCH-010 — the headless Server is a compute role and runs the same
+# Workloads container reconciler as the base Workstation package.
+podman = "*"
 
 # XPA-6 — the headless variant's weak deps: the Server-tier shell-outs only.
 # Dropped vs the base: the desktop-only cosmic-disks, the voice binaries
@@ -1687,7 +1694,6 @@ libvirt-daemon-config-network = "*"
 openssh-clients = "*"
 NetworkManager = "*"
 firewalld = "*"
-podman = "*"
 rsync = "*"
 
 # XPA-6 — upgrade/obsolete continuity for the headless variant (matches the base).

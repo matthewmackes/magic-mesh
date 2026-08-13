@@ -137,16 +137,19 @@ readonly CANDIDATE_CREDENTIAL_ASSETS=(
 )
 readonly BASE_VDI_HOST_REQUIRES=(
   "libvirt"
+  "podman"
   "qemu-kvm"
   "qemu-ui-dbus"
   "libvirt-daemon-kvm"
   "libvirt-daemon-driver-storage"
 )
 readonly BUILT_RPM_KVM_REQUIRES=(
+  "podman"
   "qemu-kvm"
   "qemu-ui-dbus"
   "libvirt-daemon-kvm"
 )
+readonly SERVER_WORKLOAD_REQUIRES=("podman")
 readonly APP_VM_BOOTSTRAP_SOURCE="infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 readonly APP_VM_BOOTSTRAP_DEST="/usr/share/mde/iac/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 readonly APP_VM_BOOTSTRAP_MARKERS=(
@@ -365,6 +368,19 @@ check_vdi_host_requires() {
       ok "hard-requires  $package"
     else
       fail "hard-requires  $package MISSING from [package.metadata.generate-rpm.requires]"
+    fi
+  done
+
+  hdr "Workloads container runtime — server RPM hard Requires"
+  seen=()
+  while IFS= read -r package; do
+    [ -n "$package" ] && seen["$package"]=1
+  done < <(parse_table_keys "$CARGO_TOML" "package.metadata.generate-rpm.variants.server.requires")
+  for package in "${SERVER_WORKLOAD_REQUIRES[@]}"; do
+    if [ -n "${seen["$package"]:-}" ]; then
+      ok "server hard-requires  $package"
+    else
+      fail "server hard-requires  $package MISSING from [package.metadata.generate-rpm.variants.server.requires]"
     fi
   done
 }
@@ -1153,6 +1169,7 @@ assets = [
 ]
 [package.metadata.generate-rpm.requires]
 libvirt = "*"
+podman = "*"
 qemu-kvm = "*"
 qemu-ui-dbus = "*"
 libvirt-daemon-kvm = "*"
@@ -1161,6 +1178,8 @@ libvirt-daemon-driver-storage = "*"
 assets = [
     { source = "target/release/should-be-ignored", dest = "/usr/bin/should-be-ignored", mode = "755" },
 ]
+[package.metadata.generate-rpm.variants.server.requires]
+podman = "*"
 TOML
   local n
   n="$(parse_assets "$good" | wc -l | tr -d ' ')"
@@ -1194,6 +1213,7 @@ TOML
 libvirt = "*"
 libvirt-daemon-driver-storage = "*"
 [package.metadata.generate-rpm.recommends]
+podman = "*"
 qemu-kvm = "*"
 qemu-ui-dbus = "*"
 libvirt-daemon-kvm = "*"
@@ -1202,8 +1222,10 @@ TOML
   if [ "$rc" -ne 0 ] \
       && grep -q "qemu-kvm MISSING" <<<"$out" \
       && grep -q "qemu-ui-dbus MISSING" <<<"$out" \
-      && grep -q "libvirt-daemon-kvm MISSING" <<<"$out"; then
-    ok "self-test: weak-only Fedora KVM dependencies fail the hard-Requires gate"
+      && grep -q "libvirt-daemon-kvm MISSING" <<<"$out" \
+      && grep -q "hard-requires  podman MISSING" <<<"$out" \
+      && grep -q "server hard-requires  podman MISSING" <<<"$out"; then
+    ok "self-test: weak-only Workloads/KVM dependencies fail the hard-Requires gate"
   else
     fail "self-test: weak-only Fedora KVM dependencies were not rejected"; st_fail=1
   fi
@@ -1216,6 +1238,7 @@ TOML
 qemu-kvm
 qemu-ui-dbus = 2:10.2.2-1.fc44
 libvirt-daemon-kvm >= 10.0
+podman >= 5.0
 rpmlib(CompressedFileNames) <= 3.0.4-1
 REQUIRES
   out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_REQUIRES="$good_rpm_requires" \
@@ -1223,8 +1246,9 @@ REQUIRES
   if [ "$rc" -eq 0 ] \
       && grep -q "actual-requires qemu-kvm present" <<<"$out" \
       && grep -q "actual-requires qemu-ui-dbus present" <<<"$out" \
-      && grep -q "actual-requires libvirt-daemon-kvm present" <<<"$out"; then
-    ok "self-test: a built RPM header with all mandatory KVM Requires passes"
+      && grep -q "actual-requires libvirt-daemon-kvm present" <<<"$out" \
+      && grep -q "actual-requires podman present" <<<"$out"; then
+    ok "self-test: a built RPM header with all mandatory Workloads/KVM Requires passes"
   else
     fail "self-test: complete built RPM KVM Requires header did not pass"; st_fail=1
   fi
@@ -1234,14 +1258,16 @@ REQUIRES
 qemu-kvm-helper
 qemu-ui-dbus-helper
 libvirt-daemon-kvm-tools
+podman-remote
 REQUIRES
   out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_REQUIRES="$bad_rpm_requires" \
       bash "$0" requirements "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] \
       && grep -q "actual-requires qemu-kvm MISSING" <<<"$out" \
       && grep -q "actual-requires qemu-ui-dbus MISSING" <<<"$out" \
-      && grep -q "actual-requires libvirt-daemon-kvm MISSING" <<<"$out"; then
-    ok "self-test: similarly named capabilities cannot satisfy built RPM KVM Requires"
+      && grep -q "actual-requires libvirt-daemon-kvm MISSING" <<<"$out" \
+      && grep -q "actual-requires podman MISSING" <<<"$out"; then
+    ok "self-test: similarly named capabilities cannot satisfy built RPM Workloads/KVM Requires"
   else
     fail "self-test: built RPM Requires gate accepted similarly named capabilities"; st_fail=1
   fi
