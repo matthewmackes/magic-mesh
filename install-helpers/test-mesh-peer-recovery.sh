@@ -147,6 +147,10 @@ case "$1" in
             elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-etcd-after-syncthing-start" ]; then
                 rm -f "$state/drop-etcd-after-syncthing-start" \
                     "$state/active-etcd.service"
+            elif [ "$unit" = syncthing.service ] && [ -f "$state/drop-overlay-after-syncthing-start" ]; then
+                rm -f "$state/drop-overlay-after-syncthing-start" \
+                    "$state/active-nebula.service"
+                : >"$state/force-nebula-inactive"
             fi
         elif [ "${2:-}" = mde-shell-egui.service ]; then
             printf '%s\n' "$2" >>"$state/mutations"
@@ -442,6 +446,31 @@ cmp "$STATE/expected-mutations" "$STATE/mutations"
 grep -Fq 'status=offline-after-syncthing' "$STATE/notifies"
 echo 'PASS Syncthing boundary fixture: link loss prevents grouped mutation'
 rm -f "$STATE/drop-after-syncthing-start"
+
+# The physical route and both configured services can remain active after the
+# overlay dies during Syncthing startup. Grouped workers must not be started
+# from that stale overlay admission or publish against a partial mesh.
+rm -f "$STATE"/active-etcd.service "$STATE"/active-syncthing.service \
+    "$STATE"/active-mackesd-*.service
+: >"$STATE/active-nebula.service"
+: >"$STATE/online"
+: >"$STATE/drop-overlay-after-syncthing-start"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+if run_helper; then
+    echo 'lost overlay unexpectedly allowed grouped recovery' >&2
+    exit 1
+fi
+cat >"$STATE/expected-mutations" <<'EOF'
+etcd.service
+syncthing.service
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=overlay-lost-before-grouped' "$STATE/notifies"
+rm -f "$STATE/drop-overlay-after-syncthing-start" \
+    "$STATE/force-nebula-inactive"
+: >"$STATE/active-nebula.service"
+echo 'PASS pre-grouped overlay fixture: lost overlay blocks grouped mutation'
 
 # Coordination can fail after Syncthing starts while the physical link remains
 # online.  The complete configured substrate must be re-attested before grouped

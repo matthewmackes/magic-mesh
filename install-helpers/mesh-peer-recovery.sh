@@ -394,10 +394,15 @@ main() {
         publish "skipped-syncthing-unconfigured"
     fi
 
-    # A successful start is only a point-in-time result.  Either configured
-    # substrate service can fail immediately after its bounded start while the
-    # physical link remains online.  Re-attest the complete configured pair
-    # before grouped workers can observe or publish state from a partial mesh.
+    # A successful start is only a point-in-time result.  The overlay or either
+    # configured substrate service can fail immediately after the bounded
+    # Syncthing start while the physical link remains online. Re-attest the
+    # complete dependency chain before grouped workers can observe or publish
+    # state from a partial mesh.
+    if ! nebula_ready; then
+        publish "overlay-lost-before-grouped"
+        return 1
+    fi
     if ! configured_substrate_ready; then
         publish "substrate-lost-before-grouped"
         return 1
