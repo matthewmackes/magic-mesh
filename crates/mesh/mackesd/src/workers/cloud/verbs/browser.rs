@@ -55,6 +55,40 @@ fn build_reply(
     };
     let spec = browser_spec(node, name, image_digest);
 
+    // Provisioning establishes the immutable identity of the one Browser VM;
+    // it is not an upgrade or replacement operation.  In particular, never
+    // let a second armed request silently retarget an existing Browser session
+    // to another image.  Exact replay is an idempotent success, while changing
+    // any admitted field requires the typed Workload lifecycle to remove the
+    // old declaration first.
+    let existing = match reconcile::read_desired_slice_strict(state_root, node) {
+        Ok(existing) => existing,
+        Err(error) => {
+            return reject(
+                verb_name,
+                format!(
+                    "browser-provision could not verify the existing desired state for `{name}` on `{node}`; nothing changed: {error}"
+                ),
+            );
+        }
+    };
+    if let Some(admitted) = existing.iter().find(|candidate| candidate.name == name) {
+        if admitted == &spec {
+            return CloudReply {
+                ok: true,
+                verb: verb_name.to_string(),
+                desired: Some(vec![admitted.clone()]),
+                ..Default::default()
+            };
+        }
+        return reject(
+            verb_name,
+            format!(
+                "browser-provision refuses to replace the admitted `{name}` VM on `{node}`; remove it through the typed Workload lifecycle before provisioning a different immutable image"
+            ),
+        );
+    }
+
     match reconcile::write_desired_doc(state_root, &spec) {
         Ok(()) => CloudReply {
             ok: true,
@@ -181,6 +215,34 @@ mod tests {
         assert_eq!(
             reconcile::read_desired_slice(tmp.path(), "eagle"),
             vec![browser_spec("eagle", BROWSER_VM_WORKLOAD_NAME, DIGEST)]
+        );
+    }
+
+    #[test]
+    fn browser_reprovision_is_idempotent_but_cannot_retarget_the_admitted_vm() {
+        let tmp = tempdir().unwrap();
+        let initial = body("eagle", Some(BROWSER_VM_WORKLOAD_NAME));
+        let admitted = build_reply(tmp.path(), "browser-provision", &initial);
+        assert!(admitted.ok, "error: {:?}", admitted.error);
+
+        let replay = build_reply(tmp.path(), "browser-provision", &initial);
+        assert!(replay.ok, "error: {:?}", replay.error);
+        assert_eq!(replay.desired, admitted.desired);
+
+        let mut replacement = initial;
+        replacement.image_digest = Some(
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+        );
+        let rejected = build_reply(tmp.path(), "browser-provision", &replacement);
+        assert!(!rejected.ok);
+        assert!(rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("refuses to replace")));
+        assert!(rejected.desired.is_none());
+        assert_eq!(
+            reconcile::read_desired_slice(tmp.path(), "eagle"),
+            admitted.desired.unwrap()
         );
     }
 
