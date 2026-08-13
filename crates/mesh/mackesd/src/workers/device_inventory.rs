@@ -869,16 +869,47 @@ pub fn input_devices(roots: &SysfsRoots) -> Vec<DeviceRecord> {
         .filter_map(|dir| {
             let node = dir.file_name()?.to_str()?;
             let observed_name = read_trim(&dir.join("name"));
-            let status = if observed_name.is_some() {
-                DeviceStatus::Ok
-            } else {
-                DeviceStatus::Unknown
+            let inhibited =
+                read_trim(&dir.join("inhibited")).and_then(|value| match value.as_str() {
+                    "0" => Some(false),
+                    "1" => Some(true),
+                    _ => None,
+                });
+            let inhibit_attribute_present = dir.join("inhibited").exists();
+            let (status, problem) = match (observed_name.is_some(), inhibited) {
+                (_, Some(true)) => (
+                    DeviceStatus::Disabled,
+                    Some("input device inhibited by kernel policy".to_string()),
+                ),
+                (true, Some(false) | None) if !inhibit_attribute_present || inhibited.is_some() => {
+                    (DeviceStatus::Ok, None)
+                }
+                (false, Some(false) | None)
+                    if !inhibit_attribute_present || inhibited.is_some() =>
+                {
+                    (
+                        DeviceStatus::Unknown,
+                        Some("input device name unavailable".to_string()),
+                    )
+                }
+                _ => (
+                    DeviceStatus::Unknown,
+                    Some("input inhibition state unavailable".to_string()),
+                ),
             };
+            let events = inhibited
+                .map(|inhibited| {
+                    vec![format!(
+                        "inhibited: {}",
+                        if inhibited { "yes" } else { "no" }
+                    )]
+                })
+                .unwrap_or_default();
             Some(DeviceRecord {
                 name: observed_name.unwrap_or_else(|| node.to_string()),
                 sysfs_path: Some(dir.to_string_lossy().into_owned()),
-                problem: (status == DeviceStatus::Unknown)
-                    .then(|| "input device name unavailable".to_string()),
+                problem,
+                events,
                 ..DeviceRecord::new(node, status)
             })
         })
@@ -1981,6 +2012,9 @@ mod tests {
                 fs::create_dir_all(&device).unwrap();
             }
         }
+        put(&input.join("input0001/inhibited"), "1\n");
+        put(&input.join("input0002/inhibited"), "invalid\n");
+        put(&input.join("input0003/inhibited"), "0\n");
         put(&input.join("event0000/dev"), "13:64\n");
 
         let records = input_devices(&roots);
@@ -1991,6 +2025,19 @@ mod tests {
             records[0].problem.as_deref(),
             Some("input device name unavailable")
         );
+        assert_eq!(records[1].status, DeviceStatus::Disabled);
+        assert_eq!(
+            records[1].problem.as_deref(),
+            Some("input device inhibited by kernel policy")
+        );
+        assert_eq!(records[1].events, ["inhibited: yes"]);
+        assert_eq!(records[2].status, DeviceStatus::Unknown);
+        assert_eq!(
+            records[2].problem.as_deref(),
+            Some("input inhibition state unavailable")
+        );
+        assert_eq!(records[3].status, DeviceStatus::Ok);
+        assert_eq!(records[3].events, ["inhibited: no"]);
         assert_eq!(records.last().unwrap().name, "Input device 255");
         assert!(records
             .iter()
