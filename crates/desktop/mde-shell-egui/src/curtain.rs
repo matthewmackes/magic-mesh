@@ -514,6 +514,10 @@ pub(crate) struct Curtain {
     password: String,
     /// The verify seam (CURTAIN-2 fills it with PAM; [`NotWired`] by default).
     verifier: Box<dyn Verifier>,
+    /// A newer authoritative lock arrived while PAM was evaluating an older
+    /// attempt. The worker cannot be cancelled safely, so its eventual verdict
+    /// is consumed but forbidden from lifting the newly locked curtain.
+    verification_revoked: bool,
     /// The CURTAIN-4 master-volume seam (real `wpctl` by default; a recording
     /// fake in tests). Write-only — the live level is read from the seat
     /// snapshot the shell hands [`Curtain::show`], never from here.
@@ -547,6 +551,7 @@ impl Curtain {
             error: None,
             password: String::new(),
             verifier,
+            verification_revoked: false,
             mixer: Box::new(HostMixer::new()),
             vol_echo: None,
             mixer_error: None,
@@ -565,9 +570,26 @@ impl Curtain {
 
     /// Drop the curtain (Super+L, and later the CURTAIN-3 triggers). Starts
     /// the slide from the top edge; a no-op while already engaged.
-    pub(crate) const fn lock(&mut self) {
-        if matches!(self.phase, Phase::Unlocked) {
-            self.phase = Phase::Dropping { p: 0.0 };
+    pub(crate) fn lock(&mut self) {
+        self.password.clear();
+        self.error = None;
+        match self.phase {
+            Phase::Unlocked => self.phase = Phase::Dropping { p: 0.0 },
+            Phase::Verifying => {
+                // PAM may already be executing off-thread. Keep polling that
+                // one attempt, but make the newer lock request authoritative.
+                self.verification_revoked = true;
+            }
+            Phase::Lifting { .. } => {
+                // A lock request that races a completed authentication must
+                // stop the lift instead of allowing stale authority to expose
+                // the seat.
+                self.phase = Phase::Locked { idle_secs: 0.0 };
+            }
+            Phase::Dropping { .. }
+            | Phase::Locked { .. }
+            | Phase::Revealing
+            | Phase::Backoff { .. } => {}
         }
     }
 
@@ -633,6 +655,13 @@ impl Curtain {
     /// stage with the honest reason, and the [`MAX_FAILS`]th deny arms the
     /// backoff wall (lock 10).
     fn settle(&mut self, verdict: Verdict) {
+        if std::mem::take(&mut self.verification_revoked) {
+            self.fails = 0;
+            self.error = None;
+            self.password.clear();
+            self.phase = Phase::Locked { idle_secs: 0.0 };
+            return;
+        }
         match verdict {
             Verdict::Granted => {
                 self.fails = 0;
@@ -701,6 +730,7 @@ impl Curtain {
             return;
         }
         let password = std::mem::take(&mut self.password);
+        self.verification_revoked = false;
         self.verifier.begin(&password);
         self.error = None;
         self.phase = Phase::Verifying;
@@ -1719,6 +1749,39 @@ mod tests {
 
         step(&mut c, LIFT_SECS + 0.1);
         assert!(!c.engaged(), "the lift ends unlocked");
+    }
+
+    #[test]
+    fn a_new_lock_revokes_an_inflight_pam_grant() {
+        let mut c = locked(Scripted::grants());
+        c.reveal();
+        c.password.push_str("correct-horse");
+        c.submit();
+        assert!(matches!(c.phase, Phase::Verifying));
+
+        // A newer loginctl/idle/operator lock is authoritative over the PAM
+        // attempt that was already running. Its eventual grant is consumed,
+        // but must not expose the newly locked seat.
+        c.lock();
+        c.tick(0.016);
+
+        assert!(matches!(c.phase, Phase::Locked { .. }));
+        assert!(c.engaged() && c.covers_fully());
+        assert!(c.password.is_empty());
+    }
+
+    #[test]
+    fn a_new_lock_interrupts_a_stale_unlock_lift() {
+        let mut c = locked(Scripted::grants());
+        c.reveal();
+        attempt(&mut c, "correct-horse");
+        assert!(matches!(c.phase, Phase::Lifting { .. }));
+
+        c.lock();
+        step(&mut c, LIFT_SECS + 0.1);
+
+        assert!(matches!(c.phase, Phase::Locked { .. }));
+        assert!(c.engaged() && c.covers_fully());
     }
 
     #[test]
