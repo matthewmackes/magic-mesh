@@ -10,6 +10,8 @@ LAUNCHER="$APP_VM/mcnf-app-vm-launch.sh"
 PROBE="$APP_VM/mcnf-app-vm-runtime-probe.sh"
 IMAGE_VERIFY="$APP_VM/verify-image.sh"
 BUILD="$APP_VM/build-image.sh"
+BASE_RECEIPT="$APP_VM/produce-base-image-receipt.py"
+BASE_RECEIPT_TEST="$APP_VM/test-produce-base-image-receipt.py"
 CATALOG_TRUST_VERIFY="$ROOT/install-helpers/verify-app-vm-catalog-trust.py"
 RPM_SUPPLY_VERIFY="$APP_VM/verify-rpm-supply.sh"
 RPM_BUILD_IDENTITY_VERIFY="$APP_VM/verify-rpm-build-identity.py"
@@ -22,6 +24,25 @@ require() {
         exit 1
     }
 }
+
+if [[ "${1:-}" == --base-receipt-self-test ]]; then
+    [[ "$#" -eq 1 ]] || {
+        echo "FATAL: --base-receipt-self-test accepts no additional arguments" >&2
+        exit 1
+    }
+    "$BASE_RECEIPT_TEST"
+    require '--base-receipt is required' "$BUILD"
+    require 'produce-base-image-receipt.py' "$BUILD"
+    require 'App VM base-image receipt admission failed' "$BUILD"
+    receipt_line=$(grep -n 'BASE_RECEIPT_JSON=' "$BUILD" | cut -d: -f1)
+    mutation_line=$(grep -nF "find \"\$RPMS_DIR\"" "$BUILD" | cut -d: -f1)
+    [[ "$receipt_line" =~ ^[0-9]+$ && "$mutation_line" =~ ^[0-9]+$ && "$receipt_line" -lt "$mutation_line" ]] || {
+        echo "FATAL: App VM builder admits its base receipt after RPM/image mutation" >&2
+        exit 1
+    }
+    echo "App VM base-image receipt contract self-test passed"
+    exit 0
+fi
 
 require_unique_container_arg() {
     local name=$1 expected=$2 file=$3 count
@@ -76,10 +97,13 @@ require_unique_unit_directive() {
 [ -x "$RPM_SUPPLY_VERIFY" ] || { echo "FATAL: RPM supply verifier is not executable" >&2; exit 1; }
 [ -x "$RPM_BUILD_IDENTITY_VERIFY" ] || { echo "FATAL: RPM build-identity verifier is not executable" >&2; exit 1; }
 [ -x "$INSTALLED_RPM_IDENTITY_VERIFY" ] || { echo "FATAL: installed RPM identity verifier is not executable" >&2; exit 1; }
+[ -x "$BASE_RECEIPT" ] || { echo "FATAL: base-image receipt producer is not executable" >&2; exit 1; }
+[ -x "$BASE_RECEIPT_TEST" ] || { echo "FATAL: base-image receipt hostile test is not executable" >&2; exit 1; }
 bash -n "$BUILD" "$IMAGE_VERIFY" "$RPM_SUPPLY_VERIFY" "$INSTALLED_RPM_IDENTITY_VERIFY" "$0"
 sh -n "$VALIDATOR" "$LAUNCHER" "$PROBE"
 "$IMAGE_VERIFY" --self-test
 python3 "$RPM_BUILD_IDENTITY_VERIFY" --self-test
+python3 "$BASE_RECEIPT_TEST"
 "$RPM_SUPPLY_VERIFY" --self-test
 "$INSTALLED_RPM_IDENTITY_VERIFY" --self-test
 
@@ -473,6 +497,15 @@ require 'MCNF_APP_VM_SOURCE_COMMIT' "$BUILD"
 require 'MCNF_APP_VM_BASE_IMAGE_ID' "$BUILD"
 require '--catalog-trust-receipt is required' "$BUILD"
 require '--catalog-trust-key is required' "$BUILD"
+require '--base-receipt is required' "$BUILD"
+require 'produce-base-image-receipt.py' "$BUILD"
+require 'App VM base-image receipt admission failed' "$BUILD"
+receipt_line=$(grep -n 'BASE_RECEIPT_JSON=' "$BUILD" | cut -d: -f1)
+mutation_line=$(grep -nF "find \"\$RPMS_DIR\"" "$BUILD" | cut -d: -f1)
+[[ "$receipt_line" =~ ^[0-9]+$ && "$mutation_line" =~ ^[0-9]+$ && "$receipt_line" -lt "$mutation_line" ]] || {
+    echo "FATAL: App VM builder admits its base receipt after RPM/image mutation" >&2
+    exit 1
+}
 require 'verify-app-vm-catalog-trust.py' "$BUILD"
 require 'mcnf_catalog_trust_receipt' "$BUILD"
 require 'org.mcnf.app-vm.source-commit' "$BUILD"

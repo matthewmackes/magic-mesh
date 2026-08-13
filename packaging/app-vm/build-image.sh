@@ -14,8 +14,10 @@ RPMS_DIR="$APP_VM_DIR/rpms"
 RPM_SUPPLY_VERIFY="$APP_VM_DIR/verify-rpm-supply.sh"
 RPM_KEY="$REPO/packaging/repo/RPM-GPG-KEY-magic-mesh"
 CATALOG_TRUST_VERIFY="$REPO/install-helpers/verify-app-vm-catalog-trust.py"
+BASE_RECEIPT_VERIFY="$APP_VM_DIR/produce-base-image-receipt.py"
 IMAGE="localhost/magic-mesh-app-vm-wayland:latest"
 BASE=""
+BASE_RECEIPT=""
 LANE="repo"
 RPMS=()
 CANDIDATE_MANIFEST=""
@@ -38,8 +40,8 @@ canonical_image_id() { # $1 = raw Podman image ID
     fi
 }
 
-append_pinned_base_arg() { # $1 = selected mutable ref, $2 = captured immutable ID
-    local selected_ref="$1" immutable_id="$2"
+append_pinned_base_arg() { # $1 = selected ref, $2 = digest, $3 = optional pinned registry ref
+    local selected_ref="$1" immutable_id="$2" pinned_ref="${3:-$2}"
     [[ -n "$selected_ref" ]] || {
         echo "FATAL: cannot pin an empty App VM base reference" >&2
         return 2
@@ -48,7 +50,11 @@ append_pinned_base_arg() { # $1 = selected mutable ref, $2 = captured immutable 
         echo "FATAL: cannot pin App VM build to invalid base image ID: $immutable_id" >&2
         return 2
     }
-    args+=(--build-arg "APP_VM_BASE=$immutable_id")
+    if [[ "$pinned_ref" != "$immutable_id" && "$pinned_ref" != *"@$immutable_id" ]]; then
+        echo "FATAL: pinned App VM base reference does not carry admitted digest" >&2
+        return 2
+    fi
+    args+=(--build-arg "APP_VM_BASE=$pinned_ref")
 }
 
 self_test() {
@@ -90,6 +96,7 @@ fi
 usage() {
     cat <<'EOF'
 Usage: packaging/app-vm/build-image.sh --catalog-trust-receipt PATH --catalog-trust-key PATH
+       --base-receipt PATH
        [--rpm PATH --candidate-manifest PATH]
        [--base IMAGE]
        [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]
@@ -145,6 +152,7 @@ while [ "$#" -gt 0 ]; do
         --candidate-manifest) CANDIDATE_MANIFEST="${2:?--candidate-manifest needs a path}"; shift 2 ;;
         --catalog-trust-receipt) CATALOG_TRUST_RECEIPT="${2:?--catalog-trust-receipt needs a path}"; shift 2 ;;
         --catalog-trust-key) CATALOG_TRUST_KEY="${2:?--catalog-trust-key needs a path}"; shift 2 ;;
+        --base-receipt) BASE_RECEIPT="${2:?--base-receipt needs a path}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
         --disk) DISK="${2:?--disk needs a type}"; shift 2 ;;
@@ -162,10 +170,14 @@ command -v podman >/dev/null 2>&1 || missing+=("podman is required")
 [ -x "$RPM_SUPPLY_VERIFY" ] || missing+=("RPM supply verifier missing or not executable: $RPM_SUPPLY_VERIFY")
 [ -f "$RPM_KEY" ] || missing+=("governed RPM key missing: $RPM_KEY")
 [ -x "$CATALOG_TRUST_VERIFY" ] || missing+=("catalog trust verifier missing or not executable: $CATALOG_TRUST_VERIFY")
+[ -x "$BASE_RECEIPT_VERIFY" ] || missing+=("base-image receipt verifier missing or not executable: $BASE_RECEIPT_VERIFY")
 [ -n "$CATALOG_TRUST_RECEIPT" ] || missing+=("--catalog-trust-receipt is required")
 [ -n "$CATALOG_TRUST_KEY" ] || missing+=("--catalog-trust-key is required")
 [ -z "$CATALOG_TRUST_RECEIPT" ] || [ -f "$CATALOG_TRUST_RECEIPT" ] || missing+=("catalog trust receipt is not a regular file")
 [ -z "$CATALOG_TRUST_KEY" ] || [ -f "$CATALOG_TRUST_KEY" ] || missing+=("catalog trust key is not a regular file")
+[ -n "$BASE_RECEIPT" ] || missing+=("--base-receipt is required")
+[ -z "$BASE_RECEIPT" ] || { [ -f "$BASE_RECEIPT" ] && [ ! -L "$BASE_RECEIPT" ]; } \
+    || missing+=("base-image receipt is not a regular non-symlink file")
 
 if [ "$LANE" = "local" ]; then
     [ "${#RPMS[@]}" -eq 1 ] || missing+=("local lane requires exactly one magic-mesh RPM")
@@ -211,6 +223,38 @@ case "$DISK" in
     *) echo "FATAL: invalid --disk" >&2; exit 2 ;;
 esac
 
+# Re-attest the registry bytes and all release bindings before RPM staging,
+# Podman storage, or the image build context can be mutated.  The receipt
+# inspector performs a bounded manifest-only registry read; it never pulls a
+# layer or handles registry credentials.
+EFFECTIVE_BASE="${BASE:-$(sed -n 's/^ARG APP_VM_BASE=//p' "$CONTAINERFILE" | head -n 1)}"
+[ -n "$EFFECTIVE_BASE" ] || {
+    echo "FATAL: cannot determine App VM base (no --base and no ARG APP_VM_BASE=)" >&2
+    exit 2
+}
+case "$(uname -m)" in
+    x86_64) REGISTRY_ARCH=amd64 ;;
+    aarch64) REGISTRY_ARCH=arm64 ;;
+    *) echo "FATAL: unsupported App VM build architecture" >&2; exit 2 ;;
+esac
+COMMIT_EPOCH="$(git -C "$REPO" show -s --format=%ct "$SOURCE_COMMIT")"
+BASE_RECEIPT_JSON="$($BASE_RECEIPT_VERIFY --repo "$REPO" inspect \
+    --image-reference "$EFFECTIVE_BASE" --architecture "$REGISTRY_ARCH" \
+    --source-revision "$SOURCE_COMMIT" --commit-epoch "$COMMIT_EPOCH" \
+    --receipt "$BASE_RECEIPT")" || {
+    echo "FATAL: App VM base-image receipt admission failed" >&2
+    exit 2
+}
+BASE_MANIFEST_DIGEST="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resolved_digest"])' <<<"$BASE_RECEIPT_JSON")"
+BASE_PLATFORM_DIGEST="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["platform_digest"] or "")' <<<"$BASE_RECEIPT_JSON")"
+BASE_ID="${BASE_PLATFORM_DIGEST:-$BASE_MANIFEST_DIGEST}"
+BASE_REPOSITORY="${EFFECTIVE_BASE%%@*}"
+BASE_LAST_COMPONENT="${BASE_REPOSITORY##*/}"
+if [[ "$BASE_LAST_COMPONENT" == *:* ]]; then
+    BASE_REPOSITORY="${BASE_REPOSITORY%:*}"
+fi
+PINNED_BASE="$BASE_REPOSITORY@$BASE_ID"
+
 if [ "$LANE" = "local" ]; then
     # The caller-supplied manifest is a consistency record, not revision trust.
     # The verifier authenticates SOURCE_COMMIT from the signed RPM binaries'
@@ -230,22 +274,7 @@ if [ "$LANE" = "local" ]; then
         "$RPMS_DIR/magic-mesh-local.rpm"
 fi
 
-EFFECTIVE_BASE="${BASE:-$(sed -n 's/^ARG APP_VM_BASE=//p' "$CONTAINERFILE" | head -n 1)}"
-[ -n "$EFFECTIVE_BASE" ] || {
-    echo "FATAL: cannot determine App VM base (no --base and no ARG APP_VM_BASE=)" >&2
-    exit 2
-}
-resolve_image "$EFFECTIVE_BASE" "App VM base"
-
-# Capture the resolved base identity before the build. A mutable tag is useful
-# for selecting a farm cache, but it is not sufficient provenance for an image
-# that may be admitted as a VM root. The immutable image ID is carried as a
-# label and checked again before any disk conversion.
-BASE_ID_RAW="$(podman image inspect --format '{{.Id}}' "$EFFECTIVE_BASE" 2>/dev/null || true)"
-if ! BASE_ID="$(canonical_image_id "$BASE_ID_RAW")"; then
-    echo "FATAL: resolved App VM base has no immutable image ID: $EFFECTIVE_BASE" >&2
-    exit 2
-fi
+resolve_image "$PINNED_BASE" "App VM base"
 
 CONTRACT_ID="wayland-standard-v1"
 
@@ -260,7 +289,8 @@ args=(
 )
 # Never let the mutable selection ref cross the build boundary. A tag may be
 # retargeted after resolve/inspect; FROM consumes the captured immutable ID.
-append_pinned_base_arg "$EFFECTIVE_BASE" "$BASE_ID"
+# The registry receipt, not mutable local image storage, owns the FROM input.
+append_pinned_base_arg "$EFFECTIVE_BASE" "$BASE_ID" "$PINNED_BASE"
 podman build "${args[@]}" \
     --label "org.mcnf.app-vm.profile=$CONTRACT_ID" \
     --label "org.mcnf.app-vm.base-image=$EFFECTIVE_BASE" \
