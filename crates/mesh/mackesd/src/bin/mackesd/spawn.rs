@@ -343,6 +343,8 @@ pub(crate) fn start_worker_runtime_status_publisher(
 
     let status = Arc::clone(worker_status);
     let stop = Arc::clone(shutdown);
+    let change_set_node_id = node_id.to_owned();
+    let change_set_shutdown = Arc::clone(shutdown);
     let node_id = node_id.to_owned();
     std::thread::Builder::new()
         .name("worker-runtime-status".into())
@@ -483,6 +485,27 @@ pub(crate) fn start_worker_runtime_status_publisher(
         .unwrap_or_else(|error| {
             tracing::warn!(%error, "worker runtime status publisher thread failed to start")
         });
+
+    // WL-ARCH-009 — the Actions process is the sole consumer authority for
+    // global Worker change sets. It reads the observation-owned aggregate so
+    // a request cannot substitute this process's partial group generation.
+    if group == mackes_mesh_types::worker_runtime::WorkerGroup::Actions {
+        let aggregate_status_path = PathBuf::from("/run/mde/mackesd-status.json");
+        match mde_bus::default_data_dir() {
+            Some(bus_root) => match mackesd_core::worker_change_set::spawn_consumer(
+                change_set_node_id,
+                bus_root,
+                aggregate_status_path,
+                change_set_shutdown,
+            ) {
+                Ok(_) => tracing::info!("worker change-set Bus consumer started"),
+                Err(error) => {
+                    tracing::warn!(%error, "worker change-set Bus consumer failed to start")
+                }
+            },
+            None => tracing::warn!("worker change-set Bus consumer has no Bus root"),
+        }
+    }
 }
 
 // run_serve round-2 extract: the Nebula-status + Shell control-surface Bus
