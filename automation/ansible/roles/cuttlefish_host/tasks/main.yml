@@ -18,9 +18,18 @@
       - cuttlefish_readiness_relay | length > 0
       - cuttlefish_vdi_agent | length > 0
       - cuttlefish_debs | length > 0
+      - cuttlefish_readiness_relay_install_path == '/usr/libexec/mcnf-cuttlefish-readiness-relay'
+      - cuttlefish_vdi_agent_install_path == '/usr/libexec/mcnf-cuttlefish-vdi-agent'
+      - cuttlefish_guest_environment_path == '/etc/mcnf/cuttlefish-guest.conf'
+      - cuttlefish_mesh_host is match('^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$')
+      - (cuttlefish_webrtc_port | string) is match('^[0-9]{1,5}$')
+      - (cuttlefish_webrtc_port | int) >= 1
+      - (cuttlefish_webrtc_port | int) <= 65535
+      - cuttlefish_session_id is match('^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$')
     fail_msg: >-
       Cuttlefish provisioning requires a signed release declaration, detached
-      signature, readiness relay, VDI agent, and at least one guest package.
+      signature, readiness relay, VDI agent, at least one guest package, and a
+      bounded session attachment identity matching the packaged service paths.
 
 - name: Create private parent for the authenticated payload stage
   ansible.builtin.file:
@@ -89,6 +98,26 @@
     groups: "{{ cuttlefish_groups }}"
     append: true
 
+- name: Create the private Cuttlefish guest configuration directory
+  ansible.builtin.file:
+    path: "{{ cuttlefish_guest_environment_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Bind the readiness relay to the governed VDI session identity
+  ansible.builtin.copy:
+    dest: "{{ cuttlefish_guest_environment_path }}"
+    owner: root
+    group: "{{ cuttlefish_user }}"
+    mode: "0640"
+    content: |
+      MCNF_MESH_HOST={{ cuttlefish_mesh_host }}
+      MCNF_WEBRTC_PORT={{ cuttlefish_webrtc_port | int }}
+      MCNF_SESSION_ID={{ cuttlefish_session_id }}
+  register: cuttlefish_guest_environment
+
 - name: Enable the cuttlefish host bridge/network services (if the debs shipped them)
   ansible.builtin.systemd:
     name: "{{ item }}"
@@ -117,3 +146,10 @@
   # `cvd status` exits non-zero when no device is running — the honest idempotency
   # guard: only start when nothing is already up.
   when: cuttlefish_status.rc != 0
+
+- name: Enable the authenticated readiness relay after Cuttlefish is available
+  ansible.builtin.systemd:
+    name: mcnf-cuttlefish-readiness-relay.service
+    enabled: true
+    daemon_reload: true
+    state: "{{ 'restarted' if cuttlefish_guest_environment.changed else 'started' }}"

@@ -15,8 +15,16 @@ cuttlefish_release_signature: ""
 cuttlefish_readiness_relay: ""
 cuttlefish_vdi_agent: ""
 cuttlefish_payload_stage_dir: /var/lib/mcnf/cuttlefish-release-payload
-cuttlefish_readiness_relay_install_path: /usr/local/libexec/mcnf-cuttlefish-readiness-relay
-cuttlefish_vdi_agent_install_path: /usr/local/libexec/mcnf-cuttlefish-vdi-agent
+cuttlefish_readiness_relay_install_path: /usr/libexec/mcnf-cuttlefish-readiness-relay
+cuttlefish_vdi_agent_install_path: /usr/libexec/mcnf-cuttlefish-vdi-agent
+
+# Runtime attachment identity consumed by the packaged readiness-relay unit.
+# These values are deliberately mandatory: provisioning must not report a
+# usable Android guest when it cannot publish a typed, session-bound VDI source.
+cuttlefish_mesh_host: ""
+cuttlefish_webrtc_port: 0
+cuttlefish_session_id: ""
+cuttlefish_guest_environment_path: /etc/mcnf/cuttlefish-guest.conf
 
 # The unprivileged user that owns the cvd runtime.
 cuttlefish_user: cvd

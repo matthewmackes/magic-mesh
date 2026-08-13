@@ -202,18 +202,32 @@ grep -Fq '{{ cuttlefish_payload_stage_dir }}/readiness-relay' "$CUTTLEFISH_TASKS
 grep -Fq '{{ cuttlefish_payload_stage_dir }}/vdi-agent' "$CUTTLEFISH_TASKS" \
     || fail "VDI agent is not installed from the authenticated stage"
 for variable in cuttlefish_release_declaration cuttlefish_release_signature \
-    cuttlefish_readiness_relay cuttlefish_vdi_agent; do
+    cuttlefish_readiness_relay cuttlefish_vdi_agent cuttlefish_mesh_host \
+    cuttlefish_webrtc_port cuttlefish_session_id cuttlefish_guest_environment_path; do
     grep -Fq "$variable" "$CUTTLEFISH_DEFAULTS" \
         || fail "production Cuttlefish assembly lacks signed handoff input: $variable"
 done
+grep -Fq 'cuttlefish_readiness_relay_install_path: /usr/libexec/mcnf-cuttlefish-readiness-relay' \
+    "$CUTTLEFISH_DEFAULTS" \
+    || fail "readiness relay install path differs from the packaged systemd unit"
+grep -Fq 'cuttlefish_vdi_agent_install_path: /usr/libexec/mcnf-cuttlefish-vdi-agent' \
+    "$CUTTLEFISH_DEFAULTS" \
+    || fail "VDI agent install path differs from the packaged systemd unit"
+grep -Fq 'MCNF_SESSION_ID={{ cuttlefish_session_id }}' "$CUTTLEFISH_TASKS" \
+    || fail "production Cuttlefish assembly does not bind the relay to a session"
+grep -Fq 'name: mcnf-cuttlefish-readiness-relay.service' "$CUTTLEFISH_TASKS" \
+    || fail "production Cuttlefish assembly does not activate the readiness relay"
 admission_line=$(grep -n -m1 'Authenticate and stage the exact signed Cuttlefish guest payload' \
     "$CUTTLEFISH_TASKS" | cut -d: -f1)
 apt_line=$(grep -n -m1 'Install the android-cuttlefish host .deb packages' \
     "$CUTTLEFISH_TASKS" | cut -d: -f1)
 cvd_line=$(grep -n -m1 'Start the Cuttlefish device with a VNC server' \
     "$CUTTLEFISH_TASKS" | cut -d: -f1)
-[[ -n $admission_line && -n $apt_line && -n $cvd_line \
-    && $admission_line -lt $apt_line && $admission_line -lt $cvd_line ]] \
+relay_line=$(grep -n -m1 'Enable the authenticated readiness relay after Cuttlefish is available' \
+    "$CUTTLEFISH_TASKS" | cut -d: -f1)
+[[ -n $admission_line && -n $apt_line && -n $cvd_line && -n $relay_line \
+    && $admission_line -lt $apt_line && $admission_line -lt $cvd_line \
+    && $cvd_line -lt $relay_line ]] \
     || fail "signed payload admission does not precede package/backend effects"
 
 "$MANIFEST_VERIFY" --self-test >/dev/null
