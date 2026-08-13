@@ -869,6 +869,14 @@ impl CallMediaProviderRegistry {
         existing_kind: Option<CallKind>,
     ) -> Result<(), CallMediaCommandExecutionError> {
         let (kind, cleanup) = match command {
+            // A Remote Desktop start is an invitation, not consent to inject
+            // input.  Persisting that signed invitation is deliberately free
+            // of provider side effects; only the exact AnswerCall below may
+            // activate the VDI provider for the admitted call id.
+            CollabCommand::StartCall {
+                kind: CallKind::RemoteDesktop,
+                ..
+            } => return Ok(()),
             CollabCommand::StartCall { kind, .. } => (Some(*kind), false),
             CollabCommand::StartOutboundCall { .. } => (Some(CallKind::Audio), false),
             CollabCommand::AnswerCall { .. }
@@ -1538,6 +1546,105 @@ mod tests {
             Err(CallMediaCommandExecutionError::NoProvider {
                 kind: CallKind::Audio
             })
+        );
+    }
+
+    #[test]
+    fn remote_desktop_control_waits_for_exact_answer_and_revokes_by_call() {
+        struct RecordingVdiProvider {
+            commands: Arc<std::sync::Mutex<Vec<(String, CallId)>>>,
+        }
+
+        impl CallMediaFrameVerifier for RecordingVdiProvider {
+            fn execute_command(
+                &self,
+                command: &CollabCommand,
+                adapter: CallMediaAdapter,
+            ) -> Result<(), CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::VdiRemoteDesktop);
+                let call = match command {
+                    CollabCommand::AnswerCall { call } | CollabCommand::HangUpCall { call } => {
+                        *call
+                    }
+                    other => panic!("unconsented VDI command reached provider: {other:?}"),
+                };
+                self.commands
+                    .lock()
+                    .expect("command recorder")
+                    .push((command.verb().to_string(), call));
+                Ok(())
+            }
+
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                panic!("consent routing must not claim frame proof")
+            }
+        }
+
+        let space = SpaceId::new();
+        let admitted_call = CallId::new();
+        let substituted_call = CallId::new();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut providers = empty_registry();
+        providers
+            .register(
+                CallMediaAdapter::VdiRemoteDesktop,
+                RecordingVdiProvider {
+                    commands: Arc::clone(&commands),
+                },
+            )
+            .expect("register VDI provider");
+
+        providers
+            .execute_command(
+                &CollabCommand::StartCall {
+                    space,
+                    call: admitted_call,
+                    kind: CallKind::RemoteDesktop,
+                },
+                None,
+            )
+            .expect("signed invitation has no provider effect");
+        assert!(commands.lock().expect("commands").is_empty());
+
+        // The worker supplies existing_kind only after resolving the exact
+        // signed call. A substituted id has no kind and must never reach VDI.
+        providers
+            .execute_command(
+                &CollabCommand::AnswerCall {
+                    call: substituted_call,
+                },
+                None,
+            )
+            .expect("core remains authoritative for missing calls");
+        assert!(commands.lock().expect("commands").is_empty());
+
+        providers
+            .execute_command(
+                &CollabCommand::AnswerCall {
+                    call: admitted_call,
+                },
+                Some(CallKind::RemoteDesktop),
+            )
+            .expect("exact consent activates VDI");
+        providers
+            .execute_command(
+                &CollabCommand::HangUpCall {
+                    call: admitted_call,
+                },
+                Some(CallKind::RemoteDesktop),
+            )
+            .expect("exact hang-up revokes VDI");
+
+        assert_eq!(
+            commands.lock().expect("commands").as_slice(),
+            [
+                ("answer_call".to_string(), admitted_call),
+                ("hang_up_call".to_string(), admitted_call),
+            ]
         );
     }
 
