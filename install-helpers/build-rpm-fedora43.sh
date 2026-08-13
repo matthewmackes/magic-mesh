@@ -328,6 +328,8 @@ elif [ "${MODE:-full}" = "server" ]; then
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-server-*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
 else
+  echo "[f43] admitting governed Kiron workstation assets"
+  /src/packaging/kiron/verify-package.sh --source
   echo "[f43] building workspace (release) — this is the long part"
   cargo build --workspace --release $MDE_RPM_LOCKED
   # E12-3 DRM + E12-5 live-vdi + BUG-VIDEO-1 media-mpv — re-link the ONE shell

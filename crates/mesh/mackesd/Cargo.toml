@@ -693,6 +693,11 @@ assets = [
     # (the system layer; the Carbon-era Brand loader retired with mde-theme
     # under E12-14c, but the imagery stays operator-swappable on disk).
     { source = "assets/brand/baked/*",             dest = "/usr/share/mde/brand/",         mode = "644" },
+    # WL-UX-014 — the Kiron A-F scene/audio pack is admitted before a full
+    # workstation RPM cut. These paths intentionally remain absent until real,
+    # licensed v2 assets exist; packaging/kiron/verify-package.sh fails closed.
+    { source = "assets/kiron/manifest-v2.json",     dest = "/usr/share/mde/kiron/manifest-v2.json", mode = "644" },
+    { source = "assets/kiron/payload/**/*",         dest = "/usr/share/mde/kiron/payload/",          mode = "644" },
     # The DISCLAIMER the /release gate checks.
     { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
     # EFF-13 — license + third-party notices ship with the package.
