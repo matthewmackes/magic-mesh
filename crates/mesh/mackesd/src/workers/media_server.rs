@@ -41,6 +41,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{self, Read as _};
 use std::net::UdpSocket;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,6 +114,49 @@ const MAX_ARTWORK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The SSDP multicast group + port a LAN UPnP control point listens on.
 const SSDP_MULTICAST: &str = "239.255.255.250:1900";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServedFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    size: u64,
+    modified_ms: u64,
+    #[cfg(unix)]
+    changed_sec: i64,
+    #[cfg(unix)]
+    changed_nsec: i64,
+}
+
+impl ServedFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| {
+                    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                }),
+            #[cfg(unix)]
+            changed_sec: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServedFile {
+    path: PathBuf,
+    identity: ServedFileIdentity,
+}
 
 // ───────────────────────────── data model ─────────────────────────────
 
@@ -394,13 +439,13 @@ pub fn load_share_dirs() -> Vec<PathBuf> {
 
 /// Scan one shared folder into media items, keyed rel-to-root. Bounded in depth
 /// + count; unreadable entries are skipped (best-effort, never fatal). Also
-/// records each item's absolute path into `abs` (id → path) for the HTTP server.
+/// records each item's admitted path identity for the HTTP server.
 fn scan_dir_into(
     root: &Path,
     dir: &Path,
     depth: usize,
     out: &mut Vec<MediaItem>,
-    abs: &mut BTreeMap<String, PathBuf>,
+    served: &mut BTreeMap<String, ServedFile>,
 ) {
     if depth > MAX_SCAN_DEPTH || out.len() >= MAX_ITEMS_PER_MANIFEST {
         return;
@@ -418,7 +463,7 @@ fn scan_dir_into(
             continue;
         };
         if meta.is_dir() {
-            scan_dir_into(root, &path, depth + 1, out, abs);
+            scan_dir_into(root, &path, depth + 1, out, served);
             continue;
         }
         if !meta.is_file() {
@@ -445,7 +490,10 @@ fn scan_dir_into(
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let id = item_id(&title, size_bytes);
-        abs.entry(id.clone()).or_insert_with(|| path.clone());
+        served.entry(id.clone()).or_insert_with(|| ServedFile {
+            path: path.clone(),
+            identity: ServedFileIdentity::from_metadata(&meta),
+        });
         out.push(MediaItem {
             id,
             title,
@@ -469,15 +517,29 @@ pub fn build_manifest(
     port: u16,
     share_dirs: &[PathBuf],
 ) -> (ShareManifest, BTreeMap<String, PathBuf>) {
+    let (manifest, served) = build_manifest_for_serving(node, host, port, share_dirs);
+    let paths = served
+        .into_iter()
+        .map(|(id, file)| (id, file.path))
+        .collect();
+    (manifest, paths)
+}
+
+fn build_manifest_for_serving(
+    node: &str,
+    host: &str,
+    port: u16,
+    share_dirs: &[PathBuf],
+) -> (ShareManifest, BTreeMap<String, ServedFile>) {
     let mut items = Vec::new();
-    let mut abs = BTreeMap::new();
+    let mut served = BTreeMap::new();
     let mut folders = Vec::new();
     for dir in share_dirs {
         if !dir.is_dir() {
             continue;
         }
         folders.push(dir.to_string_lossy().into_owned());
-        scan_dir_into(dir, dir, 0, &mut items, &mut abs);
+        scan_dir_into(dir, dir, 0, &mut items, &mut served);
     }
     items.sort_by(|a, b| {
         a.title
@@ -494,7 +556,7 @@ pub fn build_manifest(
         items,
         published_at_ms: now_ms(),
     };
-    (manifest, abs)
+    (manifest, served)
 }
 
 // ───────────────────────── the replicated plane I/O ─────────────────────────
@@ -584,9 +646,7 @@ fn read_manifests_complete(mount: &Path) -> io::Result<Vec<ShareManifest>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        if before.file_type().is_symlink()
-            || !before.is_file()
-            || before.len() > MAX_MANIFEST_BYTES
+        if before.file_type().is_symlink() || !before.is_file() || before.len() > MAX_MANIFEST_BYTES
         {
             return Err(io::Error::other(format!(
                 "unsafe or oversized media manifest {}",
@@ -846,15 +906,42 @@ pub fn ssdp_announce(uuid: &str, host: &str, port: u16) -> Result<(), String> {
 // ─────────────────────── the mesh HTTP media server (live) ───────────────────────
 
 /// Shared read-only state the HTTP media server serves each request from — the
-/// current manifest + the id→absolute-path map, swapped atomically on rescan.
+/// current manifest + the identity-bound serve map, swapped atomically on rescan.
 #[derive(Default)]
 struct ServeState {
     manifest: ShareManifest,
-    abs: BTreeMap<String, PathBuf>,
+    served: BTreeMap<String, ServedFile>,
     uuid: String,
     friendly_name: String,
     host: String,
     port: u16,
+}
+
+fn read_admitted_media(file: &ServedFile) -> io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(0o400_000 | 0o2_000_000); // Linux O_NOFOLLOW | O_CLOEXEC
+    let mut opened = options.open(&file.path)?;
+    let before = opened.metadata()?;
+    if !before.is_file() || ServedFileIdentity::from_metadata(&before) != file.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "media file no longer matches its admitted identity",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    opened.read_to_end(&mut bytes)?;
+    let after = opened.metadata()?;
+    if ServedFileIdentity::from_metadata(&after) != file.identity
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.identity.size
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "media file changed while it was being served",
+        ));
+    }
+    Ok(bytes)
 }
 
 impl Default for ShareManifest {
@@ -897,28 +984,32 @@ fn route_request(state: &ServeState, path: &str) -> (u16, String, Vec<u8>) {
         }
         p if p.starts_with("/media/") => {
             let id = &p["/media/".len()..];
-            match state.abs.get(id) {
-                Some(abs) => match std::fs::metadata(abs) {
-                    Ok(meta) if !meta.is_file() || meta.len() > MAX_ARTWORK_BYTES &&
-                        state.manifest.items.iter().find(|i| i.id == id)
-                            .is_some_and(|i| i.kind == MediaItemKind::Image) => {
-                        (413, "text/plain".to_string(), b"media item exceeds bounded artwork policy".to_vec())
-                    }
-                    Ok(_) => match std::fs::read(abs) {
+            match state.served.get(id) {
+                Some(file)
+                    if file.identity.size > MAX_ARTWORK_BYTES
+                        && state
+                            .manifest
+                            .items
+                            .iter()
+                            .find(|i| i.id == id)
+                            .is_some_and(|i| i.kind == MediaItemKind::Image) =>
+                {
+                    (
+                        413,
+                        "text/plain".to_string(),
+                        b"media item exceeds bounded artwork policy".to_vec(),
+                    )
+                }
+                Some(file) => match read_admitted_media(file) {
                     Ok(bytes) => {
                         let item = state.manifest.items.iter().find(|i| i.id == id);
-                        let ext = Path::new(abs)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
+                        let ext = file.path.extension().and_then(|e| e.to_str()).unwrap_or("");
                         let mime = item.map_or_else(
                             || "application/octet-stream".to_string(),
                             |i| mime_for(i.kind, ext),
                         );
                         (200, mime, bytes)
                     }
-                    Err(_) => (404, "text/plain".to_string(), b"not found".to_vec()),
-                    },
                     Err(_) => (404, "text/plain".to_string(), b"not found".to_vec()),
                 },
                 None => (404, "text/plain".to_string(), b"not found".to_vec()),
@@ -1135,8 +1226,8 @@ impl MediaServerWorker {
     }
 
     /// Rescan this node's shared folders into a manifest + the serve map.
-    fn rescan(&self) -> (ShareManifest, BTreeMap<String, PathBuf>) {
-        build_manifest(&self.node_id, &self.hostname, self.port, &self.share_dirs())
+    fn rescan(&self) -> (ShareManifest, BTreeMap<String, ServedFile>) {
+        build_manifest_for_serving(&self.node_id, &self.hostname, self.port, &self.share_dirs())
     }
 
     /// Read every peer's manifest off the plane + fold them into the mesh
@@ -1208,7 +1299,7 @@ impl MediaServerWorker {
         serve: Option<&Arc<Mutex<ServeState>>>,
         force: bool,
     ) -> io::Result<bool> {
-        let (manifest, abs) = self.rescan();
+        let (manifest, served) = self.rescan();
         write_manifest_complete(&self.mount, &self.hostname, &manifest)?;
         let library = self.aggregate()?;
         let published = self.publish(transaction, &manifest, library, force)?;
@@ -1217,7 +1308,7 @@ impl MediaServerWorker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.manifest = manifest.clone();
-            g.abs = abs;
+            g.served = served;
         }
         // DLNA discovery announce (honestly gated live leg).
         if self.live {
@@ -1709,11 +1800,11 @@ mod tests {
     // ── the HTTP media-server routing ──
 
     fn serve_state_with(root: &Path) -> ServeState {
-        let (manifest, abs) =
-            build_manifest("peer:elm", "elm", MESH_MEDIA_PORT, &[root.to_path_buf()]);
+        let (manifest, served) =
+            build_manifest_for_serving("peer:elm", "elm", MESH_MEDIA_PORT, &[root.to_path_buf()]);
         ServeState {
             manifest,
-            abs,
+            served,
             uuid: "uuid-x".into(),
             friendly_name: "elm (mde-media)".into(),
             host: "10.42.0.2".into(),
@@ -1760,6 +1851,29 @@ mod tests {
         assert_eq!(s, 404);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn route_rejects_media_replaced_after_manifest_admission() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Videos");
+        let admitted = root.join("movie.mp4");
+        touch(&admitted, b"ADMITTED");
+        let state = serve_state_with(&root);
+        let id = state.manifest.items[0].id.clone();
+
+        let replacement = tmp.path().join("private.mp4");
+        std::fs::write(&replacement, b"PRIVATE!").unwrap();
+        std::fs::remove_file(&admitted).unwrap();
+        symlink(&replacement, &admitted).unwrap();
+
+        let (status, _, body) = route_request(&state, &format!("/media/{id}"));
+        assert_eq!(status, 404);
+        assert_eq!(body, b"not found");
+        assert_ne!(body, b"PRIVATE!");
+    }
+
     // ── the live HTTP server (real bind, end-to-end) ──
 
     #[tokio::test]
@@ -1767,10 +1881,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Videos");
         touch(&root.join("movie.mp4"), b"HELLO");
-        let (manifest, abs) = build_manifest("peer:elm", "elm", 0, &[root.clone()]);
+        let (manifest, served) = build_manifest_for_serving("peer:elm", "elm", 0, &[root.clone()]);
         let serve = Arc::new(Mutex::new(ServeState {
             manifest: manifest.clone(),
-            abs,
+            served,
             uuid: "u".into(),
             friendly_name: "elm".into(),
             host: "127.0.0.1".into(),
@@ -1873,11 +1987,13 @@ mod tests {
         })
         .await
         .expect("the same worker must publish after Bus recovery");
-        assert!(mount
-            .path()
-            .join("recovery")
-            .join(MESH_LIBRARY_MANIFEST_FILE)
-            .exists());
+        assert!(
+            mount
+                .path()
+                .join("recovery")
+                .join(MESH_LIBRARY_MANIFEST_FILE)
+                .exists()
+        );
         assert!(!task.is_finished(), "recovered worker must remain active");
 
         shutdown_tx.send(true).expect("request shutdown");
@@ -1934,7 +2050,7 @@ mod tests {
         assert_eq!(state.node, "peer:elm");
         assert_eq!(state.server.shared_item_count, 1);
         assert_eq!(state.server.http, "idle"); // live server disabled in the test
-                                               // The aggregated library carries BOTH oak's peer film + elm's local file.
+        // The aggregated library carries BOTH oak's peer film + elm's local file.
         assert_eq!(state.library.node_count, 2);
         let titles: Vec<&str> = state
             .library
@@ -2051,11 +2167,13 @@ mod tests {
             "sentinel",
             "retired publication must not commit serving state"
         );
-        assert!(Persist::open(bus.path().to_path_buf())
-            .unwrap()
-            .read_latest(MESH_LIBRARY_TOPIC)
-            .unwrap()
-            .is_none());
+        assert!(
+            Persist::open(bus.path().to_path_buf())
+                .unwrap()
+                .read_latest(MESH_LIBRARY_TOPIC)
+                .unwrap()
+                .is_none()
+        );
 
         let current = MediaServerBusTransaction::open(bus.path().to_path_buf(), None).unwrap();
         assert!(worker.tick_once(&current, Some(&serve), true).unwrap());
@@ -2088,11 +2206,13 @@ mod tests {
         assert!(worker.tick_once(&transaction, Some(&serve), true).is_err());
         assert!(worker.last_fingerprint.is_none());
         assert_eq!(serve.lock().unwrap().manifest.host, "sentinel");
-        assert!(transaction
-            .persist
-            .read_latest(MESH_LIBRARY_TOPIC)
-            .unwrap()
-            .is_none());
+        assert!(
+            transaction
+                .persist
+                .read_latest(MESH_LIBRARY_TOPIC)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2125,8 +2245,11 @@ mod tests {
             use std::os::unix::fs::symlink;
             std::fs::remove_file(&path).unwrap();
             let outside = mount.path().join("outside.json");
-            std::fs::write(&outside, serde_json::to_vec(&manifest_with("oak", &[])).unwrap())
-                .unwrap();
+            std::fs::write(
+                &outside,
+                serde_json::to_vec(&manifest_with("oak", &[])).unwrap(),
+            )
+            .unwrap();
             symlink(&outside, &path).unwrap();
             assert!(read_manifests_complete(mount.path()).is_err());
         }
