@@ -187,6 +187,13 @@ mod action_console {
         staged_at_ms: u64,
         preview_admitted: bool,
         terminal: bool,
+        awaiting: Option<PendingOperation>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PendingOperation {
+        operation: WorkerChangeSetOperation,
+        published_at_ms: u64,
     }
 
     #[derive(Debug, Clone)]
@@ -349,6 +356,7 @@ mod action_console {
                 staged_at_ms: now_ms,
                 preview_admitted: false,
                 terminal: false,
+                awaiting: None,
             });
             self.result = None;
             if let Err(error) = self.publish_operation(WorkerChangeSetOperation::Preview, now_ms) {
@@ -410,6 +418,13 @@ mod action_console {
             Persist::open(root)
                 .and_then(|persist| persist.write(&topic, Priority::Default, None, Some(&body)))
                 .map_err(|error| format!("Worker action publication failed: {error}"))?;
+            self.staged
+                .as_mut()
+                .expect("staged change remains present through publication")
+                .awaiting = Some(PendingOperation {
+                operation,
+                published_at_ms: now_ms,
+            });
             self.last_error = None;
             self.last_poll = None;
             Ok(())
@@ -432,10 +447,29 @@ mod action_console {
                 self.last_error = Some("Worker result failed closed-contract admission.".into());
                 return;
             };
+            let Some(awaiting) = staged.awaiting else {
+                return;
+            };
             if result.request_id != staged.request_id
                 || result.target != staged.target
                 || result.expected_generation != staged.expected_generation
+                || result.operation != awaiting.operation
+                || result.completed_at_ms < awaiting.published_at_ms
             {
+                return;
+            }
+            let expected_items = staged
+                .items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if result
+                .items
+                .iter()
+                .any(|item| !expected_items.contains(item.item_id.as_str()))
+            {
+                self.last_error =
+                    Some("Worker result named an item outside the staged change.".into());
                 return;
             }
             staged.preview_admitted = result.operation == WorkerChangeSetOperation::Preview
@@ -443,6 +477,7 @@ mod action_console {
                 && result.actual_generation == staged.expected_generation;
             staged.terminal = result.operation != WorkerChangeSetOperation::Preview
                 || result.outcome != WorkerChangeSetOutcome::Previewed;
+            staged.awaiting = None;
             self.result = Some(result);
             self.last_error = None;
         }
@@ -759,6 +794,36 @@ mod action_console {
             }
         }
 
+        fn publish_result(
+            persist: &Persist,
+            staged: &StagedChange,
+            operation: WorkerChangeSetOperation,
+            outcome: WorkerChangeSetOutcome,
+            completed_at_ms: u64,
+        ) {
+            let result = WorkerChangeSetResult {
+                schema_version: WORKER_RUNTIME_SCHEMA_VERSION,
+                request_id: staged.request_id.clone(),
+                operation,
+                outcome,
+                target: staged.target.clone(),
+                expected_generation: staged.expected_generation,
+                actual_generation: staged.expected_generation,
+                items: vec![],
+                audit_id: Some(format!("audit-{:?}", operation).to_ascii_lowercase()),
+                completed_at_ms,
+                detail: None,
+            };
+            persist
+                .write(
+                    "state/workers/change-set/node-a",
+                    Priority::Default,
+                    None,
+                    Some(&result.to_json().expect("result body")),
+                )
+                .expect("publish result");
+        }
+
         #[test]
         fn preview_publication_is_typed_authenticated_and_generation_bound() {
             let temp = tempfile::tempdir().expect("bus root");
@@ -808,6 +873,19 @@ mod action_console {
             let temp = tempfile::tempdir().expect("bus root");
             let mut console = state(temp.path().to_path_buf());
             console.stage_preview(3_000).expect("publish preview");
+            let persist = Persist::open(temp.path().to_path_buf()).expect("open bus");
+            let staged = console.staged.as_ref().expect("staged").clone();
+            publish_result(
+                &persist,
+                &staged,
+                WorkerChangeSetOperation::Preview,
+                WorkerChangeSetOutcome::Previewed,
+                3_100,
+            );
+            console.poll_result(&persist);
+            console
+                .publish_operation(WorkerChangeSetOperation::Commit, 3_200)
+                .expect("publish commit");
             let staged = console.staged.as_ref().expect("staged").clone();
             let result = WorkerChangeSetResult {
                 schema_version: WORKER_RUNTIME_SCHEMA_VERSION,
@@ -827,7 +905,6 @@ mod action_console {
                 detail: Some("one typed action failed".to_string()),
             };
             result.validate().expect("typed partial result");
-            let persist = Persist::open(temp.path().to_path_buf()).expect("open bus");
             persist
                 .write(
                     "state/workers/change-set/node-a",
@@ -843,6 +920,54 @@ mod action_console {
             assert_eq!(
                 admitted.items[0].outcome,
                 WorkerChangeSetItemOutcome::Failed
+            );
+        }
+
+        #[test]
+        fn delayed_preview_result_cannot_answer_commit_or_cancel() {
+            let temp = tempfile::tempdir().expect("bus root");
+            let persist = Persist::open(temp.path().to_path_buf()).expect("open bus");
+            let mut console = state(temp.path().to_path_buf());
+            console.stage_preview(3_000).expect("publish preview");
+            let staged = console.staged.as_ref().expect("staged").clone();
+            publish_result(
+                &persist,
+                &staged,
+                WorkerChangeSetOperation::Preview,
+                WorkerChangeSetOutcome::Previewed,
+                3_100,
+            );
+            console.poll_result(&persist);
+            assert!(console
+                .staged
+                .as_ref()
+                .is_some_and(|staged| staged.preview_admitted));
+
+            console
+                .publish_operation(WorkerChangeSetOperation::Commit, 3_200)
+                .expect("publish commit");
+            publish_result(
+                &persist,
+                &staged,
+                WorkerChangeSetOperation::Preview,
+                WorkerChangeSetOutcome::Previewed,
+                3_300,
+            );
+            console.poll_result(&persist);
+
+            let staged = console.staged.as_ref().expect("commit remains pending");
+            assert_eq!(
+                staged.awaiting,
+                Some(PendingOperation {
+                    operation: WorkerChangeSetOperation::Commit,
+                    published_at_ms: 3_200,
+                })
+            );
+            assert!(!staged.terminal);
+            assert_eq!(
+                console.result.as_ref().map(|result| result.operation),
+                Some(WorkerChangeSetOperation::Preview),
+                "the delayed preview must not masquerade as the commit result"
             );
         }
 
