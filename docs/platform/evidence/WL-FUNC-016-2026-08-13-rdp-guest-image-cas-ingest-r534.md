@@ -32,14 +32,16 @@ Owned production file:
 
 ## Farm gates
 
-- `.90`, slot 1: focused exact CAS/projection test compile was aborted after
-  sustained active compilation so the lane would not remain pinned.
+- `.90`, slot 1: the initial focused compile was aborted after sustained active
+  compilation so the lane would not remain pinned.
 - `.90`, slot 2: `cargo clippy -p mackesd --features async-services --lib -- -D warnings` — passed.
 - BigBoy `.130`, slot 1: `cargo build -p mackesd --features async-services --lib` — passed.
-- BigBoy `.130`, slot 1: exact focused test reroute was blocked before mackesd
+- BigBoy `.130`, slot 1: the first exact focused test reroute was blocked before mackesd
   by concurrent unowned `mde-collab-core/src/pipeline.rs` errors (unresolved
-  `crate::value::CallKind` and an over-parameterized `Result` alias). A clean
-  commit-isolated rerun follows before push.
+  `crate::value::CallKind` and an over-parameterized `Result` alias).
+- BigBoy `.130`, slot 1, clean worktree pinned to `b00fd95e`:
+  `cargo test -p mackesd --features async-services ipc::files::tests::guest_clipboard_image_commit_publishes_exact_cas_and_files_identity -- --exact --nocapture`
+  — passed 1/1 (`4971` unrelated library tests filtered).
 - `.196`, slot 1: package format check exposed broad pre-existing concurrent
   drift; after applying the sole `ipc/files.rs` delta, the owned file no longer
   appeared in rustfmt output. No unowned formatting was changed.
