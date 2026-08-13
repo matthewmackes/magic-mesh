@@ -24,6 +24,7 @@ const SEATS: [(&str, &[&str]); 5] = [
 ];
 const MESH_SELECTION: &str = "__mesh_wide__";
 const HISTORY_PAGE_SIZE: usize = 8;
+const HISTORY_MAX_IDENTITIES: usize = 256;
 const HISTORY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const ACTION_ERROR_STATE_ID: &str = "health-action-publication-error";
 const SUPPORT_EXPORT_STATE_ID: &str = "health-support-export-outcome";
@@ -37,6 +38,7 @@ const SUPPORT_BUNDLE_MAX_TEXT_BYTES: usize = 192;
 const MAX_REDACTION_SCAN_BYTES: usize = 16 * 1024;
 const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
 const HISTORY_FILTER_STATE_ID: &str = "health-history-severity-filter";
+const HISTORY_PAGE_STATE_ID: &str = "health-history-page";
 const SNAPSHOT_AUTHORITY_STATE_ID: &str = "health-snapshot-authority";
 const ACTION_PROGRESS_STATE_ID: &str = "health-action-result-progress";
 const ACTION_RESULT_TAIL_BOUND: usize = 8;
@@ -49,6 +51,13 @@ enum HistorySeverityFilter {
     All,
     Warning,
     Critical,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryPageState {
+    node: String,
+    filter: HistorySeverityFilter,
+    page: usize,
 }
 
 impl HistorySeverityFilter {
@@ -567,16 +576,29 @@ fn detail(
                     }
                 });
             set_history_filter(ui.ctx(), filter);
-            let resolved = filtered_recurrence_history(
+            let mut page_state = history_page_state(ui.ctx(), &node, filter);
+            let mut history = paged_recurrence_history(
                 &snapshot.resolved_conditions,
                 &node,
                 snapshot.generated_at_ms,
                 filter,
+                page_state.page,
             );
-            if resolved.is_empty() {
+            let page_count = history.total.div_ceil(HISTORY_PAGE_SIZE).max(1);
+            if page_state.page >= page_count {
+                page_state.page = page_count - 1;
+                history = paged_recurrence_history(
+                    &snapshot.resolved_conditions,
+                    &node,
+                    snapshot.generated_at_ms,
+                    filter,
+                    page_state.page,
+                );
+            }
+            if history.rows.is_empty() {
                 ui.colored_label(Style::TEXT_DIM, "No history matches this filter.");
             }
-            for recurrence in resolved {
+            for recurrence in history.rows {
                 let condition = recurrence.condition;
                 let recurrence_copy = if recurrence.occurrences == 1 {
                     "once".to_string()
@@ -593,6 +615,27 @@ fn detail(
                         .map_or_else(|| "unknown".to_string(), format_health_duration_ms),
                 ));
             }
+            if history.total > HISTORY_PAGE_SIZE {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(page_state.page > 0, egui::Button::new("Previous").small())
+                        .clicked()
+                    {
+                        page_state.page -= 1;
+                    }
+                    ui.label(format!("Page {} of {page_count}", page_state.page + 1));
+                    if ui
+                        .add_enabled(
+                            page_state.page + 1 < page_count,
+                            egui::Button::new("Next").small(),
+                        )
+                        .clicked()
+                    {
+                        page_state.page += 1;
+                    }
+                });
+            }
+            set_history_page_state(ui.ctx(), page_state);
         }
     }
 }
@@ -1821,17 +1864,41 @@ fn set_history_filter(ctx: &egui::Context, filter: HistorySeverityFilter) {
     ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_FILTER_STATE_ID), filter));
 }
 
+fn history_page_state(
+    ctx: &egui::Context,
+    node: &str,
+    filter: HistorySeverityFilter,
+) -> HistoryPageState {
+    ctx.data(|data| data.get_temp::<HistoryPageState>(egui::Id::new(HISTORY_PAGE_STATE_ID)))
+        .filter(|state| state.node == node && state.filter == filter)
+        .unwrap_or_else(|| HistoryPageState {
+            node: node.to_string(),
+            filter,
+            page: 0,
+        })
+}
+
+fn set_history_page_state(ctx: &egui::Context, state: HistoryPageState) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_PAGE_STATE_ID), state));
+}
+
 struct HistoryRecurrence<'a> {
     condition: &'a HealthCondition,
     occurrences: usize,
 }
 
-/// Aggregate stable lifecycle identities without materializing the complete
+struct HistoryPage<'a> {
+    rows: Vec<HistoryRecurrence<'a>>,
+    total: usize,
+}
+
+/// Aggregate stable lifecycle identities without materializing an unbounded
 /// history in the modal. Only genuinely resolved records in the snapshot's
-/// inclusive 24-hour window participate. The first pass retains only the
-/// strongest eight identities; the second pass counts recurrences for those
-/// retained rows. This keeps paint-time memory fixed even if an untrusted
-/// caller bypasses the snapshot's wire-level collection bound.
+/// inclusive 24-hour window participate. The first pass retains a fixed maximum
+/// of 256 identities; the second pass counts recurrences for those retained
+/// rows, and paint materializes only the requested eight-row page. This keeps
+/// paint-time memory fixed even if an untrusted caller bypasses the snapshot's
+/// wire-level collection bound.
 fn recurrence_history<'a>(
     conditions: &'a [HealthCondition],
     node: &str,
@@ -1846,6 +1913,16 @@ fn filtered_recurrence_history<'a>(
     as_of_ms: u64,
     filter: HistorySeverityFilter,
 ) -> Vec<HistoryRecurrence<'a>> {
+    paged_recurrence_history(conditions, node, as_of_ms, filter, 0).rows
+}
+
+fn paged_recurrence_history<'a>(
+    conditions: &'a [HealthCondition],
+    node: &str,
+    as_of_ms: u64,
+    filter: HistorySeverityFilter,
+    page: usize,
+) -> HistoryPage<'a> {
     let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
     let applies_to_page = |condition: &HealthCondition| {
         matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
@@ -1856,7 +1933,7 @@ fn filtered_recurrence_history<'a>(
                     && resolved_at_ms >= condition.last_observed_ms
             })
     };
-    let mut resolved: Vec<HistoryRecurrence<'a>> = Vec::with_capacity(HISTORY_PAGE_SIZE);
+    let mut resolved: Vec<HistoryRecurrence<'a>> = Vec::with_capacity(HISTORY_MAX_IDENTITIES);
     for condition in conditions
         .iter()
         .filter(|condition| applies_to_page(condition))
@@ -1874,7 +1951,7 @@ fn filtered_recurrence_history<'a>(
         let insert_at = resolved.partition_point(|existing| {
             history_order(existing.condition, condition) != std::cmp::Ordering::Greater
         });
-        if insert_at >= HISTORY_PAGE_SIZE {
+        if insert_at >= HISTORY_MAX_IDENTITIES {
             continue;
         }
         resolved.insert(
@@ -1884,7 +1961,7 @@ fn filtered_recurrence_history<'a>(
                 occurrences: 0,
             },
         );
-        if resolved.len() > HISTORY_PAGE_SIZE {
+        if resolved.len() > HISTORY_MAX_IDENTITIES {
             resolved.pop();
         }
     }
@@ -1899,7 +1976,14 @@ fn filtered_recurrence_history<'a>(
             recurrence.occurrences = recurrence.occurrences.saturating_add(1);
         }
     }
-    resolved
+    let total = resolved.len();
+    let offset = page.saturating_mul(HISTORY_PAGE_SIZE).min(total);
+    let rows = resolved
+        .into_iter()
+        .skip(offset)
+        .take(HISTORY_PAGE_SIZE)
+        .collect();
+    HistoryPage { rows, total }
 }
 
 fn history_order(left: &HealthCondition, right: &HealthCondition) -> std::cmp::Ordering {
@@ -2603,6 +2687,45 @@ mod tests {
             0,
             "a filter never widens node scope"
         );
+    }
+
+    #[test]
+    fn history_pages_expose_later_rows_and_clamp_live_shrink() {
+        let mut conditions = Vec::new();
+        for index in 0..19 {
+            let mut resolved = condition(
+                &format!("node:resolved-{index:02}"),
+                "node",
+                HealthSeverity::Warning,
+                HealthComponent::System,
+            );
+            resolved.resolved_at_ms = Some(2_000 + index);
+            conditions.push(resolved);
+        }
+
+        let second =
+            paged_recurrence_history(&conditions, "node", 100_000, HistorySeverityFilter::All, 1);
+        assert_eq!(second.total, 19);
+        assert_eq!(second.rows.len(), HISTORY_PAGE_SIZE);
+        assert_eq!(second.rows[0].condition.id, "node:resolved-10");
+
+        let stale_page = paged_recurrence_history(
+            &conditions[..3],
+            "node",
+            100_000,
+            HistorySeverityFilter::All,
+            2,
+        );
+        assert_eq!(stale_page.total, 3);
+        assert!(stale_page.rows.is_empty());
+        let clamped = paged_recurrence_history(
+            &conditions[..3],
+            "node",
+            100_000,
+            HistorySeverityFilter::All,
+            0,
+        );
+        assert_eq!(clamped.rows.len(), 3);
     }
 
     #[test]
