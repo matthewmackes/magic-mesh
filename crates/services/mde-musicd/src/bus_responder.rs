@@ -4412,6 +4412,39 @@ enum TargetHandoffAction {
     Resume(Queue),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTargetHandoff {
+    completion: state::HandoffCompletion,
+    previous_queue: Queue,
+    rendered_before: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetCommitAction {
+    AwaitAudio,
+    Commit,
+    Abort,
+}
+
+/// Decide whether a started target renderer has earned handoff ownership.
+/// Decoder startup and buffered samples are not proof of playback; only a real
+/// device callback advancing the renderer generation permits the durable
+/// `playing=true` state. A dead or revoked renderer fails closed first.
+fn target_commit_action(
+    renderer_healthy: bool,
+    engine_active: bool,
+    rendered_before: u64,
+    rendered_now: u64,
+) -> TargetCommitAction {
+    if !renderer_healthy || !engine_active {
+        TargetCommitAction::Abort
+    } else if rendered_now > rendered_before {
+        TargetCommitAction::Commit
+    } else {
+        TargetCommitAction::AwaitAudio
+    }
+}
+
 /// Route a shared completion before any peer is allowed to delete or consume
 /// it. Checking `from_peer` first is essential: otherwise the yielding owner
 /// sees its own completion, fails target admission under the owner's hostname,
@@ -4544,10 +4577,62 @@ fn apply_pending_handoff(engine: Option<&Engine>, queue_path: &Path) {
 /// remains available until a playback start has been admitted; it is then
 /// cleared with its request. The request binding rejects stale/replayed or
 /// unauthorized completion files before they can alter the queue or engine.
-fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients: &[&Client]) {
+fn apply_handoff_completions(
+    engine: Option<&Engine>,
+    queue_path: &Path,
+    clients: &[&Client],
+    pending: &mut Option<PendingTargetHandoff>,
+) {
     let Some(engine) = engine else { return };
     let dir = state::coordination_dir();
     let my_host = state::local_host();
+    if let Some(started) = pending.as_ref() {
+        match target_commit_action(
+            engine.is_renderer_healthy(),
+            engine.is_active(),
+            started.rendered_before,
+            engine.rendered_frames(),
+        ) {
+            TargetCommitAction::AwaitAudio => return,
+            TargetCommitAction::Abort => {
+                engine.stop();
+                let _ = queue::write_to(queue_path, &started.previous_queue);
+                tracing::warn!(
+                    intent_id = %started.completion.intent_id,
+                    "music handoff target failed before emitting audio; restored prior queue and retained completion"
+                );
+                *pending = None;
+                return;
+            }
+            TargetCommitAction::Commit => {}
+        }
+
+        let completion = started.completion.clone();
+        let target_state = MusicState {
+            peer: my_host.clone(),
+            playing: true,
+            song_id: completion.song_id.clone(),
+            position_ms: engine.position_ms(),
+            updated_ms: state::now_ms(),
+        };
+        if let Err(error) = state::write_state(&dir, &target_state) {
+            engine.pause();
+            tracing::warn!(%error, intent_id = %completion.intent_id, "music handoff target state could not be persisted; pausing emitted audio and retaining authorization for retry");
+            return;
+        }
+        state::clear_intent(&dir, &completion.intent_id);
+        state::clear_completion(&dir, &completion.intent_id);
+        engine.resume();
+        tracing::info!(
+            intent_id = %completion.intent_id,
+            owner_peer = %completion.owner_peer,
+            song_id = %completion.song_id,
+            position_ms = target_state.position_ms,
+            "music playback emitted audio and committed owner-yield handoff"
+        );
+        *pending = None;
+        return;
+    }
     let intents = state::read_intents(&dir);
     let now_ms = state::now_ms();
     for completion in state::read_completions(&dir) {
@@ -4597,35 +4682,18 @@ fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients
             state::clear_completion(&dir, &completion.intent_id);
             continue;
         }
+        let rendered_before = engine.rendered_frames();
         if !engine.play_from_candidates_at(upcoming, queue.current, completion.position_ms) {
             let _ = queue::write_to(queue_path, &previous_queue);
             tracing::warn!(intent_id = %completion.intent_id, "music handoff target could not start the native engine; retaining completion");
             continue;
         }
-        let target_state = MusicState {
-            peer: my_host.clone(),
-            playing: true,
-            song_id: completion.song_id.clone(),
-            position_ms: completion.position_ms,
-            updated_ms: state::now_ms(),
-        };
-        if let Err(error) = state::write_state(&dir, &target_state) {
-            engine.pause();
-            let _ = queue::write_to(queue_path, &previous_queue);
-            tracing::warn!(%error, intent_id = %completion.intent_id, "music handoff target state could not be persisted; audible authority revoked and completion retained");
-            continue;
-        }
-        // Retire the authorization record first. If cleanup is interrupted
-        // after this point, the completion is no longer eligible for replay.
-        state::clear_intent(&dir, &completion.intent_id);
-        state::clear_completion(&dir, &completion.intent_id);
-        tracing::info!(
-            intent_id = %completion.intent_id,
-            owner_peer = %completion.owner_peer,
-            song_id = %completion.song_id,
-            position_ms = completion.position_ms,
-            "music playback resumed from owner-yield completion"
-        );
+        *pending = Some(PendingTargetHandoff {
+            completion,
+            previous_queue,
+            rendered_before,
+        });
+        return;
     }
 }
 
@@ -6029,6 +6097,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     let state_write_phase = initial_state_write_phase(&host);
     let mut last_state_write = Instant::now() - STATE_WRITE_INTERVAL - state_write_phase;
     let mut last_idle_state = None;
+    let mut pending_target_handoff = None;
     let phase_deadline = Instant::now() + phase;
     while !should_stop() {
         let remaining = phase_deadline.saturating_duration_since(Instant::now());
@@ -6186,7 +6255,12 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         );
         poll_peers_with_authorizer(&persist, &mut cursors, &authorizer);
         apply_pending_handoff(engine.as_ref(), queue_path);
-        apply_handoff_completions(engine.as_ref(), queue_path, &clients);
+        apply_handoff_completions(
+            engine.as_ref(),
+            queue_path,
+            &clients,
+            &mut pending_target_handoff,
+        );
         let _ = resume_interrupted_playback(
             &mut renderer_recovery,
             engine.as_ref(),
@@ -6199,7 +6273,14 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             last_browse_poll = Instant::now();
             browse_poll_due = false;
         }
-        if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
+        // A target-side handoff is not playback authority until the physical
+        // renderer generation advances and its exact state commits above.
+        // Suppress both the mesh heartbeat and workspace projection while that
+        // proof is pending; either surface claiming `playing` would bypass the
+        // one-use transfer's two-phase commit.
+        if pending_target_handoff.is_none()
+            && last_state_write.elapsed() >= STATE_WRITE_INTERVAL
+        {
             write_periodic_state(engine.as_ref(), queue_path, &mut last_idle_state);
             if let Some(current_revision) = workspace_revision {
                 if let Some(next_revision) = current_revision.checked_add(1) {
@@ -7018,6 +7099,30 @@ mod tests {
         ));
         source_playing = true;
         assert_ne!(source_playing, target_playing, "failure leaves one owner");
+    }
+
+    #[test]
+    fn target_handoff_commits_only_after_physical_renderer_progress() {
+        assert_eq!(
+            target_commit_action(true, true, 41, 41),
+            TargetCommitAction::AwaitAudio,
+            "decoder startup or buffered samples cannot claim audible ownership"
+        );
+        assert_eq!(
+            target_commit_action(true, true, 41, 42),
+            TargetCommitAction::Commit,
+            "one real output-frame generation advance proves renderer progress"
+        );
+        assert_eq!(
+            target_commit_action(false, true, 41, 42),
+            TargetCommitAction::Abort,
+            "renderer revocation wins even if an earlier callback advanced"
+        );
+        assert_eq!(
+            target_commit_action(true, false, 41, 41),
+            TargetCommitAction::Abort,
+            "a source that dies silently must release the pending transfer"
+        );
     }
 
     #[test]

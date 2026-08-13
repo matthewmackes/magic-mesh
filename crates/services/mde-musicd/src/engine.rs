@@ -1082,6 +1082,17 @@ impl EngineHandle {
         !self.shared.renderer_failed.load(Ordering::Acquire)
     }
 
+    /// Monotonic count of real device frames emitted by this renderer.
+    ///
+    /// Control-plane code snapshots this generation before starting a source
+    /// and requires it to advance before publishing audible ownership. Decode
+    /// or buffered-ring progress alone is intentionally insufficient: neither
+    /// proves that the selected output device produced sound.
+    #[must_use]
+    pub fn rendered_frames(&self) -> u64 {
+        self.shared.rendered_frames.load(Ordering::Acquire)
+    }
+
     /// Audible position captured when the physical renderer failed. Live
     /// streams and idle/paused engines return `None`: restarting either would
     /// invent continuity the daemon cannot prove.
