@@ -71,6 +71,8 @@ struct AndroidLifecycleRequest {
     request_id: String,
     expected_generation: u64,
     operation: AndroidOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_request_id: Option<String>,
     app: Option<AospStarterApp>,
     armed_token: Option<String>,
     typed_name: Option<String>,
@@ -1323,16 +1325,19 @@ fn plan_android(
         || card_workload != request.workload_id
         || (is_cancellation
             && (request.app.is_some()
+                || request.target_request_id.is_some()
                 || cancellation_target.is_none()
                 || cancellation_target == Some(request.request_id.as_str())))
         || (!is_cancellation
             && (request
                 .app
                 .is_none_or(|app| app.package_id().as_str() != card_package)
+                || request.target_request_id.is_some()
                 || cancellation_target.is_some()))
     {
         return Err(RefusalCode::TargetMismatch);
     }
+    request.target_request_id = cancellation_target.map(str::to_owned);
     let target = request.workload_id.clone();
     request.armed_token = Some(arm(
         signer,
@@ -1958,6 +1963,7 @@ mod tests {
                 request_id: invocation.request_id.clone(),
                 expected_generation: invocation.expected_generation,
                 operation: AndroidOperation::Cancel,
+                target_request_id: None,
                 app: None,
                 armed_token: None,
                 typed_name: None,
@@ -2656,6 +2662,7 @@ mod tests {
             request_id: invocation.request_id.clone(),
             expected_generation: invocation.expected_generation,
             operation: AndroidOperation::Start,
+            target_request_id: None,
             app: Some(app),
             armed_token: None,
             typed_name: None,
@@ -2688,6 +2695,10 @@ mod tests {
         assert_eq!(
             downstream.expected_generation,
             invocation.expected_generation
+        );
+        assert_eq!(
+            downstream.target_request_id.as_deref(),
+            invocation.cancels_request_id.as_deref()
         );
         assert!(downstream.app.is_none());
         let token = CloudArmedToken::parse(

@@ -3,9 +3,9 @@
 //! The governed Android resource action reaches this handler only after the
 //! Cloud placement and capability gates. `Start` is delegated to the sole typed
 //! Workload operation lane; the Cloud worker never contacts libvirt directly.
-//! Cancellation remains refused because the v1 Android request has no concrete
-//! prior operation ID to target. Retry, guest app launch, and VDI presentation
-//! remain explicit refusal boundaries until their exact typed contracts exist.
+//! Cancellation names the exact prior Workload operation and remains bound to
+//! its workload generation. Retry, guest app launch, and VDI presentation remain
+//! explicit refusal boundaries until their exact typed contracts exist.
 
 use mackes_mesh_types::android_apps::{AndroidSignedCatalog, AospStarterApp};
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmedToken, CloudReply, DeliveryType};
@@ -42,6 +42,8 @@ struct Request {
     expected_generation: u64,
     operation: Operation,
     #[serde(default)]
+    target_request_id: Option<String>,
+    #[serde(default)]
     app: Option<AospStarterApp>,
     #[serde(default)]
     armed_token: Option<String>,
@@ -59,19 +61,13 @@ pub(super) fn handle(worker: &CloudWorker, verb: &str, raw: &str) -> CloudReply 
         Err(error) => return failure(verb, error),
     };
     let result = match request.operation {
-        Operation::Start | Operation::Stop => publish_workload_operation(worker, &request),
-        Operation::Cancel => {
-            return failure(
-                verb,
-                "Android lifecycle v1 cannot safely delegate Cancel because it has no concrete prior target request ID; nothing changed",
-            )
+        Operation::Start | Operation::Stop | Operation::Cancel => {
+            publish_workload_operation(worker, &request)
         }
-        Operation::Retry => {
-            return failure(
-                verb,
-                "this Android lifecycle operation is not yet delegated to Workloads; nothing changed",
-            )
-        }
+        Operation::Retry => return failure(
+            verb,
+            "this Android lifecycle operation is not yet delegated to Workloads; nothing changed",
+        ),
     };
     match result {
         Ok(spec) => CloudReply {
@@ -102,11 +98,30 @@ fn parse(raw: &str) -> Result<Request, String> {
     if request.operation == Operation::Stop && request.expected_generation == 0 {
         return Err("stop requires a non-zero expected workload generation".to_owned());
     }
+    if request.operation == Operation::Cancel && request.expected_generation == 0 {
+        return Err("cancel requires a non-zero expected workload generation".to_owned());
+    }
     if request.operation == Operation::Start && request.expected_generation != 0 {
         return Err("start requires a zero expected workload generation".to_owned());
     }
     if matches!(request.operation, Operation::Stop | Operation::Cancel) && request.app.is_some() {
         return Err("stop/cancel must not carry an app".to_owned());
+    }
+    match request.operation {
+        Operation::Cancel => {
+            let target = request
+                .target_request_id
+                .as_deref()
+                .ok_or_else(|| "cancel requires the exact prior Workload request ID".to_owned())?;
+            super::super::path_key::segment("target_request_id", target)?;
+            if target == request.request_id {
+                return Err("cancel cannot target its own request ID".to_owned());
+            }
+        }
+        _ if request.target_request_id.is_some() => {
+            return Err("only cancel accepts a target_request_id".to_owned())
+        }
+        _ => {}
     }
     if request.typed_name.is_some() {
         return Err("Android lifecycle does not accept a legacy `typed_name`".to_owned());
@@ -223,7 +238,8 @@ fn publish_workload_operation_with_catalog(
     let (action, action_label, nonce_label) = match source.operation {
         Operation::Start => (WorkloadOperationAction::Start, "Start", "start"),
         Operation::Stop => (WorkloadOperationAction::Stop, "Stop", "stop"),
-        Operation::Cancel | Operation::Retry => {
+        Operation::Cancel => (WorkloadOperationAction::Cancel, "Cancel", "cancel"),
+        Operation::Retry => {
             return Err("unsupported Android lifecycle delegation; nothing changed".to_owned())
         }
     };
@@ -246,7 +262,7 @@ fn publish_workload_operation_with_catalog(
         target_node: worker.workload_node_id.clone(),
         expected_generation: source.expected_generation,
         action,
-        target_request_id: None,
+        target_request_id: source.target_request_id.clone(),
         deadline_at_ms,
         preferred_attachment: None,
         armed_token: None,
@@ -501,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_stop_binds_workload_generation_and_exact_replay_while_cancel_stays_refused() {
+    fn typed_stop_and_cancel_bind_workload_generation_and_exact_target() {
         let state = tempfile::tempdir().expect("temporary state root");
         let bus = tempfile::tempdir().expect("temporary Bus root");
         let signer = Arc::new(HmacTokenSigner::new(b"android-stop-test-key".to_vec()));
@@ -538,6 +554,11 @@ mod tests {
                 "request_id": "android-stop-1",
                 "expected_generation": 41,
                 "operation": operation,
+                "target_request_id": if operation == "cancel" {
+                    Some("android-start-1")
+                } else {
+                    None
+                },
                 "app": null,
                 "armed_token": null,
                 "typed_name": null
@@ -557,19 +578,25 @@ mod tests {
             document.to_string()
         };
 
-        let cancel = parse(&body("android-one", "cancel", "android-cancel-1"))
-            .expect("well-formed v1 Cancel");
-        assert_eq!(cancel.operation, Operation::Cancel);
-        let cancel_reply = handle(
-            &worker,
-            "android-lifecycle",
-            &body("android-one", "cancel", "android-cancel-2"),
-        );
-        assert!(!cancel_reply.ok);
-        assert!(cancel_reply.error.as_deref().is_some_and(|error| {
-            error.contains("no concrete prior target request ID")
-                && error.contains("nothing changed")
-        }));
+        let cancel =
+            parse(&body("android-one", "cancel", "android-cancel-1")).expect("exact-target Cancel");
+        publish_workload_operation_against_catalog(&worker, &cancel, &catalog, now)
+            .expect("typed Cancel handoff");
+
+        let mut missing_target: serde_json::Value =
+            serde_json::from_str(&body("android-one", "cancel", "android-cancel-missing"))
+                .expect("Cancel JSON");
+        missing_target["target_request_id"] = serde_json::Value::Null;
+        assert!(parse(&missing_target.to_string())
+            .expect_err("implicit cancellation target must fail closed")
+            .contains("exact prior Workload request ID"));
+        let mut self_target: serde_json::Value =
+            serde_json::from_str(&body("android-one", "cancel", "android-cancel-self"))
+                .expect("Cancel JSON");
+        self_target["target_request_id"] = self_target["request_id"].clone();
+        assert!(parse(&self_target.to_string())
+            .expect_err("self cancellation must fail closed")
+            .contains("cannot target its own request ID"));
 
         let cross_workload =
             parse(&body("android-two", "stop", "android-stop-cross")).expect("cross-workload Stop");
@@ -591,9 +618,18 @@ mod tests {
         let messages = persist
             .list_since(WORKLOAD_OPERATION_TOPIC, None)
             .expect("read Workload operations");
-        assert_eq!(messages.len(), 2, "refused requests must not publish");
-        let first_body = messages[0].body.as_deref().expect("first Stop body");
-        let replay_body = messages[1].body.as_deref().expect("replayed Stop body");
+        assert_eq!(messages.len(), 3);
+        let cancel_body = messages[0].body.as_deref().expect("Cancel body");
+        let cancellation = WorkloadOperationRequest::from_json(cancel_body, now_ms())
+            .expect("typed Workload Cancel request");
+        assert_eq!(cancellation.action, WorkloadOperationAction::Cancel);
+        assert_eq!(
+            cancellation.target_request_id.as_deref(),
+            Some("android-start-1")
+        );
+        assert_eq!(cancellation.expected_generation, 41);
+        let first_body = messages[1].body.as_deref().expect("first Stop body");
+        let replay_body = messages[2].body.as_deref().expect("replayed Stop body");
         let mut first = WorkloadOperationRequest::from_json(first_body, now_ms())
             .expect("first typed Stop request");
         let mut replay = WorkloadOperationRequest::from_json(replay_body, now_ms())
