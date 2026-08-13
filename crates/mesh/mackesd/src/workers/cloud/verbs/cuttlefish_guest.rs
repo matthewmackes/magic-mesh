@@ -20,7 +20,6 @@ use mackes_mesh_types::cuttlefish_guest::{
     CuttlefishGuestOperation as GuestOperation, CuttlefishGuestRequest as GuestRequest,
     CuttlefishGuestResponse as GuestResponse,
     CUTTLEFISH_GUEST_MAX_FRAME_BYTES as MAX_GUEST_FRAME_BYTES,
-    CUTTLEFISH_GUEST_PROTOCOL_SCHEMA_VERSION as GUEST_PROTOCOL_SCHEMA_VERSION,
 };
 
 use super::cuttlefish::CuttlefishProviderError;
@@ -327,6 +326,7 @@ mod tests {
         AndroidVdiProtocol, CuttlefishImageProvenanceRef, CuttlefishVmId,
         ANDROID_VDI_SOURCE_SCHEMA_VERSION,
     };
+    use mackes_mesh_types::cuttlefish_guest::CUTTLEFISH_GUEST_PROTOCOL_SCHEMA_VERSION as GUEST_PROTOCOL_SCHEMA_VERSION;
 
     use super::*;
 
