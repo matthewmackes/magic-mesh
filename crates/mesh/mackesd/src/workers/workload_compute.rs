@@ -4019,6 +4019,19 @@ impl WorkloadComputeWorker {
                 );
                 continue;
             }
+            if let Some(lease) = status.attachment.as_ref() {
+                if let Err(reason) =
+                    validate_recovered_attachment_lease(&request, &status, lease, now_ms)
+                {
+                    self.refuse_recovered_attachment(
+                        ledger,
+                        status,
+                        format!("recovered Display1 attachment was refused: {reason}"),
+                        now_ms,
+                    );
+                    continue;
+                }
+            }
             let outcome = match self.actuator.recover_attachment(&request, &status, now_ms) {
                 Ok(Some(outcome)) => outcome,
                 Ok(None) => continue,
@@ -4916,6 +4929,10 @@ fn validate_recovered_attachment_lease(
     lease: &WorkloadAttachmentLease,
     now_ms: u64,
 ) -> Result<(), &'static str> {
+    let authorized_generation = request.expected_generation.saturating_add(1).max(1);
+    if status.generation != authorized_generation {
+        return Err("recovered Workload generation was not authorized by its owning request");
+    }
     if lease.workload_id != request.workload_id || lease.workload_id != status.workload_id {
         return Err("lease workload identity does not match the recovered Workload");
     }
@@ -6756,6 +6773,73 @@ mod tests {
             .remediation
             .as_deref()
             .is_some_and(|remediation| remediation.contains("current generation")));
+    }
+
+    #[test]
+    fn recovered_attachment_generation_must_be_authorized_by_owning_request() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let request = request();
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, now);
+        let lease_id = lease.lease_id.clone();
+        let journal = temp.path().join("workload-operations.json");
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        seed_completed_attachment(&mut ledger, request.clone(), lease, now);
+        drop(ledger);
+
+        // Model a structurally valid journal reassociation: the status and
+        // lease agree with one another at generation two, but their durable
+        // owning request authorized only the first generation.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal).expect("read workload journal"))
+                .expect("parse workload journal");
+        let record = document["operations"]
+            .as_array_mut()
+            .and_then(|operations| operations.first_mut())
+            .expect("persisted workload record");
+        record["status"]["generation"] = serde_json::json!(2);
+        record["status"]["attachment"]["generation"] = serde_json::json!(2);
+        fs::write(
+            &journal,
+            serde_json::to_vec_pretty(&document).expect("encode hostile journal"),
+        )
+        .expect("write hostile journal");
+
+        let mut ledger =
+            WorkloadOperationLedger::open(temp.path()).expect("structurally valid hostile journal");
+        let calls = Arc::new(Mutex::new(0));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            RecoveryActuator {
+                calls: Arc::clone(&calls),
+                revoked: Arc::clone(&revoked),
+                outcome: WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::Ready,
+                    retryable: false,
+                    reason: None,
+                    remediation: None,
+                    attachment: None,
+                },
+            },
+        ));
+
+        worker.reconcile_recovered_attachments(&mut ledger, now);
+
+        assert_eq!(*calls.lock().expect("recovery calls"), 0);
+        assert_eq!(
+            revoked.lock().expect("revoked attachments").as_slice(),
+            &[(lease_id, 2)],
+            "the exact persisted capability is revoked before adapter recovery"
+        );
+        let refused = ledger.status(&request.request_id).expect("refused status");
+        assert!(refused.attachment.is_none());
+        assert_eq!(refused.readiness, WorkloadReadiness::Unavailable);
+        assert!(refused
+            .reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("was not authorized by its owning request") }));
     }
 
     #[test]
