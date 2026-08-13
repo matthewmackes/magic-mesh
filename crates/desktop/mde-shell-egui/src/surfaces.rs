@@ -173,7 +173,8 @@ pub(crate) const fn canonical_workspace_surface(surface: Surface) -> Surface {
 /// workspace but is no longer reachable from the shipped shell. The panel
 /// client and the shell host are deliberately outside this list.
 #[allow(dead_code)]
-pub(crate) const EMBEDDED_SURFACE_CRATES: [&str; 7] = [
+pub(crate) const EMBEDDED_SURFACE_CRATES: [&str; 8] = [
+    "mde-bookmarks-egui",
     "mde-collab-egui",
     "mde-editor-egui",
     "mde-files-egui",
@@ -834,10 +835,14 @@ mod tests {
 
     #[test]
     fn embedded_surface_catalog_excludes_the_shell_host() {
-        assert_eq!(EMBEDDED_SURFACE_CRATES.len(), 7);
+        assert_eq!(EMBEDDED_SURFACE_CRATES.len(), 8);
         assert!(EMBEDDED_SURFACE_CRATES
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
+        assert!(
+            EMBEDDED_SURFACE_CRATES.contains(&"mde-bookmarks-egui"),
+            "the Browser-owned bookmark manager is rendered by web::web_panel and must remain in the shipped shell catalog"
+        );
         assert!(!EMBEDDED_SURFACE_CRATES.contains(&"mde-shell-egui"));
     }
 
