@@ -244,6 +244,7 @@ fn catalog_from_services_and_root(
     ssh_x11_state: Option<&SshX11SourcesState>,
     upnp_state: Option<&UpnpSourcesState>,
 ) -> Result<ResourceCatalog, ResourceValidationError> {
+    let publisher = admitted_catalog_publisher(&state.host)?;
     let now = u64::try_from(state.published_at_ms).unwrap_or(1).max(1);
     let configured: BTreeMap<_, _> = workgroup_root
         .map(load_configurations)
@@ -260,7 +261,7 @@ fn catalog_from_services_and_root(
             + upnp_state.map_or(0, |upnp| upnp.sources.len()),
     );
     for app in AospStarterApp::ALL {
-        cards.push(application_card(app, &state.host, now)?);
+        cards.push(application_card(app, publisher, now)?);
     }
     for spec in REGISTERED {
         cards.push(registered_card(
@@ -284,13 +285,29 @@ fn catalog_from_services_and_root(
     }
     let catalog = ResourceCatalog {
         schema_version: RESOURCE_CONTRACT_VERSION,
-        revision: format!("{}-{now}", safe_id(&state.host)),
-        publisher: safe_id(&state.host),
+        revision: format!("{publisher}-{now}"),
+        publisher: publisher.to_owned(),
         generated_at_ms: now,
         content_digest: None,
         cards,
     };
     catalog.with_content_digest()
+}
+
+/// Admit the exact node identity that owns provider-declared catalog rows.
+///
+/// App cards derive their provenance from this publisher. Lossily normalizing
+/// an untrusted mirror identity here would let values such as `seat/15` and
+/// `seat-15` mint the same fresh provider source, so require the source to
+/// already be in the canonical grammar before any App/profile row is built.
+fn admitted_catalog_publisher(host: &str) -> Result<&str, ResourceValidationError> {
+    let canonical = safe_id(host);
+    if host.is_empty() || canonical != host {
+        return Err(ResourceValidationError::InvalidField(
+            "service_catalog.publisher",
+        ));
+    }
+    Ok(host)
 }
 
 /// Append desktop-source cards in stable resource-ID order, collapsing exact
@@ -1369,6 +1386,37 @@ mod tests {
             .all(|card| !card.operating_roles.is_empty()));
         assert!(catalog.content_digest.is_some());
         catalog.validate().expect("attested catalog");
+    }
+
+    #[test]
+    fn app_catalog_rejects_lossy_publisher_provenance_before_projection() {
+        for host in ["", "seat/15", "seat 15", "seat-15\n", "SEAT-15"] {
+            let error = catalog_from_services(&ServicesState {
+                host: host.into(),
+                records: vec![],
+                published_at_ms: 1_700_000_000_000,
+            })
+            .expect_err("ambiguous publisher must not mint fresh App provenance");
+            assert_eq!(
+                error,
+                ResourceValidationError::InvalidField("service_catalog.publisher"),
+                "unexpected admission result for {host:?}"
+            );
+        }
+
+        let catalog = catalog_from_services(&ServicesState {
+            host: "seat-15".into(),
+            records: vec![],
+            published_at_ms: 1_700_000_000_000,
+        })
+        .expect("canonical publisher remains admitted");
+        assert!(catalog.cards.iter().any(|card| {
+            card.identity.class == ResourceClass::Application
+                && card.provenance.iter().all(|source| {
+                    source.source_id.starts_with("aosp/seat-15/")
+                        && source.trust == ProvenanceTrust::OperatorDeclared
+                })
+        }));
     }
 
     #[test]
