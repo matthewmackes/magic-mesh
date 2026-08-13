@@ -37,6 +37,7 @@
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
 #   install-helpers/verify-rpm-payload.sh candidate-payload # credential payload in base + lighthouse candidates
 #   install-helpers/verify-rpm-payload.sh app-vm-payload [a.rpm] # exact App VM guest bootstrap payload
+#   install-helpers/verify-rpm-payload.sh android-vm-payload [a.rpm] # exact Cuttlefish guest role payload
 #   install-helpers/verify-rpm-payload.sh overlay-claims-package  # WL-CRIT-007 three-variant package/runtime shape
 #   install-helpers/verify-rpm-payload.sh surfaces       # surface-reachability check only
 #   install-helpers/verify-rpm-payload.sh --self-test    # exercise the parser on good+broken fixtures
@@ -152,6 +153,26 @@ readonly APP_VM_BOOTSTRAP_MARKERS=(
   "path: /etc/systemd/system/mcnf-app-vm-runtime.service"
   "ExecStart=/usr/local/libexec/mcnf-app-vm-runtime"
   "path: /usr/local/libexec/mcnf-app-vm-runtime"
+)
+readonly ANDROID_VM_PAYLOAD_MEMBERS=(
+  "automation/ansible/playbooks/site.yml|/usr/share/mde/iac/automation/ansible/playbooks/site.yml"
+  "automation/ansible/roles/cuttlefish_host/defaults/main.yml|/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/defaults/main.yml"
+  "automation/ansible/roles/cuttlefish_host/meta/main.yml|/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/meta/main.yml"
+  "automation/ansible/roles/cuttlefish_host/tasks/main.yml|/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/tasks/main.yml"
+)
+readonly ANDROID_VM_PLAYBOOK_MARKERS=(
+  "hosts: delivery_android_vm"
+  "role: cuttlefish_host"
+)
+readonly ANDROID_VM_PROFILE_MARKERS=(
+  "cuttlefish_user: cvd"
+  "- kvm"
+  "- cvdnetwork"
+)
+readonly ANDROID_VM_RUNTIME_MARKERS=(
+  "path: /dev/kvm"
+  "cvd version"
+  "cvd start --start_vnc_server"
 )
 
 # build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
@@ -370,6 +391,94 @@ check_app_vm_payload() {
   fi
 }
 
+# WL-FUNC-020 — Android provisioning is not carried by the App VM cloud-init
+# template. It is a distinct Ansible specialization: site.yml admits the
+# delivery_android_vm inventory group, defaults/main.yml is the guest profile,
+# and tasks/main.yml establishes nested KVM and starts cvd. These files are
+# shipped through broad playbook/role globs, so a non-empty unrelated Ansible
+# payload can otherwise hide their removal. Pin every exact member in both RPM
+# roles that can host Android compute, plus the contract that makes the files
+# operational rather than inert documentation.
+check_android_vm_payload() {
+  local rpm="${1:-}" pair member install_path marker listing=""
+  local label parser source dest covered
+  hdr "Android VM guest bootstrap/runtime/profile — exact release payload"
+
+  for pair in "${ANDROID_VM_PAYLOAD_MEMBERS[@]}"; do
+    member="${pair%%|*}"
+    install_path="${pair#*|}"
+    if [ -f "$REPO_ROOT/$member" ]; then
+      ok "android source  $member"
+    else
+      fail "android source  $member MISSING"
+    fi
+
+    for label in base server; do
+      case "$label" in
+        base) parser=parse_assets ;;
+        server) parser=parse_server_assets ;;
+      esac
+      covered=0
+      while IFS=$'\t' read -r source dest; do
+        [ -n "$source" ] || continue
+        case "$member" in
+          $source)
+            case "$dest" in
+              */playbooks/) [[ "$install_path" == "$dest"* ]] && covered=1 ;;
+              */roles/) [[ "$install_path" == "$dest"* ]] && covered=1 ;;
+            esac
+            ;;
+        esac
+      done < <($parser "$CARGO_TOML")
+      if [ "$covered" -eq 1 ]; then
+        ok "android $label manifest covers $member -> $install_path"
+      else
+        fail "android $label manifest does not cover $member at $install_path"
+      fi
+    done
+  done
+
+  for marker in "${ANDROID_VM_PLAYBOOK_MARKERS[@]}"; do
+    if grep -Fq -- "$marker" "$REPO_ROOT/automation/ansible/playbooks/site.yml"; then
+      ok "android bootstrap $marker"
+    else
+      fail "android bootstrap marker MISSING: $marker"
+    fi
+  done
+  for marker in "${ANDROID_VM_PROFILE_MARKERS[@]}"; do
+    if grep -Fq -- "$marker" "$REPO_ROOT/automation/ansible/roles/cuttlefish_host/defaults/main.yml"; then
+      ok "android profile $marker"
+    else
+      fail "android profile marker MISSING: $marker"
+    fi
+  done
+  for marker in "${ANDROID_VM_RUNTIME_MARKERS[@]}"; do
+    if grep -Fq -- "$marker" "$REPO_ROOT/automation/ansible/roles/cuttlefish_host/tasks/main.yml"; then
+      ok "android runtime $marker"
+    else
+      fail "android runtime marker MISSING: $marker"
+    fi
+  done
+
+  [ -n "$rpm" ] || return
+  if [ -z "${MCNF_FAKE_RPM_LIST:-}" ] && [ ! -f "$rpm" ]; then
+    fail "android RPM not found: $rpm"
+    return
+  fi
+  if ! listing="$(rpm_file_list "$rpm")"; then
+    fail "android could not read file list from $rpm"
+    return
+  fi
+  for pair in "${ANDROID_VM_PAYLOAD_MEMBERS[@]}"; do
+    install_path="${pair#*|}"
+    if grep -Fxq "$install_path" <<<"$listing"; then
+      ok "android payload $install_path present in rpm -qlp"
+    else
+      fail "android payload $install_path MISSING from the RPM payload"
+    fi
+  done
+}
+
 # Read the actual RPM Requires header (or the self-test fixture). Production
 # validation intentionally uses the exact query form required by the gate.
 rpm_requires_header() {
@@ -494,6 +603,7 @@ check_payload_dryrun() {
 
   check_vdi_host_requires
   check_app_vm_payload
+  check_android_vm_payload
   check_grouped_mackesd_assets
   check_candidate_credential_assets
 }
@@ -604,6 +714,9 @@ check_payload_rpm() {
   if [ "$shape" = "base" ]; then
     check_built_rpm_vdi_host_requires "$rpm"
     check_app_vm_payload "$rpm"
+    check_android_vm_payload "$rpm"
+  elif [ "$shape" = "server" ]; then
+    check_android_vm_payload "$rpm"
   else
     info "actual-requires KVM host check applies to the base RPM (shape is $shape)"
   fi
@@ -1054,6 +1167,25 @@ LISTING
     fail "self-test: missing App VM bootstrap escaped exact RPM verification"; st_fail=1
   fi
 
+  # A populated Ansible destination is not evidence that Android can boot. The
+  # Cuttlefish task file is the executable runtime boundary; prove an unrelated
+  # role plus the playbook/profile/metadata cannot conceal its omission.
+  local android_missing_list="$tmp/android-missing-list"
+  cat >"$android_missing_list" <<'LISTING'
+/usr/share/mde/iac/automation/ansible/playbooks/site.yml
+/usr/share/mde/iac/automation/ansible/roles/cloud_vm/tasks/main.yml
+/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/defaults/main.yml
+/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/meta/main.yml
+LISTING
+  out="$(MCNF_FAKE_RPM_LIST="$android_missing_list" \
+      bash "$0" android-vm-payload "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "/usr/share/mde/iac/automation/ansible/roles/cuttlefish_host/tasks/main.yml MISSING" <<<"$out"; then
+    ok "self-test: non-empty Ansible payload cannot hide a missing Cuttlefish runtime"
+  else
+    fail "self-test: missing Cuttlefish runtime escaped exact RPM verification"; st_fail=1
+  fi
+
   # ---- fixture B: a SYNTHETICALLY-BROKEN manifest ---------------------------
   # Drops the shell key-bin, adds a bin nothing builds, adds a missing file.
   local bad="$tmp/bad.toml"
@@ -1183,6 +1315,7 @@ main() {
     grouped-process) check_grouped_mackesd_assets ;;
     candidate-payload) check_candidate_credential_assets ;;
     app-vm-payload) shift; check_app_vm_payload "${1:-}" ;;
+    android-vm-payload) shift; check_android_vm_payload "${1:-}" ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")
