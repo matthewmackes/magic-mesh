@@ -1270,14 +1270,65 @@ pub trait LiveNodes {
 /// a substituted row change the VM or client peer that roaming reconnects.  The
 /// caller defers the whole convergence tick until the store returns one row per
 /// id, preserving the previously published plane instead of adopting ambiguity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionRosterAdmissionError {
+    DuplicateSession(SessionId),
+    InvalidIdentity {
+        session_id: SessionId,
+        field: &'static str,
+    },
+}
+
+impl std::fmt::Display for SessionRosterAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateSession(session_id) => {
+                write!(
+                    formatter,
+                    "duplicate persisted session identity `{session_id}`"
+                )
+            }
+            Self::InvalidIdentity { session_id, field } => write!(
+                formatter,
+                "persisted session `{session_id}` has an invalid `{field}` identity"
+            ),
+        }
+    }
+}
+
+/// Apply the same bounded identity grammar used by the live session-open path.
+/// Replicated recovery rows do not pass through `apply_request`, so roaming must
+/// re-attest every resource-route component before it can plan a reconnect or
+/// destructive release from that row.
+fn valid_recovered_session_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.chars().any(char::is_control)
+        && !value.contains('/')
+        && !value.contains('\\')
+}
+
 fn admit_session_roster(
     rows: Vec<VdiSession>,
-) -> Result<BTreeMap<SessionId, VdiSession>, SessionId> {
+) -> Result<BTreeMap<SessionId, VdiSession>, SessionRosterAdmissionError> {
     let mut admitted = BTreeMap::new();
     for session in rows {
         let id = session.id.clone();
+        for (field, value) in [
+            ("id", session.id.as_str()),
+            ("serving_peer", session.serving_peer.as_str()),
+            ("vm_id", session.vm_id.as_str()),
+            ("client_peer", session.client_peer.as_str()),
+        ] {
+            if !valid_recovered_session_identity(value) {
+                return Err(SessionRosterAdmissionError::InvalidIdentity {
+                    session_id: id,
+                    field,
+                });
+            }
+        }
         if admitted.insert(id.clone(), session).is_some() {
-            return Err(id);
+            return Err(SessionRosterAdmissionError::DuplicateSession(id));
         }
     }
     Ok(admitted)
@@ -1757,10 +1808,10 @@ impl SessionRoamingWorker {
         let observed: BTreeMap<SessionId, VdiSession> = match self.store.list() {
             Ok(rows) => match admit_session_roster(rows) {
                 Ok(observed) => observed,
-                Err(session_id) => {
+                Err(error) => {
                     tracing::warn!(
-                        %session_id,
-                        "session_roaming: duplicate persisted session identity; deferring"
+                        %error,
+                        "session_roaming: persisted session roster failed admission; deferring"
                     );
                     return;
                 }
@@ -1998,8 +2049,30 @@ mod tests {
 
         assert_eq!(
             admit_session_roster(vec![retained, substituted]),
-            Err("session-1".into()),
+            Err(SessionRosterAdmissionError::DuplicateSession(
+                "session-1".into()
+            )),
             "restart recovery must defer instead of choosing a conflicting row by iteration order"
+        );
+    }
+
+    #[test]
+    fn restarted_roaming_rejects_untrusted_resource_route_provenance() {
+        let mut hostile = sess(
+            "session-1",
+            "peer:workstation-a",
+            "peer:vm-host-a",
+            SessionState::Disconnected,
+        );
+        hostile.serving_peer = "peer:vm-host-a/../../substituted".into();
+
+        assert_eq!(
+            admit_session_roster(vec![hostile]),
+            Err(SessionRosterAdmissionError::InvalidIdentity {
+                session_id: "session-1".into(),
+                field: "serving_peer",
+            }),
+            "replicated recovery rows must re-attest route identity before reconnect planning"
         );
     }
 
