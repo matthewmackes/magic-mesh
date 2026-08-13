@@ -93,14 +93,13 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
-- Current state: typed authority exists; the shell functional gate is green
-  (farm build plus 1,612 tests passed, 0 failed, 2 ignored); KMS/EGL live proof
-  and repository-wide strict clippy remain.
-- **Native DRM/PRIME + shell wiring (2026-08-11):** native gates passed 3/3;
-  DRM shell build and VDI module passed 33/33. Live KMS/Display1 remains:
+- Current state: typed authority, the 1,612-test shell gate, and the `mackesd` all-target strict-Clippy/canonical serial gates are green. KMS/EGL live proof and
+  repository-wide strict Clippy remain.
+- **mackesd all-target quality gate (2026-08-12):** strict Clippy, 4,924 core serial tests, and authority guards are green:
+  `evidence/WL-ARCH-010-2026-08-12-mackesd-all-target-gate-r1.md`.
+- **Native DRM/PRIME + shell wiring (2026-08-11):** native gates passed 3/3; DRM shell build and VDI module passed 33/33. Live KMS/Display1 remains:
   `evidence/WL-ARCH-010-2026-08-11-native-drm-prime-boundary-r474.md`,
-  `evidence/WL-ARCH-010-2026-08-11-shell-drm-build-r475.md`,
-  `evidence/WL-ARCH-010-2026-08-11-vdi-drm-module-r477.md`.
+  `evidence/WL-ARCH-010-2026-08-11-shell-drm-build-r475.md`, `evidence/WL-ARCH-010-2026-08-11-vdi-drm-module-r477.md`.
 - Remaining work: **Recovered lease deadline (2026-08-10):** expired attachment leases refused; BigBoy: `evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **Validating capacity exclusion (2026-08-11):** `.90` exact-fit regression: `docs/platform/evidence/WL-ARCH-010-2026-08-11-validating-capacity-exclusion-r218.md`.
 - **VM identity bound (2026-08-11):** BigBoy passed bounded domain/network XML identities: `docs/platform/evidence/WL-ARCH-010-2026-08-11-vm-identity-bound-r221.md`.
@@ -138,10 +137,8 @@ behavioral evidence is not completion.
   `evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`, `evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`,
   `evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`, `evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
 - **Shell runtime projection:** raw Podman/libvirt/Nova shortcuts are gone; BigBoy passed: `evidence/WL-ARCH-010-2026-08-08-shell-runtime-projection-hard-cut-r4.md`.
-- **Heartbeat runtime-projection hard cut (2026-08-08):** peer heartbeats no
-  longer probe or replicate raw Podman/libvirt inventories. Remote VM desktop
-  cards consume the serving node's validated typed Workload snapshot; rolling
-  readers discard retired fields, and focused farm/authority gates pass. Evidence:
+- **Heartbeat runtime-projection hard cut (2026-08-08):** peer heartbeats no longer probe or replicate raw Podman/libvirt inventories; remote VM cards consume the
+  serving node's typed Workload snapshot, and rolling readers discard retired fields. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-heartbeat-runtime-projection-hard-cut-r5.md`.
 - **Retired compute-inventory hard cut (2026-08-09):** network probing no longer reads the retired VM roster; typed Workloads owns runtime identity. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-compute-inventory-hard-cut-r6.md`.
@@ -426,10 +423,8 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
 - Required outcome: six supervised groups publish bounded snapshots; Surface::Workers owns worker tree/graph/inspector/Network Operations/Action Console; remove duplicate surfaces.
-- Current state: bounded starts and six groups ship; ownership and UI cutover
-  implementation remain. Fleet/package/live proof is explicitly post-release
-  acceptance and non-blocking for the coding drain. Latest:
-  `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
+- Current state: six groups ship; ownership/UI cutover remains; fleet/package/live proof is post-release: `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
+- Remaining work:
 - **SQLite authority complete (2026-08-08):** 61 direct writes fell to zero; final 24/24 proof: `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console evidence (2026-08-08/09):** generation/digest gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census/aggregate (2026-08-09):** 160 starts fail closed without stable rows; live proof: `evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md`.
@@ -440,9 +435,7 @@ behavioral evidence is not completion.
 - **Bounded Nebula systemctl (2026-08-11):** hung commands die at 2 seconds with 8 KiB caps; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-nebula-systemctl-bound-r230.md`.
 - **Bounded Netdata overlay IP (2026-08-11):** source files cap at 256 bytes before trim; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-netdata-overlay-bound-r231.md`.
 - **Fleet reconcile retry:** failed attempts remain due; `.50` passed 1/1: `docs/platform/evidence/WL-ARCH-009-WL-CRIT-007-2026-08-11-fleet-reconcile-retry-r276.md`.
-- **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip
-  bursts; focused implementation/test/clippy gates are complete. Evidence:
-  `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
+- **Metrics slow-export recovery (2026-08-11):** missed exporter ticks skip bursts; focused gates are complete: `evidence/WL-ARCH-009-2026-08-11-metrics-interval-skip-r222.md`.
 - **Service-catalog canonical file (2026-08-11):** crash-left staging files cannot enable uncommitted services; BigBoy passed 1/1:
   `docs/platform/evidence/WL-ARCH-009-2026-08-11-service-catalog-canonical-file-r312.md`.
 - **Bounded DC health probe (2026-08-11):** Dom0 SSH hangs fail closed; BigBoy passed 1/1: `evidence/WL-ARCH-009-2026-08-11-dc-health-dom0-timeout-r233.md`.
@@ -633,8 +626,8 @@ behavioral evidence is not completion.
      - Acceptance: bounded redacted snapshots converge without secrets or legacy fallback.
      - Validation: farm chaos/package gates and live captures.
      - Done when: every required failure matrix row has evidence.
-- Scope: Owns registry/contracts, six services, budgets, snapshots, Workers UI, Network Operations, Action Console, route deletion, packaging, and fleet proof. Workload
-  lifecycle, health modal, and provider implementation remain owned elsewhere.
+- Scope: Owns registry/contracts, six services, budgets, snapshots, Workers UI, Network Operations, Action Console, route deletion, packaging, and fleet proof;
+  Workload lifecycle, health modal, and provider implementation remain elsewhere.
 - Relevant files/components: mackesd spawn/worker_role, mesh types, process units/RPM, mde-shell-egui Workers/routes, provider workers, and Network Operations design.
 - Dependencies: ARCH-010, UX-009, UX-011, FUNC-017, CRIT-006, and CRIT-007.
 - Acceptance criteria:
@@ -1860,9 +1853,7 @@ behavioral evidence is not completion.
 - Required outcome: one egui-native Clock surface provides World Clock, Alarms, Timers, and Stopwatch with AOSP DeskClock-derived procedures under Quazar styling. The
   visible clock opens Clock, a dedicated bell opens Notification Center, mackesd owns persisted scheduling and signed multi-peer execution, and mde-musicd remains the
   only Music/radio/NPR source and playback authority.
-- Current state: Signed contracts, durable scheduling/convergence, governed
-  audio, and Clock/bell chrome exist. Multi-process/UI/package/live proof is
-  explicitly post-release acceptance and non-blocking for the coding drain.
+- Current state: Signed contracts, durable scheduling/convergence, governed audio, and Clock/bell chrome exist; multi-process/UI/package/live proof is post-release acceptance.
 - **Contract/peer checkpoints (2026-08-08):** bounded Clock contracts and delivery/loss/rejoin/replay/global Stop passed `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`, `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
 - **Scheduler/restart checkpoint (2026-08-09):** weekday/DST execution and durable alarm auto-silence/audio stop passed the 7/7 Clock suite:
