@@ -36,6 +36,7 @@
 #   install-helpers/verify-rpm-payload.sh requirements a.rpm      # also inspect a built RPM's actual Requires header
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
 #   install-helpers/verify-rpm-payload.sh candidate-payload # credential payload in base + lighthouse candidates
+#   install-helpers/verify-rpm-payload.sh app-vm-payload [a.rpm] # exact App VM guest bootstrap payload
 #   install-helpers/verify-rpm-payload.sh overlay-claims-package  # WL-CRIT-007 three-variant package/runtime shape
 #   install-helpers/verify-rpm-payload.sh surfaces       # surface-reachability check only
 #   install-helpers/verify-rpm-payload.sh --self-test    # exercise the parser on good+broken fixtures
@@ -143,6 +144,14 @@ readonly BUILT_RPM_KVM_REQUIRES=(
   "qemu-kvm"
   "qemu-ui-dbus"
   "libvirt-daemon-kvm"
+)
+readonly APP_VM_BOOTSTRAP_SOURCE="infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
+readonly APP_VM_BOOTSTRAP_DEST="/usr/share/mde/iac/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
+readonly APP_VM_BOOTSTRAP_MARKERS=(
+  "path: /etc/mackesd/app-vm/guest-profile"
+  "path: /etc/systemd/system/mcnf-app-vm-runtime.service"
+  "ExecStart=/usr/local/libexec/mcnf-app-vm-runtime"
+  "path: /usr/local/libexec/mcnf-app-vm-runtime"
 )
 
 # build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
@@ -307,6 +316,60 @@ check_vdi_host_requires() {
   done
 }
 
+# WL-FUNC-018 — the App VM guest runtime is bootstrapped from one cloud-init
+# template. The generate-rpm manifest deliberately ships the cloud-init
+# directory through a glob, but a generic "destination has at least one file"
+# check cannot detect this particular template disappearing from the source or
+# a built RPM. Pin both the exact member and its runtime/profile/service
+# contract so an otherwise non-empty glob cannot produce a green release gate.
+check_app_vm_payload() {
+  local rpm="${1:-}" source dest marker listing="" covered=0
+  hdr "App VM guest bootstrap — exact release payload"
+
+  if [ ! -f "$REPO_ROOT/$APP_VM_BOOTSTRAP_SOURCE" ]; then
+    fail "app-vm source  $APP_VM_BOOTSTRAP_SOURCE MISSING"
+    return
+  fi
+
+  while IFS=$'\t' read -r source dest; do
+    [ -n "$source" ] || continue
+    if [[ "$APP_VM_BOOTSTRAP_SOURCE" == $source ]]; then
+      case "$dest" in
+        */) [ "${dest}${APP_VM_BOOTSTRAP_SOURCE##*/}" = "$APP_VM_BOOTSTRAP_DEST" ] && covered=1 ;;
+        *)  [ "$dest" = "$APP_VM_BOOTSTRAP_DEST" ] && covered=1 ;;
+      esac
+    fi
+  done < <(parse_assets "$CARGO_TOML")
+  if [ "$covered" -eq 1 ]; then
+    ok "app-vm manifest $APP_VM_BOOTSTRAP_SOURCE -> $APP_VM_BOOTSTRAP_DEST"
+  else
+    fail "app-vm manifest $APP_VM_BOOTSTRAP_SOURCE is not covered at its canonical destination"
+  fi
+
+  for marker in "${APP_VM_BOOTSTRAP_MARKERS[@]}"; do
+    if grep -Fq -- "$marker" "$REPO_ROOT/$APP_VM_BOOTSTRAP_SOURCE"; then
+      ok "app-vm contract $marker"
+    else
+      fail "app-vm contract MISSING from $APP_VM_BOOTSTRAP_SOURCE: $marker"
+    fi
+  done
+
+  [ -n "$rpm" ] || return
+  if [ -z "${MCNF_FAKE_RPM_LIST:-}" ] && [ ! -f "$rpm" ]; then
+    fail "app-vm RPM not found: $rpm"
+    return
+  fi
+  if ! listing="$(rpm_file_list "$rpm")"; then
+    fail "app-vm could not read file list from $rpm"
+    return
+  fi
+  if grep -Fxq "$APP_VM_BOOTSTRAP_DEST" <<<"$listing"; then
+    ok "app-vm payload  $APP_VM_BOOTSTRAP_DEST present in rpm -qlp"
+  else
+    fail "app-vm payload  $APP_VM_BOOTSTRAP_DEST MISSING from the RPM payload"
+  fi
+}
+
 # Read the actual RPM Requires header (or the self-test fixture). Production
 # validation intentionally uses the exact query form required by the gate.
 rpm_requires_header() {
@@ -430,6 +493,7 @@ check_payload_dryrun() {
   done
 
   check_vdi_host_requires
+  check_app_vm_payload
   check_grouped_mackesd_assets
   check_candidate_credential_assets
 }
@@ -539,6 +603,7 @@ check_payload_rpm() {
 
   if [ "$shape" = "base" ]; then
     check_built_rpm_vdi_host_requires "$rpm"
+    check_app_vm_payload "$rpm"
   else
     info "actual-requires KVM host check applies to the base RPM (shape is $shape)"
   fi
@@ -860,6 +925,7 @@ assets = [
     { source = "target/release/mde-shell-egui", dest = "/usr/bin/mde-shell-egui", mode = "755" },
     { source = "target/release/mackesd",        dest = "/usr/bin/mackesd",        mode = "755" },
     { source = "packaging/x.service",           dest = "/usr/lib/systemd/system/x.service", mode = "644" },
+    { source = "infra/tofu/cloud/cloud-init/*", dest = "/usr/share/mde/iac/infra/tofu/cloud/cloud-init/", mode = "644" },
 ]
 [package.metadata.generate-rpm.requires]
 libvirt = "*"
@@ -874,10 +940,10 @@ assets = [
 TOML
   local n
   n="$(parse_assets "$good" | wc -l | tr -d ' ')"
-  if [ "$n" -eq 3 ]; then
-    ok "self-test: parser reads exactly the 3 MAIN assets (ignores the server variant)"
+  if [ "$n" -eq 4 ]; then
+    ok "self-test: parser reads exactly the 4 MAIN assets (ignores the server variant)"
   else
-    fail "self-test: expected 3 main assets, got $n"; st_fail=1
+    fail "self-test: expected 4 main assets, got $n"; st_fail=1
   fi
   if parse_assets "$good" | grep -q "^target/release/mde-shell-egui"$'\t'"/usr/bin/mde-shell-egui$"; then
     ok "self-test: parser captures source<TAB>dest correctly"
@@ -963,6 +1029,7 @@ REQUIRES
 /usr/bin/mde-shell-egui
 /usr/bin/mackesd
 /usr/lib/systemd/system/x.service
+/usr/share/mde/iac/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl
 LISTING
   printf '%s\n' 'qemu-kvm' >"$bad_rpm_requires"
   out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_LIST="$fake_rpm_list" \
@@ -973,6 +1040,18 @@ LISTING
     ok "self-test: real-RPM payload mode enforces the actual Requires header"
   else
     fail "self-test: real-RPM payload mode skipped the actual Requires header"; st_fail=1
+  fi
+
+  # A non-empty cloud-init destination is not enough: the exact App VM guest
+  # bootstrap member must survive both manifest selection and rpm -qlp.
+  local app_vm_missing_list="$tmp/app-vm-missing-list"
+  grep -Fvx "$APP_VM_BOOTSTRAP_DEST" "$fake_rpm_list" >"$app_vm_missing_list"
+  out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_LIST="$app_vm_missing_list" \
+      bash "$0" app-vm-payload "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "$APP_VM_BOOTSTRAP_DEST MISSING" <<<"$out"; then
+    ok "self-test: non-empty cloud-init payload cannot hide a missing App VM bootstrap"
+  else
+    fail "self-test: missing App VM bootstrap escaped exact RPM verification"; st_fail=1
   fi
 
   # ---- fixture B: a SYNTHETICALLY-BROKEN manifest ---------------------------
@@ -1103,6 +1182,7 @@ main() {
     overlay-claims-package) check_overlay_claims_package ;;
     grouped-process) check_grouped_mackesd_assets ;;
     candidate-payload) check_candidate_credential_assets ;;
+    app-vm-payload) shift; check_app_vm_payload "${1:-}" ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")
