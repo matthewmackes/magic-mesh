@@ -24,6 +24,7 @@ const SYSTEM_BUS_ROOT: &str = mde_bus::SYSTEM_BUS_ROOT;
 const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TRUST_BYTES: u64 = 256;
 const MAX_ROWS_PER_POLL: usize = 32;
+const MAX_CACHE_TEMP_ATTEMPTS: usize = 32;
 const CACHE_SCHEMA: u16 = 1;
 
 const SIGNER_ID_ENV: &str = "MDE_ANDROID_CATALOG_SIGNER_ID";
@@ -225,12 +226,7 @@ impl AndroidCatalogWorker {
         // advancing the replacement generation's cursor in memory.
         let mut staged = state.clone();
         self.activate_bus(persist, &mut staged, identity, now_ms)?;
-        self.process_once(
-            persist,
-            &mut staged.cursor,
-            &mut staged.current,
-            now_ms,
-        )?;
+        self.process_once(persist, &mut staged.cursor, &mut staged.current, now_ms)?;
         verify_bus_identity(persist, bus_root, identity)?;
         *state = staged;
         Ok(())
@@ -470,15 +466,7 @@ fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()
             "admitted Android catalog exceeds persistence bound",
         ));
     }
-    let temp = parent.join(format!(".android-catalog-{}.tmp", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(0o400_000); // Linux O_NOFOLLOW
-    }
-    let mut file = options.open(&temp)?;
+    let (temp, mut file) = create_cache_temp(parent)?;
     let result = (|| {
         file.write_all(&body)?;
         file.sync_all()?;
@@ -489,6 +477,40 @@ fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Open a private staging file without trusting or replacing debris left by a
+/// killed importer. PID reuse made the former single staging name a permanent
+/// denial of catalog updates after an unclean exit. A bounded suffix search
+/// keeps that failure recoverable while preserving create-new/no-follow safety.
+fn create_cache_temp(parent: &Path) -> io::Result<(PathBuf, File)> {
+    let mut collision = None;
+    for attempt in 0..MAX_CACHE_TEMP_ATTEMPTS {
+        let path = parent.join(format!(
+            ".android-catalog-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(0o400_000); // Linux O_NOFOLLOW
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                collision = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "Android catalog cache staging slots are exhausted: {}",
+        collision
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no staging slot available".into())
+    )))
 }
 
 /// Refuse an existing symlink or non-directory anywhere in the cache parent
@@ -859,6 +881,32 @@ mod tests {
                 .len(),
             1,
             "retry publishes exactly once"
+        );
+    }
+
+    #[test]
+    fn stale_cache_staging_file_cannot_wedge_signed_catalog_updates() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let path = &worker.config.as_ref().unwrap().state_file;
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        let stale = parent.join(format!(".android-catalog-{}-0.tmp", std::process::id()));
+        fs::write(&stale, b"incomplete catalog from killed importer").unwrap();
+
+        let catalog = signed_catalog(&key, 7);
+        store_last_good(path, &catalog).unwrap();
+
+        assert_eq!(
+            load_last_good(worker.config.as_ref().unwrap(), NOW).unwrap(),
+            Some(catalog),
+            "stale staging debris must not prevent corrected-forward catalog authority"
+        );
+        assert_eq!(
+            fs::read(stale).unwrap(),
+            b"incomplete catalog from killed importer",
+            "the importer must neither trust nor overwrite stale staging content"
         );
     }
 
