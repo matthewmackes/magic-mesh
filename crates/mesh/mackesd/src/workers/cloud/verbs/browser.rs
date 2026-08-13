@@ -17,6 +17,7 @@ use super::super::CloudWorker;
 use super::CloudActionBody;
 
 const BROWSER_VM_WORKLOAD_NAME: &str = "browser-vm";
+const BROWSER_VM_VCPU: u16 = 3;
 
 /// Handle one `action/cloud/browser-provision` request.
 pub(super) fn handle(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -> CloudReply {
@@ -40,6 +41,10 @@ pub(super) fn browser_spec(node: &str, _name: &str, image_digest: &str) -> Workl
     // caller mint an alternate workload identity that can never be selected by
     // the runtime controller (or shadow the canonical desired-state file).
     let mut spec = BrowserVmProfile::default().workload_spec(node, BROWSER_VM_WORKLOAD_NAME);
+    // The Browser VM runs on four-thread Dell seats. Reserving one host thread
+    // keeps the shell, VDI transport, and libvirt control path responsive; a
+    // default profile must never consume the seat's complete CPU capacity.
+    spec.vcpu = BROWSER_VM_VCPU;
     spec.image_digest = Some(image_digest.to_owned());
     spec
 }
@@ -185,7 +190,11 @@ mod tests {
         assert_eq!(spec.delivery_type, DeliveryType::DesktopVm);
         assert_eq!(spec.node, "eagle");
         assert_eq!(spec.name, BROWSER_VM_WORKLOAD_NAME);
-        assert_eq!(spec.vcpu, 4);
+        assert_eq!(spec.vcpu, BROWSER_VM_VCPU);
+        assert!(
+            spec.vcpu < 4,
+            "the Browser guest must leave one Dell host thread free"
+        );
         assert_eq!(spec.memory_mb, 8192);
         assert_eq!(spec.disk_gb, 64);
         assert_eq!(spec.image.as_deref(), Some("browser-vm-chromium"));
