@@ -59,7 +59,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::{Style, TypographyRole};
@@ -80,6 +80,11 @@ const STATE_PREFIX: &str = "state/storage/";
 /// Poll cadence — a `UDisks2` change signal on any peer surfaces within this window.
 /// Matches the other Bus surfaces; the read is a cheap local `SQLite` scan.
 const REFRESH: Duration = Duration::from_secs(5);
+/// A storage mirror older than three worker heartbeats is retained for
+/// orientation but cannot authorize staging or apply. The worker publishes
+/// every 30 seconds; the extra heartbeat tolerates scheduler and replication
+/// jitter without presenting abandoned topology as live indefinitely.
+const MIRROR_STALE_AFTER: Duration = Duration::from_secs(90);
 
 /// A filled-circle status glyph — the shared dot the other planes render.
 const DOT: &str = "\u{25CF}";
@@ -732,6 +737,16 @@ impl NodeStorage {
     const fn available(&self) -> bool {
         matches!(self.backend, BackendStatus::Available)
     }
+
+    /// Whether this mirror is too old to authorize storage mutations. `None`
+    /// means the projection has not completed a live Bus read yet (used by pure
+    /// render fixtures); production calls always supply the read's wall clock.
+    fn stale_at(&self, observed_at_ms: Option<u64>) -> bool {
+        observed_at_ms.is_some_and(|now| {
+            now.saturating_sub(self.published_at_ms)
+                > u64::try_from(MIRROR_STALE_AFTER.as_millis()).unwrap_or(u64::MAX)
+        })
+    }
 }
 
 /// Fold raw `state/storage/*` bodies into a sorted-by-host per-node view.
@@ -1100,6 +1115,9 @@ pub(crate) struct StorageState {
     view_geometry: bool,
     /// When the Bus was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
+    /// Wall-clock time of the last successful Bus projection. Kept separate
+    /// from `last_poll`: a failed open must not make retained topology fresh.
+    observed_at_ms: Option<u64>,
 }
 
 impl Default for StorageState {
@@ -1119,6 +1137,7 @@ impl Default for StorageState {
             view_rail: false,
             view_geometry: false,
             last_poll: None,
+            observed_at_ms: None,
         }
     }
 }
@@ -1146,6 +1165,9 @@ impl StorageState {
     /// matching this module's existing pre-poll-is-honestly-empty posture.
     pub(crate) fn local_summary(&self) -> Option<(usize, u64)> {
         let node = self.nodes.iter().find(|n| n.host == self.local_host)?;
+        if node.stale_at(self.observed_at_ms) || !node.available() {
+            return None;
+        }
         let disks = node.topology.devices.len();
         let free_mib: u64 = node
             .topology
@@ -1176,6 +1198,10 @@ impl StorageState {
             bodies.extend(read_bodies(&persist, t));
         }
         self.nodes = project(&bodies);
+        self.observed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
         self.ensure_selection();
         if let Some(node) = self.selected_node.clone() {
             let lane = read_bodies(&persist, &progress_topic(&node));
@@ -1224,9 +1250,17 @@ impl StorageState {
         self.nodes.iter().find(|n| &n.host == node)
     }
 
-    /// The selected node's disks (empty when none / unavailable).
+    /// Whether the selected mirror has lost freshness authority.
+    fn selected_is_stale(&self) -> bool {
+        self.selected()
+            .is_some_and(|node| node.stale_at(self.observed_at_ms))
+    }
+
+    /// The selected node's mutation-authorizing disks. A stale or unavailable
+    /// mirror deliberately yields none so every menu staging seam fails closed.
     fn selected_devices(&self) -> Vec<BlockDevice> {
         self.selected()
+            .filter(|n| n.available() && !n.stale_at(self.observed_at_ms))
             .map(|n| n.topology.devices.clone())
             .unwrap_or_default()
     }
@@ -1261,6 +1295,9 @@ impl StorageState {
     /// the Edit → Apply All Operations gate delegates to the same pure decision
     /// the inline Apply button uses ([`armed_apply_request`], §6 one path).
     fn armed_apply(&self) -> Option<StorageRequest> {
+        if self.selected_is_stale() {
+            return None;
+        }
         let node = self.selected()?;
         armed_apply_request(node, &self.queue, &self.arming)
     }
@@ -1339,7 +1376,13 @@ impl StorageState {
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_XS);
-        let devices = self.selected_devices();
+        // The rail is also an orientation surface: keep stale disks visible,
+        // while disabling their target-selection controls below.
+        let devices = self
+            .selected()
+            .map(|node| node.topology.devices.clone())
+            .unwrap_or_default();
+        let stale = self.selected_is_stale();
         if devices.is_empty() {
             mde_egui::muted_note(ui, "No disks on this peer.");
             return;
@@ -1358,7 +1401,7 @@ impl StorageState {
             // A locked disk stays visible for orientation but can't become the
             // staging target here — the same advisory wall the inline tap keeps.
             if ui
-                .add_enabled(!locked, egui::SelectableLabel::new(is_sel, text))
+                .add_enabled(!locked && !stale, egui::SelectableLabel::new(is_sel, text))
                 .clicked()
             {
                 pick = Some(dev.name.clone());
@@ -1394,6 +1437,11 @@ impl StorageState {
         let peers = self.nodes.len();
         let disks: usize = self.nodes.iter().map(|n| n.topology.devices.len()).sum();
         let unavailable = self.nodes.iter().filter(|n| !n.available()).count();
+        let stale = self
+            .nodes
+            .iter()
+            .filter(|n| n.available() && n.stale_at(self.observed_at_ms))
+            .count();
         ui.horizontal(|ui| {
             mde_egui::field(
                 ui,
@@ -1409,15 +1457,28 @@ impl StorageState {
                         .size(Style::SMALL),
                 );
             }
+            if stale > 0 {
+                ui.add_space(Style::SP_S);
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!("{stale} stale mirror(s)")).size(Style::SMALL),
+                );
+            }
         });
     }
 
     /// The peer picker — one selectable per node that has published storage.
     fn show_peer_picker(&mut self, ui: &mut egui::Ui) {
-        let hosts: Vec<(String, bool)> = self
+        let hosts: Vec<(String, bool, bool)> = self
             .nodes
             .iter()
-            .map(|n| (n.host.clone(), n.available()))
+            .map(|n| {
+                (
+                    n.host.clone(),
+                    n.available(),
+                    n.stale_at(self.observed_at_ms),
+                )
+            })
             .collect();
         let selected = self.selected_node.clone();
         ui.horizontal_wrapped(|ui| {
@@ -1427,17 +1488,22 @@ impl StorageState {
                     .size(Style::SMALL),
             );
             ui.add_space(Style::SP_S);
-            for (host, available) in hosts {
+            for (host, available, stale) in hosts {
                 let is_sel = selected.as_deref() == Some(host.as_str());
                 let label = if host == self.local_host {
                     format!("{host} (this node)")
                 } else {
                     host.clone()
                 };
-                let tone = if available { Style::OK } else { Style::WARN };
+                let tone = if available && !stale {
+                    Style::OK
+                } else {
+                    Style::WARN
+                };
+                let state = if stale { " · stale" } else { "" };
                 let resp = ui.selectable_label(
                     is_sel,
-                    RichText::new(format!("{DOT} {label}"))
+                    RichText::new(format!("{DOT} {label}{state}"))
                         .color(tone)
                         .size(Style::SMALL),
                 );
@@ -1477,6 +1543,8 @@ impl StorageState {
             return;
         }
 
+        let stale = node.stale_at(self.observed_at_ms);
+
         let devices = &node.topology.devices;
         if devices.is_empty() {
             mde_egui::muted_note(
@@ -1513,7 +1581,8 @@ impl StorageState {
             // select_device seam the View rail + menu drive).
             ui.add_space(Style::SP_XS);
             let is_sel = self.selected_device.as_deref() == Some(dev.name.as_str());
-            if dev.protected_reason().is_none()
+            if !stale
+                && dev.protected_reason().is_none()
                 && ui
                     .selectable_label(
                         is_sel,
@@ -1528,6 +1597,33 @@ impl StorageState {
         }
         if let Some(name) = pick {
             self.select_device(&name);
+        }
+
+        if stale {
+            // A queue assembled from an earlier generation cannot survive loss
+            // of mirror freshness. Keep the topology visible for diagnosis,
+            // but remove every local mutation affordance until Refresh yields a
+            // current worker publication.
+            self.queue.clear();
+            self.arming.clear();
+            self.compose.reset();
+            self.compose_error = None;
+            ui.separator();
+            ui.add_space(Style::SP_S);
+            mde_egui::card().show(ui, |ui| {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new("Storage topology is stale").strong(),
+                );
+                ui.add_space(Style::SP_XS);
+                mde_egui::muted_note(
+                    ui,
+                    "The last worker mirror is older than three publish heartbeats. Its disks \
+                     remain visible for orientation, but staging and Apply are disabled until a \
+                     fresh topology arrives.",
+                );
+            });
+            return;
         }
 
         ui.separator();
@@ -2354,6 +2450,47 @@ fn state_body(host: &str, at: u64, available: bool) -> String {
           ]}}
         ]}},"published_at_ms":{at}}}"#
     )
+}
+
+#[cfg(test)]
+mod stale_mirror_tests {
+    use super::*;
+
+    #[test]
+    fn stale_available_mirror_loses_storage_mutation_authority() {
+        let published_at_ms = 1_000;
+        let stale_after_ms = u64::try_from(MIRROR_STALE_AFTER.as_millis()).unwrap();
+        let mut state = StorageState {
+            nodes: project(&[state_body("this-node", published_at_ms, true)]),
+            local_host: "this-node".to_string(),
+            ..StorageState::default()
+        };
+        state.ensure_selection();
+        assert!(
+            !state.selected_devices().is_empty(),
+            "a projection without a live read remains deterministic for render fixtures"
+        );
+
+        state.observed_at_ms = Some(published_at_ms + stale_after_ms + 1);
+        state.queue.push(StorageOp::DeletePartition {
+            partition: "/dev/sdb1".to_string(),
+        });
+        state.arming = "/dev/sdb".to_string();
+
+        assert!(state.selected_is_stale());
+        assert!(
+            state.selected_devices().is_empty(),
+            "stale topology must not feed any menu staging seam"
+        );
+        assert!(
+            state.armed_apply().is_none(),
+            "typed arming cannot revive a stale topology"
+        );
+        assert!(
+            state.local_summary().is_none(),
+            "the Start Menu must not project stale capacity as live"
+        );
+    }
 }
 
 #[cfg(test)]
