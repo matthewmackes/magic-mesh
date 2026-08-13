@@ -24,6 +24,8 @@ pub mod aircraft;
 pub mod android_apps;
 /// WL-FUNC-020 — bounded Cuttlefish Android VM provider/lifecycle contracts.
 pub mod android_provider;
+/// WL-FUNC-020 — shared host/guest Cuttlefish relay wire protocol.
+pub mod cuttlefish_guest;
 /// WL-FUNC-018 — versioned, signed-provenance Flatpak catalog records for App VMs.
 pub mod app_catalog;
 /// WL-FUNC-012 / OVERLAY-5 — Caltrans CWWP2 camera snapshots shared by the

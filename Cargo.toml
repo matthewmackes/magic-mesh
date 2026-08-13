@@ -19,6 +19,7 @@ exclude = [
     "vendor/ironrdp-session",
 ]
 members = [
+    "crates/guest/mcnf-cuttlefish-guest",
     "crates/guest/mde-wayland-workspace",
     "crates/platform/mde-bus",
     "crates/platform/mde-role",

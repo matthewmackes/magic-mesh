@@ -1,0 +1,29 @@
+[package]
+name = "mcnf-cuttlefish-guest"
+description = "Authenticated Cuttlefish readiness relay and VDI guest agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "mcnf-cuttlefish-readiness-relay"
+path = "src/bin/mcnf-cuttlefish-readiness-relay.rs"
+
+[[bin]]
+name = "mcnf-cuttlefish-vdi-agent"
+path = "src/bin/mcnf-cuttlefish-vdi-agent.rs"
+
+[dependencies]
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+serde_json.workspace = true
+rustix = { version = "0.38", features = ["process", "net"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

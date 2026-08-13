@@ -16,57 +16,18 @@ use mackes_mesh_types::android_apps::{
     AndroidImagePackageManifest,
 };
 use mackes_mesh_types::android_provider::{AndroidVdiSource, CuttlefishVmTarget};
-use serde::{Deserialize, Serialize};
+use mackes_mesh_types::cuttlefish_guest::{
+    CuttlefishGuestOperation as GuestOperation, CuttlefishGuestRequest as GuestRequest,
+    CuttlefishGuestResponse as GuestResponse,
+    CUTTLEFISH_GUEST_MAX_FRAME_BYTES as MAX_GUEST_FRAME_BYTES,
+    CUTTLEFISH_GUEST_PROTOCOL_SCHEMA_VERSION as GUEST_PROTOCOL_SCHEMA_VERSION,
+};
 
 use super::cuttlefish::CuttlefishProviderError;
 
-const GUEST_PROTOCOL_SCHEMA_VERSION: u16 = 1;
-const MAX_GUEST_FRAME_BYTES: usize = 256 * 1024;
 const GUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_GUEST_SOCKET_ROOT: &str = "/run/mackesd/cuttlefish-guest";
 const GUEST_SOCKET_ROOT_ENV: &str = "MDE_CUTTLEFISH_GUEST_SOCKET_DIR";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "op",
-    content = "payload",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-enum GuestOperation {
-    Observe,
-    Launch(AndroidGuestLaunchRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GuestRequest {
-    schema_version: u16,
-    request_id: String,
-    target: CuttlefishVmTarget,
-    catalog_digest: String,
-    package_manifest: AndroidImagePackageManifest,
-    generation: u64,
-    operation: GuestOperation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GuestResponse {
-    schema_version: u16,
-    request_id: String,
-    target: CuttlefishVmTarget,
-    catalog_digest: String,
-    generation: u64,
-    #[serde(default)]
-    inventory: Option<AndroidAppInventory>,
-    #[serde(default)]
-    launch_outcome: Option<AndroidGuestLaunchOutcome>,
-    #[serde(default)]
-    vdi_source: Option<AndroidVdiSource>,
-    #[serde(default)]
-    cleanup_complete: bool,
-}
 
 /// Exact guest evidence returned from an observe operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +77,9 @@ impl UnixCuttlefishGuestTransport {
     }
 
     fn exchange(&self, request: GuestRequest) -> Result<GuestResponse, CuttlefishProviderError> {
-        validate_request(&request)?;
+        request
+            .validate()
+            .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
         let socket = socket_path(&self.socket_root, request.target.vm_id.as_str())?;
         let mut stream = UnixStream::connect(&socket)
             .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
@@ -171,15 +134,15 @@ impl UnixCuttlefishGuestTransport {
         generation: u64,
         operation: GuestOperation,
     ) -> GuestRequest {
-        GuestRequest {
-            schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
-            request_id: request_id.to_owned(),
-            target: target.clone(),
-            catalog_digest: catalog_digest.to_owned(),
-            package_manifest: package_manifest.clone(),
+        GuestRequest::new(
+            request_id,
+            target.clone(),
+            catalog_digest,
+            package_manifest.clone(),
             generation,
             operation,
-        }
+        )
+        .expect("validated provider inputs must form a guest request")
     }
 }
 
@@ -272,65 +235,14 @@ impl CuttlefishGuestTransport for UnixCuttlefishGuestTransport {
     }
 }
 
-fn validate_request(request: &GuestRequest) -> Result<(), CuttlefishProviderError> {
-    if request.schema_version != GUEST_PROTOCOL_SCHEMA_VERSION || request.generation == 0 {
-        return Err(CuttlefishProviderError::ProviderRejected);
-    }
-    request
-        .target
-        .validate()
-        .map_err(CuttlefishProviderError::Contract)?;
-    request
-        .package_manifest
-        .validate()
-        .map_err(CuttlefishProviderError::InventoryContract)?;
-    if request.package_manifest.image_provenance.image_id
-        != request.target.image_provenance.image_id
-        || request.package_manifest.image_provenance.image_digest
-            != request.target.image_provenance.image_digest
-        || request.package_manifest.image_provenance.source_revision
-            != request.target.image_provenance.source_revision
-        || request.package_manifest.image_provenance.catalog_revision
-            != request.target.image_provenance.catalog_revision
-        || !valid_digest(&request.catalog_digest)
-        || request.request_id.is_empty()
-        || request.request_id.len() > 128
-    {
-        return Err(CuttlefishProviderError::ProviderRejected);
-    }
-    if let GuestOperation::Launch(launch) = &request.operation {
-        launch
-            .validate()
-            .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
-        if launch.workload_id != request.target.vm_id.as_str() {
-            return Err(CuttlefishProviderError::InvalidWorkloadIdentity);
-        }
-        let package = request
-            .package_manifest
-            .packages
-            .iter()
-            .find(|package| package.app == launch.app)
-            .ok_or(CuttlefishProviderError::ProviderRejected)?;
-        if package.package_id != launch.intent.package_id {
-            return Err(CuttlefishProviderError::ProviderRejected);
-        }
-    }
-    Ok(())
-}
-
 fn validate_response(
     request: &GuestRequest,
     response: GuestResponse,
     observation_not_before_unix_ms: u64,
 ) -> Result<GuestResponse, CuttlefishProviderError> {
-    if response.schema_version != GUEST_PROTOCOL_SCHEMA_VERSION
-        || response.request_id != request.request_id
-        || response.target != request.target
-        || response.catalog_digest != request.catalog_digest
-        || response.generation != request.generation
-    {
-        return Err(CuttlefishProviderError::ProviderRejected);
-    }
+    response
+        .validate_for(request)
+        .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
     match &request.operation {
         GuestOperation::Observe => {
             let inventory = response
@@ -392,15 +304,6 @@ fn socket_path(root: &Path, workload_id: &str) -> Result<PathBuf, CuttlefishProv
         return Err(CuttlefishProviderError::InvalidWorkloadIdentity);
     }
     Ok(root.join(format!("{workload_id}.sock")))
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 71
-        && value.starts_with("sha256:")
-        && value[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        && value[7..].bytes().any(|byte| byte != b'0')
 }
 
 fn now_unix_ms() -> u64 {
@@ -595,10 +498,7 @@ mod tests {
             ),
         };
         hostile.target.image_provenance.catalog_revision = "drifted".to_owned();
-        assert_eq!(
-            validate_request(&hostile),
-            Err(CuttlefishProviderError::ProviderRejected)
-        );
+        assert!(hostile.validate().is_err());
     }
 
     #[test]
@@ -642,8 +542,7 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("guest connection");
             let request = read_request(&mut stream);
             let mut stale_inventory = ready_inventory();
-            stale_inventory.observed_at_unix_ms =
-                Some(now_unix_ms().saturating_sub(60_000).max(1));
+            stale_inventory.observed_at_unix_ms = Some(now_unix_ms().saturating_sub(60_000).max(1));
             stale_inventory.observation_age_ms = Some(0);
             write_response(
                 &mut stream,
