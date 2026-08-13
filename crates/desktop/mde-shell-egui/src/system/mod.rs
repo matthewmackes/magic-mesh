@@ -4818,8 +4818,8 @@ fn probe_section<T>(
 /// native DRM effects are published from [`SystemState::apply_mouse_touch`]; the
 /// touchpad tap policy also mirrors the `mackesd` setting key for compositor seats.
 fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
-    ui.columns(2, |columns| {
-        column_card(&mut columns[0], "Pointer", |ui| {
+    let pointer = |ui: &mut egui::Ui, config: &mut MouseTouchConfig| {
+        column_card(ui, "Pointer", |ui| {
             let mut speed = config.pointer_speed_percent;
             if ui
                 .add(
@@ -4853,8 +4853,9 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
                     });
             });
         });
-
-        column_card(&mut columns[1], "Scroll & Click", |ui| {
+    };
+    let scroll_click = |ui: &mut egui::Ui, config: &mut MouseTouchConfig| {
+        column_card(ui, "Scroll & Click", |ui| {
             let mut natural_scroll = config.natural_scroll;
             if ui
                 .checkbox(
@@ -4890,11 +4891,22 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
                 config.double_click_ms = double_click.clamp(150, 900) as u16;
             }
         });
-    });
+    };
+
+    if fit_columns(ui.available_width(), 2) == 2 {
+        ui.columns(2, |columns| {
+            pointer(&mut columns[0], config);
+            scroll_click(&mut columns[1], config);
+        });
+    } else {
+        pointer(ui, config);
+        ui.add_space(Style::SP_S);
+        scroll_click(ui, config);
+    }
 
     ui.add_space(Style::SP_M);
-    ui.columns(2, |columns| {
-        column_card(&mut columns[0], "Touchpad", |ui| {
+    let touchpad = |ui: &mut egui::Ui, config: &mut MouseTouchConfig| {
+        column_card(ui, "Touchpad", |ui| {
             let mut tap_to_click = config.touchpad_tap_to_click;
             if ui
                 .checkbox(
@@ -4917,8 +4929,9 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
                 config.two_finger_scroll = two_finger_scroll;
             }
         });
-
-        column_card(&mut columns[1], "Touch & Surface", |ui| {
+    };
+    let touch_surface = |ui: &mut egui::Ui, config: &mut MouseTouchConfig| {
+        column_card(ui, "Touch & Surface", |ui| {
             let mut touchscreen_enabled = config.touchscreen_enabled;
             if ui
                 .checkbox(
@@ -4952,7 +4965,18 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
                 config.long_press_secondary = long_press_secondary;
             }
         });
-    });
+    };
+
+    if fit_columns(ui.available_width(), 2) == 2 {
+        ui.columns(2, |columns| {
+            touchpad(&mut columns[0], config);
+            touch_surface(&mut columns[1], config);
+        });
+    } else {
+        touchpad(ui, config);
+        ui.add_space(Style::SP_S);
+        touch_surface(ui, config);
+    }
 
     ui.add_space(Style::SP_S);
     muted_note(
@@ -5052,6 +5076,18 @@ fn bounded_mixer_volume(value: i32) -> u8 {
         100
     } else {
         value as u8
+    }
+}
+
+#[cfg(test)]
+mod responsive_system_layout_tests {
+    use super::{fit_columns, TILE_MIN_W};
+
+    #[test]
+    fn mouse_touch_cards_collapse_before_either_column_is_crushed() {
+        assert_eq!(fit_columns(TILE_MIN_W * 2.0 - 1.0, 2), 1);
+        assert_eq!(fit_columns(TILE_MIN_W * 2.0, 2), 2);
+        assert_eq!(fit_columns(f32::INFINITY, 2), 2);
     }
 }
 
