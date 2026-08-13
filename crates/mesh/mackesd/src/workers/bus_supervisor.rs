@@ -4,10 +4,9 @@
 //! supervisor itself is a regular mackesd worker; the per-task
 //! restart policy (set in `crates/mackesd/src/bin/mackesd.rs` when
 //! the worker is spawned) governs back-off + circuit-breaker
-//! semantics. This worker is the inner restart loop — it relaunches
-//! `mde-bus` immediately when the child returns 0, and propagates a
-//! non-zero exit as a `worker error` so the outer supervisor can
-//! back off.
+//! semantics. This worker is the inner restart loop and keeps every
+//! retry wait interruptible so group shutdown is never pinned behind
+//! its child-restart cadence.
 //!
 //! v6.x epic locks (see `docs/design/v6.x-mackes-bus.md`):
 //! - Every peer runs its own broker (Round 2 — gossip-synced). The
@@ -47,6 +46,16 @@ const RESPAWN_COOLDOWN: Duration = Duration::from_secs(1);
 /// to a slow poll instead of tight-respawning — preventing the duplicate-daemon
 /// zombie pile.
 const EXIT_ALREADY_RUNNING: i32 = 3;
+
+/// Wait for the next spawn attempt while retaining ownership of the shutdown
+/// edge. Returning `false` means the process group requested shutdown and the
+/// caller must leave without another child activation.
+async fn wait_for_retry(shutdown: &mut ShutdownToken, delay: Duration) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => true,
+        () = shutdown.wait() => false,
+    }
+}
 
 /// Async worker that supervises the `mde-bus` subprocess.
 pub struct BusSupervisor {
@@ -176,7 +185,9 @@ impl Worker for BusSupervisor {
                             } else {
                                 RESPAWN_COOLDOWN
                             };
-                            tokio::time::sleep(cooldown).await;
+                            if !wait_for_retry(&mut shutdown, cooldown).await {
+                                return Ok(());
+                            }
                         }
                         () = shutdown.wait() => {
                             info!("shutdown requested; killing mde-bus child");
@@ -192,11 +203,8 @@ impl Worker for BusSupervisor {
                     // No child running (binary missing). Poll on a
                     // slow tick so a freshly-installed RPM is picked
                     // up without a daemon restart.
-                    tokio::select! {
-                        () = tokio::time::sleep(Duration::from_secs(30)) => {}
-                        () = shutdown.wait() => {
-                            return Ok(());
-                        }
+                    if !wait_for_retry(&mut shutdown, Duration::from_secs(30)).await {
+                        return Ok(());
                     }
                 }
             }
@@ -233,5 +241,19 @@ mod tests {
             let w = BusSupervisor::new();
             assert!(w.resolve_binary().is_none());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn singleton_owner_backoff_is_interrupted_by_group_shutdown() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = ShutdownToken::from_receiver(shutdown_rx);
+
+        let retry = tokio::spawn(async move {
+            wait_for_retry(&mut shutdown, Duration::from_secs(30)).await
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("publish group shutdown");
+
+        assert!(!retry.await.expect("retry wait joins"));
     }
 }
