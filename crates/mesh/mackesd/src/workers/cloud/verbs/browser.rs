@@ -102,9 +102,17 @@ fn validate_image_digest(digest: &str) -> Result<(), String> {
     let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
         "`browser-provision` image_digest must use the sha256:<64-hex> form".to_string()
     })?;
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    // Keep the persisted identity canonical.  SHA-256 hex is conventionally
+    // lower-case; accepting upper-case here would let equivalent bytes produce
+    // different desired-state documents and bypass exact replay comparisons.
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte <= b'f')
+    {
         return Err(
-            "`browser-provision` image_digest must use the sha256:<64-hex> form".to_string(),
+            "`browser-provision` image_digest must use the canonical sha256:<64-lowercase-hex> form"
+                .to_string(),
         );
     }
     Ok(())
@@ -221,6 +229,20 @@ mod tests {
             assert!(!reply.ok);
             assert!(reply.desired.is_none());
         }
+        assert!(!tmp.path().join("mcnf").exists());
+    }
+
+    #[test]
+    fn browser_provision_rejects_noncanonical_uppercase_digest_before_writing() {
+        let tmp = tempdir().unwrap();
+        let mut request = body("eagle", Some(BROWSER_VM_WORKLOAD_NAME));
+        request.image_digest = Some(DIGEST.replace('a', "A"));
+
+        let reply = build_reply(tmp.path(), "browser-provision", &request);
+
+        assert!(!reply.ok);
+        assert!(reply.error.is_some());
+        assert!(reply.desired.is_none());
         assert!(!tmp.path().join("mcnf").exists());
     }
 
