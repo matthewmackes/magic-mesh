@@ -6,8 +6,12 @@ PipeWire/WirePlumber, libinput, and the image-owned runtime are installed in a
 dedicated `browser-vm-chromium` image. The image verifier is a static contents
 gate; it does not claim that a VM has booted or that a VDI endpoint is live.
 
-Build a signed/recorded ext4-rootfs disk artifact on the build farm with the Fedora-44
-`magic-mesh-lighthouse` guest RPM, publish it into the promoted mesh image
+Build a signed/recorded ext4-rootfs disk artifact on the build farm with exactly
+one Fedora-44 `magic-mesh-lighthouse` guest RPM passed through `--rpm`. The
+builder refuses the mutable repository-latest lane, hashes the selected regular
+non-symlink RPM before the container build, re-attests those exact bytes before
+`dnf` installation, and records the digest in both the OCI label and immutable
+guest metadata. Publish the resulting disk into the promoted mesh image
 catalog, then use its `browser-vm-chromium:VERSION` reference with
 `request-browser-vm-workload`. The helper sends exactly one typed
 `StartAndAttach` request to `action/workload/operation`; WorkloadCompute owns
@@ -82,9 +86,10 @@ The guest control plane is deliberately the thin `magic-mesh-lighthouse`
 package. It supplies `mackesd`, `meshctl`, Nebula join helpers, and guest
 systemd units while avoiding the workstation `magic-mesh` RPM's host
 multimedia/Samba ABI closure. The image never installs `magic-mesh-browser` or
-the full workstation package. The local `--rpm` lane accepts only a
-`magic-mesh-lighthouse-*.rpm` and installs it through `dnf`, so dependency
-resolution remains enforced; `rpm --nodeps` is not a supported image path.
+the full workstation package. The mandatory `--rpm` lane accepts exactly one
+package whose RPM name is `magic-mesh-lighthouse` and installs it through
+`dnf`, so dependency resolution remains enforced; repository-latest resolution
+and `rpm --nodeps` are not supported image paths.
 
 The profile verifier admits only a root-owned regular file: symlinked,
 group/other-writable, and executable profile inputs are rejected before the

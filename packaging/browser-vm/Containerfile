@@ -19,8 +19,8 @@ RUN set -eux; \
 
 FROM ${BROWSER_VM_BASE}
 
-ARG MCNF_RPM_LANE=repo
 ARG BROWSER_VM_SOURCE_COMMIT
+ARG BROWSER_VM_LIGHTHOUSE_RPM_SHA256
 COPY packaging/browser-vm/validate-runtime-inputs.sh /tmp/mcnf-browser-vm-validate
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtime
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service
@@ -58,12 +58,13 @@ RUN set -eux; \
         /usr/lib/systemd/system/browser-vm-guest-audio-probe-controller.service; \
     install -D -m 0644 /tmp/mcnf-browser-vm-managed-policy.json \
         /etc/chromium/policies/managed/mcnf-browser-vm.json; \
-    if [ "${MCNF_RPM_LANE}" = "local" ]; then \
-        guest_rpm="$(find /tmp/mcnf-rpms -maxdepth 1 -type f -name 'magic-mesh-lighthouse-*.rpm' -print -quit)"; \
-        [ -n "$guest_rpm" ] || { echo 'FATAL: local Browser VM lane needs a magic-mesh-lighthouse RPM'; exit 1; }; \
-        [ "$(rpm -qp --qf '%{NAME}' "$guest_rpm")" = magic-mesh-lighthouse ] || { echo 'FATAL: Browser VM accepts only the thin magic-mesh-lighthouse guest package'; exit 1; }; \
-        dnf -y --setopt=install_weak_deps=False install "$guest_rpm"; \
-    else dnf -y --setopt=install_weak_deps=False --exclude=magic-mesh-browser install magic-mesh-lighthouse; fi; \
+    [ "$(find /tmp/mcnf-rpms -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1 ]; \
+    guest_rpm="$(find /tmp/mcnf-rpms -maxdepth 1 -type f -name '*.rpm' -print -quit)"; \
+    [ "$(rpm -qp --qf '%{NAME}' "$guest_rpm")" = magic-mesh-lighthouse ] || { echo 'FATAL: Browser VM accepts only the thin magic-mesh-lighthouse guest package'; exit 1; }; \
+    case "$BROWSER_VM_LIGHTHOUSE_RPM_SHA256" in *[!0-9a-f]*|'') echo 'FATAL: malformed Lighthouse RPM digest'; exit 1 ;; esac; \
+    [ "${#BROWSER_VM_LIGHTHOUSE_RPM_SHA256}" -eq 64 ]; \
+    printf '%s  %s\n' "$BROWSER_VM_LIGHTHOUSE_RPM_SHA256" "$guest_rpm" | sha256sum --check --strict -; \
+    dnf -y --setopt=install_weak_deps=False install "$guest_rpm"; \
     dnf -y --setopt=install_weak_deps=False \
         --exclude=magic-mesh-browser install \
         chromium cloud-init dbus-daemon dbus-tools seatd sway \
@@ -120,6 +121,7 @@ RUN set -eux; \
     install -d -o mcnf-browser -g mcnf-browser -m 0700 /var/lib/mcnf-browser; \
     install -d -m 0755 /usr/share/mcnf/browser-vm; \
     printf '%s\n' "$BROWSER_VM_SOURCE_COMMIT" > /usr/share/mcnf/browser-vm/source-commit; \
+    printf '%s\n' "$BROWSER_VM_LIGHTHOUSE_RPM_SHA256" > /usr/share/mcnf/browser-vm/lighthouse-rpm.sha256; \
     printf '%s\n' \
         '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","control_plane":"magic-mesh-lighthouse","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","audio_probe_control":"rdp-webaudio-hmac-v1","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
         > /usr/share/mcnf/browser-vm/image-contract.json; \

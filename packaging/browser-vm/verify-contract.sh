@@ -36,6 +36,40 @@ fail() {
     exit 1
 }
 
+verify_lighthouse_rpm_handoff() {
+    local containerfile=$1
+    local builder=$2
+    local image_verifier=$3
+
+    grep -Fq 'BROWSER_VM_LIGHTHOUSE_RPM_SHA256' "$builder" || return 1
+    grep -Fq 'org.mcnf.browser-vm.lighthouse-rpm-sha256=' "$builder" || return 1
+    grep -Fq 'requires exactly one immutable magic-mesh-lighthouse RPM' "$builder" || return 1
+    grep -Fq 'sha256sum --check --strict -' "$containerfile" || return 1
+    grep -Fq '/usr/share/mcnf/browser-vm/lighthouse-rpm.sha256' "$containerfile" || return 1
+    grep -Fq 'org.mcnf.browser-vm.lighthouse-rpm-sha256' "$image_verifier" || return 1
+    grep -Fq 'guest Lighthouse RPM provenance matches image label' "$image_verifier" || return 1
+}
+
+if [[ "${1:-}" == --lighthouse-rpm-self-test ]]; then
+    [[ "$#" -eq 1 ]] || fail "--lighthouse-rpm-self-test accepts no additional arguments"
+    verify_lighthouse_rpm_handoff "$BROWSER_VM/Containerfile" "$IMAGE_BUILD" "$IMAGE_VERIFY" \
+        || fail "Browser image does not bind its Lighthouse RPM bytes across build and verification"
+    fixture=$(mktemp)
+    trap 'rm -f "$fixture"' EXIT
+    cp "$BROWSER_VM/Containerfile" "$fixture"
+    sed -i '/sha256sum --check --strict -/d' "$fixture"
+    if verify_lighthouse_rpm_handoff "$fixture" "$IMAGE_BUILD" "$IMAGE_VERIFY"; then
+        fail "accepted a Browser image that installs an unattested Lighthouse RPM"
+    fi
+    missing_rpm_output=$($IMAGE_BUILD 2>&1) && missing_rpm_rc=0 || missing_rpm_rc=$?
+    [[ "$missing_rpm_rc" -eq 2 ]] \
+        || fail "image builder did not reject a missing immutable Lighthouse RPM with status 2"
+    grep -Fq 'FATAL: Browser VM build requires exactly one immutable magic-mesh-lighthouse RPM' <<<"$missing_rpm_output" \
+        || fail "image builder did not reject a missing immutable Lighthouse RPM before build"
+    echo 'Browser VM Lighthouse RPM handoff self-test passed'
+    exit 0
+fi
+
 [ -x "$PROFILE_VERIFY" ] || fail "profile verifier is not executable"
 [ -x "$VALIDATOR" ] || fail "runtime validator is not executable"
 [ -x "$ACTIVATION_VERIFY" ] || fail "activation verifier is not executable"
@@ -88,8 +122,11 @@ verify_runtime_unit() {
     fi
     ! grep -Eq '^[[:space:]]*ExecStart=.*/(sh|bash)[[:space:]]' "$unit"
 }
+
 verify_runtime_unit "$RUNTIME_UNIT" \
     || fail "Browser runtime unit permits an unowned runtime or executable boundary"
+verify_lighthouse_rpm_handoff "$BROWSER_VM/Containerfile" "$IMAGE_BUILD" "$IMAGE_VERIFY" \
+    || fail "Browser image does not bind its Lighthouse RPM bytes across build and verification"
 for runtime_path in "$VALIDATOR" "$RUNTIME" "$MEDIA_PROBE"; do
     grep -Fq '/etc/mcnf-browser-vm' "$runtime_path" \
         || fail "Browser runtime component omits the dedicated readable input root: $runtime_path"
@@ -144,6 +181,14 @@ base_image="$(sed -n 's/^ARG BROWSER_VM_BASE=//p' "$BROWSER_VM/Containerfile")"
 grep -Fq 'verify-image-manifest.py' "$IMAGE_BUILD" || fail "image builder omits the cryptographic artifact manifest"
 grep -Fq 'mcnf-manifest.json' "$IMAGE_BUILD" || fail "image builder omits the stable artifact-manifest sidecar"
 set +e
+missing_rpm_output="$($IMAGE_BUILD 2>&1)"
+missing_rpm_rc=$?
+set -e
+[ "$missing_rpm_rc" -eq 2 ] \
+    || fail "image builder did not reject a missing immutable Lighthouse RPM with status 2"
+grep -Fq 'FATAL: Browser VM build requires exactly one immutable magic-mesh-lighthouse RPM' <<<"$missing_rpm_output" \
+    || fail "image builder did not reject a missing immutable Lighthouse RPM before build"
+set +e
 unsupported_disk_output="$($IMAGE_BUILD --disk anaconda-iso 2>&1)"
 unsupported_disk_rc=$?
 set -e
@@ -167,7 +212,8 @@ grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce th
 "$ACTIVATION_VERIFY" >/dev/null
 
 unit_fixture=$(mktemp)
-trap 'rm -rf "$fixture" "$profile_fixture" "$unit_fixture"' EXIT
+container_fixture=$(mktemp)
+trap 'rm -rf "$fixture" "$profile_fixture" "$unit_fixture" "$container_fixture"' EXIT
 cp "$RUNTIME_UNIT" "$unit_fixture"
 sed -i 's#^Environment=XDG_RUNTIME_DIR=/run/mcnf-browser$#Environment=XDG_RUNTIME_DIR=/run/user/1000#' \
     "$unit_fixture"
@@ -175,6 +221,13 @@ if verify_runtime_unit "$unit_fixture"; then
     fail "accepted a user-directed Browser runtime directory fixture"
 fi
 rm -f "$unit_fixture"
+
+cp "$BROWSER_VM/Containerfile" "$container_fixture"
+sed -i '/sha256sum --check --strict -/d' "$container_fixture"
+if verify_lighthouse_rpm_handoff "$container_fixture" "$IMAGE_BUILD" "$IMAGE_VERIFY"; then
+    fail "accepted a Browser image that installs an unattested Lighthouse RPM"
+fi
+rm -f "$container_fixture"
 
 profile_fixture=$(mktemp)
 trap 'rm -rf "$fixture" "$profile_fixture"' EXIT

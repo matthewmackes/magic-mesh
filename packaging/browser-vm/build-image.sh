@@ -7,7 +7,6 @@ DIR="$REPO/packaging/browser-vm"
 MANIFEST_VERIFY="$DIR/verify-image-manifest.py"
 IMAGE="localhost/magic-mesh-browser-vm-chromium:latest"
 BASE=""
-LANE=repo
 RPMS=()
 DISK=""
 OUT="$DIR/out"
@@ -29,7 +28,7 @@ DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$DIR/profile.env")"
     exit 2
 }
 
-usage() { echo "Usage: $0 [--rpm PATH]... [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
+usage() { echo "Usage: $0 --rpm PATH [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
 
 resolve_image() {
     local ref=$1 label=$2 err rc=0
@@ -44,7 +43,7 @@ resolve_image() {
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --rpm) RPMS+=("${2:?--rpm needs a path}"); LANE=local; shift 2 ;;
+        --rpm) RPMS+=("${2:?--rpm needs a path}"); shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
         --disk) DISK="${2:?--disk needs a type}"; shift 2 ;;
@@ -59,11 +58,31 @@ case "$DISK" in
     *) echo "FATAL: unsupported disk output type: $DISK" >&2; exit 2 ;;
 esac
 
+[ "${#RPMS[@]}" -eq 1 ] || {
+    echo 'FATAL: Browser VM build requires exactly one immutable magic-mesh-lighthouse RPM' >&2
+    exit 2
+}
+guest_rpm=${RPMS[0]}
+if [ ! -f "$guest_rpm" ] || [ -L "$guest_rpm" ]; then
+    echo 'FATAL: Browser VM Lighthouse RPM must be a regular non-symlink file' >&2
+    exit 2
+fi
+command -v rpm >/dev/null 2>&1 || { echo 'FATAL: rpm is required' >&2; exit 2; }
+[ "$(rpm -qp --qf '%{NAME}' -- "$guest_rpm")" = magic-mesh-lighthouse ] || {
+    echo 'FATAL: Browser VM accepts only the thin magic-mesh-lighthouse guest package' >&2
+    exit 2
+}
+guest_rpm_sha256=$(sha256sum -- "$guest_rpm" | awk '{print $1}')
+[[ "$guest_rpm_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo 'FATAL: Browser VM Lighthouse RPM digest is malformed' >&2
+    exit 2
+}
+
 command -v podman >/dev/null 2>&1 || { echo 'FATAL: podman is required' >&2; exit 2; }
 [ -f "$DIR/Containerfile" ] || { echo 'FATAL: Browser VM Containerfile is missing' >&2; exit 2; }
 mkdir -p "$DIR/rpms"
 find "$DIR/rpms" -maxdepth 1 -type f -name '*.rpm' -delete
-for rpm in "${RPMS[@]}"; do cp "$rpm" "$DIR/rpms/"; done
+cp -- "$guest_rpm" "$DIR/rpms/"
 
 effective_base="${BASE:-$(sed -n 's/^ARG BROWSER_VM_BASE=//p' "$DIR/Containerfile" | head -n1)}"
 resolve_image "$effective_base" 'Browser VM base image'
@@ -74,11 +93,12 @@ if [[ ! "$base_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
 fi
 [[ "$base_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || { echo 'FATAL: base image has no immutable digest' >&2; exit 2; }
 
-args=(--build-arg "MCNF_RPM_LANE=$LANE" --build-arg "BROWSER_VM_SOURCE_COMMIT=$SOURCE_COMMIT")
+args=(--build-arg "BROWSER_VM_SOURCE_COMMIT=$SOURCE_COMMIT" --build-arg "BROWSER_VM_LIGHTHOUSE_RPM_SHA256=$guest_rpm_sha256")
 [ -n "$BASE" ] && args+=(--build-arg "BROWSER_VM_BASE=$BASE")
 podman build "${args[@]}" \
     --label 'org.mcnf.browser-vm.profile=browser-vm-chromium-v1' \
     --label "org.mcnf.browser-vm.source-commit=$SOURCE_COMMIT" \
+    --label "org.mcnf.browser-vm.lighthouse-rpm-sha256=$guest_rpm_sha256" \
     --label "org.mcnf.browser-vm.base-image-id=$base_id" \
     -t "$IMAGE" --ignorefile "$DIR/context.containerignore" -f "$DIR/Containerfile" "$REPO"
 

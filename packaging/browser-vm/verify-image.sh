@@ -34,23 +34,28 @@ profile="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.brows
 [[ "$profile" == browser-vm-chromium-v1 ]] || { echo 'FATAL: immutable Browser VM profile label missing' >&2; exit 1; }
 profile_source_commit="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$ROOT/packaging/browser-vm/profile.env")"
 image_source_commit="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.source-commit"}}' "$TAG")"
+lighthouse_rpm_sha256="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.lighthouse-rpm-sha256"}}' "$TAG")"
 [[ "$profile_source_commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'FATAL: profile source commit is malformed' >&2; exit 1; }
 [[ "$image_source_commit" == "$profile_source_commit" ]] || {
     echo "FATAL: image source commit label does not match profile ($image_source_commit != $profile_source_commit)" >&2
     exit 1
 }
+[[ "$lighthouse_rpm_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo 'FATAL: immutable Lighthouse RPM digest label missing' >&2; exit 1; }
 
 # shellcheck disable=SC2016 # Expanded by Bash inside the image, not by this shell.
 inner='set -u
 fail=0
 ok(){ echo "  OK   $1"; }
 bad(){ echo "  FAIL $1"; fail=1; }
-for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-verify-session-input /usr/local/libexec/mcnf-browser-vm-media-probe /usr/local/libexec/mcnf-sway /usr/local/lib64/libmcnf-x11-present-copy.so /usr/libexec/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json /usr/share/mcnf/browser-vm/source-commit /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; do
+for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-verify-session-input /usr/local/libexec/mcnf-browser-vm-media-probe /usr/local/libexec/mcnf-sway /usr/local/lib64/libmcnf-x11-present-copy.so /usr/libexec/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json /usr/share/mcnf/browser-vm/source-commit /usr/share/mcnf/browser-vm/lighthouse-rpm.sha256 /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; do
   [ -f "$path" ] && ok "image file present: $path" || bad "image file missing: $path"
 done
 guest_source_commit="$(cat /usr/share/mcnf/browser-vm/source-commit 2>/dev/null || true)"
 expected_source_commit="${MCNF_EXPECTED_SOURCE_COMMIT:-}"
 [ "$guest_source_commit" = "$expected_source_commit" ] && ok "guest runtime provenance matches image label" || bad "guest runtime provenance does not match image label"
+guest_lighthouse_rpm_sha256="$(cat /usr/share/mcnf/browser-vm/lighthouse-rpm.sha256 2>/dev/null || true)"
+expected_lighthouse_rpm_sha256="${MCNF_EXPECTED_LIGHTHOUSE_RPM_SHA256:-}"
+[ "$guest_lighthouse_rpm_sha256" = "$expected_lighthouse_rpm_sha256" ] && ok "guest Lighthouse RPM provenance matches image label" || bad "guest Lighthouse RPM provenance does not match image label"
 chromium_bin="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$chromium_bin" ] && ok "runtime binary present: chromium ($chromium_bin)" || bad "runtime binary missing: chromium"
 for binary in mackesd meshctl nebula sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
@@ -97,7 +102,7 @@ command -v xrdp >/dev/null 2>&1 && ok "RDP endpoint binary present" || bad "RDP 
 command -v vainfo >/dev/null 2>&1 && ok "VA-API diagnostic present" || bad "VA-API diagnostic missing"
 exit "$fail"'
 rc=0
-out="$(printf '%s\n' "$inner" | podman run --rm -i -e "MCNF_EXPECTED_SOURCE_COMMIT=$image_source_commit" "$TAG" /bin/bash -s)" || rc=$?
+out="$(printf '%s\n' "$inner" | podman run --rm -i -e "MCNF_EXPECTED_SOURCE_COMMIT=$image_source_commit" -e "MCNF_EXPECTED_LIGHTHOUSE_RPM_SHA256=$lighthouse_rpm_sha256" "$TAG" /bin/bash -s)" || rc=$?
 printf '%s\n' "$out"
 grep -q '^  OK ' <<<"$out" || rc=1
 grep -q '^  FAIL ' <<<"$out" && rc=1
