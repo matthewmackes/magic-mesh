@@ -60,6 +60,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=install-helpers/rpm-features.sh disable=SC1091
 source "$REPO/install-helpers/rpm-features.sh"
 SOURCE_RECEIPT_HELPER="$REPO/install-helpers/source-revision-receipt.sh"
+RELEASE_INPUT_PREFLIGHT="$REPO/install-helpers/release-input-preflight.sh"
 TOFU_DIR="${MCNF_TOFU_DIR:-$REPO/infra/tofu}"
 # Per-slot remote dir lets concurrent agents share one VM (each its own target/).
 # Base is `magic-mesh-farm` (NOT the bare `magic-mesh`): the build VMs carry a
@@ -676,6 +677,23 @@ case "${1:-}" in
       < <("$SOURCE_RECEIPT_HELPER" --repo "$REPO")
     export MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH
     log "promotable source receipt: $MCNF_BUILD_SOURCE_REVISION (epoch $SOURCE_DATE_EPOCH)"
+    preflight_args=(
+      --source-revision "$MCNF_BUILD_SOURCE_REVISION" --source-epoch "$SOURCE_DATE_EPOCH"
+      --app-vm-catalog-trust-receipt "${MCNF_APP_VM_CATALOG_TRUST_RECEIPT:-}"
+      --app-vm-catalog-trust-key "${MCNF_APP_VM_CATALOG_TRUST_KEY:-}"
+      --cuttlefish-declaration "${MCNF_CUTTLEFISH_DECLARATION:-}"
+      --cuttlefish-signature "${MCNF_CUTTLEFISH_SIGNATURE:-}"
+      --cuttlefish-readiness-relay "${MCNF_CUTTLEFISH_READINESS_RELAY:-}"
+      --cuttlefish-vdi-agent "${MCNF_CUTTLEFISH_VDI_AGENT:-}"
+      --rpm-signing-fingerprint "${MCNF_RPM_SIGNING_FINGERPRINT:-}"
+      --bootc-base-digest "${MCNF_BOOTC_BASE_DIGEST:-}"
+      --app-vm-base-digest "${MCNF_APP_VM_BASE_DIGEST:-}"
+      --cuttlefish-image-digest "${MCNF_CUTTLEFISH_IMAGE_DIGEST:-}"
+    )
+    while IFS= read -r package; do
+      [[ -n "$package" ]] && preflight_args+=(--cuttlefish-guest-package "$package")
+    done <<<"${MCNF_CUTTLEFISH_GUEST_PACKAGES:-}"
+    "$RELEASE_INPUT_PREFLIGHT" "${preflight_args[@]}"
     do_sync_revision "$MCNF_BUILD_SOURCE_REVISION"
     # build-deploy-7 — cargo-generate-rpm is NOT installed per-cut on this path;
     # it is pinned at VM-PROVISIONING time to CGR_VERSION by
