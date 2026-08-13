@@ -1,0 +1,12 @@
+[Unit]
+Description=Magic Mesh Cuttlefish VDI agent readiness
+ConditionFileIsExecutable=/usr/libexec/mcnf-cuttlefish-vdi-agent
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mcnf-cuttlefish-vdi-agent --build-identity
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes

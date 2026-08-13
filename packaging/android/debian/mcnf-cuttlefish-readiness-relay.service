@@ -1,0 +1,24 @@
+[Unit]
+Description=Magic Mesh Cuttlefish readiness relay
+Requires=mcnf-cuttlefish-vdi-agent.service
+After=mcnf-cuttlefish-vdi-agent.service
+ConditionFileIsExecutable=/usr/libexec/mcnf-cuttlefish-readiness-relay
+
+[Service]
+Type=simple
+User=cvd
+Group=cvd
+RuntimeDirectory=mcnf-cuttlefish
+RuntimeDirectoryMode=0700
+EnvironmentFile=/etc/mcnf/cuttlefish-guest.conf
+ExecStart=/usr/libexec/mcnf-cuttlefish-readiness-relay --socket /run/mcnf-cuttlefish/readiness.sock --agent /usr/libexec/mcnf-cuttlefish-vdi-agent --adb /usr/bin/adb --mesh-host ${MCNF_MESH_HOST} --webrtc-port ${MCNF_WEBRTC_PORT} --session-id ${MCNF_SESSION_ID}
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/mcnf-cuttlefish
+
+[Install]
+WantedBy=multi-user.target
