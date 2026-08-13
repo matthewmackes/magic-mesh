@@ -198,15 +198,15 @@ printf '%s\\t0\\t12.1.6\\t%s\\tx86_64\\n8\\t%s\\n' "$name" "$release" "$(printf 
             assert row["sha256"] == "sha256:" + digest(artifact) and row["size"] == artifact.stat().st_size
         assert stat.S_IMODE(output.stat().st_mode) == 0o400
 
-        # The complete chain must reject a cross-role companion even when the
-        # producer itself can describe the supplied immutable path.
+        # The complete chain must reject a companion claimed across roles. The
+        # producer's global inode ownership boundary should stop it before a
+        # collection plan can be published.
         hostile = json.loads(inputs.read_text(encoding="utf-8"))
         hostile["outputs"]["workstation-rpm"]["candidate_manifest"] = str(files["server-rpm-manifest"])
         hostile_input = canonical(root / "cross-role-input.json", hostile)
         hostile_plan = root / "cross-role-plan.json"
-        run([sys.executable, str(PLAN), "--inputs", str(hostile_input), "--output", str(hostile_plan)], env)
-        run([sys.executable, str(COLLECT), "--plan", str(hostile_plan),
-             "--output", str(root / "cross-role-output.json")], env, ok=False)
+        run([sys.executable, str(PLAN), "--inputs", str(hostile_input), "--output", str(hostile_plan)], env, ok=False)
+        assert not hostile_plan.exists()
 
         # Mutation after plan publication must be detected by the repository
         # verifier/digest boundary, not admitted under the original identity.
