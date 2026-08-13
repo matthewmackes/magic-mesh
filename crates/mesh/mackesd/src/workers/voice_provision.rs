@@ -321,6 +321,79 @@ pub struct DesiredNode {
     pub hostname: String,
 }
 
+/// Admit roster identities before any provider or secret-store operation.
+///
+/// The provider username and sealed-credential reference are both derived
+/// identities. Distinct roster rows that collapse onto either value must not
+/// race to own one SIP account or one secret. Reject every member of an
+/// ambiguous group while allowing unrelated nodes to continue reconciling.
+fn admit_desired_nodes(
+    desired: &[DesiredNode],
+    realm: &str,
+) -> (Vec<DesiredNode>, Vec<NodeVoiceState>) {
+    let mut reasons = vec![Vec::<String>::new(); desired.len()];
+    let mut username_owners: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut secret_owners: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for (index, node) in desired.iter().enumerate() {
+        if node.node_id.trim().is_empty()
+            || node.node_id.trim() != node.node_id
+            || node.node_id.chars().any(char::is_control)
+        {
+            reasons[index]
+                .push("node identity is empty, whitespace-bound, or control-bearing".into());
+        }
+        let username = sub_account_username(&node.hostname);
+        if !username.is_empty() {
+            username_owners.entry(username).or_default().push(index);
+        }
+        secret_owners
+            .entry(node_creds_ref(&node.node_id))
+            .or_default()
+            .push(index);
+    }
+
+    for (username, owners) in username_owners {
+        if owners.len() > 1 {
+            for index in owners {
+                reasons[index].push(format!(
+                    "derived SIP username `{username}` is ambiguous across enrolled nodes"
+                ));
+            }
+        }
+    }
+    for (secret_ref, owners) in secret_owners {
+        if owners.len() > 1 {
+            for index in owners {
+                reasons[index].push(format!(
+                    "sealed credential identity `{secret_ref}` is ambiguous across enrolled nodes"
+                ));
+            }
+        }
+    }
+
+    let mut admitted = Vec::with_capacity(desired.len());
+    let mut rejected = Vec::new();
+    for (node, node_reasons) in desired.iter().zip(reasons) {
+        if node_reasons.is_empty() {
+            admitted.push(node.clone());
+        } else {
+            let username = sub_account_username(&node.hostname);
+            rejected.push(error_state(
+                &node.node_id,
+                &node.hostname,
+                &username,
+                realm,
+                format!(
+                    "voice identity admission failed: {}",
+                    node_reasons.join("; ")
+                ),
+            ));
+        }
+    }
+    (admitted, rejected)
+}
+
 /// One idempotent reconcile action (lock 19). The plan is a pure diff of
 /// desired vs actual so it is unit-testable without any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +674,14 @@ pub fn reconcile_once(
     failover: &[DesiredFailover],
     realm: &str,
 ) -> ReconcileOutcome {
+    let (desired, mut rejected_states) = admit_desired_nodes(desired, realm);
+    if desired.is_empty() {
+        return ReconcileOutcome {
+            states: rejected_states,
+            provisioned: 0,
+            dids: Vec::new(),
+        };
+    }
     // Actual side 1: Vitelity's existing sub-accounts. A list failure is
     // fleet-wide (we can't tell what exists) — every node degrades to an
     // honest Error state rather than double-provisioning.
@@ -608,7 +689,7 @@ pub fn reconcile_once(
         Ok(list) => list.into_iter().map(|s| s.username).collect::<HashSet<_>>(),
         Err(e) => {
             let reason = format!("cannot list Vitelity sub-accounts: {e}");
-            let states = desired
+            let mut states = desired
                 .iter()
                 .map(|n| NodeVoiceState {
                     node_id: n.node_id.clone(),
@@ -622,7 +703,8 @@ pub fn reconcile_once(
                     failover: None,
                     updated_at_s: now_epoch_s(),
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            states.append(&mut rejected_states);
             return ReconcileOutcome {
                 states,
                 provisioned: 0,
@@ -637,14 +719,14 @@ pub fn reconcile_once(
         .map(|n| n.node_id.clone())
         .collect();
 
-    let actions = plan_reconcile(desired, &existing, &sealed);
+    let actions = plan_reconcile(&desired, &existing, &sealed);
     let acted: HashSet<&str> = actions.iter().map(VoiceAction::node_id).collect();
 
     let mut provisioned = 0usize;
     // Start from the steady-state view: every node whose sub-account exists +
     // creds are sealed is Unregistered (provisioned; awaiting its own
     // REGISTER, which GW-4 publishes over the top of this topic).
-    let mut states: Vec<NodeVoiceState> = Vec::with_capacity(desired.len());
+    let mut states: Vec<NodeVoiceState> = Vec::with_capacity(desired.len() + rejected_states.len());
 
     // Apply the drift actions first, recording the resulting state per node.
     for action in &actions {
@@ -720,7 +802,7 @@ pub fn reconcile_once(
     }
 
     // The steady-state nodes (no action needed) → Unregistered (provisioned).
-    for node in desired {
+    for node in &desired {
         if acted.contains(node.node_id.as_str()) {
             continue;
         }
@@ -774,6 +856,7 @@ pub fn reconcile_once(
         }
         st.failover = failover_by_node.get(&st.node_id).cloned();
     }
+    states.append(&mut rejected_states);
 
     ReconcileOutcome {
         states,
@@ -2246,6 +2329,42 @@ mod tests {
         assert_eq!(second.states[0].reg_state, RegState::Unregistered);
         // Exactly one sub-account was ever created (idempotent, lock 19).
         assert_eq!(client.list_sub_accounts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_rejects_colliding_voice_identities_before_provider_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        let client = FakeVitelityClient::new("sip.vitelity.net");
+        let desired = vec![
+            // Distinct hostnames collapse onto the same provider account.
+            node("peer:east", "Desk.East"),
+            node("peer:west", "desk-east"),
+            // Distinct roster identities collapse onto one credential key.
+            node("peer/a", "desk-a"),
+            node("peera", "desk-b"),
+            // An unrelated identity must still make progress.
+            node("peer:safe", "desk-safe"),
+        ];
+
+        let outcome = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
+
+        assert_eq!(outcome.provisioned, 1);
+        assert_eq!(client.list_sub_accounts().unwrap().len(), 1);
+        assert_eq!(client.list_sub_accounts().unwrap()[0].username, "desk-safe");
+        assert!(store.get(&node_creds_ref("peer:safe")).unwrap().is_some());
+        for rejected in ["peer:east", "peer:west", "peer/a", "peera"] {
+            let state = outcome
+                .states
+                .iter()
+                .find(|state| state.node_id == rejected)
+                .expect("every ambiguous roster row remains visible");
+            assert!(matches!(
+                &state.reg_state,
+                RegState::Error { reason } if reason.contains("identity admission failed")
+            ));
+            assert!(store.get(&node_creds_ref(rejected)).unwrap().is_none());
+        }
     }
 
     #[test]
