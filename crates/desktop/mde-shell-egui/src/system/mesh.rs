@@ -250,140 +250,6 @@ fn role_description(role: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mesh_summary_is_explicit_before_the_first_snapshot() {
-        let summary = mesh_system_summary(&MeshFacts::default());
-
-        assert_eq!(summary.connectivity, MeshConnectivity::Unavailable);
-        assert_eq!(
-            summary.connectivity_value,
-            "unavailable — no mesh status snapshot"
-        );
-        assert_eq!(summary.role_value, "unknown — no pinned directory role");
-        assert!(summary
-            .accessibility_value()
-            .contains("connectivity is unknown"));
-        assert!(summary
-            .accessibility_value()
-            .contains("no pinned role in the peer directory"));
-    }
-
-    #[test]
-    fn mesh_summary_reports_truthful_connectivity_and_role_states() {
-        let connected = MeshFacts {
-            seen: true,
-            peer_counts: Some((2, 2)),
-            role: Some("workstation".to_owned()),
-            ..MeshFacts::default()
-        };
-        let summary = mesh_system_summary(&connected);
-        assert_eq!(summary.connectivity, MeshConnectivity::Connected);
-        assert_eq!(summary.connectivity_value, "connected — 2/2 peers live");
-        assert_eq!(summary.role_value, "workstation");
-
-        let degraded = MeshFacts {
-            seen: true,
-            peer_counts: Some((1, 2)),
-            ..MeshFacts::default()
-        };
-        let summary = mesh_system_summary(&degraded);
-        assert_eq!(summary.connectivity, MeshConnectivity::Degraded);
-        assert_eq!(summary.connectivity_value, "degraded — 1/2 peers live");
-        assert!(summary.reason.contains("no pinned role"));
-    }
-
-    #[test]
-    fn mesh_summary_keeps_missing_counts_unknown_without_fabricating_zero_zero() {
-        let summary = mesh_system_summary(&MeshFacts {
-            seen: true,
-            ..MeshFacts::default()
-        });
-
-        assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
-        assert_eq!(
-            summary.connectivity_value,
-            "unknown — peer count unavailable"
-        );
-        assert!(!summary.connectivity_value.contains("0/0"));
-        assert!(summary.reason.contains("connectivity is unknown"));
-    }
-
-    #[test]
-    fn mesh_summary_rejects_inconsistent_counts_before_rendering_them() {
-        let summary = mesh_system_summary(&MeshFacts {
-            seen: true,
-            peer_counts: None,
-            ..MeshFacts::default()
-        });
-
-        assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
-        assert!(!summary.connectivity_value.contains("peers live"));
-    }
-
-    #[test]
-    fn remote_proofing_states_name_the_provider_and_capability() {
-        let disabled = RemoteProofingConfig::default().service_plan(&MeshFacts::default());
-        assert_eq!(
-            proofing_service_value(disabled.enabled),
-            "disabled — Sunshine/Moonlight provider policy off"
-        );
-        assert_eq!(
-            proofing_bind_scope_value(&disabled),
-            "unavailable — Sunshine/Moonlight provider is disabled"
-        );
-        assert_eq!(
-            proofing_bind_address_value(&disabled),
-            "unavailable — Sunshine/Moonlight provider is disabled"
-        );
-        assert_eq!(
-            proofing_vnc_value(false),
-            "disabled — VNC rescue/admin provider not selected"
-        );
-        assert_eq!(
-            proofing_remote_input_value(false),
-            "blocked — remote keyboard/mouse capability disabled"
-        );
-        assert_eq!(
-            proofing_indicator_value(false),
-            "off — remote shadowing indicator capability disabled"
-        );
-    }
-
-    #[test]
-    fn remote_proofing_missing_mesh_address_is_not_rendered_as_resolved() {
-        let plan = RemoteProofingConfig {
-            enabled: true,
-            exposure: RemoteProofingExposure::MeshOnly,
-            ..RemoteProofingConfig::default()
-        }
-        .service_plan(&MeshFacts {
-            seen: true,
-            ..MeshFacts::default()
-        });
-
-        assert_eq!(
-            proofing_bind_scope_value(&plan),
-            "Mesh overlay — encrypted mesh capability"
-        );
-        assert_eq!(
-            proofing_bind_address_value(&plan),
-            "unavailable — mesh overlay address is not published"
-        );
-        assert_eq!(
-            proofing_capture_value(plan.sunshine_capture),
-            "DRM/KMS — Sunshine capture capability"
-        );
-        assert_eq!(
-            proofing_encoder_value(plan.sunshine_encoder),
-            "Auto — Sunshine encoder provider selects at runtime"
-        );
-    }
-}
-
 /// The Pairing section (SETTINGS-4) — folds in the pairing responder the surface
 /// already drives while Settings is open ([`SystemState::sync_pairing_agent`], §6).
 /// It surfaces the responder's honest live state — whether an adapter is present for
@@ -998,4 +864,138 @@ pub(super) fn remote_proofing_section(
             ui.colored_label(Style::WARN, RichText::new(*warning).size(Style::SMALL));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_summary_is_explicit_before_the_first_snapshot() {
+        let summary = mesh_system_summary(&MeshFacts::default());
+
+        assert_eq!(summary.connectivity, MeshConnectivity::Unavailable);
+        assert_eq!(
+            summary.connectivity_value,
+            "unavailable — no mesh status snapshot"
+        );
+        assert_eq!(summary.role_value, "unknown — no pinned directory role");
+        assert!(summary
+            .accessibility_value()
+            .contains("connectivity is unknown"));
+        assert!(summary
+            .accessibility_value()
+            .contains("no pinned role in the peer directory"));
+    }
+
+    #[test]
+    fn mesh_summary_reports_truthful_connectivity_and_role_states() {
+        let connected = MeshFacts {
+            seen: true,
+            peer_counts: Some((2, 2)),
+            role: Some("workstation".to_owned()),
+            ..MeshFacts::default()
+        };
+        let summary = mesh_system_summary(&connected);
+        assert_eq!(summary.connectivity, MeshConnectivity::Connected);
+        assert_eq!(summary.connectivity_value, "connected — 2/2 peers live");
+        assert_eq!(summary.role_value, "workstation");
+
+        let degraded = MeshFacts {
+            seen: true,
+            peer_counts: Some((1, 2)),
+            ..MeshFacts::default()
+        };
+        let summary = mesh_system_summary(&degraded);
+        assert_eq!(summary.connectivity, MeshConnectivity::Degraded);
+        assert_eq!(summary.connectivity_value, "degraded — 1/2 peers live");
+        assert!(summary.reason.contains("no pinned role"));
+    }
+
+    #[test]
+    fn mesh_summary_keeps_missing_counts_unknown_without_fabricating_zero_zero() {
+        let summary = mesh_system_summary(&MeshFacts {
+            seen: true,
+            ..MeshFacts::default()
+        });
+
+        assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
+        assert_eq!(
+            summary.connectivity_value,
+            "unknown — peer count unavailable"
+        );
+        assert!(!summary.connectivity_value.contains("0/0"));
+        assert!(summary.reason.contains("connectivity is unknown"));
+    }
+
+    #[test]
+    fn mesh_summary_rejects_inconsistent_counts_before_rendering_them() {
+        let summary = mesh_system_summary(&MeshFacts {
+            seen: true,
+            peer_counts: None,
+            ..MeshFacts::default()
+        });
+
+        assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
+        assert!(!summary.connectivity_value.contains("peers live"));
+    }
+
+    #[test]
+    fn remote_proofing_states_name_the_provider_and_capability() {
+        let disabled = RemoteProofingConfig::default().service_plan(&MeshFacts::default());
+        assert_eq!(
+            proofing_service_value(disabled.enabled),
+            "disabled — Sunshine/Moonlight provider policy off"
+        );
+        assert_eq!(
+            proofing_bind_scope_value(&disabled),
+            "unavailable — Sunshine/Moonlight provider is disabled"
+        );
+        assert_eq!(
+            proofing_bind_address_value(&disabled),
+            "unavailable — Sunshine/Moonlight provider is disabled"
+        );
+        assert_eq!(
+            proofing_vnc_value(false),
+            "disabled — VNC rescue/admin provider not selected"
+        );
+        assert_eq!(
+            proofing_remote_input_value(false),
+            "blocked — remote keyboard/mouse capability disabled"
+        );
+        assert_eq!(
+            proofing_indicator_value(false),
+            "off — remote shadowing indicator capability disabled"
+        );
+    }
+
+    #[test]
+    fn remote_proofing_missing_mesh_address_is_not_rendered_as_resolved() {
+        let plan = RemoteProofingConfig {
+            enabled: true,
+            exposure: RemoteProofingExposure::MeshOnly,
+            ..RemoteProofingConfig::default()
+        }
+        .service_plan(&MeshFacts {
+            seen: true,
+            ..MeshFacts::default()
+        });
+
+        assert_eq!(
+            proofing_bind_scope_value(&plan),
+            "Mesh overlay — encrypted mesh capability"
+        );
+        assert_eq!(
+            proofing_bind_address_value(&plan),
+            "unavailable — mesh overlay address is not published"
+        );
+        assert_eq!(
+            proofing_capture_value(plan.sunshine_capture),
+            "DRM/KMS — Sunshine capture capability"
+        );
+        assert_eq!(
+            proofing_encoder_value(plan.sunshine_encoder),
+            "Auto — Sunshine encoder provider selects at runtime"
+        );
+    }
 }
