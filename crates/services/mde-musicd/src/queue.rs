@@ -10,7 +10,7 @@
 //! is the reachable entry point, and the playback daemon (AIR-2.b) reads
 //! the same file.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub const QUEUE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_QUEUE_ENTRIES: usize = 512;
 /// Maximum UTF-8 bytes in one provider-owned song identity.
 pub const MAX_SONG_ID_BYTES: usize = 256;
+/// Maximum serialized durable queue accepted during restart.
+pub const MAX_QUEUE_FILE_BYTES: u64 = 256 * 1024;
 
 /// An ordered playback queue with a current-track cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,17 +283,53 @@ pub fn queue_path() -> PathBuf {
 /// queue is rebuildable, never a hard error).
 #[must_use]
 pub fn read_from(path: &Path) -> Queue {
-    let Some(text) = std::fs::read_to_string(path).ok() else {
+    let Some(mut file) = std::fs::File::open(path).ok() else {
+        return Queue::default();
+    };
+    let mut bytes = Vec::new();
+    if Read::by_ref(&mut file)
+        .take(MAX_QUEUE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_QUEUE_FILE_BYTES
+    {
+        return Queue::default();
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
         return Queue::default();
     };
     if let Ok(envelope) = serde_json::from_str::<QueueFileV1>(&text) {
         if envelope.schema_version == QUEUE_SCHEMA_VERSION {
-            return envelope.queue;
+            return admit_durable_queue(envelope.queue).unwrap_or_default();
         }
     }
     // Version-zero migration: preserve the old queue and let the next mutation
     // rewrite it using the bounded versioned envelope.
-    serde_json::from_str(&text).unwrap_or_default()
+    serde_json::from_str(text)
+        .ok()
+        .and_then(admit_durable_queue)
+        .unwrap_or_default()
+}
+
+fn admit_durable_queue(queue: Queue) -> Option<Queue> {
+    let cursor_is_valid = if queue.songs.is_empty() {
+        queue.current == 0
+    } else {
+        queue.current < queue.songs.len()
+    };
+    let songs_are_valid = queue.songs.len() <= MAX_QUEUE_ENTRIES
+        && queue
+            .songs
+            .iter()
+            .all(|song| !song.trim().is_empty() && song.len() <= MAX_SONG_ID_BYTES);
+    let source_is_valid = queue.preferred_source.as_ref().is_none_or(|source| {
+        !source.source_id.trim().is_empty()
+            && source.source_id.len() <= MAX_SONG_ID_BYTES
+            && !source.remote_id.trim().is_empty()
+            && source.remote_id.len() <= MAX_SONG_ID_BYTES
+            && queue.current() == Some(source.remote_id.as_str())
+    });
+    (cursor_is_valid && songs_are_valid && source_is_valid).then_some(queue)
 }
 
 /// Write the queue to `path`, creating the parent dir.
@@ -633,5 +671,44 @@ mod tests {
         write_to(&path, &read_from(&path)).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("schema_version"));
+    }
+
+    #[test]
+    fn restart_refuses_unbounded_or_incoherent_durable_queue_authority() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("music-queue.json");
+
+        let hostile = [
+            Queue {
+                songs: vec!["song".into(); MAX_QUEUE_ENTRIES + 1],
+                current: 0,
+                preferred_source: None,
+            },
+            q(&["song"], 8),
+            Queue {
+                songs: vec!["song".into()],
+                current: 0,
+                preferred_source: ContentRef::new(
+                    "provider-a",
+                    "different-song",
+                    crate::domain::ContentKind::Music,
+                ),
+            },
+        ];
+        for queue in hostile {
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&QueueFileV1 {
+                    schema_version: QUEUE_SCHEMA_VERSION,
+                    queue,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_from(&path), Queue::default());
+        }
+
+        std::fs::write(&path, vec![b'x'; MAX_QUEUE_FILE_BYTES as usize + 1]).unwrap();
+        assert_eq!(read_from(&path), Queue::default());
     }
 }
