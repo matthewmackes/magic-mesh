@@ -59,6 +59,8 @@ pathlib.Path(sys.argv[sys.argv.index("--output") + 1]).write_text("plan")
 PY
 cat >"$WORK/collector" <<'PY'
 import json, os, pathlib, sys
+if os.environ.get("TEST_COLLECTOR_REFUSE") == "1":
+    raise SystemExit("hostile signed candidate refused")
 pathlib.Path(sys.argv[sys.argv.index("--output") + 1]).write_text(json.dumps({"source_revision": os.environ["TEST_REV"], "promotion": "forbidden"}))
 PY
 chmod 0755 "$WORK/plan" "$WORK/collector"
@@ -123,6 +125,21 @@ value={"schema_version":1,"kind":"mcnf-release-output-plan-input","source_revisi
 pathlib.Path(sys.argv[1]).write_text(json.dumps(value))
 PY
 chmod 0400 "$WORK/derivative.json" "$WORK/plan-input.json"
+
+# Canonical signed-artifact admission must precede derivative construction.
+# A verifier refusal may not create derivative images or caller-visible output.
+: >"$LOG"
+export TEST_COLLECTOR_REFUSE=1
+if "$DRIVER" resume --source-revision "$REV" --target-fedora 44 --handoff "$WORK/handoff" \
+  --derivative-arguments "$WORK/derivative.json" --plan-input "$WORK/plan-input.json" --output "$WORK/refused" >/dev/null 2>&1; then
+  echo 'hostile signed candidate was accepted' >&2; exit 1
+fi
+unset TEST_COLLECTOR_REFUSE
+[[ $(grep -Ec '^derivatives' "$LOG" || true) -eq 0 ]] \
+  || { echo 'derivative construction ran before signed-artifact admission' >&2; exit 1; }
+[[ ! -e "$WORK/refused" && ! -L "$WORK/refused" ]] \
+  || { echo 'refused signed candidate published partial release output' >&2; exit 1; }
+
 "$DRIVER" resume --source-revision "$REV" --target-fedora 44 --handoff "$WORK/handoff" \
   --derivative-arguments "$WORK/derivative.json" --plan-input "$WORK/plan-input.json" --output "$WORK/resumed"
 python3 - "$WORK/resumed/release-outputs.json" <<'PY'

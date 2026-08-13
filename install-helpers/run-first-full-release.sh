@@ -288,7 +288,10 @@ lighthouse_signed=$(awk -F '\t' '$1 == "lighthouse-rpm" {print $2}' "$signed_pat
   || refuse 'derivative Lighthouse RPM differs from the admitted signed plan candidate'
 staged=$work/resumed
 mkdir -m 0700 "$staged"
-"$DERIVATIVES" --source-revision "$revision" "${derivative_args[@]}" --output "$staged/derivatives"
+# Admit every signed/package/image input through its canonical owning verifier
+# before derivative construction can create an image or other expensive side
+# effect.  Collection is private until the entire phase publishes, so a later
+# derivative failure still leaves no caller-visible partial release.
 python3 "$PLAN" --inputs "$plan_input" --output "$staged/collection-plan.json"
 python3 "$COLLECTOR" --plan "$staged/collection-plan.json" --output "$staged/release-outputs.json"
 python3 - "$staged/release-outputs.json" "$revision" <<'PY' || refuse 'collector emitted a promotable or cross-revision result'
@@ -296,5 +299,6 @@ import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["source_revision"] == sys.argv[2] and value["promotion"] == "forbidden"
 PY
+"$DERIVATIVES" --source-revision "$revision" "${derivative_args[@]}" --output "$staged/derivatives"
 publish_dir "$staged" "$output"
 printf 'first-full-release: PASS: verified seven-role output %s (promotion forbidden)\n' "$output"
