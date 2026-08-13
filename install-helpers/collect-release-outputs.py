@@ -30,6 +30,7 @@ MAX_PLAN = 1024 * 1024
 MAX_ARTIFACT = 256 * 1024**3
 MAX_VERIFIER_OUTPUT = 1024 * 1024
 MAX_MANIFEST = 1024 * 1024
+REPO = Path(__file__).resolve().parent.parent
 
 
 class Refusal(ValueError):
@@ -145,6 +146,36 @@ def verifier_argv(raw: object, artifact: Path, companions: dict[str, Path],
     regular(executable, "owning verifier", 16 * 1024**2)
     if not os.access(executable, os.X_OK):
         refuse("owning verifier is not executable")
+    try:
+        resolved = executable.resolve(strict=True)
+        relative = resolved.relative_to(REPO)
+    except (OSError, ValueError):
+        refuse("owning verifier must come from the pinned source checkout")
+    if ".git" in relative.parts:
+        refuse("owning verifier cannot come from Git metadata")
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(REPO), "rev-parse", "--verify", "HEAD^{commit}"],
+            text=True, capture_output=True, timeout=15, check=False,
+        )
+        tracked = subprocess.run(
+            ["git", "-C", str(REPO), "ls-tree", revision, "--", str(relative)],
+            text=True, capture_output=True, timeout=15, check=False,
+        )
+        unchanged = subprocess.run(
+            ["git", "-C", str(REPO), "diff", "--quiet", revision, "--", str(relative)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        refuse(f"owning verifier source identity could not be checked: {error}")
+    if head.returncode or head.stdout.strip() != revision:
+        refuse("collector checkout does not match the pinned source revision")
+    fields = tracked.stdout.split()
+    if tracked.returncode or len(fields) != 4 or fields[1] != "blob" or not fields[0].endswith("755"):
+        refuse("owning verifier is not an executable tracked source file")
+    if unchanged.returncode != 0:
+        refuse("owning verifier differs from the pinned source revision")
     return result
 
 
