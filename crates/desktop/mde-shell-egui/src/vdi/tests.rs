@@ -786,6 +786,87 @@ fn rdp_guest_image_without_files_ingress_has_an_explicit_typed_refusal() {
     );
 }
 
+#[cfg(feature = "live-vdi")]
+#[test]
+fn rdp_guest_image_offer_binds_exact_bytes_generation_and_permission_mime() {
+    use mackes_mesh_types::vdi_clipboard::{
+        ClipboardEnvelopeV2, VdiClipboardLeaseV2, VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+    };
+    use mde_vdi_rdp::clipboard::RemoteClipboardImageFormat;
+
+    let now_ms = 1_700_000_000_000;
+    let lease = VdiClipboardLeaseV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: "rdp:guest:image".into(),
+        generation: 17,
+        lease_id: "rdp-image-17".into(),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms + 60_000,
+        permitted_mime_offers: vec![super::VDI_GUEST_CF_DIBV5_MIME.into()],
+    };
+    let bytes = [124_u8, 0, 0, 0, 1, 2, 3, 4];
+    let hash = ClipboardEnvelopeV2::content_hash_for(&bytes);
+    let message = super::rdp_guest_image_clipboard_message(
+        &lease,
+        3,
+        RemoteClipboardImageFormat::DibV5,
+        &bytes,
+        hash.clone(),
+        bytes.len() as u64,
+        "files:v2:vdi-guest:0123456789abcdef".into(),
+        now_ms + 1,
+    )
+    .expect("exact governed image offer");
+    assert_eq!(message.generation, 17);
+    assert_eq!(message.lease_id, "rdp-image-17");
+    assert_eq!(message.selected_mime, super::VDI_GUEST_CF_DIBV5_MIME);
+    assert_eq!(message.envelope.content_hash, hash);
+    assert_eq!(message.envelope.byte_count, bytes.len() as u64);
+
+    assert!(super::rdp_guest_image_clipboard_message(
+        &lease,
+        4,
+        RemoteClipboardImageFormat::DibV5,
+        &bytes,
+        ClipboardEnvelopeV2::content_hash_for(b"substituted"),
+        bytes.len() as u64,
+        "files:v2:vdi-guest:fedcba9876543210".into(),
+        now_ms + 2,
+    )
+    .expect_err("hash substitution must fail before publication")
+    .contains("digest/length"));
+
+    let mut stale = lease.clone();
+    stale.expires_at_ms = now_ms + 1;
+    assert!(super::rdp_guest_image_clipboard_message(
+        &stale,
+        5,
+        RemoteClipboardImageFormat::DibV5,
+        &bytes,
+        ClipboardEnvelopeV2::content_hash_for(&bytes),
+        bytes.len() as u64,
+        "files:v2:vdi-guest:0011223344556677".into(),
+        now_ms + 2,
+    )
+    .expect_err("expired permission generation must fail")
+    .contains("refused"));
+
+    let mut denied = lease;
+    denied.permitted_mime_offers = vec!["text/plain".into()];
+    assert!(super::rdp_guest_image_clipboard_message(
+        &denied,
+        6,
+        RemoteClipboardImageFormat::DibV5,
+        &bytes,
+        ClipboardEnvelopeV2::content_hash_for(&bytes),
+        bytes.len() as u64,
+        "files:v2:vdi-guest:8899aabbccddeeff".into(),
+        now_ms + 2,
+    )
+    .expect_err("MIME permission refusal must fail")
+    .contains("refused"));
+}
+
 #[test]
 fn a_connect_request_carries_the_three_display_choices() {
     // The request-construction fold: the picked target + the three choices

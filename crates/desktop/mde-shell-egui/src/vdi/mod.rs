@@ -939,6 +939,8 @@ fn vdi_clipboard_lease(
     let permitted_mime_offers = if protocol.eq_ignore_ascii_case("rdp") {
         vec![
             VDI_GUEST_FILES_MIME.into(),
+            VDI_GUEST_CF_DIB_MIME.into(),
+            VDI_GUEST_CF_DIBV5_MIME.into(),
             "image/png".into(),
             "image/jpeg".into(),
             "text/html;charset=utf-8".into(),
@@ -1155,6 +1157,12 @@ const VDI_GUEST_FILES_INGEST_SOCKET: &str = "vdi-clipboard-guest-files.sock";
 const VDI_GUEST_FILES_PACKET_BYTES: usize = 384 * 1024;
 #[cfg(feature = "live-vdi")]
 const VDI_GUEST_FILES_MIME: &str = "application/x-mde-file-list";
+#[cfg(feature = "live-vdi")]
+const VDI_GUEST_CF_DIB_MIME: &str = "application/x-rdp-cf-dib";
+#[cfg(feature = "live-vdi")]
+const VDI_GUEST_CF_DIBV5_MIME: &str = "application/x-rdp-cf-dibv5";
+#[cfg(feature = "live-vdi")]
+const VDI_GUEST_IMAGE_CHUNK_BYTES: usize = 192 * 1024;
 
 #[cfg(feature = "live-vdi")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1240,6 +1248,34 @@ impl RdpGuestFilesTransfer {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("RDP guest file descriptor refused: {error:?}"))?;
+        Self::begin(root, lease, files)
+    }
+
+    fn from_image(
+        root: &Path,
+        lease: &VdiClipboardLeaseV2,
+        image: &RemoteClipboardImage,
+    ) -> Result<Self, String> {
+        let (name, mime) = match image.format() {
+            RemoteClipboardImageFormat::Dib => ("clipboard.cf_dib", VDI_GUEST_CF_DIB_MIME),
+            RemoteClipboardImageFormat::DibV5 => ("clipboard.cf_dibv5", VDI_GUEST_CF_DIBV5_MIME),
+        };
+        let descriptor = VdiClipboardFileDescriptorV1::new(
+            name,
+            None,
+            mime,
+            u64::try_from(image.data().len())
+                .map_err(|_| "RDP guest image size does not fit Files".to_owned())?,
+        )
+        .map_err(|error| format!("RDP guest image descriptor refused: {error:?}"))?;
+        Self::begin(root, lease, vec![descriptor])
+    }
+
+    fn begin(
+        root: &Path,
+        lease: &VdiClipboardLeaseV2,
+        files: Vec<VdiClipboardFileDescriptorV1>,
+    ) -> Result<Self, String> {
         let total_bytes = files.iter().try_fold(0_u64, |total, file| {
             total
                 .checked_add(file.byte_count)
@@ -1273,6 +1309,59 @@ impl RdpGuestFilesTransfer {
             }
             _ => Err("Files authority returned an invalid begin acknowledgement".into()),
         }
+    }
+
+    fn stage_image(
+        &mut self,
+        root: &Path,
+        image: &RemoteClipboardImage,
+    ) -> Result<(String, u64, String), String> {
+        use base64::Engine as _;
+
+        let mut staged = None;
+        for (index, data) in image.data().chunks(VDI_GUEST_IMAGE_CHUNK_BYTES).enumerate() {
+            let offset = index
+                .checked_mul(VDI_GUEST_IMAGE_CHUNK_BYTES)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| "RDP guest image chunk offset overflow".to_owned())?;
+            let complete = offset.saturating_add(data.len() as u64) == self.total_bytes;
+            let response = rdp_guest_files_authority_request(
+                root,
+                &RdpGuestFilesRequest::Chunk {
+                    transaction_id: self.transaction_id.clone(),
+                    file_index: 0,
+                    offset,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+                    complete,
+                },
+            )?;
+            match response {
+                RdpGuestFilesResponse::Ready {
+                    transaction_id,
+                    next_file_index: 0,
+                    next_offset,
+                } if transaction_id == self.transaction_id
+                    && !complete
+                    && next_offset == offset.saturating_add(data.len() as u64) => {}
+                RdpGuestFilesResponse::Staged {
+                    transaction_id,
+                    content_hash,
+                    byte_count,
+                    files_reference,
+                } if transaction_id == self.transaction_id
+                    && complete
+                    && byte_count == self.total_bytes =>
+                {
+                    staged = Some((content_hash, byte_count, files_reference));
+                }
+                RdpGuestFilesResponse::Refused { reason, .. } => {
+                    return Err(format!("Files authority refused RDP guest image: {reason}"));
+                }
+                _ => return Err("Files authority returned an invalid image acknowledgement".into()),
+            }
+        }
+        self.next_file_index = self.files.len();
+        staged.ok_or_else(|| "Files authority did not stage the complete RDP guest image".into())
     }
 
     fn stage_chunk(
@@ -1441,9 +1530,62 @@ fn rdp_guest_files_clipboard_message(
     Ok(message)
 }
 
-/// Typed, non-fatal refusal for a validated guest image that cannot yet enter
-/// Files. Raw DIB bytes are deliberately absent: the transport value is dropped
-/// unless a daemon-owned descriptor-ingest authority can mint its CAS identity.
+#[cfg(feature = "live-vdi")]
+fn rdp_guest_image_clipboard_message(
+    lease: &VdiClipboardLeaseV2,
+    message_sequence: u64,
+    format: RemoteClipboardImageFormat,
+    admitted_bytes: &[u8],
+    content_hash: String,
+    byte_count: u64,
+    files_reference: String,
+    now_ms: u64,
+) -> Result<VdiClipboardMessageV2, String> {
+    let selected_mime = match format {
+        RemoteClipboardImageFormat::Dib => VDI_GUEST_CF_DIB_MIME,
+        RemoteClipboardImageFormat::DibV5 => VDI_GUEST_CF_DIBV5_MIME,
+    };
+    if byte_count != admitted_bytes.len() as u64
+        || content_hash != ClipboardEnvelopeV2::content_hash_for(admitted_bytes)
+    {
+        return Err("RDP guest image Files digest/length did not bind admitted bytes".into());
+    }
+    let envelope = ClipboardEnvelopeV2::new_files(
+        "vdi-guest",
+        "rdp",
+        lease.session_id.clone(),
+        message_sequence,
+        now_ms,
+        vec![selected_mime.into()],
+        match format {
+            RemoteClipboardImageFormat::Dib => "RDP guest CF_DIB image",
+            RemoteClipboardImageFormat::DibV5 => "RDP guest CF_DIBV5 image",
+        },
+        content_hash,
+        byte_count,
+        files_reference,
+        now_ms.saturating_add(60_000).min(lease.expires_at_ms),
+    )
+    .map_err(|error| format!("RDP guest image envelope refused: {error}"))?;
+    let message = VdiClipboardMessageV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: lease.session_id.clone(),
+        generation: lease.generation,
+        lease_id: lease.lease_id.clone(),
+        lease_expires_at_ms: lease.expires_at_ms,
+        message_sequence,
+        selected_mime: selected_mime.into(),
+        disclosure: VdiClipboardDisclosureV2::Shareable,
+        envelope,
+    };
+    message
+        .admit(lease, None, now_ms)
+        .map_err(|error| format!("RDP guest image message refused: {error}"))?;
+    Ok(message)
+}
+
+/// Typed, non-fatal refusal for a validated guest image that Files could not
+/// stage under the current clipboard authority.
 #[cfg(feature = "live-vdi")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RdpGuestImageRefusal {
@@ -1481,9 +1623,8 @@ impl core::fmt::Display for RdpGuestImageRefusal {
     }
 }
 
-/// Fail closed until the daemon exposes an inverse of its descriptor-only
-/// Files materializer. This consumes the admitted transport value, retains only
-/// bounded metadata, and never fabricates a Files reference or writes a path.
+/// Fail closed when the root Files ingress is unavailable. This consumes the
+/// admitted transport value and never fabricates a Files reference.
 #[cfg(feature = "live-vdi")]
 fn refuse_rdp_guest_image_without_files_ingress(
     image: RemoteClipboardImage,
@@ -2598,8 +2739,49 @@ fn run_live_rdp(
                     }
                 }
             } else if let Some(image) = conn.take_guest_image_clipboard() {
-                let refusal = refuse_rdp_guest_image_without_files_ingress(image);
-                let _ = event_tx.send(LiveRdpEvent::ClipboardRefused(refusal));
+                match clipboard_root.as_deref() {
+                    Some(root) => {
+                        match RdpGuestFilesTransfer::from_image(root, &clipboard_lease, &image) {
+                            Ok(mut transfer) => match transfer.stage_image(root, &image) {
+                                Ok((content_hash, byte_count, files_reference)) => {
+                                    guest_message_sequence =
+                                        guest_message_sequence.saturating_add(1);
+                                    match rdp_guest_image_clipboard_message(
+                                        &clipboard_lease,
+                                        guest_message_sequence,
+                                        image.format(),
+                                        image.data(),
+                                        content_hash,
+                                        byte_count,
+                                        files_reference,
+                                        now_ms,
+                                    ) {
+                                        Ok(message) => {
+                                            transfer.staged_message = Some(message);
+                                            guest_files_transfer = Some(transfer);
+                                        }
+                                        Err(error) => {
+                                            transfer.cancel(root);
+                                            let _ = event_tx.send(LiveRdpEvent::Error(error));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    transfer.cancel(root);
+                                    let _ = event_tx.send(LiveRdpEvent::Error(error));
+                                }
+                            },
+                            Err(_) => {
+                                let refusal = refuse_rdp_guest_image_without_files_ingress(image);
+                                let _ = event_tx.send(LiveRdpEvent::ClipboardRefused(refusal));
+                            }
+                        }
+                    }
+                    None => {
+                        let refusal = refuse_rdp_guest_image_without_files_ingress(image);
+                        let _ = event_tx.send(LiveRdpEvent::ClipboardRefused(refusal));
+                    }
+                }
             }
         }
     }
