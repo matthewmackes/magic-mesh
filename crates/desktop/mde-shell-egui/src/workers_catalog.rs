@@ -96,11 +96,6 @@ pub(crate) fn catalog() -> Vec<CatalogEntry> {
             label: "Provisioning",
             destination: WorkersDestination::Provisioning,
         },
-        CatalogEntry {
-            id: "workers/this-node",
-            label: "This Node",
-            destination: WorkersDestination::ThisNode,
-        },
     ];
     entries.extend(page_index().iter().map(|page| CatalogEntry {
         id: page.route,
@@ -112,7 +107,11 @@ pub(crate) fn catalog() -> Vec<CatalogEntry> {
 }
 
 pub(crate) fn default_destination() -> WorkersDestination {
-    WorkersDestination::ThisNode
+    WorkersDestination::ThisNodePage(
+        *page_index()
+            .first()
+            .expect("the governed This Node catalog must have an overview page"),
+    )
 }
 
 pub(crate) fn plane(destination: WorkersDestination) -> Option<Plane> {
@@ -135,7 +134,10 @@ mod tests {
         let entries = catalog();
         assert!(!entries.is_empty());
         assert_eq!(entries[0].label, "Accessibility");
-        assert_eq!(default_destination(), WorkersDestination::ThisNode);
+        assert_eq!(
+            default_destination(),
+            WorkersDestination::ThisNodePage(page_index()[0])
+        );
         let ids: HashSet<_> = entries.iter().map(|entry| entry.id).collect();
         let labels: HashSet<_> = entries.iter().map(|entry| entry.label).collect();
         assert_eq!(ids.len(), entries.len());
@@ -146,6 +148,13 @@ mod tests {
         }));
         assert!(entries
             .iter()
-            .any(|entry| entry.destination == WorkersDestination::ThisNode));
+            .all(|entry| entry.destination != WorkersDestination::ThisNode));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(entry.destination, WorkersDestination::ThisNodePage(_)))
+                .count(),
+            page_index().len()
+        );
     }
 }
