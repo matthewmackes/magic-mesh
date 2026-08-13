@@ -233,29 +233,6 @@ impl ClockAudioAuthority {
             .take()
             .expect("active alert was inspected above");
         effects.stop_alert();
-        if let Some(volume) = active.saved_music_volume.take() {
-            effects.set_music_volume(volume);
-        }
-
-        if let Err(reason) = effects.restore_seat_streams() {
-            let status = self.status(
-                &active.request,
-                now_ms,
-                ClockAudioPlaybackPhase::ProviderUnavailable,
-                ClockAudioProviderStatus::Unavailable,
-                active.fallback_tone_id.clone(),
-                None,
-                Some(reason),
-            );
-            if let Some(record) = self
-                .ledger
-                .iter_mut()
-                .find(|record| record.request.request_id == active.request.request_id)
-            {
-                record.status = status.clone();
-            }
-            return Some(status);
-        }
 
         let fallback_tone_id = active
             .fallback_tone_id
@@ -271,6 +248,14 @@ impl ClockAudioAuthority {
                 Some(fallback_tone_id),
             ),
         };
+        let restore_error = if phase == ClockAudioPlaybackPhase::ProviderUnavailable {
+            if let Some(volume) = active.saved_music_volume.take() {
+                effects.set_music_volume(volume);
+            }
+            effects.restore_seat_streams().err()
+        } else {
+            None
+        };
         let status = self.status(
             &active.request,
             now_ms,
@@ -278,7 +263,7 @@ impl ClockAudioAuthority {
             ClockAudioProviderStatus::Unavailable,
             fallback_tone_id.clone(),
             None,
-            Some("music_audible_deadline_exceeded"),
+            Some(restore_error.unwrap_or("music_audible_deadline_exceeded")),
         );
         if let Some(record) = self
             .ledger
@@ -589,10 +574,7 @@ impl ClockAudioAuthority {
             },
         };
 
-        if matches!(
-            phase,
-            ClockAudioPlaybackPhase::PlayingFallback | ClockAudioPlaybackPhase::ProviderUnavailable
-        ) {
+        if phase == ClockAudioPlaybackPhase::ProviderUnavailable {
             if let Some(volume) = saved_music_volume {
                 effects.set_music_volume(volume);
             }
@@ -628,7 +610,9 @@ impl ClockAudioAuthority {
                 fallback_tone_id: active_fallback_tone_id,
                 saved_music_volume: if matches!(
                     phase,
-                    ClockAudioPlaybackPhase::PlayingBundled | ClockAudioPlaybackPhase::PlayingMusic
+                    ClockAudioPlaybackPhase::PlayingBundled
+                        | ClockAudioPlaybackPhase::PlayingMusic
+                        | ClockAudioPlaybackPhase::PlayingFallback
                 ) {
                     saved_music_volume
                 } else {
@@ -1175,6 +1159,22 @@ mod tests {
         );
         assert_eq!(fallback.fallback_tone_id.as_deref(), Some("bell"));
         assert_eq!(effects.starts, ["tone:bell"]);
+        assert_eq!(effects.music_volume, Some(0.15));
+        assert_eq!(effects.seat_levels, [0.13, 0.3]);
+        assert_eq!(effects.seat_writes, [vec![0.13, 0.3]]);
+        let stopped = authority.apply(
+            request(
+                "fallback-stop",
+                1,
+                ClockAudioActionV1::Stop {
+                    acknowledgement_id: "fallback-ack".into(),
+                },
+            ),
+            NOW + 1,
+            &mut effects,
+        );
+        assert_eq!(stopped.phase, ClockAudioPlaybackPhase::Stopped);
+        assert_eq!(effects.music_volume, Some(0.6));
         assert_eq!(effects.seat_levels, [0.52, 1.2]);
         assert_eq!(effects.seat_writes, [vec![0.13, 0.3], vec![0.52, 1.2]]);
 
@@ -1322,8 +1322,8 @@ mod tests {
         assert_eq!(fallback.fallback_tone_id.as_deref(), Some("bell"));
         assert_eq!(effects.starts, ["music:track-1", "tone:bell"]);
         assert_eq!(effects.stops, 1);
-        assert_eq!(effects.music_volume, Some(0.84));
-        assert_eq!(effects.volume_writes, [0.21, 0.84]);
+        assert_eq!(effects.music_volume, Some(0.21));
+        assert_eq!(effects.volume_writes, [0.21]);
         assert_eq!(effects.queue_generation, 41);
         assert_eq!(effects.history_generation, 17);
         assert_eq!(effects.bookmark_generation, 23);
@@ -1337,6 +1337,21 @@ mod tests {
         assert!(authority
             .poll_music_start(NOW + MUSIC_AUDIBLE_DEADLINE_MS + 1, &mut effects)
             .is_none());
+
+        let stopped = authority.apply(
+            request(
+                "deadline-stop",
+                7,
+                ClockAudioActionV1::Stop {
+                    acknowledgement_id: "deadline-ack".into(),
+                },
+            ),
+            NOW + MUSIC_AUDIBLE_DEADLINE_MS + 2,
+            &mut effects,
+        );
+        assert_eq!(stopped.phase, ClockAudioPlaybackPhase::Stopped);
+        assert_eq!(effects.music_volume, Some(0.84));
+        assert_eq!(effects.volume_writes, [0.21, 0.84]);
     }
 
     #[test]
@@ -1378,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_music_reference_failures_fall_back_immediately_and_restore_gain() {
+    fn typed_music_reference_failures_keep_ducking_until_fallback_stops() {
         for reason in [
             "invalid_music_reference",
             "catalog_reference_missing",
@@ -1396,9 +1411,23 @@ mod tests {
             let status = authority.apply(music_start(reason, 1), NOW, &mut effects);
             assert_eq!(status.phase, ClockAudioPlaybackPhase::PlayingFallback);
             assert_eq!(status.reason_code.as_deref(), Some(reason));
+            assert_eq!(effects.music_volume, Some(0.16));
+            assert_eq!(effects.volume_writes, [0.16]);
+            assert_eq!(effects.starts, ["tone:bell"]);
+            let stopped = authority.apply(
+                request(
+                    &format!("{reason}-stop"),
+                    1,
+                    ClockAudioActionV1::Stop {
+                        acknowledgement_id: format!("{reason}-ack"),
+                    },
+                ),
+                NOW + 1,
+                &mut effects,
+            );
+            assert_eq!(stopped.phase, ClockAudioPlaybackPhase::Stopped);
             assert_eq!(effects.music_volume, Some(0.64));
             assert_eq!(effects.volume_writes, [0.16, 0.64]);
-            assert_eq!(effects.starts, ["tone:bell"]);
         }
     }
 
