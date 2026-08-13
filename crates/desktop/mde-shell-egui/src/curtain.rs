@@ -790,6 +790,7 @@ impl Curtain {
         media: &mut dyn LockMedia,
         seat: Option<&SeatSnapshot>,
         mesh: &MeshSummary,
+        clock: Option<&crate::timers::LockClockSummary>,
     ) {
         if !self.engaged() {
             self.last_frame = None;
@@ -846,7 +847,7 @@ impl Curtain {
                 let (rect, _claim) =
                     ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
                 let sheet = rect.translate(egui::vec2(0.0, offset));
-                self.paint_sheet(ui, sheet, dim, media, seat, mesh);
+                self.paint_sheet(ui, sheet, dim, media, seat, mesh, clock);
             });
         ctx.move_to_top(layer.response.layer_id);
 
@@ -877,6 +878,7 @@ impl Curtain {
         media: &mut dyn LockMedia,
         seat: Option<&SeatSnapshot>,
         mesh: &MeshSummary,
+        clock: Option<&crate::timers::LockClockSummary>,
     ) {
         let painter = ui.painter().clone();
 
@@ -920,7 +922,7 @@ impl Curtain {
                 .max_rect(extras_rect(sheet))
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
-        self.face_extras(&mut extras_ui, dim, media, seat, mesh);
+        self.face_extras(&mut extras_ui, dim, media, seat, mesh, clock);
 
         // The two-stage reveal (lock 8): the password stage slides in
         // low-centre. It mounts the instant the stage phase arrives (so the
@@ -959,6 +961,7 @@ impl Curtain {
         media: &mut dyn LockMedia,
         seat: Option<&SeatSnapshot>,
         _mesh: &MeshSummary,
+        clock: Option<&crate::timers::LockClockSummary>,
     ) {
         // The extras fade with the face's idle dim — faint, never gone (lock 10).
         ui.set_opacity(dim.mul_add(-FAINT_DROP, 1.0));
@@ -967,6 +970,8 @@ impl Curtain {
         now_playing_strip(ui, media);
         ui.add_space(Style::SP_S);
         self.volume_row(ui, seat, now);
+        ui.add_space(Style::SP_S);
+        clock_summary(ui, clock);
         ui.add_space(Style::SP_S);
         status_row(ui, seat);
     }
@@ -1233,6 +1238,25 @@ fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>) {
                 .color(Style::TEXT_DIM),
         );
     });
+}
+
+/// Render only the bounded typed projection supplied by the shell's existing
+/// Clock reader. Absence is silent: stale or replaced Clock truth must not be
+/// retained on a locked screen.
+fn clock_summary(ui: &mut egui::Ui, clock: Option<&crate::timers::LockClockSummary>) {
+    let Some(clock) = clock else {
+        return;
+    };
+    for line in [clock.next_alarm.as_deref(), clock.active_timer.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        ui.label(
+            RichText::new(line)
+                .size(Style::TYPE_CAPTION)
+                .color(Style::TEXT_DIM),
+        );
+    }
 }
 
 /// A tiny tone dot (the tray's at-a-glance state idiom) leading a glanceable.
@@ -1585,7 +1609,7 @@ mod tests {
     /// CURTAIN-4 strip, so they mount an empty transport.
     fn show_bare(c: &mut Curtain, ctx: &egui::Context) {
         let mut media = RecordingMedia::default();
-        c.show(ctx, &mut media, None, &MeshSummary::default());
+        c.show(ctx, &mut media, None, &MeshSummary::default(), None);
     }
 
     // ── the state machine ──
@@ -2217,7 +2241,7 @@ mod tests {
 
         // Prime a frame so the covering Area is sized + settled on the face.
         let _ = ctx.run(raw(Vec::new()), |ctx| {
-            c.show(ctx, &mut media, Some(&snap), &mesh);
+            c.show(ctx, &mut media, Some(&snap), &mesh, None);
         });
         assert!(matches!(c.phase, Phase::Locked { .. }));
 
@@ -2226,7 +2250,7 @@ mod tests {
         let _ = ctx.run(
             raw(vec![egui::Event::PointerMoved(inside), click_at(inside)]),
             |ctx| {
-                c.show(ctx, &mut media, Some(&snap), &mesh);
+                c.show(ctx, &mut media, Some(&snap), &mesh, None);
             },
         );
         assert!(
@@ -2239,7 +2263,7 @@ mod tests {
         let _ = ctx.run(
             raw(vec![egui::Event::PointerMoved(outside), click_at(outside)]),
             |ctx| {
-                c.show(ctx, &mut media, Some(&snap), &mesh);
+                c.show(ctx, &mut media, Some(&snap), &mesh, None);
             },
         );
         assert!(
@@ -2259,13 +2283,13 @@ mod tests {
         let mut media = RecordingMedia::default(); // nothing playing
         let mesh = MeshSummary::default();
         let _ = ctx.run(raw(Vec::new()), |ctx| {
-            c.show(ctx, &mut media, None, &mesh);
+            c.show(ctx, &mut media, None, &mesh, None);
         });
         let over = egui::pos2(640.0, 720.0 * EXTRAS_Y_FRAC);
         let _ = ctx.run(
             raw(vec![egui::Event::PointerMoved(over), click_at(over)]),
             |ctx| {
-                c.show(ctx, &mut media, None, &mesh);
+                c.show(ctx, &mut media, None, &mesh, None);
             },
         );
         assert!(
@@ -2285,10 +2309,10 @@ mod tests {
             let mut media = np.map_or_else(RecordingMedia::default, RecordingMedia::playing);
             let mesh = MeshSummary::default();
             let _ = ctx.run(raw(Vec::new()), |ctx| {
-                c.show(ctx, &mut media, None, &mesh);
+                c.show(ctx, &mut media, None, &mesh, None);
             });
             let out = ctx.run(raw(Vec::new()), |ctx| {
-                c.show(ctx, &mut media, None, &mesh);
+                c.show(ctx, &mut media, None, &mesh, None);
             });
             let mut texts = 0;
             for clipped in &out.shapes {

@@ -11,7 +11,7 @@ use std::sync::{LazyLock, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use jiff::{tz::TimeZone, Timestamp};
+use jiff::{civil::Weekday as JiffWeekday, tz::TimeZone, Timestamp, ToSpan};
 use mackes_mesh_types::clock::{
     clock_command_topic, clock_state_topic, ClockAcknowledgementV1, ClockAlarmRecurrenceV1,
     ClockAlarmV1, ClockAudioRef, ClockCivilTimeV1, ClockCommandKindV1, ClockCommandV1,
@@ -27,6 +27,17 @@ use mde_egui::nav_chrome::AppFrame;
 use mde_egui::Style;
 const DAY_SECS: i64 = 86_400;
 const POLL: Duration = Duration::from_millis(500);
+const LOCK_SUMMARY_FRESHNESS: Duration = Duration::from_secs(2);
+const MAX_LOCK_SUMMARY_BYTES: usize = MAX_CLOCK_LABEL_BYTES + 64;
+
+/// Bounded, read-only Clock truth handed to the lock Curtain. The Curtain owns
+/// no schedule or countdown state; these already-formatted lines expire with
+/// the successful daemon-projection read that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockClockSummary {
+    pub(crate) next_alarm: Option<String>,
+    pub(crate) active_timer: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClockZoneChoice {
@@ -296,6 +307,7 @@ pub(crate) struct ClockState {
     node_id: String,
     signer_id: Option<String>,
     snapshot: Option<ClockSnapshotV1>,
+    last_projection_at: Option<Instant>,
     section: ClockSection,
     drafts: ClockDrafts,
     in_flight: Option<InFlightCommand>,
@@ -328,6 +340,7 @@ impl ClockState {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
             snapshot: None,
+            last_projection_at: None,
             section: ClockSection::default(),
             drafts: ClockDrafts {
                 world_zone: "Etc/UTC".into(),
@@ -392,7 +405,12 @@ impl ClockState {
             ClockSnapshotV1::from_persisted_json_at(body.as_bytes(), &context)
                 .map_err(|e| e.to_string())
         })();
-        match result {
+        match result.and_then(|snapshot| {
+            if snapshot.node_id != self.node_id {
+                return Err("Clock projection authority did not match this node".to_owned());
+            }
+            Ok(snapshot)
+        }) {
             Ok(snapshot) => {
                 if self
                     .in_flight
@@ -413,6 +431,7 @@ impl ClockState {
                 }
                 publish_clock_banner_projection(ctx, &snapshot);
                 self.snapshot = Some(snapshot);
+                self.last_projection_at = Some(Instant::now());
                 self.projection_error = None;
             }
             Err(error) => {
@@ -422,9 +441,34 @@ impl ClockState {
                         Vec::<ClockBannerProjection>::new(),
                     );
                 });
+                self.last_projection_at = None;
                 self.projection_error = Some(error);
             }
         }
+    }
+
+    /// Project the daemon-owned snapshot into the two glanceable lock lines.
+    /// A retained panel snapshot is deliberately insufficient: the caller only
+    /// receives data while the authoritative topic has been read successfully
+    /// within this projection lease.
+    pub(crate) fn lock_summary(&self) -> Option<LockClockSummary> {
+        let now = Instant::now();
+        let wall_utc_ms = now_unix_ms().ok()?;
+        self.lock_summary_at(now, wall_utc_ms)
+    }
+
+    fn lock_summary_at(&self, now: Instant, wall_utc_ms: i64) -> Option<LockClockSummary> {
+        let read_at = self.last_projection_at?;
+        if self.projection_error.is_some()
+            || now.saturating_duration_since(read_at) > LOCK_SUMMARY_FRESHNESS
+        {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.node_id != self.node_id {
+            return None;
+        }
+        Some(lock_summary_projection(snapshot, wall_utc_ms))
     }
 
     fn validate_banner_action(&self, action: ClockBannerAction) -> Result<ClockUiAction, String> {
@@ -578,6 +622,142 @@ impl ClockState {
             published_at: Instant::now(),
         })
     }
+}
+
+fn lock_summary_projection(snapshot: &ClockSnapshotV1, now_ms: i64) -> LockClockSummary {
+    let next_alarm = snapshot
+        .schedules
+        .iter()
+        .filter_map(|schedule| match &schedule.schedule {
+            ClockScheduleKindV1::Alarm(alarm) if alarm.enabled => {
+                next_alarm_due(alarm, now_ms).map(|due_at| (due_at, schedule))
+            }
+            _ => None,
+        })
+        .min_by_key(|(due_at, _)| *due_at)
+        .map(|(due_at, schedule)| {
+            bounded_lock_line(format!(
+                "Next alarm · {} · {}",
+                schedule.label,
+                fmt_utc_minute(due_at)
+            ))
+        });
+
+    let active_timer = snapshot
+        .schedules
+        .iter()
+        .filter_map(|schedule| match &schedule.schedule {
+            ClockScheduleKindV1::Timer(timer) if timer.phase == ClockTimerPhase::Running => timer
+                .absolute_deadline_utc_ms
+                .map(|deadline| (deadline, schedule, timer)),
+            ClockScheduleKindV1::Timer(timer) if timer.phase == ClockTimerPhase::Paused => {
+                Some((i64::MAX, schedule, timer))
+            }
+            _ => None,
+        })
+        .min_by_key(|(deadline, _, _)| *deadline)
+        .map(|(deadline, schedule, timer)| {
+            let remaining = if timer.phase == ClockTimerPhase::Paused {
+                timer.paused_remaining_ms.unwrap_or(0)
+            } else {
+                u64::try_from(deadline.saturating_sub(now_ms)).unwrap_or(0)
+            };
+            bounded_lock_line(format!(
+                "{} · {} · {}",
+                if timer.phase == ClockTimerPhase::Paused {
+                    "Timer paused"
+                } else {
+                    "Active timer"
+                },
+                schedule.label,
+                fmt_duration(remaining)
+            ))
+        });
+
+    LockClockSummary {
+        next_alarm,
+        active_timer,
+    }
+}
+
+/// Resolve recurring civil alarms for presentation only. This does not retain
+/// or advance a deadline; the daemon remains the sole scheduler and every
+/// frame is re-derived from its admitted snapshot.
+fn next_alarm_due(alarm: &ClockAlarmV1, now_ms: i64) -> Option<i64> {
+    match &alarm.recurrence {
+        ClockAlarmRecurrenceV1::OneTime { due_at_utc_ms } => {
+            (*due_at_utc_ms >= now_ms).then_some(*due_at_utc_ms)
+        }
+        ClockAlarmRecurrenceV1::Weekdays {
+            local_time,
+            weekdays,
+        } => {
+            let time_zone = TimeZone::get(&local_time.time_zone).ok()?;
+            let now = Timestamp::from_millisecond(now_ms)
+                .ok()?
+                .to_zoned(time_zone.clone());
+            for days_ahead in 0_i64..7 {
+                let date = now.date().checked_add(days_ahead.days()).ok()?;
+                if !weekdays.contains(&clock_weekday(date.weekday())) {
+                    continue;
+                }
+                let civil = date.at(
+                    i8::try_from(local_time.hour).ok()?,
+                    i8::try_from(local_time.minute).ok()?,
+                    i8::try_from(local_time.second).ok()?,
+                    0,
+                );
+                let ambiguous = time_zone.to_ambiguous_zoned(civil);
+                let due_at = match local_time.fold {
+                    ClockFoldPolicy::Earlier => ambiguous.compatible(),
+                    ClockFoldPolicy::Later => ambiguous.later(),
+                }
+                .ok()?
+                .timestamp()
+                .as_millisecond();
+                if due_at >= now_ms {
+                    return Some(due_at);
+                }
+            }
+            None
+        }
+    }
+}
+
+const fn clock_weekday(weekday: JiffWeekday) -> ClockWeekday {
+    match weekday {
+        JiffWeekday::Monday => ClockWeekday::Monday,
+        JiffWeekday::Tuesday => ClockWeekday::Tuesday,
+        JiffWeekday::Wednesday => ClockWeekday::Wednesday,
+        JiffWeekday::Thursday => ClockWeekday::Thursday,
+        JiffWeekday::Friday => ClockWeekday::Friday,
+        JiffWeekday::Saturday => ClockWeekday::Saturday,
+        JiffWeekday::Sunday => ClockWeekday::Sunday,
+    }
+}
+
+fn fmt_utc_minute(utc_ms: i64) -> String {
+    let seconds = utc_ms.div_euclid(1_000);
+    let (_, month, day) = crate::chat::civil_from_days(seconds.div_euclid(DAY_SECS));
+    let tod = seconds.rem_euclid(DAY_SECS);
+    format!(
+        "{month:02}-{day:02} {:02}:{:02} UTC",
+        tod / 3_600,
+        (tod % 3_600) / 60
+    )
+}
+
+fn bounded_lock_line(mut value: String) -> String {
+    if value.len() <= MAX_LOCK_SUMMARY_BYTES {
+        return value;
+    }
+    let mut end = MAX_LOCK_SUMMARY_BYTES.saturating_sub(3).min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    value.push_str("...");
+    value
 }
 
 fn publish_clock_banner_projection(ctx: &egui::Context, snapshot: &ClockSnapshotV1) {
@@ -1519,6 +1699,84 @@ mod tests {
         )
         .collect();
         value
+    }
+
+    #[test]
+    fn lock_summary_requires_fresh_same_authority_clock_projection() {
+        let read_at = Instant::now();
+        let now_ms = snapshot().produced_at_utc_ms;
+        let mut value = snapshot();
+        value.schedules = vec![
+            ClockScheduleV1 {
+                schedule_id: "next-alarm".into(),
+                origin_node_id: "node-a".into(),
+                revision: 1,
+                label: "Morning standup".into(),
+                selected_target_ids: vec!["node-a".into()],
+                schedule: ClockScheduleKindV1::Alarm(ClockAlarmV1 {
+                    enabled: true,
+                    label: "Morning standup".into(),
+                    recurrence: ClockAlarmRecurrenceV1::OneTime {
+                        due_at_utc_ms: now_ms + 3_600_000,
+                    },
+                    sound: bundled_tone(),
+                    vibrate: false,
+                }),
+            },
+            ClockScheduleV1 {
+                schedule_id: "active-timer".into(),
+                origin_node_id: "node-a".into(),
+                revision: 1,
+                label: "Tea".into(),
+                selected_target_ids: vec!["node-a".into()],
+                schedule: ClockScheduleKindV1::Timer(ClockTimerV1 {
+                    original_duration_ms: 120_000,
+                    phase: ClockTimerPhase::Running,
+                    absolute_deadline_utc_ms: Some(now_ms + 90_000),
+                    paused_remaining_ms: None,
+                    expired_at_utc_ms: None,
+                    sound: bundled_tone(),
+                    vibrate: false,
+                }),
+            },
+        ];
+        let mut state = ClockState::with_bus_root(None, "node-a".into());
+        state.snapshot = Some(value);
+        state.last_projection_at = Some(read_at);
+
+        let fresh = state
+            .lock_summary_at(read_at + Duration::from_millis(1), now_ms)
+            .expect("fresh same-authority summary");
+        assert!(fresh
+            .next_alarm
+            .as_deref()
+            .is_some_and(|line| line.contains("Morning standup")));
+        assert_eq!(
+            fresh.active_timer.as_deref(),
+            Some("Active timer · Tea · 01:30")
+        );
+
+        assert_eq!(
+            state.lock_summary_at(read_at + LOCK_SUMMARY_FRESHNESS + POLL, now_ms),
+            None,
+            "an elapsed read lease must remove retained Clock truth"
+        );
+
+        state.last_projection_at = Some(read_at);
+        state.snapshot.as_mut().expect("snapshot").node_id = "replacement-node".into();
+        assert_eq!(
+            state.lock_summary_at(read_at + Duration::from_millis(1), now_ms),
+            None,
+            "a replaced authority must remove the lock summary"
+        );
+
+        state.snapshot.as_mut().expect("snapshot").node_id = "node-a".into();
+        state.projection_error = Some("Bus unavailable".into());
+        assert_eq!(
+            state.lock_summary_at(read_at + Duration::from_millis(1), now_ms),
+            None,
+            "an unavailable projection must not retain the old summary"
+        );
     }
 
     #[test]
