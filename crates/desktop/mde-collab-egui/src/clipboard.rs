@@ -33,6 +33,12 @@ const PREVIEW_MAX: usize = 160;
 /// command's preview/hash materialization path.
 const MAX_CLIP_BYTES: usize = mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES;
 
+/// Source identities cross the collaboration event boundary and are rendered
+/// beside every clip. Keep them aligned with the platform's bounded identity
+/// fields: trim transport whitespace, reject control characters, and never let
+/// an unbounded projection become UI or signed-command attribution.
+const MAX_CLIP_SOURCE_BYTES: usize = 128;
+
 impl CommunicationsSurface {
     /// Render Clipboard mode for the selected space: the publish composer, then
     /// the newest-first lane with per-clip pin/attach/delete controls.
@@ -171,7 +177,8 @@ impl CommunicationsSurface {
         now_unix_ms: i64,
         local_source: &str,
     ) {
-        let origin = clipboard_origin(&item.source, local_source);
+        let source = canonical_clip_source(&item.source).unwrap_or("");
+        let origin = clipboard_origin(source, local_source);
         mde_egui::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 icons::icon(
@@ -182,7 +189,7 @@ impl CommunicationsSurface {
                 );
                 ui.label(egui::RichText::new(clip_preview(&item.preview)).color(Style::TEXT));
                 ui.label(
-                    egui::RichText::new(origin.label(&item.source))
+                    egui::RichText::new(origin.label(source))
                         .small()
                         .color(origin.color()),
                 );
@@ -225,7 +232,7 @@ impl CommunicationsSurface {
             ui.label(
                 egui::RichText::new(format!(
                     "{}  ·  {}  ·  content {}",
-                    item.source,
+                    if source.is_empty() { "unknown" } else { source },
                     relative_age(now_unix_ms, item.at_unix_ms),
                     short_hash(&item.sha256_hex),
                 ))
@@ -300,10 +307,12 @@ impl CommunicationsSurface {
         // The local session privacy gate is checked at this seam as well as at
         // the widget boundary so test callers and future UI affordances cannot
         // bypass the opt-in by constructing a command directly.
+        let Some(source) = canonical_clip_source(source) else {
+            return false;
+        };
         if !ingress.is_admitted()
             || !self.clipboard_publishing_enabled
             || text.trim().is_empty()
-            || source.trim().is_empty()
             || !clip_fits_lane(text.len())
         {
             return false;
@@ -439,13 +448,29 @@ impl ClipboardOrigin {
 /// never filtered here: visibility is a read-side property of the lane, while
 /// this helper only makes attribution explicit in the presentation.
 fn clipboard_origin(source: &str, local_source: &str) -> ClipboardOrigin {
-    if source.trim().is_empty() {
-        ClipboardOrigin::Unattributed
-    } else if source == local_source {
+    let Some(source) = canonical_clip_source(source) else {
+        return ClipboardOrigin::Unattributed;
+    };
+    let Some(local_source) = canonical_clip_source(local_source) else {
+        return ClipboardOrigin::Unattributed;
+    };
+    if source == local_source {
         ClipboardOrigin::Local
     } else {
         ClipboardOrigin::Remote
     }
+}
+
+/// Return the canonical collaboration attribution admitted for publishing and
+/// presentation. This is deliberately stricter than a cosmetic `trim()`: a
+/// control-bearing or oversized source is unavailable rather than rewritten
+/// into a potentially different actor identity.
+fn canonical_clip_source(source: &str) -> Option<&str> {
+    let source = source.trim();
+    (!source.is_empty()
+        && source.len() <= MAX_CLIP_SOURCE_BYTES
+        && !source.chars().any(char::is_control))
+    .then_some(source)
 }
 
 /// Classify a clip's content: an `http(s)://` head is a shared URI, everything
@@ -474,8 +499,8 @@ fn clip_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clip_fits_lane, clip_preview, clipboard_origin, ClipboardOrigin, VdiClipboardCapability,
-        MAX_CLIP_BYTES, PREVIEW_MAX,
+        canonical_clip_source, clip_fits_lane, clip_preview, clipboard_origin, ClipboardOrigin,
+        VdiClipboardCapability, MAX_CLIP_BYTES, MAX_CLIP_SOURCE_BYTES, PREVIEW_MAX,
     };
     use crate::{CommandSink, CommunicationsSurface};
     use mde_collab_types::SpaceId;
@@ -687,6 +712,54 @@ mod tests {
             clipboard_origin(" \t\n", "eagle"),
             ClipboardOrigin::Unattributed,
             "blank legacy attribution must not be presented as a remote source"
+        );
+    }
+
+    #[test]
+    fn source_attribution_is_canonical_and_control_safe_at_publish_boundary() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+
+        let mut canonical = CommandSink::new();
+        assert!(surface.publish_clip_text(
+            &mut canonical,
+            SpaceId::new(),
+            "mesh value",
+            "  seat:eagle  ",
+        ));
+        assert!(matches!(
+            canonical.queued().first(),
+            Some(mde_collab_types::CollabCommand::PublishClipboard { item, .. })
+                if item.source == "seat:eagle"
+        ));
+
+        for source in [
+            "seat:eagle\nspoofed",
+            "seat:eagle\u{0000}",
+            &"x".repeat(MAX_CLIP_SOURCE_BYTES + 1),
+        ] {
+            let mut rejected = CommandSink::new();
+            assert!(!surface.publish_clip_text(
+                &mut rejected,
+                SpaceId::new(),
+                "mesh value",
+                source,
+            ));
+            assert!(rejected.is_empty());
+        }
+    }
+
+    #[test]
+    fn projected_source_attribution_never_renders_control_or_spoofed_identity() {
+        assert_eq!(canonical_clip_source("  eagle  "), Some("eagle"));
+        assert_eq!(
+            clipboard_origin("  eagle  ", "eagle"),
+            ClipboardOrigin::Local
+        );
+        assert_eq!(canonical_clip_source("eagle\nfalcon"), None);
+        assert_eq!(
+            clipboard_origin("eagle\nfalcon", "eagle"),
+            ClipboardOrigin::Unattributed
         );
     }
 
