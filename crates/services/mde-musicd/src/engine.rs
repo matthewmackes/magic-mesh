@@ -915,8 +915,27 @@ impl EngineHandle {
 
     /// Resume after a [`pause`](Engine::pause).
     pub fn resume(&self) {
-        if !self.shared.renderer_failed.load(Ordering::Acquire) {
-            self.shared.playing.store(true, Ordering::Relaxed);
+        if self.shared.renderer_failed.load(Ordering::Acquire)
+            || self.shared.stop.load(Ordering::Acquire)
+        {
+            return;
+        }
+
+        // A delayed MPRIS/Bus Resume must not recreate playback authority after
+        // the provider set has failed or the decoder reached an empty terminal
+        // state. A finite track may be completely decoded while paused, so its
+        // retained ring remains sufficient authority to resume and drain.
+        let has_buffered_audio = !self
+            .shared
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        if (!self.shared.decode_done.load(Ordering::Acquire) || has_buffered_audio)
+            && !self.shared.stop.load(Ordering::Acquire)
+            && !self.shared.renderer_failed.load(Ordering::Acquire)
+        {
+            self.shared.playing.store(true, Ordering::Release);
         }
     }
 
@@ -946,6 +965,10 @@ impl EngineHandle {
         self.shared.decode_done.store(true, Ordering::Relaxed);
         self.shared.seekable.store(false, Ordering::Relaxed);
         self.shared.seek_ms.store(-1, Ordering::Relaxed);
+        // Close a concurrent stale Resume that raced the initial stop store.
+        // The output callback also observes `stop`, so this interval cannot
+        // render buffered audio; the final store restores truthful projection.
+        self.shared.playing.store(false, Ordering::Release);
     }
 
     /// Revoke an unhealthy renderer without joining a decode thread that may
@@ -1112,7 +1135,8 @@ where
     device.build_output_stream(
         config,
         move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let playing = shared.playing.load(Ordering::Relaxed);
+            let playing = shared.playing.load(Ordering::Relaxed)
+                && !shared.stop.load(Ordering::Acquire);
             let volume = f32::from_bits(shared.volume.load(Ordering::Relaxed));
             let mut real = 0usize;
             {
@@ -2178,9 +2202,50 @@ mod tests {
             !handle.is_active(),
             "failed provider must leave no active audio"
         );
+        handle.resume();
+        assert!(
+            !handle.is_playing(),
+            "a retained Resume must not recreate authority after provider failure"
+        );
 
         handle.stop();
         server.join().expect("failed provider fixture completed");
+    }
+
+    #[test]
+    fn fully_decoded_paused_tail_retains_resume_authority() {
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::from([0.25, -0.25])),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(true),
+            frames_played: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(1),
+            track_starts: Mutex::new(vec![0]),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(true),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
+        });
+        let handle = EngineHandle {
+            shared,
+            decode: Arc::new(Mutex::new(None)),
+        };
+
+        handle.resume();
+
+        assert!(
+            handle.is_playing(),
+            "a paused finite tail remains authorized after decode completion"
+        );
     }
 
     #[test]
