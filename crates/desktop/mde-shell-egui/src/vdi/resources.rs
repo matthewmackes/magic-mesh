@@ -290,24 +290,14 @@ impl RemoteSessionsModel {
         self.query = query.chars().take(MAX_SEARCH_CHARS).collect();
     }
 
-    fn visible_entries(&self, _now_ms: u64) -> Vec<&ResourceDiscoveryEntry> {
+    fn visible_entries(&self, now_ms: u64) -> Vec<&ResourceDiscoveryEntry> {
         let needle = self.query.trim().to_lowercase();
         self.projection
             .iter()
             .flat_map(|projection| projection.entries.iter())
             .filter(|entry| {
                 self.class_filter.is_none_or(|class| class == entry.class)
-                    && (needle.is_empty()
-                        || entry.display_name.to_lowercase().contains(&needle)
-                        || entry
-                            .summary
-                            .as_deref()
-                            .is_some_and(|summary| summary.to_lowercase().contains(&needle))
-                        || class_label(entry.class).to_lowercase().contains(&needle)
-                        || entry
-                            .transport_protocols
-                            .iter()
-                            .any(|protocol| protocol_label(*protocol).contains(&needle)))
+                    && entry_matches_query(entry, &needle, now_ms, &self.feed_state)
             })
             .collect()
     }
@@ -463,6 +453,36 @@ impl RemoteSessionsModel {
                         == Some(invocation.catalog_content_digest.as_str())
             })
     }
+}
+
+fn entry_matches_query(
+    entry: &ResourceDiscoveryEntry,
+    needle: &str,
+    now_ms: u64,
+    feed_state: &FeedState,
+) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    entry.display_name.to_lowercase().contains(needle)
+        || entry
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.to_lowercase().contains(needle))
+        || class_label(entry.class).to_lowercase().contains(needle)
+        || availability_label(entry, now_ms, feed_state).contains(needle)
+        || auth_label(entry.auth_status).contains(needle)
+        || joined_sources(&entry.discovery_sources)
+            .to_lowercase()
+            .contains(needle)
+        || joined_scopes(&entry.reachability_scopes)
+            .to_lowercase()
+            .contains(needle)
+        || entry
+            .transport_protocols
+            .iter()
+            .any(|protocol| protocol_label(*protocol).contains(needle))
 }
 
 pub(super) fn remote_sessions_panel(ui: &mut egui::Ui, model: &mut RemoteSessionsModel) {
@@ -1438,8 +1458,12 @@ mod tests {
     #[test]
     fn remote_sessions_model_search_filter_and_capability_projection_are_deterministic() {
         let mut model = RemoteSessionsModel::default();
+        let mut snapshot = projection("revision-1", 'c');
+        snapshot.entries[0].auth_status = AuthStatus::Required;
+        snapshot.entries[0].reachability_scopes = vec![ResourceScope::TrustedLan];
+        snapshot.entries[1].discovery_sources = vec![DiscoverySource::Manual];
         model
-            .install_projection(projection("revision-1", 'c'))
+            .install_projection(snapshot)
             .expect("admitted snapshot");
 
         model.set_query("RDP".into());
@@ -1453,6 +1477,22 @@ mod tests {
         let visible = model.visible_entries(NOW);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].display_name, "Project Archive");
+
+        model.class_filter = None;
+        for (query, expected) in [
+            ("operator", "Project Archive"),
+            ("trusted lan", "Engineering Desktop"),
+            ("auth required", "Engineering Desktop"),
+        ] {
+            model.set_query(query.into());
+            let visible = model.visible_entries(NOW);
+            assert_eq!(visible.len(), 1, "query {query:?}");
+            assert_eq!(visible[0].display_name, expected, "query {query:?}");
+        }
+
+        model.set_query("unavailable".into());
+        let visible = model.visible_entries(NOW + 300_001);
+        assert_eq!(visible.len(), 2, "expired cards remain searchable by status");
     }
 
     #[test]
