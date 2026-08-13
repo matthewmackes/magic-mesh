@@ -932,7 +932,18 @@ impl ClockWorker {
                     );
                     if peer_origin {
                         if stopwatch.revision < existing.revision {
-                            return Ok(false);
+                            // The origin remains authoritative for a delivered
+                            // mirror. It can legitimately repair a peer that
+                            // retained a fabricated/newer conflicting payload,
+                            // but only against the exact peer snapshot it
+                            // observed while issuing the repair. Without this
+                            // generation binding, a delayed lower-revision
+                            // command could roll back a legitimate newer
+                            // stopwatch after unrelated peer state advanced.
+                            anyhow::ensure!(
+                                expected_snapshot_revision == snapshot.revision,
+                                "stale Clock peer stopwatch repair"
+                            );
                         }
                         if stopwatch.revision == existing.revision {
                             anyhow::ensure!(
@@ -5796,7 +5807,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_stopwatch_convergence_repairs_newer_conflicting_payload() {
+    fn peer_stopwatch_convergence_repairs_newer_conflict_without_stale_rollback() {
         let mut fixture = Fixture::new();
         fixture.worker.approved_peer_ids.insert("seat-2".into());
         fixture.worker.tick_once().unwrap();
@@ -5831,7 +5842,7 @@ mod tests {
             .publish_peer_convergence(
                 &transaction,
                 NOW,
-                &BTreeMap::from([(String::from("seat-2"), peer)]),
+                &BTreeMap::from([(String::from("seat-2"), peer.clone())]),
             )
             .unwrap();
 
@@ -5846,6 +5857,53 @@ mod tests {
             panic!("peer repair must carry the stopwatch payload");
         };
         assert_eq!(stopwatch, desired);
+
+        let mut receiver = Fixture::new();
+        receiver.worker.node_id = "seat-2".into();
+        receiver.worker.snapshot = Some(peer);
+        assert!(receiver
+            .worker
+            .apply_command(
+                ClockCommandKindV1::UpsertStopwatch {
+                    stopwatch: desired.clone(),
+                },
+                "seat-1",
+                true,
+                "repair-current-generation",
+                1,
+                NOW,
+                NOW,
+            )
+            .expect("origin repair bound to the observed peer generation"));
+        assert_eq!(
+            receiver.worker.snapshot.as_ref().unwrap().stopwatches,
+            [desired.clone()],
+            "the origin payload must replace the newer conflicting mirror"
+        );
+
+        let snapshot = receiver.worker.snapshot.as_mut().unwrap();
+        snapshot.revision = 2;
+        let mut newer = desired.clone();
+        newer.revision += 2;
+        newer.accumulated_elapsed_ms += 2;
+        snapshot.stopwatches = vec![newer.clone()];
+        let error = receiver
+            .worker
+            .apply_command(
+                ClockCommandKindV1::UpsertStopwatch { stopwatch: desired },
+                "seat-1",
+                true,
+                "repair-stale-generation",
+                1,
+                NOW,
+                NOW,
+            )
+            .expect_err("delayed repair must not overwrite an advanced peer generation");
+        assert_eq!(error.to_string(), "stale Clock peer stopwatch repair");
+        assert_eq!(
+            receiver.worker.snapshot.as_ref().unwrap().stopwatches,
+            [newer]
+        );
     }
 
     #[test]
