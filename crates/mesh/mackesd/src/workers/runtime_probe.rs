@@ -135,17 +135,51 @@ pub fn parse_podman_mem_usage(value: &str) -> u64 {
     }
 }
 
-/// Return `true` only when the path is an actual mounted filesystem.
+/// Return `true` only when the path is one unambiguous mounted filesystem.
+///
+/// `/proc/self/mountinfo` is used instead of `/proc/mounts` because the mount ID
+/// is scoped to this process's namespace.  A stacked mount at the same target
+/// is ambiguous: a publisher could validate one filesystem and write to the
+/// shadowing one, so readiness fails closed until only one identity remains.
 #[must_use]
 pub fn is_meshfs_mounted(mount_path: &Path) -> bool {
-    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+    let Ok(metadata) = std::fs::symlink_metadata(mount_path) else {
         return false;
     };
-    let path = mount_path.to_string_lossy();
-    mounts
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .any(|mount| mount == path)
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    mountinfo_has_unique_target(&mountinfo, &mount_path.to_string_lossy())
+}
+
+fn mountinfo_has_unique_target(mountinfo: &str, expected: &str) -> bool {
+    let mut matches = mountinfo.lines().filter_map(|line| {
+        let encoded_target = line.split_whitespace().nth(4)?;
+        decode_mountinfo_path(encoded_target).filter(|target| target == expected)
+    });
+    matches.next().is_some() && matches.next().is_none()
+}
+
+fn decode_mountinfo_path(encoded: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(encoded.len());
+    let mut bytes = encoded.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(char::from(byte));
+            continue;
+        }
+        let digits = [bytes.next()?, bytes.next()?, bytes.next()?];
+        let value = digits.into_iter().try_fold(0_u8, |value, digit| {
+            (b'0'..=b'7')
+                .contains(&digit)
+                .then_some(value.saturating_mul(8).saturating_add(digit - b'0'))
+        })?;
+        decoded.push(char::from(value));
+    }
+    Some(decoded)
 }
 
 /// Decide whether a bounded latest-state publisher should write this tick.
@@ -200,5 +234,19 @@ mod tests {
             now,
             Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn mount_readiness_rejects_ambiguous_or_malformed_identity() {
+        let one = "41 30 0:38 / /mnt/mesh\\040storage rw - xfs /dev/vdb rw\n";
+        assert!(mountinfo_has_unique_target(one, "/mnt/mesh storage"));
+
+        let stacked = format!("{one}42 30 0:39 / /mnt/mesh\\040storage rw - xfs /dev/vdc rw\n");
+        assert!(!mountinfo_has_unique_target(&stacked, "/mnt/mesh storage"));
+        assert!(!mountinfo_has_unique_target(
+            "41 30 0:38 / /mnt/mesh\\04x rw - xfs /dev/vdb rw\n",
+            "/mnt/mesh x"
+        ));
+        assert!(!mountinfo_has_unique_target(one, "/mnt/other"));
     }
 }
