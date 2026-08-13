@@ -1928,8 +1928,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-022-2026-08-11-command-generation-loss-r284.md`.
 - **Deadline publication repair (2026-08-11):** a deadline commit followed by
   Bus publication failure reloads durable authority and repairs on the next
-  sweep without duplicating its occurrence or audio effect; the exact gate is
-  capacity-deferred:
+  sweep without duplicating its occurrence or audio effect; focused farm gate
+  passed 1/1:
   `docs/platform/evidence/WL-FUNC-022-2026-08-11-deadline-publication-repair-r267.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.

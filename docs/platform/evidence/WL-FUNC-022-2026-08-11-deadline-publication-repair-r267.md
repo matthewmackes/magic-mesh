@@ -11,8 +11,10 @@
   one ringing occurrence, and one pending audio outbox row are already durable,
   then restores Bus storage and verifies exactly one publication/effect.
 - Intended farm command: `cargo test -p mackesd --features async-services workers::clock::tests::deadline_publish_failure_reloads_durable_occurrence_before_replay -- --exact --nocapture`.
-- Result: **PASS**. Farm `.130`, slot `func022-deadline-r3`, ran the exact
-  regression after a clean full test-profile compilation: 1 passed, 0 failed;
-  all other test binaries were filtered. Warnings were emitted, but no build or
-  test error occurred.
-- Remaining proof: retain the epic's multi-peer/live restart acceptance.
+- Result: **PASS**. Farm `.90`, slot
+  `func022-deadline-publication-proof-20260812`, ran the focused regression
+  after a clean full test-profile compilation: 1 passed, 0 failed; all other
+  test binaries were filtered. Warnings were emitted, but no build or test
+  error occurred.
+- Remaining acceptance: multi-peer/live restart proof is post-release and
+  non-blocking under the one-node release policy.
