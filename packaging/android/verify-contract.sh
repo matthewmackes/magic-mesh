@@ -12,9 +12,12 @@ ANDROID="$ROOT/packaging/android"
 MANIFEST_VERIFY="$ANDROID/verify-manifest.sh"
 TOOL_READINESS="$ANDROID/record-guest-tool-readiness.sh"
 PLACEMENT_READINESS="$ROOT/install-helpers/verify-cuttlefish-readiness.py"
+GUEST_PAYLOAD_VERIFY="$ANDROID/verify-guest-payload.sh"
 PACKAGE_MANIFEST="$ROOT/crates/mesh/mackesd/Cargo.toml"
 PROJECT_RELEASE_KEY="$ROOT/packaging/repo/RPM-GPG-KEY-magic-mesh"
 PROJECT_RELEASE_FINGERPRINT="B546CC2EF9489F1899657AC9E6C820DAFBD1B07A"
+CUTTLEFISH_TASKS="$ROOT/automation/ansible/roles/cuttlefish_host/tasks/main.yml"
+CUTTLEFISH_DEFAULTS="$ROOT/automation/ansible/roles/cuttlefish_host/defaults/main.yml"
 
 fail() {
     echo "verify-android-contract: $*" >&2
@@ -129,8 +132,11 @@ fi
 [ -x "$MANIFEST_VERIFY" ] || fail "Android manifest verifier is not executable"
 [ -x "$TOOL_READINESS" ] || fail "guest-tool readiness recorder is not executable"
 [ -x "$PLACEMENT_READINESS" ] || fail "Cuttlefish placement verifier is not executable"
+[ -x "$GUEST_PAYLOAD_VERIFY" ] || fail "signed guest-payload verifier is not executable"
+[ -r "$CUTTLEFISH_TASKS" ] || fail "production Cuttlefish assembly tasks are missing"
+[ -r "$CUTTLEFISH_DEFAULTS" ] || fail "production Cuttlefish assembly defaults are missing"
 
-bash -n "$MANIFEST_VERIFY" "$TOOL_READINESS" "$0"
+bash -n "$MANIFEST_VERIFY" "$TOOL_READINESS" "$GUEST_PAYLOAD_VERIFY" "$0"
 python3 -m py_compile "$PLACEMENT_READINESS"
 
 # Keep the packaging path explicit: readiness must call the real Android
@@ -170,9 +176,36 @@ gpg --batch --no-options --with-colons --show-keys "$PROJECT_RELEASE_KEY" 2>/dev
 # may ship this verifier without both hard runtime dependencies.
 verify_package_manifest "$PACKAGE_MANIFEST"
 
+# The production image assembly must consume only verifier-staged bytes. Keep
+# this seam in the package contract so a future role edit cannot quietly restore
+# direct apt/runtime reads from mutable controller-provided paths.
+grep -Fq 'verify-guest-payload.sh' "$CUTTLEFISH_TASKS" \
+    || fail "production Cuttlefish assembly bypasses signed payload admission"
+grep -Fq '{{ cuttlefish_payload_stage_dir }}/packages/{{ item | basename }}' "$CUTTLEFISH_TASKS" \
+    || fail "production Cuttlefish apt path is not bound to the authenticated stage"
+grep -Fq '{{ cuttlefish_payload_stage_dir }}/readiness-relay' "$CUTTLEFISH_TASKS" \
+    || fail "readiness relay is not installed from the authenticated stage"
+grep -Fq '{{ cuttlefish_payload_stage_dir }}/vdi-agent' "$CUTTLEFISH_TASKS" \
+    || fail "VDI agent is not installed from the authenticated stage"
+for variable in cuttlefish_release_declaration cuttlefish_release_signature \
+    cuttlefish_readiness_relay cuttlefish_vdi_agent; do
+    grep -Fq "$variable" "$CUTTLEFISH_DEFAULTS" \
+        || fail "production Cuttlefish assembly lacks signed handoff input: $variable"
+done
+admission_line=$(grep -n -m1 'Authenticate and stage the exact signed Cuttlefish guest payload' \
+    "$CUTTLEFISH_TASKS" | cut -d: -f1)
+apt_line=$(grep -n -m1 'Install the android-cuttlefish host .deb packages' \
+    "$CUTTLEFISH_TASKS" | cut -d: -f1)
+cvd_line=$(grep -n -m1 'Start the Cuttlefish device with a VNC server' \
+    "$CUTTLEFISH_TASKS" | cut -d: -f1)
+[[ -n $admission_line && -n $apt_line && -n $cvd_line \
+    && $admission_line -lt $apt_line && $admission_line -lt $cvd_line ]] \
+    || fail "signed payload admission does not precede package/backend effects"
+
 "$MANIFEST_VERIFY" --self-test >/dev/null
 "$TOOL_READINESS" --self-test >/dev/null
 "$PLACEMENT_READINESS" --self-test >/dev/null
+"$GUEST_PAYLOAD_VERIFY" --self-test >/dev/null
 
 # Exercise the exact armored-key -> binary-keyring -> gpgv path with an
 # ephemeral Ed25519 release signer. gpgv cannot consume the shipped ASCII armor
