@@ -223,6 +223,7 @@ pub(crate) struct Display1Client {
     lease: WorkloadAttachmentLease,
     frame_received: bool,
     first_present_acknowledged: bool,
+    input_frame_presented: bool,
     last_frame_size: Option<(u32, u32)>,
     input_sequence: u64,
     guest_focused: bool,
@@ -275,6 +276,7 @@ impl Display1Client {
             lease,
             frame_received: false,
             first_present_acknowledged: false,
+            input_frame_presented: false,
             last_frame_size: None,
             input_sequence: 0,
             guest_focused: false,
@@ -284,26 +286,27 @@ impl Display1Client {
     /// Notify the broker exactly once that the first imported frame completed
     /// its KMS modeset/page-flip. Socket delivery alone is not readiness.
     fn acknowledge_first_present(&mut self) -> Result<(), Display1ClientError> {
-        if self.first_present_acknowledged {
-            return Ok(());
-        }
         if !self.frame_received {
             return Err(Display1ClientError::Protocol(
                 "cannot acknowledge presentation before receiving a Display1 frame".into(),
             ));
         }
-        let sent =
-            send(&self.stream, &[DISPLAY1_PRESENT_ACK], SendFlags::DONTWAIT).map_err(|error| {
-                Display1ClientError::Protocol(format!(
-                    "send Display1 presentation acknowledgement: {error}"
-                ))
-            })?;
-        if sent != 1 {
-            return Err(Display1ClientError::Protocol(
-                "short Display1 presentation acknowledgement".into(),
-            ));
+        if !self.first_present_acknowledged {
+            let sent = send(&self.stream, &[DISPLAY1_PRESENT_ACK], SendFlags::DONTWAIT).map_err(
+                |error| {
+                    Display1ClientError::Protocol(format!(
+                        "send Display1 presentation acknowledgement: {error}"
+                    ))
+                },
+            )?;
+            if sent != 1 {
+                return Err(Display1ClientError::Protocol(
+                    "short Display1 presentation acknowledgement".into(),
+                ));
+            }
+            self.first_present_acknowledged = true;
         }
-        self.first_present_acknowledged = true;
+        self.input_frame_presented = true;
         Ok(())
     }
 
@@ -316,7 +319,7 @@ impl Display1Client {
         self.lease
             .validate(current_ms())
             .map_err(|error| Display1ClientError::Lease(error.to_string()))?;
-        if !self.first_present_acknowledged {
+        if !self.input_frame_presented {
             return Err(Display1ClientError::Protocol(
                 "Display1 input requires a successfully presented native frame".into(),
             ));
@@ -498,8 +501,15 @@ impl Display1Client {
                 frame.validate().map_err(Display1ClientError::Import)?;
                 let descriptor = descriptor
                     .ok_or_else(|| Display1ClientError::Protocol("missing DMA-BUF FD".into()))?;
+                let frame_size = (frame.width, frame.height);
+                if self.last_frame_size.is_some_and(|size| size != frame_size) {
+                    if self.guest_focused {
+                        self.send_input_inner(Display1Input::ReleaseAll)?;
+                    }
+                    self.input_frame_presented = false;
+                }
                 self.frame_received = true;
-                self.last_frame_size = Some((frame.width, frame.height));
+                self.last_frame_size = Some(frame_size);
                 Ok(ReceivedFrame::Frame(descriptor, frame))
             }
             RelayEnvelope::Damage(envelope) => {
@@ -939,6 +949,7 @@ mod tests {
 
         client.frame_received = true;
         client.first_present_acknowledged = true;
+        client.input_frame_presented = true;
         client.last_frame_size = Some((1920, 1080));
         client
             .send_input_inner(Display1Input::Focus(true))
@@ -1348,6 +1359,92 @@ mod tests {
             daemon.read(&mut ack),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    fn resize_revokes_focused_input_until_the_new_frame_is_presented() {
+        let (daemon, shell) = seqpacket_pair();
+        let peer = peer_credentials(&daemon).expect("peer");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-resize-input".into(),
+            nonce: "nonce-resize-input".into(),
+            workload_id: WorkloadId::new("app-vm-resize-input").expect("workload id"),
+            generation: 8,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: current_ms().saturating_add(20_000),
+        };
+        let mut client = Display1Client::attach(shell, peer, lease, current_ms()).expect("attach");
+
+        let send_frame = |daemon: &UnixStream, width: u32, height: u32| {
+            let envelope = serde_json::to_vec(&serde_json::json!({
+                "kind": "frame",
+                "lease_id": "lease-resize-input",
+                "workload_id": "app-vm-resize-input",
+                "generation": 8,
+                "width": width,
+                "height": height,
+                "stride": width * 4,
+                "fourcc": 0x3432_5258_u32,
+                "modifier": 0,
+                "y0_top": true
+            }))
+            .expect("frame envelope");
+            let dmabuf = std::fs::File::open("/dev/null").expect("DMA-BUF fixture");
+            let descriptors = [dmabuf.as_fd()];
+            let mut control = [0_u8; rustix::cmsg_space!(ScmRights(1))];
+            let mut ancillary = SendAncillaryBuffer::new(&mut control);
+            assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+            assert_eq!(
+                sendmsg(
+                    daemon,
+                    &[IoSlice::new(&envelope)],
+                    &mut ancillary,
+                    SendFlags::empty(),
+                )
+                .expect("send frame"),
+                envelope.len()
+            );
+        };
+
+        send_frame(&daemon, 64, 32);
+        assert!(matches!(
+            client.try_receive(current_ms()),
+            Ok(Display1FramePoll::Frame { .. })
+        ));
+        client.frame_presented().expect("present initial frame");
+        let mut packet = [0_u8; MAX_INPUT_BYTES];
+        assert_eq!(
+            recv(&daemon, &mut packet, RecvFlags::empty()).expect("first-present ack"),
+            1
+        );
+        client
+            .send_input_inner(Display1Input::Focus(true))
+            .expect("focus initial frame");
+        let _ = recv(&daemon, &mut packet, RecvFlags::empty()).expect("focus packet");
+
+        send_frame(&daemon, 80, 40);
+        assert!(matches!(
+            client.try_receive(current_ms()),
+            Ok(Display1FramePoll::Frame { .. })
+        ));
+        let bytes = recv(&daemon, &mut packet, RecvFlags::empty()).expect("release-all packet");
+        let release: serde_json::Value =
+            serde_json::from_slice(&packet[..bytes]).expect("release-all JSON");
+        assert_eq!(release["input"]["action"], "release_all");
+        assert!(matches!(
+            client.send_input_inner(Display1Input::Focus(true)),
+            Err(Display1ClientError::Protocol(message)) if message.contains("presented")
+        ));
+
+        client.frame_presented().expect("present resized frame");
+        client
+            .send_input_inner(Display1Input::Focus(true))
+            .expect("focus resized frame");
+        let bytes = recv(&daemon, &mut packet, RecvFlags::empty()).expect("refocus packet");
+        let focus: serde_json::Value =
+            serde_json::from_slice(&packet[..bytes]).expect("refocus JSON");
+        assert_eq!(focus["input"]["action"], "focus");
     }
 
     #[test]
