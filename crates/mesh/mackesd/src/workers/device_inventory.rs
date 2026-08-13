@@ -38,6 +38,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt as _;
 use mackes_mesh_types::device_inventory::{
@@ -1561,7 +1562,244 @@ pub fn publish_system(workgroup_root: &Path, hostname: &str) -> std::io::Result<
     let dmesg = capture_dmesg();
     let mut inv = enumerate(&roots, &ids, tools, hostname, &dmesg);
     inv.published_at_ms = probe_started_at_ms;
-    write_inventory(workgroup_root, &inv)
+    let inventory_path = write_inventory(workgroup_root, &inv)?;
+    if let Err(error) = publish_display_readiness(workgroup_root, hostname) {
+        tracing::warn!(%error, "display-provider publication failed");
+    }
+    Ok(inventory_path)
+}
+
+// ── truthful physical-display provider ───────────────────────────────────────
+
+const DISPLAY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DISPLAY_CONNECTORS: usize = 64;
+const MAX_DISPLAY_FACT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DisplayReadiness {
+    Ready,
+    Disconnected,
+    Disabled,
+    Unknown,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DisplaySnapshot<'a> {
+    schema_version: u16,
+    node_id: &'a str,
+    observed_unix_ms: u64,
+    readiness: DisplayReadiness,
+    connectors: u16,
+    connected_connectors: u16,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrmConnectorStatus {
+    Connected,
+    Disconnected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrmConnectorFact {
+    identity: String,
+    card: u16,
+    status: DrmConnectorStatus,
+    enabled: bool,
+    has_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplaySeat {
+    Active(u32),
+    Inactive,
+}
+
+fn parse_display_seat(raw: &str) -> Option<DisplaySeat> {
+    if raw.is_empty() || raw.len() > MAX_DISPLAY_FACT_BYTES || raw.contains('\0') {
+        return None;
+    }
+    let mut fields = BTreeMap::new();
+    for line in raw.lines() {
+        let (key, value) = line.split_once('=')?;
+        if !matches!(key, "LoadState" | "ActiveState" | "SubState" | "MainPID")
+            || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    if fields.len() != 4 || fields.get("LoadState") != Some(&"loaded") {
+        return None;
+    }
+    match (fields.get("ActiveState"), fields.get("SubState"), fields.get("MainPID")) {
+        (Some(&"active"), Some(&"running"), Some(pid)) => pid
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 1)
+            .map(DisplaySeat::Active),
+        (Some(&"inactive" | &"failed"), Some(_), Some(&"0")) => Some(DisplaySeat::Inactive),
+        _ => None,
+    }
+}
+
+fn parse_drm_masters(raw: &str) -> Option<BTreeSet<u32>> {
+    if raw.is_empty() || raw.len() > MAX_DISPLAY_FACT_BYTES || raw.contains('\0') {
+        return None;
+    }
+    let mut lines = raw.lines();
+    let header = lines.next()?.split_whitespace().collect::<Vec<_>>();
+    let pid_column = header.iter().position(|field| *field == "pid")?;
+    let master_column = header.iter().position(|field| *field == "master")?;
+    let mut masters = BTreeSet::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != header.len() {
+            return None;
+        }
+        let pid = fields.get(pid_column)?.parse::<u32>().ok().filter(|pid| *pid > 1)?;
+        match *fields.get(master_column)? {
+            "y" if masters.insert(pid) => {}
+            "n" => {}
+            _ => return None,
+        }
+    }
+    Some(masters)
+}
+
+fn classify_display(
+    mut connectors: Vec<DrmConnectorFact>,
+    seat: Option<DisplaySeat>,
+    masters: Option<BTreeMap<u16, BTreeSet<u32>>>,
+) -> (DisplayReadiness, usize, usize, &'static str) {
+    connectors.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+    let malformed = connectors.len() > MAX_DISPLAY_CONNECTORS
+        || connectors.windows(2).any(|pair| pair[0].identity == pair[1].identity)
+        || connectors.iter().any(|fact| {
+            fact.identity.is_empty()
+                || fact.identity.len() > 128
+                || (fact.status == DrmConnectorStatus::Disconnected && (fact.enabled || fact.has_mode))
+                || (fact.status == DrmConnectorStatus::Connected && (!fact.enabled || !fact.has_mode))
+        });
+    if malformed {
+        return (DisplayReadiness::Unknown, 0, 0, "DRM connector facts are malformed or contradictory");
+    }
+    let connected = connectors.iter().filter(|fact| fact.status == DrmConnectorStatus::Connected).count();
+    if connectors.iter().any(|fact| fact.status == DrmConnectorStatus::Unknown) {
+        return (DisplayReadiness::Unknown, connectors.len(), connected, "DRM connector state is unknown");
+    }
+    let (Some(seat), Some(masters)) = (seat, masters) else {
+        return (DisplayReadiness::Unknown, connectors.len(), connected, "seat or DRM-master facts are unavailable");
+    };
+    let cards = connectors.iter().map(|fact| fact.card).collect::<BTreeSet<_>>();
+    if masters.keys().any(|card| !cards.contains(card)) || masters.values().any(|set| set.len() > 1) {
+        return (DisplayReadiness::Unknown, connectors.len(), connected, "DRM-master identity is substituted or ambiguous");
+    }
+    match seat {
+        DisplaySeat::Inactive if masters.values().any(|set| !set.is_empty()) => (DisplayReadiness::Unknown, connectors.len(), connected, "disabled seat contradicts a live DRM master"),
+        DisplaySeat::Inactive => (DisplayReadiness::Disabled, connectors.len(), connected, "Construct seat service is disabled"),
+        DisplaySeat::Active(_) if connected == 0 && masters.values().all(BTreeSet::is_empty) => (DisplayReadiness::Disconnected, connectors.len(), 0, "no physical display is connected"),
+        DisplaySeat::Active(pid) => {
+            let exact_owner = connectors.iter().filter(|fact| fact.status == DrmConnectorStatus::Connected).all(|fact| {
+                masters.get(&fact.card).is_some_and(|set| set.len() == 1 && set.contains(&pid))
+            }) && masters.values().all(|set| set.is_empty() || set.contains(&pid));
+            if exact_owner {
+                (DisplayReadiness::Ready, connectors.len(), connected, "connected displays are owned by the active Construct seat")
+            } else {
+                (DisplayReadiness::Unknown, connectors.len(), connected, "DRM master does not match the active Construct seat")
+            }
+        }
+    }
+}
+
+fn display_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_DISPLAY_FACT_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    (bytes.len() <= MAX_DISPLAY_FACT_BYTES).then(|| String::from_utf8(bytes).ok()).flatten()
+}
+
+fn gather_drm_connectors(root: &Path) -> Option<Vec<DrmConnectorFact>> {
+    let mut entries = std::fs::read_dir(root).ok()?.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
+    let mut facts = Vec::new();
+    for entry in entries {
+        let identity = entry.file_name().into_string().ok()?;
+        let Some((card, _)) = identity
+            .strip_prefix("card")
+            .and_then(|name| name.split_once('-'))
+        else {
+            continue;
+        };
+        let card = card.parse().ok()?;
+        let status = match display_file(&entry.path().join("status"))?.trim() {
+            "connected" => DrmConnectorStatus::Connected,
+            "disconnected" => DrmConnectorStatus::Disconnected,
+            "unknown" => DrmConnectorStatus::Unknown,
+            _ => return None,
+        };
+        let enabled = match display_file(&entry.path().join("enabled"))?.trim() {
+            "enabled" => true,
+            "disabled" => false,
+            _ => return None,
+        };
+        facts.push(DrmConnectorFact {
+            identity,
+            card,
+            status,
+            enabled,
+            has_mode: !display_file(&entry.path().join("modes"))?.trim().is_empty(),
+        });
+        if facts.len() > MAX_DISPLAY_CONNECTORS { return None; }
+    }
+    Some(facts)
+}
+
+fn gather_display_seat() -> Option<DisplaySeat> {
+    let mut command = std::process::Command::new("systemctl");
+    command.args(["show", "mde-shell-egui.service", "--property=LoadState,ActiveState,SubState,MainPID"]);
+    let output = super::proc::output_with_timeout(command, DISPLAY_COMMAND_TIMEOUT).ok()?;
+    output.status.success().then(|| String::from_utf8(output.stdout).ok()).flatten().as_deref().and_then(parse_display_seat)
+}
+
+fn gather_drm_masters(root: &Path) -> Option<BTreeMap<u16, BTreeSet<u32>>> {
+    let mut facts = BTreeMap::new();
+    for entry in std::fs::read_dir(root).ok()?.filter_map(Result::ok) {
+        let card = entry.file_name().into_string().ok()?.parse::<u16>().ok()?;
+        let clients = parse_drm_masters(&display_file(&entry.path().join("clients"))?)?;
+        if facts.insert(card, clients).is_some() { return None; }
+    }
+    Some(facts)
+}
+
+fn publish_display_readiness(workgroup_root: &Path, hostname: &str) -> std::io::Result<PathBuf> {
+    if hostname.is_empty() || hostname.len() > 128 || !hostname.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')) {
+        return Err(std::io::Error::other("invalid display-provider node identity"));
+    }
+    let (readiness, connectors, connected_connectors, reason) = classify_display(
+        gather_drm_connectors(Path::new("/sys/class/drm")).unwrap_or_default(),
+        gather_display_seat(),
+        gather_drm_masters(Path::new("/sys/kernel/debug/dri")),
+    );
+    let snapshot = DisplaySnapshot {
+        schema_version: 1,
+        node_id: hostname,
+        observed_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().try_into().unwrap_or(u64::MAX),
+        readiness,
+        connectors: connectors.try_into().unwrap_or(u16::MAX),
+        connected_connectors: connected_connectors.try_into().unwrap_or(u16::MAX),
+        reason,
+    };
+    let dir = workgroup_root.join("display-provider");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{hostname}.json"));
+    let temporary = dir.join(format!(".{hostname}.json.tmp"));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?)?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(path)
 }
 
 /// Write a prebuilt inventory to the substrate (atomic temp+rename). Split out so
@@ -2545,6 +2783,90 @@ mod tests {
         assert_eq!(inv.host, "bare");
         assert!(inv.categories.is_empty());
         assert_eq!(inv.device_count(), 0);
+    }
+
+    fn display_connector(
+        identity: &str,
+        card: u16,
+        status: DrmConnectorStatus,
+    ) -> DrmConnectorFact {
+        let connected = status == DrmConnectorStatus::Connected;
+        DrmConnectorFact {
+            identity: identity.into(),
+            card,
+            status,
+            enabled: connected,
+            has_mode: connected,
+        }
+    }
+
+    #[test]
+    fn hostile_display_provider_facts_fail_unknown_without_identity_leakage() {
+        let active = Some(DisplaySeat::Active(4242));
+        let owned = Some(BTreeMap::from([(0, BTreeSet::from([4242]))]));
+        let cases = [
+            classify_display(
+                vec![
+                    display_connector("card0-DP-1", 0, DrmConnectorStatus::Connected),
+                    display_connector("card0-DP-1", 0, DrmConnectorStatus::Connected),
+                ],
+                active,
+                owned.clone(),
+            ),
+            classify_display(
+                vec![DrmConnectorFact {
+                    enabled: true,
+                    ..display_connector("card0-DP-1", 0, DrmConnectorStatus::Disconnected)
+                }],
+                active,
+                owned.clone(),
+            ),
+            classify_display(
+                vec![display_connector("card0-DP-1", 0, DrmConnectorStatus::Connected)],
+                active,
+                Some(BTreeMap::from([(0, BTreeSet::from([9999]))])),
+            ),
+            classify_display(
+                vec![display_connector("card0-DP-1", 0, DrmConnectorStatus::Connected)],
+                active,
+                Some(BTreeMap::from([(1, BTreeSet::from([4242]))])),
+            ),
+            classify_display(
+                vec![display_connector("card0-DP-1", 0, DrmConnectorStatus::Unknown)],
+                active,
+                owned,
+            ),
+        ];
+        for (readiness, count, connected, reason) in cases {
+            assert_eq!(readiness, DisplayReadiness::Unknown);
+            assert!(!reason.contains("DP-1"));
+            assert!(count <= MAX_DISPLAY_CONNECTORS);
+            assert!(connected <= MAX_DISPLAY_CONNECTORS);
+        }
+        assert!(parse_display_seat("LoadState=loaded\nActiveState=active\nActiveState=active\nSubState=running\nMainPID=4242\n").is_none());
+        assert!(parse_drm_masters("command pid dev master\nshell 4242 0 maybe\n").is_none());
+    }
+
+    #[test]
+    fn coherent_display_provider_states_remain_distinct() {
+        let ready = classify_display(
+            vec![display_connector("card0-DP-1", 0, DrmConnectorStatus::Connected)],
+            Some(DisplaySeat::Active(42)),
+            Some(BTreeMap::from([(0, BTreeSet::from([42]))])),
+        );
+        assert_eq!(ready.0, DisplayReadiness::Ready);
+        let disconnected = classify_display(
+            vec![display_connector("card0-DP-1", 0, DrmConnectorStatus::Disconnected)],
+            Some(DisplaySeat::Active(42)),
+            Some(BTreeMap::from([(0, BTreeSet::new())])),
+        );
+        assert_eq!(disconnected.0, DisplayReadiness::Disconnected);
+        let disabled = classify_display(
+            vec![display_connector("card0-DP-1", 0, DrmConnectorStatus::Disconnected)],
+            Some(DisplaySeat::Inactive),
+            Some(BTreeMap::from([(0, BTreeSet::new())])),
+        );
+        assert_eq!(disabled.0, DisplayReadiness::Disabled);
     }
 
     #[test]
