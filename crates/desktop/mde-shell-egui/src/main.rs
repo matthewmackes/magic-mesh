@@ -1699,12 +1699,10 @@ impl Shell {
     fn normalize_surface_aliases(&mut self) {
         match self.nav.surface {
             Surface::FleetMesh => {
-                self.workers_tab = WorkersTab::Control;
-                self.fleet_mesh_tab = FleetMeshTab::Workbench;
-                self.workers_destination = WorkersDestination::ThisNodePage(
-                    this_node_catalog::page_for_route("this-node/overview")
-                        .unwrap_or(this_node_catalog::page_index()[0]),
-                );
+                // Fleet & Mesh is a retired sibling surface, not navigation
+                // authority. Preserve the exact destination selected through
+                // the typed Workers catalog; a stale alias must not demote
+                // Fleet or Action Console to the former overview activation.
                 self.nav.surface = Surface::Workers;
             }
             Surface::Workbench => {
@@ -1733,11 +1731,10 @@ impl Shell {
                 self.nav.surface = Surface::Workers;
             }
             Surface::ThisNode => {
-                self.workers_tab = WorkersTab::LocalNode;
-                self.workers_destination = WorkersDestination::ThisNodePage(
-                    this_node_catalog::page_for_route("this-node/overview")
-                        .unwrap_or(this_node_catalog::page_index()[0]),
-                );
+                // This Node is likewise only a persisted/deep-link alias. The
+                // governed Workers leaf already owns both its selected page and
+                // tab, so legacy input may collapse the surface but not replace
+                // that typed selection (including Action Console).
                 self.nav.surface = Surface::Workers;
             }
             Surface::System => {
@@ -5798,7 +5795,6 @@ mod tests {
         );
 
         for (legacy, expected_workers_tab, expected_destination) in [
-            (Surface::FleetMesh, WorkersTab::Control, overview),
             (
                 Surface::MeshView,
                 WorkersTab::Network,
@@ -5809,7 +5805,6 @@ mod tests {
                 WorkersTab::Discovery,
                 WorkersDestination::Discovery,
             ),
-            (Surface::ThisNode, WorkersTab::LocalNode, overview),
             (
                 Surface::Phones,
                 WorkersTab::Phones,
@@ -5860,6 +5855,38 @@ mod tests {
         assert_eq!(shell.nav.surface, Surface::Workers);
         assert_eq!(shell.workers_tab, WorkersTab::Control);
         assert_eq!(shell.workers_destination, WorkersDestination::ActionConsole);
+    }
+
+    #[test]
+    fn retired_fleet_and_this_node_surfaces_cannot_override_typed_workers_destinations() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        let storage = WorkersDestination::ThisNodePage(
+            this_node_catalog::page_for_route("this-node/storage").expect("governed storage route"),
+        );
+
+        for (destination, hostile_alias) in [
+            (WorkersDestination::Fleet, Surface::FleetMesh),
+            (storage, Surface::ThisNode),
+            (WorkersDestination::ActionConsole, Surface::FleetMesh),
+            (WorkersDestination::ActionConsole, Surface::ThisNode),
+        ] {
+            shell.open_workers_destination(destination);
+            let expected_tab = shell.workers_tab;
+
+            // Simulate a stale persisted surface or hostile legacy caller after
+            // the typed leaf has already established route authority.
+            shell.nav.surface = hostile_alias;
+            shell.normalize_surface_aliases();
+
+            assert_eq!(shell.nav.surface, Surface::Workers, "{hostile_alias:?}");
+            assert_eq!(shell.workers_tab, expected_tab, "{hostile_alias:?}");
+            assert_eq!(
+                shell.workers_destination, destination,
+                "{hostile_alias:?} replaced {destination:?}"
+            );
+        }
     }
 
     #[test]
