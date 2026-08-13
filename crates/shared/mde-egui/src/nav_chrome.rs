@@ -170,6 +170,16 @@ pub fn toolbar_height(density: Density) -> f32 {
     TOOLBAR_BASE_H.max(Style::SP_XS.mul_add(density.spacing_scale(), density.min_hit_target()))
 }
 
+/// The responsive arrangement selected by [`Toolbar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarLayout {
+    /// Leading and trailing groups share one row.
+    Inline,
+    /// Each group gets a full-width row so actions do not overlap at narrow or
+    /// largest-text geometry.
+    Stacked,
+}
+
 /// [`Sidebar`] row height for `density` — the large control rung
 /// ([`Style::CONTROL_H_L`]), grown to the density's hit-target floor.
 #[must_use]
@@ -560,11 +570,49 @@ impl<'a> Toolbar<'a> {
     pub fn show(self, ui: &mut Ui) -> ToolbarResponse {
         let density = Style::density(ui.ctx());
         let sp = density.spacing_scale();
-        let height = toolbar_height(density);
+        let row_height = toolbar_height(density);
+        let hit = density.min_hit_target().min(row_height);
+        let gap = Style::SP_XS * sp;
+        let leading_widths: Vec<f32> = self
+            .leading
+            .iter()
+            .map(|item| self.item_width(ui, item, hit, sp))
+            .collect();
+        let trailing_widths: Vec<f32> = self
+            .trailing
+            .iter()
+            .map(|item| self.item_width(ui, item, hit, sp))
+            .collect();
+        let group_width = |widths: &[f32]| {
+            gap.mul_add(
+                widths.len().saturating_sub(1) as f32,
+                widths.iter().sum::<f32>(),
+            )
+        };
+        let leading_width = group_width(&leading_widths);
+        let trailing_width = group_width(&trailing_widths);
+        let side_padding = 2.0 * Style::SP_S * sp;
+        let inter_group_gap = if self.leading.is_empty() || self.trailing.is_empty() {
+            0.0
+        } else {
+            Style::SP_M * sp
+        };
+        let layout = if leading_width + trailing_width + side_padding + inter_group_gap
+            <= ui.available_width()
+        {
+            ToolbarLayout::Inline
+        } else {
+            ToolbarLayout::Stacked
+        };
+        let height = match layout {
+            ToolbarLayout::Inline => row_height,
+            ToolbarLayout::Stacked => row_height * 2.0,
+        };
         let (rect, bar) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
         let mut out = ToolbarResponse {
             bar,
+            layout,
             items: Vec::new(),
             activated: None,
         };
@@ -582,17 +630,19 @@ impl<'a> Toolbar<'a> {
         ui.painter()
             .hline(rect.x_range(), edge_y, Style::hairline());
 
-        let hit = density.min_hit_target().min(rect.height());
         let accent = Style::resolve_color(ui.ctx(), Style::ACCENT);
-        let gap = Style::SP_XS * sp;
+        let leading_center_y = rect.top() + row_height * 0.5;
+        let trailing_center_y = match layout {
+            ToolbarLayout::Inline => leading_center_y,
+            ToolbarLayout::Stacked => rect.bottom() - row_height * 0.5,
+        };
 
         // Leading group, left-to-right from the leading edge.
         let mut x = Style::SP_S.mul_add(sp, rect.left());
         let mut index = 0usize;
-        for item in self.leading {
-            let width = self.item_width(ui, item, hit, sp);
+        for (item, width) in self.leading.iter().zip(leading_widths) {
             let slot = Rect::from_min_size(
-                egui::pos2(x, hit.mul_add(-0.5, rect.center().y)),
+                egui::pos2(x, hit.mul_add(-0.5, leading_center_y)),
                 Vec2::new(width, hit),
             );
             self.show_item(ui, slot, index, item, accent, &mut out);
@@ -602,19 +652,10 @@ impl<'a> Toolbar<'a> {
 
         // Trailing group: measure first so the group hugs the trailing edge
         // while responses stay in slice (doc) order.
-        let widths: Vec<f32> = self
-            .trailing
-            .iter()
-            .map(|item| self.item_width(ui, item, hit, sp))
-            .collect();
-        let group: f32 = gap.mul_add(
-            (widths.len().saturating_sub(1)) as f32,
-            widths.iter().sum::<f32>(),
-        );
-        let mut x = Style::SP_S.mul_add(-sp, rect.right()) - group;
-        for (item, width) in self.trailing.iter().zip(widths) {
+        let mut x = Style::SP_S.mul_add(-sp, rect.right()) - trailing_width;
+        for (item, width) in self.trailing.iter().zip(trailing_widths) {
             let slot = Rect::from_min_size(
-                egui::pos2(x, hit.mul_add(-0.5, rect.center().y)),
+                egui::pos2(x, hit.mul_add(-0.5, trailing_center_y)),
                 Vec2::new(width, hit),
             );
             self.show_item(ui, slot, index, item, accent, &mut out);
@@ -690,6 +731,8 @@ impl<'a> Toolbar<'a> {
 pub struct ToolbarResponse {
     /// The whole-row response.
     pub bar: Response,
+    /// The responsive arrangement used for this frame.
+    pub layout: ToolbarLayout,
     /// One response per action — leading group first, then trailing.
     pub items: Vec<Response>,
     /// The index (into [`items`](Self::items)) of the action that fired.
@@ -1143,6 +1186,54 @@ mod tests {
             last.as_ref().expect("toolbar response").activated,
             Some(0),
             "a focused icon action must activate on Space"
+        );
+    }
+
+    #[test]
+    fn toolbar_stacks_groups_before_they_overlap_at_narrow_large_text_geometry() {
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, Density::Touch);
+        let leading = [
+            ToolbarItem::labeled("Create folder"),
+            ToolbarItem::labeled("Upload files"),
+        ];
+        let trailing = [
+            ToolbarItem::labeled("Share selection"),
+            ToolbarItem::icon("view-refresh", "Refresh"),
+        ];
+        let mut response = None;
+        let _ = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    response = Some(
+                        Toolbar::new()
+                            .leading(&leading)
+                            .trailing(&trailing)
+                            .show(ui),
+                    );
+                });
+            },
+        );
+        let response = response.expect("toolbar response");
+        assert_eq!(response.layout, ToolbarLayout::Stacked);
+        assert_eq!(response.items.len(), 4, "stacking must retain every action");
+        assert!(
+            response.items[0].rect.bottom() <= response.items[2].rect.top(),
+            "leading and trailing actions must occupy disjoint rows"
+        );
+        assert!(
+            response
+                .items
+                .iter()
+                .all(|item| item.rect.height() >= Density::Touch.min_hit_target()),
+            "stacked actions must retain the largest-text/touch hit-target floor"
         );
     }
 
