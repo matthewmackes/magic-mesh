@@ -854,6 +854,10 @@ pub(crate) struct FrontDoorState {
     open: bool,
     query: String,
     selected: usize,
+    // Live providers may reorder or withdraw rows between frames. Keep the
+    // typed target as selection authority so an index cannot silently begin
+    // naming a different action while Enter is already in flight.
+    selected_target: Option<FrontDoorTarget>,
     filter: FrontDoorFilter,
     expanded: bool,
     focus_pending: bool,
@@ -873,6 +877,7 @@ impl FrontDoorState {
         self.open = true;
         self.focus_pending = true;
         self.selected = 0;
+        self.selected_target = None;
         self.filter = FrontDoorFilter::All;
         self.expanded = false;
         self.lifecycle_arm = None;
@@ -884,6 +889,7 @@ impl FrontDoorState {
         self.open = false;
         self.query.clear();
         self.selected = 0;
+        self.selected_target = None;
         self.filter = FrontDoorFilter::All;
         self.expanded = false;
         self.focus_pending = false;
@@ -940,7 +946,11 @@ impl FrontDoorState {
             items,
             sources,
         );
-        let hit = hits.get(self.selected.min(hits.len().saturating_sub(1)))?;
+        let hit = if let Some(target) = self.selected_target.as_ref() {
+            hits.iter().find(|hit| &hit.item.payload == target)?
+        } else {
+            hits.get(self.selected.min(hits.len().saturating_sub(1)))?
+        };
         match &hit.item.payload {
             FrontDoorTarget::Mesh(id) => peer_node_for_unit_id(id).map(str::to_owned),
             FrontDoorTarget::PeerApp(target) => Some(target.node.clone()),
@@ -1519,6 +1529,49 @@ fn run_command_mode(query: &str) -> bool {
     query.trim_start().starts_with('>')
 }
 
+/// Reconcile the visual row index against the selected typed target.
+///
+/// `false` means a previously selected target disappeared. The caller still
+/// paints a deterministic replacement selection, but must not activate it from
+/// the same input frame; the next frame establishes that replacement as the
+/// user's current visible selection.
+fn reconcile_front_door_selection(
+    state: &mut FrontDoorState,
+    hits: &[SearchHit<FrontDoorTarget>],
+) -> bool {
+    if hits.is_empty() {
+        state.selected = 0;
+        state.selected_target = None;
+        return false;
+    }
+
+    if let Some(target) = state.selected_target.as_ref() {
+        if let Some(index) = hits.iter().position(|hit| &hit.item.payload == target) {
+            state.selected = index;
+            return true;
+        }
+
+        state.selected = 0;
+        state.selected_target = Some(hits[0].item.payload.clone());
+        return false;
+    }
+
+    state.selected = state.selected.min(hits.len() - 1);
+    state.selected_target = Some(hits[state.selected].item.payload.clone());
+    true
+}
+
+fn move_front_door_selection(
+    state: &mut FrontDoorState,
+    hits: &[SearchHit<FrontDoorTarget>],
+    index: usize,
+) {
+    state.selected = index.min(hits.len().saturating_sub(1));
+    state.selected_target = hits.get(state.selected).map(|hit| hit.item.payload.clone());
+    state.lifecycle_arm = None;
+    state.service_lifecycle_arm = None;
+}
+
 // PLATFORM-INTERFACES Q15 — Spotlight geometry: the Front Door is a centered
 // floating search card. Both layout variants share the same placement (the
 // `expanded` variant grows HEIGHT, never position or width); the SP_XL gutter
@@ -1659,6 +1712,7 @@ pub(crate) fn front_door_panel_with_sources(
                 }
                 if response.changed() {
                     state.selected = 0;
+                    state.selected_target = None;
                     state.lifecycle_arm = None;
                     state.service_lifecycle_arm = None;
                 }
@@ -1667,12 +1721,14 @@ pub(crate) fn front_door_panel_with_sources(
                 let (filter_rect, filter_changed) = filter_chip_row(ui, &mut state.filter);
                 if filter_changed {
                     state.selected = 0;
+                    state.selected_target = None;
                     state.lifecycle_arm = None;
                     state.service_lifecycle_arm = None;
                 }
                 if let Some(step) = filter_keyboard_step(ui) {
                     state.filter = moved_filter(state.filter, step);
                     state.selected = 0;
+                    state.selected_target = None;
                     state.lifecycle_arm = None;
                     state.service_lifecycle_arm = None;
                 }
@@ -1689,13 +1745,13 @@ pub(crate) fn front_door_panel_with_sources(
                         sources,
                     )
                 };
-                if command_mode {
+                let selection_is_current = if command_mode {
                     state.selected = 0;
-                } else if !hits.is_empty() {
-                    state.selected = state.selected.min(hits.len().saturating_sub(1));
+                    state.selected_target = None;
+                    false
                 } else {
-                    state.selected = 0;
-                }
+                    reconcile_front_door_selection(state, &hits)
+                };
 
                 let (escape, enter, up, down, home, end) = ui.input(|i| {
                     (
@@ -1719,30 +1775,23 @@ pub(crate) fn front_door_panel_with_sources(
                     }
                 } else if !hits.is_empty() {
                     if home {
-                        state.selected = 0;
-                        state.lifecycle_arm = None;
-                        state.service_lifecycle_arm = None;
+                        move_front_door_selection(state, &hits, 0);
                     }
                     if end {
-                        state.selected = hits.len() - 1;
-                        state.lifecycle_arm = None;
-                        state.service_lifecycle_arm = None;
+                        move_front_door_selection(state, &hits, hits.len() - 1);
                     }
                     if down {
-                        state.selected = (state.selected + 1) % hits.len();
-                        state.lifecycle_arm = None;
-                        state.service_lifecycle_arm = None;
+                        move_front_door_selection(state, &hits, (state.selected + 1) % hits.len());
                     }
                     if up {
-                        state.selected = if state.selected == 0 {
+                        let index = if state.selected == 0 {
                             hits.len() - 1
                         } else {
                             state.selected - 1
                         };
-                        state.lifecycle_arm = None;
-                        state.service_lifecycle_arm = None;
+                        move_front_door_selection(state, &hits, index);
                     }
-                    if enter {
+                    if enter && selection_is_current {
                         action = hits.get(state.selected).map(activation_request_for_hit);
                     }
                 }
@@ -1815,6 +1864,7 @@ pub(crate) fn front_door_panel_with_sources(
                                             state.service_lifecycle_arm = None;
                                         }
                                         state.selected = idx;
+                                        state.selected_target = Some(hit.item.payload.clone());
                                     }
                                     if let Some(request) =
                                         result_context_menu_request(&response, hit, state)
@@ -4762,6 +4812,36 @@ mod tests {
 
         assert_eq!(state.query().chars().count(), MAX_QUERY_CHARS);
         assert!(state.query().starts_with('🙂'));
+    }
+
+    #[test]
+    fn front_door_selection_follows_typed_target_and_refuses_stale_substitution() {
+        let mut hits = visible_front_door_hits("", app_search_items());
+        assert!(hits.len() >= 3);
+        let selected_target = hits[1].item.payload.clone();
+        let mut state = FrontDoorState {
+            selected: 1,
+            selected_target: Some(selected_target.clone()),
+            ..Default::default()
+        };
+
+        hits.swap(0, 1);
+        assert!(reconcile_front_door_selection(&mut state, &hits));
+        assert_eq!(state.selected, 0);
+        assert_eq!(hits[state.selected].item.payload, selected_target);
+
+        hits.remove(state.selected);
+        assert!(
+            !reconcile_front_door_selection(&mut state, &hits),
+            "a withdrawn live result must withhold same-frame Enter activation"
+        );
+        assert_ne!(hits[state.selected].item.payload, selected_target);
+        assert_eq!(
+            state.selected_target.as_ref(),
+            Some(&hits[state.selected].item.payload),
+            "the visible replacement becomes authoritative only for a later frame"
+        );
+        assert!(reconcile_front_door_selection(&mut state, &hits));
     }
 
     fn drive_front_door_action(
