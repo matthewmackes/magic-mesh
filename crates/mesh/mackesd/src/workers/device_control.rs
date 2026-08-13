@@ -367,11 +367,14 @@ impl DeviceControlExecWorker {
     /// substituting another category, display name, or kernel module. A host that
     /// has published no inventory yet refuses everything (conservative +
     /// self-healing once it publishes).
-    fn offered(
+    fn offered_generation(
         &self,
         target: &DeviceTarget,
         expected_published_at_ms: u64,
-    ) -> Option<device_inventory::DeviceRecord> {
+    ) -> Option<(
+        device_inventory::DeviceInventory,
+        device_inventory::DeviceRecord,
+    )> {
         let Some(inv) = device_inventory::read_inventory(&self.workgroup_root, &self.self_hostname)
         else {
             return None;
@@ -379,7 +382,8 @@ impl DeviceControlExecWorker {
         if expected_published_at_ms == 0 || inv.published_at_ms != expected_published_at_ms {
             return None;
         }
-        inv.categories
+        let device = inv
+            .categories
             .iter()
             .filter(|category| category.key == target.category)
             .flat_map(|category| category.devices.iter())
@@ -387,8 +391,19 @@ impl DeviceControlExecWorker {
                 device.name == target.name
                     && device.sysfs_path == target.sysfs_path
                     && device.driver == target.driver
-            })
-            .cloned()
+            })?
+            .clone();
+        Some((inv, device))
+    }
+
+    #[cfg(test)]
+    fn offered(
+        &self,
+        target: &DeviceTarget,
+        expected_published_at_ms: u64,
+    ) -> Option<device_inventory::DeviceRecord> {
+        self.offered_generation(target, expected_published_at_ms)
+            .map(|(_, device)| device)
     }
 
     /// A provider-owned record with no resolved state is not safe to mutate.
@@ -412,19 +427,55 @@ impl DeviceControlExecWorker {
         Ok(())
     }
 
+    /// Admit only device-scoped effects from the exact provider generation.
+    /// Reloading a kernel module is host-wide: every device bound to that module
+    /// loses its driver while `rmmod`/`modprobe` runs. Therefore a request whose
+    /// preview names one device is truthful only when the provider generation
+    /// proves that device is the module's sole consumer.
+    fn admit_provider_scope(
+        req: &DeviceControlRequest,
+        inventory: &device_inventory::DeviceInventory,
+    ) -> Result<(), String> {
+        if req.op != DeviceControlOp::ReloadModule {
+            return Ok(());
+        }
+        let Some(driver) = non_empty(req.target.driver.as_deref()) else {
+            return Err(
+                "reload-module: the device has no bound driver/module to reload".to_string(),
+            );
+        };
+        let consumers = inventory
+            .categories
+            .iter()
+            .flat_map(|category| category.devices.iter())
+            .filter(|device| device.driver.as_deref() == Some(driver))
+            .take(2)
+            .count();
+        if consumers != 1 {
+            return Err(format!(
+                "reload-module: provider generation {} does not prove `{driver}` is exclusive to `{}` — refused before host-wide mutation",
+                inventory.published_at_ms, req.target.name,
+            ));
+        }
+        Ok(())
+    }
+
     /// Re-attest the exact preview generation and device identity immediately
     /// before executing an already-authorized mutation.
     fn re_attest_authorized_request(
         &self,
         req: &DeviceControlRequest,
     ) -> Result<device_inventory::DeviceRecord, String> {
-        let Some(device) = self.offered(&req.target, req.expected_inventory_published_at_ms) else {
+        let Some((inventory, device)) =
+            self.offered_generation(&req.target, req.expected_inventory_published_at_ms)
+        else {
             return Err(format!(
                 "device `{}` left {}'s authorized inventory generation {} before execution — refused before mutation",
                 req.target.name, self.self_hostname, req.expected_inventory_published_at_ms,
             ));
         };
         Self::admit_control_state(req.op, &device)?;
+        Self::admit_provider_scope(req, &inventory)?;
         Ok(device)
     }
 
@@ -450,7 +501,9 @@ impl DeviceControlExecWorker {
                 ),
             );
         }
-        let Some(device) = self.offered(&req.target, req.expected_inventory_published_at_ms) else {
+        let Some((inventory, device)) =
+            self.offered_generation(&req.target, req.expected_inventory_published_at_ms)
+        else {
             return DeviceControlResult::failed(
                 &req.id,
                 format!(
@@ -462,6 +515,9 @@ impl DeviceControlExecWorker {
             );
         };
         if let Err(reason) = Self::admit_control_state(req.op, &device) {
+            return DeviceControlResult::failed(&req.id, reason);
+        }
+        if let Err(reason) = Self::admit_provider_scope(req, &inventory) {
             return DeviceControlResult::failed(&req.id, reason);
         }
         let steps = match command_plan(req.op, &req.target) {
@@ -1067,6 +1123,82 @@ mod tests {
 
     fn write_inventory(root: &Path, host: &str, devices: Vec<DeviceRecord>) {
         write_inventory_at(root, host, 1, devices);
+    }
+
+    #[tokio::test]
+    async fn shared_module_reload_is_refused_by_exact_provider_generation_and_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let driver = "shared_net";
+        let selected = DeviceRecord {
+            sysfs_path: Some("/sys/bus/pci/devices/0000:01:00.0".into()),
+            driver: Some(driver.into()),
+            ..DeviceRecord::new("Primary adapter", DeviceStatus::Ok)
+        };
+        let sibling = DeviceRecord {
+            sysfs_path: Some("/sys/bus/pci/devices/0000:02:00.0".into()),
+            driver: Some(driver.into()),
+            ..DeviceRecord::new("Secondary adapter", DeviceStatus::Ok)
+        };
+        write_inventory_at(tmp.path(), "edge-2", 17, vec![selected.clone(), sibling]);
+        let db = tmp.path().join("audit.db");
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_db_path(db.clone())
+        .with_bus_root(tmp.path().join("bus"))
+        .with_authorizer(test_authorizer(tmp.path()));
+        let request = authorize_request(
+            &DeviceControlRequest {
+                schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+                armed_token: None,
+                id: "01SHAREDMODULE".into(),
+                op: DeviceControlOp::ReloadModule,
+                target: DeviceTarget {
+                    name: selected.name.clone(),
+                    category: category::NETWORK_ADAPTERS.into(),
+                    sysfs_path: selected.sysfs_path.clone(),
+                    driver: selected.driver.clone(),
+                },
+                target_host: "edge-2".into(),
+                expected_inventory_published_at_ms: 17,
+                from: "peer:operator-seat".into(),
+            },
+            "shared-module-provider-scope",
+        );
+
+        let result = worker.process(&request).await;
+
+        assert!(
+            !result.ok,
+            "a device-scoped request cannot reload a shared module"
+        );
+        assert!(result
+            .error
+            .contains("does not prove `shared_net` is exclusive"));
+        assert!(result.error.contains("provider generation 17"));
+        let conn = crate::store::open(&db).expect("open audit db");
+        let rows = crate::store::load_audit_rows(&conn).expect("load audit rows");
+        assert_eq!(rows.len(), 1, "the provider-scope refusal must be audited");
+
+        let exclusive_inventory = DeviceInventory {
+            host: "edge-2".into(),
+            published_at_ms: 18,
+            summary: HostSummary::default(),
+            tools: ToolAvailability::default(),
+            categories: vec![DeviceCategory::new(
+                category::NETWORK_ADAPTERS,
+                vec![selected],
+            )],
+        };
+        let mut next_request = request;
+        next_request.expected_inventory_published_at_ms = 18;
+        assert!(
+            DeviceControlExecWorker::admit_provider_scope(&next_request, &exclusive_inventory)
+                .is_ok(),
+            "the exact next generation can truthfully offer a sole-consumer module reload"
+        );
     }
 
     #[tokio::test]
