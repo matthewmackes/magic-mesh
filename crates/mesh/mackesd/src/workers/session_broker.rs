@@ -39,7 +39,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1536,18 +1536,25 @@ fn read_runtime_evidence(
 /// Apply one validated guest observation only when it identifies the exact
 /// admitted session hosted by this serving node. The signed action publication
 /// keeps the shell's public lifecycle rail and the daemon roster on one wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEvidenceDisposition {
+    Applied,
+    Rejected,
+    Deferred,
+}
+
 fn apply_runtime_evidence(
     roster: &mut BTreeMap<SessionId, VdiSession>,
     evidence: AppVmRuntimeEvidence,
     node_id: &str,
     bus_root: &Path,
     signer: Option<&CloudArmSigner>,
-) {
+) -> RuntimeEvidenceDisposition {
     let Some(session) = roster.get(&evidence.session_id) else {
-        return;
+        return RuntimeEvidenceDisposition::Rejected;
     };
     let Some(app) = session.app.as_ref() else {
-        return;
+        return RuntimeEvidenceDisposition::Rejected;
     };
     if session.serving_peer != node_id
         || app.session_id != evidence.session_id
@@ -1558,7 +1565,7 @@ fn apply_runtime_evidence(
             session = %evidence.session_id,
             "session_broker: App VM runtime evidence identity mismatch refused"
         );
-        return;
+        return RuntimeEvidenceDisposition::Rejected;
     }
     let state = evidence.state.lifecycle_state();
     let request = SessionRequest::AppState {
@@ -1569,12 +1576,12 @@ fn apply_runtime_evidence(
     };
     let Some(signer) = signer else {
         tracing::debug!(session = %evidence.session_id, "session_broker: runtime evidence waiting for action signer");
-        return;
+        return RuntimeEvidenceDisposition::Deferred;
     };
     let mut candidate = roster.clone();
     if let Err(error) = apply_request(&mut candidate, request, now_ms()) {
         tracing::warn!(session = %evidence.session_id, %error, "session_broker: runtime readiness transition refused");
-        return;
+        return RuntimeEvidenceDisposition::Rejected;
     }
     if let Err(error) = publish_app_state(
         bus_root,
@@ -1585,9 +1592,30 @@ fn apply_runtime_evidence(
         evidence.reason.as_deref(),
     ) {
         tracing::debug!(session = %evidence.session_id, %error, "session_broker: runtime readiness publication deferred");
-        return;
+        return RuntimeEvidenceDisposition::Deferred;
     }
     *roster = candidate;
+    RuntimeEvidenceDisposition::Applied
+}
+
+/// Commit ordered guest observations without losing one across a transient
+/// signer or Bus outage. A deferred head blocks later observations because a
+/// later generation may rely on the lifecycle edge established by that head.
+fn drain_pending_runtime_evidence(
+    pending: &mut VecDeque<AppVmRuntimeEvidence>,
+    roster: &mut BTreeMap<SessionId, VdiSession>,
+    node_id: &str,
+    bus_root: &Path,
+    signer: Option<&CloudArmSigner>,
+) {
+    while let Some(evidence) = pending.front().cloned() {
+        match apply_runtime_evidence(roster, evidence, node_id, bus_root, signer) {
+            RuntimeEvidenceDisposition::Applied | RuntimeEvidenceDisposition::Rejected => {
+                pending.pop_front();
+            }
+            RuntimeEvidenceDisposition::Deferred => break,
+        }
+    }
 }
 
 /// Build the daemon-authenticated readiness event that follows an App VM open.
@@ -1879,6 +1907,7 @@ impl Worker for SessionBrokerWorker {
         let mut active_bus: Option<SessionBusIdentity> = None;
         let mut cursor: Option<String> = None;
         let mut runtime_cursor: Option<String> = None;
+        let mut pending_runtime_evidence = VecDeque::new();
         let mut roster: BTreeMap<SessionId, VdiSession> = BTreeMap::new();
         let mut startup_recovery_pending = true;
         let mut tick = tokio::time::interval(self.poll);
@@ -1903,6 +1932,10 @@ impl Worker for SessionBrokerWorker {
                         };
                         cursor = action_tail;
                         runtime_cursor = evidence_tail;
+                        // Pending observations belong to the replaced Bus
+                        // identity. Never replay them into a different store;
+                        // the replacement tail is the new authority boundary.
+                        pending_runtime_evidence.clear();
                     }
                     active_bus = Some(identity);
                     // Fold the whole session log into the roster, then converge.
@@ -1937,15 +1970,23 @@ impl Worker for SessionBrokerWorker {
                             }
                         }
                     }
-                    for evidence in read_runtime_evidence(&bus_root, &mut runtime_cursor) {
-                        apply_runtime_evidence(
-                            &mut roster,
-                            evidence,
-                            &self.node_id,
+                    // Do not advance the runtime tail while an earlier
+                    // observation is waiting to be durably published. This
+                    // preserves lifecycle ordering and bounds the retry queue
+                    // to one fetched Bus batch.
+                    if pending_runtime_evidence.is_empty() {
+                        pending_runtime_evidence.extend(read_runtime_evidence(
                             &bus_root,
-                            self.app_state_signer.as_ref(),
-                        );
+                            &mut runtime_cursor,
+                        ));
                     }
+                    drain_pending_runtime_evidence(
+                        &mut pending_runtime_evidence,
+                        &mut roster,
+                        &self.node_id,
+                        &bus_root,
+                        self.app_state_signer.as_ref(),
+                    );
                     self.converge(&mut roster);
                 }
                 () = shutdown.wait() => break,
@@ -3164,6 +3205,85 @@ mod tests {
             Some(AppVmLifecycleState::StartingApp),
             "mismatched guest identity cannot advance the session"
         );
+    }
+
+    #[test]
+    fn runtime_evidence_waits_for_signer_without_losing_lifecycle_order() {
+        let bus = tempfile::tempdir().expect("runtime bus");
+        let signer = CloudArmSigner::new(b"runtime-retry-test-key".to_vec()).unwrap();
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-retry".into(),
+                serving_peer: "node-a".into(),
+                vm_id: "app-vm-retry".into(),
+                client_peer: "seat-a".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            1,
+        )
+        .expect("open app");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-retry".into(),
+                generation: 0,
+                state: AppVmLifecycleState::StartingGuest,
+                reason: None,
+            },
+            2,
+        )
+        .expect("guest starts");
+
+        let evidence = |generation, state| AppVmRuntimeEvidence {
+            session_id: "app-retry".into(),
+            vm_id: "app-vm-retry".into(),
+            app_id: "org.example.Editor".into(),
+            generation,
+            state,
+            reason: None,
+        };
+        let mut pending = VecDeque::from([
+            evidence(
+                1,
+                mackes_mesh_types::vdi_session::AppVmRuntimeState::StartingApp,
+            ),
+            evidence(
+                2,
+                mackes_mesh_types::vdi_session::AppVmRuntimeState::Connected,
+            ),
+        ]);
+
+        drain_pending_runtime_evidence(&mut pending, &mut roster, "node-a", bus.path(), None);
+        assert_eq!(pending.len(), 2, "missing signer must retain the full tail");
+        assert_eq!(
+            roster["app-retry"].app_state,
+            Some(AppVmLifecycleState::StartingGuest)
+        );
+
+        drain_pending_runtime_evidence(
+            &mut pending,
+            &mut roster,
+            "node-a",
+            bus.path(),
+            Some(&signer),
+        );
+        assert!(pending.is_empty());
+        assert_eq!(
+            roster["app-retry"].app_state,
+            Some(AppVmLifecycleState::Connected)
+        );
+        assert_eq!(roster["app-retry"].app_state_generation, 2);
+        let actions = Persist::open(bus.path().to_path_buf())
+            .expect("open action bus")
+            .list_since(ACTION_TOPIC, None)
+            .expect("read actions");
+        assert_eq!(actions.len(), 2, "both ordered transitions are published");
     }
 
     #[test]
