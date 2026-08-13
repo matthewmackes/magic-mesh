@@ -727,10 +727,28 @@ pub fn write_mesh_cursor(path: &Path, topic: &str, ulid: &str) -> Result<(), Str
             .map_err(|error| format!("create clipboard mesh cursor parent: {error}"))?;
     }
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, body)
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("open clipboard mesh cursor: {error}"))?;
+    use std::io::Write as _;
+    file.write_all(&body)
         .map_err(|error| format!("write clipboard mesh cursor: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync clipboard mesh cursor: {error}"))?;
     std::fs::rename(&temporary, path)
-        .map_err(|error| format!("commit clipboard mesh cursor: {error}"))
+        .map_err(|error| format!("commit clipboard mesh cursor: {error}"))?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        OpenOptions::new()
+            .read(true)
+            .open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync clipboard mesh cursor directory: {error}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
