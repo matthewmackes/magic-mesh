@@ -733,6 +733,42 @@ fn stopwatch_elapsed(stopwatch: &ClockStopwatchV1, now_ms: i64) -> u64 {
     stopwatch.accumulated_elapsed_ms.saturating_add(live)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopwatchProjection<'a> {
+    Local(&'a ClockStopwatchV1),
+    Mirror(&'a ClockStopwatchV1),
+}
+
+impl<'a> StopwatchProjection<'a> {
+    fn stopwatch(self) -> &'a ClockStopwatchV1 {
+        match self {
+            Self::Local(stopwatch) | Self::Mirror(stopwatch) => stopwatch,
+        }
+    }
+
+    const fn is_read_only(self) -> bool {
+        matches!(self, Self::Mirror(_))
+    }
+}
+
+/// Prefer this node's stopwatch authority over any delivered mirrors. A peer
+/// mirror is a useful fallback projection, but must never mask the stopwatch
+/// that this node can actually control merely because transport ordering put
+/// the mirror first.
+fn stopwatch_projection(snapshot: &ClockSnapshotV1) -> Option<StopwatchProjection<'_>> {
+    snapshot
+        .stopwatches
+        .iter()
+        .find(|stopwatch| stopwatch.origin_node_id == snapshot.node_id)
+        .map(StopwatchProjection::Local)
+        .or_else(|| {
+            snapshot
+                .stopwatches
+                .first()
+                .map(StopwatchProjection::Mirror)
+        })
+}
+
 fn command_body(
     action: ClockUiAction,
     snapshot: &ClockSnapshotV1,
@@ -1334,10 +1370,21 @@ fn stopwatch(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockS
     let Some(s) = snapshot else {
         return empty(ui, "Waiting for daemon-projected stopwatch state.");
     };
-    let sw = s.stopwatches.first();
+    let projection = stopwatch_projection(s);
+    let sw = projection.map(StopwatchProjection::stopwatch);
+    let read_only = projection.is_some_and(StopwatchProjection::is_read_only);
     let now_ms = now_unix().saturating_mul(1_000);
     let elapsed = sw.map_or(0, |value| stopwatch_elapsed(value, now_ms));
     ui.label(RichText::new(fmt_duration(elapsed)).size(Style::DISPLAY));
+    if let Some(stopwatch) = sw.filter(|_| read_only) {
+        ui.colored_label(
+            Style::TEXT_DIM,
+            format!(
+                "Mirrored from {} · read-only on this node",
+                stopwatch.origin_node_id
+            ),
+        );
+    }
     let phase = sw.map_or(ClockStopwatchPhase::Reset, |v| v.phase);
     let id = sw.map(|v| v.stopwatch_id.clone());
     ui.horizontal(|ui| {
@@ -1346,7 +1393,10 @@ fn stopwatch(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockS
         } else {
             StopwatchAction::Start
         };
-        if ui.button(format!("{primary:?}")).clicked() {
+        if ui
+            .add_enabled(!read_only, egui::Button::new(format!("{primary:?}")))
+            .clicked()
+        {
             state.emit(ClockUiAction::ControlStopwatch {
                 stopwatch_id: id.clone(),
                 action: primary,
@@ -1354,7 +1404,7 @@ fn stopwatch(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockS
         }
         if ui
             .add_enabled(
-                phase == ClockStopwatchPhase::Running,
+                !read_only && phase == ClockStopwatchPhase::Running,
                 egui::Button::new("Lap"),
             )
             .clicked()
@@ -1364,7 +1414,10 @@ fn stopwatch(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockS
                 action: StopwatchAction::Lap,
             });
         }
-        if ui.button("Reset").clicked() {
+        if ui
+            .add_enabled(!read_only, egui::Button::new("Reset"))
+            .clicked()
+        {
             state.emit(ClockUiAction::ControlStopwatch {
                 stopwatch_id: id,
                 action: StopwatchAction::Reset,
@@ -1686,6 +1739,35 @@ mod tests {
             result,
             Err("a mirrored stopwatch is read-only on this node".to_owned())
         );
+    }
+
+    #[test]
+    fn local_stopwatch_authority_wins_over_an_earlier_peer_mirror() {
+        let mut snapshot = snapshot();
+        let stopwatch = |id: &str, origin: &str| ClockStopwatchV1 {
+            stopwatch_id: id.into(),
+            origin_node_id: origin.into(),
+            mirror_target_ids: vec!["node-a".into()],
+            revision: 1,
+            phase: ClockStopwatchPhase::Paused,
+            started_wall_utc_ms: None,
+            started_monotonic_ms: None,
+            accumulated_elapsed_ms: 12_000,
+            laps: Vec::new(),
+        };
+        snapshot.stopwatches = vec![
+            stopwatch("peer-first", "node-b"),
+            stopwatch("local-second", "node-a"),
+        ];
+
+        let projection = stopwatch_projection(&snapshot).expect("local projection");
+        assert_eq!(projection.stopwatch().stopwatch_id, "local-second");
+        assert!(!projection.is_read_only());
+
+        snapshot.stopwatches.remove(1);
+        let projection = stopwatch_projection(&snapshot).expect("mirror projection");
+        assert_eq!(projection.stopwatch().stopwatch_id, "peer-first");
+        assert!(projection.is_read_only());
     }
 
     #[test]
