@@ -38,6 +38,7 @@ const SUPPORT_BUNDLE_MAX_TEXT_BYTES: usize = 192;
 const MAX_REDACTION_SCAN_BYTES: usize = 16 * 1024;
 const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
 const HISTORY_FILTER_STATE_ID: &str = "health-history-severity-filter";
+const HISTORY_COMPONENT_FILTER_STATE_ID: &str = "health-history-component-filter";
 const HISTORY_PAGE_STATE_ID: &str = "health-history-page";
 const SNAPSHOT_AUTHORITY_STATE_ID: &str = "health-snapshot-authority";
 const ACTION_PROGRESS_STATE_ID: &str = "health-action-result-progress";
@@ -57,7 +58,15 @@ enum HistorySeverityFilter {
 struct HistoryPageState {
     node: String,
     filter: HistorySeverityFilter,
+    component: HistoryComponentFilter,
     page: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum HistoryComponentFilter {
+    #[default]
+    All,
+    Component(HealthComponent),
 }
 
 impl HistorySeverityFilter {
@@ -77,6 +86,37 @@ impl HistorySeverityFilter {
             Self::Warning => matches!(severity, HealthSeverity::Warning),
             Self::Critical => matches!(severity, HealthSeverity::Critical),
         }
+    }
+}
+
+impl HistoryComponentFilter {
+    const ALL: [Self; 8] = [
+        Self::All,
+        Self::Component(HealthComponent::System),
+        Self::Component(HealthComponent::Mesh),
+        Self::Component(HealthComponent::Resources),
+        Self::Component(HealthComponent::Devices),
+        Self::Component(HealthComponent::Audio),
+        Self::Component(HealthComponent::Firmware),
+        Self::Component(HealthComponent::Evidence),
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All components",
+            Self::Component(HealthComponent::System) => "System",
+            Self::Component(HealthComponent::Mesh) => "Mesh",
+            Self::Component(HealthComponent::Resources) => "Resources",
+            Self::Component(HealthComponent::Devices) => "Devices",
+            Self::Component(HealthComponent::Audio) => "Audio",
+            Self::Component(HealthComponent::Firmware) => "Firmware",
+            Self::Component(HealthComponent::Evidence) => "Evidence",
+        }
+    }
+
+    fn admits(self, component: HealthComponent) -> bool {
+        matches!(self, Self::All)
+            || matches!(self, Self::Component(expected) if expected == component)
     }
 }
 
@@ -576,12 +616,22 @@ fn detail(
                     }
                 });
             set_history_filter(ui.ctx(), filter);
-            let mut page_state = history_page_state(ui.ctx(), &node, filter);
+            let mut component = history_component_filter(ui.ctx());
+            egui::ComboBox::from_id_salt("health-history-component-filter-combo")
+                .selected_text(component.label())
+                .show_ui(ui, |ui| {
+                    for choice in HistoryComponentFilter::ALL {
+                        ui.selectable_value(&mut component, choice, choice.label());
+                    }
+                });
+            set_history_component_filter(ui.ctx(), component);
+            let mut page_state = history_page_state(ui.ctx(), &node, filter, component);
             let mut history = paged_recurrence_history(
                 &snapshot.resolved_conditions,
                 &node,
                 snapshot.generated_at_ms,
                 filter,
+                component,
                 page_state.page,
             );
             let page_count = history.total.div_ceil(HISTORY_PAGE_SIZE).max(1);
@@ -592,6 +642,7 @@ fn detail(
                     &node,
                     snapshot.generated_at_ms,
                     filter,
+                    component,
                     page_state.page,
                 );
             }
@@ -1868,14 +1919,29 @@ fn history_page_state(
     ctx: &egui::Context,
     node: &str,
     filter: HistorySeverityFilter,
+    component: HistoryComponentFilter,
 ) -> HistoryPageState {
     ctx.data(|data| data.get_temp::<HistoryPageState>(egui::Id::new(HISTORY_PAGE_STATE_ID)))
-        .filter(|state| state.node == node && state.filter == filter)
+        .filter(|state| {
+            state.node == node && state.filter == filter && state.component == component
+        })
         .unwrap_or_else(|| HistoryPageState {
             node: node.to_string(),
             filter,
+            component,
             page: 0,
         })
+}
+
+fn history_component_filter(ctx: &egui::Context) -> HistoryComponentFilter {
+    ctx.data(|data| {
+        data.get_temp::<HistoryComponentFilter>(egui::Id::new(HISTORY_COMPONENT_FILTER_STATE_ID))
+            .unwrap_or_default()
+    })
+}
+
+fn set_history_component_filter(ctx: &egui::Context, filter: HistoryComponentFilter) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(HISTORY_COMPONENT_FILTER_STATE_ID), filter));
 }
 
 fn set_history_page_state(ctx: &egui::Context, state: HistoryPageState) {
@@ -1913,7 +1979,15 @@ fn filtered_recurrence_history<'a>(
     as_of_ms: u64,
     filter: HistorySeverityFilter,
 ) -> Vec<HistoryRecurrence<'a>> {
-    paged_recurrence_history(conditions, node, as_of_ms, filter, 0).rows
+    paged_recurrence_history(
+        conditions,
+        node,
+        as_of_ms,
+        filter,
+        HistoryComponentFilter::All,
+        0,
+    )
+    .rows
 }
 
 fn paged_recurrence_history<'a>(
@@ -1921,12 +1995,14 @@ fn paged_recurrence_history<'a>(
     node: &str,
     as_of_ms: u64,
     filter: HistorySeverityFilter,
+    component: HistoryComponentFilter,
     page: usize,
 ) -> HistoryPage<'a> {
     let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
     let applies_to_page = |condition: &HealthCondition| {
         matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
             && filter.admits(condition.severity)
+            && component.admits(condition.component)
             && !condition.is_active()
             && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
                 (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
@@ -2703,8 +2779,14 @@ mod tests {
             conditions.push(resolved);
         }
 
-        let second =
-            paged_recurrence_history(&conditions, "node", 100_000, HistorySeverityFilter::All, 1);
+        let second = paged_recurrence_history(
+            &conditions,
+            "node",
+            100_000,
+            HistorySeverityFilter::All,
+            HistoryComponentFilter::All,
+            1,
+        );
         assert_eq!(second.total, 19);
         assert_eq!(second.rows.len(), HISTORY_PAGE_SIZE);
         assert_eq!(second.rows[0].condition.id, "node:resolved-10");
@@ -2714,6 +2796,7 @@ mod tests {
             "node",
             100_000,
             HistorySeverityFilter::All,
+            HistoryComponentFilter::All,
             2,
         );
         assert_eq!(stale_page.total, 3);
@@ -2723,9 +2806,68 @@ mod tests {
             "node",
             100_000,
             HistorySeverityFilter::All,
+            HistoryComponentFilter::All,
             0,
         );
         assert_eq!(clamped.rows.len(), 3);
+    }
+
+    #[test]
+    fn history_component_and_severity_filters_compose_before_paging() {
+        let mut conditions = Vec::new();
+        for index in 0..32 {
+            let mut resolved = condition(
+                &format!("node:resolved-{index:02}"),
+                "node",
+                if index % 2 == 0 {
+                    HealthSeverity::Critical
+                } else {
+                    HealthSeverity::Warning
+                },
+                if index % 4 < 2 {
+                    HealthComponent::Devices
+                } else {
+                    HealthComponent::Audio
+                },
+            );
+            resolved.resolved_at_ms = Some(2_000 + index);
+            conditions.push(resolved);
+        }
+
+        let page = paged_recurrence_history(
+            &conditions,
+            "node",
+            100_000,
+            HistorySeverityFilter::Critical,
+            HistoryComponentFilter::Component(HealthComponent::Devices),
+            0,
+        );
+        assert_eq!(page.total, 8, "the intersection is counted before paging");
+        assert_eq!(page.rows.len(), HISTORY_PAGE_SIZE);
+        assert!(page.rows.iter().all(|recurrence| {
+            recurrence.condition.severity == HealthSeverity::Critical
+                && recurrence.condition.component == HealthComponent::Devices
+        }));
+
+        let ctx = egui::Context::default();
+        let stale = HistoryPageState {
+            node: "node".into(),
+            filter: HistorySeverityFilter::Critical,
+            component: HistoryComponentFilter::Component(HealthComponent::Audio),
+            page: 3,
+        };
+        set_history_page_state(&ctx, stale);
+        assert_eq!(
+            history_page_state(
+                &ctx,
+                "node",
+                HistorySeverityFilter::Critical,
+                HistoryComponentFilter::Component(HealthComponent::Devices),
+            )
+            .page,
+            0,
+            "changing the component dimension resets stale page authority"
+        );
     }
 
     #[test]
