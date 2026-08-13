@@ -342,6 +342,27 @@ impl RdpSession {
         std::mem::take(&mut self.pending)
     }
 
+    /// Start a newly authenticated transport generation without carrying any
+    /// one-use state from the retired connection into it.
+    ///
+    /// A disconnect can race queued operator input: replaying an old click,
+    /// key transition, or synthesized held modifier after reconnect could act
+    /// on a different Windows screen. Likewise, retaining the old framebuffer
+    /// would let the shell display pixels that the replacement transport has
+    /// not produced. The live connector calls this after the new handshake has
+    /// succeeded and before granting it focus.
+    pub(crate) fn begin_connection_generation(&mut self) {
+        self.pending.clear();
+        self.modifiers = ModifierState::default();
+        self.pointer = (0, 0);
+        self.framebuffer = Framebuffer::new(
+            usize::from(self.config.width),
+            usize::from(self.config.height),
+        );
+        self.dirty = true;
+        self.damage.mark_full();
+    }
+
     // ── Adaptive quality (E12-10) ───────────────────────────────────────────
     //
     // RDP negotiates its encoding surface at connect time only (see
@@ -683,6 +704,62 @@ mod tests {
             }
         ));
         assert_eq!(s.pointer_position(), (1, 0));
+    }
+
+    #[test]
+    fn replacement_connection_cannot_replay_retired_input_or_pixels() {
+        let mut s = session();
+        let _ = s.frame_with_damage();
+        s.apply_rect(0, 0, 1, 1, PixelFormat::Rgba, &[0xFF, 0, 0, 0xFF], 4)
+            .expect("old generation paint");
+        s.send_input(&Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        });
+        s.send_input(&Event::PointerMoved(Pos2::new(91.0, 37.0)));
+        assert!(!s.pending_input().is_empty());
+
+        s.begin_connection_generation();
+
+        assert!(
+            s.pending_input().is_empty(),
+            "retired input must not become authority on the replacement desktop"
+        );
+        assert_eq!(s.pointer_position(), (0, 0));
+        let (frame, damage) = s.frame_with_damage().expect("replacement blank frame");
+        assert_eq!(damage, mde_vdi_core::FrameDamage::Full);
+        assert!(
+            frame
+                .pixels
+                .iter()
+                .all(|pixel| *pixel == crate::egui::Color32::BLACK),
+            "old Windows pixels must remain hidden until replacement transport paint"
+        );
+
+        s.send_input(&Event::Key {
+            key: Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(
+            s.take_input(),
+            vec![RdpInputEvent::Key {
+                scancode: Scancode {
+                    code: 0x30,
+                    extended: false,
+                },
+                down: true,
+            }],
+            "retired Ctrl state must not contaminate first replacement input"
+        );
     }
 
     // ── Adaptive quality (E12-10) ───────────────────────────────────────────

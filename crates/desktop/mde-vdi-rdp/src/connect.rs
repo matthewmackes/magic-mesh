@@ -706,6 +706,11 @@ impl RdpConnection {
             first_input_focus_pending: true,
         };
 
+        // This handshake authenticates a new transport generation. Discard
+        // queued one-use input and pixels owned by the retired connection
+        // before the replacement can receive focus or publish a frame.
+        session.begin_connection_generation();
+
         // Finalization grants protocol control, but mstsc and FreeRDP also
         // focus the new input owner before forwarding operator events. Without
         // this post-grant sequence, xrdp paints the Xorg desktop yet can leave
