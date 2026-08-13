@@ -13,6 +13,19 @@
 use super::*;
 
 const INSTALLED_MACKESD_EXECUTABLE: &str = "/usr/bin/mackesd";
+const COLLABORATION_IDENTITY_ADMISSION: &str =
+    "/var/lib/mackesd/collaboration-identity-admission.json";
+
+fn admitted_collaboration_signer(node_id: &str) -> std::io::Result<ed25519_dalek::SigningKey> {
+    let node = node_id.strip_prefix("peer:").unwrap_or(node_id);
+    mackesd_core::node_key::load_collaboration_admitted(
+        std::path::Path::new(mackesd_core::node_key::DEFAULT_KEY_PATH),
+        std::path::Path::new(COLLABORATION_IDENTITY_ADMISSION),
+        &format!("peer:{node}"),
+        "system:mackesd",
+        mde_theme::brand::build::info().git_hash,
+    )
+}
 
 /// Bind worker authority to the installed executable inode, not merely to
 /// attacker-controlled argv text.  In particular, an old process whose binary
@@ -3643,9 +3656,7 @@ pub(crate) fn spawn_messaging_sync_workers(
     // NOTE (E12-20 storage worker adds its own spawn line to this block —
     // keep-both merge expected).
     if mackesd_core::worker_role::runs("chat", role_rank) {
-        match mackesd_core::node_key::load_or_create(std::path::Path::new(
-            mackesd_core::node_key::DEFAULT_KEY_PATH,
-        )) {
+        match admitted_collaboration_signer(&node_id) {
             Ok(signing_key) => {
                 let self_host = node_id
                     .strip_prefix("peer:")
@@ -3662,7 +3673,7 @@ pub(crate) fn spawn_messaging_sync_workers(
             Err(e) => tracing::warn!(
                 target: "mackesd::chat",
                 error = %e,
-                "chat worker: node signing key unavailable; not spawning",
+                "chat worker: governed collaboration identity unavailable; not spawning",
             ),
         }
     }
@@ -3679,9 +3690,7 @@ pub(crate) fn spawn_messaging_sync_workers(
     // (Phase 4; it runs ALONGSIDE chat for now) — every node, headless included,
     // participates. Same persisted node identity + bare-hostname actor as chat.
     if mackesd_core::worker_role::runs("collab", role_rank) {
-        match mackesd_core::node_key::load_or_create(std::path::Path::new(
-            mackesd_core::node_key::DEFAULT_KEY_PATH,
-        )) {
+        match admitted_collaboration_signer(&node_id) {
             Ok(signing_key) => {
                 let self_host = node_id
                     .strip_prefix("peer:")
@@ -3698,7 +3707,7 @@ pub(crate) fn spawn_messaging_sync_workers(
             Err(e) => tracing::warn!(
                 target: "mackesd::collab",
                 error = %e,
-                "collab worker: node signing key unavailable; not spawning",
+                "collab worker: governed collaboration identity unavailable; not spawning",
             ),
         }
     }
@@ -3830,6 +3839,25 @@ pub(crate) fn spawn_messaging_sync_workers(
 mod process_group_thread_admission_tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn chat_and_collaboration_share_the_release_identity_startup_gate() {
+        let source = include_str!("spawn.rs");
+        let gate_marker = ["match admitted_collaboration_signer", "(&node_id)"].concat();
+        assert_eq!(
+            source.matches(&gate_marker).count(),
+            2,
+            "Chat and Collaboration must both fail closed through one identity gate"
+        );
+        let start = source.find("// NOTIFY-CHAT-2").expect("Chat startup block");
+        let end = source
+            .find("// CHAT-FIX-2")
+            .expect("end of Collaboration startup block");
+        assert!(
+            !source[start..end].contains("node_key::load_or_create"),
+            "authenticated publication must not bypass the release admission gate"
+        );
+    }
 
     #[test]
     fn replaced_installed_executable_cannot_repopulate_worker_group_after_restart() {

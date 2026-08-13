@@ -1,0 +1,15 @@
+[Unit]
+Description=Admit the governed Collaboration identity before authenticated publication
+Documentation=https://github.com/matthewmackes/magic-mesh
+Wants=network-online.target
+After=network-online.target
+Before=mackesd.target mackesd-control.service mackesd-observation.service mackesd-actions.service mackesd-data.service mackesd-compute.service mackesd-integrations.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/timeout --signal=TERM --kill-after=5s 45s /usr/libexec/mackesd/materialize-collaboration-identity.py --receipt /etc/mcnf/release-inputs/collaboration/collaboration-identity-receipt.json --signature /etc/mcnf/release-inputs/collaboration/collaboration-identity-receipt.json.asc --release-public-key /etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh --node peer:%H
+TimeoutStartSec=55s
+RemainAfterExit=yes
+
+[Install]
+WantedBy=mackesd.target

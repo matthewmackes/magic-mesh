@@ -11,11 +11,132 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 /// Default on-disk location.
 pub const DEFAULT_KEY_PATH: &str = "/var/lib/mackesd/node-signing.key";
 
 const NODE_SEED_BYTES: usize = 32;
+
+/// Installed, non-secret proof that the collaboration identity was admitted by
+/// the governed release materializer. The detached release signature is
+/// verified before this marker is emitted; runtime re-attests every field that
+/// can change after materialization before granting publication authority.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationIdentityAdmission {
+    schema_version: u8,
+    kind: String,
+    public_key_hex: String,
+    source_revision: String,
+    target_node: String,
+    target_user: String,
+    seed_sha256: String,
+}
+
+/// Load the persisted signer only when its governed Collaboration admission
+/// still matches this executable, node, user, and exact Ed25519 public key.
+pub fn load_collaboration_admitted(
+    key_path: &Path,
+    admission_path: &Path,
+    expected_node: &str,
+    expected_user: &str,
+    expected_revision: &str,
+) -> io::Result<SigningKey> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(admission_path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || (!cfg!(test) && metadata.uid() != 0)
+        || metadata.permissions().mode() & 0o377 != 0
+        || metadata.len() > 4096
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "collaboration identity admission is not a root-owned 0400 regular file",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    options.custom_flags(0o400_000 | 0o4_000 | 0o2_000_000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+    let mut file = options.open(admission_path)?;
+    let opened = file.metadata()?;
+    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "collaboration identity admission was replaced while being opened",
+        ));
+    }
+    let mut body = Vec::with_capacity(4097);
+    (&mut file).take(4097).read_to_end(&mut body)?;
+    let after = file.metadata()?;
+    let current = std::fs::symlink_metadata(admission_path)?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.len() != opened.len()
+        || after.mtime() != opened.mtime()
+        || after.mtime_nsec() != opened.mtime_nsec()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || current.len() != metadata.len()
+        || current.mtime() != metadata.mtime()
+        || current.mtime_nsec() != metadata.mtime_nsec()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "collaboration identity admission changed while being read",
+        ));
+    }
+    let admission: CollaborationIdentityAdmission = serde_json::from_slice(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let exact_hex = |value: &str, bytes: usize| {
+        value.len() == bytes * 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if admission.schema_version != 1
+        || admission.kind != "mcnf-collaboration-identity-admission"
+        || admission.target_node != expected_node
+        || admission.target_user != expected_user
+        || admission.source_revision != expected_revision
+        || !exact_hex(&admission.public_key_hex, 32)
+        || !exact_hex(&admission.seed_sha256, 32)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "collaboration identity admission is stale, malformed, or out of scope",
+        ));
+    }
+    let seed = read_existing_seed(key_path)?;
+    let actual_seed_sha256 = Sha256::digest(seed)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_seed_sha256 != admission.seed_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "collaboration identity seed does not match the admitted SecretStore material",
+        ));
+    }
+    let key = SigningKey::from_bytes(&seed);
+    let actual_public = key
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_public != admission.public_key_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "collaboration identity does not match the admitted public key",
+        ));
+    }
+    Ok(key)
+}
 
 /// Validate every existing parent component before opening or creating the
 /// identity leaf. `O_NOFOLLOW` protects only the final leaf; a symlinked
@@ -171,6 +292,7 @@ pub fn load_or_create(path: &Path) -> io::Result<SigningKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn key_is_created_once_and_stable_across_loads() {
@@ -185,6 +307,74 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "sealed perms");
         }
+    }
+
+    #[test]
+    fn collaboration_signer_requires_exact_release_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("node-signing.key");
+        let admission_path = tmp.path().join("collaboration-admission.json");
+        let key = load_or_create(&key_path).unwrap();
+        let public = key
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let revision = "a".repeat(40);
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "kind": "mcnf-collaboration-identity-admission",
+            "public_key_hex": public,
+            "seed_sha256": Sha256::digest(key.to_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "source_revision": revision,
+            "target_node": "peer:seat-a",
+            "target_user": "system:mackesd"
+        });
+        std::fs::write(&admission_path, serde_json::to_vec(&body).unwrap()).unwrap();
+        std::fs::set_permissions(&admission_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        load_collaboration_admitted(
+            &key_path,
+            &admission_path,
+            "peer:seat-a",
+            "system:mackesd",
+            &revision,
+        )
+        .expect("exact release admission grants signer authority");
+
+        for (node, user, source) in [
+            ("peer:seat-b", "system:mackesd", revision.as_str()),
+            ("peer:seat-a", "user:mm", revision.as_str()),
+            (
+                "peer:seat-a",
+                "system:mackesd",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            ),
+        ] {
+            assert!(
+                load_collaboration_admitted(&key_path, &admission_path, node, user, source,)
+                    .is_err()
+            );
+        }
+        std::fs::write(&key_path, [9_u8; NODE_SEED_BYTES]).unwrap();
+        assert!(load_collaboration_admitted(
+            &key_path,
+            &admission_path,
+            "peer:seat-a",
+            "system:mackesd",
+            &revision,
+        )
+        .is_err());
+        std::fs::write(&key_path, key.to_bytes()).unwrap();
+        std::fs::set_permissions(&admission_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_collaboration_admitted(
+            &key_path,
+            &admission_path,
+            "peer:seat-a",
+            "system:mackesd",
+            &revision,
+        )
+        .is_err());
     }
 
     #[test]
