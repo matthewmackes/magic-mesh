@@ -48,6 +48,10 @@ struct ImageFingerprint {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +336,10 @@ fn image_fingerprint(path: &Path) -> io::Result<ImageFingerprint> {
         device: metadata.dev(),
         #[cfg(unix)]
         inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
     })
 }
 
@@ -559,5 +567,41 @@ mod tests {
             std::os::unix::fs::symlink(&image, temp.path().join("link.img")).unwrap();
             assert!(probe.image_digest(&temp.path().join("link.img")).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_image_probe_invalidates_cache_after_same_inode_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("android.img");
+        fs::write(&image, b"signed-image-one").unwrap();
+        let original_metadata = fs::metadata(&image).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        let original_accessed = original_metadata.accessed().unwrap();
+        let probe = ProductionAndroidHostProbe::default();
+        let original_digest = probe.image_digest(&image).unwrap();
+
+        // Preserve every attacker-controlled cache key: path, inode, length,
+        // and mtime.  Linux ctime still advances for this in-place rewrite and
+        // must invalidate the previously admitted signed-image digest.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&image, b"hostile-image-two").unwrap();
+        File::options()
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(original_accessed)
+                    .set_modified(original_modified),
+            )
+            .unwrap();
+
+        let replacement_digest = probe.image_digest(&image).unwrap();
+        assert_ne!(replacement_digest, original_digest);
+        assert_eq!(
+            replacement_digest,
+            format!("sha256:{:x}", Sha256::digest(b"hostile-image-two"))
+        );
     }
 }
