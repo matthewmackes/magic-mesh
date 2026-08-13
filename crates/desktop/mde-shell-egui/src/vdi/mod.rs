@@ -57,7 +57,10 @@ use {
     mde_bus::hooks::config::Priority,
     mde_collab_types::{ClipboardClipBody, ClipboardUnavailableReason},
     mde_vdi_rdp::{
-        clipboard::{RemoteClipboardImage, RemoteClipboardImageFormat},
+        clipboard::{
+            RemoteClipboardFileChunk, RemoteClipboardFileList, RemoteClipboardImage,
+            RemoteClipboardImageFormat,
+        },
         ConnectError, PumpOutcome, RdpConfig, RdpConnection,
     },
     mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
@@ -433,6 +436,10 @@ const fn request_focus_surface(_request: &ConnectRequest) -> SessionFocusSurface
 enum LiveRdpEvent {
     Connected(String),
     ClipboardPublished,
+    ClipboardFilesMaterialized {
+        count: usize,
+        destination: String,
+    },
     ClipboardRefused(RdpGuestImageRefusal),
     /// The host's TLS certificate changed since it was pinned (vdi-vm-6) — a
     /// non-fatal MITM warning; the session stays live (the Nebula link is the
@@ -930,6 +937,7 @@ fn vdi_clipboard_lease(
     let generation = next_vdi_clipboard_generation(now_ms);
     let permitted_mime_offers = if protocol.eq_ignore_ascii_case("rdp") {
         vec![
+            VDI_GUEST_FILES_MIME.into(),
             "image/png".into(),
             "image/jpeg".into(),
             "text/html;charset=utf-8".into(),
@@ -1135,6 +1143,303 @@ enum RdpClipboardPayload {
     Text(String),
     Html(String),
     Image,
+}
+
+#[cfg(feature = "live-vdi")]
+const VDI_GUEST_FILES_INGEST_SOCKET: &str = "vdi-clipboard-guest-files.sock";
+#[cfg(feature = "live-vdi")]
+const VDI_GUEST_FILES_PACKET_BYTES: usize = 384 * 1024;
+#[cfg(feature = "live-vdi")]
+const VDI_GUEST_FILES_MIME: &str = "application/x-mde-file-list";
+
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RdpGuestFileMetadata {
+    name: String,
+    relative_path: Option<String>,
+    size: u64,
+}
+
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum RdpGuestFilesRequest {
+    Begin {
+        transaction_id: String,
+        session_id: String,
+        files: Vec<RdpGuestFileMetadata>,
+        total_bytes: u64,
+    },
+    Chunk {
+        transaction_id: String,
+        file_index: usize,
+        offset: u64,
+        data_base64: String,
+        complete: bool,
+    },
+    Commit {
+        transaction_id: String,
+    },
+    Cancel {
+        transaction_id: String,
+    },
+}
+
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum RdpGuestFilesResponse {
+    Ready {
+        transaction_id: String,
+        next_file_index: usize,
+        next_offset: u64,
+    },
+    Staged {
+        transaction_id: String,
+        content_hash: String,
+        byte_count: u64,
+        files_reference: String,
+    },
+    Committed {
+        transaction_id: String,
+        destination: String,
+        file_count: usize,
+    },
+    Cancelled {
+        transaction_id: String,
+    },
+    Refused {
+        transaction_id: String,
+        reason: String,
+    },
+}
+
+#[cfg(feature = "live-vdi")]
+struct RdpGuestFilesTransfer {
+    transaction_id: String,
+    files: Vec<RdpGuestFileMetadata>,
+    total_bytes: u64,
+    next_file_index: usize,
+    staged_message: Option<VdiClipboardMessageV2>,
+    permission: Option<ClipboardGateTicket>,
+}
+
+#[cfg(feature = "live-vdi")]
+impl RdpGuestFilesTransfer {
+    fn from_list(
+        root: &Path,
+        lease: &VdiClipboardLeaseV2,
+        list: &RemoteClipboardFileList,
+    ) -> Result<Self, String> {
+        let files = list
+            .files()
+            .iter()
+            .map(|file| RdpGuestFileMetadata {
+                name: file.name().to_owned(),
+                relative_path: file.relative_path().map(str::to_owned),
+                size: file.size(),
+            })
+            .collect::<Vec<_>>();
+        let total_bytes = files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size)
+                .ok_or_else(|| "RDP guest file aggregate overflow".to_owned())
+        })?;
+        let transaction_id = uuid::Uuid::new_v4().simple().to_string();
+        let response = rdp_guest_files_authority_request(
+            root,
+            &RdpGuestFilesRequest::Begin {
+                transaction_id: transaction_id.clone(),
+                session_id: lease.session_id.clone(),
+                files: files.clone(),
+                total_bytes,
+            },
+        )?;
+        match response {
+            RdpGuestFilesResponse::Ready {
+                transaction_id: returned,
+                next_file_index: 0,
+                next_offset: 0,
+            } if returned == transaction_id => Ok(Self {
+                transaction_id,
+                files,
+                total_bytes,
+                next_file_index: 0,
+                staged_message: None,
+                permission: None,
+            }),
+            RdpGuestFilesResponse::Refused { reason, .. } => {
+                Err(format!("Files authority refused RDP guest files: {reason}"))
+            }
+            _ => Err("Files authority returned an invalid begin acknowledgement".into()),
+        }
+    }
+
+    fn stage_chunk(
+        &mut self,
+        root: &Path,
+        chunk: &RemoteClipboardFileChunk,
+    ) -> Result<Option<(String, u64, String)>, String> {
+        use base64::Engine as _;
+        if chunk.file_index() != self.next_file_index {
+            return Err("RDP guest file chunk crossed the active file boundary".into());
+        }
+        let response = rdp_guest_files_authority_request(
+            root,
+            &RdpGuestFilesRequest::Chunk {
+                transaction_id: self.transaction_id.clone(),
+                file_index: chunk.file_index(),
+                offset: chunk.offset(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(chunk.data()),
+                complete: chunk.is_complete(),
+            },
+        )?;
+        match response {
+            RdpGuestFilesResponse::Ready {
+                transaction_id,
+                next_file_index,
+                next_offset: 0,
+            } if transaction_id == self.transaction_id
+                && chunk.is_complete()
+                && next_file_index == self.next_file_index.saturating_add(1) =>
+            {
+                self.next_file_index = next_file_index;
+                Ok(None)
+            }
+            RdpGuestFilesResponse::Ready {
+                transaction_id,
+                next_file_index,
+                next_offset,
+            } if transaction_id == self.transaction_id
+                && !chunk.is_complete()
+                && next_file_index == self.next_file_index
+                && next_offset == chunk.offset().saturating_add(chunk.data().len() as u64) =>
+            {
+                Ok(None)
+            }
+            RdpGuestFilesResponse::Staged {
+                transaction_id,
+                content_hash,
+                byte_count,
+                files_reference,
+            } if transaction_id == self.transaction_id
+                && chunk.is_complete()
+                && byte_count == self.total_bytes =>
+            {
+                self.next_file_index = self.files.len();
+                Ok(Some((content_hash, byte_count, files_reference)))
+            }
+            RdpGuestFilesResponse::Refused { reason, .. } => {
+                Err(format!("Files authority refused RDP guest chunk: {reason}"))
+            }
+            _ => Err("Files authority returned an invalid chunk acknowledgement".into()),
+        }
+    }
+
+    fn cancel(&self, root: &Path) {
+        let _ = rdp_guest_files_authority_request(
+            root,
+            &RdpGuestFilesRequest::Cancel {
+                transaction_id: self.transaction_id.clone(),
+            },
+        );
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+fn rdp_guest_files_authority_request(
+    root: &Path,
+    request: &RdpGuestFilesRequest,
+) -> Result<RdpGuestFilesResponse, String> {
+    use rustix::net::{
+        connect_unix, recv, send, socket_with, AddressFamily, RecvFlags, SendFlags, SocketAddrUnix,
+        SocketFlags, SocketType,
+    };
+    use std::os::unix::net::UnixStream;
+
+    let body = serde_json::to_vec(request)
+        .map_err(|_| "RDP guest Files request encoding failed".to_owned())?;
+    if body.is_empty() || body.len() > VDI_GUEST_FILES_PACKET_BYTES {
+        return Err("RDP guest Files request exceeded its packet bound".into());
+    }
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|error| format!("RDP guest Files socket failed: {error}"))?;
+    connect_unix(
+        &socket,
+        &SocketAddrUnix::new(root.join(VDI_GUEST_FILES_INGEST_SOCKET))
+            .map_err(|error| format!("RDP guest Files address failed: {error}"))?,
+    )
+    .map_err(|error| format!("RDP guest Files authority unavailable: {error}"))?;
+    let stream: UnixStream = socket.into();
+    let peer = rustix::net::sockopt::get_socket_peercred(&stream)
+        .map_err(|error| format!("RDP guest Files credentials failed: {error}"))?;
+    if peer.uid.as_raw() != 0 {
+        return Err("RDP guest Files endpoint is not the root daemon authority".into());
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("RDP guest Files timeout failed: {error}"))?;
+    let sent = send(&stream, &body, SendFlags::empty())
+        .map_err(|error| format!("RDP guest Files request failed: {error}"))?;
+    if sent != body.len() {
+        return Err("RDP guest Files request was short".into());
+    }
+    let mut response = vec![0_u8; VDI_GUEST_FILES_PACKET_BYTES + 1];
+    let received = recv(&stream, &mut response, RecvFlags::empty())
+        .map_err(|error| format!("RDP guest Files response failed: {error}"))?;
+    if received == 0 || received > VDI_GUEST_FILES_PACKET_BYTES {
+        return Err("RDP guest Files response exceeded its packet bound".into());
+    }
+    serde_json::from_slice(&response[..received])
+        .map_err(|_| "RDP guest Files response was malformed".into())
+}
+
+#[cfg(feature = "live-vdi")]
+fn rdp_guest_files_clipboard_message(
+    lease: &VdiClipboardLeaseV2,
+    message_sequence: u64,
+    file_count: usize,
+    content_hash: String,
+    byte_count: u64,
+    files_reference: String,
+    now_ms: u64,
+) -> Result<VdiClipboardMessageV2, String> {
+    let expires_at_ms = now_ms.saturating_add(60_000).min(lease.expires_at_ms);
+    let envelope = ClipboardEnvelopeV2::new_files(
+        "vdi-guest",
+        "rdp",
+        lease.session_id.clone(),
+        message_sequence,
+        now_ms,
+        vec![VDI_GUEST_FILES_MIME.into()],
+        format!("{file_count} guest file(s)"),
+        content_hash,
+        byte_count,
+        files_reference,
+        expires_at_ms,
+    )
+    .map_err(|error| format!("RDP guest Files envelope refused: {error}"))?;
+    let message = VdiClipboardMessageV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: lease.session_id.clone(),
+        generation: lease.generation,
+        lease_id: lease.lease_id.clone(),
+        lease_expires_at_ms: lease.expires_at_ms,
+        message_sequence,
+        selected_mime: VDI_GUEST_FILES_MIME.into(),
+        disclosure: VdiClipboardDisclosureV2::Shareable,
+        envelope,
+    };
+    message
+        .admit(lease, None, now_ms)
+        .map_err(|error| format!("RDP guest Files message refused: {error}"))?;
+    Ok(message)
 }
 
 /// Typed, non-fatal refusal for a validated guest image that cannot yet enter
@@ -1791,18 +2096,125 @@ fn run_live_rdp(
         ClipboardGateTicket,
     )>;
     let mut pending_guest_clipboard = None::<(Option<ClipboardClipBody>, VdiClipboardMessageV2)>;
+    let mut guest_files_transfer = None::<RdpGuestFilesTransfer>;
     let mut guest_message_sequence = 0_u64;
 
     loop {
         if stop_rx.try_recv().is_ok() {
+            if let (Some(root), Some(transfer)) =
+                (clipboard_root.as_deref(), guest_files_transfer.as_ref())
+            {
+                transfer.cancel(root);
+            }
             let _ = conn.shutdown(&mut session);
             return;
         }
 
         let now_ms = unix_time_ms();
+        if let Some(mut transfer) = guest_files_transfer.take() {
+            let mut retain = true;
+            if transfer.permission.is_none() {
+                if let (Some(message), Some(ingress), Ok(target)) = (
+                    transfer.staged_message.as_ref(),
+                    clipboard_permissions.as_ref(),
+                    ClipboardTarget::new(
+                        ClipboardTargetKind::LocalSeat,
+                        clipboard_lease.session_id.clone(),
+                    ),
+                ) {
+                    match ingress.submit_vdi(message, &clipboard_lease, None, target, now_ms) {
+                        Ok(ticket) => transfer.permission = Some(ticket),
+                        Err(crate::clipboard_permissions::ClipboardPermissionError::Busy) => {}
+                        Err(error) => {
+                            if let Some(root) = clipboard_root.as_deref() {
+                                transfer.cancel(root);
+                            }
+                            let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                                "RDP guest Files permission refused: {error:?}"
+                            )));
+                            retain = false;
+                        }
+                    }
+                } else if transfer.staged_message.is_some() {
+                    if let Some(root) = clipboard_root.as_deref() {
+                        transfer.cancel(root);
+                    }
+                    let _ = event_tx.send(LiveRdpEvent::Error(
+                        "RDP guest Files refused: clipboard permission authority is unavailable"
+                            .into(),
+                    ));
+                    retain = false;
+                }
+            }
+            if let Some(ticket) = transfer.permission.as_ref() {
+                match ticket.try_begin_materialization() {
+                    ClipboardGateReadiness::Pending => {}
+                    ClipboardGateReadiness::Refused => {
+                        if let Some(root) = clipboard_root.as_deref() {
+                            transfer.cancel(root);
+                        }
+                        retain = false;
+                    }
+                    ClipboardGateReadiness::Materialize => {
+                        let result = clipboard_root
+                            .as_deref()
+                            .ok_or_else(|| "VDI clipboard Bus root is unavailable".to_owned())
+                            .and_then(|root| {
+                                let response = rdp_guest_files_authority_request(
+                                    root,
+                                    &RdpGuestFilesRequest::Commit {
+                                        transaction_id: transfer.transaction_id.clone(),
+                                    },
+                                )?;
+                                match response {
+                                    RdpGuestFilesResponse::Committed {
+                                        transaction_id,
+                                        destination,
+                                        file_count,
+                                    } if transaction_id == transfer.transaction_id
+                                        && file_count == transfer.files.len() =>
+                                    {
+                                        let message = transfer.staged_message.as_ref().ok_or_else(
+                                            || "RDP guest Files message disappeared".to_owned(),
+                                        )?;
+                                        try_publish_vdi_clipboard_event(Some(root), None, message)?;
+                                        Ok((destination, file_count))
+                                    }
+                                    RdpGuestFilesResponse::Refused { reason, .. } => Err(format!(
+                                        "Files authority refused RDP guest commit: {reason}"
+                                    )),
+                                    _ => Err(
+                                        "Files authority returned an invalid commit acknowledgement"
+                                            .into(),
+                                    ),
+                                }
+                            });
+                        match result {
+                            Ok((destination, count)) => {
+                                ticket.report_progress(transfer.total_bytes);
+                                ticket.report_complete(now_ms);
+                                let _ = event_tx.send(LiveRdpEvent::ClipboardFilesMaterialized {
+                                    count,
+                                    destination,
+                                });
+                            }
+                            Err(error) => {
+                                ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                                let _ = event_tx.send(LiveRdpEvent::Error(error));
+                            }
+                        }
+                        retain = false;
+                    }
+                }
+            }
+            if retain {
+                guest_files_transfer = Some(transfer);
+            }
+        }
         if gated_host_clipboard.is_none()
             && gated_guest_clipboard.is_none()
             && pending_guest_clipboard.is_none()
+            && guest_files_transfer.is_none()
             && now_ms.saturating_add(30_000) >= clipboard_lease.expires_at_ms
         {
             match renew_vdi_clipboard_lease("rdp", &clipboard_lease, now_ms) {
@@ -1852,6 +2264,11 @@ fn run_live_rdp(
                         {
                             ticket.report_failure(ClipboardFailure::Transport, now_ms);
                             let _ = event_tx.send(LiveRdpEvent::Error(error));
+                            if let (Some(root), Some(transfer)) =
+                                (clipboard_root.as_deref(), guest_files_transfer.as_ref())
+                            {
+                                transfer.cancel(root);
+                            }
                             return;
                         }
                     }
@@ -1862,6 +2279,11 @@ fn run_live_rdp(
                     let _ = event_tx.send(LiveRdpEvent::Error(format!(
                         "RDP host clipboard refused: {error}"
                     )));
+                    if let (Some(root), Some(transfer)) =
+                        (clipboard_root.as_deref(), guest_files_transfer.as_ref())
+                    {
+                        transfer.cancel(root);
+                    }
                     return;
                 }
             }
@@ -1964,6 +2386,11 @@ fn run_live_rdp(
         if had_input {
             if let Err(e) = conn.flush_input(&mut session) {
                 let _ = event_tx.send(LiveRdpEvent::Error(format!("RDP input failed: {e}")));
+                if let (Some(root), Some(transfer)) =
+                    (clipboard_root.as_deref(), guest_files_transfer.as_ref())
+                {
+                    transfer.cancel(root);
+                }
                 return;
             }
         }
@@ -1979,15 +2406,126 @@ fn run_live_rdp(
             Ok(PumpOutcome::TimedOut) => {}
             Ok(PumpOutcome::Terminated { reason }) => {
                 let _ = event_tx.send(LiveRdpEvent::Ended(reason));
+                if let (Some(root), Some(transfer)) =
+                    (clipboard_root.as_deref(), guest_files_transfer.as_ref())
+                {
+                    transfer.cancel(root);
+                }
                 return;
             }
             Err(e) => {
                 let _ = event_tx.send(LiveRdpEvent::Error(format!("RDP pump failed: {e}")));
+                if let (Some(root), Some(transfer)) =
+                    (clipboard_root.as_deref(), guest_files_transfer.as_ref())
+                {
+                    transfer.cancel(root);
+                }
                 return;
             }
         }
 
         if gated_guest_clipboard.is_none() && pending_guest_clipboard.is_none() {
+            if guest_files_transfer.is_none() {
+                if let Some(file_list) = conn.take_guest_file_list() {
+                    match (clipboard_root.as_deref(), file_list) {
+                        (Some(root), Ok(file_list)) => {
+                            match RdpGuestFilesTransfer::from_list(
+                                root,
+                                &clipboard_lease,
+                                &file_list,
+                            ) {
+                                Ok(transfer) => {
+                                    if let Err(error) = conn.begin_guest_file_retrieval(0) {
+                                        transfer.cancel(root);
+                                        let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                                            "RDP guest file retrieval refused: {error}"
+                                        )));
+                                    } else {
+                                        guest_files_transfer = Some(transfer);
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = event_tx.send(LiveRdpEvent::Error(error));
+                                }
+                            }
+                        }
+                        (_, Err(error)) => {
+                            let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                                "RDP guest file list refused: {error}"
+                            )));
+                        }
+                        (None, Ok(_)) => {
+                            let _ = event_tx.send(LiveRdpEvent::Error(
+                                "RDP guest files refused: Files authority root is unavailable"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let (Some(root), Some(mut transfer)) =
+                (clipboard_root.as_deref(), guest_files_transfer.take())
+            {
+                let mut retain = true;
+                if transfer.staged_message.is_none() {
+                    if let Some(chunk_result) = conn.take_guest_file_chunk() {
+                        match chunk_result {
+                            Ok(chunk) => match transfer.stage_chunk(root, &chunk) {
+                                Ok(Some((content_hash, byte_count, files_reference))) => {
+                                    guest_message_sequence =
+                                        guest_message_sequence.saturating_add(1);
+                                    match rdp_guest_files_clipboard_message(
+                                        &clipboard_lease,
+                                        guest_message_sequence,
+                                        transfer.files.len(),
+                                        content_hash,
+                                        byte_count,
+                                        files_reference,
+                                        now_ms,
+                                    ) {
+                                        Ok(message) => transfer.staged_message = Some(message),
+                                        Err(error) => {
+                                            transfer.cancel(root);
+                                            let _ = event_tx.send(LiveRdpEvent::Error(error));
+                                            retain = false;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    if chunk.is_complete()
+                                        && transfer.next_file_index < transfer.files.len()
+                                    {
+                                        if let Err(error) = conn
+                                            .begin_guest_file_retrieval(transfer.next_file_index)
+                                        {
+                                            transfer.cancel(root);
+                                            let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                                                "RDP guest file retrieval refused: {error}"
+                                            )));
+                                            retain = false;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    transfer.cancel(root);
+                                    let _ = event_tx.send(LiveRdpEvent::Error(error));
+                                    retain = false;
+                                }
+                            },
+                            Err(error) => {
+                                transfer.cancel(root);
+                                let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                                    "RDP guest file transfer refused: {error}"
+                                )));
+                                retain = false;
+                            }
+                        }
+                    }
+                }
+                if retain {
+                    guest_files_transfer = Some(transfer);
+                }
+            }
             if let Some(html) = conn.take_guest_html_clipboard() {
                 guest_message_sequence = guest_message_sequence.saturating_add(1);
                 if guest_message_sequence != 0 {
@@ -3793,6 +4331,11 @@ impl VdiState {
                     self.live_status = Some(message);
                 }
                 LiveRdpEvent::ClipboardPublished => {}
+                LiveRdpEvent::ClipboardFilesMaterialized { count, destination } => {
+                    self.live_status = Some(format!(
+                        "Saved {count} guest clipboard file(s) to {destination}"
+                    ));
+                }
                 LiveRdpEvent::ClipboardRefused(refusal) => {
                     // Non-fatal and explicit: the live desktop remains usable,
                     // while status never claims the image reached Files.
@@ -4555,6 +5098,45 @@ mod presentation_authority_tests {
 
         state.queue_frame(mock_frame(), FrameDamage::Full);
         assert!(state.presentation_input_authorized);
+    }
+}
+
+#[cfg(all(test, feature = "live-vdi"))]
+mod guest_files_materialization_tests {
+    use super::*;
+
+    #[test]
+    fn staged_guest_files_enter_the_permission_contract_without_host_paths() {
+        let now = 1_700_000_000_000_u64;
+        let lease = VdiClipboardLeaseV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: "rdp:oak:desktop-1".into(),
+            generation: 9,
+            lease_id: "rdp-lease-9".into(),
+            issued_at_ms: now,
+            expires_at_ms: now + 60_000,
+            permitted_mime_offers: vec![VDI_GUEST_FILES_MIME.into()],
+        };
+        let message = rdp_guest_files_clipboard_message(
+            &lease,
+            1,
+            2,
+            ClipboardEnvelopeV2::content_hash_for(b"reportchart"),
+            11,
+            "files:v2:vdi-guest:tx-1".into(),
+            now + 1,
+        )
+        .expect("staged Files result enters the same one-use permission contract");
+
+        assert_eq!(message.selected_mime, VDI_GUEST_FILES_MIME);
+        assert_eq!(message.envelope.byte_count, 11);
+        assert_eq!(
+            message.envelope.files_reference.as_deref(),
+            Some("files:v2:vdi-guest:tx-1")
+        );
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(!encoded.contains("report.txt"));
+        assert!(!encoded.contains("/home/"));
     }
 }
 

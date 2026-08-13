@@ -22,18 +22,121 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use base64::Engine as _;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
+use rustix::net::{
+    accept_with, bind_unix, connect_unix, listen, recv, send, socket_with, AddressFamily,
+    RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Responder poll interval (shared across the file surfaces).
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Root-local endpoint used by the live RDP adapter to stage guest file ranges
+/// inside the single daemon Files authority. This is intentionally separate
+/// from the read-only image descriptor endpoint.
+pub const VDI_GUEST_FILES_INGEST_SOCKET: &str = "vdi-clipboard-guest-files.sock";
+const VDI_GUEST_FILES_PACKET_BYTES: usize = 384 * 1024;
+const VDI_GUEST_FILES_CHUNK_BYTES: usize = 256 * 1024;
+const VDI_GUEST_FILES_MAX_COUNT: usize = 1_024;
+const VDI_GUEST_FILES_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const VDI_GUEST_FILES_TRANSACTION_TTL_MS: u64 = 60_000;
+const VDI_GUEST_FILES_STAGING_DIR: &str = ".mde-vdi-clipboard-staging";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestFileMetadata {
+    name: String,
+    relative_path: Option<String>,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum GuestFilesRequest {
+    Begin {
+        transaction_id: String,
+        session_id: String,
+        files: Vec<GuestFileMetadata>,
+        total_bytes: u64,
+    },
+    Chunk {
+        transaction_id: String,
+        file_index: usize,
+        offset: u64,
+        data_base64: String,
+        complete: bool,
+    },
+    Commit {
+        transaction_id: String,
+    },
+    Cancel {
+        transaction_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum GuestFilesResponse {
+    Ready {
+        transaction_id: String,
+        next_file_index: usize,
+        next_offset: u64,
+    },
+    Staged {
+        transaction_id: String,
+        content_hash: String,
+        byte_count: u64,
+        files_reference: String,
+    },
+    Committed {
+        transaction_id: String,
+        destination: String,
+        file_count: usize,
+    },
+    Cancelled {
+        transaction_id: String,
+    },
+    Refused {
+        transaction_id: String,
+        reason: String,
+    },
+}
+
+struct GuestFilesTransaction {
+    files: Vec<GuestFileMetadata>,
+    total_bytes: u64,
+    next_file_index: usize,
+    next_offset: u64,
+    bytes_received: u64,
+    hasher: Sha256,
+    staging_root: PathBuf,
+    expires_at_ms: u64,
+    staged_hash: Option<String>,
+}
+
+struct GuestFilesAuthority {
+    listener: UnixStream,
+    socket_path: PathBuf,
+    destination_root: PathBuf,
+    owner: Option<(u32, u32)>,
+    expected_uid: u32,
+    transactions: BTreeMap<String, GuestFilesTransaction>,
+}
 
 /// JSON `{"error": <msg>}` envelope — the Bus equivalent of the old
 /// `zbus::fdo::Error::Failed`. Callers parse-and-surface rather than
@@ -58,6 +161,488 @@ pub struct Surface {
     pub reply: ReplyFn,
 }
 
+impl GuestFilesAuthority {
+    fn bind(bus_root: &Path, destination_root: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(bus_root)?;
+        std::fs::create_dir_all(&destination_root)?;
+        let destination_root = std::fs::canonicalize(destination_root)?;
+        if let Some((uid, gid)) = desktop_files_owner() {
+            let _ = std::os::unix::fs::chown(&destination_root, Some(uid), Some(gid));
+        }
+        let staging = destination_root.join(VDI_GUEST_FILES_STAGING_DIR);
+        std::fs::create_dir_all(&staging)?;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
+
+        let socket_path = bus_root.join(VDI_GUEST_FILES_INGEST_SOCKET);
+        if socket_path.exists() {
+            match guest_seqpacket_connect(&socket_path) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "VDI guest Files authority is already active",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(&socket_path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let listener = guest_seqpacket_listener(&socket_path)?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Self {
+            listener,
+            socket_path,
+            destination_root,
+            owner: desktop_files_owner(),
+            expected_uid: rustix::process::getuid().as_raw(),
+            transactions: BTreeMap::new(),
+        })
+    }
+
+    fn drain(&mut self, now_ms: u64) {
+        let expired = self
+            .transactions
+            .iter()
+            .filter_map(|(id, transaction)| {
+                (transaction.expires_at_ms <= now_ms).then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in expired {
+            self.cancel(&id);
+        }
+
+        for _ in 0..8 {
+            let stream = match accept_with(&self.listener, SocketFlags::CLOEXEC) {
+                Ok(stream) => UnixStream::from(stream),
+                Err(error) if error == rustix::io::Errno::AGAIN => break,
+                Err(error) => {
+                    tracing::warn!(%error, "VDI guest Files authority accept failed");
+                    break;
+                }
+            };
+            let peer = match rustix::net::sockopt::get_socket_peercred(&stream) {
+                Ok(peer) if peer.uid.as_raw() == self.expected_uid => peer,
+                _ => continue,
+            };
+            let _ = peer;
+            let response = match receive_guest_files_request(&stream) {
+                Ok(request) => self.handle(request, now_ms),
+                Err(reason) => GuestFilesResponse::Refused {
+                    transaction_id: String::new(),
+                    reason,
+                },
+            };
+            if let Err(error) = send_guest_files_response(&stream, &response) {
+                tracing::warn!(%error, "VDI guest Files authority response failed");
+            }
+        }
+    }
+
+    fn handle(&mut self, request: GuestFilesRequest, now_ms: u64) -> GuestFilesResponse {
+        let result = match request {
+            GuestFilesRequest::Begin {
+                transaction_id,
+                session_id,
+                files,
+                total_bytes,
+            } => self.begin(transaction_id, session_id, files, total_bytes, now_ms),
+            GuestFilesRequest::Chunk {
+                transaction_id,
+                file_index,
+                offset,
+                data_base64,
+                complete,
+            } => self.chunk(
+                transaction_id,
+                file_index,
+                offset,
+                data_base64,
+                complete,
+                now_ms,
+            ),
+            GuestFilesRequest::Commit { transaction_id } => self.commit(transaction_id),
+            GuestFilesRequest::Cancel { transaction_id } => {
+                self.cancel(&transaction_id);
+                Ok(GuestFilesResponse::Cancelled { transaction_id })
+            }
+        };
+        result.unwrap_or_else(|(transaction_id, reason)| GuestFilesResponse::Refused {
+            transaction_id,
+            reason,
+        })
+    }
+
+    fn begin(
+        &mut self,
+        transaction_id: String,
+        session_id: String,
+        files: Vec<GuestFileMetadata>,
+        total_bytes: u64,
+        now_ms: u64,
+    ) -> Result<GuestFilesResponse, (String, String)> {
+        let refuse = |reason: &str| Err((transaction_id.clone(), reason.to_owned()));
+        if !safe_guest_identity(&transaction_id) || !safe_guest_identity(&session_id) {
+            return refuse("invalid transaction or session identity");
+        }
+        if files.is_empty()
+            || files.len() > VDI_GUEST_FILES_MAX_COUNT
+            || total_bytes > VDI_GUEST_FILES_MAX_TOTAL_BYTES
+            || self.transactions.contains_key(&transaction_id)
+        {
+            return refuse("invalid or duplicate bounded file transaction");
+        }
+        let mut declared = 0_u64;
+        for file in &files {
+            if !safe_guest_component(&file.name)
+                || file
+                    .relative_path
+                    .as_deref()
+                    .is_some_and(|path| !safe_guest_relative_path(path))
+            {
+                return refuse("unsafe guest file metadata");
+            }
+            declared = declared
+                .checked_add(file.size)
+                .ok_or_else(|| (transaction_id.clone(), "file size overflow".to_owned()))?;
+        }
+        if declared != total_bytes {
+            return refuse("declared aggregate size mismatch");
+        }
+        let staging_root = self
+            .destination_root
+            .join(VDI_GUEST_FILES_STAGING_DIR)
+            .join(&transaction_id);
+        if staging_root.exists() {
+            return refuse("transaction staging path already exists");
+        }
+        std::fs::create_dir(&staging_root)
+            .map_err(|error| (transaction_id.clone(), format!("staging failed: {error}")))?;
+        std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                (
+                    transaction_id.clone(),
+                    format!("staging mode failed: {error}"),
+                )
+            },
+        )?;
+        let payload = staging_root.join("payload");
+        std::fs::create_dir(&payload).map_err(|error| {
+            (
+                transaction_id.clone(),
+                format!("payload staging failed: {error}"),
+            )
+        })?;
+        self.transactions.insert(
+            transaction_id.clone(),
+            GuestFilesTransaction {
+                files,
+                total_bytes,
+                next_file_index: 0,
+                next_offset: 0,
+                bytes_received: 0,
+                hasher: Sha256::new(),
+                staging_root,
+                expires_at_ms: now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS),
+                staged_hash: None,
+            },
+        );
+        Ok(GuestFilesResponse::Ready {
+            transaction_id,
+            next_file_index: 0,
+            next_offset: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chunk(
+        &mut self,
+        transaction_id: String,
+        file_index: usize,
+        offset: u64,
+        data_base64: String,
+        complete: bool,
+        now_ms: u64,
+    ) -> Result<GuestFilesResponse, (String, String)> {
+        let Some(transaction) = self.transactions.get_mut(&transaction_id) else {
+            return Err((transaction_id, "unknown or expired transaction".to_owned()));
+        };
+        let failure = |reason: String| (transaction_id.clone(), reason);
+        if transaction.staged_hash.is_some()
+            || file_index != transaction.next_file_index
+            || offset != transaction.next_offset
+        {
+            return Err(failure(
+                "non-sequential or completed transaction chunk".into(),
+            ));
+        }
+        let Some(metadata) = transaction.files.get(file_index) else {
+            return Err(failure(
+                "file index is outside the admitted snapshot".into(),
+            ));
+        };
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_base64.as_bytes())
+            .map_err(|_| failure("chunk is not canonical base64".into()))?;
+        if data.len() > VDI_GUEST_FILES_CHUNK_BYTES
+            || (data.is_empty() && metadata.size != 0)
+            || offset.saturating_add(data.len() as u64) > metadata.size
+        {
+            return Err(failure("chunk exceeds its admitted file range".into()));
+        }
+        let relative = guest_staged_relative_path(metadata);
+        let path = transaction.staging_root.join("payload").join(relative);
+        if let Some(parent) = path.parent() {
+            create_guest_directories(&transaction.staging_root.join("payload"), parent)
+                .map_err(|error| failure(format!("staging directory refused: {error}")))?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).append(true).mode(0o600);
+        if offset == 0 {
+            options.create_new(true);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|error| failure(format!("staging write refused: {error}")))?;
+        if file.metadata().map(|value| value.len()).unwrap_or(u64::MAX) != offset {
+            return Err(failure("staged file offset changed".into()));
+        }
+        file.write_all(&data)
+            .and_then(|()| file.sync_data())
+            .map_err(|error| failure(format!("staging write failed: {error}")))?;
+        transaction.hasher.update(&data);
+        transaction.next_offset = transaction.next_offset.saturating_add(data.len() as u64);
+        transaction.bytes_received = transaction.bytes_received.saturating_add(data.len() as u64);
+        transaction.expires_at_ms = now_ms.saturating_add(VDI_GUEST_FILES_TRANSACTION_TTL_MS);
+        if complete != (transaction.next_offset == metadata.size) {
+            return Err(failure(
+                "chunk completion disagrees with admitted size".into(),
+            ));
+        }
+        if complete {
+            transaction.next_file_index += 1;
+            transaction.next_offset = 0;
+        }
+        if transaction.next_file_index == transaction.files.len() {
+            if transaction.bytes_received != transaction.total_bytes {
+                return Err(failure("completed aggregate size mismatch".into()));
+            }
+            let hash = format!("{:x}", transaction.hasher.clone().finalize());
+            transaction.staged_hash = Some(hash.clone());
+            return Ok(GuestFilesResponse::Staged {
+                transaction_id: transaction_id.clone(),
+                content_hash: hash,
+                byte_count: transaction.total_bytes,
+                files_reference: format!("files:v2:vdi-guest:{transaction_id}"),
+            });
+        }
+        Ok(GuestFilesResponse::Ready {
+            transaction_id,
+            next_file_index: transaction.next_file_index,
+            next_offset: transaction.next_offset,
+        })
+    }
+
+    fn commit(&mut self, transaction_id: String) -> Result<GuestFilesResponse, (String, String)> {
+        let Some(transaction) = self.transactions.remove(&transaction_id) else {
+            return Err((transaction_id, "unknown or expired transaction".to_owned()));
+        };
+        if transaction.staged_hash.is_none()
+            || transaction.next_file_index != transaction.files.len()
+        {
+            let _ = std::fs::remove_dir_all(&transaction.staging_root);
+            return Err((
+                transaction_id,
+                "transaction is not completely staged".to_owned(),
+            ));
+        }
+        let payload = transaction.staging_root.join("payload");
+        let destination = self
+            .destination_root
+            .join(format!("Clipboard from RDP {transaction_id}"));
+        if let Err(error) = rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &payload,
+            rustix::fs::CWD,
+            &destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            let _ = std::fs::remove_dir_all(&transaction.staging_root);
+            return Err((transaction_id, format!("atomic commit failed: {error}")));
+        }
+        chown_guest_tree(&destination, self.owner);
+        let _ = std::fs::remove_dir(&transaction.staging_root);
+        Ok(GuestFilesResponse::Committed {
+            transaction_id,
+            destination: destination.display().to_string(),
+            file_count: transaction.files.len(),
+        })
+    }
+
+    fn cancel(&mut self, transaction_id: &str) {
+        if let Some(transaction) = self.transactions.remove(transaction_id) {
+            let _ = std::fs::remove_dir_all(transaction.staging_root);
+        }
+    }
+}
+
+impl Drop for GuestFilesAuthority {
+    fn drop(&mut self) {
+        for (_, transaction) in std::mem::take(&mut self.transactions) {
+            let _ = std::fs::remove_dir_all(transaction.staging_root);
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+fn receive_guest_files_request(stream: &UnixStream) -> Result<GuestFilesRequest, String> {
+    let mut bytes = vec![0_u8; VDI_GUEST_FILES_PACKET_BYTES + 1];
+    let received = recv(stream, &mut bytes, RecvFlags::empty())
+        .map_err(|error| format!("request receive failed: {error}"))?;
+    if received == 0 || received > VDI_GUEST_FILES_PACKET_BYTES {
+        return Err("request exceeded its packet bound".into());
+    }
+    serde_json::from_slice(&bytes[..received]).map_err(|_| "request was malformed".into())
+}
+
+fn send_guest_files_response(
+    stream: &UnixStream,
+    response: &GuestFilesResponse,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(response)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if body.is_empty() || body.len() > VDI_GUEST_FILES_PACKET_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response exceeded its packet bound",
+        ));
+    }
+    let sent = send(stream, &body, SendFlags::empty())?;
+    if sent != body.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "short guest Files response",
+        ));
+    }
+    Ok(())
+}
+
+fn guest_seqpacket_connect(path: &Path) -> std::io::Result<UnixStream> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    connect_unix(&socket, &SocketAddrUnix::new(path)?)?;
+    Ok(socket.into())
+}
+
+fn guest_seqpacket_listener(path: &Path) -> std::io::Result<UnixStream> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )?;
+    bind_unix(&socket, &SocketAddrUnix::new(path)?)?;
+    listen(&socket, 8)?;
+    Ok(socket.into())
+}
+
+fn guest_staged_relative_path(metadata: &GuestFileMetadata) -> PathBuf {
+    metadata
+        .relative_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(&metadata.name)
+}
+
+fn safe_guest_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+}
+
+fn safe_guest_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':' | '\0'))
+}
+
+fn safe_guest_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['/', '\\'])
+        && value.len() <= 1_024
+        && value.split(['/', '\\']).all(safe_guest_component)
+}
+
+fn create_guest_directories(root: &Path, destination: &Path) -> std::io::Result<()> {
+    let relative = destination
+        .strip_prefix(root)
+        .map_err(|_| std::io::Error::other("staging path escaped its root"))?;
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => return Err(std::io::Error::other("staging ancestor is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cursor)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn desktop_files_owner() -> Option<(u32, u32)> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        let uid = fields.get(2)?.parse::<u32>().ok()?;
+        let gid = fields.get(3)?.parse::<u32>().ok()?;
+        (uid == 1_000).then_some((uid, gid))
+    })
+}
+
+fn desktop_files_destination() -> Option<PathBuf> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        let uid = fields.get(2)?.parse::<u32>().ok()?;
+        if uid == 1_000 {
+            Some(PathBuf::from(*fields.get(5)?).join("Downloads"))
+        } else {
+            None
+        }
+    })
+}
+
+fn chown_guest_tree(root: &Path, owner: Option<(u32, u32)>) {
+    let Some((uid, gid)) = owner else { return };
+    let _ = std::os::unix::fs::chown(root, Some(uid), Some(gid));
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            chown_guest_tree(&path, owner);
+        } else {
+            let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+        }
+    }
+}
+
 /// Drive ALL the file surfaces from one thread + one `Persist` (cheaper
 /// than a thread per surface, and `Persist`/rusqlite isn't `Send` so it
 /// can't be shared across threads anyway). Each tick polls every
@@ -66,12 +651,32 @@ pub struct Surface {
 /// thread.
 pub fn serve_all(persist: &Persist, surfaces: &[Surface], should_stop: impl Fn() -> bool) {
     let mut cursors: HashMap<String, String> = HashMap::new();
+    let mut guest_files_authority = mde_bus::default_data_dir()
+        .zip(desktop_files_destination())
+        .and_then(|(bus_root, destination)| {
+            match GuestFilesAuthority::bind(&bus_root, destination) {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    tracing::warn!(%error, "VDI guest Files authority unavailable");
+                    None
+                }
+            }
+        });
     while !should_stop() {
+        if let Some(authority) = &mut guest_files_authority {
+            authority.drain(guest_files_now_ms());
+        }
         for s in surfaces {
             poll_once(persist, s.prefix, s.verbs, &s.reply, &mut cursors);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn guest_files_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 /// One poll sweep across `verbs` (split out so a test can drive it
@@ -935,6 +1540,141 @@ mod tests {
         assert_eq!(FILE_OPS_PREFIX, "file-ops");
         assert_eq!(FLEET_FILES_PREFIX, "fleet-files");
         assert_eq!(FLEET_FILES_VERBS, ["peers", "self-node", "list-peer"]);
+    }
+
+    #[test]
+    fn guest_clipboard_files_stage_commit_and_cancel_atomically() {
+        use base64::Engine as _;
+
+        let bus = tempfile::tempdir().expect("bus root");
+        let destination = tempfile::tempdir().expect("Files destination");
+        let mut authority = GuestFilesAuthority::bind(bus.path(), destination.path().to_path_buf())
+            .expect("bind Files authority");
+        authority.owner = None;
+        let now = 1_700_000_000_000_u64;
+        let files = vec![
+            GuestFileMetadata {
+                name: "report.txt".into(),
+                relative_path: None,
+                size: 6,
+            },
+            GuestFileMetadata {
+                name: "chart.csv".into(),
+                relative_path: Some("nested".into()),
+                size: 5,
+            },
+        ];
+        assert!(matches!(
+            authority.handle(
+                GuestFilesRequest::Begin {
+                    transaction_id: "tx-atomic".into(),
+                    session_id: "rdp-session".into(),
+                    files: files.clone(),
+                    total_bytes: 11,
+                },
+                now,
+            ),
+            GuestFilesResponse::Ready { .. }
+        ));
+        assert!(matches!(
+            authority.handle(
+                GuestFilesRequest::Chunk {
+                    transaction_id: "tx-atomic".into(),
+                    file_index: 0,
+                    offset: 0,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(b"report"),
+                    complete: true,
+                },
+                now + 1,
+            ),
+            GuestFilesResponse::Ready {
+                next_file_index: 1,
+                ..
+            }
+        ));
+        let staged = authority.handle(
+            GuestFilesRequest::Chunk {
+                transaction_id: "tx-atomic".into(),
+                file_index: 1,
+                offset: 0,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(b"chart"),
+                complete: true,
+            },
+            now + 2,
+        );
+        assert!(matches!(
+            staged,
+            GuestFilesResponse::Staged { byte_count: 11, .. }
+        ));
+        assert!(
+            !destination
+                .path()
+                .join("Clipboard from RDP tx-atomic")
+                .exists(),
+            "staging is not visible before permission-backed commit"
+        );
+        assert!(matches!(
+            authority.handle(
+                GuestFilesRequest::Commit {
+                    transaction_id: "tx-atomic".into(),
+                },
+                now + 3,
+            ),
+            GuestFilesResponse::Committed { file_count: 2, .. }
+        ));
+        let committed = destination.path().join("Clipboard from RDP tx-atomic");
+        assert_eq!(
+            std::fs::read(committed.join("report.txt")).unwrap(),
+            b"report"
+        );
+        assert_eq!(
+            std::fs::read(committed.join("nested/chart.csv")).unwrap(),
+            b"chart"
+        );
+
+        assert!(matches!(
+            authority.handle(
+                GuestFilesRequest::Begin {
+                    transaction_id: "tx-cancel".into(),
+                    session_id: "rdp-session".into(),
+                    files: vec![GuestFileMetadata {
+                        name: "partial.bin".into(),
+                        relative_path: None,
+                        size: 8,
+                    }],
+                    total_bytes: 8,
+                },
+                now + 4,
+            ),
+            GuestFilesResponse::Ready { .. }
+        ));
+        let _ = authority.handle(
+            GuestFilesRequest::Chunk {
+                transaction_id: "tx-cancel".into(),
+                file_index: 0,
+                offset: 0,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(b"half"),
+                complete: false,
+            },
+            now + 5,
+        );
+        assert!(matches!(
+            authority.handle(
+                GuestFilesRequest::Cancel {
+                    transaction_id: "tx-cancel".into(),
+                },
+                now + 6,
+            ),
+            GuestFilesResponse::Cancelled { .. }
+        ));
+        assert!(
+            !destination
+                .path()
+                .join(VDI_GUEST_FILES_STAGING_DIR)
+                .join("tx-cancel")
+                .exists(),
+            "cancel removes every partial byte"
+        );
     }
 
     // AUD2-2 — the pre-FileXfer free reply builders were removed; the

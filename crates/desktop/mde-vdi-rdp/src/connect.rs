@@ -74,7 +74,9 @@ use tokio::net::TcpStream;
 use crate::audio::{
     PendingWave, PipeWireRdpsndHandler, PreparedAudio, RdpAudioCapability, RdpAudioStats,
 };
-use crate::clipboard::{ClipboardBridge, RemoteClipboardImage};
+use crate::clipboard::{
+    ClipboardBridge, RemoteClipboardFileChunk, RemoteClipboardFileList, RemoteClipboardImage,
+};
 use crate::config::RdpConfig;
 use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
@@ -959,6 +961,31 @@ impl RdpConnection {
         self.clipboard.take_remote_image()
     }
 
+    /// Take one bounded guest file-list snapshot admitted by the CLIPRDR
+    /// boundary. The shell must open a governed Files-authority transaction
+    /// before requesting any payload ranges.
+    pub fn take_guest_file_list(
+        &self,
+    ) -> Option<Result<RemoteClipboardFileList, crate::clipboard::ClipboardBridgeError>> {
+        self.clipboard.take_remote_file_list()
+    }
+
+    /// Begin range retrieval for one file in the currently admitted snapshot.
+    /// The next pump flush emits the exact request through CLIPRDR.
+    pub fn begin_guest_file_retrieval(
+        &self,
+        file_index: usize,
+    ) -> Result<(), crate::clipboard::ClipboardBridgeError> {
+        self.clipboard.begin_remote_file_retrieval(file_index)
+    }
+
+    /// Take one validated bounded guest-file range exactly once.
+    pub fn take_guest_file_chunk(
+        &self,
+    ) -> Option<Result<RemoteClipboardFileChunk, crate::clipboard::ClipboardBridgeError>> {
+        self.clipboard.take_remote_file_chunk()
+    }
+
     fn write_clipboard_messages(
         &mut self,
         messages: ironrdp_cliprdr::CliprdrSvcMessages<CliprdrRoleClient>,
@@ -1006,6 +1033,17 @@ impl RdpConnection {
                     ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
                 })?
                 .submit_format_data(response)
+                .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+            self.write_clipboard_messages(messages)?;
+        }
+        if let Some(request) = self.clipboard.take_remote_file_contents_request() {
+            let messages = self
+                .active_stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .ok_or_else(|| {
+                    ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
+                })?
+                .request_file_contents(request)
                 .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
             self.write_clipboard_messages(messages)?;
         }
