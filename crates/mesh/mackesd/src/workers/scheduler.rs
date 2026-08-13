@@ -2481,7 +2481,8 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut w = SchedulerWorker::new("node".to_string())
             .with_publisher(Box::new(rec))
-            .with_bus_root(dir)
+            .with_bus_root(dir.clone())
+            .with_state_root(dir.join("state"))
             .with_poll(Duration::from_millis(10));
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { w.run(token).await });
