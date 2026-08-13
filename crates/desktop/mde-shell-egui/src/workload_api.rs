@@ -11,12 +11,13 @@ use std::path::Path;
 
 use mackes_mesh_types::workloads::{
     reject_duplicate_json_keys, workload_state_topic, WorkloadAttachmentProtocol, WorkloadBackend,
-    WorkloadOperationAction, WorkloadOperationRequest, WorkloadOperationStatus, WorkloadProfile,
-    WorkloadResources, WorkloadStateSnapshot, WORKLOAD_CONTRACT_SCHEMA_VERSION,
-    WORKLOAD_OPERATION_TOPIC,
+    WorkloadOperationAction, WorkloadOperationReply, WorkloadOperationRequest,
+    WorkloadOperationStatus, WorkloadProfile, WorkloadResources, WorkloadStateSnapshot,
+    WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+use mde_bus::rpc::reply_topic;
 
 /// Build a short-lived, target-bound Workload operation request.
 pub(crate) fn request(
@@ -181,6 +182,47 @@ pub(crate) fn read_status(
         .find(|status| status.workload_id.as_str() == workload_id)
 }
 
+/// Read only the generation produced by one exact operation request.
+///
+/// A workload can retain an older terminal status while a new operation is in
+/// flight. Matching only its workload id would let that stale generation
+/// falsely complete the new action in the shell.
+pub(crate) fn read_status_for_request(
+    persist: &Persist,
+    node: &str,
+    workload_id: &str,
+    request_id: &str,
+) -> Option<WorkloadOperationStatus> {
+    read_status(persist, node, workload_id).filter(|status| status.request_id == request_id)
+}
+
+/// Decode the correlated Workload RPC reply and enforce its closed shape.
+pub(crate) fn read_reply(
+    persist: &Persist,
+    message_ulid: &str,
+    request_id: &str,
+) -> Option<WorkloadOperationReply> {
+    let message = persist
+        .list_since_limit(&reply_topic(message_ulid), None, 1)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let body = message.body.as_deref()?;
+    reject_duplicate_json_keys(body).ok()?;
+    let reply: WorkloadOperationReply = serde_json::from_str(body).ok()?;
+    if reply.schema_version != WORKLOAD_CONTRACT_SCHEMA_VERSION
+        || reply.request_id != request_id
+        || reply.accepted != reply.status.is_some()
+        || reply.accepted == reply.error_code.is_some()
+        || reply.status.as_ref().is_some_and(|status| {
+            status.request_id != request_id || status.validate(current_ms()).is_err()
+        })
+    {
+        return None;
+    }
+    Some(reply)
+}
+
 fn current_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,6 +234,33 @@ fn current_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::workloads::{
+        WorkloadOperationErrorCode, WorkloadOperationPhase, WorkloadPowerState, WorkloadReadiness,
+        WorkloadRuntimeSignals,
+    };
+
+    fn terminal_status(request_id: &str) -> WorkloadOperationStatus {
+        WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: request_id.to_string(),
+            workload_id: mackes_mesh_types::workloads::WorkloadId::new("browser-seat15")
+                .expect("workload id"),
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadProfile::Small.resources(),
+            image_ref: None,
+            generation: 7,
+            phase: WorkloadOperationPhase::Completed,
+            power: WorkloadPowerState::Running,
+            readiness: WorkloadReadiness::Ready,
+            signals: WorkloadRuntimeSignals::default(),
+            retryable: false,
+            attempt: 1,
+            next_retry_at_ms: 0,
+            reason: None,
+            remediation: None,
+            attachment: None,
+        }
+    }
 
     #[test]
     fn request_is_typed_and_capability_bound() {
@@ -253,6 +322,70 @@ mod tests {
     #[test]
     fn publish_uses_only_the_workload_action_lane() {
         assert_eq!(WORKLOAD_OPERATION_TOPIC, "action/workload/operation");
+    }
+
+    #[test]
+    fn status_resolution_requires_the_exact_request_generation() {
+        let bus = tempfile::tempdir().expect("bus tempdir");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let snapshot = WorkloadStateSnapshot {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            node: "seat15".into(),
+            observed_at_ms: current_ms(),
+            workloads: vec![terminal_status("workload-op-previous")],
+        };
+        persist
+            .write(
+                &workload_state_topic("seat15"),
+                Priority::Default,
+                Some("retained terminal projection"),
+                Some(&serde_json::to_string(&snapshot).expect("snapshot body")),
+            )
+            .expect("persist snapshot");
+
+        assert!(
+            read_status_for_request(&persist, "seat15", "browser-seat15", "workload-op-current")
+                .is_none(),
+            "an older terminal generation must not complete a newer shell request"
+        );
+        assert!(read_status_for_request(
+            &persist,
+            "seat15",
+            "browser-seat15",
+            "workload-op-previous"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn workload_reply_is_correlated_and_closed_before_ui_use() {
+        let bus = tempfile::tempdir().expect("bus tempdir");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let reply = WorkloadOperationReply {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: "workload-op-current".into(),
+            accepted: false,
+            status: None,
+            error_code: Some(WorkloadOperationErrorCode::StaleGeneration),
+        };
+        persist
+            .write(
+                &reply_topic("bus-message-1"),
+                Priority::Default,
+                Some("typed Workload refusal"),
+                Some(&serde_json::to_string(&reply).expect("reply body")),
+            )
+            .expect("persist reply");
+
+        assert_eq!(
+            read_reply(&persist, "bus-message-1", "workload-op-current")
+                .and_then(|reply| reply.error_code),
+            Some(WorkloadOperationErrorCode::StaleGeneration)
+        );
+        assert!(
+            read_reply(&persist, "bus-message-1", "workload-op-other").is_none(),
+            "a reply for another idempotency key must not settle this request"
+        );
     }
 
     #[test]

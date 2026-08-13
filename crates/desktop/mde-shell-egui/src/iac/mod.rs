@@ -936,6 +936,20 @@ struct Pending {
     sent: Instant,
 }
 
+/// One exact Workload request awaiting its correlated reply/projection.
+#[derive(Debug, Clone)]
+struct PendingWorkload {
+    /// Bus message identity used by the worker's `reply/<ulid>` lane.
+    ulid: String,
+    /// Idempotency identity that must match replies and projected status.
+    request_id: String,
+    /// Placement and workload identity used to locate the node projection.
+    node: String,
+    workload_id: String,
+    /// Bounds UI waiting when neither reply nor projection arrives.
+    sent: Instant,
+}
+
 /// Progress through the shared guided provisioning flow. This is deliberately
 /// delivery-neutral: every workload follows desired state → plan → typed row operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -1365,9 +1379,9 @@ pub struct WorkloadsState {
     mutation_pending: Option<Pending>,
     /// A transient one-line action note — honest feedback, never a silent op.
     note: Option<String>,
-    /// A typed Workload operation awaiting its node-local projection. Workload
-    /// actions do not produce cloud `reply/<ulid>` messages.
-    workload_pending: Option<(String, String, Instant)>,
+    /// A typed Workload operation awaiting its correlated RPC reply and exact
+    /// request generation in the node-local projection.
+    workload_pending: Option<PendingWorkload>,
     /// The session audit trail (newest last), capped at [`MAX_AUDIT`].
     audit: Vec<AuditEntry>,
     /// Test-only signer injection. Production has no programmatic key seam and
@@ -1543,13 +1557,45 @@ impl WorkloadsState {
     /// A missing snapshot is simply pending; a terminal status becomes one
     /// bounded audit entry and never falls back to the legacy cloud reply lane.
     fn resolve_workload_operation(&mut self) {
-        let Some((node, workload_id, _sent)) = self.workload_pending.clone() else {
+        let Some(pending) = self.workload_pending.clone() else {
             return;
         };
         let Some(persist) = self.persist() else {
             return;
         };
-        let Some(status) = crate::workload_api::read_status(&persist, &node, &workload_id) else {
+        if let Some(reply) =
+            crate::workload_api::read_reply(&persist, &pending.ulid, &pending.request_id)
+        {
+            if !reply.accepted {
+                let detail = reply
+                    .error_code
+                    .map_or_else(|| "unknown refusal".to_string(), |code| format!("{code:?}"));
+                self.record_audit(AuditEntry {
+                    verb: "workload-operation".to_string(),
+                    outcome: AuditOutcome::Failed,
+                    detail: detail.clone(),
+                });
+                self.note = Some(format!(
+                    "Workload {} request was refused: {detail}.",
+                    pending.workload_id
+                ));
+                self.workload_pending = None;
+                return;
+            }
+        }
+        let Some(status) = crate::workload_api::read_status_for_request(
+            &persist,
+            &pending.node,
+            &pending.workload_id,
+            &pending.request_id,
+        ) else {
+            if pending.sent.elapsed() >= REQUEST_TIMEOUT {
+                self.note = Some(format!(
+                    "Workload {} did not publish status for request {} within five minutes; the request may still finish.",
+                    pending.workload_id, pending.request_id
+                ));
+                self.workload_pending = None;
+            }
             return;
         };
         if !status.phase.is_terminal() {
@@ -1570,9 +1616,9 @@ impl WorkloadsState {
             detail: detail.clone(),
         });
         self.note = Some(if ok {
-            format!("Workload {workload_id} completed.")
+            format!("Workload {} completed.", pending.workload_id)
         } else {
-            format!("Workload {workload_id} failed: {detail}")
+            format!("Workload {} failed: {detail}", pending.workload_id)
         });
         self.workload_pending = None;
         self.forced = true;
@@ -1994,12 +2040,14 @@ impl WorkloadsState {
                     return;
                 };
                 match crate::workload_api::publish(root, &request) {
-                    Ok(_) => {
-                        self.workload_pending = Some((
-                            request.target_node.clone(),
-                            request.workload_id.as_str().to_string(),
-                            Instant::now(),
-                        ));
+                    Ok(ulid) => {
+                        self.workload_pending = Some(PendingWorkload {
+                            ulid,
+                            request_id: request.request_id.clone(),
+                            node: request.target_node.clone(),
+                            workload_id: request.workload_id.as_str().to_string(),
+                            sent: Instant::now(),
+                        });
                         self.note = Some(format!(
                             "Requested {label}; waiting for Workload readiness."
                         ));
