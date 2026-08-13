@@ -658,6 +658,10 @@ pub struct RemotePty {
     terminal: Terminal,
     /// The state-log read cursor (last ULID seen), reset on a reconnect.
     cursor: Option<String>,
+    /// Highest worker sequence accepted for the current session. The Bus topic
+    /// is only a routing hint: the record must also prove the same session and
+    /// peer, and replayed/out-of-order records must never repaint or refold it.
+    last_seq: Option<u64>,
     /// The folded client status.
     status: RemoteStatus,
     /// Current grid geometry (the last size published).
@@ -694,6 +698,7 @@ impl RemotePty {
             id,
             terminal,
             cursor: None,
+            last_seq: None,
             status: RemoteStatus::Connecting,
             cols,
             rows,
@@ -729,10 +734,13 @@ impl RemotePty {
         // Seed the cursor at the session log's current tail so the pane streams the
         // reattach snapshot + live output forward, not the whole (possibly large)
         // prior history — the broker's ring IS the bounded scrollback we replay.
-        let cursor = bus
-            .read_since(id, None)
-            .last()
-            .map(|(ulid, _)| ulid.clone());
+        let tail = bus.read_since(id, None).into_iter().last();
+        let cursor = tail.as_ref().map(|(ulid, _)| ulid.clone());
+        let last_seq = tail
+            .as_ref()
+            .and_then(|(_, body)| parse_record(body))
+            .filter(|record| record.id == id && record.peer == peer)
+            .map(|record| record.seq);
         let mut this = Self {
             bus,
             peer: peer.to_string(),
@@ -740,6 +748,7 @@ impl RemotePty {
             id: id.to_string(),
             terminal,
             cursor,
+            last_seq,
             status: RemoteStatus::Connecting,
             cols,
             rows,
@@ -932,6 +941,23 @@ impl RemotePty {
     /// Fold one state record: feed its output into the engine, then advance the
     /// status by its phase. Returns whether to keep reading this batch.
     fn ingest(&mut self, rec: PtyRecord) -> bool {
+        if rec.id != self.id || rec.peer != self.peer {
+            self.status = RemoteStatus::Failed {
+                reason: format!(
+                    "remote session provenance mismatch (expected {}/{}, received {}/{})",
+                    self.peer, self.id, rec.peer, rec.id
+                ),
+            };
+            return false;
+        }
+        if self.last_seq.is_some_and(|last| rec.seq <= last) {
+            // Persist cursors normally suppress replay, but sequence is the
+            // worker's authoritative per-session ordering boundary. Ignore a
+            // duplicate or stale record before it can repaint bytes or regress
+            // lifecycle state.
+            return true;
+        }
+        self.last_seq = Some(rec.seq);
         // Output first, so the final bytes before a close are still shown.
         if let Some(data) = &rec.data {
             if let Ok(bytes) = B64.decode(data) {
@@ -988,6 +1014,7 @@ impl RemotePty {
         let attempt = RECONNECT_BUDGET - self.reconnects_left;
         self.id = mint_id(&self.peer);
         self.cursor = None;
+        self.last_seq = None;
         self.ever_open = false;
         self.status = RemoteStatus::Reconnecting { attempt };
         self.emit_open();
@@ -1084,6 +1111,21 @@ pub(crate) mod test_support {
 
         /// Seed one state-log record for `id` (auto-numbered ULID-ish cursor).
         pub fn push_state(&self, id: &str, body: &str) {
+            let mut document: serde_json::Value =
+                serde_json::from_str(body).expect("fake state body is valid JSON");
+            let next_seq = self
+                .logs
+                .lock()
+                .expect("logs lock")
+                .get(id)
+                .map_or(1, |records| records.len() + 1);
+            document["seq"] = serde_json::Value::from(next_seq);
+            self.push_state_raw(id, &document.to_string());
+        }
+
+        /// Seed an exact state-log record without normalizing its worker sequence.
+        /// Used only by hostile replay/provenance fixtures.
+        pub fn push_state_raw(&self, id: &str, body: &str) {
             let mut logs = self.logs.lock().expect("logs lock");
             let entry = logs.entry(id.to_string()).or_default();
             let ulid = format!("{:026}", entry.len() + 1);
@@ -1325,6 +1367,61 @@ mod tests {
             full_text(&remote).contains("hello-mesh"),
             "the decoded bytes reached the engine grid"
         );
+    }
+
+    #[test]
+    fn poll_rejects_cross_session_or_peer_records_before_they_can_render() {
+        let bus = FakeBus::new();
+        let mut remote = open_on(Arc::new(bus.clone()));
+        let id = remote.session_id().to_string();
+        let hostile = serde_json::json!({
+            "id": "another-session",
+            "peer": "birch",
+            "phase": "open",
+            "seq": 1,
+            "data": B64.encode("FORGED-OUTPUT")
+        });
+        bus.push_state_raw(&id, &hostile.to_string());
+
+        remote.poll_once();
+
+        assert!(matches!(
+            remote.status(),
+            RemoteStatus::Failed { reason } if reason.contains("provenance mismatch")
+        ));
+        assert!(!full_text(&remote).contains("FORGED-OUTPUT"));
+        assert!(remote.send_input(b"whoami\n").is_err());
+    }
+
+    #[test]
+    fn poll_deduplicates_worker_sequences_before_output_or_lifecycle_fold() {
+        let bus = FakeBus::new();
+        let mut remote = open_on(Arc::new(bus.clone()));
+        let id = remote.session_id().to_string();
+        let opened = serde_json::json!({
+            "id": id,
+            "peer": "oak",
+            "phase": "open",
+            "seq": 7,
+            "data": B64.encode("ONCE")
+        });
+        let replayed_close = serde_json::json!({
+            "id": id,
+            "peer": "oak",
+            "phase": "closed",
+            "seq": 7,
+            "exit": 0,
+            "data": B64.encode("REPLAYED")
+        });
+        bus.push_state_raw(&id, &opened.to_string());
+        bus.push_state_raw(&id, &replayed_close.to_string());
+
+        remote.poll_once();
+
+        assert_eq!(*remote.status(), RemoteStatus::Open);
+        let text = full_text(&remote);
+        assert!(text.contains("ONCE"));
+        assert!(!text.contains("REPLAYED"));
     }
 
     // ── write / resize verbs ──────────────────────────────────────────────────
