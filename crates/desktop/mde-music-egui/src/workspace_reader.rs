@@ -63,11 +63,22 @@ impl WorkspaceReader {
                 return None;
             }
         };
-        let snapshot = serde_json::from_str::<MusicWorkspaceSnapshotV1>(&body).ok()?;
+        let snapshot = match serde_json::from_str::<MusicWorkspaceSnapshotV1>(&body) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                // A retained malformed row is provider/Bus loss, not an empty
+                // workspace.  Drop the handle so the next poll can reopen a
+                // repaired/replaced index rather than repeatedly trusting a
+                // poisoned long-lived connection.
+                self.persist = None;
+                return None;
+            }
+        };
         if snapshot.validate().is_err()
             || !has_unambiguous_source_identities(&snapshot)
             || snapshot.revision <= self.last_revision
         {
+            self.persist = None;
             return None;
         }
         self.last_revision = snapshot.revision;
@@ -156,6 +167,36 @@ mod tests {
         assert!(WorkspaceReader::from_root(Some(dir.path().to_path_buf()))
             .poll()
             .is_none());
+    }
+
+    #[test]
+    fn reader_reopens_after_malformed_retained_row_and_accepts_repaired_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+        persist
+            .write(
+                WORKSPACE_STATE_TOPIC,
+                Priority::Default,
+                None,
+                Some("{malformed music workspace"),
+            )
+            .unwrap();
+
+        let mut reader = WorkspaceReader::from_root(Some(dir.path().to_path_buf()));
+        assert!(reader.poll().is_none());
+
+        // A repaired provider/Bus writes a valid retained row at the same
+        // location.  The reader must reconnect instead of retaining the
+        // poisoned handle from the malformed row.
+        persist
+            .write(
+                WORKSPACE_STATE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&snapshot(9)).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(reader.poll().unwrap().revision, 9);
     }
 
     #[test]
