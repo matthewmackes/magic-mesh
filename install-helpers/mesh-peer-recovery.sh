@@ -196,6 +196,37 @@ restore_role_desktop_state() {
     restore_workstation_session
 }
 
+attest_recovery_convergence() {
+    local role="$1"
+    # XDG repair and shell activation are external systemd transactions. They
+    # can outlive every readiness check that admitted the desktop phase, so a
+    # successful helper return is not itself proof that the peer still owns a
+    # complete authenticated session. Re-attest the entire dependency chain at
+    # the publication boundary; otherwise a late etcd/Nebula loss can be
+    # reported as corrected-forward convergence until another event happens.
+    if ! physical_network_online; then
+        publish "offline-after-desktop"
+        return 2
+    fi
+    if ! nebula_ready; then
+        publish "overlay-lost-after-desktop"
+        return 1
+    fi
+    if ! configured_substrate_ready; then
+        publish "substrate-lost-after-desktop"
+        return 1
+    fi
+    if ! grouped_mackesd_ready; then
+        publish "grouped-lost-after-desktop"
+        return 1
+    fi
+    if [ "$role" = workstation ] \
+        && ! bounded_systemctl is-active --quiet mde-shell-egui.service >/dev/null 2>&1; then
+        publish "session-lost-after-desktop"
+        return 1
+    fi
+}
+
 configured_substrate_ready() {
     if [ -s "$ETCD_MEMBER_FILE" ]; then
         bounded_systemctl is-active --quiet etcd.service >/dev/null 2>&1 || return 1
@@ -278,6 +309,12 @@ main() {
     # Lighthouses must not start that role-inapplicable unit.
     if nebula_ready && configured_substrate_ready && grouped_mackesd_ready; then
         restore_role_desktop_state "$role" || return 1
+        attest_recovery_convergence "$role"
+        case $? in
+            0) ;;
+            2) return 0 ;;
+            *) return 1 ;;
+        esac
         publish "already-recovered"
         return 0
     fi
@@ -383,6 +420,12 @@ main() {
     # grouped readiness gate so a failed daemon/session recovery cannot report
     # or partially apply a healthy desktop state.
     restore_role_desktop_state "$role" || return 1
+    attest_recovery_convergence "$role"
+    case $? in
+        0) ;;
+        2) return 0 ;;
+        *) return 1 ;;
+    esac
     publish "recovered"
 }
 

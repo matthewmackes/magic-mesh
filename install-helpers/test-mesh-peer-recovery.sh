@@ -111,6 +111,9 @@ case "$1" in
             printf '%s\n' xdg-binds >>"$state/mutations"
             if [ -f "$state/drop-after-xdg" ]; then
                 rm -f "$state/drop-after-xdg" "$state/online"
+            elif [ -f "$state/drop-substrate-after-xdg" ]; then
+                rm -f "$state/drop-substrate-after-xdg" \
+                    "$state/active-etcd.service"
             fi
         elif [ "${2:-}" = etcd.service ] || [ "${2:-}" = syncthing.service ]; then
             unit=$2
@@ -491,6 +494,30 @@ cmp "$STATE/expected-mutations" "$STATE/mutations"
 [ ! -s "$STATE/sleeps" ]
 grep -Fq 'status=already-recovered' "$STATE/notifies"
 echo 'PASS repeated healthy event: no overlay or service restart'
+
+# Desktop restoration is an external systemd mutation and can race loss of a
+# previously healthy coordination process. The final success publication must
+# re-attest the whole peer/session chain rather than retaining the pre-XDG
+# substrate result.
+: >"$STATE/active-etcd.service"
+: >"$STATE/drop-substrate-after-xdg"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+if run_helper; then
+    echo 'late coordination loss unexpectedly reported recovery success' >&2
+    exit 1
+fi
+printf '%s\n' xdg-binds >"$STATE/expected-mutations"
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=substrate-lost-after-desktop' "$STATE/notifies"
+if grep -Fq 'status=already-recovered' "$STATE/notifies" \
+    || grep -Fq 'status=recovered' "$STATE/notifies"; then
+    echo 'late coordination loss retained a false convergence publication' >&2
+    exit 1
+fi
+rm -f "$STATE/drop-substrate-after-xdg"
+: >"$STATE/active-etcd.service"
+echo 'PASS final convergence fixture: post-XDG coordination loss retracts success'
 
 # A healthy mesh substrate does not prove that the Workstation session survived
 # boot/resume. Recovery must start a missing shell without restarting healthy
