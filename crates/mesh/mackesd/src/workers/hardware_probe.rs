@@ -258,7 +258,17 @@ fn publish(workgroup_root: &Path, node_id: &str) {
 /// regular residue from an interrupted prior write may be reclaimed; every
 /// other occupant fails closed and leaves the prior `probe.json` untouched.
 fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use rustix::fs::{Mode, OFlags};
+    write_probe_with_finalize(path, bytes, || {})
+}
+
+/// Descriptor-anchored probe publication with an injected pre-finalize seam for
+/// hostile replacement tests.
+fn write_probe_with_finalize(
+    path: &Path,
+    bytes: &[u8],
+    before_finalize: impl FnOnce(),
+) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -269,11 +279,20 @@ fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(".probe.json.tmp");
-
-    match std::fs::symlink_metadata(&temporary) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 => {
-            std::fs::remove_file(&temporary)?;
+    let directory_fd = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let directory: std::fs::File = directory_fd.into();
+    let pinned_parent = directory.metadata()?;
+    match rustix::fs::statat(&directory, ".probe.json.tmp", AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata)
+            if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                == rustix::fs::FileType::RegularFile
+                && metadata.st_nlink == 1 =>
+        {
+            rustix::fs::unlinkat(&directory, ".probe.json.tmp", AtFlags::empty())?;
         }
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -282,11 +301,12 @@ fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
 
-    let fd = rustix::fs::open(
-        &temporary,
+    let fd = rustix::fs::openat(
+        &directory,
+        ".probe.json.tmp",
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
     )?;
@@ -294,7 +314,35 @@ fn write_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(temporary, path)
+    before_finalize();
+
+    // The path must still resolve to the exact directory we pinned before the
+    // transaction. A replacement cannot redirect the final name, and a
+    // detached old directory cannot be reported as a successful publication.
+    let current_parent = std::fs::symlink_metadata(parent);
+    let parent_is_current = current_parent.as_ref().is_ok_and(|metadata| {
+        metadata.file_type().is_dir()
+            && metadata.dev() == pinned_parent.dev()
+            && metadata.ino() == pinned_parent.ino()
+    });
+    if !parent_is_current {
+        let _ = rustix::fs::unlinkat(&directory, ".probe.json.tmp", AtFlags::empty());
+        return Err(std::io::Error::other(
+            "hardware probe publication directory changed during transaction",
+        ));
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hardware probe path has no file name",
+        )
+    })?;
+    if let Err(error) = rustix::fs::renameat(&directory, ".probe.json.tmp", &directory, file_name) {
+        let _ = rustix::fs::unlinkat(&directory, ".probe.json.tmp", AtFlags::empty());
+        return Err(error.into());
+    }
+    directory.sync_all()
 }
 
 /// The default Bus root (persisted message tree), matching every other worker.
@@ -479,5 +527,35 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read(&outside).unwrap(), b"operator-owned\n");
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_probe_directory_cannot_capture_hardware_publication() {
+        let store = tempfile::tempdir().unwrap();
+        let path = probe_path(store.path(), "peer:node-a");
+        let parent = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).unwrap();
+        let detached = store.path().join("detached-mackesd");
+
+        let error = write_probe_with_finalize(
+            &path,
+            br#"{"peer_id":"peer:node-a","trusted":true}"#,
+            || {
+                std::fs::rename(&parent, &detached).unwrap();
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(parent.join(".probe.json.tmp"), b"foreign authority\n").unwrap();
+            },
+        )
+        .expect_err("a replaced publication directory must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            std::fs::read(parent.join(".probe.json.tmp")).unwrap(),
+            b"foreign authority\n"
+        );
+        assert!(!path.exists());
+        assert!(!detached.join(".probe.json.tmp").exists());
+        assert!(!detached.join("probe.json").exists());
     }
 }
