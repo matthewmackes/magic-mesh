@@ -608,6 +608,8 @@ impl ClipboardBridge {
         state.local_dib = None;
         state.local_file = None;
         state.local_advertised_generation = None;
+        state.local_data_request = None;
+        state.locked_local_files.clear();
         state.local_file_responses.clear();
     }
 }
@@ -1904,9 +1906,30 @@ mod tests {
             b"governed"
         );
 
-        backend.on_unlock(LockDataId(41));
+        assert_eq!(
+            bridge.offer_host_file("../outside.txt".into(), b"must-not-serve".to_vec()),
+            Err(ClipboardBridgeError::InvalidLocalFile),
+            "an invalid replacement must revoke every prior file authority"
+        );
         backend.on_file_contents_request(FileContentsRequest {
             stream_id: 10,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 8,
+            data_id: Some(41),
+        });
+        assert!(
+            bridge
+                .take_local_file_response()
+                .expect("revocation response")
+                .is_error(),
+            "a rejected replacement must destroy the locked prior snapshot"
+        );
+
+        backend.on_unlock(LockDataId(41));
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 11,
             index: 0,
             flags: FileContentsFlags::RANGE,
             position: 0,
