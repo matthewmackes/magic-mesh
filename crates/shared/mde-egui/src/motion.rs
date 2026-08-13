@@ -300,6 +300,25 @@ impl Spring {
     /// long stall (backgrounded tab) can't blow the integrator up.
     #[must_use]
     pub fn step(self, pos: f32, vel: f32, target: f32, dt: f32) -> (f32, f32) {
+        let fallback = if target.is_finite() {
+            target
+        } else if pos.is_finite() {
+            pos
+        } else {
+            0.0
+        };
+        if !pos.is_finite()
+            || !vel.is_finite()
+            || !target.is_finite()
+            || !dt.is_finite()
+            || dt < 0.0
+            || !self.stiffness.is_finite()
+            || self.stiffness < 0.0
+            || !self.damping.is_finite()
+            || self.damping < 0.0
+        {
+            return (fallback, 0.0);
+        }
         let dt = dt.clamp(0.0, 1.0 / 30.0);
         let accel = self.stiffness.mul_add(target - pos, -(self.damping * vel));
         let vel = accel.mul_add(dt, vel);
@@ -985,15 +1004,29 @@ impl Motion {
     /// springs. Under [`reduce_motion`](Self::reduce_motion) it returns `target`
     /// immediately (a11y — no travel, no repaint churn).
     pub fn spring_to(ctx: &Context, id: impl std::hash::Hash, target: f32, spring: Spring) -> f32 {
-        if Self::reduce_motion() {
-            return target;
-        }
         let id = egui::Id::new(id);
         let dt = ctx.input(|i| i.stable_dt);
-        let (pos, vel) = ctx
+        let (stored_pos, stored_vel) = ctx
             .data_mut(|d| d.get_temp::<(f32, f32)>(id))
             .unwrap_or((target, 0.0));
-        let (pos, vel) = spring.step(pos, vel, target, dt);
+        // A failed geometry calculation or stale EGL/egui memory must not turn
+        // the direct-DRM runner into a permanent repaint loop. Preserve the last
+        // trustworthy visual position when the new target is invalid; otherwise
+        // settle on the requested endpoint whenever any timeline input is
+        // poisoned. Storing the repaired pair also makes recovery durable across
+        // later event-only frames.
+        let target = if target.is_finite() {
+            target
+        } else if stored_pos.is_finite() {
+            stored_pos
+        } else {
+            0.0
+        };
+        if Self::reduce_motion() {
+            ctx.data_mut(|d| d.insert_temp(id, (target, 0.0)));
+            return target;
+        }
+        let (pos, vel) = spring.step(stored_pos, stored_vel, target, dt);
         ctx.data_mut(|d| d.insert_temp(id, (pos, vel)));
         if !spring.settled(pos, vel, target) {
             ctx.request_repaint();
@@ -1730,6 +1763,59 @@ mod tests {
             "settled near target: pos={pos} vel={vel}"
         );
         assert!((pos - 100.0).abs() < 1.0, "landed on the target");
+    }
+
+    #[test]
+    fn poisoned_spring_timeline_repairs_to_a_finite_settled_value() {
+        let spring = Spring::SNAPPY;
+
+        assert_eq!(spring.step(f32::NAN, 1.0, 42.0, 1.0 / 60.0), (42.0, 0.0));
+        assert_eq!(
+            spring.step(17.0, f32::INFINITY, f32::NAN, 1.0 / 60.0),
+            (17.0, 0.0),
+            "an invalid target preserves the last finite visual position"
+        );
+        assert_eq!(
+            spring.step(3.0, 1.0, 42.0, f32::NAN),
+            (42.0, 0.0),
+            "an invalid DRM frame delta settles instead of integrating forever"
+        );
+        assert_eq!(
+            Spring {
+                stiffness: f32::INFINITY,
+                damping: 1.0,
+            }
+            .step(3.0, 1.0, 42.0, 1.0 / 60.0),
+            (42.0, 0.0),
+            "invalid caller-provided spring coefficients fail closed"
+        );
+    }
+
+    #[test]
+    fn spring_context_driver_repairs_poisoned_memory_without_repaint_churn() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("poisoned-spring-driver");
+        ctx.data_mut(|d| d.insert_temp(id, (f32::NAN, f32::INFINITY)));
+
+        assert_eq!(
+            Motion::spring_to(&ctx, "poisoned-spring-driver", 42.0, Spring::SNAPPY),
+            42.0
+        );
+        assert_eq!(
+            ctx.data_mut(|d| d.get_temp::<(f32, f32)>(id)),
+            Some((42.0, 0.0)),
+            "the persisted carrier is repaired to a settled finite pair"
+        );
+
+        assert_eq!(
+            Motion::spring_to(&ctx, "poisoned-spring-driver", f32::NAN, Spring::SNAPPY),
+            42.0,
+            "a bad target cannot replace the last trustworthy visual value"
+        );
+        assert_eq!(
+            ctx.data_mut(|d| d.get_temp::<(f32, f32)>(id)),
+            Some((42.0, 0.0))
+        );
     }
 
     #[test]
