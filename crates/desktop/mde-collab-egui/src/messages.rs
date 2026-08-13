@@ -19,6 +19,32 @@ use mde_collab_types::{
 use crate::icons::CommsHoverExt;
 use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
 
+/// Maximum retained rows that one frame may search or lay out. The durable
+/// collaboration projection remains complete; these newest-first windows keep
+/// a hostile or long-lived channel from turning one shell frame into unbounded
+/// CPU, allocation, and widget state.
+const MAX_VISIBLE_MESSAGES: usize = 512;
+const MAX_VISIBLE_THREAD_REPLIES: usize = 256;
+const MAX_VISIBLE_TASKS: usize = 256;
+
+fn newest_rows<T>(rows: &[T], limit: usize) -> (&[T], usize) {
+    let omitted = rows.len().saturating_sub(limit);
+    (&rows[omitted..], omitted)
+}
+
+fn omitted_rows_notice(ui: &mut egui::Ui, omitted: usize, noun: &str) {
+    if omitted > 0 {
+        ui.label(
+            egui::RichText::new(format!(
+                "{omitted} older {noun} retained in history; showing the newest bounded window."
+            ))
+            .small()
+            .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_XS);
+    }
+}
+
 /// A constrained quick reaction held only in this surface's local view state.
 ///
 /// This deliberately is not a command, event, or read-model field: the operator
@@ -108,11 +134,13 @@ impl CommunicationsSurface {
 
         match data.channel_tasks(space) {
             Some(tasks) if !tasks.tasks.is_empty() => {
+                let (visible_tasks, omitted) = newest_rows(&tasks.tasks, MAX_VISIBLE_TASKS);
                 egui::ScrollArea::vertical()
                     .id_salt("collab-channel-tasks")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (i, task) in tasks.tasks.iter().enumerate() {
+                        omitted_rows_notice(ui, omitted, "tasks");
+                        for (i, task) in visible_tasks.iter().enumerate() {
                             crate::anim::entrance(ui, "task", task.task, i, |ui| {
                                 self.task_row(ui, data, sink, task, data.now_unix_ms());
                             });
@@ -248,8 +276,8 @@ impl CommunicationsSurface {
                 );
                 if let Some(source) = task.source {
                     let source_present = data.conversation(task.space).is_some_and(|timeline| {
-                        timeline
-                            .messages
+                        newest_rows(&timeline.messages, MAX_VISIBLE_MESSAGES)
+                            .0
                             .iter()
                             .any(|message| message.event_id == source)
                     });
@@ -443,6 +471,8 @@ impl CommunicationsSurface {
             .show(ui, |ui| match data.conversation(space) {
                 Some(conv) if !conv.messages.is_empty() => {
                     let messages = channel_find_messages(&conv.messages, find_query.as_str());
+                    let omitted = conv.messages.len().saturating_sub(MAX_VISIBLE_MESSAGES);
+                    omitted_rows_notice(ui, omitted, "messages");
                     // A newly-appearing row fades up on the shared staggered list
                     // entrance (lock #4) — only genuinely new event ids animate; a row
                     // already on screen is settled at full opacity.
@@ -942,7 +972,10 @@ impl CommunicationsSurface {
             .show(ui, |ui| match data.thread(space, thread) {
                 Some(timeline) => {
                     thread_message(ui, &timeline.root, now);
-                    for reply in &timeline.replies {
+                    let (replies, omitted) =
+                        newest_rows(&timeline.replies, MAX_VISIBLE_THREAD_REPLIES);
+                    omitted_rows_notice(ui, omitted, "thread replies");
+                    for reply in replies {
                         ui.indent("collab-thread-reply", |ui| thread_message(ui, reply, now));
                     }
                     if timeline.resolved {
@@ -1142,7 +1175,8 @@ pub(crate) fn channel_find_messages<'a>(
     messages: &'a [MessageView],
     query: &str,
 ) -> Vec<&'a MessageView> {
-    messages
+    newest_rows(messages, MAX_VISIBLE_MESSAGES)
+        .0
         .iter()
         .filter(|msg| message_matches_channel_find(msg, query))
         .collect()
@@ -1322,8 +1356,8 @@ const fn delivery_label(delivery: DeliveryState) -> &'static str {
 mod tests {
     use super::{
         cap_message_input, channel_find_messages, composer_enter_state_for,
-        for_each_markdown_chunk, message_matches_channel_find, LocalReaction,
-        MAX_MARKDOWN_LAYOUT_CHARS, MAX_MESSAGE_BODY_BYTES,
+        for_each_markdown_chunk, message_matches_channel_find, newest_rows, LocalReaction,
+        MAX_MARKDOWN_LAYOUT_CHARS, MAX_MESSAGE_BODY_BYTES, MAX_VISIBLE_MESSAGES,
     };
     use mde_collab_types::{ActorId, DeliveryState, EventId, MessageView};
     use mde_egui::egui;
@@ -1425,6 +1459,37 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].body, "Deploy is green.");
+    }
+
+    #[test]
+    fn hostile_projection_searches_only_the_newest_bounded_window() {
+        let peer = ActorId::new("falcon");
+        let messages = (0..MAX_VISIBLE_MESSAGES + 37)
+            .map(|index| MessageView {
+                event_id: EventId::new(),
+                author: peer.clone(),
+                created_unix_ms: index as i64,
+                body: if index == 0 {
+                    "old-window-only".to_owned()
+                } else {
+                    format!("message-{index}")
+                },
+                edited: false,
+                deleted: false,
+                delivery: DeliveryState::Delivered,
+                reply_count: 0,
+            })
+            .collect::<Vec<_>>();
+
+        let (visible, omitted) = newest_rows(&messages, MAX_VISIBLE_MESSAGES);
+        assert_eq!(visible.len(), MAX_VISIBLE_MESSAGES);
+        assert_eq!(omitted, 37);
+        assert_eq!(
+            visible.first().map(|message| message.created_unix_ms),
+            Some(37)
+        );
+        assert!(channel_find_messages(&messages, "old-window-only").is_empty());
+        assert_eq!(channel_find_messages(&messages, "message-548").len(), 1);
     }
 
     #[test]
