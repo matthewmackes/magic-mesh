@@ -875,6 +875,28 @@ enum RestartRecoveryStep {
     ObserveGuest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerStartRecoveryStep {
+    RematerializeAndStart,
+}
+
+fn container_start_recovery_step(
+    request: &WorkloadOperationRequest,
+    phase: WorkloadOperationPhase,
+    running: bool,
+) -> Option<ContainerStartRecoveryStep> {
+    if running || request.backend != WorkloadBackend::QuadletSystemd {
+        return None;
+    }
+    match (request.action, phase) {
+        (WorkloadOperationAction::Start, WorkloadOperationPhase::WaitingForGuest)
+        | (WorkloadOperationAction::Restart, WorkloadOperationPhase::Starting) => {
+            Some(ContainerStartRecoveryStep::RematerializeAndStart)
+        }
+        _ => None,
+    }
+}
+
 fn restart_recovery_step(
     phase: WorkloadOperationPhase,
     running: bool,
@@ -1354,6 +1376,25 @@ impl SystemWorkloadActuator {
         request: &WorkloadOperationRequest,
         status: &WorkloadOperationStatus,
     ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+        if container_start_recovery_step(request, status.phase, false)
+            == Some(ContainerStartRecoveryStep::RematerializeAndStart)
+        {
+            self.ensure_container_unit(request)?;
+            Self::run_power_command(request, "start")
+                .map_err(WorkloadActuatorError::Retryable)?;
+            return Ok(Some(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::WaitingForGuest,
+                power: WorkloadPowerState::Starting,
+                readiness: WorkloadReadiness::WaitingForGuest,
+                retryable: true,
+                reason: Some(
+                    "reinstalled the approved Quadlet after runtime-state loss and restarted its service"
+                        .into(),
+                ),
+                remediation: None,
+                attachment: None,
+            }));
+        }
         match status.phase {
             WorkloadOperationPhase::Stopping => Ok(Some(self.stopped_outcome(request))),
             WorkloadOperationPhase::WaitingForGuest => Err(WorkloadActuatorError::Retryable(
@@ -2524,6 +2565,11 @@ impl WorkloadActuator for SystemWorkloadActuator {
         let running = Self::running(request)?;
         if request.action == WorkloadOperationAction::Restart {
             if let Some(outcome) = recover_restart(status.phase, running, || {
+                if container_start_recovery_step(request, status.phase, running)
+                    == Some(ContainerStartRecoveryStep::RematerializeAndStart)
+                {
+                    self.ensure_container_unit(request)?;
+                }
                 Self::run_power_command(request, "start").map_err(WorkloadActuatorError::Retryable)
             })? {
                 return Ok(Some(outcome));
@@ -6281,6 +6327,49 @@ mod tests {
 
         request.preferred_attachment = Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf);
         assert!(validate_native_attachment_route(&request).is_ok());
+    }
+
+    #[test]
+    fn quadlet_runtime_loss_recovers_only_admitted_start_phases() {
+        let mut request = request();
+        request.backend = WorkloadBackend::QuadletSystemd;
+        request.action = WorkloadOperationAction::Start;
+
+        assert_eq!(
+            container_start_recovery_step(&request, WorkloadOperationPhase::WaitingForGuest, false,),
+            Some(ContainerStartRecoveryStep::RematerializeAndStart)
+        );
+        assert_eq!(
+            container_start_recovery_step(&request, WorkloadOperationPhase::WaitingForGuest, true,),
+            None,
+            "an active service must proceed through readiness observation"
+        );
+
+        request.action = WorkloadOperationAction::Restart;
+        assert_eq!(
+            container_start_recovery_step(&request, WorkloadOperationPhase::Starting, false),
+            Some(ContainerStartRecoveryStep::RematerializeAndStart)
+        );
+        assert_eq!(
+            container_start_recovery_step(&request, WorkloadOperationPhase::Stopping, false),
+            None,
+            "restart must journal Starting before recreating the unit"
+        );
+
+        request.action = WorkloadOperationAction::Stop;
+        assert_eq!(
+            container_start_recovery_step(&request, WorkloadOperationPhase::WaitingForGuest, false,),
+            None,
+            "cleanup operations must never recreate a container"
+        );
+
+        request.action = WorkloadOperationAction::Start;
+        request.backend = WorkloadBackend::LibvirtVirtqemud;
+        assert_eq!(
+            container_start_recovery_step(&request, WorkloadOperationPhase::WaitingForGuest, false,),
+            None,
+            "the Quadlet recovery path must not define VM lifecycle"
+        );
     }
 
     #[test]
