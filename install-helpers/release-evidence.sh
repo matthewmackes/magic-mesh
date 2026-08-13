@@ -339,7 +339,7 @@ required_check_binding_shape() {
 }
 
 write_release_binding() {
-  local out="" source_commit="" ci_gate_status="" parent tmp status_size
+  local out="" source_commit="" ci_gate_status="" parent parent_fd parent_fd_path parent_identity current_parent_identity tmp status_size
   local status_before status_after artifacts_json job_id build_host build_slot output_size arg
   local -a artifacts=()
 
@@ -405,12 +405,17 @@ write_release_binding() {
 
   parent="$(dirname -- "$out")"
   [ -d "$parent" ] && [ ! -L "$parent" ] || die "output parent is not a non-symlink directory: $parent"
+  parent_identity="$(stat -Lc '%d:%i' -- "$parent")" \
+    || die "could not identify binding output parent: $parent"
+  exec {parent_fd}<"$parent" \
+    || die "could not open binding output parent: $parent"
+  parent_fd_path="/proc/$BASHPID/fd/$parent_fd"
   if [ -e "$out" ] || [ -L "$out" ]; then
     [ -f "$out" ] && [ ! -L "$out" ] \
       || die "binding output is not a regular, non-symlink file: $out"
   fi
-  tmp="$(mktemp "$parent/.release-binding.XXXXXX")"
-  trap 'rm -f -- "$tmp" "$tmp.artifacts"' RETURN
+  tmp="$(mktemp "$parent_fd_path/.release-binding.XXXXXX")"
+  trap 'rm -f -- "$tmp" "$tmp.artifacts"; exec {parent_fd}<&-' EXIT
 
   {
     for arg in "${artifacts[@]}"; do artifact_json "$arg"; done
@@ -424,10 +429,18 @@ write_release_binding() {
   [ "$output_size" -gt 0 ] && [ "$output_size" -le "$MAX_RELEASE_BINDING_BYTES" ] \
     || die "generated release binding must be 1..$MAX_RELEASE_BINDING_BYTES bytes"
   chmod 0644 -- "$tmp"
+  current_parent_identity="$(stat -Lc '%d:%i' -- "$parent" 2>/dev/null || true)"
+  [ ! -L "$parent" ] && [ "$current_parent_identity" = "$parent_identity" ] \
+    || die "binding output parent was replaced while it was prepared: $parent"
+  if [ -e "$out" ] || [ -L "$out" ]; then
+    [ -f "$out" ] && [ ! -L "$out" ] \
+      || die "binding output changed type while it was prepared: $out"
+  fi
   [ ! -L "$out" ] || die "binding output became a symlink while it was prepared: $out"
-  mv -f -- "$tmp" "$out"
+  mv -fT -- "$tmp" "$out"
   rm -f -- "$tmp.artifacts"
-  trap - RETURN
+  exec {parent_fd}<&-
+  trap - EXIT
   echo "release-evidence: wrote canonical release binding to $out"
 }
 
@@ -1026,7 +1039,7 @@ write_evidence() {
       || die "evidence output is not a regular, non-symlink file: $out"
   fi
   tmp="$(mktemp "$parent/.release-evidence.XXXXXX")"
-  trap 'rm -f -- "$tmp" "$tmp.bound" "$tmp.artifacts" "$tmp.sbom" "$tmp.gate" "$tmp.ci-gate" "$tmp.resource-publisher-attestation" "$tmp.vdi" "$tmp.topology"' RETURN
+  trap 'rm -f -- "$tmp" "$tmp.bound" "$tmp.artifacts" "$tmp.sbom" "$tmp.gate" "$tmp.ci-gate" "$tmp.resource-publisher-attestation" "$tmp.vdi" "$tmp.topology"' EXIT
 
   {
     for arg in "${artifacts[@]}"; do artifact_json "$arg"; done
@@ -1114,7 +1127,7 @@ write_evidence() {
       || die "evidence output changed type while it was prepared: $out"
   fi
   mv -fT -- "$tmp" "$out"
-  trap - RETURN
+  trap - EXIT
   echo "release-evidence: wrote deterministic evidence to $out"
 }
 
@@ -1173,6 +1186,7 @@ self_test() {
   local hostile_descriptor_status hostile_descriptor_binding hostile_descriptor_evidence
   local missing_binding symlink_binding_artifact malformed_status
   local binding_swap_source binding_swap_original binding_swap_marker binding_swap_output
+  local binding_parent binding_parent_original binding_parent_marker binding_parent_output real_chmod
   local replacement_race replacement_race_original replacement_race_marker real_jq
   local artifact_replacement artifact_replacement_original artifact_replacement_marker
   local gate_replacement gate_replacement_marker gate_original_identity real_sha256sum
@@ -1342,6 +1356,44 @@ EOF
     && [ "$(<"$binding_swap_output")" = preserve-existing-binding-output ] \
     || die "self-test: write-binding accepted an artifact pathname replacement or changed existing output"
   cp -- "$binding_swap_original" "$work/a.rpm"
+
+  # Bind publication to the directory inode admitted before verification.
+  binding_parent="$work/binding-parent"
+  binding_parent_original="$work/binding-parent-original"
+  binding_parent_marker="$work/binding-parent-replacement.marker"
+  binding_parent_output="$binding_parent/release-binding.json"
+  mkdir -- "$binding_parent"
+  real_chmod="$(command -v chmod)"
+  mkdir -- "$work/hostile-binding-chmod"
+  cat >"$work/hostile-binding-chmod/chmod" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+"${RELEASE_EVIDENCE_REAL_CHMOD:?}" "$@"
+candidate="${@: -1}"
+if [[ "$candidate" == /proc/*/fd/*/.release-binding.* ]] \
+  && [ ! -e "${RELEASE_EVIDENCE_BINDING_PARENT_MARKER:?}" ]; then
+  mv -- "${RELEASE_EVIDENCE_BINDING_PARENT:?}" \
+    "${RELEASE_EVIDENCE_BINDING_PARENT_ORIGINAL:?}"
+  mkdir -- "${RELEASE_EVIDENCE_BINDING_PARENT:?}"
+  : >"${RELEASE_EVIDENCE_BINDING_PARENT_MARKER:?}"
+fi
+EOF
+  chmod 0755 -- "$work/hostile-binding-chmod/chmod"
+  set +e
+  PATH="$work/hostile-binding-chmod:$PATH" \
+    RELEASE_EVIDENCE_REAL_CHMOD="$real_chmod" \
+    RELEASE_EVIDENCE_BINDING_PARENT="$binding_parent" \
+    RELEASE_EVIDENCE_BINDING_PARENT_ORIGINAL="$binding_parent_original" \
+    RELEASE_EVIDENCE_BINDING_PARENT_MARKER="$binding_parent_marker" \
+    "$0" write-binding --out "$binding_parent_output" \
+      --source-commit 0123456789abcdef0123456789abcdef01234567 \
+      --ci-gate-status "$duplicate_status" --artifact "$work/a.rpm" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] && [ -e "$binding_parent_marker" ] \
+    && [ ! -e "$binding_parent_output" ] \
+    && [ -z "$(find "$binding_parent_original" -maxdepth 1 -name '.release-binding.*' -print -quit)" ] \
+    || die "self-test: write-binding published through a replaced parent or retained partial state"
 
   # A malformed or authenticated-status identity change must leave an existing
   # output byte-for-byte untouched.
