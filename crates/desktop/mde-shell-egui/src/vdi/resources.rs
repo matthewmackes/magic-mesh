@@ -173,6 +173,7 @@ enum PendingActionKind {
 #[derive(Debug)]
 struct PendingResourceAction {
     kind: PendingActionKind,
+    admission_epoch: u64,
     receiver: Receiver<Result<ResourceActionReceipt, String>>,
 }
 
@@ -201,6 +202,7 @@ pub(super) struct RemoteSessionsModel {
     class_filter: Option<ResourceClass>,
     action_pending: Option<PendingResourceAction>,
     action_feedback: Option<String>,
+    admission_epoch: u64,
 }
 
 impl Default for RemoteSessionsModel {
@@ -215,6 +217,7 @@ impl Default for RemoteSessionsModel {
             class_filter: None,
             action_pending: None,
             action_feedback: None,
+            admission_epoch: 0,
         }
     }
 }
@@ -258,8 +261,7 @@ impl RemoteSessionsModel {
                     "Publisher {} supplied a conflicting or non-monotonic catalog at revision {}. The last admitted snapshot remains visible and actionless.",
                     projection.publisher, projection.revision
                 ));
-                self.android_starts.clear();
-                self.cancellable_actions.clear();
+                self.revoke_action_authority();
                 return Err("conflicting resource catalog revision".into());
             }
             if !same_generation
@@ -269,7 +271,7 @@ impl RemoteSessionsModel {
                 // card/action generation as its original request. A refreshed
                 // catalog requires the owning action surface to re-admit a new
                 // operation instead of carrying an old cancellation handle.
-                self.cancellable_actions.clear();
+                self.revoke_action_authority();
             }
         }
 
@@ -279,11 +281,19 @@ impl RemoteSessionsModel {
     }
 
     pub(super) fn mark_reconnecting(&mut self, detail: impl Into<String>) {
+        self.revoke_action_authority();
         self.feed_state = FeedState::Reconnecting(bounded_detail(detail.into()));
     }
 
     pub(super) fn mark_unavailable(&mut self, detail: impl Into<String>) {
+        self.revoke_action_authority();
         self.feed_state = FeedState::Unavailable(bounded_detail(detail.into()));
+    }
+
+    fn revoke_action_authority(&mut self) {
+        self.admission_epoch = self.admission_epoch.wrapping_add(1);
+        self.android_starts.clear();
+        self.cancellable_actions.clear();
     }
 
     fn set_query(&mut self, query: String) {
@@ -327,6 +337,7 @@ impl RemoteSessionsModel {
         ));
         self.action_pending = Some(PendingResourceAction {
             kind: PendingActionKind::Start,
+            admission_epoch: self.admission_epoch,
             receiver,
         });
         std::thread::spawn(move || {
@@ -357,6 +368,7 @@ impl RemoteSessionsModel {
         self.action_feedback = Some("Cancelling exact workload action…".to_owned());
         self.action_pending = Some(PendingResourceAction {
             kind: PendingActionKind::Cancel,
+            admission_epoch: self.admission_epoch,
             receiver,
         });
         std::thread::spawn(move || {
@@ -370,6 +382,7 @@ impl RemoteSessionsModel {
             return;
         };
         let kind = pending.kind;
+        let admission_epoch = pending.admission_epoch;
         match pending.receiver.try_recv() {
             Ok(Ok(receipt)) => {
                 let request_id = receipt.invocation.request_id.clone();
@@ -380,7 +393,9 @@ impl RemoteSessionsModel {
                 // the daemon, but this browser must not present that stale
                 // result as belonging to the newly admitted generation or
                 // retain a cancellation handle for it.
-                if !self.invocation_matches_current_catalog(&receipt.invocation) {
+                if admission_epoch != self.admission_epoch
+                    || !self.invocation_matches_current_catalog(&receipt.invocation)
+                {
                     self.action_feedback = Some(
                         "Action reply refused: the admitted resource generation changed."
                             .to_owned(),
@@ -1492,7 +1507,11 @@ mod tests {
 
         model.set_query("unavailable".into());
         let visible = model.visible_entries(NOW + 300_001);
-        assert_eq!(visible.len(), 2, "expired cards remain searchable by status");
+        assert_eq!(
+            visible.len(),
+            2,
+            "expired cards remain searchable by status"
+        );
     }
 
     #[test]
@@ -1576,6 +1595,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         model.action_pending = Some(PendingResourceAction {
             kind: PendingActionKind::Start,
+            admission_epoch: model.admission_epoch,
             receiver,
         });
 
@@ -1587,6 +1607,45 @@ mod tests {
         sender
             .send(Ok(receipt))
             .expect("deliver delayed accepted authority reply");
+
+        model.poll_action();
+
+        assert!(model.action_pending.is_none());
+        assert!(!model.cancellable_actions.contains_key(&resource_id));
+        assert!(model
+            .action_feedback
+            .as_deref()
+            .is_some_and(|message| message.contains("generation changed")));
+    }
+
+    #[test]
+    fn action_reply_from_before_feed_loss_is_not_adopted_after_same_catalog_recovers() {
+        let receipt = accepted_workload_receipt();
+        let resource_id = receipt.invocation.resource_id.clone();
+        let admitted = projection("revision-workload-9", 'a');
+        let mut model = RemoteSessionsModel::default();
+        model
+            .install_projection(admitted.clone())
+            .expect("request generation admitted");
+        model
+            .cancellable_actions
+            .insert(resource_id.clone(), receipt.clone());
+
+        let (sender, receiver) = mpsc::channel();
+        model.action_pending = Some(PendingResourceAction {
+            kind: PendingActionKind::Start,
+            admission_epoch: model.admission_epoch,
+            receiver,
+        });
+
+        model.mark_unavailable("publisher credential disappeared");
+        assert!(model.cancellable_actions.is_empty());
+        model
+            .install_projection(admitted)
+            .expect("same catalog recovered with fresh local authority");
+        sender
+            .send(Ok(receipt))
+            .expect("deliver pre-outage accepted authority reply");
 
         model.poll_action();
 
