@@ -1040,18 +1040,22 @@ impl Worker for TransfersWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let mut engine = self.engine()?;
-        let mut clipboard_materializer = self
-            .bus_root
-            .enabled()
-            .then(|| {
-                self.bus_root.resolve().and_then(|root| {
-                    clipboard_materializer::ClipboardFilesMaterializer::bind(
-                        root,
-                        Arc::clone(&self.files_resolver),
-                    )
-                })
-            })
-            .transpose()?;
+        let mut clipboard_materializer = if self.bus_root.enabled() {
+            match self.bus_root.resolve().and_then(|root| {
+                clipboard_materializer::ClipboardFilesMaterializer::bind(
+                    root,
+                    Arc::clone(&self.files_resolver),
+                )
+            }) {
+                Ok(materializer) => Some(materializer),
+                Err(error) => {
+                    tracing::warn!(%error, "clipboard materializer Bus unavailable; deferring bind");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         tracing::info!(
             target: "mackesd::transfers",
             store = %self.store_root.display(), cap = self.cap,
