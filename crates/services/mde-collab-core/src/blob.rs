@@ -771,10 +771,7 @@ mod tests {
     impl Read for FailingReader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             if self.successful_reads_left == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "injected stream failure",
-                ));
+                return Err(std::io::Error::other("injected stream failure"));
             }
             self.successful_reads_left -= 1;
             let limit = buffer.len().min(3);

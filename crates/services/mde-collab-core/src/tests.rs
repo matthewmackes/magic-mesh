@@ -2501,7 +2501,7 @@ fn start_call_flows_into_the_call_state_projection() {
     let expected = a.projection().dump_tables().expect("dump projection");
     let mut replay = engine("replay");
     replay
-        .merge(shuffle(&a.all_events(), 0xC011_AFE))
+        .merge(shuffle(&a.all_events(), 0x0C01_1AFE))
         .expect("replay shuffled call log");
     assert_eq!(
         replay.projection().dump_tables().expect("dump replay"),
