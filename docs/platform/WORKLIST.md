@@ -920,7 +920,10 @@ behavioral evidence is not completion.
 - Problem: node hardware and OS observations/actions are incomplete, duplicated, and not consistently capability-driven or safe.
 - Required outcome: credential-free Workers providers publish bounded sourced hardware/OS entities and only allow capability-gated, generation-bound, audited safe
   controls for Wi-Fi, audio, display, input, storage, printers, services, power, and virtualization.
-- Current state: typed providers exist; coverage, safe actions, and fleet proof remain. Latest: `evidence/WL-UX-011-2026-08-11-hardware-staging-generation-r472.md`.
+- Current state: the bounded observation taxonomy now covers the declared
+  hardware/OS categories, including printers, services, and virtualization;
+  remaining UX-011 work is capability-gated action coverage and shared rollout
+  proof. Latest implementation evidence: `evidence/WL-UX-011-2026-08-14-service-provider-r1.md`.
 - **Device-control ownership checkpoint (2026-08-09):** privileged controls now
   require an exact match on provider host, category, name, sysfs path, and
   driver; forged and foreign-host targets cannot reach mutation. `.90` passed
