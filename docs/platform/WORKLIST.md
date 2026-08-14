@@ -488,6 +488,10 @@ behavioral evidence is not completion.
 - **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
 - Remaining work:
+- **Android Remote Sessions handoff (2026-08-14):** typed catalog/readiness,
+  exact-generation VDI source, authorization refusal, and no-dial behavior
+  passed 30/30 on `.90`; guest packaging/nested-KVM/live execution remain:
+  `evidence/WL-FUNC-020-2026-08-14-android-remote-session-farm-gate-r1.md`.
 - **Typed Android Workload start (2026-08-11):** governed outer-VM `Start`
   validates the declaration and publishes a signed, generation-bound,
   replay-stable operation; clean BigBoy slot 2 passed 1/1:
