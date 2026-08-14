@@ -1019,6 +1019,23 @@ impl ClockWorker {
                                 expected_snapshot_revision == snapshot.revision,
                                 "stale Clock peer stopwatch repair"
                             );
+                            // A lower-revision payload is only valid as the
+                            // deterministic repair emitted by the origin for
+                            // this exact target/generation.  A peer-origin
+                            // command with an arbitrary request id could
+                            // otherwise masquerade as that repair while
+                            // reusing the same local snapshot revision.
+                            anyhow::ensure!(
+                                request_id
+                                    == peer_request_id(
+                                        "stopwatch",
+                                        &local_node_id,
+                                        &stopwatch.stopwatch_id,
+                                        stopwatch.revision,
+                                        "",
+                                    ),
+                                "unauthorized Clock peer stopwatch repair"
+                            );
                         }
                         if stopwatch.revision == existing.revision {
                             anyhow::ensure!(
@@ -6090,16 +6107,16 @@ mod tests {
         receiver.worker.snapshot = Some(peer);
         assert!(receiver
             .worker
-            .apply_command(
-                ClockCommandKindV1::UpsertStopwatch {
-                    stopwatch: desired.clone(),
-                },
-                "seat-1",
-                true,
-                "repair-current-generation",
-                1,
-                NOW,
-                NOW,
+                .apply_command(
+                    ClockCommandKindV1::UpsertStopwatch {
+                        stopwatch: desired.clone(),
+                    },
+                    "seat-1",
+                    true,
+                    &peer_request_id("stopwatch", "seat-2", "mesh-stopwatch", 4, ""),
+                    1,
+                    NOW,
+                    NOW,
             )
             .expect("origin repair bound to the observed peer generation"));
         assert_eq!(
@@ -6120,7 +6137,7 @@ mod tests {
                 ClockCommandKindV1::UpsertStopwatch { stopwatch: desired },
                 "seat-1",
                 true,
-                "repair-stale-generation",
+                &peer_request_id("stopwatch", "seat-2", "mesh-stopwatch", 4, ""),
                 1,
                 NOW,
                 NOW,

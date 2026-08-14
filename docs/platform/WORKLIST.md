@@ -1887,6 +1887,8 @@ behavioral evidence is not completion.
   `evidence/WL-FUNC-022-2026-08-11-clock-action-payload-r453.md`.
 - **Occurrence payload binding (2026-08-11):** active generations reject conflicting audio/volume; `.90` passed 1/1:
   `docs/platform/evidence/WL-FUNC-022-2026-08-11-clock-occurrence-payload-binding-r365.md`.
+- **Peer stopwatch repair binding (2026-08-14):** lower-revision repairs now require the deterministic origin-generated request identity bound to target, stopwatch, and revision; BigBoy `172.20.0.130` passed the Clock worker suite 36/36:
+  `evidence/WL-FUNC-022-2026-08-14-peer-stopwatch-repair-binding-r1.md`.
 - **Peer convergence probe budget (2026-08-11):** retry-suppressed peer probes
   are capped independently at 512 per tick, preventing large retained snapshots
   from consuming unbounded convergence work; evidence:
