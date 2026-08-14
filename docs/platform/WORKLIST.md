@@ -476,8 +476,10 @@ behavioral evidence is not completion.
   UX.
 - Required outcome: Workloads exposes governed Android app, outer Android VM, and full Workstation desktop choices; the app path uses a signed AOSP/Cuttlefish image,
   typed start/stop/readiness, VDI presentation, and bounded host isolation.
-- Current state: signed catalog/import, provider preflight, crash-safe lifecycle, bounded guest relay, typed VDI source, and governed Workloads cards/actions exist;
-  release artifacts, remote-session attachment, guest packaging, nested-KVM run, and live proof remain.
+- Current state: signed catalog/import, provider preflight, crash-safe lifecycle,
+  bounded guest relay, typed VDI source, governed Workloads cards/actions, and
+  reproducible guest packaging exist; release inputs, nested-KVM execution, and
+  live proof remain.
 - **Catalog/provider (2026-08-08):** signed import and image/KVM/capacity/libvirt preflight passed:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
 - **S3 lifecycle/readiness (2026-08-09):** recovery, guest relay, and VDI revocation passed:
@@ -490,7 +492,7 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Android Remote Sessions handoff (2026-08-14):** typed catalog/readiness,
   exact-generation VDI source, authorization refusal, and no-dial behavior
-  passed 30/30 on `.90`; guest packaging/nested-KVM/live execution remain:
+  passed 30/30 on `.90`; nested-KVM/live execution remain:
   `evidence/WL-FUNC-020-2026-08-14-android-remote-session-farm-gate-r1.md`.
 - **Typed Android Workload start (2026-08-11):** governed outer-VM `Start`
   validates the declaration and publishes a signed, generation-bound,
