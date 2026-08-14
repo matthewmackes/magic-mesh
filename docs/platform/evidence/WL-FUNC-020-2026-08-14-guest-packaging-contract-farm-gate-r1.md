@@ -6,7 +6,10 @@
   `bash packaging/android/verify-guest-payload.sh --self-test`; and
   `python3 packaging/android/test-produce-image-receipt.py`.
 - Result: all four passed.
-- Limitation: `test-guest-debs.sh` and
-  `test-stage-guest-runtime-artifacts.sh` call `git rev-parse`/`git archive`;
-  the farm workspace has no `.git` metadata by design, so those fixtures were
-  not claimed as passed.
+- Full fixture attempt: after creating an isolated local Git snapshot in the
+  farm workspace, `test-guest-debs.sh` and
+  `test-stage-guest-runtime-artifacts.sh` reached the archived source build but
+  failed before producing artifacts: `cargo build --locked` reported that it
+  could not update the archived `Cargo.lock`. The snapshot contains
+  `Cargo.lock`; this is recorded as a reproducible Cargo lock/dependency
+  resolution blocker, not as package proof.
