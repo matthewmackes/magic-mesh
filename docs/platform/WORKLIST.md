@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **8 active epics:** 8 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **7 active epics:** 7 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -467,137 +467,6 @@ behavioral evidence is not completion.
 - Verification method: collab/file/editor/media cargo suites, architecture/secret/package gates, visual captures, and live provider tests; route long jobs to BigBoy.
 - Origin or merged source IDs: NOTIFY-CHAT, EDITOR-*, FILEMGR-*, TEAMS-*, CLIPBOARD-*, VOICE-*; 2026-08-03 Mesh Collaboration survey.
 
-### WL-FUNC-020 - Expose governed Android applications in Workloads
-
-- Status: Remaining
-- Priority: P1
-- Complexity: Large
-- Problem: Android is represented by partially integrated Cuttlefish layers without a complete signed app catalog, image/provider contract, lifecycle, or honest failure
-  UX.
-- Required outcome: Workloads exposes governed Android app, outer Android VM, and full Workstation desktop choices; the app path uses a signed AOSP/Cuttlefish image,
-  typed start/stop/readiness, VDI presentation, and bounded host isolation.
-- Current state: signed catalog/import, provider preflight, crash-safe lifecycle,
-  bounded guest relay, typed VDI source, governed Workloads cards/actions, and
-  reproducible guest packaging exist; release inputs, nested-KVM execution, and
-  live proof remain.
-- **Catalog/provider (2026-08-08):** signed import and image/KVM/capacity/libvirt preflight passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
-- **S3 lifecycle/readiness (2026-08-09):** recovery, guest relay, and VDI revocation passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-lifecycle-s3-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-09-vdi-readiness-revocation-r4.md`.
-- **S4 governed UX (2026-08-08):** signed cards, lifecycle, rendering, handoff, and no-dial refusal passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-08-governed-android-ux-s4-r1.md`.
-- **Release admission (2026-08-09):** schema-v2 readiness binding passed: `docs/platform/evidence/WL-FUNC-020-2026-08-09-release-artifact-admission-s2-s5-r5.md`.
-- **Future-issued catalog (2026-08-10):** provider preflight refuses catalogs issued after the admission clock; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-10-future-issued-catalog-r153.md`.
-- Remaining work:
-- **Android Remote Sessions handoff (2026-08-14):** typed catalog/readiness,
-  exact-generation VDI source, authorization refusal, and no-dial behavior
-  passed 30/30 on `.90`; nested-KVM/live execution remain:
-  `evidence/WL-FUNC-020-2026-08-14-android-remote-session-farm-gate-r1.md`.
-- **Typed Android Workload start (2026-08-11):** governed outer-VM `Start`
-  validates the declaration and publishes a signed, generation-bound,
-  replay-stable operation; clean BigBoy slot 2 passed 1/1:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-11-typed-workload-start-r256.md`.
-- **Corrupt catalog restart (2026-08-11):** invalid durable state cannot become empty authority or switch identity; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-11-corrupt-catalog-restart-r293.md`.
-- **Signed Android desired definition (2026-08-11):** provision re-verifies the durable catalog, exact artifact/package provenance, capacity, and provider before
-  persistence; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-11-signed-desired-definition-r263.md`.
-- **Typed lifecycle delegation:** signed-catalog-bound Start/Stop use Workloads only; Cancel stays refused without a prior request ID. BigBoy passed 2/2:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-11-android-lifecycle-delegation-r273.md`.
-- **Bounded Android host probes (2026-08-11):** `/proc` and nested-KVM sysfs reads reject oversized host text before parsing; BigBoy passed 1/1:
-  `evidence/WL-FUNC-020-2026-08-11-android-host-probe-bound-r227.md`.
-- **Guest packaging contracts (2026-08-14):** `.90` passed the contract
-  Android/Cuttlefish contract, image-manifest, signed guest-payload, and image
-  receipt self-tests; BigBoy `.130` passed the full guest-DEB/staging fixtures
-  after the tracked Cargo lockfile was refreshed:
-  `evidence/WL-FUNC-020-2026-08-14-guest-packaging-contract-farm-gate-r1.md`.
-- **Bounded cloud replay cleanup (2026-08-11):** expired nonce rows reject symlinks and payloads over 128 bytes before parsing; BigBoy passed 1/1:
-  `evidence/WL-FUNC-020-2026-08-11-cloud-gate-nonce-bound-r227.md`.
-- **Authenticated Cuttlefish relay (2026-08-11):** the production guest
-  transport rejects writable, substituted, ownership-drifted, or peer-credential-
-  mismatched Unix relays before sending governed request bytes; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-11-authenticated-cuttlefish-relay-r248.md`.
-- **VDI source identity checkpoint (2026-08-10):** Cuttlefish VDI sources now require current guest-ready state plus
-  matching workload, image provenance, and generation. `.90` passed a hostile mismatched-workload regression:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-10-vdi-source-identity-r187.md`.
-- **Android catalog identity checkpoint (2026-08-10):** higher-revision signed imports cannot switch catalog identity; seat 90 passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-10-android-identity-continuity-r161.md`.
-- **Android catalog state-parent checkpoint (2026-08-10):** cache replay and replacement refuse symlinked or non-directory parent components; seat 90 passed the hostile regression:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-10-catalog-state-parent-nofollow-r196.md`.
-- **Stale Android generation admission (2026-08-10):** non-ready or stale
-  Cuttlefish operations stop before backend contact; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-10-stale-generation-admission-r210.md`.
-- **Cuttlefish readiness revocation (2026-08-11):** failed refresh revokes retained launch/VDI authority before backend contact; `.50` passed 1/1:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-11-cuttlefish-readiness-revocation-r315.md`.
-- **Future guest inventory:** future observations cannot fabricate fresh readiness; BigBoy 1/1: `evidence/WL-FUNC-020-2026-08-11-future-guest-inventory-r382.md`.
-- **Guest exchange generation:** pre-restart inventory cannot authorize current readiness; `.196` 1/1: `evidence/WL-FUNC-020-2026-08-11-cuttlefish-exchange-generation-r436.md`.
-- **Guest readiness publication:** parent/staging substitution cannot redirect the receipt; `.196` self-test:
-  `evidence/WL-FUNC-020-2026-08-11-guest-readiness-publication-r445.md`.
-- **VDI host canonicalization:** hostile aliases cannot cross mesh-host authority; BigBoy 1/1:
-  `evidence/WL-FUNC-020-2026-08-11-vdi-host-canonicalization-r448.md`.
-- **Expired catalog replay:** replacement Bus activation retains only anti-rollback identity; BigBoy 1/1: `evidence/WL-FUNC-020-2026-08-11-expired-catalog-bus-replacement-r384.md`.
-- **Catalog Bus generation:** replay/import progress cannot cross a replaced index; `.170` 1/1: `evidence/WL-FUNC-020-2026-08-11-catalog-bus-generation-r401.md`.
-- **Retry generation:** terminal retry cannot relabel running power; `.196` 1/1: `evidence/WL-FUNC-020-WL-ARCH-010-2026-08-11-cuttlefish-failed-retry-generation-r407.md`.
-  - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
-    libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
-  - **Signed release-artifact admission (2026-08-09):** schema v3 requires one bounded detached signature from the pinned installed MCNF key before provisioning; missing,
-    invalid, substituted, or changed artifacts fail closed. BigBoy passed the real GPG/dearmor package gate:
-    `docs/platform/evidence/WL-FUNC-020-2026-08-09-signed-release-artifact-admission-r102.md`.
-  - **S1 importer retry boundary (2026-08-09):** transient persistence/publication failure no longer acknowledges a signed catalog row; terminal refusals still
-    advance and the repaired retry publishes exactly once. Machine 9 exact regression passed 1/1:
-    `docs/platform/evidence/WL-FUNC-020-2026-08-09-android-import-side-effect-retry-s1-r6.md`.
-  1. S1 Freeze Android catalog/image contracts.
-     - Objective: define signed app identity, package/version, image digest, permissions, capabilities, resource profile, and guest readiness.
-     - Inputs: Android mesh types and provider policy.
-     - Deliverable: bounded contracts, importer, and hostile tests.
-     - Depends on: ARCH-010 S2.
-     - Acceptance: unsigned, stale, incompatible, or over-limit entries fail closed.
-     - Validation: mesh-type cargo tests on .50.
-     - Done when: catalog/image hashes and fixtures exist.
-  2. S2 Implement image and provider admission.
-     - Objective: verify AOSP/Cuttlefish image, host capability, nested virtualization, and provider health before placement.
-     - Inputs: S1, CloudRunner, node capabilities.
-     - Deliverable: provider adapter, preflight, and refusal diagnostics.
-     - Depends on: S1.
-     - Acceptance: no unsupported host receives Android and no fake ready state is emitted.
-     - Validation: provider/property cargo tests and package checks on BigBoy.
-     - Done when: preflight matrix is evidenced.
-  3. S3 Integrate typed app lifecycle.
-     - Objective: start one outer VM, install/launch/stop one approved app, and reclaim resources through Workload operations.
-     - Inputs: S1/S2 and ARCH-010 S3/S4.
-     - Deliverable: lifecycle adapter, generation/cancel/retry tests, and VDI source.
-     - Depends on: S2.
-     - Acceptance: duplicate/cancel/crash/restart never leaks VM, app, lease, or process.
-     - Validation: Workload/Android cargo tests on BigBoy.
-     - Done when: end-to-end operation trace exists.
-  4. S4 Render governed Android UX.
-     - Objective: show app cards, permission/approval, progress, VDI input, unavailable state, and cleanup in Workloads/Remote Sessions.
-     - Inputs: S3 and UX-009/012.
-     - Deliverable: render/model fixtures and typed action wiring.
-     - Depends on: S3.
-     - Acceptance: shell never launches adb, qemu, or package commands directly.
-     - Validation: shell render/authority tests.
-     - Done when: responsive captures and refusal states pass.
-  5. S5 Prove security, package, and live behavior.
-     - Objective: verify image provenance, SELinux/cgroup/device isolation, audio/input, reconnect, upgrade, and acceptance on no more than two seats.
-     - Inputs: S1-S4 and CRIT-006/007.
-     - Deliverable: signed package/security/live evidence.
-     - Depends on: S4.
-     - Acceptance: host secrets/files are inaccessible and provider failures remain actionable.
-     - Validation: package/SELinux/VDI/live hardware gates.
-     - Done when: unavailable Cuttlefish hardware/provider is explicitly named.
-- Scope: Owns Android catalog/image/provider, outer VM/app lifecycle, VDI UX, policy, packaging, and proof. Generic Workload, Remote Sessions catalog, and native Music
-  are out of scope.
-- Relevant files/components: mesh Android/provider types, mackesd CloudRunner/Cuttlefish workers, Workloads/IAC shell, image-builder, libvirt/VDI packaging.
-- Dependencies: ARCH-010, FUNC-019, UX-009, UX-012, CRIT-006, CRIT-007.
-- Acceptance criteria:
-  1. Signed app/image identity and host preflight gate every operation.
-  2. One typed operation controls VM/app start, readiness, input, stop, cancel, retry, and cleanup.
-  3. Security/package/live evidence proves no host escape or invented readiness.
-- Verification method: contract/provider/Workload/shell/package/SELinux cargo gates and named Cuttlefish/live-seat proof; BigBoy runs the Android image gate.
-- Origin or merged source IDs: 2026-08-03 governed Android Workloads decision and archived Android/App VM workstreams.
-
 ### WL-FUNC-021 - Deliver the Spotify-class Music workspace and service parity
 - Status: Remaining
 - Priority: P1
@@ -894,6 +763,11 @@ behavioral evidence is not completion.
   implementation. Once a governed A–F scene/audio package exists, its signed
   package, installed-seat captures, and live renderer/audio evidence are shared
   rollout proof owned here; no additional seat requirement is imposed on UX-014.
+- **Android release/live proof boundary:** FUNC-020 implementation is archived
+  after catalog, lifecycle, VDI/session, packaging, and hostile farm gates.
+  Cuttlefish release inputs, nested-KVM execution, and live Android/provider
+  captures are shared rollout proof owned here; no additional seat requirement
+  is imposed on the archived implementation.
 - **Release-gate proof boundary:** CRIT-006’s remaining operator-supplied
   release execution is shared rollout proof owned here; it is not repeated as
   a product-epic implementation requirement.
