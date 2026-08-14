@@ -1340,7 +1340,11 @@ pub fn power_supplies(roots: &SysfsRoots) -> Vec<DeviceRecord> {
 /// not enter the inventory. A missing/refusing `lpstat` is an explicit
 /// unavailable row rather than an inferred healthy printer set.
 #[must_use]
-pub fn printers() -> Vec<DeviceRecord> {
+pub fn printers(roots: &SysfsRoots) -> Vec<DeviceRecord> {
+    // Fixture-root enumeration must not observe the runner's CUPS service.
+    if roots.sys != Path::new("/sys") || roots.proc != Path::new("/proc") {
+        return Vec::new();
+    }
     use std::io::Read as _;
     use std::process::Stdio;
 
@@ -1454,7 +1458,12 @@ fn parse_printer_output(output: &[u8]) -> Vec<DeviceRecord> {
 /// Read-only systemd service observation. Unit names and coarse active state
 /// are the only fields admitted into the mesh inventory.
 #[must_use]
-pub fn services() -> Vec<DeviceRecord> {
+pub fn services(roots: &SysfsRoots) -> Vec<DeviceRecord> {
+    // Enumeration tests inject fixture roots; never let them observe the test
+    // runner's host service manager. Production uses the canonical system roots.
+    if roots.sys != Path::new("/sys") || roots.proc != Path::new("/proc") {
+        return Vec::new();
+    }
     let mut command = Command::new("systemctl");
     command.args([
         "list-units",
@@ -1686,8 +1695,8 @@ pub fn enumerate(
     add(&mut buckets, category::SENSORS, sensors(roots));
     add(&mut buckets, category::BLUETOOTH, bluetooth(roots));
     add(&mut buckets, category::POWER, power_supplies(roots));
-    add(&mut buckets, category::PRINTERS, printers());
-    add(&mut buckets, category::SERVICES, services());
+    add(&mut buckets, category::PRINTERS, printers(roots));
+    add(&mut buckets, category::SERVICES, services(roots));
 
     suppress_conflicting_sysfs_identities(&mut buckets);
 
