@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **17 active epics:** 17 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **16 active epics:** 16 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -797,158 +797,6 @@ behavioral evidence is not completion.
   3. Three-seat-maximum release proof records real providers, partial failures, and corrected-forward recovery.
 - Verification method: collab/file/editor/media cargo suites, architecture/secret/package gates, visual captures, and live provider tests; route long jobs to BigBoy.
 - Origin or merged source IDs: NOTIFY-CHAT, EDITOR-*, FILEMGR-*, TEAMS-*, CLIPBOARD-*, VOICE-*; 2026-08-03 Mesh Collaboration survey.
-
-### WL-FUNC-016 - Native rich clipboard across the DRM seat, mesh, and VDI
-
-- Status: Remaining
-- Priority: P0
-- Complexity: Epic
-- Problem: Clipboard is text-only and cannot safely negotiate rich MIME payloads across local seat, mesh peers, and guest VDI.
-- Required outcome: one versioned bounded clipboard contract supports text, HTML, images, files, and typed metadata through direct DRM, authenticated mesh, and VDI paths
-  with explicit permission, limits, and cleanup.
-- Current state: bounded rich contracts and DRM/mesh/VDI scaffolding exist; live adapters, permissions, cleanup, and proof remain.
-- **S1 rich contract (2026-08-08):** V2 offers, generations, secret policy, and denials passed 72/72: `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
-- **S3 mesh xproc (2026-08-09):** Persist/SQLite/CAS/replay passed 1/1; live nodes remain: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cross-process-r11.md`.
-- **Bookmarks/clipboard UI full gate (2026-08-14):** BigBoy passed 41/41: `evidence/WL-FUNC-016-2026-08-14-bookmarks-full-farm-gate-r1.md`.
-- **S2 DRM authority (2026-08-08/09):** seat authority passed 19/19; focus-bound asynchronous paste expiry passed 12/12; live proof remains:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`, `docs/platform/evidence/WL-FUNC-016-2026-08-09-drm-paste-ownership-r10.md`.
-- **VDI transport/permission checkpoints (2026-08-08):** bounded VNC/RDP/SPICE text, one-use/replay/revocation, modal, and redacted audit passed; live guest proof remains:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-08-vdi-clipboard-transport-s4-r1.md`, `docs/platform/evidence/WL-FUNC-016-2026-08-08-permission-audit-model-s5-r1.md`.
-- **VDI admission checkpoints (2026-08-09):** metadata bounds passed 31/31, lease-capped permission passed 12/12, and post-materialization cancellation passed 13/13:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-metadata-admission-r6.md`; `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-lease-expiry-r7.md`;
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-materialization-cancellation-r8.md`.
-- **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
-  Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
-- Remaining work:
-- **Invalid replacement revocation:** rejected local replacements revoke stale offer/request authority; `.170` 1/1:
-  `evidence/WL-FUNC-016-2026-08-11-invalid-replacement-revocation-r376.md`.
-- **Native offer revocation:** invalid provider replacement revokes stale DRM selection authority; BigBoy exact:
-  `evidence/WL-FUNC-016-2026-08-11-native-offer-revocation-r457.md`.
-- **Future VDI envelope admission (2026-08-11):** future-dated clipboard envelopes are rejected before replay admission; `.90` passed the exact regression:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-vdi-future-envelope-r216.md`.
-- **Materialization envelope expiry (2026-08-11):** one-use descriptor authority expires at the earlier lease or envelope deadline; BigBoy passed the exact regression:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-envelope-expiry-r219.md`.
-- **V2 checkpoint ordering (2026-08-11):** a failed durable cursor write stops later rich-envelope materialization; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-v2-checkpoint-ordering-r241.md`.
-- **V2 consent ordering (2026-08-11):** a consent-withheld row blocks later cursor advance until retry; `.170` passed 1/1:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-v2-consent-ordering-r294.md`.
-- **Consent epoch revocation:** re-enable cannot resurrect prior-epoch clipboard content; `.90` 1/1: `evidence/WL-FUNC-016-2026-08-11-consent-epoch-revocation-r393.md`.
-- **Consent checkpoint failure:** a failed durable consent write cannot disclose queued content before or after restart; `.90` 1/1:
-  `evidence/WL-FUNC-016-2026-08-11-consent-checkpoint-failure-r441.md`.
-- **RDP advertised generation:** delayed old requests cannot read unadvertised replacement content; `.50` 1/1: `evidence/WL-FUNC-016-2026-08-11-rdp-advertised-generation-r412.md`.
-- **RDP guest-key generation:** a restarted endpoint cannot adopt a replacement TLS key before credentials; BigBoy 1/1:
-  `evidence/WL-FUNC-016-2026-08-11-rdp-guest-key-generation-r447.md`.
-- **VDI replay expiry:** `.90` passed bounded expired-session cleanup before fresh clipboard admission:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-expiry-r182.md`.
-- **VDI replay retention:** `.90` passed refusal of an older replay after a newer
-  shorter-lived sequence; the lane retains the longest expiry observed:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-vdi-replay-retention-r185.md`.
-- **Guest HTML safety checkpoint (2026-08-10):** active guest CF_HTML is refused before host publication; seat 90 passed the exact live-connect regression:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-guest-html-safety-r160.md`.
-- **RDP bitfield admission (2026-08-10):** malformed 40-byte `BI_BITFIELDS` headers are refused before image materialization; `.50` passed live-connect:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-bitfield-admission-r157.md`.
-- **Rich-session replay-capacity checkpoint (2026-08-10):** expired signed collaboration sessions release bounded ledger capacity before fresh intake while newer
-  replay expiry remains monotonic; machine 9 passed the exact regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-rich-session-replay-capacity-r121.md`.
-- **RDP CF_HTML:** bounded offsets, stale replies, and registered-format equivocation fail closed; `.50`/BigBoy gates passed:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-cf-html-r125.md`,
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-rdp-html-format-equivocation-r283.md`.
-- **RDP session declaration (2026-08-11):** endpoint/user/domain/geometry substitution is rejected before transport effects; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-rdp-session-declaration-r295.md`.
-- **RDP duplicate-response checkpoint (2026-08-10):** an unsolicited CLIPRDR
-  format-data response is now treated as a replay and cannot erase an already
-  admitted clipboard value; the focused exact farm regression is recorded in
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-duplicate-response-r194.md`.
-- **RDP image materialization checkpoint (2026-08-10):** host-to-guest PNG/JPEG
-  now crosses the one-use permission gate through an exact lease/command-bound,
-  root-local Files descriptor authority, bounded decode, and validated
-  CF_DIBV5 negotiation. Four focused farm gates passed on `.50`, `.90`, `.170`,
-  and `.196`; guest-to-host images and live Windows proof remain:
-  `docs/platform/evidence/WL-FUNC-016-WL-ARCH-010-2026-08-10-rdp-image-materialization-r138.md`.
-- **RDP guest image admission (2026-08-11):** CF_DIB/CF_DIBV5 responses are
-  format-bound, structurally bounded, replay-safe, and production-reachable.
-  Until daemon Files/CAS ingest exists the live shell emits truthful
-  `FilesProviderUnavailable` and drops raw bytes; exact gates are
-  capacity-deferred and the guest-to-host image gap remains open:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-11-rdp-guest-image-admission-r270.md`.
-- **Expired consent capacity checkpoint (2026-08-10):** every clipboard consent sweep removes expired authority before admission, including an empty sweep; machine 193
-  passed the exact denial regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-consent-capacity-cleanup-r22.md`.
-- **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks
-  now expire at their admitting envelope/lease boundary; newer terminal
-  sequences extend both high-water and retention monotonically, while renewed
-  signed authority can reuse sequencing at exact expiry. Machine 9 passed both
-  focused boundary tests:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-replay-mark-expiry-s5-r16.md`.
-- **Mesh replay-expiry retention (2026-08-10):** restart recovery preserves the
-  longest expiry across newer shorter generations; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-10-mesh-replay-expiry-r205.md`.
-- **Mesh expired-replay cleanup checkpoint (2026-08-09):** expired source/session
-  high-water marks are removed before generation validation, so a stale hostile
-  generation cannot block a valid session reuse. Machine 9 passed the exact
-  hostile-generation fixture:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-expired-replay-r17.md`.
-- **Clipboard bridge Bus checkpoint (2026-08-09):** startup now retries late
-  Bus availability after a fail-closed tail prime; live read failures retain
-  cursor/pending work and recover one queued action exactly once. Machine 194
-  passed five exact recovery/replay tests:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-clipboard-bridge-bus-recovery-r20.md`.
-- **Clipboard sync Bus checkpoint (2026-08-09):** startup preserves durable
-  receive checkpoints, skips retained mutation lanes, and defers every effect after an incomplete six-lane read. BigBoy passed four exact tests:
-  `docs/platform/evidence/WL-FUNC-016-WL-ARCH-009-2026-08-09-clipboard-sync-bus-recovery-r38.md`.
-- **VDI orphan-gate cleanup checkpoint (2026-08-09):** disconnected transport tickets now fail visibly, release their permission gate, retain stale-sequence replay
-  protection, and admit newer rich-MIME reconnect work. BigBoy passed the exact hostile HTML reconnect regression 1/1:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-orphan-gate-cleanup-r21.md`.
-- **Transfer transaction checkpoint (2026-08-09):** complete Files registry reads and generation-bound durable result receipts recover replacement without repeated copy.
-  Machine 9 passed 12 exact gates: `docs/platform/evidence/WL-FUNC-016-WL-FUNC-019-WL-ARCH-009-2026-08-09-transfer-bus-transaction-recovery-r69.md`.
-  1. S1 Define the rich contract.
-     - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
-     - Inputs: collab types and existing clipboard v2.
-     - Deliverable: serde-bounded contract and hostile payload tests.
-     - Depends on: none.
-     - Acceptance: oversized, unknown, stale, secret-bearing, and unsupported payloads fail closed.
-     - Validation: shared-contract cargo tests on .50.
-     - Done when: contract hash and fixtures are recorded.
-  2. S2 Implement local DRM ownership.
-     - Objective: connect egui/DRM selection and shortcuts to one clipboard authority without blocking render.
-     - Inputs: mde-egui DRM/input and shell clipboard bridge.
-     - Deliverable: local provider, paste/copy tests, bounded selection cache.
-     - Depends on: S1.
-     - Acceptance: focus, cut/copy/paste, ownership loss, and app switch preserve correct MIME.
-     - Validation: mde-egui and shell clipboard cargo tests.
-     - Done when: local render and shortcut evidence passes.
-  3. S3 Implement authenticated mesh transport.
-     - Objective: replicate permitted rich payloads over mde-bus with peer identity, expiry, size caps, and no raw paths.
-     - Inputs: mde-bus, peer auth, transfer CAS.
-     - Deliverable: sender/receiver adapter with deduplication and cleanup.
-     - Depends on: S1.
-     - Acceptance: unauthorized peers, replay, flood, and unavailable peers are bounded and honest.
-     - Validation: bus/property/security cargo tests on .90.
-     - Done when: cross-node fixture records exact bytes and denial reasons.
-  4. S4 Implement VDI guest transport.
-     - Objective: bridge negotiated clipboard to Browser/App/Workload guests through typed VDI messages.
-     - Inputs: Workload attachment, VDI session, S1 contract.
-     - Deliverable: guest adapter with reconnect and lease-expiry behavior.
-     - Depends on: S1, ARCH-010 S6.
-     - Acceptance: guest cannot access host secrets or unapproved MIME; reconnect never duplicates payload.
-     - Validation: VDI cargo tests and live guest fixture on BigBoy.
-     - Done when: all supported MIME types have evidence.
-  5. S5 Integrate UI permissions and release proof.
-     - Objective: expose user-visible source/target, approval, progress, and failure without a second clipboard store.
-     - Inputs: FUNC-011 suite and UX-009.
-     - Deliverable: UI model, redacted audit rows, package policy, and proof on no more than three seats.
-     - Depends on: S2-S4.
-     - Acceptance: only approved transfers occur and all limits remain enforced.
-     - Validation: shell render, package, and live-seat gates.
-     - Done when: evidence bundle covers local/mesh/VDI and cleanup.
-- Scope: Rich MIME negotiation and transport across DRM, mesh, VDI, permissions, limits, package policy, and proof. Files application UX and general collaboration
-  navigation remain FUNC-011.
-- Relevant files/components: mde-egui DRM/input, mde-shell-egui clipboard/VDI, mde-collab-types, mde-bus, transfer/CAS workers, and Workload VDI adapters.
-- Dependencies: FUNC-011 consumes the contract and UI; ARCH-010 supplies attachment; UX-009 supplies styling.
-- Acceptance criteria:
-  1. Text, HTML, image, file, and typed metadata round-trip or fail with a typed reason.
-  2. Secret, replay, flood, stale lease, and unauthorized-peer tests pass.
-  3. At-most-three-seat local/mesh/VDI evidence shows bounded memory and cleanup.
-- Verification method: shared, bus, shell, VDI, package, and live cargo gates with explicit farm routing; record exact payload hashes.
-- Origin or merged source IDs: 2026-07-26 operator platform cut; archived clipboard workstreams.
 
 ### WL-FUNC-017 - Complete Maps, navigation, and MG90 radio health
 - Status: Remaining
@@ -2290,6 +2138,12 @@ behavioral evidence is not completion.
 - **Health transition/live captures:** direct modal transition and installed-seat
   captures are shared rollout proof owned by `WL-TEST-001`; no additional seat
   requirement is imposed on product implementation.
+- **Rich clipboard guest/provider proof:** implementation is archived after
+  farm verification of Files/CAS guest-image admission (mackesd 1/1) and the
+  live-vdi shell image boundary (2/2). Remaining Windows/guest/provider and
+  installed-seat captures are shared rollout proof owned here; no extra seat
+  requirement is imposed on the product implementation. See
+  `docs/worklist-archive/2026-08-14-wl-func-016-closure.md`.
 - Remaining work:
 - **Admit release inputs:** obtain governed Maps approval/source/verifier, App
   VM trust receipt/key and base digest, Cuttlefish declaration/signature/
