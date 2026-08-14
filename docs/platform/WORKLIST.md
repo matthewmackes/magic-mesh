@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **14 active epics:** 14 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **13 active epics:** 13 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -1715,6 +1715,11 @@ behavioral evidence is not completion.
   captures, and live recovery are shared rollout proof owned here; no extra seat
   requirement is imposed on the product implementation. See
   `docs/worklist-archive/2026-08-14-wl-func-019-closure.md`.
+- **Construct taskbar/Home proof:** implementation is archived after geometry,
+  typed action, pin identity, responsive boundary, and wallpaper inode gates
+  passed. Remaining direct-DRM/package/installed-seat captures are shared
+  rollout proof owned here; no extra seat requirement is imposed on the product
+  implementation. See `docs/worklist-archive/2026-08-14-wl-ux-012-closure.md`.
 - Remaining work:
 - **Admit release inputs:** obtain governed Maps approval/source/verifier, App
   VM trust receipt/key and base digest, Cuttlefish declaration/signature/
@@ -1978,72 +1983,6 @@ behavioral evidence is not completion.
 - Verification method: provider/property/action cargo suites, authority/security/package scans, render fixtures, and live provider captures; BigBoy runs broad provider
   checks.
 - Origin or merged source IDs: 2026-07-26 node hardware and safe-controls survey.
-
-### WL-UX-012 - Full-width Construct taskbar and search-first Home
-
-- Status: Remaining
-- Priority: P1
-- Complexity: Epic
-- Problem: taskbar placement, Start/Search, Home, pins, clock/tray, and health entry still diverge from the operator-locked full-width Construct contract.
-- Required outcome: a 48px full-width taskbar supports Bottom/Left placement, icon-only Start/Search/Back/Home, user-managed centered pins, right-side placement control,
-  clock/tray semantics, and Bing-wallpaper Home with no second launcher.
-- Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and three-seat proof remain.
-- **Live battery (2026-08-08/09):** the primary UPower percentage/icon is immediately left of the clock in both placements; `.90` passed the two exact source/geometry tests:
-  `docs/platform/evidence/WL-UX-012-2026-08-09-live-battery-r13.md`.
-- **Taskbar identity checkpoint (2026-08-09):** connected sessions and pinned desktops now have disjoint typed egui identities and hit regions; BigBoy passed 49/49:
-  `docs/platform/evidence/WL-UX-012-2026-08-09-taskbar-control-identity-r2.md`.
-- **Narrow geometry checkpoint (2026-08-09):** center controls are admitted only when a physical 40px slot exists, preserving More at 480px and preventing Home overlap at
-  320px; `.50` passed 50/50: `docs/platform/evidence/WL-UX-012-2026-08-09-narrow-center-geometry-r3.md`.
-- **Taskbar action map (2026-08-10):** typed Start/Search/Back/Home map passed; conflicting cycle deleted: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-action-map-r4.md`.
-- **Taskbar pin identity (2026-08-10):** BigBoy passed stable deduplication: `docs/platform/evidence/WL-UX-012-2026-08-10-taskbar-pin-dedupe-r156.md`.
-- **Front Door command boundary:** unsafe/oversized `>` input refuses before terminal activation; BigBoy passed: `evidence/WL-UX-012-2026-08-10-command-input-boundary-r187.md`.
-- **Short Left rail:** 320×160 containment and placement escape passed BigBoy: `evidence/WL-UX-012-2026-08-11-left-placement-escape-r280.md`.
-- **Future preference schema:** untrusted placement/pins fail to empty Bottom; `.50` 1/1: `evidence/WL-UX-012-2026-08-11-future-preference-schema-r422.md`.
-- Remaining work:
-- **Home wallpaper inode:** replaced or non-regular cache paths cannot redirect decode; BigBoy exact:
-  `evidence/WL-UX-012-2026-08-11-home-wallpaper-inode-r452.md`.
-  1. S1 Freeze geometry and placement.
-     - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
-     - Inputs: shell navigation, UX-009 Style/Visuals, platform interfaces.
-     - Deliverable: placement model and layout fixtures.
-     - Depends on: UX-009 S1.
-     - Acceptance: taskbar is full width, never overlaps content, and restores a valid placement.
-     - Validation: shell render cargo tests on .50.
-     - Done when: wide/narrow/largest-text captures pass.
-  2. S2 Implement icon actions and Front Door.
-     - Objective: make Start open Front Door search, Search focus search, Back navigate, Home open Bing-wallpaper Home, and no Start menu exist.
-     - Inputs: S1, Front Door, Home route.
-     - Deliverable: typed action map and navigation tests.
-     - Depends on: S1.
-     - Acceptance: each icon has one action and never launches a raw command or second launcher.
-     - Validation: shell navigation cargo tests.
-     - Done when: action trace and negative route scan pass.
-  3. S3 Implement pins, status slots, clock/bell geometry, and health anchor.
-     - Objective: persist centered pins and reserve disjoint typed slots for placement, FUNC-017 weather, battery, clock, bell, tray, and Health without owning their actions.
-     - Inputs: S1/S2, UX-013 health authority, and FUNC-017 weather projection/deep link.
-     - Deliverable: bounded settings, taskbar projection slots, disjoint weather/battery/clock/bell/tray geometry, and migration tests.
-     - Depends on: S2.
-     - Acceptance: pins survive restart; every slot remains reachable and non-overlapping; owning surfaces bind actions later; no tray flyout is introduced.
-     - Validation: model/property/render cargo tests.
-     - Done when: persistence and deep-link evidence exists.
-  4. S4 Prove responsive and release behavior.
-     - Objective: verify Bottom/Left, Dark/Light, large text, lock, multi-display, session switching, package upgrade, and captures on no more than three seats.
-     - Inputs: S1-S3, UX-009, CRIT-006/007.
-     - Deliverable: deterministic captures and rollout evidence.
-     - Depends on: S3.
-     - Acceptance: no clipping, hover-only meaning, duplicate launcher, or focus loss.
-     - Validation: shell cargo, package, and live-seat gates.
-     - Done when: every required state is directly reviewed.
-- Scope: Owns Construct taskbar geometry, placement, actions, pins, status/clock/tray, Home anchor, health entry, persistence, and proof. Guest Browser chrome, Workers
-  content, and health evaluation remain elsewhere.
-- Relevant files/components: shell nav/taskbar/home/front-door, mde-egui style/motion/input, health/taskbar bridge, settings persistence, render fixtures, package.
-- Dependencies: UX-009, UX-013, ARCH-009, FUNC-019, CRIT-006/007.
-- Acceptance criteria:
-  1. Full-width 48px Bottom/Left taskbar and icon-only actions match the lock.
-  2. Pins, placement, clock/tray, health deep link, and Home persist and remain bounded.
-  3. At-most-three-seat responsive/package proof passes without a second launcher.
-- Verification method: shell model/render/navigation cargo gates, package checks, and direct-DRM/Sunshine captures on no more than three selected seats.
-- Origin or merged source IDs: 2026-07-29 taskbar/Home operator lock and archived dock workstreams.
 
 ### WL-UX-014 - Grade-specific cinematic Kiron health lower thirds
 
