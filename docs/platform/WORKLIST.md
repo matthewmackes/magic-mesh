@@ -350,7 +350,11 @@ behavioral evidence is not completion.
 - **Descriptor source generation:** post-hash replacement fails closed; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-descriptor-source-generation-r416.md`.
 - **Files CAS registration (2026-08-11):** authenticated staging, worker admission, projection, and rollback passed 15/15 on BigBoy:
   `docs/platform/evidence/WL-FUNC-011-2026-08-11-cas-stream-staging-r275.md`.
-- **Calls proof attribution (2026-08-11):** incompatible adapters and altered/vacuous requirements fail before provider evidence; the exact farm gate is capacity-blocked:
+- **Calls proof attribution (2026-08-11):** incompatible adapters and
+  altered/vacuous requirements fail before provider evidence; `.90` passed the
+  exact regression 1/1. The remaining gap is the real external boundary—no
+  production call-media provider or live call proof exists—not farm capacity
+  or a multi-seat requirement:
   `docs/platform/evidence/WL-FUNC-011-2026-08-11-call-media-proof-attribution-r261.md`.
 - **Calls readiness restart:** missing/corrupt readiness revokes stale media proof; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-calls-readiness-restart-r297.md`.
 - **Actor-log path identity (2026-08-11):** misplaced `(space, actor)` events fail before append and after restart; `.50` passed 1/1:
