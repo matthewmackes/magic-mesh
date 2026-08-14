@@ -1179,7 +1179,7 @@ impl MusicApp {
                             self.download_catalog_item(item);
                         }
                         if !enabled {
-                            let _ = button.on_hover_text(
+                            let _ = mde_egui::disabled_hover_text(button,
                                 "Download requires the authenticated Construct shell action path.",
                             );
                         }
@@ -1198,7 +1198,7 @@ impl MusicApp {
                 self.request_next_browse_page(&key, kind);
             }
             if !can_request && !loading {
-                let _ = button.on_hover_text(
+                let _ = mde_egui::disabled_hover_text(button,
                     "Load more requires the authenticated Construct shell browse path.",
                 );
             }
@@ -1300,7 +1300,7 @@ impl MusicApp {
                             self.publish_download_action(action, content.clone());
                         }
                         if !enabled {
-                            let _ = button.on_hover_text(
+                            let _ = mde_egui::disabled_hover_text(button,
                                 "Download controls require the authenticated Construct shell action path.",
                             );
                         }
@@ -1504,7 +1504,7 @@ impl MusicApp {
                             self.download_catalog_item(item);
                         }
                         if !enabled {
-                            let _ = button.on_hover_text(
+                            let _ = mde_egui::disabled_hover_text(button,
                                 "Download requires the authenticated Construct shell action path.",
                             );
                         }
@@ -1555,7 +1555,7 @@ impl MusicApp {
                     self.play_radio_station(&detail);
                 }
                 if !enabled {
-                    let _ = button.on_hover_text(
+                    let _ = mde_egui::disabled_hover_text(button,
                         "Playback requires the authenticated Construct shell action path.",
                     );
                 }
@@ -2579,7 +2579,7 @@ fn render_bookmark_shelf(ui: &mut egui::Ui, bookmarks: &[BookmarkItem], app: &mu
                         app.play_bookmark(bookmark);
                     }
                     if !resume_enabled {
-                        let _ = button.on_hover_text(
+                        let _ = mde_egui::disabled_hover_text(button,
                             "Resume requires the authenticated Construct shell action path.",
                         );
                     }
@@ -2991,7 +2991,7 @@ fn render_daemon_targets(ui: &mut egui::Ui, app: &mut MusicApp) {
                 send_clicked = true;
             }
             if !can_handoff {
-                let _ = button.on_hover_text(
+                let _ = mde_egui::disabled_hover_text(button,
                     "Handoff requires an available mesh seat and the authenticated Construct shell action path.",
                 );
             }
@@ -3028,7 +3028,7 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                             );
                             ui.label(RichText::new(&song.artist).small().color(Style::TEXT_DIM));
                         });
-                        if ui.button("⏮").on_hover_text("Previous track").clicked() {
+                        if mde_egui::hover_text(ui.button("⏮"), "Previous track").clicked() {
                             if app.state.workspace.is_some() {
                                 app.publish_queue_playback_action("previous", None, None);
                             } else if !app.try_publish_transport_action("seek", Some(0), None) {
@@ -3052,7 +3052,7 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                             }
                         }
                         if app.state.workspace.is_some()
-                            && ui.button("⏭").on_hover_text("Next track").clicked()
+                            && mde_egui::hover_text(ui.button("⏭"), "Next track").clicked()
                         {
                             app.publish_queue_playback_action("next", None, None);
                         }
@@ -3106,10 +3106,11 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                                 } else {
                                     "Shuffle off"
                                 };
-                                if ui
-                                    .selectable_label(playback.shuffle, "🔀")
-                                    .on_hover_text(shuffle_label)
-                                    .clicked()
+                                if mde_egui::hover_text(
+                                    ui.selectable_label(playback.shuffle, "🔀"),
+                                    shuffle_label,
+                                )
+                                .clicked()
                                 {
                                     app.publish_queue_playback_action(
                                         "shuffle",
@@ -3122,16 +3123,17 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                                     "context" => "track",
                                     _ => "off",
                                 };
-                                if ui
-                                    .button(match playback.repeat.as_str() {
+                                if mde_egui::hover_text(
+                                    ui.button(match playback.repeat.as_str() {
                                         "track" => "🔂",
                                         _ => "🔁",
-                                    })
-                                    .on_hover_text(format!(
+                                    }),
+                                    format!(
                                         "Repeat {} (choose {next_repeat})",
                                         playback.repeat
-                                    ))
-                                    .clicked()
+                                    ),
+                                )
+                                .clicked()
                                 {
                                     app.publish_queue_playback_action(
                                         "repeat",

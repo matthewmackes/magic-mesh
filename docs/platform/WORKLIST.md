@@ -841,6 +841,11 @@ behavioral evidence is not completion.
   headers, hero lanes, cards, typography, radii, and spacing now use shared
   tokens; BigBoy `mde-shell-egui --all-targets` check passed:
   `evidence/WL-UX-009-2026-08-14-resource-catalog-quazar-migration-r1.md`.
+- **Shared tooltip gate (2026-08-14):** all 23 raw egui hover-text calls in
+  shipped Construct surfaces now use the shared Quazar tooltip overlay;
+  Carbon/style-leak lint passes with zero leaks and BigBoy shell all-targets
+  check passes:
+  `evidence/WL-UX-009-2026-08-14-shared-tooltip-gate-r1.md`.
 - Remaining work:
   1. S1 Freeze tokens, fonts, and icon registry.
      - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.

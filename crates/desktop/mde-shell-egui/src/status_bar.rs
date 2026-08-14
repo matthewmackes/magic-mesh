@@ -1210,7 +1210,7 @@ fn paint_health_status(
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
     });
-    let response = response.on_hover_text(label);
+    let response = mde_egui::hover_text(response, label);
     let painter = ui.painter();
     if response.hovered() {
         painter.rect_filled(
@@ -1333,7 +1333,7 @@ fn paint_notification_bell(
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
     });
-    let response = response.on_hover_text(label);
+    let response = mde_egui::hover_text(response, label);
     let painter = ui.painter();
     if response.hovered() {
         painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
@@ -1395,7 +1395,7 @@ fn paint_mesh_teams_launcher(
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    let response = response.on_hover_text(label);
+    let response = mde_egui::hover_text(response, label);
     let painter = ui.painter();
     if response.hovered() {
         painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
@@ -1444,7 +1444,7 @@ fn paint_live_battery(
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label.clone())
     });
-    let response = response.on_hover_text(label);
+    let response = mde_egui::hover_text(response, label);
     let painter = ui.painter();
     if response.hovered() {
         painter.rect_filled(
@@ -1503,7 +1503,7 @@ fn paint_live_weather(
             weather.label.clone(),
         )
     });
-    let response = response.on_hover_text(weather.label.clone());
+    let response = mde_egui::hover_text(response, weather.label.clone());
     let painter = ui.painter();
     let foreground = if placement == "bottom" {
         weather.tone.taskbar_foreground()

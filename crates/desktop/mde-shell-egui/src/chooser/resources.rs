@@ -864,11 +864,11 @@ impl ResourceBrowserState {
                             }
                         }
                         if !authenticated {
-                            let _ = button.on_hover_text(
+                            let _ = mde_egui::disabled_hover_text(button,
                                 "Detached publisher proof is missing or invalid; this catalog remains untrusted.",
                             );
                         } else if !locally_handled {
-                            let _ = button.on_hover_text(
+                            let _ = mde_egui::disabled_hover_text(button,
                                 "This action remains disabled until its typed daemon provider publishes readiness.",
                             );
                         }
@@ -965,7 +965,7 @@ impl ResourceBrowserState {
                         }
                     }
                     if !authenticated {
-                        let _ = button.on_hover_text(
+                        let _ = mde_egui::disabled_hover_text(button,
                             "Detached publisher proof is missing or invalid; approval is disabled.",
                         );
                     }

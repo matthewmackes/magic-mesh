@@ -753,9 +753,8 @@ fn paint_resource_card(
                             entry.auth_status,
                             AuthStatus::NotRequired | AuthStatus::Authorized
                         );
-                    if ui
-                        .add_enabled(usable, egui::Button::new(action_label(verb)))
-                        .on_hover_text(
+                    if mde_egui::disabled_hover_text(
+                        ui.add_enabled(usable, egui::Button::new(action_label(verb))),
                             "Revalidates the exact generation against Workloads before routing.",
                         )
                         .clicked()
@@ -773,7 +772,7 @@ fn paint_resource_card(
                         intent = Some(CardActionIntent::StartAndroid);
                     }
                     if !can_start_android {
-                        let _ = button.on_hover_text(
+                        let _ = mde_egui::disabled_hover_text(button,
                             "Android Start requires an exact workload-bound identity from the admitted full card.",
                         );
                     }
@@ -796,9 +795,10 @@ fn paint_resource_card(
                         entry.auth_status,
                         AuthStatus::NotRequired | AuthStatus::Authorized
                     );
-                if ui
-                    .add_enabled(usable, egui::Button::new("Cancel"))
-                    .on_hover_text("Cancel only the exact accepted workload request for this card.")
+                if mde_egui::disabled_hover_text(
+                    ui.add_enabled(usable, egui::Button::new("Cancel")),
+                    "Cancel only the exact accepted workload request for this card.",
+                )
                     .clicked()
                 {
                     intent = Some(CardActionIntent::Cancel);

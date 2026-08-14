@@ -676,7 +676,7 @@ fn starter_app_row(
                 });
             }
         }
-        launch_button.on_hover_text(if launch_enabled {
+        mde_egui::hover_text(launch_button, if launch_enabled {
             "Launch uses only the admitted closed MAIN + LAUNCHER action for this Android app."
         } else {
             "Launch requires a fresh admitted Android inventory entry that is installed, ready, launcher-resolved, and dispatch-ready."
