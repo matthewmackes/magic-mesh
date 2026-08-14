@@ -326,6 +326,7 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
             fi
         done
         if [ "$healthy_endpoint" -eq 0 ]; then
+            log "WARN: etcd unreachable; no configured coordination endpoint passed the read-only health probe"
             if [ -s "$ETCD_MEMBER_FILE" ]; then
                 coordination_failed=1
                 recover_etcd_if_safe "${etcd_endpoints[@]}" || true
