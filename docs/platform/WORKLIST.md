@@ -1242,7 +1242,7 @@ behavioral evidence is not completion.
   3. Asset provenance, package, farm, and at-most-two-seat evidence is reproducible.
 - Verification method: health/toast/asset/renderer/accessibility cargo gates,
   package/license checks, golden/video/waveform captures, and live proof on no
-  more than three seats; BigBoy
+  more than two seats; BigBoy
   runs the longest renderer job.
 - Origin or merged source IDs: 2026-08-04 cinematic A-F Kiron survey and archived KIRON/toast workstreams.
 
