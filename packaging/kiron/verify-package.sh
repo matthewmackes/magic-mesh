@@ -18,10 +18,12 @@ verify_wiring() {
 }
 
 verify_source_package() {
+  local manifest="${KIRON_MANIFEST:-$ROOT/assets/kiron/manifest-v2.json}"
+  local asset_root="${KIRON_ASSET_ROOT:-$ROOT/assets/kiron}"
   verify_wiring
-  [[ -f "$MANIFEST" ]] || fail "production manifest is missing: $MANIFEST"
-  [[ -d "$ASSET_ROOT/payload" ]] || fail "production payload is missing: $ASSET_ROOT/payload"
-  python3 "$VERIFIER" --root "$ASSET_ROOT" "$MANIFEST" \
+  [[ -f "$manifest" ]] || fail "production manifest is missing: $manifest"
+  [[ -d "$asset_root/payload" ]] || fail "production payload is missing: $asset_root/payload"
+  python3 "$VERIFIER" --root "$asset_root" "$manifest" \
     || fail 'production asset package did not pass governed v2 admission'
   printf 'verify-kiron-package: PASS: governed workstation RPM asset package admitted\n'
 }

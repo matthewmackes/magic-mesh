@@ -901,6 +901,7 @@ behavioral evidence is not completion.
   is ahead of the seat clock; the focused hostile regression is recorded in
   `docs/platform/evidence/WL-UX-014-2026-08-10-future-timestamp-admission-r194.md`.
 - **Kiron asset admission (2026-08-10):** self-test passed coverage/license/size/path/digest rules: `docs/platform/evidence/WL-UX-014-2026-08-10-kiron-asset-admission-r212.md`.
+- **Original KIRON package (2026-08-14):** the reproducible producer now authors 18 source-owned A–F fallback assets and six original PCM cues; source package admission and hostile packaging self-test pass. S2 is complete; renderer/live proof remains: `evidence/WL-UX-014-2026-08-14-original-kiron-package-r1.md`.
 - Remaining work:
 - **Kiron asset inode (2026-08-14):** multiply-linked scenes cannot retain
   mutation authority across restart; `.196` passed the exact self-test:

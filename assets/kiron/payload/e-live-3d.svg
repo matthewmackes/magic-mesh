@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="220" viewBox="0 0 1280 220">
+  <title>KIRON E Critical LIVE</title>
+  <rect width="1280" height="220" rx="18" fill="#161616"/>
+  <rect width="16" height="220" rx="8" fill="#fa4d56"/>
+  <circle cx="90" cy="110" r="48" fill="#fa4d56" opacity=".18" stroke="#fa4d56" stroke-width="3"/>
+  <text x="90" y="128" text-anchor="middle" font-family="sans-serif" font-size="54" font-weight="700" fill="#fa4d56">E</text>
+  <text x="170" y="92" font-family="sans-serif" font-size="34" font-weight="700" fill="#f4f4f4">KIRON HEALTH · CRITICAL</text>
+  <text x="170" y="138" font-family="sans-serif" font-size="22" fill="#c6c6c6">Node health transition · LIVE fallback tier</text>
+  <path d="M170 178 H1110" stroke="#fa4d56" stroke-width="4" opacity=".8"/>
+  <circle cx="1110" cy="178" r="7" fill="#fa4d56"/>
+</svg>
