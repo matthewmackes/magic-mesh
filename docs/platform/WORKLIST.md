@@ -1045,8 +1045,10 @@ behavioral evidence is not completion.
   preserving boot and read-only catalog access; `.90` gates passed: `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-readiness-r4.md`.
 - **Catalog rollback checkpoint (2026-08-09):** same-publisher rollback/equivocation preserves last-good cards and revokes stale actions; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-remote-sessions-catalog-rollback-r5.md`.
-- **Media stable-ID equivocation:** conflicting raw rows are suppressed before redaction/deduplication while unrelated cards survive; exact gate deferred:
-  `docs/platform/evidence/WL-FUNC-019-2026-08-11-media-stable-id-equivocation-r272.md`.
+- **Media stable-ID equivocation (2026-08-14):** conflicting raw rows are
+  suppressed before redaction/deduplication while unrelated cards survive;
+  `.90` passed the exact gate 1/1:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-14-media-stable-id-equivocation-farm-gate-r1.md`.
 - **Live Windows authority checkpoints (2026-08-09):** seat 15 detects RDP; signed Open/revocation passed on `.196`, and the formerly absent shared publisher key is sealed.
   Installed credential activation/live login remain: `evidence/WL-FUNC-019-2026-08-09-rdp-authority-handoff-r8.md`,
   `evidence/WL-FUNC-019-2026-08-09-resource-publisher-key-r9.md`.
