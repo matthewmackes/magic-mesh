@@ -51,6 +51,11 @@ mde-egui = { path = "../../shared/mde-egui", features = ["accesskit"] }
 # string. A toolkit-free leaf crate; the edge points inward (§6).
 mde-theme = { path = "../../shared/mde-theme" }
 
+# The About legal section renders the same canonical disclaimer shipped by the
+# installer and accepted by first-run flows; keeping this as a leaf dependency
+# prevents the UI copy from drifting from DISCLAIMER.md.
+mde-disclaimer = { path = "../../shared/mde-disclaimer" }
+
 # The shell publishes typed Workload intent and reads bounded Workload
 # projections through mde-bus. The dependency edge points inward (§6).
 mde-bus = { path = "../../platform/mde-bus" }

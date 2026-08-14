@@ -133,9 +133,34 @@ fn build_section(ui: &mut egui::Ui) {
 }
 
 /// The legal card — each shipped doc at its packaged runtime path (or named
-/// alone when absent, §7), plus the project source URL.
+/// alone when absent, §7), plus the complete canonical disclaimer text and
+/// project source URL. The disclaimer is embedded from the repository root via
+/// `mde-disclaimer`, so About, first-run consent, and packaged documentation
+/// cannot drift apart.
 fn legal_section(ui: &mut egui::Ui) {
     section(ui, "LEGAL", |ui| {
+        ui.label(
+            RichText::new("DISCLAIMER, RISK NOTICE, AND ACCEPTABLE USE POLICY")
+                .color(Style::TEXT)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        egui::Frame::NONE
+            .fill(Style::SURFACE)
+            .inner_margin(Style::SP_S)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("about-canonical-disclaimer")
+                    .max_height(640.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(mde_disclaimer::TEXT)
+                                .color(Style::TEXT_DIM)
+                                .size(Style::SMALL),
+                        );
+                    });
+            });
+        ui.add_space(Style::SP_M);
         muted_note(ui, "Shipped with the package:");
         ui.add_space(Style::SP_XS);
         for (name, path) in LEGAL_DOCS {
@@ -230,6 +255,12 @@ mod tests {
                 "{path} is not an absolute packaged path"
             );
         }
+    }
+
+    #[test]
+    fn legal_section_uses_the_canonical_non_empty_disclaimer() {
+        assert!(mde_disclaimer::is_present());
+        assert!(mde_disclaimer::TEXT.contains("Warning"));
     }
 
     #[test]
