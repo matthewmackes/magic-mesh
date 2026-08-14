@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **12 active epics:** 12 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **11 active epics:** 11 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -686,135 +686,6 @@ behavioral evidence is not completion.
   3. Three-seat-maximum release proof records real providers, partial failures, and corrected-forward recovery.
 - Verification method: collab/file/editor/media cargo suites, architecture/secret/package gates, visual captures, and live provider tests; route long jobs to BigBoy.
 - Origin or merged source IDs: NOTIFY-CHAT, EDITOR-*, FILEMGR-*, TEAMS-*, CLIPBOARD-*, VOICE-*; 2026-08-03 Mesh Collaboration survey.
-
-### WL-FUNC-018 - Seamless Flatpak Front Door backed by App VMs
-- Status: Remaining
-- Priority: P1
-- Complexity: Epic
-- Problem: Construct lacks a governed way to discover and run Flatpak applications without installing native host apps.
-- Required outcome: Front Door searches a signed catalog, starts an isolated App VM through Workloads, displays its Wayland app over VDI, and stops/cleans the session
-  predictably.
-- Current state: bounded signed catalog admission, deterministic search, and a production-registered fail-closed importer now exist alongside typed App VM/OpenApp/session
-  contracts; trust provisioning, image supply, launch readiness, UX, security, and live proof remain.
-- **Catalog replacement authority:** replaced Flatpak state cannot retain launch authority; `.90` 1/1: `evidence/WL-FUNC-018-2026-08-11-flatpak-catalog-replacement-r461.md`.
-- **Catalog checkpoints (2026-08-08):** exact-signer admission/ranking and root-owned rollback-safe import passed `.196`; `.170` compiled production:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-08-signed-app-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-018-2026-08-08-catalog-importer-s1-r1.md`.
-- **App VM profile checkpoint (2026-08-08):** the immutable Wayland/Flatpak contract, supervisor, readiness/provenance, and hostile fixtures passed on `.170`;
-  a current built image/hash and live boot remain:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-08-app-vm-profile-s2-r1.md`.
-- **Runtime admission checkpoints (2026-08-09):** unavailable or cross-VM guest evidence cannot authorize resume or mutate desired state; `.90` passed 25/25 and BigBoy passed
-  26/26: `docs/platform/evidence/WL-FUNC-018-2026-08-09-unavailable-runtime-admission-r2.md`, `docs/platform/evidence/WL-FUNC-018-2026-08-09-runtime-vm-identity-r3.md`.
-- **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
-  machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
-- Remaining work:
-- **Governed App-VM RPM supply (2026-08-11):** local image builds admit one
-  bounded immutable `magic-mesh` RPM, verify its governed signature and exact
-  compile-time source revision before/after staging and inside the build, and
-  enable DNF local signature checking; repo installs verify both ELF identities
-  and exact owning-RPM SHA-256 manifests before layering. Hostile fixtures passed:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-11-governed-rpm-supply-r253.md`.
-- **Bounded persistence recovery (2026-08-11):** retained App-catalog and
-  durable-cursor reads refuse data beyond declared limits; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-11-bounded-persistence-read-r224.md`.
-- **Durable App-catalog restart cursor (2026-08-11):** committed rows are checkpointed and skipped after restart without emitting an idempotent replay; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-11-app-catalog-restart-cursor-r216.md`.
-- **Authenticated first-launch handoff (2026-08-11):** cold boot publishes signed `StartAndAttach` then identity-bound VDI `OpenApp`; replay is effect-idempotent.
-  BigBoy/`.90` passed 5/5:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-11-first-launch-cold-boot-r239.md`.
-- **App-open identity:** active sessions bind catalog revision/capabilities/resume; stale/future substitution emits no extra effects; `.50`/`.90` 1/1 each:
-  `evidence/WL-FUNC-018-2026-08-11-app-open-declaration-identity-r285.md`, `evidence/WL-FUNC-018-2026-08-11-active-app-catalog-revision-r390.md`.
-- **Restart readiness:** recovered `Connected` requires a forward generation; `.50` 1/1: `evidence/WL-FUNC-018-WL-ARCH-010-2026-08-11-app-vm-restart-readiness-r403.md`.
-- **Front Door serving route:** unsafe node IDs fail before App launch emission; `.50` 1/1: `evidence/WL-FUNC-018-2026-08-11-front-door-serving-route-r424.md`.
-- **App-VM base variable:** hard-coded substitute bases fail the image contract; `.50` passed: `evidence/WL-FUNC-018-2026-08-11-app-vm-base-variable-r408.md`.
-- **App-VM ExecStart authority:** one active canonical runtime is required; `.196` self-test: `evidence/WL-FUNC-018-WL-ARCH-008-2026-08-11-app-vm-execstart-authority-r425.md`.
-- **App-VM base image ID:** mutable tags cannot substitute build inputs; `.196` self-test:
-  `evidence/WL-FUNC-018-WL-ARCH-008-2026-08-11-app-vm-base-image-id-r427.md`.
-- **App session client binding:** restart cannot rebind another initiating seat; `.90` 1/1: `evidence/WL-FUNC-018-WL-ARCH-010-2026-08-11-app-session-client-binding-r433.md`.
-- **Front Door equivocation (2026-08-11):** conflicting declarations suppress only their app identity; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-11-front-door-equivocation-r299.md`.
-- **Launch-action admission checkpoint (2026-08-10):** installed Flatpak rows without exact `launch` authority are withheld before App-VM projection; seat 90 passed:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-10-launch-action-admission-r162.md`.
-- **Blocked App-VM authorization checkpoint (2026-08-10):** stale, unavailable, or malformed blocked Flatpak rows now fail before root authorization or Bus payload;
-  `.90` passed the focused regression: `docs/platform/evidence/WL-FUNC-018-2026-08-10-blocked-appvm-authorization-r127.md`.
-- **App VM generation rollback (2026-08-10):** later lower-generation runtime
-  rows are refused; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-generation-rollback-r156.md`.
-- **App VM target admission (2026-08-10):** empty, control-bearing, and
-  path-like serving/client peer or VM identities are refused before session
-  roster mutation; `.50` passed the hostile regression:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-target-admission-r186.md`.
-- **App VM capability admission (2026-08-10):** catalog-backed Front Door
-  requests now apply the closed App VM capability policy before root
-  authorization; unsupported host capabilities cannot reach the authorizer.
-  `.90` passed the hostile regression:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-10-appvm-capability-admission-r192.md`.
-- **Admitted capability projection (2026-08-10):** App-VM sessions reject
-  unsupported host capabilities at projection; `.90` passed:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-10-admitted-capability-projection-r206.md`.
-- **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
-  only after governed projection/status effects succeed, and expiry retains
-  authority until its retraction publishes. Machine 194 passed the exact
-  failure/retry regression:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-09-catalog-side-effect-retry-s1-r5.md`.
-- **App Catalog Bus transaction checkpoint (2026-08-09):** cursor, catalog,
-  watermark, status, recovery, and Bus identity stage until required writes
-  succeed. BigBoy passed 10 module tests plus two exact recovery cases:
-  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`.
-- **Android Catalog Bus checkpoint (2026-08-09):** late/replaced storage
-  replays durable authority and retries failed publication before cursor/state
-  commit. BigBoy passed two exact recovery cases:
-  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`.
-- **Peer-app launch recovery (2026-08-09):** durable effect claims prevent ambiguous relaunch; late/replaced Bus results correct forward. Machine 9 passed four gates:
-  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-peer-app-launch-bus-transaction-recovery-r87.md`.
-  1. S1 Freeze catalog and identity.
-     - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
-     - Inputs: catalog projection and trust policy.
-     - Deliverable: bounded catalog contract, importer, and ranking tests.
-     - Depends on: ARCH-010 S2.
-     - Acceptance: unsigned, stale, duplicate, or secret-bearing entries are rejected.
-     - Validation: catalog/property cargo tests on .50.
-     - Done when: catalog evidence and signature hashes exist.
-  2. S2 Build App VM image/profile.
-     - Objective: create reproducible image with Flatpak runtime, Wayland guest, agent, GPU/audio policy, and safe resource bounds.
-     - Inputs: Workload adapter and image builder.
-     - Deliverable: image/profile manifest and readiness probe.
-     - Depends on: ARCH-010 S4, S5.
-     - Acceptance: image contains only approved runtimes and reports ready/unavailable truthfully.
-     - Validation: image/package cargo and shell checks on BigBoy.
-     - Done when: image hash and probe trace exist.
-  3. S3 Implement typed open/resume/stop.
-     - Objective: start one App VM, wait for readiness, attach VDI, and stop it on session close or policy.
-     - Inputs: S1/S2 and Workload operation API.
-     - Deliverable: controller, idempotency, cancellation, and cleanup tests.
-     - Depends on: S2.
-     - Acceptance: duplicate opens reuse one session; timeout and crash clean all resources.
-     - Validation: Workload/App VM cargo tests.
-     - Done when: lifecycle trace proves one operation path.
-  4. S4 Integrate Front Door UX.
-     - Objective: search, select, approve permissions, show progress, focus input, and report failure in the shared Construct style.
-     - Inputs: S1-S3, UX-009/012.
-     - Deliverable: render/model fixtures and no-backend-I/O UI.
-     - Depends on: S3.
-     - Acceptance: no shell process or arbitrary command is launched.
-     - Validation: shell render/navigation tests.
-     - Done when: Dark/Light/narrow/largest-text captures pass.
-  5. S5 Prove security and release behavior.
-     - Objective: verify sandbox, resource limits, package upgrade, app data persistence, reconnect, and acceptance on no more than three seats.
-     - Inputs: S1-S4 and CRIT-006/007.
-     - Deliverable: signed security/package/live evidence.
-     - Depends on: S4.
-     - Acceptance: host files/secrets are inaccessible and corrected-forward recovery succeeds.
-     - Validation: package, SELinux, architecture, and live VDI gates.
-     - Done when: every supported provider limitation is named.
-- Scope: Owns Flatpak catalog, Front Door, App VM image/lifecycle, VDI UX, policy, package, migration, and proof. Generic Workload and Android lifecycle are out of scope.
-- Relevant files/components: app catalog types/workers, mde-shell-egui Front Door/IAC, image-builder, browser/VDI, Quadlet/libvirt packaging.
-- Dependencies: ARCH-010, ARCH-009, UX-009, UX-012, CRIT-006, CRIT-007.
-- Acceptance criteria:
-  1. Signed catalog search opens one isolated App VM through typed Workloads.
-  2. Readiness, input, audio, persistence, stop, crash, reconnect, and cleanup are truthful.
-  3. Three-seat-maximum security and package proof passes without host app installation.
-- Verification method: catalog, image, Workload, shell, package, SELinux, and live VDI cargo gates; BigBoy runs image/build jobs.
-- Origin or merged source IDs: 2026-07-31 Flatpak Front Door decision and archived app-launch workstreams.
 
 ### WL-FUNC-020 - Expose governed Android applications in Workloads
 
@@ -1615,6 +1486,12 @@ behavioral evidence is not completion.
   performance, and installed-seat captures are shared rollout proof owned here;
   no extra seat requirement is imposed on the product implementation. See
   `docs/worklist-archive/2026-08-14-wl-arch-008-closure.md`.
+- **Flatpak App-VM proof:** implementation is archived after signed catalog,
+  App-VM image/profile, RPM supply, launch/readiness, lifecycle, cleanup, and
+  capability gates passed. Remaining current-image, live-boot, package, and
+  installed-seat captures are shared rollout proof owned here; no extra seat
+  requirement is imposed on the product implementation. See
+  `docs/worklist-archive/2026-08-14-wl-func-018-closure.md`.
 - Remaining work:
 - **Admit release inputs:** obtain governed Maps approval/source/verifier, App
   VM trust receipt/key and base digest, Cuttlefish declaration/signature/
