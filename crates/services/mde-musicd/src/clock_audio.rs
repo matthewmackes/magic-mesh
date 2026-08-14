@@ -555,22 +555,29 @@ impl ClockAudioAuthority {
                     (!effects.music_is_audible())
                         .then_some(now_ms.saturating_add(MUSIC_AUDIBLE_DEADLINE_MS)),
                 ),
-                Err(provider_reason) => match effects.start_bundled(fallback_tone_id) {
-                    Ok(()) => (
-                        ClockAudioPlaybackPhase::PlayingFallback,
-                        ClockAudioProviderStatus::Unavailable,
-                        Some(fallback_tone_id.clone()),
-                        Some(provider_reason),
-                        None,
-                    ),
-                    Err(_) => (
-                        ClockAudioPlaybackPhase::ProviderUnavailable,
-                        ClockAudioProviderStatus::Unavailable,
-                        Some(fallback_tone_id.clone()),
-                        Some(provider_reason),
-                        None,
-                    ),
-                },
+                Err(provider_reason) => {
+                    // A provider may fail only after it has allocated or even
+                    // started the independent renderer. Revoke that attempt
+                    // before opening the bundled source so a late provider
+                    // callback cannot overlap or replace the governed fallback.
+                    effects.revoke_alert();
+                    match effects.start_bundled(fallback_tone_id) {
+                        Ok(()) => (
+                            ClockAudioPlaybackPhase::PlayingFallback,
+                            ClockAudioProviderStatus::Unavailable,
+                            Some(fallback_tone_id.clone()),
+                            Some(provider_reason),
+                            None,
+                        ),
+                        Err(_) => (
+                            ClockAudioPlaybackPhase::ProviderUnavailable,
+                            ClockAudioProviderStatus::Unavailable,
+                            Some(fallback_tone_id.clone()),
+                            Some(provider_reason),
+                            None,
+                        ),
+                    }
+                }
             },
         };
 
@@ -794,6 +801,7 @@ mod tests {
         output_available: bool,
         music_audible: bool,
         start_music_error: Option<&'static str>,
+        start_music_error_after_renderer: bool,
         queue_generation: u64,
         history_generation: u64,
         bookmark_generation: u64,
@@ -870,6 +878,12 @@ mod tests {
                 return Err("provider_unavailable");
             }
             if let Some(reason) = self.start_music_error {
+                if self.start_music_error_after_renderer {
+                    let ClockAudioRef::Music { remote_id, .. } = audio else {
+                        return Err("invalid_music_reference");
+                    };
+                    self.starts.push(format!("music:{remote_id}"));
+                }
                 return Err(reason);
             }
             let ClockAudioRef::Music { remote_id, .. } = audio else {
@@ -1429,6 +1443,63 @@ mod tests {
             assert_eq!(effects.music_volume, Some(0.64));
             assert_eq!(effects.volume_writes, [0.16, 0.64]);
         }
+    }
+
+    #[test]
+    fn partial_external_start_is_revoked_before_queue_isolated_fallback() {
+        let mut authority = ClockAudioAuthority::default();
+        let mut effects = Effects {
+            music_volume: Some(0.68),
+            seat_levels: vec![0.8, 0.44],
+            provider_available: true,
+            output_available: true,
+            start_music_error: Some("provider_failed_after_renderer_start"),
+            start_music_error_after_renderer: true,
+            queue_generation: 41,
+            history_generation: 17,
+            bookmark_generation: 23,
+            ..Effects::default()
+        };
+
+        let start = music_start("partial-provider-start", 11);
+        let fallback = authority.apply(start.clone(), NOW, &mut effects);
+        assert_eq!(fallback.phase, ClockAudioPlaybackPhase::PlayingFallback);
+        assert_eq!(
+            fallback.reason_code.as_deref(),
+            Some("provider_failed_after_renderer_start")
+        );
+        assert_eq!(effects.starts, ["music:track-1", "tone:bell"]);
+        assert_eq!(effects.stops, 1, "partial provider renderer must be revoked");
+        assert_eq!(effects.music_volume, Some(0.17));
+        assert_eq!(effects.seat_levels, [0.2, 0.11]);
+        assert_eq!(effects.queue_generation, 41);
+        assert_eq!(effects.history_generation, 17);
+        assert_eq!(effects.bookmark_generation, 23);
+
+        assert_eq!(authority.apply(start, NOW + 1, &mut effects), fallback);
+        assert_eq!(effects.starts, ["music:track-1", "tone:bell"]);
+        assert_eq!(effects.stops, 1, "replay must not revoke the fallback");
+
+        let stopped = authority.apply(
+            request(
+                "partial-provider-stop",
+                11,
+                ClockAudioActionV1::Stop {
+                    acknowledgement_id: "partial-provider-ack".into(),
+                },
+            ),
+            NOW + 2,
+            &mut effects,
+        );
+        assert_eq!(stopped.phase, ClockAudioPlaybackPhase::Stopped);
+        assert_eq!(effects.stops, 2);
+        assert_eq!(effects.music_volume, Some(0.68));
+        assert_eq!(effects.seat_levels, [0.8, 0.44]);
+        assert_eq!(effects.volume_writes, [0.17, 0.68]);
+        assert_eq!(
+            effects.seat_writes,
+            [vec![0.2, 0.11], vec![0.8, 0.44]]
+        );
     }
 
     #[test]
