@@ -505,6 +505,12 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-020-2026-08-11-android-lifecycle-delegation-r273.md`.
 - **Bounded Android host probes (2026-08-11):** `/proc` and nested-KVM sysfs reads reject oversized host text before parsing; BigBoy passed 1/1:
   `evidence/WL-FUNC-020-2026-08-11-android-host-probe-bound-r227.md`.
+- **Guest packaging contracts (2026-08-14):** farm slot `.90` passed the
+  Android/Cuttlefish contract, image-manifest, signed guest-payload, and image
+  receipt self-tests. The full guest-DEB/staging fixtures still require a Git
+  checkout, which `xcp-build.sh` intentionally omits; that harness dependency
+  is recorded rather than treated as package proof:
+  `evidence/WL-FUNC-020-2026-08-14-guest-packaging-contract-farm-gate-r1.md`.
 - **Bounded cloud replay cleanup (2026-08-11):** expired nonce rows reject symlinks and payloads over 128 bytes before parsing; BigBoy passed 1/1:
   `evidence/WL-FUNC-020-2026-08-11-cloud-gate-nonce-bound-r227.md`.
 - **Authenticated Cuttlefish relay (2026-08-11):** the production guest
