@@ -429,6 +429,7 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
+- **Farm gate (2026-08-14):** BigBoy `mackesd` passed 4,999/4,999; release inputs remain under `WL-TEST-001`: `evidence/WL-ARCH-009-2026-08-14-mackesd-full-farm-gate-r1.md`.
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
 - Required outcome: six supervised groups publish bounded snapshots; Surface::Workers owns worker tree/graph/inspector/Network Operations/Action Console; remove duplicate surfaces.
 - Current state: six groups ship; ownership/UI cutover remains; fleet/package/live proof is post-release: `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
@@ -460,8 +461,7 @@ behavioral evidence is not completion.
   `evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`. CI now runs the package verifier, rejecting peer lifecycle coupling and non-exact/unlimited cgroup policy:
   `evidence/WL-ARCH-009-2026-08-11-exact-group-policy-r250.md`.
 - **Live cgroup-enforcement checkpoint (2026-08-08):** Release 23 on seat 15 placed six groups in distinct cgroup-v2 paths with package-matched CPU, memory, task, and I/O limits.
-  A bounded transient
-  128 MiB allocation under a 16 MiB/no-swap boundary was OOM-killed exactly at
+  A bounded transient 128 MiB allocation under a 16 MiB/no-swap boundary was OOM-killed exactly at
   16 MiB; cleanup left the target and every group active. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-live-cgroup-enforcement-r3.md`.
 - **Optional-worker quiescence checkpoint (2026-08-08):** an Android catalog
