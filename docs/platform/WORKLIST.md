@@ -100,6 +100,11 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - **Farm gate (2026-08-14):** BigBoy `mackesd` passed 4,999/4,999; release inputs remain under `WL-TEST-001`: `evidence/WL-ARCH-009-2026-08-14-mackesd-full-farm-gate-r1.md`.
+- **Virtualization health ownership (2026-08-14):** the bounded read-only
+  `qemu:///system` KVM readiness probe is explicitly reviewed as a health
+  provider, not workload inventory or lifecycle authority; the workload
+  authority lint passes with `workload_compute.rs` remaining the sole typed
+  workload adapter (`a89e4150`).
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
 - Required outcome: six supervised groups publish bounded snapshots; Surface::Workers owns worker tree/graph/inspector/Network Operations/Action Console; remove duplicate surfaces.
 - Current state: six groups ship; ownership/UI cutover remains; fleet/package/live proof is post-release: `evidence/WL-ARCH-009-2026-08-11-link-traffic-process-group-r463.md`.
@@ -939,6 +944,10 @@ behavioral evidence is not completion.
   provider/fixture tests pass on BigBoy; injected fixture roots cannot observe
   host CUPS/systemd services, while production system roots retain both
   providers. Evidence: `evidence/WL-UX-011-2026-08-14-service-provider-r1.md`.
+- **Virtualization provider ownership (2026-08-14):** KVM/libvirt readiness is
+  published as typed health facts only; fixed `qemu:///system` probes are
+  bounded and read-only, and workload lifecycle remains owned by the typed
+  Workload adapter. The architecture authority lint passes (`a89e4150`).
 - Remaining work:
 - **Inventory generation:** delayed pre-restart probes cannot replace newer truth; `.196` 1/1: `evidence/WL-UX-011-2026-08-11-device-inventory-generation-r386.md`.
 - **Inventory staging identity:** symlink/hard-link substitution cannot redirect publication; `.90` 1/1: `evidence/WL-UX-011-2026-08-11-inventory-staging-nofollow-r421.md`.
