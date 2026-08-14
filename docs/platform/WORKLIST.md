@@ -979,12 +979,12 @@ behavioral evidence is not completion.
 - **Offline basemap admission:** unsafe candidates fail closed; `.90` 6/6; live proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-region-admission-r145.md`.
 - **Offline index recovery:** hostile metadata fails closed; machine 193: `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
 - **Basemap cache reload:** `.90` passed atomic replacement: `docs/platform/evidence/WL-FUNC-017-2026-08-10-basemap-cache-revalidation-r215.md`.
-- **Weather cache recovery:** restart binds source identity and rejects malformed state; `.194`: `evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
-- **Atmospheric cache quarantine:** malformed bytes leave authority before fallback; `.90` 1/1: `evidence/WL-FUNC-017-2026-08-11-atmosphere-cache-quarantine-r237.md`.
+- **Weather/atmospheric cache recovery:** restart identity and malformed-byte quarantine passed `.194`/`.90`: `evidence/WL-FUNC-017-2026-08-11-atmosphere-cache-quarantine-r237.md`.
 - **Atmospheric viewport restart:** retained geometry/generation match source identity; BigBoy 1/1: `evidence/WL-FUNC-017-2026-08-11-atmosphere-viewport-restart-r305.md`.
 - **Location provenance:** same-generation substitution discards snapshots; BigBoy 1/1: `evidence/WL-FUNC-017-2026-08-11-location-provenance-revalidation-r374.md`.
 - **Future cache fallback (2026-08-11):** `.50` passed: `docs/platform/evidence/WL-FUNC-017-2026-08-11-future-cache-fallback-r219.md`.
 - **Governed route provider:** signed bounded loopback and stale-result refusal; `.90` 2/2: `evidence/WL-FUNC-017-2026-08-11-provider-route-freshness-r255.md`.
+- **Maps full farm gate (2026-08-14):** `.90` passed 324/324 after schema-v1 cache quarantine repair: `evidence/WL-FUNC-017-2026-08-14-maps-full-farm-gate-r1.md`.
 - **Navigation source inodes:** replacement routes and hard-linked gazetteers fail closed; `.90`/BigBoy 1/1:
   `evidence/WL-FUNC-017-2026-08-11-navigation-authority-inode-r406.md`, `evidence/WL-FUNC-017-2026-08-11-gazetteer-inode-r450.md`.
 - **Route identity:** replacement geometry cannot reuse the active ID; BigBoy 1/1: `evidence/WL-FUNC-017-2026-08-11-route-identity-replacement-r296.md`.
@@ -1663,6 +1663,7 @@ behavioral evidence is not completion.
 - **Queue persistence rollback:** failed durable writes roll memory back and report failure; BigBoy 1/1: `evidence/WL-FUNC-021-2026-08-11-queue-persistence-rollback-r410.md`.
 - **Media-source heartbeat:** impossible retained observations cannot restore reachability; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-media-source-heartbeat-r313.md`.
 - **Provider identity:** endpoint equivocation revokes fallback; `.50` 1/1: `evidence/WL-FUNC-021-2026-08-11-provider-identity-equivocation-r314.md`.
+- **Media UI full farm gate (2026-08-14):** `.90` passed 114/114; H.264 remains transcode-only under the mpv baseline: `evidence/WL-FUNC-021-2026-08-14-media-full-farm-gate-r1.md`.
 - **Manifest/Jellyfin identities:** forged/duplicate manifest items and server IDs fail closed; `.196`/`.50` 1/1 each:
   `evidence/WL-FUNC-021-2026-08-11-media-manifest-item-identity-r317.md`, `evidence/WL-FUNC-021-2026-08-11-jellyfin-server-identity-r316.md`.
 - **Jellyfin cache/sync:** exact digests and URL segments reject content/path substitution; `.50`/`.196` 1/1 each:
