@@ -136,7 +136,10 @@ scan_runtime_inventory_candidates() {
 # while a duplicate or differently-shaped command is a new authority bypass.
 # The libvirt `version` health probe and the Podman volume runner are not
 # inventory, but are pinned here because the deliberately broad candidate scan
-# makes future argument expansion reviewable.
+# makes future argument expansion reviewable.  kvm_health.rs is likewise a
+# bounded, read-only qemu:///system readiness provider: it does not enumerate
+# or mutate workloads, while workload_compute.rs remains the sole lifecycle
+# adapter.
 is_reviewed_runtime_inventory_candidate() {
   local relative="$1" code="$2" ordinal="$3"
   case "$relative|$code" in
@@ -153,6 +156,10 @@ is_reviewed_runtime_inventory_candidate() {
     'crates/mesh/mackesd/src/workers/virtual_storage.rs|"podman",')
       [ "$ordinal" -le 2 ] ;;
     'crates/mesh/mackesd/src/workers/virtual_storage.rs|let mut cmd = Command::new("podman");')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/kvm_health.rs|let mut command = Command::new("virsh");')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/kvm_health.rs|let mut virsh = Command::new("virsh");')
       [ "$ordinal" -le 1 ] ;;
     *) return 1 ;;
   esac
