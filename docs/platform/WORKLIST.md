@@ -1721,6 +1721,8 @@ behavioral evidence is not completion.
 - **Bounded bookmark link probe (2026-08-11):** HTTP curl hangs fail closed; `.50` passed 1/1: `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-11-bookmark-probe-timeout-r235.md`.
 - **PipeWire dump bound (2026-08-11):** `pw-dump` output capped at 16 MiB before JSON parsing; `.50` passed: `evidence/WL-FUNC-021-2026-08-11-pw-dump-bound-r223.md`.
 - **Cast URL admission:** unsafe/local/credential-bearing URLs refused; BigBoy: `evidence/WL-FUNC-021-2026-08-10-cast-media-url-admission-r184.md`.
+- **Full Music daemon farm gate (2026-08-14):** `mde-musicd` passed 274/274 tests after eliminating the parallel `HOME` mutation race in cover-art proof:
+  `evidence/WL-FUNC-021-2026-08-14-music-full-farm-gate-r1.md`.
 - **Direct URL admission:** malformed/credential-bearing/unsafe URLs refused; `.90`: `evidence/WL-FUNC-021-2026-08-10-direct-media-url-admission-r214.md`.
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.

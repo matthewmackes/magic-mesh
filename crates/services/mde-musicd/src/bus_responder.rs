@@ -2846,13 +2846,20 @@ fn local_artwork_dir() -> PathBuf {
 /// concurrent reader never sees a half-written image). The id is sanitized to a
 /// single safe filename via [`crate::cache::artwork_filename`] (Subsonic ids are
 /// never trusted as paths). `None` on any IO failure (no dir, read-only, race).
+/// Testable form of the local artwork materializer with an injected local
+/// artwork root. Keeping the production wrapper on the daemon-owned cache
+/// preserves the runtime path while preventing tests from mutating process
+/// `HOME` and racing provider/cache tests in the same binary.
 #[must_use]
-fn materialize_local_artwork(cover_id: &str, bytes: &[u8]) -> Option<PathBuf> {
+fn materialize_local_artwork_in(
+    dir: &Path,
+    cover_id: &str,
+    bytes: &[u8],
+) -> Option<PathBuf> {
     if bytes.is_empty() {
         return None;
     }
-    let dir = local_artwork_dir();
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir).ok()?;
     let name = crate::cache::artwork_filename(cover_id);
     let path = dir.join(&name);
     // Already present + non-empty (a prior pull) → reuse it, no rewrite.
@@ -2877,7 +2884,16 @@ fn materialize_local_artwork(cover_id: &str, bytes: &[u8]) -> Option<PathBuf> {
 /// failure degrades to the legacy base64 shape rather than erroring.
 #[must_use]
 fn cover_art_path_reply(cover_id: &str, bytes: &[u8]) -> serde_json::Value {
-    if let Some(path) = materialize_local_artwork(cover_id, bytes) {
+    cover_art_path_reply_in(&local_artwork_dir(), cover_id, bytes)
+}
+
+#[must_use]
+fn cover_art_path_reply_in(
+    dir: &Path,
+    cover_id: &str,
+    bytes: &[u8],
+) -> serde_json::Value {
+    if let Some(path) = materialize_local_artwork_in(dir, cover_id, bytes) {
         json!({ "path": path.to_string_lossy(), "bytes": bytes.len() })
     } else {
         use base64::Engine;
@@ -6911,13 +6927,13 @@ mod tests {
     fn cover_art_reply_carries_a_path_not_base64_bytes() {
         // MUSIC-RESPONSIVE-4 — the get-cover-art reply must carry a file PATH, not
         // the base64 image blob, so the Bus spool stops growing with art bytes.
-        // Point the LOCAL artwork cache at a tempdir (it keys off $HOME via
-        // crate::cache::cache_dir()). One test owns $HOME so there's no parallel race.
+        // Inject the LOCAL artwork cache root; tests must not mutate process
+        // HOME because provider/cache tests run concurrently.
         let home = tempfile::tempdir().expect("tmp home");
-        std::env::set_var("HOME", home.path());
+        let artwork_dir = home.path().join(".local/share/mde/music-cache/artwork");
 
         let bytes = b"\xff\xd8\xff\xe0JFIF-cover-bytes".to_vec();
-        let reply = cover_art_path_reply("al-42", &bytes);
+        let reply = cover_art_path_reply_in(&artwork_dir, "al-42", &bytes);
         // Path, not bytes: the reply has a `path` and NO base64 `art` field.
         let path = reply
             .get("path")
@@ -6935,10 +6951,8 @@ mod tests {
         // the whole point: the Bus reply no longer grows with the image.
         assert!(path.len() < 256, "path reply stays small");
         // A second call for the same id reuses the file (no rewrite, same path).
-        let again = cover_art_path_reply("al-42", &bytes);
+        let again = cover_art_path_reply_in(&artwork_dir, "al-42", &bytes);
         assert_eq!(again.get("path"), reply.get("path"));
-
-        std::env::remove_var("HOME");
     }
 
     #[test]
