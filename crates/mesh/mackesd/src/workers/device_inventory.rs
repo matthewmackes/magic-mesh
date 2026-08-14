@@ -38,6 +38,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt as _;
@@ -87,6 +88,11 @@ const MAX_READ_TRIM_BYTES: usize = 256 * 1024;
 /// The vendor databases are larger than individual sysfs attributes, but
 /// remain bounded static inputs rather than untrusted unbounded streams.
 const MAX_IDS_DATABASE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bound the read-only CUPS projection replicated to every Workers client.
+const MAX_PRINTERS: usize = 64;
+const MAX_PRINTER_NAME_BYTES: usize = 128;
+const MAX_PRINTER_OUTPUT_BYTES: usize = 128 * 1024;
 
 /// Read a small sysfs/procfs file, trimmed; `None` when absent/empty/unreadable.
 fn read_trim(path: &Path) -> Option<String> {
@@ -1327,6 +1333,122 @@ pub fn power_supplies(roots: &SysfsRoots) -> Vec<DeviceRecord> {
     out
 }
 
+/// Read-only CUPS printer observation. Only queue names and a small state token
+/// cross the mesh boundary; URIs, job names, users, and command diagnostics do
+/// not enter the inventory. A missing/refusing `lpstat` is an explicit
+/// unavailable row rather than an inferred healthy printer set.
+#[must_use]
+pub fn printers() -> Vec<DeviceRecord> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let child = Command::new("lpstat")
+        .args(["-p", "-d"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return unavailable_printer();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return unavailable_printer();
+    };
+    let mut output = Vec::with_capacity(MAX_PRINTER_OUTPUT_BYTES.saturating_add(1));
+    if stdout
+        .take((MAX_PRINTER_OUTPUT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut output)
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return unavailable_printer();
+    }
+    if output.len() > MAX_PRINTER_OUTPUT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return unavailable_printer();
+    }
+    let Ok(status) = child.wait() else {
+        return unavailable_printer();
+    };
+    if !status.success() {
+        return unavailable_printer();
+    }
+    parse_printer_output(&output)
+}
+
+fn unavailable_printer() -> Vec<DeviceRecord> {
+    vec![DeviceRecord {
+        problem: Some("CUPS printer provider unavailable".to_string()),
+        ..DeviceRecord::new("Printers unavailable", DeviceStatus::Unknown)
+    }]
+}
+
+fn valid_printer_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PRINTER_NAME_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+        })
+}
+
+fn parse_printer_output(output: &[u8]) -> Vec<DeviceRecord> {
+    if output.len() > MAX_PRINTER_OUTPUT_BYTES {
+        return unavailable_printer();
+    }
+    let text = String::from_utf8_lossy(output);
+    let mut records = Vec::new();
+    let mut default = None;
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.first() == Some(&"printer") && fields.len() >= 4 {
+            let Some(name) = fields.get(1).filter(|name| valid_printer_name(name)) else {
+                continue;
+            };
+            let state = fields
+                .get(3)
+                .copied()
+                .unwrap_or("unknown")
+                .trim_end_matches('.');
+            let state = match state {
+                "idle" | "printing" | "disabled" => state,
+                _ => "unknown",
+            };
+            let status = if state == "disabled" {
+                DeviceStatus::Disabled
+            } else {
+                DeviceStatus::Ok
+            };
+            let mut record = DeviceRecord::new(format!("Printer: {name}"), status);
+            record.events.push(format!("state: {state}"));
+            records.push(record);
+            if records.len() == MAX_PRINTERS {
+                break;
+            }
+        } else if fields.first() == Some(&"system")
+            && fields.get(1) == Some(&"default")
+            && fields.get(2) == Some(&"destination:")
+        {
+            default = fields
+                .get(3)
+                .copied()
+                .filter(|name| valid_printer_name(name))
+                .map(str::to_owned);
+        }
+    }
+    if let Some(default) = default {
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record.name == format!("Printer: {default}"))
+        {
+            record.events.push("default: yes".to_string());
+        }
+    }
+    records
+}
+
 // ── host summary + tool availability ─────────────────────────────────────────
 
 /// Parse the first (uptime) field of `/proc/uptime`.
@@ -1501,6 +1623,7 @@ pub fn enumerate(
     add(&mut buckets, category::SENSORS, sensors(roots));
     add(&mut buckets, category::BLUETOOTH, bluetooth(roots));
     add(&mut buckets, category::POWER, power_supplies(roots));
+    add(&mut buckets, category::PRINTERS, printers());
 
     suppress_conflicting_sysfs_identities(&mut buckets);
 
@@ -2364,6 +2487,47 @@ mod tests {
         assert!(!published.contains("credential"));
         assert!(!published.contains(&"x".repeat(MAX_POWER_IDENTITY_BYTES + 1)));
         assert!(!published.contains("101%"));
+    }
+
+    #[test]
+    fn printer_provider_is_bounded_and_redacts_cups_payloads() {
+        let mut output = String::from(
+            "printer office is idle. enabled since today\n\
+             printer disabled is disabled. enabled since yesterday\n\
+             system default destination: office\n\
+             DeviceURI: ipp://user:password@example.invalid/queue\n\
+             job-42 secret-document.pdf alice\n",
+        );
+        for index in 0..(MAX_PRINTERS + 8) {
+            output.push_str(&format!("printer queue-{index:03} is printing. enabled\n"));
+        }
+        let records = parse_printer_output(output.as_bytes());
+        assert_eq!(records.len(), MAX_PRINTERS);
+        assert_eq!(records[0].name, "Printer: office");
+        assert_eq!(records[0].status, DeviceStatus::Ok);
+        assert_eq!(records[0].events, ["state: idle", "default: yes"]);
+        assert_eq!(records[1].status, DeviceStatus::Disabled);
+        let published = serde_json::to_string(&records).unwrap();
+        assert!(!published.contains("password"));
+        assert!(!published.contains("secret-document"));
+        assert!(!published.contains("ipp://"));
+    }
+
+    #[test]
+    fn printer_provider_reports_unavailable_and_rejects_unsafe_names() {
+        let records = parse_printer_output(
+            b"printer safe-name is idle. enabled\nprinter bad/name is idle. enabled\n",
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "Printer: safe-name");
+
+        let records = parse_printer_output(&vec![b'x'; MAX_PRINTER_OUTPUT_BYTES + 1]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, DeviceStatus::Unknown);
+        assert_eq!(
+            records[0].problem.as_deref(),
+            Some("CUPS printer provider unavailable")
+        );
     }
 
     #[test]

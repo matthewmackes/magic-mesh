@@ -33,6 +33,7 @@ const MAX_DETAIL_BYTES: usize = 512;
 const VERIFICATION_UNAVAILABLE: &str = "\0call-media-verification-unavailable";
 const SIP_COMMAND_CAPACITY: usize = 16;
 const SIP_COMMAND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+const MAX_SIP_DIAL_TARGET_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SipProviderHealth {
@@ -46,9 +47,9 @@ enum SipProviderHealth {
 /// The provider starts only when a governed SIP account exists.  The voice
 /// core owns registration, inbound INVITE handling, RTP/G.711, PipeWire/ALSA,
 /// mute state, and RFC 4733 DTMF.  This adapter deliberately exposes only the
-/// commands that core can acknowledge through its bounded agent queue; an
-/// outbound Collaboration call has no dial target in its current command
-/// contract and therefore continues to fail closed.
+/// commands that core can acknowledge through its bounded agent queue. An
+/// outbound Collaboration call must use the explicit bounded dial command;
+/// the space-scoped start command continues to fail closed without a target.
 struct SipGatewayProvider {
     commands: std::sync::mpsc::SyncSender<AgentCommand>,
     health: Arc<Mutex<SipProviderHealth>>,
@@ -228,6 +229,28 @@ fn bounded_health_detail(detail: &str) -> String {
     detail[..end].to_string()
 }
 
+fn validate_sip_dial_target(target: &str) -> Result<(), CallMediaProviderError> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err(CallMediaProviderError::ExecutionRefused {
+            detail: "SIP outbound target must not be empty".to_string(),
+        });
+    }
+    if trimmed.len() > MAX_SIP_DIAL_TARGET_BYTES {
+        return Err(CallMediaProviderError::ExecutionRefused {
+            detail: format!(
+                "SIP outbound target exceeds {MAX_SIP_DIAL_TARGET_BYTES}-byte limit"
+            ),
+        });
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(CallMediaProviderError::ExecutionRefused {
+            detail: "SIP outbound target contains a control character".to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl CallMediaFrameVerifier for SipGatewayProvider {
     fn execute_command(
         &self,
@@ -287,8 +310,10 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
                 });
             }
             CollabCommand::StartOutboundCall { call, target, .. } => {
+                validate_sip_dial_target(target)?;
+                let target = target.trim().to_owned();
                 self.send_acknowledged(|completion| AgentCommand::Dial {
-                    target: target.clone(),
+                    target,
                     completion,
                 })?;
                 if let Ok(mut active) = self.active_call.lock() {
@@ -1342,6 +1367,33 @@ mod tests {
             unavailable,
             CallMediaProviderError::ProviderUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn outbound_sip_ingress_rejects_unbounded_or_control_targets_before_dial() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let provider = SipGatewayProvider::with_channel(tx, SipProviderHealth::Ready);
+        let oversized = "x".repeat(MAX_SIP_DIAL_TARGET_BYTES + 1);
+        for target in ["", "   ", "peer\nforged-header", oversized.as_str()] {
+            let error = provider
+                .execute_command(
+                    &CollabCommand::StartOutboundCall {
+                        space: SpaceId::new(),
+                        call: CallId::new(),
+                        target: target.to_string(),
+                    },
+                    CallMediaAdapter::SipGateway,
+                )
+                .expect_err("invalid signed dial target must fail closed");
+            assert!(matches!(
+                error,
+                CallMediaProviderError::ExecutionRefused { .. }
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[test]

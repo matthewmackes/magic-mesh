@@ -335,6 +335,10 @@ behavioral evidence is not completion.
   closed without opening or changing bytes. BigBoy passed 5/5: `docs/platform/evidence/WL-FUNC-011-2026-08-09-native-office-admission-r5.md`.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
   Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
+- **Outbound SIP ingress (2026-08-14):** bounded signed-command dial targets
+  reject empty/control/oversized values before provider effects; BigBoy
+  `mackesd` passed 1/1 and `mde-voice-hud` SIP passed 37/37:
+  `evidence/WL-FUNC-011-2026-08-14-outbound-sip-ingress-r1.md`.
 - **Native collaboration full gate (2026-08-14):** BigBoy passed 136/136: `evidence/WL-FUNC-011-2026-08-14-collab-egui-full-farm-gate-r1.md`.
 - Remaining work:
 - **CAS read-only replay:** canonical bytes are sealed and substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-readonly-replay-r377.md`.
@@ -833,6 +837,10 @@ behavioral evidence is not completion.
 - **Finite motion restart:** corrupt/non-finite timelines settle without repaint loops; `.50` 1/1: `evidence/WL-UX-009-2026-08-11-motion-finite-restart-r426.md`.
 - **Disabled status tone:** unavailable workspaces cannot retain live semantic colors; BigBoy exact:
   `evidence/WL-UX-009-2026-08-11-disabled-status-tone-r456.md`.
+- **Resource catalog Quazar migration (2026-08-14):** Construct resource
+  headers, hero lanes, cards, typography, radii, and spacing now use shared
+  tokens; BigBoy `mde-shell-egui --all-targets` check passed:
+  `evidence/WL-UX-009-2026-08-14-resource-catalog-quazar-migration-r1.md`.
 - Remaining work:
   1. S1 Freeze tokens, fonts, and icon registry.
      - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.
@@ -905,6 +913,10 @@ behavioral evidence is not completion.
 - **Device-control authorization checkpoint (2026-08-09):** exact-body, short-lived, single-use root-shell capabilities now gate the fixed executor; machine 9 passed
   contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
 - **Unavailable provider control (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-UX-011-2026-08-10-unavailable-control-r207.md`.
+- **CUPS printer inventory (2026-08-14):** Workers now publishes a bounded,
+  credential-free `printers` category with explicit unavailable state; `.90`
+  passed 2/2 bounded/redaction tests:
+  `evidence/WL-UX-011-2026-08-14-printer-provider-r1.md`.
 - Remaining work:
 - **Inventory generation:** delayed pre-restart probes cannot replace newer truth; `.196` 1/1: `evidence/WL-UX-011-2026-08-11-device-inventory-generation-r386.md`.
 - **Inventory staging identity:** symlink/hard-link substitution cannot redirect publication; `.90` 1/1: `evidence/WL-UX-011-2026-08-11-inventory-staging-nofollow-r421.md`.

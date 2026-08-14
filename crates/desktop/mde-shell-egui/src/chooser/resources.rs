@@ -26,7 +26,7 @@ use mackes_mesh_types::resources::{
 };
 use mde_bus::persist::Persist;
 use mde_egui::egui::{self, Color32, FontId, RichText, Sense, Stroke, StrokeKind};
-use mde_egui::Style;
+use mde_egui::{Style, TypographyRole};
 use serde::{Deserialize, Serialize};
 
 const RESOURCE_ACTION_TOPIC: &str = "action/resources/invoke";
@@ -575,7 +575,10 @@ impl ResourceBrowserState {
                 } else {
                     "UNTRUSTED COMPATIBILITY PATH"
                 })
-                .font(FontId::monospace(9.0))
+                .font(Style::typography_font_with_size(
+                    TypographyRole::Mono,
+                    Style::TYPE_CAPTION,
+                ))
                 .color(if authenticated {
                     Style::OK
                 } else {
@@ -673,10 +676,10 @@ impl ResourceBrowserState {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 16.0, Style::SURFACE);
+        painter.rect_filled(rect, Style::RADIUS_L, Style::SURFACE);
         painter.rect_stroke(
             rect,
-            16.0,
+            Style::RADIUS_L,
             Stroke::new(1.0, Style::ACCENT_COMMS),
             StrokeKind::Inside,
         );
@@ -686,10 +689,10 @@ impl ResourceBrowserState {
             "LOCAL SERVICE STACK / LIVE TOPOLOGY · SELECT TO UNNEST"
         };
         painter.text(
-            rect.left_top() + egui::vec2(18.0, 15.0),
+            rect.left_top() + egui::vec2(Style::SP_M, Style::SP_S),
             egui::Align2::LEFT_TOP,
             title,
-            FontId::monospace(13.0),
+            Style::typography_font_with_size(TypographyRole::Mono, Style::TYPE_SUBHEADLINE),
             Style::ACCENT_COMMS,
         );
 
@@ -703,7 +706,7 @@ impl ResourceBrowserState {
         for (index, (tier, label)) in tiers.iter().enumerate() {
             let lane = egui::Rect::from_min_size(
                 egui::pos2(rect.left() + 16.0, lane_top + index as f32 * lane_height),
-                egui::vec2(rect.width() - 32.0, lane_height - 5.0),
+                egui::vec2(rect.width() - 2.0 * Style::SP_M, lane_height - Style::SP_XS),
             );
             painter.rect_stroke(
                 lane,
@@ -712,10 +715,10 @@ impl ResourceBrowserState {
                 StrokeKind::Inside,
             );
             painter.text(
-                lane.left_center() + egui::vec2(10.0, 0.0),
+                lane.left_center() + egui::vec2(Style::SP_S, 0.0),
                 egui::Align2::LEFT_CENTER,
                 *label,
-                FontId::monospace(10.0),
+                Style::typography_font(TypographyRole::Caption),
                 Style::TEXT_DIM,
             );
             let mut x = lane.left() + 155.0;
@@ -744,7 +747,7 @@ impl ResourceBrowserState {
                     node.center(),
                     egui::Align2::CENTER_CENTER,
                     truncate(&card.display_name, 13),
-                    FontId::monospace(9.0),
+                    Style::typography_font(TypographyRole::Caption),
                     Style::TEXT_STRONG,
                 );
                 x += 100.0;
@@ -777,20 +780,20 @@ impl ResourceBrowserState {
                 if selected { 1.8 } else { 1.0 },
                 lifecycle_color(service.lifecycle),
             ))
-            .corner_radius(12.0)
-            .inner_margin(14.0);
+            .corner_radius(Style::RADIUS_M)
+            .inner_margin(Style::SP_M);
         let response = frame
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(service.service_kind.to_ascii_uppercase())
-                            .font(FontId::monospace(12.0))
+                            .font(Style::typography_font(TypographyRole::Mono))
                             .color(Style::ACCENT),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{:?}", service.lifecycle).to_ascii_uppercase())
-                                .font(FontId::monospace(10.0))
+                                .font(Style::typography_font(TypographyRole::Caption))
                                 .color(lifecycle_color(service.lifecycle)),
                         );
                     });
@@ -844,7 +847,7 @@ impl ResourceBrowserState {
                                 && self.action_pending.is_none(),
                             egui::Button::new(
                                 RichText::new(format!("{:?}", action.verb).to_ascii_uppercase())
-                                    .font(FontId::monospace(9.0)),
+                                    .font(Style::typography_font(TypographyRole::Caption)),
                             ),
                         );
                         if button.clicked() {
@@ -895,12 +898,12 @@ impl ResourceBrowserState {
         let response = egui::Frame::new()
             .fill(Style::SURFACE)
             .stroke(Stroke::new(if selected { 1.8 } else { 1.0 }, color))
-            .corner_radius(12.0)
-            .inner_margin(14.0)
+            .corner_radius(Style::RADIUS_M)
+            .inner_margin(Style::SP_M)
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(format!("{:?}", card.identity.class).to_ascii_uppercase())
-                        .font(FontId::monospace(12.0))
+                        .font(Style::typography_font(TypographyRole::Mono))
                         .color(Style::ACCENT),
                 );
                 ui.label(
