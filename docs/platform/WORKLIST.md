@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **13 active epics:** 13 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **12 active epics:** 12 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -315,117 +315,6 @@ behavioral evidence is not completion.
   @farm:{cargo test -p mackesd workload_compute}
   @farm:{cargo test -p mde-shell-egui --features live-vdi}; BigBoy release/package gates use explicit host/slot and capture live evidence.
 - Origin or merged source IDs: Job One 2026-08-05; archived ARCH-006/007, CRIT-001; VDI zero-copy design; current Dell/seat-15 incidents.
-### WL-ARCH-008 - Extract the host Browser stack and replace it with a VM Browser
-
-- Status: Remaining
-- Priority: P0
-- Complexity: Epic
-- Problem: CEF/Servo host Browser code, frame copies, helpers, and package seams still compete with the DRM shell and violate the VM-only application boundary.
-- Required outcome: Preserve the old stack with history in matthewmackes/magic-mesh-browser-stack, remove it from magic-mesh, and make Surface::Browser start/resume a
-  browser-vm that renders guest Chromium over VDI with focused input and guest-owned chrome.
-- Current state: Standalone CI and the typed Browser path pass; portable import, guest image/audio quality, and three-seat performance proof remain.
-- **Portable migration checkpoints (2026-08-06):** deterministic allowlist, idempotency, symlink, and secret boundaries passed BigBoy and `.50`:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`, `docs/platform/evidence/WL-ARCH-008-2026-08-09-portable-manifest-identity-r2.md`.
-- **Display1 rollback checkpoint (2026-08-09):** exact XML restoration passed `.90`: `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
-- **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
-- **Browser VM artifact-identity checkpoint (2026-08-09):** exact 4/8192/64 profile and bounded qcow2/raw manifests reject stale, hostile, or unsupported artifacts;
-  machine 194 passed the focused contract gates: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-image-contract-r72.md`.
-  A real admitted 64-GiB qcow2 then passed `qemu-img` integrity: `docs/platform/evidence/WL-ARCH-008-2026-08-09-browser-vm-real-image-r77.md`.
-- **Dell Display1/RDP (2026-08-09):** guest RDP boot proof: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
-- **Host-browser profile (2026-08-10):** manifest self-test passed: `docs/platform/evidence/WL-ARCH-008-2026-08-10-host-browser-profile-refusal-r156.md`.
-- Remaining work:
-- **Browser runtime path:** xrdp cannot redirect executable lookup outside immutable guest entrypoints; `.196` self-test:
-  `evidence/WL-ARCH-008-2026-08-11-browser-runtime-path-r443.md`.
-- **Bookmark clock generation:** transplanted clocks cannot roll back snapshot history; `.50` 1/1: `evidence/WL-ARCH-008-2026-08-11-bookmark-clock-generation-r430.md`.
-- **App-VM base authority:** conflicting duplicate base declarations fail verification; `.196` passed: `evidence/WL-ARCH-008-2026-08-11-app-vm-base-declaration-r379.md`.
-- **Session restart readiness (2026-08-11):** the broker demotes recovered
-  historical `Active` rows before first convergence, replacing stale shared
-  ready state until a forward authorized reconnect; `.50` passed 1/1:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-11-session-restart-readiness-r265.md`.
-- **Browser reconnect identity (2026-08-11):** exact replay preserves the live route/transport while retargeting fails closed; BigBoy passed 1/1:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-11-browser-reconnect-identity-r245.md`.
-- **Lifecycle request correlation (2026-08-11):** Browser start/resume terminal
-  rows now require the exact published request ID; BigBoy passed 14/14:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-11-browser-request-correlation-r476.md`.
-- **Early file-count admission (2026-08-11):** Browser migration carries the
-  remaining `MAX_FILES` budget into traversal and refuses the next source entry
-  before retaining more candidates; `.50` passed the self-test:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-11-file-count-admission-r223.md`.
-- **Portable bundle integrity (2026-08-10):** payload size/hash, symlink,
-  duplicate, and unexpected-file checks passed `.90`:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-10-portable-bundle-integrity-r176.md`.
-- **Special-node refusal (2026-08-10):** `.90` passed the migration boundary
-  fixture that refuses an allowlisted FIFO instead of silently omitting it:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-10-special-node-refusal-r185.md`.
-- **Portable publication integrity:** unsafe parents and unrelated outputs fail closed; replacement atomically preserves one complete bundle. Farm gates passed:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-10-output-parent-integrity-r192.md`,
-  `docs/platform/evidence/WL-ARCH-008-2026-08-11-atomic-bundle-replacement-r279.md`.
-- **Browser source-parent integrity (2026-08-10):** symlinked/non-directory
-  ancestors are rejected before bundle publication; farm self-tests passed:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-10-source-parent-integrity-r212.md`.
-  1. S1 Preserve history and build the standalone repository.
-     - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
-     - Inputs: current repo commit, Browser inventory, licenses.
-     - Deliverable: repository, provenance record, workspace/lockfiles, CI, and clean-clone build log.
-     - Depends on: ARCH-010 S2.
-     - Acceptance: no path/submodule/Git dependency points back to magic-mesh.
-     - Validation: clean clone cargo build/test on BigBoy.
-     - Done when: immutable revision and evidence hash are recorded.
-  2. S2 Migrate portable Browser data safely.
-     - Objective: inventory and idempotently import/export profiles, bookmarks, history, sessions, downloads, policies, and extensions without exposing secrets.
-     - Inputs: legacy profile locations and guest image contract.
-     - Deliverable: migration tool with imported/skipped/failed counts and redacted fixtures.
-     - Depends on: S1.
-     - Acceptance: downloads survive; cookies, passwords, passkeys, and sealed credentials never export silently.
-     - Validation: migration unit/property tests and secret scan.
-     - Done when: two consecutive migrations produce the same result.
-  3. S3 Remove host Browser production seams.
-     - Objective: delete host crates, workers, engines, package variants, installers, policies, units, and active docs.
-     - Inputs: S1 inventory and S2 migration.
-     - Deliverable: source/package deletion plus negative reachability scan.
-     - Depends on: S1, S2.
-     - Acceptance: no mde-web, CEF/Servo host engine, Browser helper, or Browser RPM is reachable.
-     - Validation: workspace/package/architecture/supersession gates.
-     - Done when: scan is clean in a fresh checkout.
-  4. S4 Build and integrate browser-vm.
-     - Objective: create the 3-vCPU/8-GiB/64-GiB Dell-safe baseline image and typed Workload profile with Chromium, GPU/video, PipeWire, guest agents, RDP preferred, Sunshine
-       alternate, and host_browser=false.
-     - Inputs: ARCH-010 adapter/readiness contracts and image builder.
-     - Deliverable: reproducible image/profile and readiness fixture.
-     - Depends on: S3 and ARCH-010 S4.
-     - Acceptance: start/resume exposes the advertised desktop source or an actionable failure.
-     - Validation: image/package and Workload tests on BigBoy.
-     - Done when: profile hash and readiness evidence exist.
-  5. S5 Replace shell Browser with VDI controller.
-     - Objective: preserve Construct navigation, focused input, clipboard, source selection, reconnect, and preference without guest chrome mirroring.
-     - Inputs: S4, VDI contract, UX-009.
-     - Deliverable: controller and render/input/audio regression fixtures.
-     - Depends on: S4.
-     - Acceptance: switching transport preserves the VM and never silently changes preference.
-     - Validation: shell live-vdi cargo tests and rendered captures.
-     - Done when: no host helper process exists during the proof.
-  6. S6 Prove quality and upgrade behavior.
-     - Objective: verify five-tab cadence, damage uploads, navigation latency, guest audio, install/upgrade cleanup, and corrected-forward recovery.
-     - Inputs: S1-S5 and release artifacts.
-     - Deliverable: timestamped 15-minute metrics, audio proof, RPM proof, and captures from no more than three selected seats.
-     - Depends on: S5, CRIT-006, CRIT-007.
-     - Acceptance: >=30 FPS visible target, no unexplained >500ms stall, navigation p95 <=100ms, and no secret/data loss.
-     - Validation: farm standalone/magic-mesh gates and live seat commands.
-     - Done when: all measurements and unavailable hardware are honestly recorded.
-- Scope: Owns old-stack preservation, migration, host removal, Browser VM image/workload, shell VDI behavior, packaging, and proof. Guest Chromium UI and generic Workload
-  lifecycle are out of scope.
-- Relevant files/components: root manifests, mde-shell-egui web/vdi, old mde-web crates/workers, Browser packaging, image-build, VDI, and sibling browser repository.
-- Dependencies: ARCH-010 is blocking; FUNC-016 owns VDI clipboard; UX-009 owns Construct connection/error styling.
-- Acceptance criteria:
-  1. Old Browser stack builds from its clean standalone clone and is absent from production magic-mesh.
-  2. Browser opens the same guest session over RDP/Sunshine with focused input, audio, clipboard, reconnect, and no host engine.
-  3. Five-tab performance, package cleanup, and data migration meet the stated thresholds.
-- Verification method: standalone and root cargo gates,
-  architecture/secret/package gates, and live video/audio/latency captures on
-  no more than three selected seats; put the longest build on
-  BigBoy.
-- Origin or merged source IDs: 2026-07-28 Option 3; archived WL-PERF-003, FUNC-001..004, ARCH-005; browser-perf-native design.
 ### WL-ARCH-009 - Process-isolated mackesd and unified Workers interface
 - Status: Remaining
 - Priority: P0
@@ -1720,6 +1609,12 @@ behavioral evidence is not completion.
   passed. Remaining direct-DRM/package/installed-seat captures are shared
   rollout proof owned here; no extra seat requirement is imposed on the product
   implementation. See `docs/worklist-archive/2026-08-14-wl-ux-012-closure.md`.
+- **Browser VM quality proof:** implementation is archived after portable
+  migration, host-boundary, image identity, reconnect, lifecycle, and runtime
+  executable-path gates passed. Remaining guest image/audio quality, upgrade,
+  performance, and installed-seat captures are shared rollout proof owned here;
+  no extra seat requirement is imposed on the product implementation. See
+  `docs/worklist-archive/2026-08-14-wl-arch-008-closure.md`.
 - Remaining work:
 - **Admit release inputs:** obtain governed Maps approval/source/verifier, App
   VM trust receipt/key and base digest, Cuttlefish declaration/signature/
