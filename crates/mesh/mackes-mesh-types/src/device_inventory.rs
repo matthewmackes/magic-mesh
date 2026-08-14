@@ -54,6 +54,8 @@ pub mod category {
     pub const POWER: &str = "power";
     /// CUPS printer queues (names and coarse state only).
     pub const PRINTERS: &str = "printers";
+    /// System service units (names and coarse state only).
+    pub const SERVICES: &str = "services";
 
     /// The full locked taxonomy (#4) in render order.
     ///
@@ -75,6 +77,7 @@ pub mod category {
         BLUETOOTH,
         POWER,
         PRINTERS,
+        SERVICES,
     ];
 }
 
@@ -98,6 +101,7 @@ pub fn category_label(key: &str) -> String {
         category::BLUETOOTH => "Bluetooth".to_string(),
         category::POWER => "Batteries".to_string(),
         category::PRINTERS => "Printers".to_string(),
+        category::SERVICES => "Services".to_string(),
         other => other.replace(['-', '_'], " "),
     }
 }

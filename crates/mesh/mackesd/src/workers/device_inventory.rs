@@ -93,6 +93,8 @@ const MAX_IDS_DATABASE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRINTERS: usize = 64;
 const MAX_PRINTER_NAME_BYTES: usize = 128;
 const MAX_PRINTER_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_SERVICES: usize = 128;
+const MAX_SERVICE_OUTPUT_BYTES: usize = 128 * 1024;
 
 /// Read a small sysfs/procfs file, trimmed; `None` when absent/empty/unreadable.
 fn read_trim(path: &Path) -> Option<String> {
@@ -1350,7 +1352,7 @@ pub fn printers() -> Vec<DeviceRecord> {
     let Ok(mut child) = child else {
         return unavailable_printer();
     };
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return unavailable_printer();
@@ -1444,6 +1446,67 @@ fn parse_printer_output(output: &[u8]) -> Vec<DeviceRecord> {
             .find(|record| record.name == format!("Printer: {default}"))
         {
             record.events.push("default: yes".to_string());
+        }
+    }
+    records
+}
+
+/// Read-only systemd service observation. Unit names and coarse active state
+/// are the only fields admitted into the mesh inventory.
+#[must_use]
+pub fn services() -> Vec<DeviceRecord> {
+    let mut command = Command::new("systemctl");
+    command.args([
+        "list-units",
+        "--type=service",
+        "--state=running,failed",
+        "--no-legend",
+        "--no-pager",
+    ]);
+    let Ok(output) = super::proc::output_with_timeout(command, Duration::from_secs(2)) else {
+        return unavailable_services();
+    };
+    if !output.status.success() || output.stdout.len() > MAX_SERVICE_OUTPUT_BYTES {
+        return unavailable_services();
+    }
+    parse_service_output(&output.stdout)
+}
+
+fn unavailable_services() -> Vec<DeviceRecord> {
+    vec![DeviceRecord {
+        problem: Some("system service provider unavailable".to_string()),
+        ..DeviceRecord::new("Services unavailable", DeviceStatus::Unknown)
+    }]
+}
+
+fn valid_service_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@')
+        })
+}
+
+fn parse_service_output(output: &[u8]) -> Vec<DeviceRecord> {
+    if output.len() > MAX_SERVICE_OUTPUT_BYTES {
+        return unavailable_services();
+    }
+    let mut records = Vec::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 4 || !valid_service_name(fields[0]) {
+            continue;
+        }
+        let status = match fields[2] {
+            "active" => DeviceStatus::Ok,
+            "failed" => DeviceStatus::Degraded,
+            _ => DeviceStatus::Unknown,
+        };
+        let mut record = DeviceRecord::new(format!("Service: {}", fields[0]), status);
+        record.events.push(format!("substate: {}", fields[3]));
+        records.push(record);
+        if records.len() == MAX_SERVICES {
+            break;
         }
     }
     records
@@ -1624,6 +1687,7 @@ pub fn enumerate(
     add(&mut buckets, category::BLUETOOTH, bluetooth(roots));
     add(&mut buckets, category::POWER, power_supplies(roots));
     add(&mut buckets, category::PRINTERS, printers());
+    add(&mut buckets, category::SERVICES, services());
 
     suppress_conflicting_sysfs_identities(&mut buckets);
 
@@ -2528,6 +2592,22 @@ mod tests {
             records[0].problem.as_deref(),
             Some("CUPS printer provider unavailable")
         );
+    }
+
+    #[test]
+    fn service_provider_is_bounded_and_redacts_descriptions() {
+        let mut output = String::from(
+            "mde-shell-egui.service loaded active running Construct shell\n\
+             bad/name.service loaded failed failed secret-description\n",
+        );
+        for index in 0..(MAX_SERVICES + 4) {
+            output.push_str(&format!("worker-{index:03}.service loaded active running\n"));
+        }
+        let records = parse_service_output(output.as_bytes());
+        assert_eq!(records.len(), MAX_SERVICES);
+        assert_eq!(records[0].name, "Service: mde-shell-egui.service");
+        assert_eq!(records[0].status, DeviceStatus::Ok);
+        assert!(!serde_json::to_string(&records).unwrap().contains("secret-description"));
     }
 
     #[test]

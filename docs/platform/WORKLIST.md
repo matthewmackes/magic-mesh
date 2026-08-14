@@ -917,6 +917,11 @@ behavioral evidence is not completion.
   credential-free `printers` category with explicit unavailable state; `.90`
   passed 2/2 bounded/redaction tests:
   `evidence/WL-UX-011-2026-08-14-printer-provider-r1.md`.
+- **System service inventory (2026-08-14):** Workers now publishes a bounded,
+  credential-free `services` category from read-only systemd observation;
+  unit names are allowlisted, descriptions are excluded, coarse state is
+  retained, and unavailable/oversized input fails closed. BigBoy passed 1/1:
+  `evidence/WL-UX-011-2026-08-14-service-provider-r1.md`.
 - Remaining work:
 - **Inventory generation:** delayed pre-restart probes cannot replace newer truth; `.196` 1/1: `evidence/WL-UX-011-2026-08-11-device-inventory-generation-r386.md`.
 - **Inventory staging identity:** symlink/hard-link substitution cannot redirect publication; `.90` 1/1: `evidence/WL-UX-011-2026-08-11-inventory-staging-nofollow-r421.md`.
