@@ -785,7 +785,8 @@ behavioral evidence is not completion.
   test seats. Lighthouses retain independent quorum proof and are not seats.
 - **Post-release product proof:** execute deferred provider/runtime captures
   referenced by the product epics and CRIT-007. Use one named seat when enough;
-  expand only to three when the invariant is genuinely cross-seat.
+  use at most two only when the invariant is genuinely cross-seat; otherwise
+  record the precise external blocker.
 - **Corrected-forward recovery:** exercise boot, sleep/resume, peer return,
   provider loss, package restart, stale-payload refusal, and corrected-forward
   deployment. Preserve the six-hour privacy boundary and never rollback.
