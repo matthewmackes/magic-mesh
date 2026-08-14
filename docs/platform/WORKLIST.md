@@ -750,6 +750,12 @@ behavioral evidence is not completion.
   passed. Remaining direct-DRM/package/installed-seat captures are shared
   rollout proof owned here; no extra seat requirement is imposed on the product
   implementation. See `docs/worklist-archive/2026-08-14-wl-ux-012-closure.md`.
+- **Quazar workspace proof:** UX-009 implementation is archived after shared
+  style/icon, responsive-state, motion, resource-catalog, and tooltip gates
+  passed. Remaining direct-DRM/package/Dark-Light/large-text captures and
+  human visual review are shared rollout proof owned here; no extra seat
+  requirement is imposed. See
+  `docs/worklist-archive/2026-08-14-wl-ux-009-closure.md`.
 - **Browser VM quality proof:** implementation is archived after portable
   migration, host-boundary, image identity, reconnect, lifecycle, and runtime
   executable-path gates passed. Remaining guest image/audio quality, upgrade,
@@ -832,85 +838,6 @@ behavioral evidence is not completion.
   active epics.
 
 ## User Interface And Experience
-
-### WL-UX-009 - Complete the shared Quazar workspace design language
-
-- Status: Remaining
-- Priority: P1
-- Complexity: Epic
-- Problem: Construct surfaces still diverge in typography, palette, icons, spacing, responsive layout, and motion despite shared primitives.
-- Required outcome: every Construct-owned egui surface uses the shared Quazar Style/Visuals, approved fonts/icons, Dark/Light appearances, responsive geometry, semantic
-  state language, and bounded motion with no hand-rolled surface styling.
-- Current state: shared style and many primitives exist; adoption gaps, icon audit, responsive outliers, and integrated visual proof remain.
-- **Workspace-state checkpoint (2026-08-09):** shared panels stay bounded and use active Light tokens at narrow touch geometry; `.50` passed 12/12:
-  `docs/platform/evidence/WL-UX-009-2026-08-09-workspace-state-responsive-light-r1.md`.
-- **Carbon icon registry drift gate (2026-08-10):** exact 44-asset parity,
-  symbolic SVG, safe-name, and Apache-2.0 checks passed:
-  `docs/platform/evidence/WL-UX-009-2026-08-10-carbon-registry-r213.md`.
-- **Finite motion restart:** corrupt/non-finite timelines settle without repaint loops; `.50` 1/1: `evidence/WL-UX-009-2026-08-11-motion-finite-restart-r426.md`.
-- **Disabled status tone:** unavailable workspaces cannot retain live semantic colors; BigBoy exact:
-  `evidence/WL-UX-009-2026-08-11-disabled-status-tone-r456.md`.
-- **Resource catalog Quazar migration (2026-08-14):** Construct resource
-  headers, hero lanes, cards, typography, radii, and spacing now use shared
-  tokens; BigBoy `mde-shell-egui --all-targets` check passed:
-  `evidence/WL-UX-009-2026-08-14-resource-catalog-quazar-migration-r1.md`.
-- **Shared tooltip gate (2026-08-14):** all 23 raw egui hover-text calls in
-  shipped Construct surfaces now use the shared Quazar tooltip overlay;
-  Carbon/style-leak lint passes with zero leaks and BigBoy shell all-targets
-  check passes:
-  `evidence/WL-UX-009-2026-08-14-shared-tooltip-gate-r1.md`.
-- Remaining work:
-  1. S1 Freeze tokens, fonts, and icon registry.
-     - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.
-     - Inputs: mde-egui style, platform interfaces, icon assets.
-     - Deliverable: registry, license manifest, and drift lint.
-     - Depends on: none.
-     - Acceptance: no new raw surface style or unlicensed icon is accepted.
-     - Validation: style/icon cargo tests and license scan on .50.
-     - Done when: registry hash and scan are recorded.
-  2. S2 Migrate Construct surfaces.
-     - Objective: replace local colors, spacing, typography, and icon choices in shell, Workers, Collaboration, Music, Maps, Browser connection, and Health.
-     - Inputs: S1 and owner epic route models.
-     - Deliverable: touched surfaces using shared primitives and negative raw-style scan.
-     - Depends on: S1.
-     - Acceptance: no Construct-owned surface bypasses Style/Visuals.
-     - Validation: focused crate tests and architecture scan.
-     - Done when: all active surfaces are inventoried and migrated.
-  3. S3 Implement responsive and appearance states.
-     - Objective: make wide, narrow, tablet, largest-text, Dark, Light, disabled, stale, and unavailable layouts readable and operable.
-     - Inputs: S1/S2 and render fixtures.
-     - Deliverable: deterministic screenshot fixtures and layout tests.
-     - Depends on: S2.
-     - Acceptance: no clipping, overlap, hidden control, or contrast failure in supported states.
-     - Validation: egui/surface cargo render tests on BigBoy.
-     - Done when: fixture set and human review record exist.
-  4. S4 Integrate motion and interaction policy.
-     - Objective: use centralized DRM-aware motion, focus/keyboard semantics, and event-only repaint without a second loop.
-     - Inputs: mde-egui motion/DRM and governance.
-     - Deliverable: motion/focus fixtures and repaint bounds.
-     - Depends on: S2.
-     - Acceptance: no continuously repainting idle surface or per-widget timing authority.
-     - Validation: motion/render cargo tests and direct-DRM capture.
-     - Done when: motion traces and reduced-motion compatibility evidence exist.
-  5. S5 Prove visual consistency.
-     - Objective: review all shipped Construct surfaces and package fonts/icons/styles in one release.
-     - Inputs: S1-S4 and CRIT-006.
-     - Deliverable: signed Dark/Light/large-text capture set and package report.
-     - Depends on: S3, S4.
-     - Acceptance: human review finds no competing design language.
-     - Validation: farm shell tests, RPM payload checks, and named seat captures.
-     - Done when: evidence is linked and limitations are explicit.
-- Scope: Owns shared egui style, typography, icon registry/licensing, responsive layout, semantic states, motion integration, and visual proof. It does not own guest
-  Browser chrome, health evaluation, or taskbar product behavior.
-- Relevant files/components: crates/shared/mde-egui style/visuals/motion, shell surface modules, icon/font assets, platform interface/design docs, render fixtures,
-  packaging.
-- Dependencies: ARCH-008, ARCH-009, FUNC-011, FUNC-017, FUNC-019, FUNC-021, UX-011/012/013/014.
-- Acceptance criteria:
-  1. All Construct-owned surfaces use one Style/Visuals and licensed registry.
-  2. Dark/Light/responsive/largest-text/stale/unavailable captures are legible.
-  3. Motion, focus, repaint, package, and human review evidence pass.
-- Verification method: style/icon/render cargo gates, license/architecture scans, RPM checks, and direct-DRM/Sunshine captures; longest render gate on BigBoy.
-- Origin or merged source IDs: 2026-07-26 unified Quazar theme survey and archived visual workstreams.
 
 ### WL-UX-011 - Node hardware providers and safe controls for Workers
 
