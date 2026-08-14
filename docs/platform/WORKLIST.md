@@ -2080,6 +2080,9 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- Shared first-release signing, package, installed-seat, provider, and
+  corrected-forward proof execution is owned by `WL-TEST-001`; this epic keeps
+  only the release-gate contracts and verifier foundations it supplies.
 - **Two-stage mandatory signing evidence (2026-08-11):** operator-only RPM
   preparation embeds signatures without publication output; final publication
   binds validated input/output inodes, atomically publishes no-replace files,
@@ -2244,10 +2247,10 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - Problem: boot and laptop sleep can leave Nebula, mackesd, Syncthing, etcd, and desktop state stale or duplicated.
-- Required outcome: every enrolled workstation and lighthouse returns to one authenticated identity, one healthy daemon/session, synchronized substrate, and visible
-  recovery state after boot, sleep, reboot, network transition, or corrected-forward upgrade.
+- Required outcome: enrolled nodes/lighthouses recover one identity/session and synchronized substrate across boot, sleep, reboot, network change, and upgrade.
 - Current state: bounded recovery exists; ordering, desktop restore, and fleet proof remain. Latest: `evidence/WL-CRIT-007-2026-08-11-peer-return-transition-r464.md`.
 - Remaining work:
+- Shared rollout proof is owned by `WL-TEST-001`; this epic keeps recovery implementation and fixtures.
 - **Etcd restart authority:** etcd outage cannot use stale filesystem health; `.196` 1/1: `evidence/WL-CRIT-007-2026-08-11-etcd-restart-source-authority-r381.md`.
 - **Fleet retry:** failure cannot defer the corrected next poll; `.90` 1/1: `evidence/WL-CRIT-007-2026-08-11-fleet-reconcile-corrected-forward-r396.md`.
 - **Startup return retry:** transient instability cannot strand retained absence; `.90` 1/1: `evidence/WL-CRIT-007-2026-08-11-startup-return-retry-r399.md`.
