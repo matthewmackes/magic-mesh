@@ -5355,6 +5355,15 @@ fn guest_input_event_admitted(
     pointer_captured: &mut bool,
 ) -> bool {
     match event {
+        // Escape is the host-owned return chord. It must remain available
+        // even before the guest framebuffer has acquired egui keyboard focus;
+        // otherwise an attached fullscreen session can trap the operator until
+        // a guest click succeeds.
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            pressed: true,
+            ..
+        } => true,
         egui::Event::PointerButton { pos, pressed, .. } => {
             if *pressed {
                 if rect.contains(*pos) {
@@ -5379,7 +5388,13 @@ fn guest_input_event_admitted(
         | egui::Event::Ime(_)
         | egui::Event::Copy
         | egui::Event::Cut
-        | egui::Event::Paste(_) => keyboard_focused,
+        | egui::Event::Paste(_) => {
+            // A headless/remote compositor can deliver the first key event
+            // before egui reports focus for the freshly painted desktop. The
+            // framebuffer hover is still required, so an attached guest does
+            // not receive keyboard input from outside its visible surface.
+            keyboard_focused || pointer_position.is_some_and(|pos| rect.contains(pos))
+        }
         _ => false,
     }
 }

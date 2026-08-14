@@ -99,10 +99,11 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
+- **Full shell farm gate (2026-08-14):** `mde-shell-egui` passed 1,621/1,621 tests, including VNC/SPICE host Escape and guest-input routing:
+  `evidence/WL-ARCH-010-2026-08-14-shell-full-farm-gate-r1.md`.
 - Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: idempotent Workload API owns lifecycle; reconciler actuates libvirt/Quadlet; shell consumes bounded projections with Display1/KMS and RDP/SPICE/VNC recovery.
-- Current state: typed authority, the 1,612-test shell gate, and the `mackesd` all-target strict-Clippy/canonical serial gates are green. KMS/EGL live proof and
-  repository-wide strict Clippy remain.
+- Current state: typed authority, shell/mackesd gates green; KMS/EGL live proof and repository-wide strict Clippy remain.
 - **mackesd all-target quality gate (2026-08-12):** strict Clippy, 4,924 core serial tests, and authority guards are green:
   `evidence/WL-ARCH-010-2026-08-12-mackesd-all-target-gate-r1.md`.
 - **Native DRM/PRIME + shell wiring (2026-08-11):** native gates passed 3/3; DRM shell build and VDI module passed 33/33. Live KMS/Display1 remains:
