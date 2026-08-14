@@ -84,15 +84,18 @@ pub enum DeviceControlOp {
     ReloadModule,
     /// Re-enumerate the device's parent bus (the sysfs `.../rescan` write).
     RescanBus,
+    /// Restart one provider-admitted systemd service unit.
+    RestartService,
 }
 
 impl DeviceControlOp {
     /// Every op, in Device-Manager menu order (the shell's context-menu table).
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Enable,
         Self::Disable,
         Self::ReloadModule,
         Self::RescanBus,
+        Self::RestartService,
     ];
 
     /// The stable wire token (matches the serde `kebab-case` tag) for logs/audit.
@@ -103,6 +106,7 @@ impl DeviceControlOp {
             Self::Disable => "disable",
             Self::ReloadModule => "reload-module",
             Self::RescanBus => "rescan-bus",
+            Self::RestartService => "restart-service",
         }
     }
 
@@ -114,6 +118,7 @@ impl DeviceControlOp {
             Self::Disable => "Disable device",
             Self::ReloadModule => "Reload driver module",
             Self::RescanBus => "Rescan bus",
+            Self::RestartService => "Restart service",
         }
     }
 
@@ -619,10 +624,11 @@ mod tests {
             "\"reload-module\""
         );
         assert_eq!(DeviceControlOp::Disable.as_str(), "disable");
-        assert_eq!(DeviceControlOp::ALL.len(), 4);
+        assert_eq!(DeviceControlOp::ALL.len(), 5);
         assert!(DeviceControlOp::Disable.is_disabling());
         assert!(!DeviceControlOp::Enable.is_disabling());
         assert!(!DeviceControlOp::RescanBus.is_disabling());
+        assert_eq!(DeviceControlOp::RestartService.as_str(), "restart-service");
     }
 
     #[test]

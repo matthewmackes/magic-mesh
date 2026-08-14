@@ -2161,7 +2161,18 @@ impl DeviceManagerState {
         ));
         entries.push(Entry::Separator);
         if controllable {
-            for op in DeviceControlOp::ALL {
+            let ops: &[DeviceControlOp] = self
+                .selected_device()
+                .map(|(key, _)| key == category::SERVICES)
+                .map(|services| {
+                    if services {
+                        &[DeviceControlOp::RestartService][..]
+                    } else {
+                        &DeviceControlOp::ALL[..4]
+                    }
+                })
+                .unwrap_or(&DeviceControlOp::ALL[..4]);
+            for &op in ops {
                 entries.push(Entry::Item(
                     Item::new(
                         MenuAction::ArmControl(op),
@@ -4307,7 +4318,12 @@ fn device_context_menu(
     if allow_control {
         // DEVMGR-8 — the privileged, node-side verbs (#12/#13/#14). Each arms first
         // (type the device name) and dispatches to the RAIL-selected host's mackesd.
-        for op in DeviceControlOp::ALL {
+        let control_ops: &[DeviceControlOp] = if category == category::SERVICES {
+            &[DeviceControlOp::RestartService]
+        } else {
+            &DeviceControlOp::ALL[..4]
+        };
+        for &op in control_ops {
             if ui
                 .button(RichText::new(control_label(op)).color(Style::DANGER))
                 .clicked()
@@ -4346,6 +4362,7 @@ const fn control_label(op: DeviceControlOp) -> &'static str {
         DeviceControlOp::Disable => "\u{25A0}  Disable device", // ■
         DeviceControlOp::ReloadModule => "\u{21BB}  Reload driver module", // ↻
         DeviceControlOp::RescanBus => "\u{2921}  Rescan bus", // ⤡
+        DeviceControlOp::RestartService => "\u{21BB}  Restart service", // ↻
     }
 }
 

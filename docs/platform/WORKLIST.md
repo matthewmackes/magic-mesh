@@ -878,6 +878,11 @@ behavioral evidence is not completion.
   published as typed health facts only; fixed `qemu:///system` probes are
   bounded and read-only, and workload lifecycle remains owned by the typed
   Workload adapter. The architecture authority lint passes (`a89e4150`).
+- **Service control provider (2026-08-14):** Workers now admits a typed,
+  generation-bound `RestartService` operation for provider-published service
+  rows; fixed `systemctl` argv, hostile-unit rejection, and shell routing pass
+  BigBoy daemon 30/30 plus shell all-targets check:
+  `evidence/WL-UX-011-2026-08-14-service-control-r1.md`.
 - Remaining work:
 - **Inventory generation:** delayed pre-restart probes cannot replace newer truth; `.196` 1/1: `evidence/WL-UX-011-2026-08-11-device-inventory-generation-r386.md`.
 - **Inventory staging identity:** symlink/hard-link substitution cannot redirect publication; `.90` 1/1: `evidence/WL-UX-011-2026-08-11-inventory-staging-nofollow-r421.md`.

@@ -178,6 +178,15 @@ fn parse_anchor(sysfs_path: &str) -> Option<Anchor> {
 /// A human-readable reason suitable for a [`DeviceControlResult::failed`] `error`.
 pub fn command_plan(op: DeviceControlOp, target: &DeviceTarget) -> Result<Vec<ExecStep>, String> {
     match op {
+        DeviceControlOp::RestartService => {
+            if target.category != device_inventory::category::SERVICES {
+                return Err("restart-service: target is not a published service".to_string());
+            }
+            let unit = non_empty(Some(target.name.as_str()))
+                .ok_or_else(|| "restart-service: service unit is empty".to_string())?;
+            validate_service_unit(unit)?;
+            Ok(vec![ExecStep::command("systemctl", &["restart", unit])])
+        }
         DeviceControlOp::ReloadModule => {
             let module = non_empty(target.driver.as_deref()).ok_or_else(|| {
                 "reload-module: the device has no bound driver/module to reload".to_string()
@@ -299,6 +308,18 @@ fn validate_driver_name(driver: &str) -> Result<(), String> {
         return Err(format!(
             "driver `{driver}` is not a bounded kernel module identifier — refused before mutation"
         ));
+    }
+    Ok(())
+}
+
+fn validate_service_unit(unit: &str) -> Result<(), String> {
+    let bytes = unit.as_bytes();
+    if bytes.len() > 255
+        || !unit.ends_with(".service")
+        || !bytes.first().is_some_and(|b| b.is_ascii_alphanumeric())
+        || !bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'@' | b'.' | b'-'))
+    {
+        return Err(format!("service unit `{unit}` is not a bounded service identifier"));
     }
     Ok(())
 }
@@ -998,6 +1019,32 @@ mod tests {
                 contents: "1".into(),
             }]
         );
+    }
+
+    #[test]
+    fn service_restart_plans_only_for_a_published_service_unit() {
+        let target = DeviceTarget::new("mde-shell-egui.service", category::SERVICES);
+        assert_eq!(
+            command_plan(DeviceControlOp::RestartService, &target).expect("planned"),
+            vec![ExecStep::command(
+                "systemctl",
+                &["restart", "mde-shell-egui.service"]
+            )]
+        );
+    }
+
+    #[test]
+    fn service_restart_rejects_cross_category_and_hostile_units() {
+        let mut target = DeviceTarget::new("mde-shell-egui.service", category::NETWORK_ADAPTERS);
+        let wrong_category = command_plan(DeviceControlOp::RestartService, &target)
+            .expect_err("service action must stay in the service provider");
+        assert!(wrong_category.contains("not a published service"), "{wrong_category}");
+
+        target.category = category::SERVICES.into();
+        target.name = "mde-shell-egui.service; reboot".into();
+        let hostile = command_plan(DeviceControlOp::RestartService, &target)
+            .expect_err("hostile unit must not reach systemctl");
+        assert!(hostile.contains("bounded service identifier"), "{hostile}");
     }
 
     // ── command_plan: an inapplicable op is a TYPED ERROR, never a fake success ─

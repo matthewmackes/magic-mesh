@@ -1331,7 +1331,7 @@ fn nic() -> DeviceRecord {
 fn the_context_menu_now_offers_every_privileged_op() {
     // The armed action set IS exactly MDM's four hardware-mutating verbs (#12) —
     // now PRESENT (DEVMGR-8's node-side seam exists), no longer omitted.
-    assert_eq!(DeviceControlOp::ALL.len(), 4);
+    assert_eq!(DeviceControlOp::ALL.len(), 5);
     // device_target carries the exact exec fields the node's executor resolves
     // the seam from (§9 — typed params, not a command).
     let t = device_target(category::NETWORK_ADAPTERS, &nic());
@@ -2531,8 +2531,8 @@ fn the_device_menu_carries_the_armed_posture_gated_by_selection() {
         .collect();
     assert_eq!(
         armed,
-        DeviceControlOp::ALL.to_vec(),
-        "all four armed verbs present"
+        DeviceControlOp::ALL[..4].to_vec(),
+        "all hardware armed verbs present"
     );
     // A device is selected, so both the copy + the armed verbs are enabled.
     let all_enabled = device
