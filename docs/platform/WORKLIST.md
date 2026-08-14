@@ -1890,6 +1890,8 @@ behavioral evidence is not completion.
 - **Peer stopwatch repair binding (2026-08-14):** lower-revision repairs now require the deterministic origin-generated request identity bound to target, stopwatch, and revision.
   BigBoy `172.20.0.130` passed the Clock worker suite 36/36:
   `evidence/WL-FUNC-022-2026-08-14-peer-stopwatch-repair-binding-r1.md`.
+- **Clock UI farm gate (2026-08-14):** the four-section surface, signed actions, generation expiry, IANA/DST, peer authority, and no-shell-authority checks passed 15/15 on BigBoy:
+  `evidence/WL-FUNC-022-2026-08-14-clock-ui-farm-gate-r1.md`.
 - **Peer convergence probe budget (2026-08-11):** retry-suppressed peer probes
   are capped independently at 512 per tick, preventing large retained snapshots
   from consuming unbounded convergence work; evidence:
