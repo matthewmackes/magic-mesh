@@ -37,8 +37,8 @@ provider-network, package, or installed-release acceptance.
   the crate-wide gate is not green: it stopped on eight pre-existing warnings
   in unrelated `bus_responder.rs`, `cache.rs`, and `queue.rs`.
 - Build — `172.20.0.170`, slot `1`:
-  `cargo build -p mde-musicd --all-targets --all-features`
-  **PENDING_RESULT**.
+  `cargo build -p mde-musicd --all-targets --all-features` passed (`dev`
+  profile, all targets built successfully).
 - Scoped `git diff --check` passed.
 
 ## Remaining FUNC-022 acceptance
