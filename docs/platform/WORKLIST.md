@@ -1900,8 +1900,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-014-2026-08-10-future-timestamp-admission-r194.md`.
 - **Kiron asset admission (2026-08-10):** self-test passed coverage/license/size/path/digest rules: `docs/platform/evidence/WL-UX-014-2026-08-10-kiron-asset-admission-r212.md`.
 - Remaining work:
-- **Kiron asset inode:** multiply-linked scenes cannot retain mutation authority across restart; `.196` self-test:
-  `evidence/WL-UX-014-2026-08-11-kiron-asset-inode-r446.md`.
+- **Kiron asset inode (2026-08-14):** multiply-linked scenes cannot retain
+  mutation authority across restart; `.196` passed the exact self-test:
+  `evidence/WL-UX-014-2026-08-14-kiron-asset-inode-farm-gate-r1.md`.
 - **Health toast watermark (2026-08-11):** stale replay stays refused after queue removal and overflow fails closed; `.170` passed 1/1:
   `docs/platform/evidence/WL-UX-014-2026-08-11-health-toast-watermark-r282.md`.
 - **Grade E/F lifecycle (2026-08-11):** timed grade E cannot enter grade F's acknowledgement-only path; `.90` passed 1/1:
