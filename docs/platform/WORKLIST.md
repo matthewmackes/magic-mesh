@@ -889,6 +889,11 @@ behavioral evidence is not completion.
   fleet-matrix captures are shared rollout proof owned here; no extra seat
   requirement is imposed on the product implementation. See
   `docs/worklist-archive/2026-08-14-wl-crit-007-closure.md`.
+- **KIRON asset/live proof boundary:** UX-014 retains responsibility for the
+  ToastHost, asset admission, timeline, fallback, and interaction
+  implementation. Once a governed A–F scene/audio package exists, its signed
+  package, installed-seat captures, and live renderer/audio evidence are shared
+  rollout proof owned here; no additional seat requirement is imposed on UX-014.
 - **Release-gate proof boundary:** CRIT-006’s remaining operator-supplied
   release execution is shared rollout proof owned here; it is not repeated as
   a product-epic implementation requirement.
