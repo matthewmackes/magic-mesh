@@ -323,7 +323,7 @@ behavioral evidence is not completion.
 - Problem: Collaboration is split across legacy Chat, Teams rails, text-only clipboard, duplicate Files/transfers, incomplete Calls media, and an App-VM office path.
 - Required outcome: one egui-native Collaboration surface has exactly Alerts, Chat, Calls, Files, Editor, and Clipboard; durable signed transport, real media, native
   office editing, and one executor replace all retired paths.
-- Current state: signed envelopes, projections, native Editor foundation, POSIX/CAS Files transfer, and shell mounting exist; Calls providers, cross-node executors,
+- Current state: signed envelopes, projections, native Editor foundation, POSIX/CAS Files transfer, and shell mounting exist; the governed SIP call adapter is implemented but requires an installed account for activation; cross-node executors,
   office transport, canonical Alerts, migration, and hard cut remain.
 - **Transfer executor checkpoints (2026-08-09):** only Local/Copy is admitted; Clipboard names its missing profile/Files/session/generation authority and refuses early.
   `.50` passed 2/2 plus 1/1: `docs/platform/evidence/WL-FUNC-011-2026-08-09-transfer-executor-r7.md`, `docs/platform/evidence/WL-FUNC-011-2026-08-09-transfer-executor-r8.md`.
@@ -334,7 +334,8 @@ behavioral evidence is not completion.
 - **Native-office admission checkpoint (2026-08-09):** office containers no longer fall through to lossy text editing; unsafe paths and the absent non-VCL adapter fail
   closed without opening or changing bytes. BigBoy passed 5/5: `docs/platform/evidence/WL-FUNC-011-2026-08-09-native-office-admission-r5.md`.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
-  Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
+  Machine 9 passed 4/4; the SIP adapter remains fail-closed until a governed account is installed, while WebRTC/LiveKit adapters remain absent:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
 - **Outbound SIP ingress (2026-08-14):** bounded signed-command dial targets
   reject empty/control/oversized values before provider effects; BigBoy
   `mackesd` passed 1/1 and `mde-voice-hud` SIP passed 37/37:
@@ -353,8 +354,8 @@ behavioral evidence is not completion.
 - **Calls proof attribution (2026-08-11):** incompatible adapters and
   altered/vacuous requirements fail before provider evidence; `.90` passed the
   exact regression 1/1. The remaining gap is the real external boundary—no
-  production call-media provider or live call proof exists—not farm capacity
-  or a multi-seat requirement:
+  governed SIP account/live call evidence is available yet, and WebRTC/LiveKit
+  adapters are not implemented—not farm capacity or a multi-seat requirement:
   `docs/platform/evidence/WL-FUNC-011-2026-08-11-call-media-proof-attribution-r261.md`.
 - **Calls readiness restart:** missing/corrupt readiness revokes stale media proof; BigBoy 1/1: `evidence/WL-FUNC-011-2026-08-11-calls-readiness-restart-r297.md`.
 - **Actor-log path identity (2026-08-11):** misplaced `(space, actor)` events fail before append and after restart; `.50` passed 1/1:
