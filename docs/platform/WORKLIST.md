@@ -505,12 +505,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-020-2026-08-11-android-lifecycle-delegation-r273.md`.
 - **Bounded Android host probes (2026-08-11):** `/proc` and nested-KVM sysfs reads reject oversized host text before parsing; BigBoy passed 1/1:
   `evidence/WL-FUNC-020-2026-08-11-android-host-probe-bound-r227.md`.
-- **Guest packaging contracts (2026-08-14):** farm slot `.90` passed the
+- **Guest packaging contracts (2026-08-14):** `.90` passed the contract
   Android/Cuttlefish contract, image-manifest, signed guest-payload, and image
-  receipt self-tests. A full guest-DEB/staging fixture attempt using an
-  isolated farm-local Git snapshot reached Cargo but failed because the
-  archived source tree cannot satisfy `cargo build --locked` without updating
-  its lockfile; the failure is recorded rather than treated as package proof:
+  receipt self-tests; BigBoy `.130` passed the full guest-DEB/staging fixtures
+  after the tracked Cargo lockfile was refreshed:
   `evidence/WL-FUNC-020-2026-08-14-guest-packaging-contract-farm-gate-r1.md`.
 - **Bounded cloud replay cleanup (2026-08-11):** expired nonce rows reject symlinks and payloads over 128 bytes before parsing; BigBoy passed 1/1:
   `evidence/WL-FUNC-020-2026-08-11-cloud-gate-nonce-bound-r227.md`.
