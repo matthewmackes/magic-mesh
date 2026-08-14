@@ -831,7 +831,10 @@ behavioral evidence is not completion.
   package, signing, and artifact-integrity checks; live proofs and acceptance
   are post-release obligations. Additional physical nodes, seats, or
   lighthouses are optional follow-up evidence and are not release blockers.
-- Current state: signing exists; live release proof remains. Evidence: `evidence/WL-CRIT-006-WL-ARCH-009-2026-08-11-worker-executable-generation-r467.md`.
+- Current state: release-gate contracts, signing/finalizer, topology, identity,
+  and verifier foundations are implemented; shared live release proof is owned
+  by `WL-TEST-001` and is not an implementation blocker for this epic. Evidence:
+  `evidence/WL-CRIT-006-WL-ARCH-009-2026-08-11-worker-executable-generation-r467.md`.
 - **Farm expansion (2026-08-08):** XEN-196 is a verified fifth build node; topology is 5/5 with 10 slots and `.196` passed `mde-bus` 425/425:
   `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
 - **Artifact claim checkpoint (2026-08-09):** one capture cannot satisfy independent node/scenario claims; `.90` passed 2 positive and 18 negative fixtures:
@@ -845,7 +848,8 @@ behavioral evidence is not completion.
 - Remaining work:
 - Shared first-release signing, package, installed-seat, provider, and
   corrected-forward proof execution is owned by `WL-TEST-001`; this epic keeps
-  only the release-gate contracts and verifier foundations it supplies.
+  only the release-gate contracts and verifier foundations it supplies. No
+  additional seat or proof requirement is imposed here.
 - **Two-stage mandatory signing evidence (2026-08-11):** operator-only RPM
   preparation embeds signatures without publication output; final publication
   binds validated input/output inodes, atomically publishes no-replace files,
@@ -1076,6 +1080,9 @@ behavioral evidence is not completion.
   fleet-matrix captures are shared rollout proof owned here; no extra seat
   requirement is imposed on the product implementation. See
   `docs/worklist-archive/2026-08-14-wl-crit-007-closure.md`.
+- **Release-gate proof boundary:** CRIT-006’s remaining operator-supplied
+  release execution is shared rollout proof owned here; it is not repeated as
+  a product-epic implementation requirement.
 - Remaining work:
 - **Admit release inputs:** obtain governed Maps approval/source/verifier, App
   VM trust receipt/key and base digest, Cuttlefish declaration/signature/
