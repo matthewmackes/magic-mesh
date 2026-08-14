@@ -666,6 +666,7 @@ behavioral evidence is not completion.
   closed without opening or changing bytes. BigBoy passed 5/5: `docs/platform/evidence/WL-FUNC-011-2026-08-09-native-office-admission-r5.md`.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
   Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
+- **Native collaboration full gate (2026-08-14):** BigBoy passed 136/136: `evidence/WL-FUNC-011-2026-08-14-collab-egui-full-farm-gate-r1.md`.
 - Remaining work:
 - **CAS read-only replay:** canonical bytes are sealed and substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-readonly-replay-r377.md`.
 - **CAS purge inode:** concurrent replacements cannot redirect destructive purge; `.50` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-purge-inode-binding-r428.md`.
@@ -808,6 +809,7 @@ behavioral evidence is not completion.
 - Current state: bounded rich contracts and DRM/mesh/VDI scaffolding exist; live adapters, permissions, cleanup, and proof remain.
 - **S1 rich contract (2026-08-08):** V2 offers, generations, secret policy, and denials passed 72/72: `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
 - **S3 mesh xproc (2026-08-09):** Persist/SQLite/CAS/replay passed 1/1; live nodes remain: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cross-process-r11.md`.
+- **Bookmarks/clipboard UI full gate (2026-08-14):** BigBoy passed 41/41: `evidence/WL-FUNC-016-2026-08-14-bookmarks-full-farm-gate-r1.md`.
 - **S2 DRM authority (2026-08-08/09):** seat authority passed 19/19; focus-bound asynchronous paste expiry passed 12/12; live proof remains:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`, `docs/platform/evidence/WL-FUNC-016-2026-08-09-drm-paste-ownership-r10.md`.
 - **VDI transport/permission checkpoints (2026-08-08):** bounded VNC/RDP/SPICE text, one-use/replay/revocation, modal, and redacted audit passed; live guest proof remains:
