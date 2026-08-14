@@ -139,9 +139,9 @@ impl OfflineTileCache {
     pub fn open(root: impl Into<PathBuf>, policy: CachePolicy) -> Result<Self, CacheError> {
         let root = root.into();
         ensure_root(&root)?;
-        let entries = match load_index(&root, policy) {
-            Ok(entries) => entries,
-            Err(CacheError::CorruptIndex(_)) => recover_corrupt_regular_index(&root)?,
+        let (entries, reconcile_payloads) = match load_index(&root, policy) {
+            Ok(result) => result,
+            Err(CacheError::CorruptIndex(_)) => (recover_corrupt_regular_index(&root)?, true),
             Err(error) => return Err(error),
         };
         let mut cache = Self {
@@ -149,7 +149,9 @@ impl OfflineTileCache {
             policy,
             entries,
         };
-        cache.reconcile_payloads()?;
+        if reconcile_payloads {
+            cache.reconcile_payloads()?;
+        }
         Ok(cache)
     }
 
@@ -470,11 +472,14 @@ fn read_bounded_regular_file(path: &Path, expected: u64) -> Result<Vec<u8>, Read
     Ok(bytes)
 }
 
-fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, CacheError> {
+fn load_index(
+    root: &Path,
+    policy: CachePolicy,
+) -> Result<(Vec<CacheEntry>, bool), CacheError> {
     let path = root.join(INDEX_FILE);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
         Err(error) => return Err(CacheError::Io(error.to_string())),
     };
     if !is_exclusive_regular_file(&metadata) || metadata.len() > MAX_INDEX_BYTES {
@@ -545,7 +550,7 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
             "index exceeds configured quota".to_string(),
         ));
     }
-    Ok(index.entries)
+    Ok((index.entries, true))
 }
 
 fn is_exclusive_regular_file(metadata: &std::fs::Metadata) -> bool {
@@ -559,7 +564,10 @@ fn is_exclusive_regular_file(metadata: &std::fs::Metadata) -> bool {
     true
 }
 
-fn invalidate_legacy_index(root: &Path, bytes: &[u8]) -> Result<Vec<CacheEntry>, CacheError> {
+fn invalidate_legacy_index(
+    root: &Path,
+    bytes: &[u8],
+) -> Result<(Vec<CacheEntry>, bool), CacheError> {
     let legacy = serde_json::from_slice::<LegacyCacheIndex>(bytes).ok();
     let empty = serde_json::to_vec(&CacheIndex {
         schema: INDEX_SCHEMA,
@@ -579,8 +587,13 @@ fn invalidate_legacy_index(root: &Path, bytes: &[u8]) -> Result<Vec<CacheEntry>,
                 }
             }
         }
+        Ok((Vec::new(), true))
+    } else {
+        // A malformed legacy index cannot establish ownership of any payload.
+        // Keep orphaned bytes isolated for operator inspection instead of
+        // letting the normal reconciliation sweep delete them.
+        Ok((Vec::new(), false))
     }
-    Ok(Vec::new())
 }
 
 fn recover_corrupt_regular_index(root: &Path) -> Result<Vec<CacheEntry>, CacheError> {

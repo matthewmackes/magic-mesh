@@ -3788,7 +3788,7 @@ mod tests {
         )
     }
 
-    /// A Jellyfin movie with one direct-playable (mkv / h264 / aac) source.
+    /// A Jellyfin movie with one direct-playable (mkv / vp9 / aac) source.
     fn jelly_movie() -> BaseItemDto {
         BaseItemDto {
             id: "m1".into(),
@@ -3800,7 +3800,7 @@ mod tests {
                 media_streams: vec![
                     MediaStream {
                         stream_type: Some("Video".into()),
-                        codec: Some("h264".into()),
+                        codec: Some("vp9".into()),
                         index: 0,
                         ..MediaStream::default()
                     },
@@ -3830,13 +3830,13 @@ mod tests {
             }
             let body = if request.url.contains("/PlaybackInfo") {
                 r#"{"MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
-                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Video","Codec":"vp9","Index":0},
                     {"Type":"Audio","Codec":"aac","Index":1,"IsDefault":true}]}],
                     "PlaySessionId":"sess-1"}"#
             } else if request.url.contains("/Items") {
                 r#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
                     "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
-                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Video","Codec":"vp9","Index":0},
                     {"Type":"Audio","Codec":"aac","Index":1}]}]}],
                     "TotalRecordCount":1,"StartIndex":0}"#
             } else {
@@ -3860,7 +3860,8 @@ mod tests {
         // stock title direct-plays.
         let caps = client_capabilities(&MpvCapabilities::baseline());
         assert!(caps.supports_container("mkv"));
-        assert!(caps.supports_video_codec("h264"));
+        assert!(caps.supports_video_codec("vp9"));
+        assert!(!caps.supports_video_codec("h264"));
         assert!(caps.supports_audio_codec("aac"));
     }
 
