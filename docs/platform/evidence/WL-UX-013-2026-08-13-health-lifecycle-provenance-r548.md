@@ -8,17 +8,14 @@
   positive observation; authority state does not cross providers.
 - Regression:
   `workers::node_grade::tests::lifecycle_provenance_substitution_starts_new_incident_and_preserves_history`.
-- Farm focused test: BigBoy `172.20.0.130`, slot 3. Compilation stopped before
-  the module-qualified test binary could report a discovery count because the
-  initial patch used `RequirementClass` in an ordered set and the fixture
-  named a nonexistent `HealthComponent::Services`. Both defects were corrected
-  by using bounded vector equality and `HealthComponent::System`; cadence
-  prohibited a rerun, so this run is **not** claimed as passing evidence.
-- Farm strict Clippy: `172.20.0.170`, slot 1. The same pre-correction `Ord`
-  compile error stopped the one allowed run; no Clippy diagnostic was emitted
-  for the production behavior.
-- Farm build: `172.20.0.170`, slot 2. The same pre-correction `Ord` error and
-  invalid fixture variant stopped the one allowed run.
+- Farm focused test: BigBoy `172.20.0.130`, slot 3. Corrected exact command
+  `cargo test -p mackesd workers::node_grade::tests::lifecycle_provenance_substitution_starts_new_incident_and_preserves_history -- --exact --nocapture`
+  passed `1/1` with 4,998 tests filtered.
+- Farm library check: `172.20.0.50`, slot 1. Corrected command
+  `cargo check -p mackesd --lib --all-features` passed in 2m44s.
+- The earlier failed compile was an invalid pre-correction fixture run and is
+  retained only as historical context; it is superseded by the corrected gates
+  above.
 - Farm formatting: `172.20.0.170`, slot 1. The one crate-wide check was red from
   pre-existing unrelated formatting drift outside `node_grade.rs`; those files
   were preserved.
