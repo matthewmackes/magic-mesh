@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 19 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -27,6 +27,12 @@ tasks.
   tests, farm command and result, and required live/package evidence are recorded
   in docs/platform/evidence/. Missing hardware or provider access is a named
   blocker, not a passing substitute.
+- **Shared release-proof ownership:** first-release input admission, signed
+  artifact/package proof, installed baseline acceptance, corrected-forward
+  recovery, and deferred provider/live proofs are owned by `WL-TEST-001`.
+  Product epics must not duplicate those rollout tasks; they retain only
+  product-specific implementation and integration gaps, and cite `WL-TEST-001`
+  when its acceptance is a dependency.
 - **Test-seat cap (operator lock 2026-08-10):** no validation, rollout proof,
   capture, chaos, recovery, or acceptance activity may require or exercise more
   than three physical test seats. The default release set is Dell, seat 15, and
@@ -74,6 +80,8 @@ authorities. Archive old MEDIA and FUNC-007 IDs; they are evidence only.
 7. Music/Media Player.
 8. Clock, distributed alarms/timers, and notification entry cutover.
 9. Quazar visual integration, health modal/Kiron, and release/recovery proof.
+10. Shared first-release, installed-seat, provider, and corrected-forward proof
+    under WL-TEST-001.
 
 ## Story execution contract
 
@@ -2450,6 +2458,66 @@ behavioral evidence is not completion.
   3. Every selected test seat (maximum three) and required lighthouse has direct recovery evidence.
 - Verification method: systemd/shell/Workload cargo gates, farm package checks, fault injection, and live recovery scripts; BigBoy runs the broadest gate.
 - Origin or merged source IDs: operator boot/sleep peer-return bug and archived recovery incidents.
+
+### WL-TEST-001 - First-release, installed-seat, and provider proof boundary
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: Product epics have substantial implementation and farm evidence, but
+  their shared closure boundary is scattered across deferred release inputs,
+  signed package production, installed-seat validation, provider access, and
+  corrected-forward recovery. This encourages false closure or repeated proof.
+- Required outcome: one bounded authority admits the exact source revision and
+  mandatory inputs, verifies the signed first release, proves package/runtime
+  integrity on no more than three physical seats plus lighthouses, and records
+  provider/live/recovery evidence. Product epics depend on this epic only for
+  shared rollout proof.
+- Current state: Release preflight, signing/finalizer, topology identity,
+  artifact binding, farm routing, and corrected-forward contracts exist with
+  hostile evidence. The first release still lacks operator-supplied Maps, App
+  VM, Cuttlefish, signing, bootc, and installed-provider inputs.
+- Remaining work:
+- **Admit release inputs:** obtain governed Maps approval/source/verifier, App
+  VM trust receipt/key and base digest, Cuttlefish declaration/signature/
+  packages/readiness relay/VDI agent/image receipt, RPM signing receipt, and
+  bootc digest receipt. Run `release-input-preflight.sh` on one pinned revision.
+- **Cut the signed release:** run `run-first-full-release.sh prepare` through
+  the farm, perform operator-only signing/finalization, then run the canonical
+  seven-role output plan, collector, and release-gate verifier. No unsigned or
+  substituted artifact may reach promotion.
+- **Baseline package proof:** verify NEVRA, payload digests, manifests, role
+  gates, governed payloads, and source identity on no more than three physical
+  test seats. Lighthouses retain independent quorum proof and are not seats.
+- **Post-release product proof:** execute deferred provider/runtime captures
+  referenced by the product epics and CRIT-007. Use one named seat when enough;
+  expand only to three when the invariant is genuinely cross-seat.
+- **Corrected-forward recovery:** exercise boot, sleep/resume, peer return,
+  provider loss, package restart, stale-payload refusal, and corrected-forward
+  deployment. Preserve the six-hour privacy boundary and never rollback.
+- **Evidence disposition:** record each role/scenario with revision, command,
+  farm host/slot or named seat, digest, and result under
+  `docs/platform/evidence/`; archive superseded rollout diaries. Missing
+  external providers remain precise blockers, not product-epic failures.
+- Scope: Owns shared release admission, artifact/package/signing proof, baseline
+  installed-seat acceptance, provider/live coordination, and recovery. Product
+  behavior, provider implementation, UI, and daemon ownership remain elsewhere.
+- Relevant files/components: release preflight/full-release helpers, release
+  plan/collector/verifier, `xcp-build.sh`, `automation/promotion/`, packaging,
+  and `docs/platform/evidence/`.
+- Dependencies: ARCH-008, ARCH-009, ARCH-010, CRIT-006, CRIT-007, FUNC-017, FUNC-018, FUNC-020, FUNC-021, FUNC-022, UX-011, and operator-supplied release inputs.
+- Acceptance criteria:
+  1. One clean pinned revision and epoch pass release-input preflight with all mandatory receipts and bounded external artifacts.
+  2. Signed Workstation, Server, and Lighthouse outputs plus the canonical seven-role plan pass identity, digest, package, and source-revision verification.
+  3. Baseline installed proof passes on no more than three physical test seats, with independent lighthouse quorum evidence and no five-seat requirement.
+  4. Every deferred product/provider/recovery scenario has a dated evidence record or a precise external blocker; no product epic duplicates this rollout queue.
+  5. Corrected-forward recovery succeeds without rollback, stale payload admission, privacy-epoch violation, or duplicate authority.
+- Verification method: farm-only build/package/signing gates with the longest
+  job on BigBoy; hostile release self-tests; package inspection; live proof on
+  one to three named seats; lighthouse quorum and corrected-forward evidence.
+- Origin or merged source IDs: CRIT-006/007 release boundary, operator
+  two/three-seat lock, and deferred proof obligations previously repeated across
+  active epics.
 
 ## User Interface And Experience
 
