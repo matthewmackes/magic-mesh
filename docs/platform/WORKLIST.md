@@ -493,7 +493,10 @@ behavioral evidence is not completion.
 - **Bounded service registration hostname (2026-08-11):** `/etc/hostname` caps at 255 bytes; BigBoy passed 1/1: `evidence/WL-FUNC-021-2026-08-11-service-hostname-bound-r230.md`.
 - **Bounded Navidrome commands (2026-08-11):** systemctl uses shared 15s boundary; BigBoy passed 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-command-bound-r231.md`.
 - **Navidrome setup bound (2026-08-11):** re-provision shares 15s timeout; `.90` 3/3: `evidence/WL-FUNC-021-2026-08-11-navidrome-setup-timeout-r232.md`.
-- Remaining work: **Artwork byte bound (2026-08-11):** non-regular/over-4M reads and oversized writes refuse; `.50`: `evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
+- **Artwork byte bound (2026-08-11):** non-regular/over-4M reads and
+  oversized writes refuse; `.50` passed the focused gate. This slice is
+  complete; remaining Music work is renderer/provider/cast/handoff/live proof:
+  `evidence/WL-FUNC-021-2026-08-11-artwork-byte-bound-r222.md`.
 - **Revoked renderer generation:** device loss blocks in-flight audio/queue commit; `.170` 1/1: `evidence/WL-FUNC-021-2026-08-11-revoked-renderer-generation-r429.md`.
 - **Transcode generation binding:** source/session substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-transcode-generation-binding-r432.md`.
 - **Queue persistence rollback:** failed durable writes roll memory back and report failure; BigBoy 1/1: `evidence/WL-FUNC-021-2026-08-11-queue-persistence-rollback-r410.md`.
