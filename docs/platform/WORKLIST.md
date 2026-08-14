@@ -33,13 +33,13 @@ tasks.
   Product epics must not duplicate those rollout tasks; they retain only
   product-specific implementation and integration gaps, and cite `WL-TEST-001`
   when its acceptance is a dependency.
-- **Test-seat cap (operator lock 2026-08-10):** no validation, rollout proof,
+- **Test-seat cap (operator lock 2026-08-14):** no validation, rollout proof,
   capture, chaos, recovery, or acceptance activity may require or exercise more
-  than three physical test seats. The default release set is Dell, seat 15, and
-  Surface; an epic may substitute another named seat when its hardware is the
-  subject, but must remain at three or fewer. Historical five-seat evidence stays
-  factual but creates no forward five-seat requirement. Lighthouses are not test
-  seats and retain their independently governed three-node quorum proof.
+  than two physical test seats. An epic may substitute named seats when its
+  hardware is the subject, but must remain at two or fewer. Historical three- and
+  five-seat evidence stays factual but creates no forward multi-seat requirement.
+  Lighthouses are not test seats and retain their independently governed quorum
+  proof.
 - **Privacy-retention lock (operator lock 2026-08-10):** system logs, Bus
   history, transfer ledgers, collaboration JSONL, application histories, and
   audit records have a fleet-wide maximum lifetime of six hours. No priority or
@@ -52,7 +52,7 @@ tasks.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
   never run filler tests.
-- **Rollout lock:** prove each release activity on no more than three selected
+- **Rollout lock:** prove each release activity on no more than two selected
   physical seats and the independently required lighthouses. Wider fleet
   deployment, when needed, proceeds in separately bounded waves and does not
   expand the test requirement. Publish the red AI-GENERATED-ALERT and wait five
@@ -299,7 +299,7 @@ behavioral evidence is not completion.
   7. S7 Prove fleet isolation and convergence.
      - Objective: run crashes, provider loss, saturation, stale snapshots, staged change, forced partial failure, and corrected-forward recovery.
      - Inputs: S4-S6 and CRIT-006/007.
-     - Deliverable: at-most-three-workstation/three-lighthouse evidence bundle.
+     - Deliverable: at-most-two-workstation/three-lighthouse evidence bundle.
      - Depends on: S6.
      - Acceptance: bounded redacted snapshots converge without secrets or legacy fallback.
      - Validation: farm chaos/package gates and live captures.
@@ -312,7 +312,7 @@ behavioral evidence is not completion.
   1. Registry/spawn drift tests prove exactly one owner for every worker and capability.
   2. Six groups run under budgets with bounded credential-free snapshots and one SQLite writer.
   3. Workers and Action Console are the only node-management surfaces; Health remains a separate modal.
-  4. Fleet chaos and at-most-three-seat/three-lighthouse evidence passes.
+  4. Fleet chaos and at-most-two-seat/three-lighthouse evidence passes.
 - Verification method: registry, contract, process/chaos, action-auth, route/render, package, format, and live fleet cargo gates; longest job on BigBoy.
 - Origin or merged source IDs: 2026-08-01 process isolation evaluation; 2026-08-03 Workers merge survey; 2026-08-04 Network Operations directive.
 ### WL-FUNC-011 - Build the native Mesh Collaboration Suite and hard-cut legacy collaboration
@@ -448,7 +448,7 @@ behavioral evidence is not completion.
      - Validation: architecture, secret, supersession, package, and shell gates.
      - Done when: fresh checkout has no retired production route/worker/package.
   8. S8 Prove collaboration release.
-     - Objective: run offline/online, permission, media, transfer, editor, clipboard, migration, recovery, and at-most-three-seat live acceptance.
+     - Objective: run offline/online, permission, media, transfer, editor, clipboard, migration, recovery, and at-most-two-seat live acceptance.
      - Inputs: S1-S7, CRIT-006.
      - Deliverable: signed evidence bundle and visual captures.
      - Depends on: S7.
@@ -580,7 +580,7 @@ behavioral evidence is not completion.
      - Validation: shell render/authority tests.
      - Done when: responsive captures and refusal states pass.
   5. S5 Prove security, package, and live behavior.
-     - Objective: verify image provenance, SELinux/cgroup/device isolation, audio/input, reconnect, upgrade, and acceptance on no more than three seats.
+     - Objective: verify image provenance, SELinux/cgroup/device isolation, audio/input, reconnect, upgrade, and acceptance on no more than two seats.
      - Inputs: S1-S4 and CRIT-006/007.
      - Deliverable: signed package/security/live evidence.
      - Depends on: S4.
@@ -812,7 +812,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Daemon authority and real mpv frame/audio playback pass hostile and fixture tests.
   2. Library/Jellyfin/cache/bookmark, discovery/cast, handoff, and network-loss flows are typed and bounded.
-  3. At-most-three-seat visual/audio/package evidence proves the shipped release or names blockers.
+  3. At-most-two-seat visual/audio/package evidence proves the shipped release or names blockers.
 - Verification method: use @farm:{cargo test -p mde-musicd}
   @farm:{cargo test -p mde-media-core --features mpv}
   @farm:{cargo test -p mde-media-egui}
@@ -829,7 +829,7 @@ behavioral evidence is not completion.
   corrected-forward recovery. This encourages false closure or repeated proof.
 - Required outcome: one bounded authority admits the exact source revision and
   mandatory inputs, verifies the signed first release, proves package/runtime
-  integrity on no more than three physical seats plus lighthouses, and records
+  integrity on no more than two physical seats plus lighthouses, and records
   provider/live/recovery evidence. Product epics depend on this epic only for
   shared rollout proof.
 - Current state: Release preflight, signing/finalizer, topology identity,
@@ -902,7 +902,7 @@ behavioral evidence is not completion.
   seven-role output plan, collector, and release-gate verifier. No unsigned or
   substituted artifact may reach promotion.
 - **Baseline package proof:** verify NEVRA, payload digests, manifests, role
-  gates, governed payloads, and source identity on no more than three physical
+  gates, governed payloads, and source identity on no more than two physical
   test seats. Lighthouses retain independent quorum proof and are not seats.
 - **Post-release product proof:** execute deferred provider/runtime captures
   referenced by the product epics and CRIT-007. Use one named seat when enough;
@@ -924,14 +924,14 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. One clean pinned revision and epoch pass release-input preflight with all mandatory receipts and bounded external artifacts.
   2. Signed Workstation, Server, and Lighthouse outputs plus the canonical seven-role plan pass identity, digest, package, and source-revision verification.
-  3. Baseline installed proof passes on no more than three physical test seats, with independent lighthouse quorum evidence and no five-seat requirement.
+  3. Baseline installed proof passes on no more than two physical test seats, with independent lighthouse quorum evidence and no multi-seat expansion requirement.
   4. Every deferred product/provider/recovery scenario has a dated evidence record or a precise external blocker; no product epic duplicates this rollout queue.
   5. Corrected-forward recovery succeeds without rollback, stale payload admission, privacy-epoch violation, or duplicate authority.
 - Verification method: farm-only build/package/signing gates with the longest
   job on BigBoy; hostile release self-tests; package inspection; live proof on
-  one to three named seats; lighthouse quorum and corrected-forward evidence.
+  one or two named seats; lighthouse quorum and corrected-forward evidence.
 - Origin or merged source IDs: CRIT-006/007 release boundary, operator
-  two/three-seat lock, and deferred proof obligations previously repeated across
+  two-seat lock, and deferred proof obligations previously repeated across
   active epics.
 
 ## User Interface And Experience
@@ -1138,7 +1138,7 @@ behavioral evidence is not completion.
   4. S4 Integrate Workers and fleet proof.
      - Objective: render device-by-type/topology/entity details, conflicts, history, scans, and redacted exports across the fleet.
      - Inputs: S1-S3 and UX-009.
-     - Deliverable: Workers device_inventory view and at-most-three-seat/three-lighthouse evidence.
+     - Deliverable: Workers device_inventory view and at-most-two-seat/three-lighthouse evidence.
      - Depends on: S3.
      - Acceptance: stale/failed providers remain visible and export contains no credentials.
      - Validation: shell render, package, and live provider gates.
@@ -1224,7 +1224,7 @@ behavioral evidence is not completion.
   5. S5 Prove live performance and release.
      - Objective: exercise all grades, fallback, audio, GPU loss,
        suspend/resume, lock, immersive, reduced motion, multi-display, package
-       upgrade, and runtime on no more than three seats.
+       upgrade, and runtime on no more than two seats.
      - Inputs: S1-S4 and CRIT-006/007.
      - Deliverable: frames, videos, waveforms, package manifest, and live evidence.
      - Depends on: S4.
@@ -1239,7 +1239,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. One ToastHost renders six distinct grades, correct dwell/audio/grouping/ack, and no duplicate authority.
   2. Live/pre-rendered/static tiers preserve semantics across device loss and all responsive/interruption states.
-  3. Asset provenance, package, farm, and at-most-three-seat evidence is reproducible.
+  3. Asset provenance, package, farm, and at-most-two-seat evidence is reproducible.
 - Verification method: health/toast/asset/renderer/accessibility cargo gates,
   package/license checks, golden/video/waveform captures, and live proof on no
   more than three seats; BigBoy
