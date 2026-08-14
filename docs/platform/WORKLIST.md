@@ -471,7 +471,7 @@ behavioral evidence is not completion.
 - Acceptance criteria:
   1. Exactly six primary sections exist and all retired collaboration surfaces are unreachable.
   2. Signed offline replay, real media, CAS transfer, native office, and rich clipboard pass focused hostile tests.
-  3. Three-seat-maximum release proof records real providers, partial failures, and corrected-forward recovery.
+  3. At-most-two-seat release proof records real providers, partial failures, and corrected-forward recovery.
 - Verification method: collab/file/editor/media cargo suites, architecture/secret/package gates, visual captures, and live provider tests; route long jobs to BigBoy.
 - Origin or merged source IDs: NOTIFY-CHAT, EDITOR-*, FILEMGR-*, TEAMS-*, CLIPBOARD-*, VOICE-*; 2026-08-03 Mesh Collaboration survey.
 
@@ -607,7 +607,7 @@ behavioral evidence is not completion.
 - **Continuation:** daemon 182/182, roaming 18/18, reconnect 8/8, router 26/26, and Dell CPU passed:
   `evidence/WL-FUNC-021-2026-08-06-roaming-root-loss-r1.md`, `evidence/WL-FUNC-021-2026-08-06-reconnect-loop-audit-r1.md`.
 - **Live boundary:** same-provider resume and package/gateway gates pass; no physical cast target was found and Dell later became unreachable.
-  Live loss, renderer, handoff, auth/rotation, physical cast/two-seat, and three-seat CPU/NWS remain open.
+  Live loss, renderer, handoff, auth/rotation, physical cast/two-seat, and two-seat CPU/NWS remain open; no third seat is required.
   `evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`, `evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`.
 - **Seat-15 CPU:** bounded samples found Syncthing convergence; load stayed below capacity and no daemon was pegged; steady-state retest remains:
   `evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`, `evidence/WL-FUNC-021-2026-08-10-seat15-cpu-retest-r157.md`.
@@ -622,7 +622,7 @@ behavioral evidence is not completion.
   `install-helpers/verify-music-drm-proof.py`.
 - **RPM/install:** F44 release 5 passed payload/size and Dell CPU proof; seat 15 remained release 4: `evidence/WL-FUNC-021-2026-08-06-dell-release5-cpu-r1.md`.
 - **Artwork/pagination:** daemon/UI/shell gates pass; release 6 is live on Dell/seat 15 with distinct bounded pages and local JPEG art.
-  Open: renderer, provider-loss, cast, handoff, radio playback, and three-seat CPU/NWS.
+  Open: renderer, provider-loss, cast, handoff, radio playback, and two-seat CPU/NWS; no third seat is required.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-music-artwork-release6-r1.md`.
 - **Mutation authorization delivery:** domain-separated Ed25519 capabilities bind digest/scope/expiry/replay; daemon receives only the public key.
   Shared types 431/431 and daemon 174/174 pass; live authorized mutation and installed-seat rotation remain open.
