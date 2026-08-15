@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **6 active epics:** 6 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **6 active epics:** 0 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** freeze the exact newest feature-complete source under
   `WL-REL-001`; cut the three RPM roles under `WL-REL-002`; self-sign them and
@@ -90,12 +90,15 @@ behavioral evidence is not completion.
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: version 12.1.6 is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
 - Required outcome: freeze one clean, pushed, feature-complete commit and bind every release input, version surface, note, and tag plan to it.
-- Current state: the branch is clean and pushed; the root version is 12.1.6; the latest release tag is magic-mesh-v12.1.1.
+- Current state: source freeze and version scope are complete at revision
+  01ea65db; browser helpers and the shipped role chooser resolve to 12.1.6,
+  and the five internal non-release crates are documented in
+  docs/RELEASE-VERSIONING.md.
 - Remaining work:
   1. S1 Select the immutable source.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
@@ -103,13 +106,18 @@ behavioral evidence is not completion.
      - Deliverable: docs/platform/evidence/WL-REL-001-source-freeze-r1.md with exact commands and outputs.
      - Validation: source-revision-receipt.sh --repo .; git diff --quiet; git diff --cached --quiet; compare HEAD with upstream.
      - Done when: one non-null 40-character revision and positive epoch identify the clean pushed source.
-  2. S2 Verify every version surface.
+  2. S2 Verify every version surface. Complete: the three isolated browser
+     helper manifests/lockfiles and shipped role chooser resolve to 12.1.6;
+     the five non-shipped crates are recorded as packaging/test boundaries in
+     docs/RELEASE-VERSIONING.md.
      - Inputs: docs/RELEASE-VERSIONING.md, root and isolated Cargo workspaces, package recipes, CLI/About build identity.
      - Action: run Cargo metadata; compare shipped package versions; scan runtime sources for competing numeric release authorities.
      - Deliverable: bounded version matrix naming each shipped surface, source, observed value, and exception.
      - Validation: farm metadata/package checks on .50; no runtime version authority other than workspace/package reflection.
      - Done when: every current release surface resolves to 12.1.6 or a documented packaging release suffix.
-  3. S3 Admit all governed release inputs.
+  3. S3 Admit all governed release inputs. BLOCKED: no private preflight argv
+     file exists; Maps, App VM, Cuttlefish, RPM signer, and bootc receipts are
+     absent. Do not run a build with historical loose artifacts.
      - Inputs: Maps approval/source, App VM trust receipt/key, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
      - Action: create one private JSON argv file containing every mandatory release-input-preflight argument.
      - Deliverable: immutable preflight argument file plus redacted input inventory; never commit credentials or private keys.
@@ -131,12 +139,12 @@ behavioral evidence is not completion.
 
 ### WL-REL-002 - Cut the complete three-RPM unsigned handoff
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
 - Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable promotion-forbidden handoff.
-- Current state: prepare-path hostile tests pass, but no current-revision handoff exists and no available Server RPM completes the old artifact set.
+- Current state: prepare-path hostile tests pass, but WL-REL-001 is blocked and no current-revision three-RPM handoff exists.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
@@ -172,12 +180,12 @@ behavioral evidence is not completion.
 
 ### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and four verified image roles; no current-revision seven-role set exists.
 - Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, Cuttlefish, and bootc roles.
-- Current state: signing and derivative hostile suites pass; operator self-signing is authorized; historical RPMs are not admissible inputs.
+- Current state: signing and derivative hostile suites pass; WL-REL-002 has no handoff and the required signer/base/guest/bootc inputs are absent.
 - Remaining work:
   1. S1 Materialize and verify the self-signing boundary.
      - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
@@ -225,12 +233,12 @@ behavioral evidence is not completion.
 
 ### WL-REL-004 - Assemble the signed seven-role release evidence bundle
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: publication is forbidden until all artifacts, manifests, gates, SBOM data, checksums, and provenance form one exact signed bundle.
 - Required outcome: collect and verify all seven roles, execute mandatory release gates, and sign one immutable publication envelope.
-- Current state: collector, gate-matrix, corrected-forward, signing rollback, and hostile publication controls pass only as self-tests.
+- Current state: collector and gate controls pass only as self-tests; WL-REL-003 has not produced the seven-role input set.
 - Remaining work:
   1. S1 Resume and collect the seven-role output.
      - Inputs: WL-REL-002 handoff, WL-REL-003 derivative argv and plan input, frozen revision, and Fedora target.
@@ -272,12 +280,12 @@ behavioral evidence is not completion.
 
 ### WL-REL-005 - Publish and promote the newest complete release
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: version 12.1.6 has no immutable current tag or complete public asset set, and partial candidates must never enter the package channel.
 - Required outcome: publish one immutable tag and GitHub release, verify all assets by readback, then atomically expose only signed package metadata.
-- Current state: tags end at magic-mesh-v12.1.1; no complete 12.1.6 release exists; publication controls pass self-test.
+- Current state: tags end at magic-mesh-v12.1.1; WL-REL-004 has no signed seven-role bundle, so publication is correctly refused.
 - Remaining work:
   1. S1 Reconfirm publication authority and remote state.
      - Inputs: WL-REL-001 tag plan, WL-REL-004 readiness evidence, GitHub remote, and package repository destination.
@@ -325,12 +333,12 @@ behavioral evidence is not completion.
 
 ### WL-TEST-002 - Install and prove the newest complete release
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P1
 - Complexity: Epic
 - Problem: exact-release installation, providers, direct-DRM rendering, guest/device integrations, and corrected-forward recovery need live proof.
 - Required outcome: install the WL-REL-005 release on no more than two physical seats and execute every deferred acceptance obligation honestly.
-- Current state: pre-release verifier, input, signing, seat-control, and publication harnesses pass; no current signed release is installed or proven.
+- Current state: pre-release harnesses pass; WL-REL-005 has no published signed release, so installed/live acceptance cannot begin.
 - Remaining work:
   1. S1 Admit the published release.
      - Inputs: WL-REL-005 publication receipt, clean-room readback, signed package/image identities, and selected seats.

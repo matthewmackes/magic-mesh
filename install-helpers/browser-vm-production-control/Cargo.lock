@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "browser-vm-production-control"
-version = "0.1.0"
+version = "12.1.6"
 dependencies = [
  "anyhow",
  "hmac 0.12.1",

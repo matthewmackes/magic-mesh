@@ -4752,7 +4752,7 @@ dependencies = [
 
 [[package]]
 name = "mde-role-chooser"
-version = "0.1.0"
+version = "12.1.6"
 dependencies = [
  "mde-disclaimer",
  "mde-egui",

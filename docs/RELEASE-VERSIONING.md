@@ -49,6 +49,16 @@ match the RPM `VERSION`. `mesh-help` explicitly queries the installed RPM and
 prints the full package identity (`VERSION-RELEASE.ARCH`) without knowing a
 particular release number.
 
+### Intentional non-release package boundaries
+
+The following workspace packages are internal libraries or test-only helpers,
+not independently published release roles: `mde-kdc-host`, `mde-kdc-proto`,
+`magic-fleet`, and `mackes-transport` retain `0.0.0`; the isolated Maps
+verifier retains `0.0.0`. They are included in the source workspace for
+dependency and test resolution, but no standalone artifact, RPM, image, or
+runtime version surface is produced for them. The shipped `mde-role-chooser`
+and all isolated browser helper workspaces inherit the platform version.
+
 ## Bump procedure
 
 1. Edit only the `version` value in the root `Cargo.toml` workspace package

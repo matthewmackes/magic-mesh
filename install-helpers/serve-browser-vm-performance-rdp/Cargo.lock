@@ -3889,7 +3889,7 @@ dependencies = [
 
 [[package]]
 name = "serve-browser-vm-performance-rdp"
-version = "0.1.0"
+version = "12.1.6"
 dependencies = [
  "mde-vdi-core",
  "mde-vdi-rdp",
