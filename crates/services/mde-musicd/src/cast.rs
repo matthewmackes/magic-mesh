@@ -158,7 +158,7 @@ pub fn execute_cast_command(target: &CastTarget, command: &CastCommand) -> io::R
 
 #[cfg(test)]
 mod tests {
-    use super::{CastCommand, CastTarget, CASTV2_PORT};
+    use super::{verify_castv2, CastCommand, CastTarget, CASTV2_PORT};
     use std::io;
 
     #[test]
@@ -176,5 +176,14 @@ mod tests {
         assert!(CastCommand::load("http://127.0.0.1/song.mp3", "audio/mpeg", 0.0).is_ok());
         assert!(CastCommand::seek(f64::NAN).is_err());
         assert!(CastCommand::seek(-1.0).is_err());
+    }
+
+    #[test]
+    fn live_castv2_connection_when_operator_supplies_target() {
+        let Ok(address) = std::env::var("MDE_CAST_LIVE_TARGET") else {
+            return;
+        };
+        let target = CastTarget::new(&address, "operator-supplied Cast target").unwrap();
+        verify_castv2(&target).expect("operator-supplied Cast target must accept CASTV2 connection");
     }
 }

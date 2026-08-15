@@ -21,6 +21,11 @@ seek through the default media receiver. This farm evidence does not claim a
 live media URL was loaded or that renderer ownership was committed; those are
 post-release validation and projection work respectively.
 
+Opt-in live adapter validation, run with `MDE_CAST_LIVE_TARGET=172.20.146.150`,
+passed 7/7 on the farm. The Rust `rust_cast` connection itself successfully
+established a CASTV2 session with the operator-supplied receiver. This still
+does not claim media URL delivery or ownership commit.
+
 The playback projection now admits an operator-configured numeric Cast target
 (`MDE_MUSIC_CAST_ADDRESS` plus optional `MDE_MUSIC_CAST_NAME`) as an explicit
 `cast_renderer` row. It remains unavailable until the blocking provider lane
