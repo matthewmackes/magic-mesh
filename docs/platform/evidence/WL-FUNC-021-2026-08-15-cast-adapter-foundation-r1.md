@@ -40,11 +40,14 @@ UDN, model, and numeric address identity. It remains unavailable until the block
 performs live verification, so projection cannot fabricate renderer ownership.
 Generation-bound ownership records use atomic same-directory replacement and
 are covered by the focused farm test. The provider-lane helper now enforces
-command-success-before-commit; mesh handoff schema integration remains.
+command-success-before-commit; the production handoff completion pump now
+routes exact `cast_renderer` target identities through this helper before
+publishing the target Music state.
 The typed `CastHandoff` contract carries bounded media identity, position, and
 generation into that provider-lane helper.
 
 The durable Music handoff records now carry optional target kind and target
 identity fields with `mesh_seat` defaults for legacy records. The farm handoff
-compatibility suite passed 15/15, including exact-once, expiry, replay, and
-atomic-record regressions.
+compatibility suite passed 16/16, including exact-once, expiry, replay,
+atomic-record regressions, and Cast-target routing. Signed-release/provider
+continuity proof remains post-release.

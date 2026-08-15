@@ -3753,6 +3753,25 @@ fn apply_workspace_action_with_clients_and_coordination(
                 .as_deref()
                 .ok_or("missing_target_peer")?;
             let local_peer = state::local_host();
+            if let Some(target_id) = target_peer.strip_prefix("cast:") {
+                let configured = std::env::var("MDE_MUSIC_CAST_ADDRESS").map_err(|_| "cast_not_configured")?;
+                if configured != target_id {
+                    return Err("cast_target_not_admitted");
+                }
+                if engine.is_none_or(|value| !value.is_active()) {
+                    return Err("playback_not_active");
+                }
+                state::post_takeover_target(
+                    coordination_dir,
+                    &local_peer,
+                    Some(local_peer.clone()),
+                    "cast_renderer",
+                    target_peer,
+                    state::now_ms(),
+                )
+                .map(|_| false)
+                .map_err(|_| "handoff_persist_failed")
+            } else {
             if target_peer == local_peer {
                 return Err("target_is_local_peer");
             }
@@ -3790,6 +3809,7 @@ fn apply_workspace_action_with_clients_and_coordination(
             )
             .map(|_| false)
             .map_err(|_| "handoff_persist_failed")
+            }
         }
         _ => Err("unknown_action"),
     }
@@ -4474,10 +4494,83 @@ fn target_handoff_action(
     if completion.from_peer != target_peer {
         return TargetHandoffAction::IgnoreForeign;
     }
+    if let Some(intent) = intents.iter().find(|intent| intent.intent_id == completion.intent_id) {
+        if intent.target_kind != completion.target_kind || intent.target_id != completion.target_id {
+            return TargetHandoffAction::DropInvalid;
+        }
+    }
     admitted_handoff_queue(completion, intents, target_peer, now_ms).map_or(
         TargetHandoffAction::DropInvalid,
         TargetHandoffAction::Resume,
     )
+}
+
+/// Consume a Cast-target completion without requiring a local audio engine.
+/// The provider load is the ownership admission point; durable mesh state is
+/// published only after the Cast receiver accepts the media URL.
+fn apply_cast_handoff_completion(queue_path: &Path, clients: &[&Client]) -> bool {
+    let dir = state::coordination_dir();
+    let local_peer = state::local_host();
+    let intents = state::read_intents(&dir);
+    let now_ms = state::now_ms();
+    for completion in state::read_completions(&dir)
+        .into_iter()
+        .filter(|completion| completion.target_kind == "cast_renderer")
+    {
+        let queue = match target_handoff_action(&completion, &intents, &local_peer, now_ms) {
+            TargetHandoffAction::Resume(queue) => queue,
+            TargetHandoffAction::IgnoreForeign => continue,
+            TargetHandoffAction::DropInvalid => {
+                state::clear_completion(&dir, &completion.intent_id);
+                continue;
+            }
+        };
+        let Some(address) = completion.target_id.strip_prefix("cast:") else { continue };
+        let Ok(configured) = std::env::var("MDE_MUSIC_CAST_ADDRESS") else { continue };
+        if configured != address {
+            continue;
+        }
+        let name = std::env::var("MDE_MUSIC_CAST_NAME").unwrap_or_else(|_| "Cast receiver".to_owned());
+        let Ok(target) = crate::cast::CastTarget::new(address, name) else { continue };
+        let candidates = if clients.is_empty() {
+            cached_upcoming_tracks(&queue, &crate::cache::cache_dir()).map(|tracks| {
+                tracks.into_iter().map(|(url, _)| url).collect::<Vec<_>>()
+            })
+        } else {
+            let catalog = load_catalog(&state::data_dir()).unwrap_or_default();
+            source_aware_upcoming_candidates(&queue, clients, &catalog).map(|tracks| {
+                tracks.into_iter().filter_map(|track| track.candidates.into_iter().next().map(|(url, _)| url)).collect()
+            })
+        };
+        let Some(media_url) = candidates.and_then(|urls| urls.into_iter().next()) else { continue };
+        let handoff = match crate::cast::CastHandoff::new(
+            &media_url,
+            "audio/mpeg",
+            completion.position_ms as f64 / 1000.0,
+            completion.completed_ms,
+        ) {
+            Ok(handoff) => handoff,
+            Err(_) => continue,
+        };
+        if crate::cast::execute_cast_handoff(&target, &handoff, &dir.join("music-cast-owner.json")).is_err() {
+            continue;
+        }
+        let target_state = MusicState {
+            peer: local_peer.clone(),
+            playing: true,
+            song_id: completion.song_id.clone(),
+            position_ms: completion.position_ms,
+            updated_ms: state::now_ms(),
+        };
+        if state::write_state(&dir, &target_state).is_err() {
+            continue;
+        }
+        let _ = queue::write_to(queue_path, &queue);
+        state::clear_intent(&dir, &completion.intent_id);
+        state::clear_completion(&dir, &completion.intent_id);
+        return true;
+    }
+    false
 }
 
 /// Yield the local engine to the newest admitted takeover intent. The intent
@@ -4563,8 +4656,8 @@ fn apply_pending_handoff(engine: Option<&Engine>, queue_path: &Path) {
         expires_ms: snapshot
             .updated_ms
             .saturating_add(state::HANDOFF_ACK_TIMEOUT_MS),
-        target_kind: "mesh_seat".to_owned(),
-        target_id: String::new(),
+        target_kind: intent.target_kind.clone(),
+        target_id: intent.target_id.clone(),
     };
     if let Err(error) = state::write_completion(&dir, &completion) {
         let restored = MusicState {
@@ -4601,6 +4694,9 @@ fn apply_handoff_completions(
     clients: &[&Client],
     pending: &mut Option<PendingTargetHandoff>,
 ) {
+    if apply_cast_handoff_completion(queue_path, clients) {
+        return;
+    }
     let Some(engine) = engine else { return };
     let dir = state::coordination_dir();
     let my_host = state::local_host();
@@ -4654,6 +4750,9 @@ fn apply_handoff_completions(
     let intents = state::read_intents(&dir);
     let now_ms = state::now_ms();
     for completion in state::read_completions(&dir) {
+        if completion.target_kind == "cast_renderer" {
+            continue;
+        }
         let queue = match target_handoff_action(&completion, &intents, &my_host, now_ms) {
             TargetHandoffAction::IgnoreForeign => continue,
             TargetHandoffAction::DropInvalid => {

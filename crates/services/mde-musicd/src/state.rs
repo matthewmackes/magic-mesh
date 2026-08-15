@@ -150,6 +150,8 @@ fn valid_state_record(state: &MusicState) -> bool {
 fn valid_intent_record(intent: &HandoffIntent) -> bool {
     valid_component(&intent.intent_id, MAX_INTENT_ID_BYTES)
         && valid_component(&intent.from_peer, MAX_PEER_NAME_BYTES)
+        && (intent.target_kind.is_empty() || valid_component(&intent.target_kind, 32))
+        && intent.target_id.len() <= 256
         && intent
             .to_peer
             .as_deref()
@@ -160,6 +162,8 @@ fn valid_completion_record(completion: &HandoffCompletion) -> bool {
     valid_component(&completion.intent_id, MAX_INTENT_ID_BYTES)
         && valid_component(&completion.from_peer, MAX_PEER_NAME_BYTES)
         && valid_component(&completion.owner_peer, MAX_PEER_NAME_BYTES)
+        && (completion.target_kind.is_empty() || valid_component(&completion.target_kind, 32))
+        && completion.target_id.len() <= 256
         && !completion.song_id.is_empty()
         && valid_song_id(&completion.song_id)
         && !completion.queue.songs.is_empty()
@@ -649,10 +653,32 @@ pub fn post_takeover(
     to_peer: Option<String>,
     now_ms: u64,
 ) -> std::io::Result<HandoffIntent> {
+    post_takeover_target(
+        dir,
+        from_peer,
+        to_peer,
+        "mesh_seat",
+        "",
+        now_ms,
+    )
+}
+
+/// Persist a takeover intent for a concrete playback target. Legacy callers
+/// use [`post_takeover`] and retain the mesh-seat defaults.
+pub fn post_takeover_target(
+    dir: &Path,
+    from_peer: &str,
+    to_peer: Option<String>,
+    target_kind: &str,
+    target_id: &str,
+    now_ms: u64,
+) -> std::io::Result<HandoffIntent> {
     if !valid_component(from_peer, MAX_PEER_NAME_BYTES)
         || to_peer
             .as_deref()
             .is_some_and(|peer| !valid_component(peer, MAX_PEER_NAME_BYTES))
+        || !valid_component(target_kind, 32)
+        || target_id.len() > 256
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -664,8 +690,8 @@ pub fn post_takeover(
         intent_id: id.clone(),
         from_peer: from_peer.to_string(),
         to_peer,
-        target_kind: "mesh_seat".to_owned(),
-        target_id: String::new(),
+        target_kind: target_kind.to_owned(),
+        target_id: target_id.to_owned(),
         issued_ms: now_ms,
     };
     let d = intents_dir(dir);
