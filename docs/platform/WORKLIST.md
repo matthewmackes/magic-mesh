@@ -95,14 +95,16 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: version 12.1.6 is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
 - Required outcome: freeze one clean, pushed, feature-complete commit and bind every release input, version surface, note, and tag plan to it.
-- Current state: the previously recorded 01ea65db source identity is stale.
-  The current clean checkout and its upstream branch both resolve to
-  f095b8ce66b3183d3bdc6123746ced007b49a0b0 (commit epoch 1786803889), but the
-  replacement source-freeze evidence has not yet been recorded. Browser helpers
-  and the shipped role chooser resolve to 12.1.6, and the five internal
+- Current state: the stale 01ea65db source identity has been replaced by the
+  clean, pushed revision 1dfe6906609d71da9ee2ce20c860912a09b32855 (commit epoch
+  1786813297); current source-freeze evidence is recorded in
+  docs/platform/evidence/WL-REL-001-2026-08-15-source-freeze-r2.md. Browser
+  helpers and the shipped role chooser resolve to 12.1.6, and the five internal
   non-release crates are documented in docs/RELEASE-VERSIONING.md.
 - Remaining work:
-  1. S1 Select the immutable source.
+  1. S1 Select the immutable source. Complete: revision
+     1dfe6906609d71da9ee2ce20c860912a09b32855 is clean, pushed, upstream-equal,
+     and bound to epoch 1786813297 in the r2 source-freeze receipt.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD, upstream HEAD, commit epoch, Fedora target, and version.
      - Deliverable: docs/platform/evidence/WL-REL-001-source-freeze-r1.md with exact commands and outputs.
