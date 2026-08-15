@@ -60,7 +60,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=install-helpers/rpm-features.sh disable=SC1091
 source "$REPO/install-helpers/rpm-features.sh"
 SOURCE_RECEIPT_HELPER="$REPO/install-helpers/source-revision-receipt.sh"
-RELEASE_INPUT_PREFLIGHT="$REPO/install-helpers/release-input-preflight.sh"
+RELEASE_INPUT_ARGV_LOADER="$REPO/install-helpers/release-input-argv.py"
 TOFU_DIR="${MCNF_TOFU_DIR:-$REPO/infra/tofu}"
 # Per-slot remote dir lets concurrent agents share one VM (each its own target/).
 # Base is `magic-mesh-farm` (NOT the bare `magic-mesh`): the build VMs carry a
@@ -677,36 +677,11 @@ case "${1:-}" in
       < <("$SOURCE_RECEIPT_HELPER" --repo "$REPO")
     export MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH
     log "promotable source receipt: $MCNF_BUILD_SOURCE_REVISION (epoch $SOURCE_DATE_EPOCH)"
-    preflight_args=(
-      --source-revision "$MCNF_BUILD_SOURCE_REVISION" --source-epoch "$SOURCE_DATE_EPOCH"
-      --app-vm-catalog-trust-receipt "${MCNF_APP_VM_CATALOG_TRUST_RECEIPT:-}"
-      --app-vm-catalog-trust-key "${MCNF_APP_VM_CATALOG_TRUST_KEY:-}"
-      --cuttlefish-declaration "${MCNF_CUTTLEFISH_DECLARATION:-}"
-      --cuttlefish-signature "${MCNF_CUTTLEFISH_SIGNATURE:-}"
-      --cuttlefish-readiness-relay "${MCNF_CUTTLEFISH_READINESS_RELAY:-}"
-      --cuttlefish-vdi-agent "${MCNF_CUTTLEFISH_VDI_AGENT:-}"
-      --rpm-signing-identity-receipt "${MCNF_RPM_SIGNING_IDENTITY_RECEIPT:-}"
-      --bootc-base-digest-receipt "${MCNF_BOOTC_BASE_DIGEST_RECEIPT:-}"
-      --bootc-base-image-reference "${MCNF_BOOTC_BASE_IMAGE_REFERENCE:-}"
-      --bootc-base-architecture "${MCNF_BOOTC_BASE_ARCHITECTURE:-}"
-      --bootc-release-role "${MCNF_BOOTC_RELEASE_ROLE:-}"
-      --app-vm-base-image-receipt "${MCNF_APP_VM_BASE_IMAGE_RECEIPT:-}"
-      --app-vm-base-image-reference "${MCNF_APP_VM_BASE_IMAGE_REFERENCE:-}"
-      --app-vm-base-architecture "${MCNF_APP_VM_BASE_ARCHITECTURE:-}"
-      --cuttlefish-image-receipt "${MCNF_CUTTLEFISH_IMAGE_RECEIPT:-}"
-      --cuttlefish-image-source-kind "${MCNF_CUTTLEFISH_IMAGE_SOURCE_KIND:-}"
-      --cuttlefish-image-original-source "${MCNF_CUTTLEFISH_IMAGE_ORIGINAL_SOURCE:-}"
-      --cuttlefish-image-architecture "${MCNF_CUTTLEFISH_IMAGE_ARCHITECTURE:-}"
-      --cuttlefish-provider-identity "${MCNF_CUTTLEFISH_PROVIDER_IDENTITY:-}"
-      --cuttlefish-android-release-id "${MCNF_CUTTLEFISH_ANDROID_RELEASE_ID:-}"
-      --cuttlefish-image-compatibility-id "${MCNF_CUTTLEFISH_IMAGE_COMPATIBILITY_ID:-}"
-      --cuttlefish-image-media-type "${MCNF_CUTTLEFISH_IMAGE_MEDIA_TYPE:-application/octet-stream}"
-      --cuttlefish-image-artifact-format "${MCNF_CUTTLEFISH_IMAGE_ARTIFACT_FORMAT:-android-cuttlefish-host-package}"
-    )
-    while IFS= read -r package; do
-      [[ -n "$package" ]] && preflight_args+=(--cuttlefish-guest-package "$package")
-    done <<<"${MCNF_CUTTLEFISH_GUEST_PACKAGES:-}"
-    "$RELEASE_INPUT_PREFLIGHT" "${preflight_args[@]}"
+    [[ -n "${MCNF_RELEASE_INPUT_ARGV_FILE:-}" ]] \
+      || { warn "MCNF_RELEASE_INPUT_ARGV_FILE is required for a release RPM cut"; exit 2; }
+    "$RELEASE_INPUT_ARGV_LOADER" "$MCNF_RELEASE_INPUT_ARGV_FILE" \
+      --expected-source-revision "$MCNF_BUILD_SOURCE_REVISION" \
+      --expected-source-epoch "$SOURCE_DATE_EPOCH"
     do_sync_revision "$MCNF_BUILD_SOURCE_REVISION"
     # build-deploy-7 — cargo-generate-rpm is NOT installed per-cut on this path;
     # it is pinned at VM-PROVISIONING time to CGR_VERSION by

@@ -408,7 +408,7 @@ python3 - "$ENTRY" <<'PY'
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
 rpm = text.index("  rpm)\n")
-preflight = text.index('"$RELEASE_INPUT_PREFLIGHT" "${preflight_args[@]}"', rpm)
+preflight = text.index('"$RELEASE_INPUT_ARGV_LOADER" "$MCNF_RELEASE_INPUT_ARGV_FILE"', rpm)
 sync = text.index('do_sync_revision "$MCNF_BUILD_SOURCE_REVISION"', rpm)
 vendor = text.index('remote "./install-helpers/vendor-birthright-blobs.sh"', rpm)
 build = text.index('remote "export MCNF_BUILD_SOURCE_REVISION=', rpm)
@@ -416,21 +416,12 @@ if not rpm < preflight < sync < vendor < build:
     raise SystemExit("preflight self-test: release entry can mutate before input admission")
 rpm_body = text[rpm:sync]
 required = (
-    'MCNF_BOOTC_BASE_DIGEST_RECEIPT',
-    'MCNF_BOOTC_BASE_IMAGE_REFERENCE',
-    'MCNF_BOOTC_BASE_ARCHITECTURE',
-    'MCNF_BOOTC_RELEASE_ROLE',
-    'MCNF_APP_VM_BASE_IMAGE_RECEIPT',
-    'MCNF_APP_VM_BASE_IMAGE_REFERENCE',
-    'MCNF_APP_VM_BASE_ARCHITECTURE',
-    'MCNF_CUTTLEFISH_IMAGE_RECEIPT',
-    'MCNF_CUTTLEFISH_IMAGE_ORIGINAL_SOURCE',
-    'MCNF_CUTTLEFISH_IMAGE_ARCHITECTURE',
-    'MCNF_CUTTLEFISH_PROVIDER_IDENTITY',
-    'MCNF_CUTTLEFISH_ANDROID_RELEASE_ID',
-    'MCNF_CUTTLEFISH_IMAGE_COMPATIBILITY_ID',
+    'MCNF_RELEASE_INPUT_ARGV_FILE',
+    '--expected-source-revision',
+    '--expected-source-epoch',
 )
-if any(item not in rpm_body for item in required) or 'MCNF_BOOTC_BASE_DIGEST:-' in rpm_body or 'MCNF_APP_VM_BASE_DIGEST:-' in rpm_body or 'MCNF_CUTTLEFISH_IMAGE_DIGEST:-' in rpm_body:
-    raise SystemExit("preflight self-test: canonical RPM entry does not exclusively consume governed image receipts")
+forbidden = ('MCNF_BOOTC_BASE_', 'MCNF_APP_VM_BASE_', 'MCNF_CUTTLEFISH_IMAGE_', 'preflight_args=(')
+if any(item not in rpm_body for item in required) or any(item in rpm_body for item in forbidden):
+    raise SystemExit("preflight self-test: canonical RPM entry does not exclusively consume the private argv document")
 PY
 echo 'release-input-preflight: self-test PASS (missing or mismatched receipts stop before build command)'
