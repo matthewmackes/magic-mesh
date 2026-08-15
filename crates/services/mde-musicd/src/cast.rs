@@ -12,6 +12,34 @@ use std::str::FromStr;
 
 /// The standard CASTV2 control port.
 pub const CASTV2_PORT: u16 = 8009;
+const MAX_DIAL_DESCRIPTOR_BYTES: usize = 64 * 1024;
+
+/// Identity returned by the Cast/DIAL device descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastDiscovery {
+    pub target: CastTarget,
+    pub udn: String,
+    pub model: String,
+}
+
+/// Parse a bounded DIAL descriptor without trusting arbitrary XML contents.
+pub fn parse_dial_descriptor(body: &[u8], address: &str) -> io::Result<CastDiscovery> {
+    if body.is_empty() || body.len() > MAX_DIAL_DESCRIPTOR_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Cast descriptor exceeds bound"));
+    }
+    fn tag(body: &str, name: &str) -> Option<String> {
+        let start = body.find(&format!("<{name}>"))? + name.len() + 2;
+        let end = body[start..].find(&format!("</{name}>"))? + start;
+        let value = body[start..end].trim();
+        (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_owned())
+    }
+    let text = std::str::from_utf8(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Cast descriptor is not UTF-8"))?;
+    let name = tag(text, "friendlyName").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Cast descriptor has no name"))?;
+    let udn = tag(text, "UDN").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Cast descriptor has no UDN"))?;
+    let model = tag(text, "modelName").unwrap_or_else(|| "unknown".to_owned());
+    Ok(CastDiscovery { target: CastTarget::new(address, name)?, udn, model })
+}
 
 /// The bounded commands that the Music daemon may send to a Cast receiver.
 /// Media execution remains behind the blocking provider lane; the UI and bus
@@ -176,6 +204,16 @@ mod tests {
         assert!(CastCommand::load("http://127.0.0.1/song.mp3", "audio/mpeg", 0.0).is_ok());
         assert!(CastCommand::seek(f64::NAN).is_err());
         assert!(CastCommand::seek(-1.0).is_err());
+    }
+
+    #[test]
+    fn dial_descriptor_projects_bounded_cast_identity() {
+        let descriptor = br#"<root><friendlyName>Family Room TV</friendlyName><UDN>uuid:cast-1</UDN><modelName>MIBOX4</modelName></root>"#;
+        let discovery = super::parse_dial_descriptor(descriptor, "172.20.146.150").unwrap();
+        assert_eq!(discovery.target.name, "Family Room TV");
+        assert_eq!(discovery.udn, "uuid:cast-1");
+        assert_eq!(discovery.model, "MIBOX4");
+        assert!(super::parse_dial_descriptor(b"<root/>", "172.20.146.150").is_err());
     }
 
     #[test]
