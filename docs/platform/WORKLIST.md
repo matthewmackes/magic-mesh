@@ -97,14 +97,25 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Live provider activation and first-release integration evidence depend on operator-supplied artifacts and deployment inputs unavailable during implementation.
-- Required outcome: after the first development release, admit the governed SIP account, run the Calls activation/reconnect/mute lifecycle test, capture package and live evidence, and reconcile the result without weakening proof requirements.
-- Current state: test scope is separated from FUNC-011 implementation; no live provider artifact or release deployment claim is made.
-- Dependencies: WL-FUNC-011 and the first development release.
-- Deliverable: redacted provider readiness artifact, live Calls test result, package/version identity, and farm command/result.
-- Validation: run the named Calls lifecycle and package gates on the build farm, then attach operator-supplied live evidence.
-- Acceptance: no fake connected state; provider absence/failure remains visible; evidence identifies the tested release and authorized provider boundary.
+- Problem: implementation and farm gates are complete for many slices, but first-development-release installation, operator providers, physical-seat behavior, direct-DRM rendering, guest/device integrations, and corrected-forward recovery were intentionally deferred until a signed release and its deployment inputs exist.
+- Required outcome: after the first development release, execute and archive every deferred testing, proofing, and validation obligation in this epic; reconcile failures as implementation work or named external-input blockers, without weakening proof requirements.
+- Current state: the queue is intentionally post-release and non-blocking for pre-release coding. No live provider, installed-seat, hardware, guest, or release-deployment claim is made.
+- Dependencies: first development release, signed package/image artifacts, operator-approved provider credentials, and no more than two physical test seats.
+- Deliverable: release identity and artifact admission, installed-seat baseline, provider readiness, live behavior captures, direct-DRM/GUI proof, guest/device proof, recovery/corrected-forward results, and farm commands/results with redacted operator evidence.
+- Validation: run all focused farm gates first, then execute the named one-node/two-seat live checks on the exact installed release; attach evidence to the owning source epic and cross-reference this epic.
+- Acceptance: tested bytes match the signed release; no fake connected/healthy state; provider absence and failure remain visible; recovery is corrected-forward; every result identifies hardware/provider authorization and stays within the two-seat cap.
 - Owner: Platform collaboration and release verification.
+
+#### WL-TEST-002 test queue
+
+1. **Release and package admission:** build/sign the first development release; verify package/image manifests, provenance, dependency closure, upgrade/install identity, and corrected-forward payload binding.
+2. **Installed baseline:** install the exact release on the governed one-node/two-seat test set; record service, Workers, Bus, storage, network, display, audio, and restart/rejoin observations.
+3. **Collaboration and providers:** activate the governed SIP account; test Calls connect/reconnect/mute/consent/revocation; test deferred provider-backed collaboration and transfer behavior without asserting a fake live state.
+4. **GUI and direct-DRM proof:** capture deferred shell, taskbar, style/font, Kiron, Maps, Workers, Editor, Music, and narrow/largest-text states on the real display path; include human visual review where required.
+5. **Media and physical providers:** test mpv/audio/video, cache/network loss, renderer recovery, cast/handoff/DLNA, installed package/CPU behavior, and external catalog/server paths with authorized provider inputs.
+6. **Guest and device integrations:** test App VM/VDI, Browser/Android/Cuttlefish, GPU/audio/input, nested-KVM, remote-session, and guest reconnect/upgrade paths when their signed images and runtime artifacts are admitted.
+7. **Recovery and resilience:** run deferred one-node service/process, display/session, lock/sleep, storage/network, generation, reboot, restart, recovery, and corrected-forward drills; record failures rather than converting unavailable hardware into passes.
+8. **Reconciliation:** map every result to its owning epic, archive release evidence, reopen implementation work for regressions, and retain named operator blockers for missing artifacts or authorization.
 
 ## Core Architecture
 
