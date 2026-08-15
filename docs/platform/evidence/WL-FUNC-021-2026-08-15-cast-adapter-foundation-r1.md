@@ -20,3 +20,8 @@ Result: 6 tests passed, 0 failed. The adapter now dispatches load/play/pause/
 seek through the default media receiver. This farm evidence does not claim a
 live media URL was loaded or that renderer ownership was committed; those are
 post-release validation and projection work respectively.
+
+The playback projection now admits an operator-configured numeric Cast target
+(`MDE_MUSIC_CAST_ADDRESS` plus optional `MDE_MUSIC_CAST_NAME`) as an explicit
+`cast_renderer` row. It remains unavailable until the blocking provider lane
+performs live verification, so projection cannot fabricate renderer ownership.

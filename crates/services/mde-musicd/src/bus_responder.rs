@@ -4721,6 +4721,9 @@ fn playback_targets(audio_available: bool, data_dir: &Path) -> Vec<crate::domain
     let local_peer = state::local_host();
     let now = state::now_ms();
     let mut targets = local_playback_targets(audio_available);
+    if let Some(cast_target) = configured_cast_target() {
+        targets.push(cast_target);
+    }
     for peer in state::read_all_peer_states(data_dir)
         .into_iter()
         .filter(|peer| peer.peer != local_peer)
@@ -4744,6 +4747,22 @@ fn playback_targets(audio_available: bool, data_dir: &Path) -> Vec<crate::domain
     targets.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     targets.truncate(MAX_SOURCE_RECORDS);
     targets
+}
+
+/// Project the operator-admitted Cast endpoint without claiming that the
+/// receiver is ready for ownership. Runtime Cast verification and media
+/// dispatch happen in the blocking provider lane.
+fn configured_cast_target() -> Option<crate::domain::PlaybackTarget> {
+    let address = std::env::var("MDE_MUSIC_CAST_ADDRESS").ok()?;
+    let name = std::env::var("MDE_MUSIC_CAST_NAME").unwrap_or_else(|_| "Cast receiver".to_owned());
+    let target = crate::cast::CastTarget::new(&address, name).ok()?;
+    Some(crate::domain::PlaybackTarget {
+        id: format!("cast:{}", target.address),
+        name: target.name,
+        kind: "cast_renderer".to_owned(),
+        available: false,
+        unavailable_reason: Some("Cast receiver requires live provider verification".to_owned()),
+    })
 }
 
 /// Project only the local target. Remote seats enter through
