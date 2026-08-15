@@ -7,13 +7,13 @@ tasks.
 
 ## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **3 active epics:** 3 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **6 active epics:** 6 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
-- **Execution order:** complete ARCH-010 stories in order; then consume its
-  contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
-  vertical slices FUNC-011/FUNC-016, FUNC-017, FUNC-021, and FUNC-022 next. Integrate
-  UX-009, UX-011, UX-012, and UX-014 at their named story gates. Close
-  every slice through CRIT-006 and CRIT-007.
+- **Execution order:** freeze the exact newest feature-complete source under
+  `WL-REL-001`; cut the three RPM roles under `WL-REL-002`; self-sign them and
+  produce the four derivative roles under `WL-REL-003`; assemble the exact
+  seven-role evidence bundle under `WL-REL-004`; publish the release under
+  `WL-REL-005`; then execute installed and live acceptance under `WL-TEST-002`.
 - **Single-authority lock:** typed Workload operations are the only VM/container
   lifecycle API; mackesd is the only daemon authority; mde-bus is the only
   platform bus; the shell renders typed bounded projections and sends typed
@@ -64,24 +64,20 @@ tasks.
 
 ## Active Drain Goal
 
-Finish the Music and Media Player vertical slice (daemon catalog/playback,
-mpv frame/audio, library/Jellyfin, cache/offline, discovery, casting, handoff,
-visual proof) while preserving the single Workload, Bus, and typed executor
-authorities. Archive old MEDIA and FUNC-007 IDs; they are evidence only.
+Cut, self-sign, publish, install, and prove the newest feature-complete Construct
+release from one exact clean source revision. Produce all seven canonical roles,
+retain fail-closed provenance, and keep live acceptance within two physical
+test seats.
 
 ## Service Release Queue
 
-1. Workloads runtime and native attachment.
-2. Browser VM cutover and standalone legacy repository.
-3. Process-isolated mackesd and Workers.
-4. Collaboration Suite and rich clipboard.
-5. Maps/MG90 and universal resource browser.
-6. Flatpak App VMs and Android Workloads.
-7. Music/Media Player.
-8. Clock, distributed alarms/timers, and notification entry cutover.
-9. Quazar visual integration, health modal/Kiron, and release/recovery proof.
-10. Shared first-release, installed-seat, provider, and corrected-forward proof
-    under WL-TEST-002.
+1. Freeze the newest feature-complete source and numeric release identity.
+2. Build the Workstation, Server, and Lighthouse RPM handoff.
+3. Self-sign all RPM roles and build Browser VM, App VM, Cuttlefish, and bootc roles.
+4. Assemble and verify the seven-role provenance/evidence bundle.
+5. Publish the immutable tag, GitHub release assets, and signed package metadata.
+6. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance
+   under WL-TEST-002.
 
 ## Story execution contract
 
@@ -91,6 +87,76 @@ add the stated hostile or regression test; run the stated validation; record the
 revision, command, result, and evidence path; and mark the story complete only
 when the Done when condition is true. A passing compile without the named
 behavioral evidence is not completion.
+
+### WL-REL-001 - Freeze the newest feature-complete release source
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: workspace version `12.1.6` is newer than the latest published tag, while existing loose RPMs and checksum files are from different cuts and cannot define one release identity.
+- Required outcome: select one clean, pushed, feature-complete commit; verify every shipped Cargo workspace reflects the root version; freeze its revision, commit epoch, target Fedora release, release notes, and exact tag name without changing source underneath the cut.
+- Current state: the branch is clean and pushed, root version is `12.1.6`, latest release tag is `magic-mesh-v12.1.1`, and no admissible seven-role bundle is bound to the current head.
+- Dependencies: all intended implementation epics archived or explicitly deferred to `WL-TEST-002`; operator authorization to self-sign is recorded in the release session.
+- Deliverable: clean-source receipt, version-inheritance report, release notes, selected revision/epoch, tag plan, and admitted release-input argument files for Fedora 44.
+- Validation: `source-revision-receipt.sh`, Cargo metadata/version checks, release-input preflight, worklist gate, and a negative scan for competing runtime version literals.
+- Acceptance: one immutable source identity is selected; every release input binds to it; no historical RPM, stale checksum file, dirty tree, or moving branch can enter the cut.
+- Owner: Release engineering.
+
+### WL-REL-002 - Cut the complete three-RPM unsigned handoff
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: the release workflow requires exact Workstation, Server, and Lighthouse RPM roles from the same source revision, but the available artifact store has only unrelated Workstation/Lighthouse cuts and no Server candidate.
+- Required outcome: use `run-first-full-release.sh prepare` and the farm to build exactly one Workstation RPM, one Server RPM, and one Lighthouse RPM for Fedora 44 from the `WL-REL-001` source receipt.
+- Current state: first-release preflight and hostile phase-boundary self-tests pass; no current-revision immutable handoff exists.
+- Dependencies: `WL-REL-001`.
+- Deliverable: promotion-forbidden immutable handoff directory containing the three unsigned RPMs, `handoff.json`, exact NEVRA/payload identities, and farm command/results.
+- Validation: BigBoy full RPM lane, independent Server RPM lane, RPM identity queries, handoff verifier, and mutation/substitution rejection checks.
+- Acceptance: all three RPM roles share the frozen revision/version/target, each payload is uniquely identified, and no partial or stale artifact is admitted.
+- Owner: Build and packaging.
+
+### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: a complete release needs signed RPM candidates plus Browser VM, App VM, Cuttlefish image, and bootc image roles; only two unbound historical RPM files are currently available.
+- Required outcome: self-sign the exact `WL-REL-002` RPM handoff with the project release identity, generate candidate manifests, then build and verify the four derivative roles from those signed candidates without changing payload identity.
+- Current state: signing, seat-control, derivative orchestration, and hostile release-binding self-tests pass; no current-revision signed seven-role input set exists.
+- Dependencies: `WL-REL-002` and access to the local self-signing key material.
+- Deliverable: three signed RPMs, four verified derivative artifacts, role-specific candidate manifests/receipts, checksums, and a seven-role release-output plan input.
+- Validation: `sign-release.sh --prepare-rpms`, role-specific supply verifiers, derivative-image builder, guest/bootc receipt verifiers, and exact signed-versus-handoff payload comparison.
+- Acceptance: exactly seven canonical roles exist and bind to one source revision; RPM signatures verify; derivative inputs are exact; substitutions, missing roles, and partial outputs fail closed.
+- Owner: Release signing and image engineering.
+
+### WL-REL-004 - Assemble the signed seven-role release evidence bundle
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: release publication is forbidden until artifacts, SBOM, gate manifests, provenance, and checksums form one exact evidence-bound bundle.
+- Required outcome: resume the first-full-release workflow, collect all seven verified roles, run the canonical release gate matrix, generate SBOM/provenance/checksums, and sign the publication envelope with the authorized self-signing identity.
+- Current state: release-output planning, collection, corrected-forward, signing rollback, and hostile publication controls pass in self-test; no current-revision production evidence envelope exists.
+- Dependencies: `WL-REL-003`.
+- Deliverable: immutable seven-role output collection, release evidence envelope, SBOM manifest, gate manifest, `PROVENANCE.json`, `SHA256SUMS`, detached signature, and verification transcript.
+- Validation: `run-first-full-release.sh resume`, release-output collector, release-gate matrix verifier, `sign-release.sh --evidence`, checksum/signature verification, and GitHub release-binding preflight.
+- Acceptance: every signed byte and manifest is revision-bound and unchanged; all mandatory gates are green; publication refuses any missing, stale, unsigned, unbound, or cross-revision input.
+- Owner: Release assurance.
+
+### WL-REL-005 - Publish and promote the newest complete release
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: version `12.1.6` has no immutable current release tag or complete published asset set, and the package channel must not expose partial or unsigned candidates.
+- Required outcome: create the immutable `magic-mesh-v12.1.6` tag at the frozen revision, publish one GitHub release containing the exact admitted assets/evidence, update signed repository metadata atomically, and retain corrected-forward recovery information.
+- Current state: prior tags end at `magic-mesh-v12.1.1`; publication controls pass self-test, but no current complete release exists.
+- Dependencies: `WL-REL-004`.
+- Deliverable: pushed tag, GitHub release and seven-role asset set, signed checksums/provenance/SBOM/gate evidence, atomic package-repository metadata, release notes, and publication receipt.
+- Validation: GitHub release-binding verifier, remote tag/asset readback, signature/checksum verification from downloaded assets, package metadata query, and promotion refusal test for HOLD/partial artifacts.
+- Acceptance: public tag, release metadata, downloadable assets, checksums, signatures, provenance, and repository package identities all agree on the frozen source and version; no partial release is visible.
+- Owner: Release publication.
 
 ### WL-TEST-002 - Post-first-development-release testing and proofing
 
