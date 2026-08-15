@@ -271,6 +271,17 @@ from substitution, corruption, or an unauthorized input. Beta releases remain
 subject to the two-seat cap for live acceptance and may not bypass acceptable-
 use, authorization, security, or safety restrictions.
 
+**Engineering snapshot classification (2026-08-15).** A **DEV-SNAPSHOT** is a
+separate, non-production distribution type for exercising the available source
+tree when first-release inputs are unavailable. A DEV-SNAPSHOT may omit the
+Maps, App VM, Cuttlefish, bootc, provider, and installed-seat obligations and
+may ship without the complete seven-role release bundle. It must be labeled
+`DEV-SNAPSHOT — NOT A FULL RELEASE`, identify its source revision and build
+result, and may not be presented as a release, production candidate, supported
+package channel, or complete platform. DEV-SNAPSHOT artifacts remain subject
+to licensing, authorization, acceptable-use, security, and safety rules; this
+classification does not authorize unsafe or unlawful distribution.
+
 ## §8 — Positioning & trust envelope
 
 **Production workgroup-grade, not hyperscale.** Infrastructure envelope: a single
