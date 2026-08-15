@@ -290,7 +290,7 @@ behavioral evidence is not completion.
 - Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
 - Required outcome: daemon-owned typed music catalog/queue/playback/cache; real mpv audio/video; local/Jellyfin, discovery, cast, handoff, and live proof.
 - Current state: release 11/daemon authority run on five seats; Dell/CPU/NWS/provider-loss pass; Bus fold:
-  `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/audio/cast/handoff remain.
+  `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/cast/handoff implementation remains. Live-seat, provider, package, and continuity proof is post-release validation owned by `WL-TEST-002`.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass.
   Live renderer/provider acceptance is owned by `WL-TEST-002`; no second-seat proof is required. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`.
@@ -400,11 +400,10 @@ behavioral evidence is not completion.
 - **Two-seat handoff:** exact-once transfer, mismatch/stale refusal, and atomic records pass `.50`/`.90`/`.170`; live boundary:
   `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`, `evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
 - **Cast runtime audit:** no physical renderer, usable Chromecast path, receiver unit, or second admitted peer was found; typed paths remain fixture-proven.
-  Physical renderer, Chromecast, and mesh-owner receiver implementation remain open.
-  Any resulting installed-seat or continuity capture is coordinated by `WL-TEST-002`, with no two-seat proof requirement for this epic.
+  Physical renderer, Chromecast, and mesh-owner receiver implementation remain open. Any installed-seat or continuity capture is post-release validation coordinated by `WL-TEST-002`, with no two-seat proof requirement for this epic.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-runtime-audit-r1.md`.
 - **Cast-admission checkpoint (2026-08-06):** URLs, titles, and HTTP endpoints reject oversized/control-bearing input before the network gate; BigBoy tests
-  passed 20/20. Live renderer, Chromecast, and mesh-owner receiver implementation remain open; installed-seat capture is owned by `WL-TEST-002`.
+  passed 20/20. Live renderer, Chromecast, and mesh-owner receiver implementation remain open; installed-seat capture is post-release validation owned by `WL-TEST-002`.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-admission-r1.md`.
 - **Two-catalog outage checkpoint (2026-08-06):** source projection retains two admitted variants under one logical queue track.
   Failed-first/healthy-second decoding and BigBoy gates pass; live outage, mid-track resume, and hardware/package proof remain open.
