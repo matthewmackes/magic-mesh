@@ -122,7 +122,8 @@ behavioral evidence is not completion.
   3. S3 Admit all governed release inputs. BLOCKED: no private preflight argv
      file exists; the RPM signer receipt has been generated and inspected
      privately for the superseded f095b8ce revision; it must be regenerated for
-     d248ba2f at epoch 1786813297. Maps approval/source, App VM trust receipt/
+     the frozen 1dfe6906609d71da9ee2ce20c860912a09b32855 revision at epoch
+     1786813297. Maps approval/source, App VM trust receipt/
      key, Cuttlefish declarations/packages/image receipt, and bootc receipt are
      not admitted for the frozen revision. Maps provider/live proof
      is explicitly deferred to WL-TEST-002; that deferral does not create a
@@ -160,8 +161,15 @@ behavioral evidence is not completion.
   substitute fixtures, unverifiable public images, or provider credentials.
 - Current state: open-source implementation and local-generation paths exist
   for the receipt contracts, but no current-revision production inputs have
-  been admitted. This epic is the implementation/acquisition lane; downstream
-  release epics remain blocked until its receipts pass preflight.
+  been admitted. App VM base admission now consumes the canonical registry-
+  resolved receipt instead of a raw digest, and Kiron admission proves its
+  package bytes against the requested source revision. The canonical RPM lane
+  now consumes one strict mode-0400 private JSON document, binds its revision
+  and epoch to the clean checkout, and no longer reconstructs release inputs
+  from many environment variables. Focused evidence is recorded in
+  docs/platform/evidence/WL-REL-006-2026-08-15-input-admission-hardening-r1.md.
+  This epic is the implementation/acquisition lane; downstream release epics
+  remain blocked until its receipts pass preflight.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: frozen source receipt, Fedora target, architecture, applicable
