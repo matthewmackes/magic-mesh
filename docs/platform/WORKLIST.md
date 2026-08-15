@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **5 active epics:** 5 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **4 active epics:** 4 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -683,7 +683,14 @@ behavioral evidence is not completion.
   checks.
 - Origin or merged source IDs: 2026-07-26 node hardware and safe-controls survey.
 
-### WL-UX-014 - Grade-specific cinematic Kiron health lower thirds
+### WL-UX-014 evidence disposition — implementation closed; S5 proof moved to WL-TEST-002 (2026-08-15)
+
+**Disposition: CLOSED FOR IMPLEMENTATION.**
+
+S1–S4 are implemented and covered by the authored package, renderer, hostile,
+and farm evidence below. S5 live/runtime/release proof is post-first-release
+validation owned by WL-TEST-002 and is not retained as an implementation
+blocker here.
 
 - Status: Remaining
 - Priority: P1
