@@ -316,4 +316,23 @@ mod tests {
         execute_cast_command(&target, &load).expect("Cast receiver must accept media load");
         execute_cast_command(&target, &CastCommand::Pause).expect("Cast receiver must accept pause");
     }
+
+    #[test]
+    fn live_cast_handoff_commits_owner_after_media_success() {
+        let (Ok(address), Ok(url)) = (
+            std::env::var("MDE_CAST_LIVE_TARGET"),
+            std::env::var("MDE_CAST_LIVE_MEDIA_URL"),
+        ) else {
+            return;
+        };
+        let target = CastTarget::new(&address, "operator-supplied Cast target").unwrap();
+        let handoff = super::CastHandoff::new(&url, "video/mp4", 0.0, 99).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cast-owner.json");
+        super::execute_cast_handoff(&target, &handoff, &path)
+            .expect("Cast ownership must commit after media load");
+        let record: super::CastOwnership = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(record.target_id, format!("cast:{address}"));
+        assert_eq!(record.generation, 99);
+    }
 }
