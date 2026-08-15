@@ -103,7 +103,7 @@ behavioral evidence is not completion.
 - Problem: Collaboration is split across legacy Chat, Teams rails, text-only clipboard, duplicate Files/transfers, incomplete Calls media, and an App-VM office path.
 - Required outcome: one egui-native Collaboration surface has exactly Alerts, Chat, Calls, Files, Editor, and Clipboard; durable signed transport, real media, native
   office editing, and one executor replace all retired paths.
-- Current state: signed envelopes, projections, native Editor foundation, POSIX/CAS Files transfer, typed cross-node executor registry, canonical AlertInbox projection, and the bounded legacy migration importer are implemented; the governed SIP call adapter is implemented but requires an installed account for activation. Native LibreOfficeKit transport and the final legacy hard cut remain.
+- Current state: signed envelopes, projections, native Editor foundation, POSIX/CAS Files transfer, typed cross-node executor registry, canonical AlertInbox projection, and the bounded legacy migration importer are implemented; native office editing is explicitly deferred by operator decision (2026-08-15), while the governed SIP call adapter still requires an installed account for activation and the final legacy hard cut remains.
 - **Transfer executor checkpoints (2026-08-09):** only Local/Copy is admitted; Clipboard names its missing profile/Files/session/generation authority and refuses early.
   `.50` passed 2/2 plus 1/1: `docs/platform/evidence/WL-FUNC-011-2026-08-09-transfer-executor-r7.md`, `docs/platform/evidence/WL-FUNC-011-2026-08-09-transfer-executor-r8.md`.
 - **Hard-cut/atomicity checkpoints (2026-08-09):** retired collaboration routes fail closed, and failed SQLite projection preserves clocks/state; BigBoy and `.50` passed:
@@ -121,6 +121,7 @@ behavioral evidence is not completion.
   `evidence/WL-FUNC-011-2026-08-14-outbound-sip-ingress-r1.md`.
 - **Native collaboration full gate (2026-08-14):** BigBoy passed 136/136: `evidence/WL-FUNC-011-2026-08-14-collab-egui-full-farm-gate-r1.md`.
 - Remaining work:
+- **Native office editing disposition (2026-08-15):** operator selected defer/close for the LibreOfficeKit requirement. The existing office admission boundary remains fail-closed and no VCL/GTK or `soffice` fallback is admitted. Reopen only when an approved sandboxed LibreOfficeKit runtime/package is supplied.
 - **Cross-node executor registry and migration audit (2026-08-15):** the production V2 worker admits the typed Mesh/Rsync/Sftp/Http/Scrape/Multipart/Recurring/Clipboard families through the shared registry, and `mde-collab-core` provides the bounded idempotent legacy importer plus canonical `AlertInbox` projection. These were previously described as absent; no new implementation is required for this slice.
 - **CAS read-only replay:** canonical bytes are sealed and substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-readonly-replay-r377.md`.
 - **CAS purge inode:** concurrent replacements cannot redirect destructive purge; `.50` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-purge-inode-binding-r428.md`.
