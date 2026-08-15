@@ -6,6 +6,7 @@ umask 077
 ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 KIRON_VERIFY="${MCNF_KIRON_VERIFY:-$ROOT/packaging/kiron/verify-package.sh}"
 APP_TRUST_VERIFY="${MCNF_APP_TRUST_VERIFY:-$ROOT/install-helpers/verify-app-vm-catalog-trust.py}"
+APP_VM_BASE_RECEIPT="${MCNF_APP_VM_BASE_RECEIPT_INSPECTOR:-$ROOT/packaging/app-vm/produce-base-image-receipt.py}"
 CUTTLEFISH_VERIFY="${MCNF_CUTTLEFISH_VERIFY:-$ROOT/packaging/android/verify-guest-payload.sh}"
 CUTTLEFISH_DEB_VERIFY="${MCNF_CUTTLEFISH_DEB_VERIFY:-$ROOT/packaging/android/verify-guest-debs.sh}"
 SOURCE_VERIFY="${MCNF_SOURCE_VERIFY:-$ROOT/install-helpers/source-revision-receipt.sh}"
@@ -18,16 +19,12 @@ MAPS_MATERIALIZER="${MCNF_MAPS_MATERIALIZER:-$ROOT/packaging/maps/materialize-of
 
 die() { printf 'release-input-preflight: REFUSED: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${2:-}" ]] || die "missing mandatory input: $1"; }
-digest() {
-  [[ "$2" =~ ^sha256:[0-9a-f]{64}$ && "$2" != "sha256:$(printf '%064d' 0)" ]] \
-    || die "$1 must be a non-null immutable sha256 digest"
-}
-
 source_revision='' source_epoch='' app_receipt='' app_key=''
 maps_approval='' maps_source_root='' maps_quota='' maps_verifier=''
 cuttlefish_declaration='' cuttlefish_signature='' cuttlefish_relay='' cuttlefish_agent=''
 rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
-app_vm_base_digest='' cuttlefish_image_receipt='' cuttlefish_image_source_kind=''
+app_vm_base_receipt='' app_vm_base_reference='' app_vm_base_architecture=''
+cuttlefish_image_receipt='' cuttlefish_image_source_kind=''
 cuttlefish_image_original_source='' cuttlefish_image_architecture=''
 cuttlefish_provider_identity='' cuttlefish_android_release_id=''
 cuttlefish_image_compatibility_id='' cuttlefish_image_media_type='application/octet-stream'
@@ -53,7 +50,9 @@ while (($#)); do
     --bootc-base-image-reference) bootc_reference=${2:-}; shift 2 ;;
     --bootc-base-architecture) bootc_architecture=${2:-}; shift 2 ;;
     --bootc-release-role) bootc_role=${2:-}; shift 2 ;;
-    --app-vm-base-digest) app_vm_base_digest=${2:-}; shift 2 ;;
+    --app-vm-base-image-receipt) app_vm_base_receipt=${2:-}; shift 2 ;;
+    --app-vm-base-image-reference) app_vm_base_reference=${2:-}; shift 2 ;;
+    --app-vm-base-architecture) app_vm_base_architecture=${2:-}; shift 2 ;;
     --cuttlefish-image-receipt) cuttlefish_image_receipt=${2:-}; shift 2 ;;
     --cuttlefish-image-source-kind) cuttlefish_image_source_kind=${2:-}; shift 2 ;;
     --cuttlefish-image-original-source) cuttlefish_image_original_source=${2:-}; shift 2 ;;
@@ -77,7 +76,9 @@ for pair in \
   'RPM signing identity receipt' "$rpm_signing_receipt" 'bootc base digest receipt' "$bootc_receipt" \
   'bootc base image reference' "$bootc_reference" 'bootc base architecture' "$bootc_architecture" \
   'bootc release role' "$bootc_role" \
-  'App VM base digest' "$app_vm_base_digest" \
+  'App VM base image receipt' "$app_vm_base_receipt" \
+  'App VM base image reference' "$app_vm_base_reference" \
+  'App VM base architecture' "$app_vm_base_architecture" \
   'Cuttlefish image receipt' "$cuttlefish_image_receipt" \
   'Cuttlefish image source kind' "$cuttlefish_image_source_kind" \
   'Cuttlefish image original source' "$cuttlefish_image_original_source" \
@@ -90,7 +91,13 @@ done
 
 "$SOURCE_VERIFY" --verify "$source_revision" "$source_epoch" >/dev/null \
   || die 'source revision receipt is invalid'
-"$KIRON_VERIFY" --source >/dev/null || die 'UX-014 A-F package admission failed'
+"$KIRON_VERIFY" --source --expected-source-revision "$source_revision" >/dev/null \
+  || die 'UX-014 A-F package admission failed'
+python3 "$APP_VM_BASE_RECEIPT" --repo "$ROOT" inspect \
+  --image-reference "$app_vm_base_reference" --architecture "$app_vm_base_architecture" \
+  --source-revision "$source_revision" --commit-epoch "$source_epoch" \
+  --receipt "$app_vm_base_receipt" >/dev/null \
+  || die 'App VM base-image receipt admission failed'
 
 trust_stage=$(mktemp -d)
 payload_parent=$(mktemp -d)
@@ -196,5 +203,4 @@ python3 "$BOOTC_DIGEST_RECEIPT" inspect --receipt "$bootc_receipt" \
   --expected-release-role "$bootc_role" >/dev/null \
   || die 'bootc base digest receipt admission failed'
 
-digest 'App VM base digest' "$app_vm_base_digest"
 printf 'release-input-preflight: PASS: all mandatory first-release inputs admitted for %s\n' "$source_revision"

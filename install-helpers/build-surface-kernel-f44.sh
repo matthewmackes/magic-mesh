@@ -308,29 +308,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir "$scratch/linux-surface" "$scratch/kernel-ark"
 
-python3 - "$INPUTS/$linux_filename" "$INPUTS/$ark_filename" <<'PY'
-import sys
-import tarfile
-from pathlib import PurePosixPath
-
-for archive in sys.argv[1:]:
-    with tarfile.open(archive, "r:*") as stream:
-        members = stream.getmembers()
-        if not members or len(members) > 250000:
-            raise SystemExit("source archive member count is outside bounds")
-        roots = set()
-        for member in members:
-            path = PurePosixPath(member.name)
-            if path.is_absolute() or ".." in path.parts or not path.parts:
-                raise SystemExit("source archive contains an unsafe path")
-            roots.add(path.parts[0])
-            if member.issym() or member.islnk():
-                target = PurePosixPath(member.linkname)
-                if target.is_absolute() or ".." in target.parts:
-                    raise SystemExit("source archive contains an unsafe link")
-        if len(roots) != 1:
-            raise SystemExit("source archive must have exactly one top-level directory")
-PY
+python3 "$ROOT/install-helpers/verify-surface-source-archive.py" \
+    "$INPUTS/$linux_filename" "$INPUTS/$ark_filename"
 tar --extract --gzip --file "$INPUTS/$linux_filename" --directory "$scratch/linux-surface" \
     --strip-components=1 --no-same-owner --no-same-permissions
 tar --extract --gzip --file "$INPUTS/$ark_filename" --directory "$scratch/kernel-ark" \

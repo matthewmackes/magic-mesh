@@ -19,13 +19,24 @@ source_epoch=$(git -C "$fixture/source-repo" show -s --format=%ct "$source_revis
 bootc_reference='registry.invalid/mcnf/bootc:release'
 bootc_architecture='amd64'
 bootc_role='unified-seat-server'
-for verifier in source kiron app; do
+app_vm_reference='registry.invalid/fedora/app-vm-base:44'
+app_vm_architecture='amd64'
+for verifier in source app; do
   cat >"$fixture/$verifier" <<'EOF'
 #!/usr/bin/env bash
 exit "${FAKE_VERIFIER_RC:-0}"
 EOF
   chmod 0755 "$fixture/$verifier"
 done
+cat >"$fixture/kiron" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${FAKE_VERIFIER_RC:-0} -eq 0 ]] || exit "${FAKE_VERIFIER_RC}"
+[[ $# -eq 3 && $1 == --source && $2 == --expected-source-revision \
+  && $3 == "$PREFLIGHT_TEST_REVISION" ]]
+touch "$PREFLIGHT_TEST_KIRON_MARKER"
+EOF
+chmod 0755 "$fixture/kiron"
 cat >"$fixture/maps-verifier" <<'EOF'
 #!/usr/bin/env bash
 [[ ${FAKE_VERIFIER_RC:-0} -eq 0 ]] || exit "${FAKE_VERIFIER_RC}"
@@ -85,6 +96,28 @@ os.execv(
 )
 EOF
 chmod 0755 "$fixture/bootc-inspector"
+cat >"$fixture/app-vm-base-inspector" <<'EOF'
+#!/usr/bin/env python3
+import os
+import sys
+
+arguments = sys.argv[1:]
+if "--repo" in arguments:
+    index = arguments.index("--repo")
+    del arguments[index:index + 2]
+os.execv(
+    sys.executable,
+    [sys.executable, os.environ["APP_VM_TEST_INSPECTOR"], "--repo", os.environ["APP_VM_TEST_REPO"], "--skopeo", os.environ["APP_VM_TEST_SKOPEO"], *arguments],
+)
+EOF
+chmod 0755 "$fixture/app-vm-base-inspector"
+cat >"$fixture/app-vm-skopeo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1:-} == inspect && ${2:-} == --raw && ${3:-} == "docker://${APP_VM_TEST_REFERENCE:?}" ]]
+cat "$APP_VM_TEST_MANIFEST"
+EOF
+chmod 0755 "$fixture/app-vm-skopeo"
 cat >"$fixture/bin/gpg" <<'EOF'
 #!/usr/bin/env bash
 printf 'sec:-:4096:1:DEADBEEF:0:0:::::::23::0:\n'
@@ -168,6 +201,30 @@ with open(path, "w", encoding="ascii") as stream:
     json.dump(receipt, stream, sort_keys=True, separators=(",", ":"))
     stream.write("\n")
 PY
+app_vm_platform_digest="sha256:$(printf 'a%.0s' {1..64})"
+python3 - "$fixture/app-vm-manifest.json" "$app_vm_platform_digest" <<'PY'
+import json
+import sys
+
+path, platform_digest = sys.argv[1:]
+manifest = {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.index.v1+json",
+    "manifests": [{
+        "digest": platform_digest,
+        "platform": {"os": "linux", "architecture": "amd64"},
+    }],
+}
+with open(path, "w", encoding="ascii") as stream:
+    json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+APP_VM_TEST_REFERENCE="$app_vm_reference" APP_VM_TEST_MANIFEST="$fixture/app-vm-manifest.json" \
+  python3 "$ROOT/packaging/app-vm/produce-base-image-receipt.py" \
+  --repo "$fixture/source-repo" --skopeo "$fixture/app-vm-skopeo" produce \
+  --image-reference "$app_vm_reference" --architecture "$app_vm_architecture" \
+  --source-revision "$source_revision" --commit-epoch "$source_epoch" \
+  --output "$fixture/app-vm-base-receipt.json" >/dev/null
 
 args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --maps-approval "$fixture/maps-approval.json"
@@ -184,7 +241,9 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --bootc-base-image-reference "$bootc_reference"
   --bootc-base-architecture "$bootc_architecture"
   --bootc-release-role "$bootc_role"
-  --app-vm-base-digest "sha256:$(printf 'c%.0s' {1..64})"
+  --app-vm-base-image-receipt "$fixture/app-vm-base-receipt.json"
+  --app-vm-base-image-reference "$app_vm_reference"
+  --app-vm-base-architecture "$app_vm_architecture"
   --cuttlefish-image-receipt "$fixture/cuttlefish-image-receipt.json"
   --cuttlefish-image-source-kind artifact
   --cuttlefish-image-original-source "$fixture/cuttlefish-image.tar"
@@ -197,20 +256,28 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
 envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_VERIFY="$fixture/kiron"
   MCNF_APP_TRUST_VERIFY="$fixture/app" MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
   MCNF_CUTTLEFISH_DEB_VERIFY="$fixture/guest-debs"
+  PREFLIGHT_TEST_REVISION="$source_revision"
+  PREFLIGHT_TEST_KIRON_MARKER="$fixture/kiron-revision-verified"
   PREFLIGHT_TEST_RELAY="$fixture/relay" PREFLIGHT_TEST_AGENT="$fixture/agent"
   PREFLIGHT_TEST_DEB_MARKER="$fixture/guest-debs-verified"
   MCNF_RPM_SIGNING_RECEIPT_INSPECTOR="$fixture/signing-receipt.py"
   MCNF_BOOTC_DIGEST_RECEIPT_INSPECTOR="$fixture/bootc-inspector"
+  MCNF_APP_VM_BASE_RECEIPT_INSPECTOR="$fixture/app-vm-base-inspector"
   MCNF_CUTTLEFISH_IMAGE_RECEIPT_INSPECTOR="$ROOT/packaging/android/produce-image-receipt.py"
   MCNF_CUTTLEFISH_IMAGE_REPO="$fixture/source-repo"
   BOOTC_TEST_INSPECTOR="$ROOT/install-helpers/produce-bootc-digest-receipt.py"
-  BOOTC_TEST_REPO="$fixture/source-repo")
+  BOOTC_TEST_REPO="$fixture/source-repo"
+  APP_VM_TEST_INSPECTOR="$ROOT/packaging/app-vm/produce-base-image-receipt.py"
+  APP_VM_TEST_REPO="$fixture/source-repo" APP_VM_TEST_SKOPEO="$fixture/app-vm-skopeo"
+  APP_VM_TEST_REFERENCE="$app_vm_reference" APP_VM_TEST_MANIFEST="$fixture/app-vm-manifest.json")
 
 run_release() { env "${envs[@]}" "$PRE" "$@" && : >"$marker"; }
 run_release "${args[@]}"
 [[ -e "$marker" ]] || { echo 'preflight self-test: valid fixture did not reach build command' >&2; exit 1; }
+[[ -e "$fixture/kiron-revision-verified" ]] || { echo 'preflight self-test: Kiron verifier did not receive the release revision' >&2; exit 1; }
 [[ -e "$fixture/guest-debs-verified" ]] || { echo 'preflight self-test: deterministic guest DEB verifier was not invoked' >&2; exit 1; }
 echo 'release-input-preflight: bootc receipt integration PASS (revision, epoch, architecture, role, and image reference matched)'
+echo 'release-input-preflight: App VM base receipt integration PASS (revision, epoch, architecture, reference, manifest, and platform digest matched)'
 rm -f "$marker"
 
 missing_maps=()
@@ -290,6 +357,47 @@ if run_release "${bad[@]}" >/dev/null 2>&1; then
 fi
 [[ ! -e "$marker" ]] || { echo 'preflight self-test: bad bootc receipt mutated build state' >&2; exit 1; }
 
+bad=("${args[@]}")
+for ((index = 0; index < ${#bad[@]}; index++)); do
+  if [[ ${bad[index]} == --app-vm-base-architecture ]]; then
+    bad[index + 1]=arm64
+    break
+  fi
+done
+if run_release "${bad[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: mismatched App VM base receipt reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: bad App VM base receipt mutated build state' >&2; exit 1; }
+
+python3 - "$fixture/app-vm-manifest.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="ascii") as stream:
+    value = json.load(stream)
+value["manifests"][0]["digest"] = "sha256:" + "d" * 64
+with open(path, "w", encoding="ascii") as stream:
+    json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+if run_release "${args[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: substituted App VM registry manifest reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: substituted App VM manifest mutated build state' >&2; exit 1; }
+python3 - "$fixture/app-vm-manifest.json" "$app_vm_platform_digest" <<'PY'
+import json
+import sys
+
+path, platform_digest = sys.argv[1:]
+with open(path, encoding="ascii") as stream:
+    value = json.load(stream)
+value["manifests"][0]["digest"] = platform_digest
+with open(path, "w", encoding="ascii") as stream:
+    json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+
 printf 'substituted image bytes\n' >"$fixture/cuttlefish-image.tar"
 if run_release "${args[@]}" >/dev/null 2>&1; then
   echo 'preflight self-test: substituted Cuttlefish image reached build command' >&2; exit 1
@@ -312,6 +420,9 @@ required = (
     'MCNF_BOOTC_BASE_IMAGE_REFERENCE',
     'MCNF_BOOTC_BASE_ARCHITECTURE',
     'MCNF_BOOTC_RELEASE_ROLE',
+    'MCNF_APP_VM_BASE_IMAGE_RECEIPT',
+    'MCNF_APP_VM_BASE_IMAGE_REFERENCE',
+    'MCNF_APP_VM_BASE_ARCHITECTURE',
     'MCNF_CUTTLEFISH_IMAGE_RECEIPT',
     'MCNF_CUTTLEFISH_IMAGE_ORIGINAL_SOURCE',
     'MCNF_CUTTLEFISH_IMAGE_ARCHITECTURE',
@@ -319,7 +430,7 @@ required = (
     'MCNF_CUTTLEFISH_ANDROID_RELEASE_ID',
     'MCNF_CUTTLEFISH_IMAGE_COMPATIBILITY_ID',
 )
-if any(item not in rpm_body for item in required) or 'MCNF_BOOTC_BASE_DIGEST:-' in rpm_body or 'MCNF_CUTTLEFISH_IMAGE_DIGEST:-' in rpm_body:
+if any(item not in rpm_body for item in required) or 'MCNF_BOOTC_BASE_DIGEST:-' in rpm_body or 'MCNF_APP_VM_BASE_DIGEST:-' in rpm_body or 'MCNF_CUTTLEFISH_IMAGE_DIGEST:-' in rpm_body:
     raise SystemExit("preflight self-test: canonical RPM entry does not exclusively consume governed image receipts")
 PY
 echo 'release-input-preflight: self-test PASS (missing or mismatched receipts stop before build command)'
