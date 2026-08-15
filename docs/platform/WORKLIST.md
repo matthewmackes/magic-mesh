@@ -108,6 +108,8 @@ behavioral evidence is not completion.
 
 #### WL-TEST-002 test queue
 
+- **Pre-release verifier controls (2026-08-15):** corrected-forward verifier self-test passed 19/19 and release-gate matrix self-test accepted 1 valid fixture while rejecting 21 hostile fixtures; evidence: `evidence/WL-TEST-002-2026-08-15-release-recovery-verifier-r1.md`. This does not claim exact-release, installed-seat, provider, hardware, or live recovery proof.
+
 1. **Release and package admission:** implementation-complete contracts already cover manifest/provenance, dependency closure, upgrade/install identity, and corrected-forward payload binding; after a signed first development release, verify those properties against the exact admitted bytes.
 2. **Installed baseline:** implementation-complete service, Workers, Bus, storage, and restart/rejoin gates remain; install the exact release on the governed one-node/two-seat test set and record display, audio, network, and physical-seat observations.
 3. **Collaboration and providers:** bounded collaboration and fail-closed provider controls are implementation-complete; activate the governed SIP account and test Calls connect/reconnect/mute/consent/revocation plus deferred provider-backed collaboration and transfer behavior without asserting a fake live state.
