@@ -26,6 +26,13 @@ passed 7/7 on the farm. The Rust `rust_cast` connection itself successfully
 established a CASTV2 session with the operator-supplied receiver. This still
 does not claim media URL delivery or ownership commit.
 
+Opt-in live media validation additionally ran with
+`MDE_CAST_LIVE_MEDIA_URL=https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4`.
+The adapter loaded that public MP4 through the default media receiver and then
+paused it successfully: 8/8 Cast-filtered tests passed. This closes the live
+Cast media load/control proof; receiver discovery projection and renderer
+ownership commit remain separate boundaries.
+
 The playback projection now admits an operator-configured numeric Cast target
 (`MDE_MUSIC_CAST_ADDRESS` plus optional `MDE_MUSIC_CAST_NAME`) as an explicit
 `cast_renderer` row. It remains unavailable until the blocking provider lane

@@ -158,7 +158,7 @@ pub fn execute_cast_command(target: &CastTarget, command: &CastCommand) -> io::R
 
 #[cfg(test)]
 mod tests {
-    use super::{verify_castv2, CastCommand, CastTarget, CASTV2_PORT};
+    use super::{execute_cast_command, verify_castv2, CastCommand, CastTarget, CASTV2_PORT};
     use std::io;
 
     #[test]
@@ -185,5 +185,19 @@ mod tests {
         };
         let target = CastTarget::new(&address, "operator-supplied Cast target").unwrap();
         verify_castv2(&target).expect("operator-supplied Cast target must accept CASTV2 connection");
+    }
+
+    #[test]
+    fn live_cast_media_load_and_pause_when_operator_supplies_url() {
+        let (Ok(address), Ok(url)) = (
+            std::env::var("MDE_CAST_LIVE_TARGET"),
+            std::env::var("MDE_CAST_LIVE_MEDIA_URL"),
+        ) else {
+            return;
+        };
+        let target = CastTarget::new(&address, "operator-supplied Cast target").unwrap();
+        let load = CastCommand::load(&url, "video/mp4", 0.0).unwrap();
+        execute_cast_command(&target, &load).expect("Cast receiver must accept media load");
+        execute_cast_command(&target, &CastCommand::Pause).expect("Cast receiver must accept pause");
     }
 }
