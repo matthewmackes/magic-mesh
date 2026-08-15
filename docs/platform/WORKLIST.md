@@ -5,9 +5,9 @@ runbooks, and operator notes are inputs, not parallel trackers. Historical
 implementation diaries remain in docs/worklist-archive/ and are not executable
 tasks.
 
-## Current Snapshot - 2026-08-06 executable story rewrite
+## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **7 active epics:** 7 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **5 active epics:** 5 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -29,9 +29,9 @@ tasks.
   blocker, not a passing substitute.
 - **Shared release-proof ownership:** first-release input admission, signed
   artifact/package proof, installed baseline acceptance, corrected-forward
-  recovery, and deferred provider/live proofs are owned by `WL-TEST-001`.
+  recovery, and deferred provider/live proofs are owned by `WL-TEST-002`.
   Product epics must not duplicate those rollout tasks; they retain only
-  product-specific implementation and integration gaps, and cite `WL-TEST-001`
+  product-specific implementation and integration gaps, and cite `WL-TEST-002`
   when its acceptance is a dependency.
 - **Test-seat cap (operator lock 2026-08-14):** no validation, rollout proof,
   capture, chaos, recovery, or acceptance activity may require or exercise more
@@ -81,7 +81,7 @@ authorities. Archive old MEDIA and FUNC-007 IDs; they are evidence only.
 8. Clock, distributed alarms/timers, and notification entry cutover.
 9. Quazar visual integration, health modal/Kiron, and release/recovery proof.
 10. Shared first-release, installed-seat, provider, and corrected-forward proof
-    under WL-TEST-001.
+    under WL-TEST-002.
 
 ## Story execution contract
 
@@ -91,6 +91,20 @@ add the stated hostile or regression test; run the stated validation; record the
 revision, command, result, and evidence path; and mark the story complete only
 when the Done when condition is true. A passing compile without the named
 behavioral evidence is not completion.
+
+### WL-TEST-002 - Post-first-development-release testing and proofing
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: Live provider activation and first-release integration evidence depend on operator-supplied artifacts and deployment inputs unavailable during implementation.
+- Required outcome: after the first development release, admit the governed SIP account, run the Calls activation/reconnect/mute lifecycle test, capture package and live evidence, and reconcile the result without weakening proof requirements.
+- Current state: test scope is separated from FUNC-011 implementation; no live provider artifact or release deployment claim is made.
+- Dependencies: WL-FUNC-011 and the first development release.
+- Deliverable: redacted provider readiness artifact, live Calls test result, package/version identity, and farm command/result.
+- Validation: run the named Calls lifecycle and package gates on the build farm, then attach operator-supplied live evidence.
+- Acceptance: no fake connected state; provider absence/failure remains visible; evidence identifies the tested release and authorized provider boundary.
+- Owner: Platform collaboration and release verification.
 
 ## Core Architecture
 
@@ -123,6 +137,7 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Native office editing disposition (2026-08-15):** operator selected defer/close for the LibreOfficeKit requirement. The existing office admission boundary remains fail-closed and no VCL/GTK or `soffice` fallback is admitted. Reopen only when an approved sandboxed LibreOfficeKit runtime/package is supplied.
 - **Cross-node executor registry and migration audit (2026-08-15):** the production V2 worker admits the typed Mesh/Rsync/Sftp/Http/Scrape/Multipart/Recurring/Clipboard families through the shared registry, and `mde-collab-core` provides the bounded idempotent legacy importer plus canonical `AlertInbox` projection. These were previously described as absent; no new implementation is required for this slice.
+- **Calls test disposition (2026-08-15):** live SIP activation and provider proof move to `WL-TEST-002` after the first development release; FUNC-011 retains the bounded adapter and fail-closed lifecycle controls.
 - **CAS read-only replay:** canonical bytes are sealed and substitution fails closed; `.196` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-readonly-replay-r377.md`.
 - **CAS purge inode:** concurrent replacements cannot redirect destructive purge; `.50` 1/1: `evidence/WL-FUNC-011-2026-08-11-cas-purge-inode-binding-r428.md`.
 - **Import-map inode:** hard-link aliases cannot mutate migration replay authority; BigBoy 1/1:
@@ -267,7 +282,7 @@ behavioral evidence is not completion.
   `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/audio/cast/handoff remain.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass.
-  Live renderer/provider acceptance is owned by `WL-TEST-001`; no second-seat proof is required. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`.
+  Live renderer/provider acceptance is owned by `WL-TEST-002`; no second-seat proof is required. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`.
 - **Provider consistency (2026-08-09):** restart selection and stale fallback invalidation passed `.90`; evidence: `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`.
 - **Music Bus replacement (2026-08-10):** `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-10-music-bus-reopen-r158.md`.
 - **Bounded media config (2026-08-11):** shared-folder JSON caps at 64 KiB and rejects symlinks; BigBoy: `evidence/WL-FUNC-021-2026-08-11-media-config-bound-r226.md`.
@@ -375,10 +390,10 @@ behavioral evidence is not completion.
   `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`, `evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
 - **Cast runtime audit:** no physical renderer, usable Chromecast path, receiver unit, or second admitted peer was found; typed paths remain fixture-proven.
   Physical renderer, Chromecast, and mesh-owner receiver implementation remain open.
-  Any resulting installed-seat or continuity capture is coordinated by `WL-TEST-001`, with no two-seat proof requirement for this epic.
+  Any resulting installed-seat or continuity capture is coordinated by `WL-TEST-002`, with no two-seat proof requirement for this epic.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-runtime-audit-r1.md`.
 - **Cast-admission checkpoint (2026-08-06):** URLs, titles, and HTTP endpoints reject oversized/control-bearing input before the network gate; BigBoy tests
-  passed 20/20. Live renderer, Chromecast, and mesh-owner receiver implementation remain open; installed-seat capture is owned by `WL-TEST-001`.
+  passed 20/20. Live renderer, Chromecast, and mesh-owner receiver implementation remain open; installed-seat capture is owned by `WL-TEST-002`.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-admission-r1.md`.
 - **Two-catalog outage checkpoint (2026-08-06):** source projection retains two admitted variants under one logical queue track.
   Failed-first/healthy-second decoding and BigBoy gates pass; live outage, mid-track resume, and hardware/package proof remain open.
