@@ -10,8 +10,10 @@ Read-only endpoint checks from the build host recorded:
 - Manufacturer/model: Xiaomi MIBOX4
 - Google Cast control channel: TCP 8009 reachable
 - Cast HTTPS endpoint: TCP 8443 reachable
+- CastV2 TLS handshake: completed on 2026-08-15 with the device's
+  self-signed certificate (CN/UUID `bc67b7d7-1d52-26a4-0353-76b269ef4b3c`)
 
-This proves target availability only. It does not claim that the Music Rust
-adapter can yet establish the Cast TLS/protobuf session, load media, seek, or
-commit renderer ownership. Those remain implementation work; no additional
+This proves target availability and the live CastV2 TLS channel only. It does
+not claim that the Music Rust adapter has loaded media, played, sought, or
+committed renderer ownership. Those remain implementation work; no additional
 seat is required.
