@@ -39,4 +39,5 @@ The playback projection now admits an operator-configured numeric Cast target
 UDN, model, and numeric address identity. It remains unavailable until the blocking provider lane
 performs live verification, so projection cannot fabricate renderer ownership.
 Generation-bound ownership records use atomic same-directory replacement and
-are covered by the focused farm test; mesh handoff integration remains.
+are covered by the focused farm test. The provider-lane helper now enforces
+command-success-before-commit; mesh handoff schema integration remains.

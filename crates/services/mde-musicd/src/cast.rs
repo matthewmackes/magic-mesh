@@ -71,6 +71,18 @@ pub fn commit_cast_ownership(path: &Path, target: &CastTarget, generation: u64) 
     std::fs::rename(&temp, path)
 }
 
+/// Provider-lane success path: ownership is committed only when the Cast
+/// command has completed successfully.
+pub fn execute_and_commit_cast_command(
+    target: &CastTarget,
+    command: &CastCommand,
+    ownership_path: &Path,
+    generation: u64,
+) -> io::Result<()> {
+    execute_cast_command(target, command)?;
+    commit_cast_ownership(ownership_path, target, generation)
+}
+
 impl CastCommand {
     /// Admit only remote HTTP(S) media and finite, non-negative positions.
     pub fn load(url: &str, content_type: &str, start_seconds: f64) -> io::Result<Self> {
