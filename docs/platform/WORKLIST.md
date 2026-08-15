@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **6 active epics:** 0 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
+- **7 active epics:** 1 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** freeze the exact newest feature-complete source under
   `WL-REL-001`; cut the three RPM roles under `WL-REL-002`; self-sign them and
@@ -145,6 +145,110 @@ behavioral evidence is not completion.
 - Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
 - Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
 - Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
+
+### WL-REL-006 - Create governed open-source release inputs
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: WL-REL-001 cannot admit the first release while Maps, App VM,
+  Cuttlefish, bootc, UX-014 assets, and the private preflight argv exist only as
+  missing operator inputs or non-production fixtures.
+- Required outcome: create or select open-source-compatible inputs, bind every
+  byte and license to the frozen source revision, and produce the exact
+  non-secret receipts required by the canonical preflight. This epic may not
+  substitute fixtures, unverifiable public images, or provider credentials.
+- Current state: open-source implementation and local-generation paths exist
+  for the receipt contracts, but no current-revision production inputs have
+  been admitted. This epic is the implementation/acquisition lane; downstream
+  release epics remain blocked until its receipts pass preflight.
+- Remaining work:
+  1. S1 Establish the open-source input policy.
+     - Inputs: frozen source receipt, Fedora target, architecture, applicable
+       licenses, and the existing receipt/verifier contracts.
+     - Action: choose reproducible open-source sources or local build recipes
+       for each role; record upstream project, license, version, digest method,
+       and whether credentials or operator authorization are required.
+     - Deliverable: redacted open-source input inventory and license manifest.
+     - Validation: every source is redistributable or explicitly operator-gated;
+       no source is labeled production-ready from a test fixture alone.
+     - Done when: all six input families have a named reproducible source or an
+       exact external-provider blocker.
+  2. S2 Produce the Maps input.
+     - Inputs: open map data/provider, immutable tile or catalog source,
+       approved offline-cache policy, frozen source receipt, and license terms.
+     - Action: materialize a bounded local Maps catalog/tile set and generate a
+       current-revision approval receipt; preserve provider attribution and
+       defer live provider proof to WL-TEST-002.
+     - Deliverable: immutable Maps source manifest, hashes, attribution, and
+       approval receipt.
+     - Validation: Maps verifier rejects changed bytes, wrong revision,
+       unapproved provider, quota violation, and path substitution.
+     - Done when: preflight admits the Maps input without claiming live service.
+  3. S3 Produce the App VM input.
+     - Inputs: reproducible open-source base image or authorized registry
+       manifest, architecture, catalog trust root, and frozen source receipt.
+     - Action: build or inspect the base image without pulling unpinned layers;
+       produce the canonical App VM base-image receipt and catalog trust record.
+     - Deliverable: immutable App VM digest, receipt, trust metadata, and
+       license record.
+     - Validation: App VM producer/inspector and build-image admission pass;
+       registry or local bytes are bound to the frozen revision.
+     - Done when: App VM inputs pass preflight before image-context mutation.
+  4. S4 Produce the Cuttlefish input.
+     - Inputs: open-source Cuttlefish image or authorized artifact, Android
+       release/compatibility identity, architecture, guest package sources,
+       and frozen source receipt.
+     - Action: build or inspect the image, generate the immutable image receipt,
+       and create the signed guest declaration over exact package bytes.
+     - Deliverable: Cuttlefish image receipt, declaration, package manifest,
+       hashes, and license record.
+     - Validation: guest payload, declaration, image, and preflight verifiers
+       reject substitution, wrong provider, architecture, release, or revision.
+     - Done when: the Cuttlefish role is admissible without undocumented bytes.
+  5. S5 Produce the bootc input.
+     - Inputs: reproducible open-source bootc base or authorized registry
+       manifest, architecture, expected role, and frozen source receipt.
+     - Action: inspect exact manifest bytes and produce the canonical bootc
+       digest receipt; integrate receipt consumption into release preflight.
+     - Deliverable: immutable bootc receipt and preflight integration evidence.
+     - Validation: architecture, role, digest, revision, epoch, and media type
+       are all fail-closed; unavailable registry access refuses admission.
+     - Done when: preflight consumes the receipt rather than a raw digest.
+  6. S6 Create UX-014 release assets.
+     - Inputs: existing open-source UI assets, Kiron verifier contract, license
+       attribution, frozen source receipt, and required asset dimensions.
+     - Action: create the A-F package assets and their manifest using the
+       governed asset format; do not claim live hardware proof from screenshots.
+     - Deliverable: asset package, manifest, hashes, attribution, and verifier
+       evidence.
+     - Validation: Kiron verifier accepts the complete set and rejects missing,
+       substituted, stale, or unlicensed assets.
+     - Done when: WL-REL-003/004 can consume the exact asset manifest.
+  7. S7 Materialize private first-release preflight argv.
+     - Inputs: all current-revision receipts from S2-S6, RPM signer receipt,
+       private paths, target architecture, and release epoch.
+     - Action: write one mode-0400 private JSON argv file outside Git and run
+       release-input-preflight before any build mutation.
+     - Deliverable: private argv path, redacted input inventory, and preflight
+       transcript.
+     - Validation: missing, changed, symlinked, stale, cross-revision, and
+       fixture inputs refuse; no credentials or private keys enter Git/logs.
+     - Done when: WL-REL-001 S3 is green and downstream release work may start.
+- Scope: open-source source selection, reproducible input generation, receipts,
+  licenses, and preflight admission; no public release or live-seat testing.
+- Relevant files/components: install-helpers/release-input-preflight.sh,
+  packaging/app-vm, packaging/android, install-helpers/produce-bootc-digest-receipt.py,
+  Maps catalog/verifier tools, and the Kiron asset verifier.
+- Dependencies: WL-REL-001 S1/S2; external registry/provider access only where
+  no reproducible local open-source source is available.
+- Acceptance criteria: every mandatory first-release input is reproducible,
+  licensed, immutable, current-revision-bound, and admitted by preflight, or is
+  recorded as one exact external blocker.
+- Verification method: farm-only source/image/package gates, receipt inspectors,
+  hostile substitution tests, license review, and canonical preflight.
+- Origin or merged source IDs: WL-CRIT-006, WL-FUNC-017, WL-FUNC-018,
+  WL-FUNC-020, and the deferred WL-TEST-002 provider-proof queue.
 
 ### WL-REL-002 - Cut the complete three-RPM unsigned handoff
 
