@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **4 active epics:** 4 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **3 active epics:** 3 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
@@ -507,7 +507,15 @@ behavioral evidence is not completion.
 - Origin or merged source IDs: Spotify-class Music survey; archived WL-FUNC-007 and MEDIA-1..17; 2026-08-05/06 Music and Media evidence.
 ## User Interface And Experience
 
-### WL-UX-011 - Node hardware providers and safe controls for Workers
+### WL-UX-011 evidence disposition — implementation closed; Surface proof moved to WL-TEST-002 (2026-08-15)
+
+**Disposition: CLOSED FOR IMPLEMENTATION.**
+
+Provider taxonomy, bounded inventory, capability/generation authorization,
+cancellation, recovery, service controls, and Workers integration are covered
+by the evidence below. Surface kernel/module signing, release artifacts,
+governed seat access, and physical Pro 6/Pro 5 validation are post-release
+proof owned by WL-TEST-002.
 
 - Status: Remaining
 - Priority: P0
