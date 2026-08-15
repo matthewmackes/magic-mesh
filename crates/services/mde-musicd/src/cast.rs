@@ -9,6 +9,7 @@
 use std::io;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::path::Path;
 
 /// The standard CASTV2 control port.
 pub const CASTV2_PORT: u16 = 8009;
@@ -50,6 +51,24 @@ pub enum CastCommand {
     Play,
     Pause,
     Seek { position_seconds: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CastOwnership {
+    pub target_id: String,
+    pub generation: u64,
+}
+
+/// Persist renderer ownership only after the provider command has succeeded.
+/// The same-directory temporary replacement keeps readers from observing a
+/// partial record and binds ownership to the caller's generation.
+pub fn commit_cast_ownership(path: &Path, target: &CastTarget, generation: u64) -> io::Result<()> {
+    let record = CastOwnership { target_id: format!("cast:{}", target.address), generation };
+    let body = serde_json::to_vec(&record)
+        .map_err(|error| io::Error::other(format!("Cast ownership encode failed: {error}")))?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temp, body)?;
+    std::fs::rename(&temp, path)
 }
 
 impl CastCommand {
@@ -214,6 +233,17 @@ mod tests {
         assert_eq!(discovery.udn, "uuid:cast-1");
         assert_eq!(discovery.model, "MIBOX4");
         assert!(super::parse_dial_descriptor(b"<root/>", "172.20.146.150").is_err());
+    }
+
+    #[test]
+    fn ownership_commit_is_generation_bound_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cast-owner.json");
+        let target = CastTarget::new("172.20.146.150", "Family Room TV").unwrap();
+        super::commit_cast_ownership(&path, &target, 42).unwrap();
+        let record: super::CastOwnership = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(record.target_id, "cast:172.20.146.150");
+        assert_eq!(record.generation, 42);
     }
 
     #[test]
