@@ -109,7 +109,7 @@ do_sync() {
   # Agent/model handoffs can restore a file with the same size and timestamp as
   # an older farm copy. Content checksums prevent rsync's quick-check heuristic
   # from silently compiling that stale source as if it were authoritative.
-  rsync -az --checksum --delete -e "${SSH[*]}" \
+  rsync -az --checksum --delete --chmod=Fgo-w,Dgo-w -e "${SSH[*]}" \
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
     --exclude '/.claude' \
     --exclude '/.git' \
@@ -128,7 +128,7 @@ do_sync_revision() {
   trap 'rm -rf -- "$snapshot"' EXIT
   git -C "$REPO" archive --format=tar "$revision" | tar -xf - -C "$snapshot"
   log "rsync immutable source revision $revision → $DEST:$REMOTE_DIR"
-  rsync -az --checksum --delete -e "${SSH[*]}" \
+  rsync -az --checksum --delete --chmod=Fgo-w,Dgo-w -e "${SSH[*]}" \
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
     --exclude '/.claude' --exclude '/.git' \
     "$snapshot/" "$DEST:$REMOTE_DIR/"
