@@ -7,8 +7,9 @@ evidence is currently asserted.
 
 `surface-build-inputs.f44.json` is the earlier producer-side lock. It binds the
 official linux-surface Fedora 43 packaging refs selected for the Fedora 44
-rebuild, the Fedora kernel-ark input, the upstream libwacom tarball, the Surface
-Secure Boot certificate, and a digest-pinned Fedora 44 builder image. It does
+rebuild, the Fedora kernel-ark input, the upstream libwacom tarball, the
+project-owned DEV-SNAPSHOT Surface MOK certificate, and a digest-pinned Fedora
+44 builder image. It does
 not claim that any RPM has been built or signed. Validate it or fetch the full
 hash-checked source set into a new non-overwritten directory with:
 
@@ -38,7 +39,8 @@ explicit signing manifest:
 ```sh
 install-helpers/build-surface-kernel-f44.sh \
   --inputs /verified/input/path --output /new/kernel/path \
-  --private-key /operator-only/MOK.key --certificate /verified/input/path/surface.cer
+  --private-key /operator-only/MOK.key \
+  --certificate /verified/input/path/mcnf-dev-snapshot-surface.cer
 ```
 
 That output still does not assert the module signer and none of the producer
@@ -86,7 +88,7 @@ install-helpers/finalize-surface-stack.py \
   --source-bundle /verified/input/path \
   --signed-dir /new/prepared-rpms \
   --release-key /public/RPM-GPG-KEY-magic-mesh \
-  --certificate /verified/input/path/surface.cer \
+  --certificate /verified/input/path/mcnf-dev-snapshot-surface.cer \
   --bootc-base quay.io/fedora/fedora-bootc:44@sha256:EXACT_64_HEX_DIGEST \
   --output /new/surface-stack-candidate
 ```

@@ -69,12 +69,12 @@
     },
     {
       "id": "surface-certificate",
-      "filename": "surface.cer",
-      "url": "https://raw.githubusercontent.com/linux-surface/linux-surface/d8887bc8ce14a47d5b9d45f6697f05d53e43fe9a/pkg/keys/surface.crt",
-      "ref": "d8887bc8ce14a47d5b9d45f6697f05d53e43fe9a:pkg/keys/surface.crt",
-      "commit": "d8887bc8ce14a47d5b9d45f6697f05d53e43fe9a",
-      "sha256": "362f021b5f8da1a0a6c377d16b005d34701d1879de67b4293d8cbd4859f16b5b",
-      "license": "LicenseRef-linux-surface-certificate"
+      "filename": "mcnf-dev-snapshot-surface.cer",
+      "url": "https://raw.githubusercontent.com/matthewmackes/magic-mesh/61d9828031edc55c2bc3d1550ce37cfc6ea21fa2/packaging/surface/mcnf-dev-snapshot-surface.cer",
+      "ref": "61d9828031edc55c2bc3d1550ce37cfc6ea21fa2",
+      "commit": "61d9828031edc55c2bc3d1550ce37cfc6ea21fa2",
+      "sha256": "61c72922d9778c932c8a89d15b48ccca86c5de74e664cb82b059c9c653cd66b7",
+      "license": "LicenseRef-MCNF-DEV-SNAPSHOT-MOK"
     }
   ],
   "packages": [
