@@ -108,13 +108,13 @@ behavioral evidence is not completion.
 
 #### WL-TEST-002 test queue
 
-1. **Release and package admission:** build/sign the first development release; verify package/image manifests, provenance, dependency closure, upgrade/install identity, and corrected-forward payload binding.
-2. **Installed baseline:** install the exact release on the governed one-node/two-seat test set; record service, Workers, Bus, storage, network, display, audio, and restart/rejoin observations.
-3. **Collaboration and providers:** activate the governed SIP account; test Calls connect/reconnect/mute/consent/revocation; test deferred provider-backed collaboration and transfer behavior without asserting a fake live state.
-4. **GUI and direct-DRM proof:** capture deferred shell, taskbar, style/font, Kiron, Maps, Workers, Editor, Music, and narrow/largest-text states on the real display path; include human visual review where required.
-5. **Media and physical providers:** test mpv/audio/video, cache/network loss, renderer recovery, cast/handoff/DLNA, installed package/CPU behavior, and external catalog/server paths with authorized provider inputs.
-6. **Guest and device integrations:** test App VM/VDI, Browser/Android/Cuttlefish, GPU/audio/input, nested-KVM, remote-session, and guest reconnect/upgrade paths when their signed images and runtime artifacts are admitted.
-7. **Recovery and resilience:** run deferred one-node service/process, display/session, lock/sleep, storage/network, generation, reboot, restart, recovery, and corrected-forward drills; record failures rather than converting unavailable hardware into passes.
+1. **Release and package admission:** implementation-complete contracts already cover manifest/provenance, dependency closure, upgrade/install identity, and corrected-forward payload binding; after a signed first development release, verify those properties against the exact admitted bytes.
+2. **Installed baseline:** implementation-complete service, Workers, Bus, storage, and restart/rejoin gates remain; install the exact release on the governed one-node/two-seat test set and record display, audio, network, and physical-seat observations.
+3. **Collaboration and providers:** bounded collaboration and fail-closed provider controls are implementation-complete; activate the governed SIP account and test Calls connect/reconnect/mute/consent/revocation plus deferred provider-backed collaboration and transfer behavior without asserting a fake live state.
+4. **GUI and direct-DRM proof:** implementation-complete shell, taskbar, style/font, Kiron, Maps, Workers, Editor, and Music slices still require real-display captures, including human visual review where required.
+5. **Media and physical providers:** bounded media/Cast/handoff controls are implementation-complete; test mpv/audio/video, cache/network loss, renderer recovery, Cast/handoff/DLNA, installed package/CPU behavior, and external catalog/server paths with authorized provider inputs.
+6. **Guest and device integrations:** guest/runtime admission controls are implementation-complete; test App VM/VDI, Browser/Android/Cuttlefish, GPU/audio/input, nested-KVM, remote-session, and guest reconnect/upgrade paths when signed images and runtime artifacts are admitted.
+7. **Recovery and resilience:** recovery mechanisms and corrected-forward guards are implementation-complete; run deferred one-node service/process, display/session, lock/sleep, storage/network, generation, reboot, restart, recovery, and corrected-forward drills, recording failures rather than converting unavailable hardware into passes.
 8. **Reconciliation:** map every result to its owning epic, archive release evidence, reopen implementation work for regressions, and retain named operator blockers for missing artifacts or authorization.
 
    **Moved implementation-closed UX proof queues:** `WL-UX-011` Surface
