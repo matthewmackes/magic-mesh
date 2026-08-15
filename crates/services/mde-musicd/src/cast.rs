@@ -53,6 +53,21 @@ pub enum CastCommand {
     Seek { position_seconds: f64 },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastHandoff {
+    pub media_url: String,
+    pub content_type: String,
+    pub position_seconds: f64,
+    pub generation: u64,
+}
+
+impl CastHandoff {
+    pub fn new(media_url: &str, content_type: &str, position_seconds: f64, generation: u64) -> io::Result<Self> {
+        CastCommand::load(media_url, content_type, position_seconds)?;
+        Ok(Self { media_url: media_url.to_owned(), content_type: content_type.to_owned(), position_seconds, generation })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CastOwnership {
     pub target_id: String,
@@ -81,6 +96,20 @@ pub fn execute_and_commit_cast_command(
 ) -> io::Result<()> {
     execute_cast_command(target, command)?;
     commit_cast_ownership(ownership_path, target, generation)
+}
+
+/// Execute a typed Cast handoff and commit ownership at the same generation.
+pub fn execute_cast_handoff(
+    target: &CastTarget,
+    handoff: &CastHandoff,
+    ownership_path: &Path,
+) -> io::Result<()> {
+    let command = CastCommand::load(
+        &handoff.media_url,
+        &handoff.content_type,
+        handoff.position_seconds,
+    )?;
+    execute_and_commit_cast_command(target, &command, ownership_path, handoff.generation)
 }
 
 impl CastCommand {
@@ -256,6 +285,13 @@ mod tests {
         let record: super::CastOwnership = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(record.target_id, "cast:172.20.146.150");
         assert_eq!(record.generation, 42);
+    }
+
+    #[test]
+    fn cast_handoff_reuses_bounded_media_contract() {
+        let handoff = super::CastHandoff::new("https://music.example/song.mp3", "audio/mpeg", 12.5, 7).unwrap();
+        assert_eq!(handoff.generation, 7);
+        assert!(super::CastHandoff::new("file:///secret", "audio/mpeg", 0.0, 1).is_err());
     }
 
     #[test]
