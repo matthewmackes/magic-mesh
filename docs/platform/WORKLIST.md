@@ -95,10 +95,12 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: version 12.1.6 is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
 - Required outcome: freeze one clean, pushed, feature-complete commit and bind every release input, version surface, note, and tag plan to it.
-- Current state: source freeze and version scope are complete at revision
-  01ea65db; browser helpers and the shipped role chooser resolve to 12.1.6,
-  and the five internal non-release crates are documented in
-  docs/RELEASE-VERSIONING.md.
+- Current state: the previously recorded 01ea65db source identity is stale.
+  The current clean checkout and its upstream branch both resolve to
+  f095b8ce66b3183d3bdc6123746ced007b49a0b0 (commit epoch 1786803889), but the
+  replacement source-freeze evidence has not yet been recorded. Browser helpers
+  and the shipped role chooser resolve to 12.1.6, and the five internal
+  non-release crates are documented in docs/RELEASE-VERSIONING.md.
 - Remaining work:
   1. S1 Select the immutable source.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
@@ -116,8 +118,12 @@ behavioral evidence is not completion.
      - Validation: farm metadata/package checks on .50; no runtime version authority other than workspace/package reflection.
      - Done when: every current release surface resolves to 12.1.6 or a documented packaging release suffix.
   3. S3 Admit all governed release inputs. BLOCKED: no private preflight argv
-     file exists; Maps, App VM, Cuttlefish, RPM signer, and bootc receipts are
-     absent. Do not run a build with historical loose artifacts.
+     file exists; the RPM signer receipt has been generated and inspected
+     privately for f095b8ce at epoch 1786803889, but Maps approval/source, App
+     VM trust receipt/key, Cuttlefish declarations/packages/image receipt, and
+     bootc receipt are not admitted for that revision. Maps provider/live proof
+     is explicitly deferred to WL-TEST-002; that deferral does not create a
+     release-input approval. Do not run a build with historical loose artifacts.
      - Inputs: Maps approval/source, App VM trust receipt/key, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
      - Action: create one private JSON argv file containing every mandatory release-input-preflight argument.
      - Deliverable: immutable preflight argument file plus redacted input inventory; never commit credentials or private keys.
