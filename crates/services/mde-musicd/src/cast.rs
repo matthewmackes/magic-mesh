@@ -13,6 +13,41 @@ use std::str::FromStr;
 /// The standard CASTV2 control port.
 pub const CASTV2_PORT: u16 = 8009;
 
+/// The bounded commands that the Music daemon may send to a Cast receiver.
+/// Media execution remains behind the blocking provider lane; the UI and bus
+/// never receive protocol-specific command objects.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CastCommand {
+    Load { url: String, content_type: String, start_seconds: f64 },
+    Play,
+    Pause,
+    Seek { position_seconds: f64 },
+}
+
+impl CastCommand {
+    /// Admit only remote HTTP(S) media and finite, non-negative positions.
+    pub fn load(url: &str, content_type: &str, start_seconds: f64) -> io::Result<Self> {
+        let scheme = url.split_once("://").map(|(scheme, _)| scheme);
+        if !matches!(scheme, Some("http" | "https")) || url.len() > 2048 || url.chars().any(char::is_control) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cast media URL must be a bounded HTTP(S) URL"));
+        }
+        if content_type.is_empty() || content_type.len() > 128 || content_type.chars().any(char::is_control) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Cast media content type"));
+        }
+        if !start_seconds.is_finite() || start_seconds < 0.0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Cast start position"));
+        }
+        Ok(Self::Load { url: url.to_owned(), content_type: content_type.to_owned(), start_seconds })
+    }
+
+    pub fn seek(position_seconds: f64) -> io::Result<Self> {
+        if !position_seconds.is_finite() || position_seconds < 0.0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid Cast seek position"));
+        }
+        Ok(Self::Seek { position_seconds })
+    }
+}
+
 /// A validated, operator-admitted Cast endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CastTarget {
@@ -57,7 +92,7 @@ pub fn verify_castv2(target: &CastTarget) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CastTarget, CASTV2_PORT};
+    use super::{CastCommand, CastTarget, CASTV2_PORT};
     use std::io;
 
     #[test]
@@ -66,5 +101,14 @@ mod tests {
         assert_eq!(CASTV2_PORT, 8009);
         assert_eq!(CastTarget::new("cast.local", "TV").unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(CastTarget::new("172.20.146.150", "\n").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn commands_reject_local_or_unbounded_media_inputs() {
+        assert!(CastCommand::load("http://music.example/song.mp3", "audio/mpeg", 0.0).is_ok());
+        assert!(CastCommand::load("file:///secret.mp3", "audio/mpeg", 0.0).is_err());
+        assert!(CastCommand::load("http://127.0.0.1/song.mp3", "audio/mpeg", 0.0).is_ok());
+        assert!(CastCommand::seek(f64::NAN).is_err());
+        assert!(CastCommand::seek(-1.0).is_err());
     }
 }
