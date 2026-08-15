@@ -156,16 +156,6 @@ mde-vdi-spice = { path = "../mde-vdi-spice" }
 # as the three backends, so `FrameDamage` names the one shared `ColorImage`.
 mde-vdi-core = { path = "../mde-vdi-core" }
 
-# The pure `mde-chat` model (Roster / Contact / Presence / Message / MessageKind)
-# read off the Bus state topics (`state/chat/roster`, `state/chat/conversation/
-# <key>`). WL-FUNC-011 Phase-2 retired the standalone Surface::Chat UI, but the
-# shell still consumes the model: the `ChatState` poll feeds the tray action-
-# center unread badge, and the Browser/Terminal share-to-chat producers construct
-# `MessageKind` for `action/chat/send`. It never depends on the mackesd daemon
-# crate (§6 mesh/desktop boundary; the Bus JSON is the seam), just the shared
-# services-tier model. The edge points inward (§6).
-mde-chat = { path = "../../services/mde-chat" }
-
 # WL-FUNC-011 — the Surface::Communications live mount. `mde-collab-egui` is the
 # pure `CommunicationsSurface` widget (Activity + Messages over the CollabReadModel
 # projections); the shell hands it a Bus-backed `CollabData` folded off the
@@ -221,6 +211,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+mde-chat = { path = "../../services/mde-chat" }
 # The Car-Mode instrument-strip tests seed a DETERMINISTIC simulated cockpit via
 # `MapsLocationSurface::simulated()`. That fixture is cfg-gated out of every
 # production build (WL-UX-007/S1) and only reachable through this dev-only

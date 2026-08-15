@@ -23,12 +23,14 @@ mod bus_reader;
 mod car_home;
 mod car_keymap;
 mod car_motion_policy;
+mod calendar;
 // WL-FUNC-011 Phase-2 retired the standalone Surface::Chat render. This module
 // remains only for the shared calendar helper and compatibility tests while the
 // canonical Communications read model owns live collaboration notifications.
 // Its ICQ render path and Bus polling are unreachable from the shipped shell.
 mod acceptance_cli;
 #[allow(dead_code)]
+#[cfg(test)]
 mod chat;
 mod chooser;
 mod chrome;
@@ -1135,6 +1137,7 @@ struct Shell {
     /// The Chat surface (NOTIFY-CHAT-3) — the ICQ roster + conversation panes over
     /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
     /// read-model. A pure renderer; sends via `action/chat/send`.
+    #[cfg(test)]
     chat: chat::ChatState,
     /// The Communications surface (WL-FUNC-011) — the unified collaboration hub
     /// (`mde-collab-egui`'s `CommunicationsSurface`) mounted live: a Bus-backed
@@ -1435,6 +1438,7 @@ impl Shell {
             session_rail: session_rail::SessionRailState::new(),
             sessions_picker_open: false,
             infra_code: iac::InfraCodeState::default(),
+            #[cfg(test)]
             chat: chat::ChatState::default(),
             communications: communications::CommunicationsState::default(),
             phones_hub: phones_hub::PhonesHubState::default(),

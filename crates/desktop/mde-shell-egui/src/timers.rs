@@ -738,7 +738,7 @@ const fn clock_weekday(weekday: JiffWeekday) -> ClockWeekday {
 
 fn fmt_utc_minute(utc_ms: i64) -> String {
     let seconds = utc_ms.div_euclid(1_000);
-    let (_, month, day) = crate::chat::civil_from_days(seconds.div_euclid(DAY_SECS));
+    let (_, month, day) = crate::calendar::civil_from_days(seconds.div_euclid(DAY_SECS));
     let tod = seconds.rem_euclid(DAY_SECS);
     format!(
         "{month:02}-{day:02} {:02}:{:02} UTC",

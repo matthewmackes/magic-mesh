@@ -1008,7 +1008,7 @@ fn bottom_tray(
 
     let (time, date) = match crate::timers::display_unix() {
         Ok(now) => {
-            let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
+            let (year, month, day) = crate::calendar::civil_from_days(now.div_euclid(86_400));
             (
                 crate::timers::hhmm(now),
                 format!("{month:02}/{day:02}/{year:04}"),

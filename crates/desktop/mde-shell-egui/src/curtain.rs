@@ -465,11 +465,11 @@ fn lift_offset(p: f32) -> f32 {
 
 /// The face's two lines (lock 6): wall-clock `HH:MM` over the civil
 /// `YYYY-MM-DD`, UTC — the same no-time-crate calendar fold the Chat timeline
-/// runs ([`crate::chat::civil_from_days`] is the crate's ONE calendar, §6),
+/// runs ([`crate::calendar::civil_from_days`] is the crate's ONE calendar, §6),
 /// restated here rather than reaching across surface modules.
 fn face_lines(unix_secs: i64) -> (String, String) {
     let tod = unix_secs.rem_euclid(86_400);
-    let (year, month, day) = crate::chat::civil_from_days(unix_secs.div_euclid(86_400));
+    let (year, month, day) = crate::calendar::civil_from_days(unix_secs.div_euclid(86_400));
     (
         format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60),
         format!("{year:04}-{month:02}-{day:02}"),
