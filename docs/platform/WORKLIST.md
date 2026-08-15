@@ -151,6 +151,7 @@ behavioral evidence is not completion.
   `mackesd` passed 1/1 and `mde-voice-hud` SIP passed 37/37:
   `evidence/WL-FUNC-011-2026-08-14-outbound-sip-ingress-r1.md`.
 - **Native collaboration full gate (2026-08-14):** BigBoy passed 136/136: `evidence/WL-FUNC-011-2026-08-14-collab-egui-full-farm-gate-r1.md`.
+- **Chat poll hard-cut (2026-08-15):** the shell no longer polls the retired `mde-chat` model; expanded-shell notification polling now uses the canonical Communications read model. BigBoy compiled and linked the shell and passed the targeted legacy-route test 1/1: `evidence/WL-FUNC-011-2026-08-15-chat-poll-hard-cut-r1.md`.
 - Remaining work:
 - **Native office editing disposition (2026-08-15):** operator selected defer/close for the LibreOfficeKit requirement. The existing office admission boundary remains fail-closed and no VCL/GTK or `soffice` fallback is admitted. Reopen only when an approved sandboxed LibreOfficeKit runtime/package is supplied.
 - **Cross-node executor registry and migration audit (2026-08-15):** the production V2 worker admits the typed Mesh/Rsync/Sftp/Http/Scrape/Multipart/Recurring/Clipboard families through the shared registry, and `mde-collab-core` provides the bounded idempotent legacy importer plus canonical `AlertInbox` projection. These were previously described as absent; no new implementation is required for this slice.

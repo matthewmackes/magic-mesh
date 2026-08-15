@@ -23,13 +23,10 @@ mod bus_reader;
 mod car_home;
 mod car_keymap;
 mod car_motion_policy;
-// WL-FUNC-011 Phase-2 retired the standalone Surface::Chat render, but this module
-// is kept for its still-live parts: `civil_from_days` (the crate's ONE calendar,
-// consumed by the clock/curtain/timers) and `ChatState::poll` (folds the chat model
-// off the Bus to feed the tray action-center unread badge). Its dormant ICQ-render
-// path (`ChatState::show` + the render submodule) is now unreachable — allow it dead
-// pending the mde-chat → mde-collab-core migration tracked in the parity ledger,
-// rather than leaving a ~215-warning cascade.
+// WL-FUNC-011 Phase-2 retired the standalone Surface::Chat render. This module
+// remains only for the shared calendar helper and compatibility tests while the
+// canonical Communications read model owns live collaboration notifications.
+// Its ICQ render path and Bus polling are unreachable from the shipped shell.
 mod acceptance_cli;
 #[allow(dead_code)]
 mod chat;
@@ -3197,17 +3194,6 @@ impl Shell {
             self.nav.surface = Surface::Desktop;
         }
 
-        // The chat notification model — folded alerts + clipboard clips + human
-        // chat — tails its `state/chat/*` read-model whenever the shell is expanded:
-        // a cheap incremental read that keeps the roster + conversations live and
-        // drives the tray action-center unread badge (no cold-start wait). The
-        // standalone Chat surface was retired in the WL-FUNC-011 Phase-2 cutover
-        // (its feed is now the Communications hub's Alerts/Messages modes), but the
-        // model poll stays live here as the badge's source.
-        if self.nav.expanded {
-            self.chat.poll(ctx);
-        }
-
         // The Storage surface tails the `state/storage/*` mirrors + the selected
         // peer's progress lane while it's in view — a cheap local scan so a UDisks2
         // change on any peer surfaces without operator input (E12-21).
@@ -3257,7 +3243,7 @@ impl Shell {
         // aggregated call-state) on its cadence while in view (WL-FUNC-011) — a
         // cheap local latest-wins read; the honest empty rail until the worker's
         // projections land (§7).
-        if self.nav.expanded && self.nav.surface == Surface::Communications {
+        if self.nav.expanded {
             self.communications.poll(ctx);
         }
 
