@@ -291,7 +291,7 @@ behavioral evidence is not completion.
 - Required outcome: daemon-owned typed music catalog/queue/playback/cache; real mpv audio/video; local/Jellyfin, discovery, cast, handoff, and live proof.
 - Current state: release 11/daemon authority run on five seats; Dell/CPU/NWS/provider-loss pass; Bus fold:
   `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/cast/handoff implementation remains. Live-seat, provider, package, and continuity proof is post-release validation owned by `WL-TEST-002`.
-- **Cast target availability (2026-08-15):** operator supplied `172.20.146.150`; the reachable Xiaomi MIBOX4 exposes DIAL on 8008 and Cast control/TLS ports 8009/8443. Device proof is recorded in `evidence/WL-FUNC-021-2026-08-15-cast-target-availability-r1.md`; the remaining gap is the typed Rust Cast adapter and control lifecycle.
+- **Cast adapter foundation (2026-08-15):** `mde-musicd` now owns a bounded numeric-address Cast target and CASTV2 TLS/protobuf connection seam using `rust_cast`; focused farm tests pass 5/5. The reachable Xiaomi MIBOX4 proof is recorded in `evidence/WL-FUNC-021-2026-08-15-cast-target-availability-r1.md`; media load/play/seek/ownership control remains.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass.
   Live renderer/provider acceptance is owned by `WL-TEST-002`; no second-seat proof is required. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`.

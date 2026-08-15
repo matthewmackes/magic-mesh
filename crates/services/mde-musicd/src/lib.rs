@@ -14,6 +14,7 @@
 pub mod airsonic;
 pub mod bus_responder;
 pub mod cache;
+pub mod cast;
 pub mod clock_audio;
 pub mod creds;
 pub mod domain;

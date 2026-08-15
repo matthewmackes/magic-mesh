@@ -60,6 +60,10 @@ zbus       = { version = "5", default-features = false, features = ["tokio"] }
 # AIR-16 — the get-cover-art Bus verb base64-encodes the fetched image
 # bytes into its JSON reply (the GUI decodes + runs dominant-colour).
 base64     = "0.22"
+# AIR-18 — the approved CASTV2 client for bounded renderer discovery and
+# media-control sessions. The daemon owns this blocking adapter on its
+# dedicated provider lane; the UI only consumes typed target projections.
+rust_cast = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
