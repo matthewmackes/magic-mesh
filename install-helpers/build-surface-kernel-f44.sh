@@ -108,12 +108,15 @@ if header_end < 0:
 header = phase_two[:header_end]
 required = (
     "--network=none",
+    '"LOCKED_ARK_BRANCH=$ark_branch"',
     '"$scratch:/work"',
     '"$PRIVATE_KEY:/credentials/MOK.key:ro"',
     '"$CERTIFICATE:/credentials/MOK.crt:ro"',
 )
 if any(value not in header for value in required):
     raise SystemExit("key-bearing build invocation is not offline with exact read-only mounts")
+if 'git init --quiet --initial-branch="$LOCKED_ARK_BRANCH"' not in phase_two:
+    raise SystemExit("offline kernel-ark worktree does not use the locked release branch")
 print("Surface kernel container phase-boundary assertions passed")
 PY
     echo "Surface kernel builder self-test passed (9 hostile/structural fixtures rejected)"
@@ -249,13 +252,16 @@ items = {row["id"]: row for row in lock["inputs"]}
 print(lock["builder_image"])
 for ident in mapping["input_ids"]:
     item = items[ident]
-    print("\t".join((ident, item["filename"], item["commit"], item["sha256"])))
+    print("\t".join((ident, item["filename"], item["ref"], item["commit"], item["sha256"])))
 PY
 )
 builder_image=${build_metadata[0]}
-IFS=$'\t' read -r _ linux_filename linux_commit linux_sha <<<"${build_metadata[1]}"
-IFS=$'\t' read -r _ ark_filename ark_commit ark_sha <<<"${build_metadata[2]}"
-IFS=$'\t' read -r _ cert_filename cert_commit cert_sha <<<"${build_metadata[3]}"
+IFS=$'\t' read -r _ linux_filename linux_ref linux_commit linux_sha <<<"${build_metadata[1]}"
+IFS=$'\t' read -r _ ark_filename ark_ref ark_commit ark_sha <<<"${build_metadata[2]}"
+IFS=$'\t' read -r _ cert_filename cert_ref cert_commit cert_sha <<<"${build_metadata[3]}"
+[[ "$ark_ref" =~ ^refs/tags/kernel-([0-9]+)\.([0-9]+)\.[0-9]+-[0-9]+$ ]] \
+    || { echo "locked kernel-ark ref cannot derive the Fedora release branch" >&2; exit 1; }
+ark_branch="linux-${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.y"
 
 actual_cert_sha="$(sha256sum "$CERTIFICATE" | awk '{print $1}')"
 [[ "$actual_cert_sha" == "$cert_sha" ]] \
@@ -371,12 +377,13 @@ podman run --rm --pull=never \
     --network=none \
     --security-opt label=disable \
     --env "LOCKED_ARK_COMMIT=$ark_commit" \
+    --env "LOCKED_ARK_BRANCH=$ark_branch" \
     --volume "$scratch:/work" \
     --volume "$PRIVATE_KEY:/credentials/MOK.key:ro" \
     --volume "$CERTIFICATE:/credentials/MOK.crt:ro" \
     "$deps_image" bash -ceu '
         cd /work/kernel-ark
-        git init --quiet
+        git init --quiet --initial-branch="$LOCKED_ARK_BRANCH"
         git config user.name "MCNF Surface Builder"
         git config user.email "surface-builder@invalid"
         git add --all
