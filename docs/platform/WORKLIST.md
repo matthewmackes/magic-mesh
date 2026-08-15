@@ -291,7 +291,7 @@ behavioral evidence is not completion.
 - Required outcome: daemon-owned typed music catalog/queue/playback/cache; real mpv audio/video; local/Jellyfin, discovery, cast, handoff, and live proof.
 - Current state: release 11/daemon authority run on five seats; Dell/CPU/NWS/provider-loss pass; Bus fold:
   `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/cast/handoff implementation remains. Live-seat, provider, package, and continuity proof is post-release validation owned by `WL-TEST-002`.
-- **Cast adapter foundation (2026-08-15):** `mde-musicd` now owns a bounded numeric-address Cast target and CASTV2 TLS/protobuf connection seam using `rust_cast`; focused farm tests pass 5/5. The reachable Xiaomi MIBOX4 proof is recorded in `evidence/WL-FUNC-021-2026-08-15-cast-target-availability-r1.md`; media load/play/seek/ownership control remains.
+- **Cast adapter and command dispatch (2026-08-15):** `mde-musicd` now owns a bounded numeric-address Cast target, CASTV2 TLS/protobuf seam, and blocking default-media-receiver load/play/pause/seek dispatch using `rust_cast`; focused farm tests pass 6/6. The reachable Xiaomi MIBOX4 proof is recorded in `evidence/WL-FUNC-021-2026-08-15-cast-target-availability-r1.md`; receiver discovery projection and renderer ownership commit remain.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass.
   Live renderer/provider acceptance is owned by `WL-TEST-002`; no second-seat proof is required. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`.
@@ -397,7 +397,7 @@ behavioral evidence is not completion.
   Seat 15 recovers the provider while daemon/cached projections remain available; audible in-progress continuity remains open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-network-loss-reconnect-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-reconnect-timeout-r1.md`.
 - **Zero-audio failover:** empty streams cannot suppress fallback; `.196` 1/1: `evidence/WL-FUNC-021-2026-08-11-zero-audio-provider-failover-r289.md`.
-- **Cast loopback:** bounded discovery/control/seek passes; live proof open: `evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
+- **Cast loopback:** bounded discovery/control/seek passes; live CastV2 channel and command-dispatch seam are implemented; media/ownership live proof remains post-release validation in `WL-TEST-002`: `evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
 - **Two-seat handoff:** exact-once transfer, mismatch/stale refusal, and atomic records pass `.50`/`.90`/`.170`; live boundary:
   `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`, `evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
 - **Cast runtime audit:** no physical renderer, usable Chromecast path, receiver unit, or second admitted peer was found; typed paths remain fixture-proven.

@@ -90,6 +90,72 @@ pub fn verify_castv2(target: &CastTarget) -> io::Result<()> {
     Ok(())
 }
 
+/// Execute one admitted command against the default media receiver.
+///
+/// This is deliberately a blocking operation: CASTV2 request/response traffic
+/// is kept out of async/UI code, and a failed receiver operation is returned to
+/// the caller instead of being reported as successful playback.
+pub fn execute_cast_command(target: &CastTarget, command: &CastCommand) -> io::Result<()> {
+    use rust_cast::channels::media::{Media, LoadOptions, StreamType};
+    use rust_cast::channels::receiver::CastDeviceApp;
+
+    let device = rust_cast::CastDevice::connect_without_host_verification(
+        target.address.to_string(),
+        CASTV2_PORT,
+    )
+    .map_err(|error| io::Error::other(format!("Cast connection failed: {error}")))?;
+    let app = device
+        .receiver
+        .launch_app(&CastDeviceApp::DefaultMediaReceiver)
+        .map_err(|error| io::Error::other(format!("Cast receiver launch failed: {error}")))?;
+    device
+        .connection
+        .connect(app.transport_id.as_str())
+        .map_err(|error| io::Error::other(format!("Cast media channel failed: {error}")))?;
+
+    let result = match command {
+        CastCommand::Load { url, content_type, start_seconds } => device
+            .media
+            .load_with_opts(
+                app.transport_id.as_str(),
+                app.session_id.as_str(),
+                &Media {
+                    content_id: url.clone(),
+                    content_type: content_type.clone(),
+                    stream_type: StreamType::Buffered,
+                    duration: None,
+                    metadata: None,
+                },
+                LoadOptions { current_time: *start_seconds, autoplay: true },
+            )
+            .map(|_| ()),
+        CastCommand::Play | CastCommand::Pause | CastCommand::Seek { .. } => {
+            let status = device
+                .media
+                .get_status(app.transport_id.as_str(), None)
+                .map_err(|error| io::Error::other(format!("Cast media status failed: {error}")))?;
+            let entry = status.entries.first().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Cast receiver has no active media")
+            })?;
+            match command {
+                CastCommand::Play => device.media.play(app.transport_id.as_str(), entry.media_session_id).map(|_| ()),
+                CastCommand::Pause => device.media.pause(app.transport_id.as_str(), entry.media_session_id).map(|_| ()),
+                CastCommand::Seek { position_seconds } => device
+                    .media
+                    .seek(
+                        app.transport_id.as_str(),
+                        entry.media_session_id,
+                        Some(*position_seconds as f32),
+                        None,
+                    )
+                    .map(|_| ()),
+                CastCommand::Load { .. } => unreachable!(),
+            }
+        }
+    };
+    result.map_err(|error| io::Error::other(format!("Cast media command failed: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CastCommand, CastTarget, CASTV2_PORT};
