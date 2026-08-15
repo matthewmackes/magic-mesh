@@ -65,7 +65,7 @@ pub struct MusicState {
 }
 
 /// A take-over request: `from_peer` asks the current owner to yield.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffIntent {
     /// ULID — also the intent file's basename.
     pub intent_id: String,
@@ -74,6 +74,12 @@ pub struct HandoffIntent {
     /// Current owner being asked to pause (`None` = claim an idle mesh).
     #[serde(default)]
     pub to_peer: Option<String>,
+    /// Target class; absent legacy records are treated as mesh seats.
+    #[serde(default = "default_target_kind")]
+    pub target_kind: String,
+    /// Provider-specific target identity, when the target is not a mesh seat.
+    #[serde(default)]
+    pub target_id: String,
     /// Epoch-ms the intent was issued (conflict tiebreak: latest wins).
     pub issued_ms: u64,
 }
@@ -82,7 +88,7 @@ pub struct HandoffIntent {
 /// paused state. The requesting peer consumes this record to resume the same
 /// queue song at the owner's exact position; it is coordination metadata, not
 /// a second playback state authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffCompletion {
     /// The intent that caused the yield.
     pub intent_id: String,
@@ -106,6 +112,16 @@ pub struct HandoffCompletion {
     /// After this deadline the source is allowed to reclaim authority.
     #[serde(default)]
     pub expires_ms: u64,
+    /// Target class carried forward from the intent.
+    #[serde(default = "default_target_kind")]
+    pub target_kind: String,
+    /// Provider-specific target identity, when applicable.
+    #[serde(default)]
+    pub target_id: String,
+}
+
+fn default_target_kind() -> String {
+    "mesh_seat".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,6 +664,8 @@ pub fn post_takeover(
         intent_id: id.clone(),
         from_peer: from_peer.to_string(),
         to_peer,
+        target_kind: "mesh_seat".to_owned(),
+        target_id: String::new(),
         issued_ms: now_ms,
     };
     let d = intents_dir(dir);
@@ -776,6 +794,7 @@ mod tests {
             from_peer: from.into(),
             to_peer: to.map(ToString::to_string),
             issued_ms: issued,
+            ..Default::default()
         }
     }
 
@@ -800,6 +819,7 @@ mod tests {
             position_ms,
             completed_ms,
             expires_ms: completed_ms.saturating_add(HANDOFF_ACK_TIMEOUT_MS),
+            ..Default::default()
         }
     }
 

@@ -4563,6 +4563,8 @@ fn apply_pending_handoff(engine: Option<&Engine>, queue_path: &Path) {
         expires_ms: snapshot
             .updated_ms
             .saturating_add(state::HANDOFF_ACK_TIMEOUT_MS),
+        target_kind: "mesh_seat".to_owned(),
+        target_id: String::new(),
     };
     if let Err(error) = state::write_completion(&dir, &completion) {
         let restored = MusicState {
@@ -7014,6 +7016,7 @@ mod tests {
             from_peer: "target-seat".into(),
             to_peer: Some("source-seat".into()),
             issued_ms: 1_000,
+            ..Default::default()
         };
         let completion = state::HandoffCompletion {
             intent_id: intent.intent_id.clone(),
@@ -7024,6 +7027,7 @@ mod tests {
             position_ms: 42_500,
             completed_ms: 1_001,
             expires_ms: 1_001 + state::HANDOFF_ACK_TIMEOUT_MS,
+            ..Default::default()
         };
 
         let mut source_yields = 0;
@@ -7170,6 +7174,7 @@ mod tests {
             from_peer: "target-seat".into(),
             to_peer: Some("source-seat".into()),
             issued_ms: 20_000,
+            ..Default::default()
         };
         let completion = state::HandoffCompletion {
             intent_id: intent.intent_id.clone(),
@@ -7180,6 +7185,7 @@ mod tests {
             position_ms: 73_250,
             completed_ms: 20_001,
             expires_ms: 20_001 + state::HANDOFF_ACK_TIMEOUT_MS,
+            ..Default::default()
         };
 
         for polling_peer in ["source-seat", "unrelated-seat"] {

@@ -43,3 +43,8 @@ are covered by the focused farm test. The provider-lane helper now enforces
 command-success-before-commit; mesh handoff schema integration remains.
 The typed `CastHandoff` contract carries bounded media identity, position, and
 generation into that provider-lane helper.
+
+The durable Music handoff records now carry optional target kind and target
+identity fields with `mesh_seat` defaults for legacy records. The farm handoff
+compatibility suite passed 15/15, including exact-once, expiry, replay, and
+atomic-record regressions.
