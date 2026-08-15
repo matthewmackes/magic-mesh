@@ -391,7 +391,7 @@ behavioral evidence is not completion.
 - **Typed target handoff checkpoint (2026-08-06):** fresh idle peers publish typed `transfer`; stale/owning peers remain browse-only. `.50` passed 48/48; live proof remains:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-target-handoff-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-peer-targets-r1.md`.
 - **Handoff routing:** owner/bystander pumps preserve another seat's completion; BigBoy 12/12; evidence: `evidence/WL-FUNC-021-08-09-handoff-target-routing-r95.md`.
-- **Cast:** bounds passed; live open: `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`.
+- **Cast:** bounds, live CASTV2 connection, DIAL identity, media load, pause, and generation-bound ownership passed; mesh handoff integration remains: `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`, `evidence/WL-FUNC-021-2026-08-15-cast-adapter-foundation-r1.md`.
 - **Live provider loss:** seat 15 recovered with zero restarts; audible continuity remains: `evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.
 - **Provider-loss reconnect:** bounded `timeOffset` resume clears buffered-ahead samples, preserves cache, and refuses arbitrary URLs; focused gates pass.
   Seat 15 recovers the provider while daemon/cached projections remain available; audible in-progress continuity remains open.
@@ -400,11 +400,10 @@ behavioral evidence is not completion.
 - **Cast loopback:** bounded discovery/control/seek passes; live CastV2 channel and command-dispatch seam are implemented; media/ownership live proof remains post-release validation in `WL-TEST-002`: `evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
 - **Two-seat handoff:** exact-once transfer, mismatch/stale refusal, and atomic records pass `.50`/`.90`/`.170`; live boundary:
   `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`, `evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
-- **Cast runtime audit:** no physical renderer, usable Chromecast path, receiver unit, or second admitted peer was found; typed paths remain fixture-proven.
-  Physical renderer, Chromecast, and mesh-owner receiver implementation remain open. Any installed-seat or continuity capture is post-release validation coordinated by `WL-TEST-002`, with no two-seat proof requirement for this epic.
+- **Cast runtime audit:** the authorized Xiaomi MIBOX4 Cast target is now reachable and the Rust adapter has live CASTV2/media proof. Mesh-owner receiver integration remains open. Any installed-seat or continuity capture is post-release validation coordinated by `WL-TEST-002`, with no two-seat proof requirement for this epic.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-runtime-audit-r1.md`.
 - **Cast-admission checkpoint (2026-08-06):** URLs, titles, and HTTP endpoints reject oversized/control-bearing input before the network gate; BigBoy tests
-  passed 20/20. Live renderer, Chromecast, and mesh-owner receiver implementation remain open; installed-seat capture is post-release validation owned by `WL-TEST-002`.
+  passed 20/20. Live Cast adapter/media proof is recorded separately; mesh-owner receiver integration and installed-seat capture remain post-release validation owned by `WL-TEST-002`.
   Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-admission-r1.md`.
 - **Two-catalog outage checkpoint (2026-08-06):** source projection retains two admitted variants under one logical queue track.
   Failed-first/healthy-second decoding and BigBoy gates pass; live outage, mid-track resume, and hardware/package proof remain open.
@@ -417,8 +416,8 @@ behavioral evidence is not completion.
 - **Real-mpv UI (2026-08-07):** frames clear; 110/110 UI and 257 tests passed; physical proof remains: `docs/platform/evidence/WL-FUNC-021-2026-08-07-media-render-clear-r1.md`.
 - **Continuation:** daemon 182/182, roaming 18/18, reconnect 8/8, router 26/26, and Dell CPU passed:
   `evidence/WL-FUNC-021-2026-08-06-roaming-root-loss-r1.md`, `evidence/WL-FUNC-021-2026-08-06-reconnect-loop-audit-r1.md`.
-- **Live boundary:** same-provider resume and package/gateway gates pass; no physical cast target was found and Dell later became unreachable.
-  Live loss, renderer, handoff, auth/rotation, physical cast/two-seat, and two-seat CPU/NWS remain open; no third seat is required.
+- **Live boundary:** same-provider resume and package/gateway gates pass; the authorized Cast target is now available and media control is proven.
+  Live loss, renderer recovery, mesh handoff, auth/rotation, and two-seat CPU/NWS remain open; no third seat is required.
   `evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`, `evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`.
 - **Seat-15 CPU:** bounded samples found Syncthing convergence; load stayed below capacity and no daemon was pegged; steady-state retest remains:
   `evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`, `evidence/WL-FUNC-021-2026-08-10-seat15-cpu-retest-r157.md`.
