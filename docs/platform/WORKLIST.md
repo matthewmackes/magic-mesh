@@ -93,120 +93,300 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: workspace version `12.1.6` is newer than the latest published tag, while existing loose RPMs and checksum files are from different cuts and cannot define one release identity.
-- Required outcome: select one clean, pushed, feature-complete commit; verify every shipped Cargo workspace reflects the root version; freeze its revision, commit epoch, target Fedora release, release notes, and exact tag name without changing source underneath the cut.
-- Current state: the branch is clean and pushed, root version is `12.1.6`, latest release tag is `magic-mesh-v12.1.1`, and no admissible seven-role bundle is bound to the current head.
-- Dependencies: all intended implementation epics archived or explicitly deferred to `WL-TEST-002`; operator authorization to self-sign is recorded in the release session.
-- Deliverable: clean-source receipt, version-inheritance report, release notes, selected revision/epoch, tag plan, and admitted release-input argument files for Fedora 44.
-- Validation: `source-revision-receipt.sh`, Cargo metadata/version checks, release-input preflight, worklist gate, and a negative scan for competing runtime version literals.
-- Acceptance: one immutable source identity is selected; every release input binds to it; no historical RPM, stale checksum file, dirty tree, or moving branch can enter the cut.
-- Owner: Release engineering.
+- Problem: version 12.1.6 is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
+- Required outcome: freeze one clean, pushed, feature-complete commit and bind every release input, version surface, note, and tag plan to it.
+- Current state: the branch is clean and pushed; the root version is 12.1.6; the latest release tag is magic-mesh-v12.1.1.
+- Remaining work:
+  1. S1 Select the immutable source.
+     - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
+     - Action: fetch remote refs; require an empty worktree; record HEAD, upstream HEAD, commit epoch, Fedora target, and version.
+     - Deliverable: docs/platform/evidence/WL-REL-001-source-freeze-r1.md with exact commands and outputs.
+     - Validation: source-revision-receipt.sh --repo .; git diff --quiet; git diff --cached --quiet; compare HEAD with upstream.
+     - Done when: one non-null 40-character revision and positive epoch identify the clean pushed source.
+  2. S2 Verify every version surface.
+     - Inputs: docs/RELEASE-VERSIONING.md, root and isolated Cargo workspaces, package recipes, CLI/About build identity.
+     - Action: run Cargo metadata; compare shipped package versions; scan runtime sources for competing numeric release authorities.
+     - Deliverable: bounded version matrix naming each shipped surface, source, observed value, and exception.
+     - Validation: farm metadata/package checks on .50; no runtime version authority other than workspace/package reflection.
+     - Done when: every current release surface resolves to 12.1.6 or a documented packaging release suffix.
+  3. S3 Admit all governed release inputs.
+     - Inputs: Maps approval/source, App VM trust receipt/key, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
+     - Action: create one private JSON argv file containing every mandatory release-input-preflight argument.
+     - Deliverable: immutable preflight argument file plus redacted input inventory; never commit credentials or private keys.
+     - Validation: release-input-preflight.sh against the frozen revision and epoch; missing/substituted input fixture must refuse.
+     - Done when: preflight succeeds before any build mutation and every accepted input identifies the frozen revision.
+  4. S4 Freeze release notes and tag plan.
+     - Inputs: commits since magic-mesh-v12.1.1, archived epic dispositions, current worklist, and user-visible feature set.
+     - Action: draft release notes with features, compatibility, known limitations, upgrade path, and corrected-forward recovery.
+     - Deliverable: versioned release-note source and exact tag name magic-mesh-v12.1.6.
+     - Validation: notes contain no unsupported production/security claim and identify deferred provider/live proof honestly.
+     - Done when: notes, tag, source receipt, and input inventory agree on version and revision.
+- Scope: source identity, version authority, mandatory input admission, release notes, and tag planning only; no artifact build or publication.
+- Relevant files/components: Cargo.toml, Cargo.lock, isolated Cargo workspaces, docs/RELEASE-VERSIONING.md,
+  install-helpers/source-revision-receipt.sh, install-helpers/release-input-preflight.sh.
+- Dependencies: implementation epics are archived or explicitly deferred to WL-TEST-002; operator self-sign authorization is recorded.
+- Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
+- Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
+- Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
 
 ### WL-REL-002 - Cut the complete three-RPM unsigned handoff
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: the release workflow requires exact Workstation, Server, and Lighthouse RPM roles from the same source revision, but the available artifact store has only unrelated Workstation/Lighthouse cuts and no Server candidate.
-- Required outcome: use `run-first-full-release.sh prepare` and the farm to build exactly one Workstation RPM, one Server RPM, and one Lighthouse RPM for Fedora 44 from the `WL-REL-001` source receipt.
-- Current state: first-release preflight and hostile phase-boundary self-tests pass; no current-revision immutable handoff exists.
-- Dependencies: `WL-REL-001`.
-- Deliverable: promotion-forbidden immutable handoff directory containing the three unsigned RPMs, `handoff.json`, exact NEVRA/payload identities, and farm command/results.
-- Validation: BigBoy full RPM lane, independent Server RPM lane, RPM identity queries, handoff verifier, and mutation/substitution rejection checks.
-- Acceptance: all three RPM roles share the frozen revision/version/target, each payload is uniquely identified, and no partial or stale artifact is admitted.
-- Owner: Build and packaging.
+- Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
+- Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable promotion-forbidden handoff.
+- Current state: prepare-path hostile tests pass, but no current-revision handoff exists and no available Server RPM completes the old artifact set.
+- Remaining work:
+  1. S1 Reconfirm the frozen source immediately before build.
+     - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
+     - Action: verify source receipt again; verify preflight again; reserve BigBoy for full RPM and a distinct farm slot for Server RPM.
+     - Deliverable: build invocation record with host, slot, revision, epoch, target, and output parent.
+     - Validation: run-first-full-release.sh must refuse dirty, moving, cross-epoch, or non-Fedora-44 input.
+     - Done when: both build lanes are pinned before either artifact is admitted.
+  2. S2 Build Workstation and Lighthouse RPMs.
+     - Inputs: frozen source and admitted inputs.
+     - Action: run the full Fedora 44 RPM lane on BigBoy through run-first-full-release.sh prepare.
+     - Deliverable: exactly one magic-mesh RPM and one magic-mesh-lighthouse RPM in the private pull directory.
+     - Validation: farm command succeeds; rpm -qp reports expected names, version 12.1.6, architecture, and SHA-256 payload digest.
+     - Done when: no duplicate, stale, symlinked, mutable, or unexpected full-lane RPM remains in the candidate set.
+  3. S3 Build the Server RPM.
+     - Inputs: same frozen source and admitted inputs.
+     - Action: run the independent Fedora 44 Server RPM lane and pull exactly one magic-mesh-server candidate.
+     - Deliverable: one Server RPM from the same revision, version, target, and build policy.
+     - Validation: role/name/NEVRA/payload identity and embedded build identity checks pass.
+     - Done when: the Server candidate is exact and cannot be confused with Workstation or Lighthouse.
+  4. S4 Seal and verify the handoff.
+     - Inputs: three unsigned RPM candidates.
+     - Action: let run-first-full-release.sh create handoff.json and atomically publish its read-only handoff directory.
+     - Deliverable: workstation-unsigned.rpm, server-unsigned.rpm, lighthouse-unsigned.rpm, and handoff.json.
+     - Validation: rerun the handoff parser; independently hash files; mutate a private copied fixture and confirm refusal.
+     - Done when: all three roles, hashes, sizes, NEVRAs, payload digests, revision, epoch, and Fedora target agree.
+- Scope: unsigned RPM construction and immutable handoff only; no signing, derivative images, promotion, or live installation.
+- Relevant files/components: install-helpers/run-first-full-release.sh, install-helpers/xcp-build.sh,
+  packaging/app-vm, packaging/server-rpm, packaging/browser-vm.
+- Dependencies: WL-REL-001.
+- Acceptance criteria: one immutable three-role handoff exists; every RPM is exact and same-source; partial or substituted sets refuse.
+- Verification method: BigBoy full RPM lane, independent Server farm lane, RPM/build-identity checks, and handoff hostile verification.
+- Origin or merged source IDs: archived WL-BUILD-001 and first-release preparation from WL-CRIT-006.
 
 ### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: a complete release needs signed RPM candidates plus Browser VM, App VM, Cuttlefish image, and bootc image roles; only two unbound historical RPM files are currently available.
-- Required outcome: self-sign the exact `WL-REL-002` RPM handoff with the project release identity, generate candidate manifests, then build and verify the four derivative roles from those signed candidates without changing payload identity.
-- Current state: signing, seat-control, derivative orchestration, and hostile release-binding self-tests pass; no current-revision signed seven-role input set exists.
-- Dependencies: `WL-REL-002` and access to the local self-signing key material.
-- Deliverable: three signed RPMs, four verified derivative artifacts, role-specific candidate manifests/receipts, checksums, and a seven-role release-output plan input.
-- Validation: `sign-release.sh --prepare-rpms`, role-specific supply verifiers, derivative-image builder, guest/bootc receipt verifiers, and exact signed-versus-handoff payload comparison.
-- Acceptance: exactly seven canonical roles exist and bind to one source revision; RPM signatures verify; derivative inputs are exact; substitutions, missing roles, and partial outputs fail closed.
-- Owner: Release signing and image engineering.
+- Problem: a complete release requires three signed RPM roles and four verified image roles; no current-revision seven-role set exists.
+- Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, Cuttlefish, and bootc roles.
+- Current state: signing and derivative hostile suites pass; operator self-signing is authorized; historical RPMs are not admissible inputs.
+- Remaining work:
+  1. S1 Materialize and verify the self-signing boundary.
+     - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
+     - Action: confirm public fingerprint and receipt; copy only the three handoff RPMs into one private signing directory.
+     - Deliverable: redacted signer identity evidence and exact pre-sign payload identity table.
+     - Validation: sign-release.sh --self-test; receipt inspector; rpm -Kv before mutation; no secret bytes enter logs or Git.
+     - Done when: one authorized fingerprint is selected and all three inputs match handoff.json exactly.
+  2. S2 Sign all three RPM roles atomically.
+     - Inputs: verified signing directory.
+     - Action: run sign-release.sh --prepare-rpms on all three RPMs in one invocation.
+     - Deliverable: signed Workstation, Server, and Lighthouse RPMs plus post-sign identity table.
+     - Validation: rpm -Kv verifies signatures; payload digests and NEVRAs equal the unsigned handoff; partial failure leaves no mixed set.
+     - Done when: all three signatures verify and no payload identity changed.
+  3. S3 Produce RPM candidate manifests and base receipts.
+     - Inputs: signed RPMs, frozen source, App/Browser base images, trust receipts, and release key.
+     - Action: run each role's canonical supply/candidate verifier and freeze Browser/App base-image profiles.
+     - Deliverable: three RPM candidate manifests and exact App VM/Browser VM base receipts.
+     - Validation: app-vm, server-rpm, and lighthouse candidate tools accept only their corresponding signed RPM.
+     - Done when: every manifest names one immutable artifact, revision, signer, NEVRA, and payload digest.
+  4. S4 Build Browser VM and App VM derivatives.
+     - Inputs: signed Workstation/Lighthouse RPMs, candidate manifests, base images/receipts, and App catalog trust inputs.
+     - Action: run build-release-derivative-images.sh with an absent private output path.
+     - Deliverable: immutable Browser VM and App VM images, manifests, and frozen Browser profile.
+     - Validation: image manifest verifiers, qcow2 checks, source revision checks, and hostile substitution fixture.
+     - Done when: both derivatives verify and the helper publishes no partial output.
+  5. S5 Admit Cuttlefish and bootc roles.
+     - Inputs: Cuttlefish artifact/declaration/signature/image receipt and bootc digest receipt/reference/architecture/role.
+     - Action: verify governed Cuttlefish bytes and bootc receipt; do not rebuild or relabel ungoverned third-party bytes.
+     - Deliverable: Cuttlefish artifact/receipt fields and bootc receipt fields ready for the seven-role plan.
+     - Validation: verify-guest-payload.sh, verify-guest-debs.sh, image receipt verifier, and bootc digest receipt verifier.
+     - Done when: both roles bind to the frozen revision and reject changed bytes, identity, architecture, or provider.
+  6. S6 Create the exact seven-role plan input.
+     - Inputs: three signed RPMs/manifests, two derivative images/manifests, Cuttlefish fields, and bootc fields.
+     - Action: write one private mcnf-release-output-plan-input JSON object containing exactly the seven canonical roles.
+     - Deliverable: immutable plan input and a redacted role inventory.
+     - Validation: produce-release-output-plan.py accepts it; missing, duplicate, extra, relative, mutable, or cross-revision inputs refuse.
+     - Done when: exactly seven role records are accepted and no artifact path is ambiguous.
+- Scope: self-signing, candidate manifests, derivative generation, and plan input; no final evidence signing, publication, or installation.
+- Relevant files/components: install-helpers/sign-release.sh, install-helpers/build-release-derivative-images.sh,
+  install-helpers/produce-release-output-plan.py, packaging/app-vm, packaging/browser-vm, packaging/android, bootc receipt tools.
+- Dependencies: WL-REL-002 and local access to authorized self-signing key material.
+- Acceptance criteria: three RPM signatures verify without payload drift; four derivative roles verify; exactly seven roles bind to one revision.
+- Verification method: signing and role-specific verifiers, derivative hostile suite, plan producer, and independent hash/identity comparison.
+- Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016, WL-FUNC-017, and WL-CRIT-006 release roles.
 
 ### WL-REL-004 - Assemble the signed seven-role release evidence bundle
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: release publication is forbidden until artifacts, SBOM, gate manifests, provenance, and checksums form one exact evidence-bound bundle.
-- Required outcome: resume the first-full-release workflow, collect all seven verified roles, run the canonical release gate matrix, generate SBOM/provenance/checksums, and sign the publication envelope with the authorized self-signing identity.
-- Current state: release-output planning, collection, corrected-forward, signing rollback, and hostile publication controls pass in self-test; no current-revision production evidence envelope exists.
-- Dependencies: `WL-REL-003`.
-- Deliverable: immutable seven-role output collection, release evidence envelope, SBOM manifest, gate manifest, `PROVENANCE.json`, `SHA256SUMS`, detached signature, and verification transcript.
-- Validation: `run-first-full-release.sh resume`, release-output collector, release-gate matrix verifier, `sign-release.sh --evidence`, checksum/signature verification, and GitHub release-binding preflight.
-- Acceptance: every signed byte and manifest is revision-bound and unchanged; all mandatory gates are green; publication refuses any missing, stale, unsigned, unbound, or cross-revision input.
-- Owner: Release assurance.
+- Problem: publication is forbidden until all artifacts, manifests, gates, SBOM data, checksums, and provenance form one exact signed bundle.
+- Required outcome: collect and verify all seven roles, execute mandatory release gates, and sign one immutable publication envelope.
+- Current state: collector, gate-matrix, corrected-forward, signing rollback, and hostile publication controls pass only as self-tests.
+- Remaining work:
+  1. S1 Resume and collect the seven-role output.
+     - Inputs: WL-REL-002 handoff, WL-REL-003 derivative argv and plan input, frozen revision, and Fedora target.
+     - Action: run run-first-full-release.sh resume into an absent private output path.
+     - Deliverable: collection-plan.json, release-outputs.json, verified derivatives, and promotion-forbidden output directory.
+     - Validation: resume compares signed RPM payloads to the handoff and collectors re-run every canonical owning verifier.
+     - Done when: collection is atomic, immutable, revision-bound, and contains exactly seven verified roles.
+  2. S2 Execute the canonical gate matrix.
+     - Inputs: release-gate-matrix.json, frozen revision, collected artifacts, and all named evidence commands.
+     - Action: run every mandatory gate; route heavy package/workspace gates to the farm and preserve exact commands/results.
+     - Deliverable: complete gate manifest with pass/fail, owner, command, artifact, revision, and timestamps.
+     - Validation: verify-release-gate-matrix.py --expected-revision; omitted, vacuous, stale, or altered gate results refuse.
+     - Done when: all mandatory gates are genuinely green or the epic is marked Blocked with the exact failing implementation.
+  3. S3 Generate SBOM and release evidence.
+     - Inputs: seven-role collection, dependency closure outputs, build identities, and gate manifest.
+     - Action: run existing SBOM/evidence producers; bind every artifact hash and candidate manifest into one evidence envelope.
+     - Deliverable: SBOM manifest, evidence JSON, release-output inventory, and artifact-to-source traceability table.
+     - Validation: all evidence paths are immutable regular files; hashes and source revisions match collector output.
+     - Done when: every published artifact has one verifiable source, role, checksum, signer, manifest, and gate lineage.
+  4. S4 Sign checksums and provenance.
+     - Inputs: exact artifacts, SBOM manifest, gate manifest, evidence envelope, and authorized self-signing identity.
+     - Action: run sign-release.sh --evidence on the complete artifact set in one final publication directory.
+     - Deliverable: PROVENANCE.json, SHA256SUMS, SHA256SUMS.asc, and signed evidence bundle.
+     - Validation: detached signature, checksum, provenance, signer identity, exact artifact set, and inode/race protections verify.
+     - Done when: fresh verification succeeds and any changed, added, missing, symlinked, or unbound file refuses.
+  5. S5 Preflight remote publication.
+     - Inputs: final bundle, planned tag, repository identity, workflow evidence, and release notes.
+     - Action: run verify-github-release-binding.sh without publishing.
+     - Deliverable: publication-readiness evidence naming exact tag, revision, assets, hashes, and signer.
+     - Validation: hostile artifact-root, identity, set, path, symlink, and unbound-log cases remain rejected.
+     - Done when: the complete bundle is ready for one atomic logical publication and nothing else is admitted.
+- Scope: evidence collection, release gates, SBOM, provenance, signatures, and publication preflight; no public mutation or seat installation.
+- Relevant files/components: install-helpers/run-first-full-release.sh, produce-release-output-plan.py,
+  collect-release-outputs.py, release-gate-matrix.json, verify-release-gate-matrix.py, sign-release.sh.
+- Dependencies: WL-REL-003.
+- Acceptance criteria: one signed immutable seven-role evidence bundle passes all mandatory gates and rejects any artifact-set drift.
+- Verification method: farm gates, collector and gate verifiers, SBOM/evidence checks, detached-signature verification, and publication preflight.
+- Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006 production-evidence responsibilities.
 
 ### WL-REL-005 - Publish and promote the newest complete release
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: version `12.1.6` has no immutable current release tag or complete published asset set, and the package channel must not expose partial or unsigned candidates.
-- Required outcome: create the immutable `magic-mesh-v12.1.6` tag at the frozen revision, publish one GitHub release containing the exact admitted assets/evidence, update signed repository metadata atomically, and retain corrected-forward recovery information.
-- Current state: prior tags end at `magic-mesh-v12.1.1`; publication controls pass self-test, but no current complete release exists.
-- Dependencies: `WL-REL-004`.
-- Deliverable: pushed tag, GitHub release and seven-role asset set, signed checksums/provenance/SBOM/gate evidence, atomic package-repository metadata, release notes, and publication receipt.
-- Validation: GitHub release-binding verifier, remote tag/asset readback, signature/checksum verification from downloaded assets, package metadata query, and promotion refusal test for HOLD/partial artifacts.
-- Acceptance: public tag, release metadata, downloadable assets, checksums, signatures, provenance, and repository package identities all agree on the frozen source and version; no partial release is visible.
-- Owner: Release publication.
+- Problem: version 12.1.6 has no immutable current tag or complete public asset set, and partial candidates must never enter the package channel.
+- Required outcome: publish one immutable tag and GitHub release, verify all assets by readback, then atomically expose only signed package metadata.
+- Current state: tags end at magic-mesh-v12.1.1; no complete 12.1.6 release exists; publication controls pass self-test.
+- Remaining work:
+  1. S1 Reconfirm publication authority and remote state.
+     - Inputs: WL-REL-001 tag plan, WL-REL-004 readiness evidence, GitHub remote, and package repository destination.
+     - Action: verify tag and release do not exist; verify frozen revision is pushed; verify authenticated publication access.
+     - Deliverable: pre-publication remote-state record.
+     - Validation: any existing conflicting tag/release, wrong repository, moving revision, incomplete bundle, or missing authority stops work.
+     - Done when: the target names are absent and the exact revision/bundle is ready.
+  2. S2 Create and push the immutable tag.
+     - Inputs: frozen revision, exact tag name, and release-note title.
+     - Action: create a signed annotated magic-mesh-v12.1.6 tag and push that tag only.
+     - Deliverable: remote tag object and tag-signature evidence.
+     - Validation: local and remote tag dereference to the frozen revision; tag signature verifies.
+     - Done when: no branch tip or alternate commit can masquerade as the release tag.
+  3. S3 Publish the GitHub release and exact assets.
+     - Inputs: remote tag, release notes, seven artifacts, manifests, SBOM, gates, provenance, checksums, and signatures.
+     - Action: create one release and upload the complete admitted set; do not publish a draft/partial set as final.
+     - Deliverable: public release URL, asset inventory, sizes, hashes, and publication receipt.
+     - Validation: verify-github-release-binding.sh against remote metadata; asset count and names equal the admitted bundle.
+     - Done when: every required asset is downloadable and no unadmitted asset is attached.
+  4. S4 Verify downloaded bytes independently.
+     - Inputs: fresh private download directory and published release.
+     - Action: download every asset; verify SHA256SUMS.asc, checksums, provenance, SBOM/gates, RPM signatures, and role identities.
+     - Deliverable: clean-room readback transcript and downloaded-asset digest table.
+     - Validation: no local artifact path is reused; all downloaded bytes match the signed bundle.
+     - Done when: public readback independently reconstructs the exact seven-role release identity.
+  5. S5 Promote signed package metadata atomically.
+     - Inputs: verified published RPMs, signed repository policy, HOLD boundary, and current channel metadata.
+     - Action: stage metadata privately; ensure HOLD/unsigned candidates are excluded; atomically publish signed repodata.
+     - Deliverable: repository metadata receipt and package query output for all three RPM roles.
+     - Validation: fresh repository query resolves only signed admitted NEVRAs; partial/unsigned fixture cannot enter metadata.
+     - Done when: package clients can resolve the complete release and no stale or unsigned higher candidate blocks upgrades.
+  6. S6 Hand off to installed acceptance.
+     - Inputs: publication receipt, download verifier results, package/image references, and corrected-forward recovery identity.
+     - Action: update WL-TEST-002 with exact release inputs and select no more than two physical proof seats.
+     - Deliverable: acceptance handoff naming immutable artifacts, seats, lighthouses, providers, and rollback-forbidden recovery plan.
+     - Validation: all references resolve and every seat mutation requires the governed alert/wait sequence.
+     - Done when: WL-TEST-002 can begin without guessing any release, package, image, seat, or recovery identity.
+- Scope: tag, GitHub release, asset readback, signed package metadata promotion, and acceptance handoff.
+- Relevant files/components: Git remote/tag tooling, GitHub release workflow, verify-github-release-binding.sh,
+  packaging/repo, dnf-channel helpers, release notes, and WL-TEST-002.
+- Dependencies: WL-REL-004.
+- Acceptance criteria: tag, release, assets, signatures, provenance, and package metadata agree exactly; no partial release is visible.
+- Verification method: remote tag/release readback, clean-room asset verification, repository queries, and HOLD/partial promotion refusal.
+- Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 publication responsibilities.
 
-### WL-TEST-002 - Post-first-development-release testing and proofing
+### WL-TEST-002 - Install and prove the newest complete release
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: implementation and farm gates are complete for many slices, but first-development-release installation, operator providers, physical-seat behavior, direct-DRM rendering, guest/device integrations, and corrected-forward recovery were intentionally deferred until a signed release and its deployment inputs exist.
-- Required outcome: after the first development release, execute and archive every deferred testing, proofing, and validation obligation in this epic; reconcile failures as implementation work or named external-input blockers, without weakening proof requirements.
-- Current state: the queue is intentionally post-release and non-blocking for pre-release coding. No live provider, installed-seat, hardware, guest, or release-deployment claim is made.
-- Dependencies: first development release, signed package/image artifacts, operator-approved provider credentials, and no more than two physical test seats.
-- Deliverable: release identity and artifact admission, installed-seat baseline, provider readiness, live behavior captures, direct-DRM/GUI proof, guest/device proof, recovery/corrected-forward results, and farm commands/results with redacted operator evidence.
-- Validation: run all focused farm gates first, then execute the named one-node/two-seat live checks on the exact installed release; attach evidence to the owning source epic and cross-reference this epic.
-- Acceptance: tested bytes match the signed release; no fake connected/healthy state; provider absence and failure remain visible; recovery is corrected-forward; every result identifies hardware/provider authorization and stays within the two-seat cap.
-- Owner: Platform collaboration and release verification.
-
-#### WL-TEST-002 test queue
-
-- **Pre-release verifier controls (2026-08-15):** corrected-forward verifier self-test passed 19/19 and release-gate matrix self-test accepted 1 valid fixture while rejecting 21 hostile fixtures; evidence: `evidence/WL-TEST-002-2026-08-15-release-recovery-verifier-r1.md`. This does not claim exact-release, installed-seat, provider, hardware, or live recovery proof.
-- **Release-input boundary controls (2026-08-15):** mandatory-input/bootc receipt admission passed and the hostile first-release phase-boundary suite rejected unsigned or incomplete promotion; evidence: `evidence/WL-TEST-002-2026-08-15-release-input-boundary-r1.md`. This does not claim a signed release artifact.
-- **Signing and seat-control boundaries (2026-08-15):** release-signing atomic rollback, live-seat verification refusal paths, and remote-input mapping self-tests passed without external signing or SSH actions; evidence: `evidence/WL-TEST-002-2026-08-15-signing-seat-controls-r1.md`. This does not claim installed-seat or live proof.
-- **Release-output publication controls (2026-08-15):** output-plan, collector, derivative-image orchestration, and GitHub release-binding hostile suites passed; evidence: `evidence/WL-TEST-002-2026-08-15-release-output-publication-r1.md`. This does not claim a signed release or live proof.
-
-1. **Release and package admission:** implementation-complete contracts already cover manifest/provenance, dependency closure, upgrade/install identity, and corrected-forward payload binding; after a signed first development release, verify those properties against the exact admitted bytes.
-2. **Installed baseline:** implementation-complete service, Workers, Bus, storage, and restart/rejoin gates remain; install the exact release on the governed one-node/two-seat test set and record display, audio, network, and physical-seat observations.
-3. **Collaboration and providers:** bounded collaboration and fail-closed provider controls are implementation-complete; activate the governed SIP account and test Calls connect/reconnect/mute/consent/revocation plus deferred provider-backed collaboration and transfer behavior without asserting a fake live state.
-4. **GUI and direct-DRM proof:** implementation-complete shell, taskbar, style/font, Kiron, Maps, Workers, Editor, and Music slices still require real-display captures, including human visual review where required.
-5. **Media and physical providers:** bounded media/Cast/handoff controls are implementation-complete; test mpv/audio/video, cache/network loss, renderer recovery, Cast/handoff/DLNA, installed package/CPU behavior, and external catalog/server paths with authorized provider inputs.
-6. **Guest and device integrations:** guest/runtime admission controls are implementation-complete; test App VM/VDI, Browser/Android/Cuttlefish, GPU/audio/input, nested-KVM, remote-session, and guest reconnect/upgrade paths when signed images and runtime artifacts are admitted.
-7. **Recovery and resilience:** recovery mechanisms and corrected-forward guards are implementation-complete; run deferred one-node service/process, display/session, lock/sleep, storage/network, generation, reboot, restart, recovery, and corrected-forward drills, recording failures rather than converting unavailable hardware into passes.
-8. **Reconciliation:** map every result to its owning epic, archive release evidence, reopen implementation work for regressions, and retain named operator blockers for missing artifacts or authorization.
-
-   **Moved implementation-closed UX proof queues:** `WL-UX-011` Surface
-   Pro 5/6, provider, seat, and physical acceptance; and `WL-UX-014` KIRON
-   renderer/live proof are post-development-release obligations owned here.
-   Their implementation evidence is archived in
-   `docs/worklist-archive/2026-08-15-wl-ux-011-ux-014-disposition.md`.
-
-   **Moved implementation-closed Music proof queue:** `WL-FUNC-021` signed
-   release, installed package/seat, provider continuity/loss, direct-render,
-   Cast/DLNA, and live handoff observations are post-development-release
-   obligations owned here. Music daemon/workspace/cast/handoff implementation
-   evidence is archived in
-   `docs/worklist-archive/2026-08-15-wl-func-021-disposition.md`.
-
-   **Moved implementation-closed Collaboration proof queue:** `WL-FUNC-011`
-   native-office runtime admission, governed SIP activation, exact-release,
-   installed-seat, provider, visual, and live recovery observations are
-   post-development-release obligations owned here. Implementation evidence
-   is archived in
-   `docs/worklist-archive/2026-08-15-wl-func-011-disposition.md`.
+- Problem: exact-release installation, providers, direct-DRM rendering, guest/device integrations, and corrected-forward recovery need live proof.
+- Required outcome: install the WL-REL-005 release on no more than two physical seats and execute every deferred acceptance obligation honestly.
+- Current state: pre-release verifier, input, signing, seat-control, and publication harnesses pass; no current signed release is installed or proven.
+- Remaining work:
+  1. S1 Admit the published release.
+     - Inputs: WL-REL-005 publication receipt, clean-room readback, signed package/image identities, and selected seats.
+     - Action: verify release bytes again; record seat hardware, authorization, current package, target package, and recovery identity.
+     - Deliverable: installed-acceptance plan and pre-mutation baseline.
+     - Validation: tested bytes equal public signed bytes; no more than two physical seats are selected.
+     - Done when: exact inputs and targets are unambiguous and recoverable by corrected-forward deployment.
+  2. S2 Install and verify the baseline.
+     - Inputs: admitted package/image references and governed mutation plan.
+     - Action: publish the red AI-GENERATED-ALERT, wait five seconds, install, reboot only if required, and collect baseline observations.
+     - Deliverable: installed NEVRAs/build identities, service states, display/audio/network/storage inventory, and restart/rejoin evidence.
+     - Validation: package, mackesd, shell, About, watermark, welcome, and mesh-help versions agree.
+     - Done when: each selected seat boots the exact release with honest degraded states and no stale build identity.
+  3. S3 Prove collaboration and authorized providers.
+     - Inputs: governed SIP/provider credentials, collaboration identities, two-seat maximum, and signed release.
+     - Action: test Calls lifecycle, mute, consent, revocation, reconnect, chat/alerts, files/transfers, editor, and clipboard.
+     - Deliverable: redacted provider/readiness, command, failure, and recovery evidence.
+     - Validation: missing providers remain visible; no fake connected state; signed attribution and revocation remain auditable.
+     - Done when: available provider paths pass and unavailable paths are named external blockers, not passes.
+  4. S4 Capture Construct direct-DRM acceptance.
+     - Inputs: selected display seat, exact release, Dark/Light and required text/layout profiles.
+     - Action: capture shell, taskbar, Front Door, Workers, Kiron/health, Maps, Editor, Music, Files, and key error states.
+     - Deliverable: native readback images/metadata, hashes, route identity, dimensions, and human-review disposition.
+     - Validation: captures come from the direct-DRM seat and exact release; boot curtains, stale routes, or clipped required controls fail.
+     - Done when: required visual routes pass or reopen a named implementation epic.
+  5. S5 Prove media and physical integrations.
+     - Inputs: audio/video fixtures, authorized Cast/DLNA devices, catalog/server paths, and network-loss controls.
+     - Action: test playback, cache/offline, audio/video, renderer recovery, Cast, DLNA, typed handoff, and provider loss.
+     - Deliverable: device identity, media command/result, continuity, loss, recovery, and CPU/package observations.
+     - Validation: device/provider discovery is real; media state never claims success after transport failure.
+     - Done when: each available integration passes or has one exact external blocker.
+  6. S6 Prove guest and device roles.
+     - Inputs: signed Browser VM, App VM, Cuttlefish, bootc artifacts, GPU/audio/input fixtures, and nested-KVM capability.
+     - Action: launch and reconnect Browser/VDI/App/Android roles; test input, audio, GPU, upgrade identity, and failure recovery.
+     - Deliverable: artifact-to-runtime identity, readiness, connection, detach/reconnect, and failure evidence.
+     - Validation: runtime bytes match signed artifacts; missing capability is visible and cannot become a healthy state.
+     - Done when: every available guest role passes exact identity and lifecycle checks or records a named hardware blocker.
+  7. S7 Execute recovery and resilience drills.
+     - Inputs: installed baseline, corrected-forward candidate, service/network/storage controls, and recovery verifier.
+     - Action: test process restart, display/session recovery, lock/sleep, network/storage loss, generation change, reboot, and re-enrollment.
+     - Deliverable: pre-failure, failure, correction, and post-recovery evidence for each drill.
+     - Validation: verify-corrected-forward-recovery.py; no rollback satisfies recovery; data/history retention rules remain enforced.
+     - Done when: failures converge by corrected-forward action without invented health or unrecorded data loss.
+  8. S8 Reconcile and archive acceptance.
+     - Inputs: all S1-S7 evidence and every archived source-epic proof queue.
+     - Action: map results to owning epics; reopen implementation regressions; retain external blockers; create final release disposition.
+     - Deliverable: signed acceptance index, blocker list, reopened work references, and WL-TEST-002 archive disposition.
+     - Validation: every deferred obligation has evidence, a reopened implementation item, or one exact external-input blocker.
+     - Done when: no obligation is silently dropped and the epic can be removed from the active worklist.
+- Scope: exact-release admission, up to two physical seats, providers, direct DRM, media/devices, guests, resilience, and reconciliation.
+- Relevant files/components: docs/platform/release-evidence, install-helpers release/live/recovery verifiers,
+  packaging installed-identity tools, direct-DRM capture helpers, and archived epic dispositions.
+- Dependencies: WL-REL-005, authorized provider inputs, selected hardware, and no more than two physical test seats.
+- Acceptance criteria: tested bytes match the signed release; states remain honest; recovery is corrected-forward; every deferred proof is reconciled.
+- Verification method: focused farm gates followed by exact installed one-seat/two-seat live checks with redacted evidence and independent readback.
+- Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
 
 ## Core Architecture
 
