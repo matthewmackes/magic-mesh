@@ -1774,6 +1774,12 @@ impl Shell {
                     .unwrap_or(this_node_catalog::page_index()[0]);
                 self.nav.surface = Surface::Workers;
             }
+            Surface::Files => {
+                // Files is a retired top-level route. Its canonical authority
+                // is the Files section inside Communications.
+                self.communications.open_files();
+                self.nav.surface = Surface::Communications;
+            }
             _ => {}
         }
         self.nav.surface = canonical_workspace_surface(self.nav.surface);
@@ -2757,16 +2763,7 @@ impl Shell {
                     ui.ctx().request_repaint();
                 }
             }
-            Surface::Files => {
-                // Compatibility-only deep link: standalone Files was merged
-                // into Mesh Teams. Preserve old pins/toasts while rendering the
-                // one collaboration destination and one files authority.
-                let communications = &mut self.communications;
-                communications.open_files();
-                ui.push_id("shell-communications-files", |ui| {
-                    communications.show(ui);
-                });
-            }
+            Surface::Files => unreachable!("legacy Files route is normalized into Communications"),
             Surface::Browser => {
                 let target = self
                     .infra_code

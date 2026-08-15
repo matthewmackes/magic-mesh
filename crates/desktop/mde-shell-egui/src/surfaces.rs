@@ -161,6 +161,7 @@ pub(crate) const fn canonical_workspace_surface(surface: Surface) -> Surface {
         | Surface::System
         | Surface::Storage
         | Surface::About => Surface::Workers,
+        Surface::Files => Surface::Communications,
         Surface::Phones => Surface::Workers,
         surface => surface,
     }
