@@ -117,6 +117,12 @@ behavioral evidence is not completion.
 7. **Recovery and resilience:** run deferred one-node service/process, display/session, lock/sleep, storage/network, generation, reboot, restart, recovery, and corrected-forward drills; record failures rather than converting unavailable hardware into passes.
 8. **Reconciliation:** map every result to its owning epic, archive release evidence, reopen implementation work for regressions, and retain named operator blockers for missing artifacts or authorization.
 
+   **Moved implementation-closed UX proof queues:** `WL-UX-011` Surface
+   Pro 5/6, provider, seat, and physical acceptance; and `WL-UX-014` KIRON
+   renderer/live proof are post-development-release obligations owned here.
+   Their implementation evidence is archived in
+   `docs/worklist-archive/2026-08-15-wl-ux-011-ux-014-disposition.md`.
+
 ## Core Architecture
 
 
@@ -507,7 +513,7 @@ behavioral evidence is not completion.
 - Origin or merged source IDs: Spotify-class Music survey; archived WL-FUNC-007 and MEDIA-1..17; 2026-08-05/06 Music and Media evidence.
 ## User Interface And Experience
 
-### WL-UX-011 evidence disposition — implementation closed; Surface proof moved to WL-TEST-002 (2026-08-15)
+### WL-UX-011 archived evidence disposition — implementation closed; proof moved to WL-TEST-002 (2026-08-15)
 
 **Disposition: CLOSED FOR IMPLEMENTATION.**
 
@@ -690,7 +696,7 @@ proof owned by WL-TEST-002.
   checks.
 - Origin or merged source IDs: 2026-07-26 node hardware and safe-controls survey.
 
-### WL-UX-014 evidence disposition — implementation closed; S5 proof moved to WL-TEST-002 (2026-08-15)
+### WL-UX-014 archived evidence disposition — implementation closed; S5 proof moved to WL-TEST-002 (2026-08-15)
 
 **Disposition: CLOSED FOR IMPLEMENTATION.**
 
