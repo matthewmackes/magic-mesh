@@ -19,3 +19,14 @@ packaging/kiron/verify-package.sh --self-test
 
 This closes the missing authored-package input for S2. Direct renderer,
 installed-seat, audio, and live proof remain downstream UX-014 work.
+
+The shared ToastHost renderer now consumes the governed scene bytes for its
+admitted `Live3d` and `PreRendered` tiers, caches decoded textures per egui
+context, and falls back to the procedural static grade motif when rasterization
+or device readiness is unavailable. BigBoy focused gate:
+
+```text
+MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=ux014-renderer-farm4 \
+  install-helpers/xcp-build.sh cargo test -p mde-egui toast::tests -- --nocapture
+42 passed, 0 failed
+```

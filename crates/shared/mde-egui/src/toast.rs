@@ -203,7 +203,7 @@ pub enum Dwell {
 /// `Static` is implemented entirely with egui primitives and is therefore
 /// always admitted. Richer tiers are selected only after their renderer has
 /// explicitly reported both assets and device state ready.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum KironSceneTier {
     /// Deterministic primitive-only fallback.
     #[default]
@@ -898,7 +898,7 @@ impl ToastHost {
                 band = if toast.is_ai_generated_alert() {
                     paint_ai_generated_alert(ui, &toast, backlog, remaining, t)
                 } else {
-                    paint_banner(ui, &toast, backlog, remaining, t)
+                    paint_banner(ui, &toast, backlog, remaining, self.kiron_scene_tier, t)
                 };
             });
 
@@ -1047,8 +1047,12 @@ fn paint_kiron_grade_scene(
     painter: &egui::Painter,
     card: Rect,
     scene: KironGradeScene,
+    tier: KironSceneTier,
     alpha: f32,
 ) {
+    if tier != KironSceneTier::Static && paint_kiron_asset(painter, card, scene, tier, alpha) {
+        return;
+    }
     let color = scene.color();
     let field = Rect::from_min_max(
         card.min,
@@ -1079,6 +1083,118 @@ fn paint_kiron_grade_scene(
         Style::typography_font_with_size(TypographyRole::Display, Style::TYPE_TITLE1),
         color.gamma_multiply(0.28 * alpha),
     );
+}
+
+/// Paint a governed authored scene for the richer tiers. Textures are cached
+/// per egui context; malformed assets fail closed to the procedural static
+/// motif above, preserving a truthful health grade during device loss.
+fn paint_kiron_asset(
+    painter: &egui::Painter,
+    card: Rect,
+    scene: KironGradeScene,
+    tier: KironSceneTier,
+    alpha: f32,
+) -> bool {
+    let key = egui::Id::new(("mde-egui-kiron", scene.letter(), tier));
+    let texture = match painter
+        .ctx()
+        .data_mut(|data| data.get_temp::<Option<egui::TextureHandle>>(key))
+    {
+        Some(cached) => cached,
+        None => {
+            let loaded = kiron_texture(painter.ctx(), scene, tier);
+            painter
+                .ctx()
+                .data_mut(|data| data.insert_temp(key, loaded.clone()));
+            loaded
+        }
+    };
+    let Some(texture) = texture else { return false };
+    let draw = card.shrink(Style::SP_S);
+    let aspect = texture.size()[0].max(1) as f32 / texture.size()[1].max(1) as f32;
+    let height = draw.height().min(draw.width() / aspect);
+    let rect = Rect::from_center_size(draw.center(), vec2(height * aspect, height));
+    painter.image(
+        texture.id(),
+        rect,
+        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0).round() as u8),
+    );
+    true
+}
+
+fn kiron_texture(
+    ctx: &egui::Context,
+    scene: KironGradeScene,
+    tier: KironSceneTier,
+) -> Option<egui::TextureHandle> {
+    let tree = resvg::usvg::Tree::from_str(
+        std::str::from_utf8(kiron_asset_bytes(scene, tier)).ok()?,
+        &resvg::usvg::Options::default(),
+    )
+    .ok()?;
+    let size = tree.size();
+    let scale = 512.0 / size.height().max(1.0);
+    let width = (size.width() * scale).round().max(1.0) as u32;
+    let height = (size.height() * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
+    for pixel in pixmap.pixels() {
+        let pixel = pixel.demultiply();
+        rgba.extend_from_slice(&[pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]);
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+    Some(ctx.load_texture(
+        format!("kiron-{}-{tier:?}", scene.letter()),
+        image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn kiron_asset_bytes(scene: KironGradeScene, tier: KironSceneTier) -> &'static [u8] {
+    let mode = match tier {
+        KironSceneTier::Live3d => "live-3d",
+        KironSceneTier::PreRendered => "pre-rendered",
+        KironSceneTier::Static => "static",
+    };
+    match (scene.letter(), mode) {
+        ('A', "live-3d") => include_bytes!("../../../../assets/kiron/payload/a-live-3d.svg"),
+        ('A', "pre-rendered") => {
+            include_bytes!("../../../../assets/kiron/payload/a-pre-rendered.svg")
+        }
+        ('B', "live-3d") => include_bytes!("../../../../assets/kiron/payload/b-live-3d.svg"),
+        ('B', "pre-rendered") => {
+            include_bytes!("../../../../assets/kiron/payload/b-pre-rendered.svg")
+        }
+        ('C', "live-3d") => include_bytes!("../../../../assets/kiron/payload/c-live-3d.svg"),
+        ('C', "pre-rendered") => {
+            include_bytes!("../../../../assets/kiron/payload/c-pre-rendered.svg")
+        }
+        ('D', "live-3d") => include_bytes!("../../../../assets/kiron/payload/d-live-3d.svg"),
+        ('D', "pre-rendered") => {
+            include_bytes!("../../../../assets/kiron/payload/d-pre-rendered.svg")
+        }
+        ('E', "live-3d") => include_bytes!("../../../../assets/kiron/payload/e-live-3d.svg"),
+        ('E', "pre-rendered") => {
+            include_bytes!("../../../../assets/kiron/payload/e-pre-rendered.svg")
+        }
+        ('F', "live-3d") => include_bytes!("../../../../assets/kiron/payload/f-live-3d.svg"),
+        ('F', "pre-rendered") => {
+            include_bytes!("../../../../assets/kiron/payload/f-pre-rendered.svg")
+        }
+        ('A', "static") => include_bytes!("../../../../assets/kiron/payload/a-static.svg"),
+        ('B', "static") => include_bytes!("../../../../assets/kiron/payload/b-static.svg"),
+        ('C', "static") => include_bytes!("../../../../assets/kiron/payload/c-static.svg"),
+        ('D', "static") => include_bytes!("../../../../assets/kiron/payload/d-static.svg"),
+        ('E', "static") => include_bytes!("../../../../assets/kiron/payload/e-static.svg"),
+        ('F', "static") => include_bytes!("../../../../assets/kiron/payload/f-static.svg"),
+        _ => unreachable!("KIRON scene has only A-F grades and three tiers"),
+    }
 }
 
 /// The AI-generated deployment alert is intentionally compact: a readable
@@ -1186,6 +1302,7 @@ fn paint_banner(
     toast: &Toast,
     backlog: usize,
     remaining: Option<Duration>,
+    scene_tier: KironSceneTier,
     t: f32,
 ) -> BandOutcome {
     let Tier::Alert(severity) = toast.tier else {
@@ -1218,7 +1335,7 @@ fn paint_banner(
     );
 
     if let Some(scene) = KironGradeScene::from_flag(&toast.flag) {
-        paint_kiron_grade_scene(&painter, card, scene, alpha);
+        paint_kiron_grade_scene(&painter, card, scene, scene_tier, alpha);
     }
 
     // Left: the Carbon severity glyph on a severity-tinted plate.
@@ -2653,7 +2770,14 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Style::BG))
                 .show(ctx, |ui| {
-                    let _ = paint_banner(ui, &banner, 2, Some(Duration::from_secs(5)), 1.0);
+                    let _ = paint_banner(
+                        ui,
+                        &banner,
+                        2,
+                        Some(Duration::from_secs(5)),
+                        KironSceneTier::Static,
+                        1.0,
+                    );
                 });
         })
         .expect("render standard popup proof");
@@ -2665,7 +2789,14 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Style::BG))
                 .show(ctx, |ui| {
-                    let _ = paint_banner(ui, &banner, 2, Some(Duration::from_secs(5)), 1.0);
+                    let _ = paint_banner(
+                        ui,
+                        &banner,
+                        2,
+                        Some(Duration::from_secs(5)),
+                        KironSceneTier::Static,
+                        1.0,
+                    );
                 });
         })
         .expect("render narrow popup proof");
