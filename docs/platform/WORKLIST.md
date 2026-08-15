@@ -121,9 +121,10 @@ behavioral evidence is not completion.
      - Done when: every current release surface resolves to 12.1.6 or a documented packaging release suffix.
   3. S3 Admit all governed release inputs. BLOCKED: no private preflight argv
      file exists; the RPM signer receipt has been generated and inspected
-     privately for f095b8ce at epoch 1786803889, but Maps approval/source, App
-     VM trust receipt/key, Cuttlefish declarations/packages/image receipt, and
-     bootc receipt are not admitted for that revision. Maps provider/live proof
+     privately for the superseded f095b8ce revision; it must be regenerated for
+     d248ba2f at epoch 1786813297. Maps approval/source, App VM trust receipt/
+     key, Cuttlefish declarations/packages/image receipt, and bootc receipt are
+     not admitted for the frozen revision. Maps provider/live proof
      is explicitly deferred to WL-TEST-002; that deferral does not create a
      release-input approval. Do not run a build with historical loose artifacts.
      - Inputs: Maps approval/source, App VM trust receipt/key, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
