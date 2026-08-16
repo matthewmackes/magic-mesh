@@ -85,6 +85,19 @@ pub fn plan(role: Role) -> Vec<PlannedUnit> {
         .collect()
 }
 
+/// Return the units expected to run for a role.
+///
+/// Status and readiness consumers use this catalog instead of maintaining a
+/// second service list that can drift from role provisioning.
+#[must_use]
+pub fn units_for_role(role: Role) -> Vec<&'static str> {
+    plan(role)
+        .into_iter()
+        .filter(|unit| unit.action == UnitAction::Enable)
+        .map(|unit| unit.unit)
+        .collect()
+}
+
 /// Injectable seam over the two systemd operations, so [`apply`] is testable
 /// without a live systemd. Production wires [`SystemctlUnits`]; tests pass a fake.
 ///
@@ -269,6 +282,17 @@ mod tests {
     fn plan_is_deterministic() {
         assert_eq!(plan(Role::Lighthouse), plan(Role::Lighthouse));
         assert_eq!(plan(Role::Workstation), plan(Role::Workstation));
+    }
+
+    #[test]
+    fn readiness_unit_catalog_matches_role_plan() {
+        let lighthouse = units_for_role(Role::Lighthouse);
+        assert!(lighthouse.contains(&"mesh-status.timer"));
+        assert!(!lighthouse.contains(&"mde-shell-egui.service"));
+
+        let workstation = units_for_role(Role::Workstation);
+        assert!(workstation.contains(&"mde-shell-egui.service"));
+        assert!(workstation.contains(&"mesh-status.timer"));
     }
 
     #[test]

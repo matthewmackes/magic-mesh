@@ -158,6 +158,8 @@ pub mod image_catalog;
 pub mod install_profiles;
 pub mod leave;
 pub mod lifecycle;
+/// WL-FUNC-023 — exclusive, resumable lifecycle checkpoint authority.
+pub mod lifecycle_authority;
 pub mod mesh_init;
 pub mod mirrors;
 pub mod surface;

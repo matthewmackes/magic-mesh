@@ -23,6 +23,7 @@ path = "src/bin/magic-setup.rs"
 # The mesh control-plane lib — the network-enroll client (ONBOARD-3),
 # token parser, and bundle materializer the TUI drives.
 mackesd = { path = "../mackesd" }
+mackes-mesh-types = { path = "../mackes-mesh-types" }
 # SETUP — detect whether a deployment role is pinned (configured vs first-run).
 mde-role = { path = "../../platform/mde-role" }
 # SETUP §43 — the canonical Warning/Disclaimer/Mission text shown on the

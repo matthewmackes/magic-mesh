@@ -162,6 +162,55 @@ pub fn write_intent(
     target_version: &str,
     now_ms: u64,
 ) -> std::io::Result<PathBuf> {
+    write_intent_with_artifact_digest(mesh_home, target_version, now_ms, None)
+}
+
+/// Publish an intent bound to the exact artifact admitted by lifecycle
+/// authority.  An intent without this receipt remains readable for migration
+/// and diagnostics, but the watcher will never invoke a package manager for
+/// it.
+pub fn write_intent_with_artifact_digest(
+    mesh_home: &Path,
+    target_version: &str,
+    now_ms: u64,
+    artifact_digest: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    write_intent_signed(mesh_home, target_version, now_ms, None, artifact_digest)
+}
+
+/// Publish an intent carrying the complete authority-admitted artifact
+/// selection. The JSON is parsed and validated before it is signed, so the
+/// watcher never receives an opaque operator label in place of a receipt.
+pub fn write_intent_with_selection_json(
+    mesh_home: &Path,
+    target_version: &str,
+    now_ms: u64,
+    selection_json: &str,
+) -> std::io::Result<PathBuf> {
+    let selection: mackes_mesh_types::lifecycle::LifecycleArtifactSelectionV1 =
+        serde_json::from_str(selection_json).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+        })?;
+    selection.validate().map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid artifact selection: {error:?}"))
+    })?;
+    let selection_value = serde_json::to_value(selection).map_err(std::io::Error::other)?;
+    write_intent_signed(
+        mesh_home,
+        target_version,
+        now_ms,
+        Some(selection_value),
+        None,
+    )
+}
+
+fn write_intent_signed(
+    mesh_home: &Path,
+    target_version: &str,
+    now_ms: u64,
+    selection: Option<Value>,
+    artifact_digest: Option<&str>,
+) -> std::io::Result<PathBuf> {
     let signer = production_action_signer()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
     let auth_now_ms = i64::try_from(now_ms).map_err(|_| {
@@ -177,6 +226,8 @@ pub fn write_intent(
         &signer,
         auth_now_ms,
         &fresh_nonce(),
+        selection,
+        artifact_digest,
     )
 }
 
@@ -189,6 +240,8 @@ fn write_intent_with_signer(
     signer: &CloudArmSigner,
     auth_now_ms: i64,
     nonce: &str,
+        selection: Option<Value>,
+        artifact_digest: Option<&str>,
 ) -> std::io::Result<PathBuf> {
     let dir = mesh_home.join("upgrade-intent");
     std::fs::create_dir_all(&dir)?;
@@ -210,9 +263,32 @@ fn write_intent_with_signer(
         "initiated_at_ms": initiated_at_ms,
         "ready": {},
     });
+    let mut body = body;
+    if let Some(digest) = artifact_digest {
+        body["artifact_digest"] = Value::String(digest.to_string());
+    }
+    if let Some(selection) = selection {
+        body["artifact_selection"] = selection;
+    }
     let text = sign_intent_document(&path, body, signer, auth_now_ms, nonce)?;
     write_intent_file(&path, &text)?;
     Ok(path)
+}
+
+fn admitted_artifact_digest(intent: &Value) -> Option<String> {
+    if let Some(selection) = intent.get("artifact_selection") {
+        let parsed: Result<mackes_mesh_types::lifecycle::LifecycleArtifactSelectionV1, _> =
+            serde_json::from_value(selection.clone());
+        if let Ok(selection) = parsed {
+            if selection.validate().is_ok() {
+                return Some(selection.artifact_digest_hex);
+            }
+        }
+        return None;
+    }
+    let digest = intent.get("artifact_digest").and_then(Value::as_str)?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(digest.to_string())
 }
 
 /// Build the stable capability target from the exact replicated filename. A
@@ -668,6 +744,15 @@ impl UpgradeIntentWatcher {
 
             // INST-11 — upgrade half.
             if should_act(&intent, &self.hostname) {
+                if admitted_artifact_digest(&intent).is_none() {
+                    self.emit_upgrade_alert(
+                        &target_version(&intent),
+                        "blocked",
+                        "warn",
+                        "upgrade intent has no admitted artifact digest; package execution withheld",
+                    );
+                    continue;
+                }
                 if authorize_intent_body(&self.authorizer, &path, &raw).is_err() {
                     continue;
                 }
@@ -721,6 +806,9 @@ impl UpgradeIntentWatcher {
                 continue;
             };
             if barrier_should_fire(&fresh, peer_count, now_s, &self.hostname) {
+                if admitted_artifact_digest(&fresh).is_none() {
+                    continue;
+                }
                 if authorize_intent_body(&self.authorizer, &path, &fresh_raw).is_err() {
                     continue;
                 }
@@ -995,6 +1083,8 @@ mod tests {
             &signer,
             TEST_NOW_MS,
             "write-intent-valid-nonce",
+            None,
+            None,
         )
         .unwrap();
         assert!(path.ends_with("upgrade-intent/latest.json"));
@@ -1009,6 +1099,41 @@ mod tests {
     }
 
     #[test]
+    fn typed_artifact_selection_is_required_for_typed_execution() {
+        let home = tempdir().unwrap();
+        let signer = test_signer();
+        let selection = json!({
+            "schema_version": 1,
+            "selection_id": "selection-1",
+            "target_id": "upgrade-coordinator",
+            "channel": "stable",
+            "artifact_digest_hex": "a".repeat(64),
+            "source_revision": "revision-1",
+            "signed": true,
+            "unverified_build": false,
+            "generation": 4242
+        });
+        let path = write_intent_with_signer(
+            home.path(),
+            "stable-1",
+            4242,
+            &signer,
+            TEST_NOW_MS,
+            "typed-selection-nonce",
+            Some(selection.clone()),
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let digest = "a".repeat(64);
+        assert_eq!(admitted_artifact_digest(&value).as_deref(), Some(digest.as_str()));
+
+        let mut invalid = value;
+        invalid["artifact_selection"]["signed"] = Value::Bool(false);
+        assert!(admitted_artifact_digest(&invalid).is_none());
+    }
+
+    #[test]
     fn write_intent_sanitizes_the_filename() {
         let home = tempdir().unwrap();
         let signer = test_signer();
@@ -1019,6 +1144,8 @@ mod tests {
             &signer,
             TEST_NOW_MS,
             "write-intent-sanitize-nonce",
+            None,
+            None,
         )
         .unwrap();
         // Path-unsafe chars collapse to '-'; the label is preserved inside.
@@ -1038,6 +1165,8 @@ mod tests {
             &signer,
             TEST_NOW_MS,
             "read-only-poll-nonce",
+            None,
+            None,
         )
         .unwrap();
         let gate = ActionAuthorizer::for_test(TEST_KEY, home.path().join("auth"), TEST_NOW_MS);
@@ -1077,6 +1206,8 @@ mod tests {
             &signer,
             TEST_NOW_MS,
             "tamper-source-nonce",
+            None,
+            None,
         )
         .unwrap();
         let raw = read_raw(&signed_path).unwrap();
@@ -1132,6 +1263,8 @@ mod tests {
             &signer,
             now_ms,
             "valid-execution-nonce",
+            None,
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
         )
         .unwrap();
 

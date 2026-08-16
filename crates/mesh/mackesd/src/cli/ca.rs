@@ -439,13 +439,12 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 let workgroup_root =
                     workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
                 let self_id = self_node_id.unwrap_or_else(default_node_id);
-                let rows = mackesd_core::ca::revoke::revoke_peer(
+                let rows = revoke_with_authority(
                     &conn,
                     &workgroup_root,
                     &self_id,
                     &node_id,
-                )
-                .context("ca revoke")?;
+                )?;
                 println!(
                     "revoked '{node_id}': {rows} cert row(s) marked revoked; \
                          added to ban list at {self_id}'s QNM-Shared entry."
@@ -460,14 +459,49 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 let workgroup_root =
                     workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
                 let self_id = default_node_id();
-                match mackesd_core::ca::ban_list::add_banned(&workgroup_root, &self_id, &node_id) {
-                    Ok(true) => println!(
+                let generation = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs().max(1))
+                    .unwrap_or(1);
+                let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+                    schema_version: 1,
+                    request_id: format!("ca-ban-{node_id}-{generation}"),
+                    target_id: node_id.clone(),
+                    intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::Offboard,
+                    generation,
+                    steps: vec!["offboard".into()],
+                };
+                let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(
+                    &workgroup_root,
+                    plan,
+                )
+                .map_err(|error| anyhow::anyhow!("cannot acquire CA ban authority: {error:?}"))?;
+                let mut added = None;
+                let result = authority.run_next(|_| {
+                    added = Some(
+                        mackesd_core::ca::ban_list::add_banned(
+                            &workgroup_root,
+                            &self_id,
+                            &node_id,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    );
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    let _ = authority.finish();
+                    return Err(anyhow::anyhow!("CA ban lifecycle failure: {error:?}"));
+                }
+                authority.finish().map_err(|error| {
+                    anyhow::anyhow!("cannot release CA ban authority: {error:?}")
+                })?;
+                match added.ok_or_else(|| anyhow::anyhow!("CA ban returned no result"))? {
+                    true => println!(
                         "banned '{node_id}' (recorded in {}'s ban list; \
                              propagates to every peer via mesh-storage).",
                         self_id
                     ),
-                    Ok(false) => println!("'{node_id}' was already banned (no-op)."),
-                    Err(e) => return Err(anyhow::anyhow!("ca ban: {e}")),
+                    false => println!("'{node_id}' was already banned (no-op)."),
                 }
             }
             CaCmd::Unban {
@@ -480,10 +514,45 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 let workgroup_root =
                     workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
                 let self_id = default_node_id();
-                match mackesd_core::ca::ban_list::remove_banned(&workgroup_root, &self_id, &node_id)
-                {
-                    Ok(true) => println!("unbanned '{node_id}' from {self_id}'s ban list."),
-                    Ok(false) => {
+                let generation = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs().max(1))
+                    .unwrap_or(1);
+                let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+                    schema_version: 1,
+                    request_id: format!("ca-unban-{node_id}-{generation}"),
+                    target_id: node_id.clone(),
+                    intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::VerifyAndCorrect,
+                    generation,
+                    steps: vec!["identity".into()],
+                };
+                let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(
+                    &workgroup_root,
+                    plan,
+                )
+                .map_err(|error| anyhow::anyhow!("cannot acquire CA unban authority: {error:?}"))?;
+                let mut removed = None;
+                let result = authority.run_next(|_| {
+                    removed = Some(
+                        mackesd_core::ca::ban_list::remove_banned(
+                            &workgroup_root,
+                            &self_id,
+                            &node_id,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    );
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    let _ = authority.finish();
+                    return Err(anyhow::anyhow!("CA unban lifecycle failure: {error:?}"));
+                }
+                authority.finish().map_err(|error| {
+                    anyhow::anyhow!("cannot release CA unban authority: {error:?}")
+                })?;
+                match removed.ok_or_else(|| anyhow::anyhow!("CA unban returned no result"))? {
+                    true => println!("unbanned '{node_id}' from {self_id}'s ban list."),
+                    false => {
                         // Still surface the union state so the
                         // operator knows if another peer banned it.
                         if mackesd_core::ca::ban_list::is_banned(&workgroup_root, &node_id) {
@@ -495,7 +564,6 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                             println!("'{node_id}' isn't banned (no-op).");
                         }
                     }
-                    Err(e) => return Err(anyhow::anyhow!("ca unban: {e}")),
                 }
             }
             CaCmd::BanList { workgroup_root } => {
@@ -516,6 +584,45 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn revoke_with_authority(
+    conn: &rusqlite::Connection,
+    workgroup_root: &std::path::Path,
+    self_id: &str,
+    node_id: &str,
+) -> anyhow::Result<u32> {
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
+    let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("ca-revoke-{node_id}-{generation}"),
+        target_id: node_id.to_string(),
+        intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::Offboard,
+        generation,
+        steps: vec!["offboard".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(workgroup_root, plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire CA revoke authority: {error:?}"))?;
+    let mut rows = None;
+    let result = authority.run_next(|_| {
+        rows = Some(
+            mackesd_core::ca::revoke::revoke_peer(conn, workgroup_root, self_id, node_id)
+                .context("ca revoke")
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("CA revoke lifecycle failure: {error:?}"));
+    }
+    authority
+        .finish()
+        .map_err(|error| anyhow::anyhow!("cannot release CA revoke authority: {error:?}"))?;
+    rows.ok_or_else(|| anyhow::anyhow!("CA revoke authority completed without a result"))
 }
 
 #[cfg(test)]

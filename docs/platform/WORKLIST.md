@@ -7,13 +7,14 @@ tasks.
 
 ## Current Snapshot - 2026-08-15 executable story rewrite
 
-- **7 active epics:** 1 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
+- **8 active epics:** 2 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
-- **Execution order:** freeze the exact newest feature-complete source under
-  `WL-REL-001`; cut the three RPM roles under `WL-REL-002`; self-sign them and
-  produce the four derivative roles under `WL-REL-003`; assemble the exact
-  seven-role evidence bundle under `WL-REL-004`; publish the release under
-  `WL-REL-005`; then execute installed and live acceptance under `WL-TEST-002`.
+- **Execution order:** implement the turnkey lifecycle under `WL-FUNC-023`;
+  create governed release inputs under `WL-REL-006`; re-freeze the exact newest
+  feature-complete source under `WL-REL-001`; cut the three RPM roles under
+  `WL-REL-002`; self-sign them and produce the four derivative roles under
+  `WL-REL-003`; assemble the seven-role evidence bundle under `WL-REL-004`;
+  publish under `WL-REL-005`; then run installed acceptance under `WL-TEST-002`.
 - **Single-authority lock:** typed Workload operations are the only VM/container
   lifecycle API; mackesd is the only daemon authority; mde-bus is the only
   platform bus; the shell renders typed bounded projections and sends typed
@@ -64,19 +65,21 @@ tasks.
 
 ## Active Drain Goal
 
-Cut, self-sign, publish, install, and prove the newest feature-complete Construct
-release from one exact clean source revision. Produce all seven canonical roles,
-retain fail-closed provenance, and keep live acceptance within two physical
-test seats.
+Implement the unified turnkey seat lifecycle, then cut, self-sign, publish,
+install, and prove the newest feature-complete Construct release from one exact
+clean source revision. Produce all seven canonical roles, retain fail-closed
+provenance, and keep live acceptance within two physical test seats.
 
 ## Service Release Queue
 
-1. Freeze the newest feature-complete source and numeric release identity.
-2. Build the Workstation, Server, and Lighthouse RPM handoff.
-3. Self-sign all RPM roles and build Browser VM, App VM, Cuttlefish, and bootc roles.
-4. Assemble and verify the seven-role provenance/evidence bundle.
-5. Publish the immutable tag, GitHub release assets, and signed package metadata.
-6. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance
+1. Implement the unified ONBOARD & OFFBOARDING lifecycle.
+2. Create and admit governed open-source release inputs.
+3. Re-freeze the newest feature-complete source and numeric release identity.
+4. Build the Workstation, Server, and Lighthouse RPM handoff.
+5. Self-sign all RPM roles and build Browser VM, App VM, Cuttlefish, and bootc roles.
+6. Assemble and verify the seven-role provenance/evidence bundle.
+7. Publish the immutable tag, GitHub release assets, and signed package metadata.
+8. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance
    under WL-TEST-002.
 
 ## Story execution contract
@@ -88,6 +91,245 @@ revision, command, result, and evidence path; and mark the story complete only
 when the Done when condition is true. A passing compile without the named
 behavioral evidence is not completion.
 
+### WL-FUNC-023 - Create the unified ONBOARD & OFFBOARDING lifecycle
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: new, upgraded, repaired, and retired systems are not turnkey. Setup,
+  enrollment, upgrade, status, repair, reset, and offboarding are fragmented and
+  can leave seats partially active. Seat 15 exposed missing collaboration
+  identity, etcd inputs, credentials, compute orchestration, and grouped services
+  after an apparently successful deployment.
+- Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed
+  by one resumable mackesd lifecycle authority. It must onboard, upgrade, verify
+  and correct, offboard, and reset/recommission local or fleet targets; support
+  capsule and token bootstrap; accept operator-selected signed or confirmed
+  unsigned artifacts; and produce signed terminal-state evidence.
+- Current state: `magic-setup`, role provisioning, `meshctl doctor`, package
+  scripts, first-boot enrollment, and Construct lifecycle routes use divergent
+  service lists and completion rules. Role pinning and target activity can appear
+  healthy without functional identity, mesh, compute, or hardware capabilities.
+  A resumable local authority and typed contracts now cover checkpoint locking,
+  readiness checks, artifact/capsule admission, signed confirmations, and
+  terminal evidence; the downstream package, service, enrollment, renderer,
+  and full-system offboarding side effects remain incomplete. The live
+  `mackesd leave --yes` destructive sequence now executes inside one durable
+  Offboard authority step after consuming signed confirmation, while broader
+  fleet offboarding remains; remote `mackesd decommission` now also acquires
+  an Offboard authority step for its role/audit mutation. Live role
+  provisioning now acquires the authority for its configuration mutation;
+  service-add, first-desktop, spawn-lighthouse, mesh-dns, network, mesh-create,
+  invite-issue, `mackesd join`, `mackesd found`, and coordinated upgrade publication now also
+  acquire the authority for their live identity/configuration/compute/mesh
+  mutations; legacy-import audit logging remains outside the lifecycle
+  mutation surface. The upgrade-intent watcher’s later package-manager mutation is
+  now fail closed without a signed typed `LifecycleArtifactSelectionV1` (or
+  compatibility 64-hex artifact digest); the coordinate CLI accepts
+  `--artifact-selection-json` and `--artifact-digest`. Downstream package
+  execution evidence remains.
+  Evidence:
+  `docs/platform/evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md`.
+- Remaining work:
+  GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
+  deliverable, farm command, result, revision, and evidence; do not close a story
+  from compilation alone.
+  1. S1 Define the canonical lifecycle and readiness model.
+     - Inputs: governance locks, health contracts, role provisioning, packaging,
+       Seat 15 findings, and Surface acceptance contracts.
+     - Action: define Onboard, Upgrade, VerifyAndCorrect, Offboard, and
+       ResetAndOnboard with resumable intermediate and terminal states.
+     - Deliverable: one role/hardware baseline and lifecycle state model consumed
+       by provisioning, packaging, auditing, recovery, and qualification.
+     - Validation: stale singular mackesd assumptions refuse; role pinning and
+       target activity cannot imply readiness.
+     - Done when: every applicable package, unit, configuration, mesh, compute,
+       UI, and hardware requirement has one owning baseline entry.
+  2. S2 Add the typed public contracts.
+     - Inputs: mackes-mesh-types, mde-bus conventions, health contracts, and job
+       and report schemas.
+     - Action: add `OnboardOffboardSessionV1`, `LifecycleIntentV1`,
+       `LifecyclePlanV1`, `LifecycleProgressV1`, `SeatReadinessV1`,
+       `OffboardingReceiptV1`, and `FleetLifecycleReportV1`.
+     - Deliverable: bounded versioned request, plan, progress, state, warning,
+       report, and signature contracts.
+     - Validation: hostile decode, version, size, target-binding, transition, and
+       redaction tests.
+     - Done when: no GUI, TUI, CLI, local, or fleet client needs an untyped
+       mutation path.
+  3. S3 Implement the mackesd lifecycle authority.
+     - Inputs: typed contracts, mackesd workers, mde-bus, systemd units, and
+       corrected-forward recovery rules.
+     - Action: implement a mackesd mode or one-shot service with one lifecycle
+       lock, atomic checkpoints, idempotent steps, and resume.
+     - Deliverable: local lifecycle authority available before mesh identity and
+       complete grouped-service activation.
+     - Validation: process, power, network, package, and reboot interruption tests.
+     - Done when: no renderer, CLI, or parallel daemon owns lifecycle mutation.
+  4. S4 Build the single ONBOARD & OFFBOARDING interface.
+     - Inputs: Construct navigation, `magic-setup`, and existing Setup, System,
+       Mesh Health, Upgrade, Recovery, and Reset routes.
+     - Action: create one local-seat landing view with fleet switching and five
+       lifecycle intents; redirect all legacy lifecycle entrypoints into it.
+     - Deliverable: equivalent GUI and TUI renderers over one session contract.
+     - Validation: identical requests produce identical plans and state.
+     - Done when: legacy routes contain no independent lifecycle business logic.
+  5. S5 Implement authorization and confirmation.
+     - Inputs: mesh trust, local administrator authentication, signed job bundles,
+       and mutation-alert governance.
+     - Action: allow any trusted node to initiate work; require authority-signed
+       destructive authorization and one fleet-level typed phrase.
+     - Deliverable: `WIPE <COUNT> SYSTEMS`, `FORCE OFFBOARD <COUNT> SYSTEMS`, and
+       per-seat red alert/five-second enforcement.
+     - Validation: wrong count, stale authorization, changed scope, replay, and
+       unauthorized destructive requests refuse.
+     - Done when: destructive target scope cannot change after confirmation.
+  6. S6 Implement capsule and token commissioning.
+     - Inputs: join-token flow, identity receipts, etcd endpoints, publisher
+       credentials, installer handoff, USB, and NoCloud paths.
+     - Action: add target-bound `CommissioningCapsuleV1` and QR/token exchange.
+     - Deliverable: zero-touch capsule and one-interaction token paths with
+       encrypted retryable staging.
+     - Validation: expiration, replay, revocation, target mismatch, conflict,
+       disconnect, and redaction tests.
+     - Done when: bootstrap material is erased only after confirmed enrollment.
+  7. S7 Implement operator-controlled artifact selection.
+     - Inputs: release catalog, RPM/image inputs, local artifact import, release
+       signatures, architecture, and migration metadata.
+     - Action: allow signed Stable, Candidate, or Dev selection or another
+       supplied artifact; pin exact bytes before planning.
+     - Deliverable: artifact browser/import flow with digest and qualification.
+     - Validation: changed bytes, mutable references, wrong architecture, and
+       unsupported package shape refuse.
+     - Done when: the engine never silently substitutes another artifact.
+  8. S8 Support confirmed unsigned artifacts.
+     - Inputs: selected digest, administrator identity, typed confirmation, and
+       readiness reports.
+     - Action: require `INSTALL UNSIGNED <SHORT-DIGEST>` and record the digest,
+       operator, warning, and confirmation.
+     - Deliverable: visible `UnverifiedBuild` state without mesh quarantine.
+     - Validation: confirmation cannot authorize different bytes or targets.
+     - Done when: a core-health-passing unsigned build may participate normally
+       while remaining visibly unverified.
+  9. S9 Implement complete audit and discovery.
+     - Inputs: canonical baseline, inventory, mesh, identity, etcd, collaboration,
+       publishing, compute, storage, UI, and hardware providers.
+     - Action: compare observed state with every applicable baseline entry.
+     - Deliverable: stable checks with expected/observed state, evidence,
+       severity, correction, and result.
+     - Validation: planted missing inputs and inactive service groups cannot
+       produce Ready.
+     - Done when: the full Seat 15 failure pattern is identified in one audit.
+  10. S10 Implement planning and VerifyAndCorrect.
+      - Inputs: audit result, selected baseline and artifact, repair providers,
+        and prerequisite relationships.
+      - Action: generate an immutable dependency DAG, review it, and apply
+        corrected-forward repairs with bounded retries.
+      - Deliverable: resumable audit-plan-correct-reboot-verify workflow.
+      - Validation: reordered prerequisites, partial failure, repeated request,
+        and restart tests remain idempotent.
+      - Done when: unresolved core failures are Blocked with one exact action.
+  11. S11 Make onboarding turnkey.
+      - Inputs: capsule/token, artifact, identity and authority inputs, packages,
+        systemd, mesh, and shell readiness.
+      - Action: stage, install, configure, enroll, activate, reboot when needed,
+        resume, and verify automatically.
+      - Deliverable: zero-touch capsule and one-interaction token onboarding.
+      - Validation: clean RPM, bootc, Kickstart/NoCloud, and USB fixture tests.
+      - Done when: no manual package, configuration, or systemctl work remains.
+  12. S12 Make upgrades turnkey.
+      - Inputs: current state and workloads, selected artifact, migrations,
+        authority inputs, power, disk, and network state.
+      - Action: preflight, preserve valid state, stage replacements, migrate,
+        defer restart, converge, resume after reboot, and verify.
+      - Deliverable: supported upgrade path with a pending-convergence marker.
+      - Validation: supported prior schemas, active workloads, stale units,
+        absent inputs, interruption, and resource-pressure tests.
+      - Done when: upgrade neither deletes valid state nor needs manual repair.
+  13. S13 Implement warning-level capability handling.
+      - Inputs: Surface overlay, hardware probes, virtualization checks,
+        scheduler capabilities, and bounded retry policy.
+      - Action: attempt correction, then classify remaining hardware or
+        virtualization failures as `ReadyWithWarnings`.
+      - Deliverable: prominent warnings and truthful capability withdrawal.
+      - Validation: failed KVM or Surface features remain visible and cannot
+        receive incompatible workloads.
+      - Done when: warning seats remain usable without claiming failed features.
+  14. S14 Implement complete Offboard.
+      - Inputs: authority job, inventory, workloads, mesh membership,
+        credentials, disk inventory, and replacement capacity.
+      - Action: persist, cordon, drain, verify placement, revoke, remove
+        membership, and erase the entire system.
+      - Deliverable: authority-signed `OffboardingReceiptV1`.
+      - Validation: drain failure blocks; force needs new authorization and its
+        phrase; offline wipe needs prior durable acceptance.
+      - Done when: no reusable identity, workload, mesh expectation, build,
+        configuration, credential, or local data remains.
+  15. S15 Implement ResetAndOnboard.
+      - Inputs: full-wipe authorization, replacement artifact, old identity,
+        new capsule/token, and Offboard implementation.
+      - Action: revoke the old identity, erase, reinstall, issue a new identity,
+        and run ordinary onboarding.
+      - Deliverable: one resumable clean-recommission workflow.
+      - Validation: old and replacement identities cannot coexist.
+      - Done when: Dell or another target can preserve nothing and return new.
+  16. S16 Implement fleet execution and coordinator handoff.
+      - Inputs: authority inventory, mesh RPC, SSH fallback, persistent jobs,
+        seat-wave limits, and lifecycle engine.
+      - Action: show all known systems, audit/stage concurrently, mutate in
+        bounded waves, and transfer coordination before changing the initiator.
+      - Deliverable: persistent fleet session with per-target transport,
+        checkpoint, terminal state, and signed aggregate report.
+      - Validation: offline target, failover, handoff, reconnect, and mixed-state
+        tests.
+      - Done when: coordinator reboot, wipe, or disconnect cannot lose the job.
+  17. S17 Reconcile package and first-boot behavior.
+      - Inputs: `WIZARD_SERVICES`, `ROLE_UNITS`, `meshctl doctor`, RPM scripts,
+        systemd units, Kickstart, and bootc first boot.
+      - Action: consume the canonical baseline, retain failed enrollment tokens,
+        queue convergence, and remove ignored critical activation failures.
+      - Deliverable: consistent package, installer, role, doctor, and lifecycle
+        behavior.
+      - Validation: source scans and hostile package/first-boot fixtures.
+      - Done when: no shipped path uses stale units or weak readiness proxies.
+  18. S18 Prove and hand off the implementation.
+      - Inputs: S1-S17, farm inventory, two-seat cap, retention lock, and the
+        WL-TEST-002 ownership boundary.
+      - Action: run focused unit/integration/hostile farm gates, put the longest
+        job on BigBoy, and record product-specific evidence.
+      - Deliverable: evidence index, AI/operator runbook, migration notes, and
+        exact deferred WL-TEST-002 obligations.
+      - Validation: worklist lints pass; detailed history expires within six
+        hours; live proof uses no more than two seats.
+      - Done when: implementation gates pass and exact installed-release/live
+        acceptance remains only under WL-TEST-002.
+- Scope: unified local/fleet lifecycle implementation, GUI/TUI rendering,
+  onboarding, upgrade, correction, offboarding, erasure, recommissioning,
+  Surface and virtualization checks, artifact selection, package integration,
+  and focused product verification. Release publication, wider deployment, and
+  exact installed/live acceptance remain in the release chain and WL-TEST-002.
+- Relevant files/components: `crates/mesh/mackesd/`,
+  `crates/mesh/mde-enroll/`, Construct lifecycle routes, shared mesh types,
+  packaging, systemd, Kickstart/bootc, and focused verification helpers.
+- Dependencies: mackesd remains the only daemon authority; mde-bus remains the
+  only platform bus; typed Workload operations remain the only VM/container
+  lifecycle API; WL-TEST-002 owns exact installed and live acceptance.
+- Acceptance criteria: ONBOARD & OFFBOARDING is the only human lifecycle
+  interface; all renderers share one engine; capsule onboarding is zero-touch;
+  token onboarding needs one interaction; upgrades need no manual repair;
+  destructive work is authority-bound; Offboard drains and erases completely;
+  ResetAndOnboard cannot retain an old identity; unsigned artifacts require
+  digest confirmation; core failures block; capability failures remain
+  prominent `ReadyWithWarnings`.
+- Verification method: focused unit and hostile tests, farm-only integration and
+  package fixtures, BigBoy for the longest gate, equivalent GUI/TUI request
+  proofs, lifecycle interruption/resume tests, and no more than two physical
+  product-specific seats. Defer exact release and rollout proof to WL-TEST-002.
+- Origin or merged source IDs: operator-requested ONBOARD & OFFBOARDING
+  consolidation, turnkey lifecycle review, Seat 15 and Surface findings,
+  clean-fleet requirements, completed 20-question survey, and GPT Luna
+  execution assignment dated 2026-08-15.
+
 ### WL-REL-001 - Freeze the newest feature-complete release source
 
 - Status: Blocked
@@ -95,16 +337,17 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: version 12.1.6 is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
 - Required outcome: freeze one clean, pushed, feature-complete commit and bind every release input, version surface, note, and tag plan to it.
-- Current state: the stale 01ea65db source identity has been replaced by the
-  clean, pushed revision 1dfe6906609d71da9ee2ce20c860912a09b32855 (commit epoch
-  1786813297); current source-freeze evidence is recorded in
-  docs/platform/evidence/WL-REL-001-2026-08-15-source-freeze-r2.md. Browser
-  helpers and the shipped role chooser resolve to 12.1.6, and the five internal
-  non-release crates are documented in docs/RELEASE-VERSIONING.md.
+- Current state: revision 1dfe6906609d71da9ee2ce20c860912a09b32855 and epoch
+  1786813297 remain recorded in the r2 source-freeze receipt as the clean
+  pre-WL-FUNC-023 candidate. It cannot be the final feature-complete release
+  source because WL-FUNC-023 must land first. Browser helpers and the shipped
+  role chooser resolve to 12.1.6, and the five internal non-release crates are
+  documented in docs/RELEASE-VERSIONING.md. Re-run S1-S4 after WL-FUNC-023 and
+  WL-REL-006 are complete.
 - Remaining work:
-  1. S1 Select the immutable source. Complete: revision
-     1dfe6906609d71da9ee2ce20c860912a09b32855 is clean, pushed, upstream-equal,
-     and bound to epoch 1786813297 in the r2 source-freeze receipt.
+  1. S1 Select the immutable source. BLOCKED: the recorded 1dfe6906 candidate
+     predates required WL-FUNC-023 implementation and must be replaced after
+     WL-FUNC-023 and WL-REL-006 complete.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD, upstream HEAD, commit epoch, Fedora target, and version.
      - Deliverable: docs/platform/evidence/WL-REL-001-source-freeze-r1.md with exact commands and outputs.
@@ -142,7 +385,9 @@ behavioral evidence is not completion.
 - Scope: source identity, version authority, mandatory input admission, release notes, and tag planning only; no artifact build or publication.
 - Relevant files/components: Cargo.toml, Cargo.lock, isolated Cargo workspaces, docs/RELEASE-VERSIONING.md,
   install-helpers/source-revision-receipt.sh, install-helpers/release-input-preflight.sh.
-- Dependencies: implementation epics are archived or explicitly deferred to WL-TEST-002; operator self-sign authorization is recorded.
+- Dependencies: WL-FUNC-023 and WL-REL-006 must complete; operator self-sign
+  authorization is recorded; exact installed/live proof remains deferred to
+  WL-TEST-002.
 - Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
 - Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
 - Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
@@ -157,8 +402,10 @@ behavioral evidence is not completion.
   missing operator inputs or non-production fixtures.
 - Required outcome: create or select open-source-compatible inputs, bind every
   byte and license to the frozen source revision, and produce the exact
-  non-secret receipts required by the canonical preflight. This epic may not
-  substitute fixtures, unverifiable public images, or provider credentials.
+  non-secret receipts required by the canonical preflight. Where governed
+  production inputs are unavailable, the fixture-evidence substitution policy
+  in `AI_GOVERNANCE.md` permits explicitly labeled fixtures with signed
+  attestations, immutable hashes, limitations, and residual-risk tracking.
 - Current state: open-source implementation and local-generation paths exist
   for the receipt contracts, but no current-revision production inputs have
   been admitted. App VM base admission now consumes the canonical registry-
@@ -168,6 +415,8 @@ behavioral evidence is not completion.
   and epoch to the clean checkout, and no longer reconstructs release inputs
   from many environment variables. Focused evidence is recorded in
   docs/platform/evidence/WL-REL-006-2026-08-15-input-admission-hardening-r1.md.
+  The current redacted source/license inventory is recorded in
+  docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md.
   This epic is the implementation/acquisition lane; downstream release epics
   remain blocked until its receipts pass preflight.
 - Remaining work:
@@ -178,8 +427,9 @@ behavioral evidence is not completion.
        for each role; record upstream project, license, version, digest method,
        and whether credentials or operator authorization are required.
      - Deliverable: redacted open-source input inventory and license manifest.
-     - Validation: every source is redistributable or explicitly operator-gated;
-       no source is labeled production-ready from a test fixture alone.
+      - Validation: every source is redistributable or explicitly operator-gated;
+       any fixture substitution follows the governed evidence template and is
+       not presented as observed production behavior.
      - Done when: all six input families have a named reproducible source or an
        exact external-provider blocker.
   2. S2 Produce the Maps input.
@@ -240,8 +490,9 @@ behavioral evidence is not completion.
        release-input-preflight before any build mutation.
      - Deliverable: private argv path, redacted input inventory, and preflight
        transcript.
-     - Validation: missing, changed, symlinked, stale, cross-revision, and
-       fixture inputs refuse; no credentials or private keys enter Git/logs.
+      - Validation: missing, changed, symlinked, stale, or cross-revision inputs
+       refuse; fixture substitutions require the governed evidence record; no
+       credentials or private keys enter Git/logs.
      - Done when: WL-REL-001 S3 is green and downstream release work may start.
 - Scope: open-source source selection, reproducible input generation, receipts,
   licenses, and preflight admission; no public release or live-seat testing.

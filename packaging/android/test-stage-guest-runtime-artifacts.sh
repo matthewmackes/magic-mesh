@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT=$(git rev-parse --show-toplevel)
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 STAGER=$ROOT/packaging/android/stage-guest-runtime-artifacts.sh
-revision=$(git -C "$ROOT" rev-parse HEAD)
+revision=${MCNF_BUILD_SOURCE_REVISION:-}
+if [[ -z "$revision" ]]; then
+    revision=$(git -C "$ROOT" rev-parse HEAD)
+fi
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 

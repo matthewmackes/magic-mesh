@@ -5,9 +5,35 @@
 use crate::*;
 
 /// Handle the `decommission` subcommand.
-#[allow(unreachable_code)]
 pub fn run(node_id: String, force: bool, db_path: PathBuf) -> anyhow::Result<()> {
-    {
+    let root = mackesd_core::default_qnm_shared_root();
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
+    let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("decommission-{node_id}-{generation}"),
+        target_id: node_id.clone(),
+        intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::Offboard,
+        generation,
+        steps: vec!["offboard".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire decommission authority: {error:?}"))?;
+    let result = authority.run_next(|_| {
+        run_inner(node_id, force, db_path).map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("decommission lifecycle failure: {error:?}"));
+    }
+    authority
+        .finish()
+        .map_err(|error| anyhow::anyhow!("cannot release decommission authority: {error:?}"))
+}
+
+fn run_inner(node_id: String, force: bool, db_path: PathBuf) -> anyhow::Result<()> {
         // Phase 12.3.4 — soft-delete the node row and emit a
         // hash-chained Lifecycle event so the audit trail
         // records the operator action. `--force` only changes
@@ -34,6 +60,5 @@ pub fn run(node_id: String, force: bool, db_path: PathBuf) -> anyhow::Result<()>
             "audit_logged":     true,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
-    }
     Ok(())
 }

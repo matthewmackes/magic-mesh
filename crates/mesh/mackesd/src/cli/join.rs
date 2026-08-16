@@ -506,6 +506,41 @@ pub fn run(
     name: Option<String>,
     workgroup_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+    let root = workgroup_root.clone().unwrap_or_else(mackesd_core::default_qnm_shared_root);
+    let node_id = default_node_id();
+    let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+    let lifecycle_plan = LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("join-{node_id}-{generation}"),
+        target_id: node_id,
+        intent: LifecycleIntentKind::Onboard,
+        generation,
+        // Token redemption, role persistence, network enrollment, and setup
+        // are one atomic enrollment boundary from this CLI's perspective.
+        steps: vec!["mesh".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for join: {error:?}"))?;
+    let result = authority.run_next(|_| {
+        run_inner(token, role, name, workgroup_root.clone())
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("join lifecycle authority recorded failure: {error:?}"));
+    }
+    authority.finish()
+        .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))
+}
+
+fn run_inner(
+    token: Option<String>,
+    role: Option<&str>,
+    name: Option<String>,
+    workgroup_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
     // No token → hand off to the enrollment TUI (ONBOARD-5, `mde-enroll`).
     let Some(raw_token) = token else {
         let launched = std::process::Command::new("mde-enroll").status();

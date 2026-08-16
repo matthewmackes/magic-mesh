@@ -114,14 +114,15 @@ pub fn self_test_argv() -> Vec<String> {
     ]
 }
 
-/// The service set the wizard reports/guarantees (design §"Service set").
-pub const WIZARD_SERVICES: [&str; 5] = [
-    "nebula.service",
-    "mackesd.service",
-    "mesh-health.timer",
-    "etcd.service",
-    "syncthing.service",
-];
+/// Return the canonical role-specific service set the wizard reports.
+#[must_use]
+pub fn wizard_services(role: SetupRole) -> Vec<&'static str> {
+    let role = match role {
+        SetupRole::Lighthouse => mde_role::Role::Lighthouse,
+        SetupRole::Workstation => mde_role::Role::Workstation,
+    };
+    mackesd_core::onboard::role_provision::units_for_role(role)
+}
 
 /// Run `argv` and stream each stdout/stderr line to `on_line`, returning the
 /// process success flag. The wizard pumps `on_line` into its live-log pane so
@@ -220,6 +221,9 @@ mod tests {
     fn role_args_match_mackesd_vocabulary() {
         assert_eq!(SetupRole::Lighthouse.as_arg(), "lighthouse");
         assert_eq!(SetupRole::Workstation.as_arg(), "workstation");
+        assert_eq!(wizard_services(SetupRole::Lighthouse).len(), 6);
+        assert_eq!(wizard_services(SetupRole::Workstation).len(), 9);
+        assert!(wizard_services(SetupRole::Workstation).contains(&"mde-shell-egui.service"));
     }
 
     #[test]

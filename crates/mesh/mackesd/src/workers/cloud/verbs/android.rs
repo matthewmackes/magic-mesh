@@ -920,7 +920,10 @@ pub(super) fn android_spec(node: &str, name: &str) -> WorkloadSpec {
         // path) — the delivery type's default, not an operator override here.
         image: None,
         image_digest: None,
-        network_isolation: false,
+        // Android workloads are admitted only on an isolated network; the
+        // signed release preflight rejects any definition that can reach the
+        // host or mesh control plane directly.
+        network_isolation: true,
         raw_hcl: None,
         app: None,
     }
@@ -1090,7 +1093,7 @@ mod tests {
         assert!(spec.memory_mb >= 8192, "mem {}", spec.memory_mb);
         assert!(spec.disk_gb >= 80, "disk {}", spec.disk_gb);
         assert!(spec.image.is_none());
-        assert!(!spec.network_isolation);
+        assert!(spec.network_isolation);
     }
 
     #[test]

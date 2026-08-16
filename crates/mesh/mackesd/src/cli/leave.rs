@@ -4,23 +4,77 @@
 //! CLI verb handlers). Behaviour is unchanged; only the location moved.
 
 /// Handle the `leave` subcommand.
-#[allow(unreachable_code)]
-pub fn run(yes: bool) -> anyhow::Result<()> {
-    {
-        if !yes {
-            anyhow::bail!(
-                "leave wipes this box's mesh state (cert, keys, relay authority trust, role). \
-                     Re-run with --yes to confirm."
-            );
-        }
-        let root = mackesd_core::default_qnm_shared_root();
-        let hostname = std::process::Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
+pub fn run(yes: bool, confirmation_json: String, verifying_key_hex: String) -> anyhow::Result<()> {
+    if !yes {
+        anyhow::bail!(
+            "leave wipes this box's mesh state (cert, keys, relay authority trust, role). \
+             Re-run with --yes to confirm."
+        );
+    }
+    let root = mackesd_core::default_qnm_shared_root();
+    let hostname = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let node_id = format!("peer:{hostname}");
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
+    let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("offboard-{node_id}-{generation}"),
+        target_id: node_id,
+        intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::Offboard,
+        generation,
+        steps: vec!["offboard".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire offboard authority: {error:?}"))?;
+    let confirmation: mackes_mesh_types::lifecycle::LifecycleConfirmationV1 =
+        serde_json::from_str(&confirmation_json)
+            .map_err(|error| anyhow::anyhow!("invalid offboard confirmation: {error}"))?;
+    let key_bytes = parse_hex_32(&verifying_key_hex)
+        .map_err(|error| anyhow::anyhow!("invalid verifying key hex: {error}"))?;
+    let key_bytes: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("verifying key must contain exactly 32 bytes"))?;
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid verifying key: {error}"))?;
+    authority
+        .accept_confirmation(confirmation, &verifying_key)
+        .map_err(|error| anyhow::anyhow!("offboard confirmation rejected: {error:?}"))?;
+    let result = authority.run_next(|_| {
+        run_inner(yes, root, hostname).map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("offboard lifecycle failure: {error:?}"));
+    }
+    authority
+        .finish()
+        .map_err(|error| anyhow::anyhow!("cannot release offboard authority: {error:?}"))
+}
+
+fn parse_hex_32(value: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return Err("expected exactly 64 hexadecimal characters");
+    }
+    let mut output = Vec::with_capacity(32);
+    for pair in bytes.chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16).ok_or("non-hex character")?;
+        let low = (pair[1] as char).to_digit(16).ok_or("non-hex character")?;
+        output.push(((high << 4) | low) as u8);
+    }
+    Ok(output)
+}
+
+fn run_inner(yes: bool, root: std::path::PathBuf, hostname: String) -> anyhow::Result<()> {
+    debug_assert!(yes);
         let node_id = format!("peer:{hostname}");
         // HA — drop our own etcd cluster membership BEFORE stopping the overlay
         // (the cluster is reached over nebula), so a retired node never leaves a
@@ -56,9 +110,7 @@ pub fn run(yes: bool) -> anyhow::Result<()> {
         trust_teardown?;
         println!("left the mesh: {report:#?}");
         println!("re-join later with: mackesd join '<fresh token from a lighthouse>'");
-        return Ok(());
-    }
-    Ok(())
+        Ok(())
 }
 
 /// An absent pin/key is an idempotent success (including a Workstation that

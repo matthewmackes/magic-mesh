@@ -31,7 +31,7 @@ use ratatui::{Frame, Terminal};
 use mde_enroll::setup::{Screen, Wizard};
 use mde_enroll::setup_action::{
     add_peer_argv, found_argv, is_active_argv, join_argv, peers_argv, remove_peer_argv,
-    run_streaming, self_test_argv, SetupRole, WIZARD_SERVICES,
+    run_streaming, self_test_argv, wizard_services, SetupRole,
 };
 
 /// The action screens that collect one input value before running a verb.
@@ -223,7 +223,7 @@ fn run_create(wiz: &mut Wizard, mesh_id: &str, role: SetupRole) {
             "✓ mesh founded — this node is a complete mesh-of-one; services enabled + Mesh Sync up."
                 .to_string(),
         );
-        run_self_test(wiz);
+        run_self_test(wiz, role);
         wiz.push_log(
             "→ Next: share a join token from Manage → \"add peer\" to grow the mesh,".to_string(),
         );
@@ -243,7 +243,7 @@ fn run_join(wiz: &mut Wizard, token: &str, role: SetupRole) {
     }
     if ok {
         wiz.push_log("✓ joined — overlay up, services enabled, Mesh Sync mounted.".to_string());
-        run_self_test(wiz);
+        run_self_test(wiz, role);
         wiz.push_log(
             "→ Next: open the Mesh view to see the network — this node is reachable".to_string(),
         );
@@ -257,9 +257,9 @@ fn run_join(wiz: &mut Wizard, token: &str, role: SetupRole) {
 /// green/red, then run the node self-diagnostic and narrate its verdict. A
 /// mesh-of-one with no lighthouse is success, not a failure — the self-test
 /// classifies the missing lighthouse as skipped, never red.
-fn run_self_test(wiz: &mut Wizard) {
+fn run_self_test(wiz: &mut Wizard, role: SetupRole) {
     wiz.push_log("— self-test: mesh services —".to_string());
-    for unit in WIZARD_SERVICES {
+    for unit in wizard_services(role) {
         let mut state = String::from("unknown");
         run_streaming(&is_active_argv(unit), |l| state = l);
         let glyph = if state == "active" { "✓" } else { "✗" };
@@ -333,7 +333,7 @@ fn run_status(wiz: &mut Wizard) {
         .map(|r| r.to_string())
         .unwrap_or_else(|_| "unpinned".to_string());
     wiz.push_log(format!("— status — role: {role} —"));
-    for unit in WIZARD_SERVICES {
+    for unit in wizard_services(role) {
         let mut state = String::from("unknown");
         run_streaming(&is_active_argv(unit), |l| state = l);
         let glyph = if state == "active" { "✓" } else { "✗" };
@@ -545,10 +545,16 @@ fn draw_screen(
     // reads at a glance.
     let height = rows[1].height.saturating_sub(2) as usize;
     let start = wiz.log.len().saturating_sub(height.max(1));
-    let log_lines: Vec<Line> = wiz.log[start..]
+    let mut log_lines: Vec<Line> = wiz.log[start..]
         .iter()
         .map(|l| Line::styled(l.as_str(), log_line_style(l)))
         .collect();
+    if let Some(view) = &wiz.lifecycle_view {
+        log_lines.insert(
+            0,
+            Line::styled(view.status_line(), Style::default().fg(Color::Cyan)),
+        );
+    }
     f.render_widget(
         Paragraph::new(log_lines).block(Block::default().borders(Borders::ALL).title("Log")),
         rows[1],

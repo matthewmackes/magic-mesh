@@ -5,9 +5,35 @@
 use crate::*;
 
 /// Handle the `reenroll` subcommand.
-#[allow(unreachable_code)]
 pub fn run(node_id: String, db_path: PathBuf) -> anyhow::Result<()> {
-    {
+    let root = mackesd_core::default_qnm_shared_root();
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
+    let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("reenroll-{node_id}-{generation}"),
+        target_id: node_id.clone(),
+        intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::VerifyAndCorrect,
+        generation,
+        steps: vec!["identity".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire reenroll authority: {error:?}"))?;
+    let result = authority.run_next(|_| {
+        run_inner(node_id, db_path).map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("reenroll lifecycle failure: {error:?}"));
+    }
+    authority
+        .finish()
+        .map_err(|error| anyhow::anyhow!("cannot release reenroll authority: {error:?}"))
+}
+
+fn run_inner(node_id: String, db_path: PathBuf) -> anyhow::Result<()> {
         // Phase 12.3.5 — mint a fresh keypair and write its
         // hex public key into the existing node row. Lifecycle
         // event records the old fingerprint so a forensic
@@ -39,6 +65,5 @@ pub fn run(node_id: String, db_path: PathBuf) -> anyhow::Result<()> {
             "audit_logged":     true,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
-    }
     Ok(())
 }

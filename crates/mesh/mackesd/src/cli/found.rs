@@ -19,6 +19,41 @@ pub fn run(
     enroll_port: Option<u16>,
     with_backoffice: Option<&str>,
 ) -> anyhow::Result<()> {
+    use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+    let root = mackesd_core::default_qnm_shared_root();
+    let node_id = default_node_id();
+    let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+    let lifecycle_plan = LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("found-{node_id}-{generation}"),
+        target_id: node_id,
+        intent: LifecycleIntentKind::Onboard,
+        generation,
+        steps: vec!["mesh".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for found: {error:?}"))?;
+    let result = authority.run_next(|_| {
+        run_inner(db_path, mesh_id, external_addr, role, enroll_port, with_backoffice)
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("found lifecycle authority recorded failure: {error:?}"));
+    }
+    authority.finish()
+        .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))
+}
+
+fn run_inner(
+    db_path: &std::path::Path,
+    mesh_id: &str,
+    external_addr: &str,
+    role: &str,
+    enroll_port: Option<u16>,
+    with_backoffice: Option<&str>,
+) -> anyhow::Result<()> {
     use mackesd_core::nebula_enroll_endpoint::{generate_endpoint_identity, DEFAULT_ENROLL_PORT};
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
 
@@ -280,16 +315,32 @@ mod found_backoffice_tests {
     /// Extract the `with_backoffice` field from a parsed `found` (panics if the
     /// args didn't parse to a `Found`).
     fn parse_found(args: &[&str]) -> Option<String> {
-        let cli = Cli::try_parse_from(args).expect("found args should parse");
-        match cli.cmd {
+        match parse_cli(args).cmd {
             Cmd::Found {
                 with_backoffice, ..
-            } => with_backoffice,
+            } => with_backoffice.flatten(),
             other => panic!(
                 "expected Cmd::Found, got something else: {:?}",
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        // The top-level CLI has a deliberately broad command tree; Clap's
+        // derive parser exceeds the test harness's small per-test stack on
+        // this path. Keep the production parser unchanged while giving this
+        // parser-contract helper a bounded, explicit stack.
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .name("found-cli-parse".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                Cli::try_parse_from(args).expect("found args should parse")
+            })
+            .expect("spawn parser helper")
+            .join()
+            .expect("parser helper should not panic")
     }
 
     #[test]
@@ -356,7 +407,7 @@ mod found_backoffice_tests {
     #[test]
     fn with_backoffice_keeps_the_other_found_flags() {
         // The new flag is additive — the existing flags still parse alongside it.
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli(&[
             "mackesd",
             "found",
             "home-mesh",
@@ -365,8 +416,7 @@ mod found_backoffice_tests {
             "--role",
             "lighthouse",
             "--with-backoffice=full",
-        ])
-        .expect("parse");
+        ]);
         match cli.cmd {
             Cmd::Found {
                 mesh_id,
@@ -378,7 +428,7 @@ mod found_backoffice_tests {
                 assert_eq!(mesh_id, "home-mesh");
                 assert_eq!(external_addr, "203.0.113.7");
                 assert_eq!(role, "lighthouse");
-                assert_eq!(with_backoffice.as_deref(), Some("full"));
+                assert_eq!(with_backoffice.as_ref().and_then(|value| value.as_deref()), Some("full"));
             }
             _ => panic!("expected Found"),
         }

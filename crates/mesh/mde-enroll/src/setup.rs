@@ -5,9 +5,12 @@
 //! the actual work (found/join/setup-etcd/setup-syncthing/systemctl) is shelled by the
 //! action layer ([`crate::setup_action`]) — keeping the model terminal- and
 //! subprocess-free makes the whole flow unit-testable.
+
 //!
 //! Lock 1 (one binary grown from `mde-enroll`): the Join screen reuses the
 //! ONBOARD-5 enroll [`crate::app::App`]; `mde-enroll` stays the join-only shim.
+
+use crate::lifecycle_view::LifecycleSessionView;
 
 /// Which top-level screen the wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,8 @@ pub struct Wizard {
     pub menu_index: usize,
     /// Verbose live-log pane (newest last).
     pub log: Vec<String>,
+    /// Read-only authority projection rendered by lifecycle-aware clients.
+    pub lifecycle_view: Option<LifecycleSessionView>,
     /// Set when the operator chooses Quit.
     pub should_quit: bool,
 }
@@ -131,6 +136,7 @@ impl Wizard {
             menu_items,
             menu_index: 0,
             log: Vec::new(),
+            lifecycle_view: None,
             should_quit: false,
         }
     }
@@ -202,6 +208,12 @@ impl Wizard {
     /// Append a verbose log line (the live-log pane).
     pub fn push_log(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
+    }
+
+    /// Attach the latest authority projection without giving the wizard any
+    /// lifecycle mutation capability.
+    pub fn set_lifecycle_view(&mut self, view: LifecycleSessionView) {
+        self.lifecycle_view = Some(view);
     }
 }
 

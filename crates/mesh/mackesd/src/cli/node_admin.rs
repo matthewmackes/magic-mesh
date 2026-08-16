@@ -103,6 +103,34 @@ fn mint_join_token(
 /// can still be locked out.
 pub fn remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> anyhow::Result<()> {
     let root = mackesd_core::default_qnm_shared_root();
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
+    let plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+        schema_version: 1,
+        request_id: format!("remove-peer-{node_id}-{generation}"),
+        target_id: node_id.to_string(),
+        intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::Offboard,
+        generation,
+        steps: vec!["offboard".into()],
+    };
+    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+        .map_err(|error| anyhow::anyhow!("cannot acquire remove-peer authority: {error:?}"))?;
+    let result = authority.run_next(|_| {
+        remove_peer_inner(db_path, node_id, force).map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        let _ = authority.finish();
+        return Err(anyhow::anyhow!("remove-peer lifecycle failure: {error:?}"));
+    }
+    authority
+        .finish()
+        .map_err(|error| anyhow::anyhow!("cannot release remove-peer authority: {error:?}"))
+}
+
+fn remove_peer_inner(db_path: &std::path::Path, node_id: &str, force: bool) -> anyhow::Result<()> {
+    let root = mackesd_core::default_qnm_shared_root();
     let self_id = default_node_id();
     let mut conn = mackesd_core::store::open(db_path)
         .with_context(|| format!("opening store at {}", db_path.display()))?;

@@ -3,8 +3,9 @@
 set -euo pipefail
 umask 077
 
-ROOT=$(git rev-parse --show-toplevel)
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 readonly ROOT
+SOURCE_REPO=${MCNF_SOURCE_REPO:-$ROOT}
 readonly STAGE_VERIFY="$ROOT/packaging/android/stage-guest-runtime-artifacts.sh"
 readonly PACKAGE_VERIFY="$ROOT/packaging/android/verify-guest-debs.sh"
 readonly UNIT_DIR="$ROOT/packaging/android/debian"
@@ -34,7 +35,7 @@ PY
 )
 [[ ${#identity[@]} -eq 2 ]] || fail "stage build identity is invalid"
 version=${identity[0]}; release=${identity[1]}; deb_version="$version-$release"
-epoch=$(git -C "$ROOT" show -s --format=%ct "$revision")
+epoch=$(git -C "$SOURCE_REPO" show -s --format=%ct "$revision")
 [[ $epoch =~ ^[1-9][0-9]*$ ]] || fail "commit epoch is invalid"
 export SOURCE_DATE_EPOCH=$epoch TZ=UTC LC_ALL=C
 

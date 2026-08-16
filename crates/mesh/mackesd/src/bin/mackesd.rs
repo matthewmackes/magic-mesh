@@ -37,6 +37,17 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[cfg(test)]
+fn parse_cli_on_large_test_stack(args: Vec<String>) -> Result<Cli, clap::error::Error> {
+    std::thread::Builder::new()
+        .name("mackesd-cli-parse".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || Cli::try_parse_from(args))
+        .expect("spawn CLI parser helper")
+        .join()
+        .expect("CLI parser helper should not panic")
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Apply every pending `SQLite` migration against the store.
@@ -660,6 +671,12 @@ enum Cmd {
         /// Required confirmation — this wipes local mesh state.
         #[arg(long)]
         yes: bool,
+        /// Signed LifecycleConfirmationV1 JSON for the offboard operation.
+        #[arg(long)]
+        confirmation_json: String,
+        /// Ed25519 verifying key (64 hexadecimal characters).
+        #[arg(long)]
+        verifying_key_hex: String,
     },
 
     /// ENT-4 — bootstrap THIS box as the mesh's founding lighthouse:
@@ -825,7 +842,7 @@ enum Cmd {
             num_args = 0..=1,
             default_missing_value = "minimal"
         )]
-        with_backoffice: Option<String>,
+        with_backoffice: Option<Option<String>>,
     },
 
     /// ONBOARD-4 — **the Magic joining verb.** Join an existing mesh in
@@ -1055,6 +1072,12 @@ enum Cmd {
         /// Coordination label for the intent (default `latest`).
         #[arg(long)]
         version: Option<String>,
+        /// SHA-256 digest of the lifecycle-admitted upgrade artifact.
+        #[arg(long)]
+        artifact_digest: Option<String>,
+        /// JSON-encoded, authority-admitted LifecycleArtifactSelectionV1.
+        #[arg(long, conflicts_with = "artifact_digest")]
+        artifact_selection_json: Option<String>,
     },
 
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
@@ -1459,6 +1482,108 @@ enum ProbeCmd {
 /// code these CLI verbs do.
 #[derive(Subcommand)]
 enum OnboardCmd {
+    /// WL-FUNC-023 — validate one typed lifecycle intent and print its bounded
+    /// daemon-owned plan. Mutation requires a later authority session; this
+    /// verb never claims readiness or completion.
+    Lifecycle {
+        /// JSON-encoded `mackes_mesh_types::lifecycle::LifecycleIntentV1`.
+        #[arg(long, value_name = "JSON")]
+        intent_json: String,
+        /// Ordered lifecycle step names selected by the operator.
+        #[arg(long = "step", value_name = "STEP")]
+        steps: Vec<String>,
+    },
+    /// WL-FUNC-023 — commit one already-successful lifecycle step through the
+    /// daemon authority and print the resulting checkpoint.
+    LifecycleComplete {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        #[arg(long, value_name = "INDEX")]
+        step_index: u32,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — verify and persist the signed operator confirmation
+    /// required by destructive lifecycle intents.
+    LifecycleConfirm {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        /// JSON-encoded `LifecycleConfirmationV1`.
+        #[arg(long, value_name = "JSON")]
+        confirmation_json: String,
+        /// Hex-encoded Ed25519 public key authorized for this confirmation.
+        #[arg(long, value_name = "HEX")]
+        verifying_key_hex: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — print authority-derived readiness for a lifecycle target.
+    LifecycleReadiness {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — persist one exact artifact selection for this target.
+    LifecycleArtifactSelect {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        /// JSON-encoded `LifecycleArtifactSelectionV1`.
+        #[arg(long, value_name = "JSON")]
+        selection_json: String,
+        /// JSON-encoded signed confirmation, required for unsigned builds.
+        #[arg(long, value_name = "JSON")]
+        confirmation_json: Option<String>,
+        /// Hex-encoded Ed25519 public key, required for unsigned builds.
+        #[arg(long, value_name = "HEX")]
+        verifying_key_hex: Option<String>,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — admit one signed target-bound commissioning capsule.
+    LifecycleCapsuleAdmit {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        /// JSON-encoded `CommissioningCapsuleV1`.
+        #[arg(long, value_name = "JSON")]
+        capsule_json: String,
+        /// Hex-encoded Ed25519 public key.
+        #[arg(long, value_name = "HEX")]
+        verifying_key_hex: String,
+        /// Current epoch milliseconds; defaults to the system clock.
+        #[arg(long)]
+        now_ms: Option<i64>,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — confirm enrollment and erase the staged capsule.
+    LifecycleCapsuleConfirm {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        #[arg(long, value_name = "CAPSULE")]
+        capsule_id: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — revoke a staged commissioning capsule.
+    LifecycleCapsuleRevoke {
+        #[arg(long, value_name = "TARGET")]
+        target_id: String,
+        #[arg(long, value_name = "CAPSULE")]
+        capsule_id: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — admit a validated plan into the local authority and
+    /// persist its initial checkpoint for a later executor/resume session.
+    LifecycleStart {
+        #[arg(long, value_name = "JSON")]
+        intent_json: String,
+        #[arg(long = "step", value_name = "STEP")]
+        steps: Vec<String>,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
     /// OW-2 — node self-diagnostic: KVM stack readiness (the KVM_SERVICES
     /// catalog), the mesh peer directory, and identity + CA presence. Prints a
     /// human report (or `--json`) and exits non-zero when a *critical* check
@@ -2192,7 +2317,9 @@ fn main() -> anyhow::Result<()> {
             dry_run,
         } => cli::fleet_push_setting::run(key, value, peers, author, dry_run, db_path)?,
         Cmd::Revisions { cmd } => cli::revisions::run(cmd, db_path)?,
-        Cmd::Leave { yes } => cli::leave::run(yes)?,
+        Cmd::Leave { yes, confirmation_json, verifying_key_hex } => {
+            cli::leave::run(yes, confirmation_json, verifying_key_hex)?
+        }
         Cmd::MeshInit {
             mesh_id,
             external_addr,
@@ -2243,7 +2370,7 @@ fn main() -> anyhow::Result<()> {
             &external_addr,
             &role,
             enroll_port,
-            with_backoffice.as_deref(),
+            with_backoffice.as_ref().and_then(|value| value.as_deref()),
         )?,
         Cmd::Join {
             token,
@@ -2303,7 +2430,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Upgrade {
             coordinate,
             version,
-        } => cli::upgrade::run(coordinate, version)?,
+            artifact_digest,
+            artifact_selection_json,
+        } => cli::upgrade::run(coordinate, version, artifact_digest, artifact_selection_json)?,
         Cmd::Nodes { cmd } => cli::nodes::run(cmd, db_path)?,
         Cmd::AnsibleHistory { cmd } => cli::ansible_history::run(cmd)?,
         Cmd::Events { cmd } => cli::events::run(cmd, db_path)?,
@@ -3378,11 +3507,11 @@ fn resolve_enroll_endpoint_host(
 
 #[cfg(test)]
 mod join_cli_role_tests {
-    use super::{Cli, Cmd};
-    use clap::Parser as _;
+    use super::{parse_cli_on_large_test_stack, Cmd};
 
     fn parsed_join_role(args: &[&str]) -> Option<String> {
-        let cli = Cli::try_parse_from(args).expect("join CLI parses");
+        let cli = parse_cli_on_large_test_stack(args.iter().map(|arg| (*arg).to_owned()).collect())
+            .expect("join CLI parses");
         match cli.cmd {
             Cmd::Join { role, .. } => role,
             _ => panic!("expected join command"),
@@ -3415,12 +3544,12 @@ mod join_cli_role_tests {
 
 #[cfg(test)]
 mod serve_process_group_cli_tests {
-    use super::Cli;
-    use clap::{error::ErrorKind, Parser as _};
+    use super::parse_cli_on_large_test_stack;
+    use clap::error::ErrorKind;
 
     #[test]
     fn serve_without_a_process_group_fails_closed() {
-        let error = match Cli::try_parse_from(["mackesd", "serve"]) {
+        let error = match parse_cli_on_large_test_stack(vec!["mackesd".into(), "serve".into()]) {
             Ok(_) => panic!("the retired all-groups serve mode must be unreachable"),
             Err(error) => error,
         };

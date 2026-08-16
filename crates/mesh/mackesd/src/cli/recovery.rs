@@ -18,7 +18,7 @@ pub fn run(
         // identity's passive-revocation status (short-TTL certs self-lapse — no
         // CRL, no key-backup) + the auto-renewal decision for the current cert.
         // The live re-enroll is integration-gated behind the RecoveryApply seam.
-        use mackesd_core::recovery::{self as rec, RecoveryApply as _};
+        use mackesd_core::recovery as rec;
         let node_id = node_id.unwrap_or_else(default_node_id);
         let root = mackesd_core::default_qnm_shared_root();
         // Reuse the persisted roster (nebula_peer_certs.expires_at + cert_pem) to
@@ -68,58 +68,73 @@ pub fn run(
             }
             return Ok(());
         }
-        // Optional immediate eviction: fingerprint the old cert (from its roster
-        // PEM) and record it into the replicated ENT-3 blocklist (reuse
-        // ca::blocklist) so peers drop its tunnels within a tick.
-        if evict {
-            if let Some(row) = roster.iter().find(|r| r.node_id == node_id) {
-                if let Some(fingerprints) = rec::fingerprint_old_cert(&row.cert_pem) {
-                    let req = rec::EvictRequest {
-                        workgroup_root: root,
-                        node_id: node_id.clone(),
-                        fingerprints,
-                        node_key_path: std::path::PathBuf::from(
-                            mackesd_core::node_key::DEFAULT_KEY_PATH,
-                        ),
-                    };
-                    match rec::LiveRecovery.blocklist_old_identity(&req) {
-                        Ok(receipt) => println!(
-                            "  evicted old identity into the blocklist at {} (signed={})",
-                            receipt.blocklist_path.display(),
-                            receipt.signed
-                        ),
-                        Err(e) => {
-                            eprintln!("  immediate eviction failed: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "  immediate eviction needs nebula-cert to fingerprint the old \
-                             cert (unavailable)"
-                    );
-                    std::process::exit(1);
-                }
-            } else {
-                println!("  --evict: no old roster row for {node_id} — nothing to blocklist");
-            }
+        let generation = u64::try_from(now.max(1)).unwrap_or(1);
+        let lifecycle_plan = mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+            schema_version: 1,
+            request_id: format!("recovery-{node_id}-{generation}"),
+            target_id: node_id.clone(),
+            intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::VerifyAndCorrect,
+            generation,
+            steps: vec!["identity".into()],
+        };
+        let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(
+            &root,
+            lifecycle_plan,
+        )
+        .map_err(|error| anyhow::anyhow!("cannot acquire recovery authority: {error:?}"))?;
+        let result = authority.run_next(|_| {
+            run_live_recovery(node_id, roster, root, plan, evict)
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = result {
+            let _ = authority.finish();
+            return Err(anyhow::anyhow!("recovery lifecycle failure: {error:?}"));
         }
-        // Live path: drive the integration-gated RecoveryApply seam (fresh re-enroll).
-        match rec::execute(&plan, &rec::LiveRecovery) {
-            Ok(rec::RecoveryOutcome::Reenrolled { receipt }) => {
-                println!(
-                    "  re-enrolled {} into {} (overlay {})",
-                    receipt.node_id, receipt.mesh_id, receipt.overlay_ip
-                );
-            }
-            Ok(rec::RecoveryOutcome::Blocked { reason }) => {
-                println!("  no-op — blocked ({reason}); retry available");
-            }
-            Err(e) => {
-                eprintln!("  recovery re-enroll failed (live re-enroll is integration-gated): {e}");
-                std::process::exit(1);
-            }
+        authority
+            .finish()
+            .map_err(|error| anyhow::anyhow!("cannot release recovery authority: {error:?}"))?;
+    }
+    Ok(())
+}
+
+fn run_live_recovery(
+    node_id: String,
+    roster: Vec<mackesd_core::nebula_roster::RosterRow>,
+    root: PathBuf,
+    plan: mackesd_core::recovery::RecoveryPlan,
+    evict: bool,
+) -> anyhow::Result<()> {
+    use mackesd_core::recovery::{self as rec, RecoveryApply as _};
+    if evict {
+        if let Some(row) = roster.iter().find(|r| r.node_id == node_id) {
+            let fingerprints = rec::fingerprint_old_cert(&row.cert_pem)
+                .ok_or_else(|| anyhow::anyhow!("--evict needs nebula-cert to fingerprint the old cert"))?;
+            let req = rec::EvictRequest {
+                workgroup_root: root,
+                node_id: node_id.clone(),
+                fingerprints,
+                node_key_path: PathBuf::from(mackesd_core::node_key::DEFAULT_KEY_PATH),
+            };
+            let receipt = rec::LiveRecovery
+                .blocklist_old_identity(&req)
+                .map_err(|error| anyhow::anyhow!("immediate eviction failed: {error}"))?;
+            println!(
+                "  evicted old identity into the blocklist at {} (signed={})",
+                receipt.blocklist_path.display(), receipt.signed
+            );
+        } else {
+            println!("  --evict: no old roster row for {node_id} — nothing to blocklist");
         }
+    }
+    match rec::execute(&plan, &rec::LiveRecovery) {
+        Ok(rec::RecoveryOutcome::Reenrolled { receipt }) => println!(
+            "  re-enrolled {} into {} (overlay {})",
+            receipt.node_id, receipt.mesh_id, receipt.overlay_ip
+        ),
+        Ok(rec::RecoveryOutcome::Blocked { reason }) => {
+            println!("  no-op — blocked ({reason}); retry available")
+        }
+        Err(error) => return Err(anyhow::anyhow!("recovery re-enroll failed: {error}")),
     }
     Ok(())
 }

@@ -79,6 +79,8 @@ pub mod lighthouse;
 pub mod lighthouse_probe;
 /// WL-FUNC-017 — bounded weather-location preference and effective-location contracts.
 pub mod location;
+/// WL-FUNC-023 — bounded local ONBOARD & OFFBOARDING intent contract.
+pub mod lifecycle;
 /// WL-FUNC-015 — shared `state/media/sources` wire records published by
 /// `mackesd` and consumed by the Media Workspace without a daemon dependency.
 pub mod media_sources;

@@ -8,6 +8,150 @@ use crate::*;
 #[allow(unreachable_code)]
 pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
     match verb {
+        OnboardCmd::Lifecycle { intent_json, steps } => {
+            use mackes_mesh_types::lifecycle::LifecyclePlanV1;
+            let intent = mackes_mesh_types::lifecycle::LifecycleIntentV1::from_json(&intent_json)
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle intent: {error:?}"))?;
+            let steps = if steps.is_empty() { intent.default_steps() } else { steps };
+            let plan = LifecyclePlanV1 {
+                schema_version: intent.schema_version,
+                request_id: intent.request_id,
+                target_id: intent.target_id,
+                intent: intent.intent,
+                generation: intent.generation,
+                steps,
+            };
+            plan.validate()
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle plan: {error:?}"))?;
+            println!("{}", serde_json::to_string(&plan)?);
+        }
+        OnboardCmd::LifecycleComplete { target_id, step_index, root } => {
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            authority.complete_step(step_index)
+                .map_err(|error| anyhow::anyhow!("cannot complete lifecycle step: {error:?}"))?;
+            println!("{}", serde_json::to_string(authority.checkpoint())?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleConfirm { target_id, confirmation_json, verifying_key_hex, root } => {
+            use ed25519_dalek::VerifyingKey;
+            use mackes_mesh_types::lifecycle::LifecycleConfirmationV1;
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let confirmation: LifecycleConfirmationV1 = serde_json::from_str(&confirmation_json)
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle confirmation: {error}"))?;
+            let key_bytes = parse_hex_32(&verifying_key_hex)
+                .ok_or_else(|| anyhow::anyhow!("verifying key must be exactly 64 hex characters"))?;
+            let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|error| anyhow::anyhow!("invalid verifying key: {error}"))?;
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            authority.accept_confirmation(confirmation, &verifying_key)
+                .map_err(|error| anyhow::anyhow!("cannot accept lifecycle confirmation: {error:?}"))?;
+            println!("{}", serde_json::to_string(authority.checkpoint())?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleReadiness { target_id, root } => {
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            let readiness = authority.readiness()
+                .map_err(|error| anyhow::anyhow!("cannot derive lifecycle readiness: {error:?}"))?;
+            println!("{}", serde_json::to_string(&readiness)?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleArtifactSelect { target_id, selection_json, confirmation_json, verifying_key_hex, root } => {
+            use ed25519_dalek::VerifyingKey;
+            use mackes_mesh_types::lifecycle::LifecycleArtifactSelectionV1;
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let selection: LifecycleArtifactSelectionV1 = serde_json::from_str(&selection_json)
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle artifact selection: {error}"))?;
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            if selection.unverified_build {
+                let confirmation_json = confirmation_json.ok_or_else(|| anyhow::anyhow!("unsigned artifact requires --confirmation-json"))?;
+                let verifying_key_hex = verifying_key_hex.ok_or_else(|| anyhow::anyhow!("unsigned artifact requires --verifying-key-hex"))?;
+                let confirmation: mackes_mesh_types::lifecycle::LifecycleConfirmationV1 = serde_json::from_str(&confirmation_json)
+                    .map_err(|error| anyhow::anyhow!("invalid unsigned confirmation: {error}"))?;
+                let key_bytes = parse_hex_32(&verifying_key_hex)
+                    .ok_or_else(|| anyhow::anyhow!("verifying key must be exactly 64 hex characters"))?;
+                let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+                    .map_err(|error| anyhow::anyhow!("invalid verifying key: {error}"))?;
+                authority.select_unsigned_artifact(selection, confirmation, &verifying_key)
+                    .map_err(|error| anyhow::anyhow!("cannot select unsigned artifact: {error:?}"))?;
+            } else {
+                authority.select_artifact(selection)
+                    .map_err(|error| anyhow::anyhow!("cannot select artifact: {error:?}"))?;
+            }
+            println!("{}", serde_json::to_string(authority.checkpoint())?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleCapsuleAdmit { target_id, capsule_json, verifying_key_hex, now_ms, root } => {
+            use ed25519_dalek::VerifyingKey;
+            use mackes_mesh_types::lifecycle::CommissioningCapsuleV1;
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let capsule: CommissioningCapsuleV1 = serde_json::from_str(&capsule_json)
+                .map_err(|error| anyhow::anyhow!("invalid commissioning capsule: {error}"))?;
+            let key_bytes = parse_hex_32(&verifying_key_hex)
+                .ok_or_else(|| anyhow::anyhow!("verifying key must be exactly 64 hex characters"))?;
+            let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|error| anyhow::anyhow!("invalid verifying key: {error}"))?;
+            let now_ms = now_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0)
+            });
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            let digest = authority.admit_commissioning_capsule(capsule, now_ms, &verifying_key)
+                .map_err(|error| anyhow::anyhow!("cannot admit commissioning capsule: {error:?}"))?;
+            println!("{{\"bootstrap_digest_hex\":\"{digest}\",\"checkpoint\":{}}}", serde_json::to_string(authority.checkpoint())?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleCapsuleConfirm { target_id, capsule_id, root } => {
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            authority.confirm_commissioning_capsule(&capsule_id)
+                .map_err(|error| anyhow::anyhow!("cannot confirm commissioning capsule: {error:?}"))?;
+            println!("{}", serde_json::to_string(authority.checkpoint())?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleCapsuleRevoke { target_id, capsule_id, root } => {
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
+            authority.revoke_commissioning_capsule(&capsule_id)
+                .map_err(|error| anyhow::anyhow!("cannot revoke commissioning capsule: {error:?}"))?;
+            println!("{}", serde_json::to_string(authority.checkpoint())?);
+            authority.finish()
+                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+        }
+        OnboardCmd::LifecycleStart { intent_json, steps, root } => {
+            use mackes_mesh_types::lifecycle::LifecyclePlanV1;
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let intent = mackes_mesh_types::lifecycle::LifecycleIntentV1::from_json(&intent_json)
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle intent: {error:?}"))?;
+            let steps = if steps.is_empty() { intent.default_steps() } else { steps };
+            let plan = LifecyclePlanV1 {
+                schema_version: intent.schema_version,
+                request_id: intent.request_id,
+                target_id: intent.target_id,
+                intent: intent.intent,
+                generation: intent.generation,
+                steps,
+            };
+            let authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+                .map_err(|error| anyhow::anyhow!("cannot start lifecycle authority: {error:?}"))?;
+            println!("{}", serde_json::to_string(authority.checkpoint())?);
+            // Dropping the authority releases the OS lock while retaining the
+            // checkpoint and lock path for crash-safe resume.
+        }
         OnboardCmd::SelfTest { json } => {
             // Probe the live node, fold into the report, print, and exit on
             // its verdict (non-zero iff a critical check failed).
@@ -30,6 +174,7 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             std::process::exit(report.exit_code());
         }
         OnboardCmd::RoleProvision { role, dry_run } => {
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
             let parsed: mde_role::Role = role.parse().map_err(|_| {
                 anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation")
             })?;
@@ -45,10 +190,32 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            let outcomes = mackesd_core::onboard::role_provision::apply(
-                &plan,
-                &mackesd_core::onboard::role_provision::SystemctlUnits,
-            );
+            let target_id = default_node_id();
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let authority_root = mackesd_core::default_qnm_shared_root();
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("role-provision-{target_id}-{generation}"),
+                target_id: target_id.clone(),
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["configuration".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&authority_root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for role provisioning: {error:?}"))?;
+            let mut outcomes = Vec::new();
+            let apply_result = authority.run_next(|_| {
+                outcomes = mackesd_core::onboard::role_provision::apply(
+                    &plan,
+                    &mackesd_core::onboard::role_provision::SystemctlUnits,
+                );
+                if outcomes.iter().any(|outcome| !outcome.ok) {
+                    Err("one or more role units failed".into())
+                } else {
+                    Ok(())
+                }
+            });
             let mut failed = 0usize;
             for o in &outcomes {
                 if o.ok {
@@ -68,6 +235,15 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 parsed.as_str(),
                 outcomes.len()
             );
+            let finish_result = authority.finish();
+            if let Err(error) = apply_result {
+                eprintln!("role-provision lifecycle authority recorded failure: {error:?}");
+                if let Err(finish_error) = finish_result {
+                    eprintln!("cannot release lifecycle authority: {finish_error:?}");
+                }
+                std::process::exit(1);
+            }
+            finish_result.map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
             if failed > 0 {
                 std::process::exit(1);
             }
@@ -86,27 +262,51 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             let external_addr = detect_primary_ipv4()
                 .map(|ip| format!("{ip}:4242"))
                 .unwrap_or_else(|_| "127.0.0.1:4242".to_string());
-            let report = mackesd_core::onboard::mesh_create::create(
-                &mackesd_core::ca::SubprocessBackend,
-                &conn,
-                &root,
-                &node_id,
-                std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
-                std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
-                std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
-                std::path::Path::new("/etc/nebula"),
-                &external_addr,
-                label.as_deref(),
-            )?;
-            // Best-effort overlay start on a fresh founding (mirrors
-            // mesh-init; the next serve's supervisor also materializes +
-            // starts). A no-op founding leaves the running overlay untouched.
-            if report.created {
-                let _ = std::process::Command::new("systemctl")
-                    .args(["start", "nebula.service"])
-                    .status();
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("mesh-create-{node_id}-{generation}"),
+                target_id: node_id.clone(),
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["identity".into(), "mesh".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for mesh-create: {error:?}"))?;
+            let mut report = None;
+            let result = authority.run_next(|_| {
+                report = Some(mackesd_core::onboard::mesh_create::create(
+                    &mackesd_core::ca::SubprocessBackend,
+                    &conn,
+                    &root,
+                    &node_id,
+                    std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
+                    std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
+                    std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+                    std::path::Path::new("/etc/nebula"),
+                    &external_addr,
+                    label.as_deref(),
+                ).map_err(|error| error.to_string())?);
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("mesh-create lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
             }
-            print!("{}", report.human());
+            // The create operation is one authority step; leave the second
+            // declared mesh convergence step resumable for the supervisor.
+            if let Some(report) = report {
+                if report.created {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["start", "nebula.service"])
+                        .status();
+                }
+                print!("{}", report.human());
+            }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::InviteIssue { ttl } => {
             // Mint a short-TTL, mesh-scoped invite on THIS node, record it in
@@ -120,11 +320,32 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             let root = mackesd_core::default_qnm_shared_root();
             let mesh_id = mackesd_core::onboard::invite::resolve_mesh_id(&root, &node_id);
             let minutes = ttl.unwrap_or(mackesd_core::onboard::invite::DEFAULT_TTL_MINUTES);
-            let issued = mackesd_core::onboard::invite::issue(
-                &root,
-                &mesh_id,
-                std::time::Duration::from_secs(minutes.saturating_mul(60)),
-            )?;
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("invite-issue-{node_id}-{generation}"),
+                target_id: node_id.clone(),
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["identity".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for invite issuance: {error:?}"))?;
+            let mut issued = None;
+            let result = authority.run_next(|_| {
+                issued = Some(mackesd_core::onboard::invite::issue(
+                    &root, &mesh_id, std::time::Duration::from_secs(minutes.saturating_mul(60)),
+                ).map_err(|error| error.to_string())?);
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("invite issuance lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
+            }
+            let issued = issued.expect("successful invite authority step produces issued invite");
             println!(
                 "invite-issue: mesh '{mesh_id}' — expires in {minutes} min \
                      (exp {} epoch-ms){}",
@@ -147,6 +368,7 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                          or mint an endpoint-bearing token on a lighthouse with `mackesd add-peer`"
                 ),
             }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::Network { dry_run } => {
             // Detect DHCP-vs-static on the primary LAN interface (reusing
@@ -169,17 +391,34 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 print!("{}", mackesd_core::onboard::network::render_keyfile(&plan));
                 return Ok(());
             }
-            match mackesd_core::onboard::network::apply(
-                &plan,
-                dir,
-                &mackesd_core::onboard::network::SystemConnections,
-            ) {
-                Ok(outcome) => println!("  keyfile {}: {}", outcome.tag(), path.display()),
-                Err(e) => {
-                    eprintln!("  keyfile apply failed (LAN bring-up is integration-gated): {e}");
-                    std::process::exit(1);
-                }
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let node_id = default_node_id();
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("network-{node_id}-{generation}"),
+                target_id: node_id,
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["configuration".into()],
+            };
+            let lifecycle_root = mackesd_core::default_qnm_shared_root();
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&lifecycle_root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for network: {error:?}"))?;
+            let result = authority.run_next(|_| {
+                mackesd_core::onboard::network::apply(
+                    &plan, dir, &mackesd_core::onboard::network::SystemConnections,
+                )
+                .map(|outcome| println!("  keyfile {}: {}", outcome.tag(), path.display()))
+                .map_err(|error| error.to_string())
+            });
+            if let Err(error) = result {
+                eprintln!("  network lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
             }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::MeshDns { dry_run } => {
             // Fold the replicated peer roster into the mesh-DNS zone and
@@ -200,23 +439,35 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 print!("{}", mackesd_core::onboard::mesh_dns::render_hosts(&zone));
                 return Ok(());
             }
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("mesh-dns-{node_id}-{generation}"),
+                target_id: node_id,
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["mesh".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for mesh-dns: {error:?}"))?;
             let sink = mackesd_core::onboard::mesh_dns::EtcHosts::default();
-            match mackesd_core::onboard::mesh_dns::apply(&zone, &sink) {
-                Ok(outcome) => println!(
-                    "  {} → {} ({})",
-                    outcome.names,
-                    mackesd_core::onboard::mesh_dns::DEFAULT_HOSTS_PATH,
-                    if outcome.changed {
-                        "updated"
-                    } else {
-                        "unchanged"
-                    }
-                ),
-                Err(e) => {
-                    eprintln!("mesh-dns apply failed: {e}");
-                    std::process::exit(1);
-                }
+            let result = authority.run_next(|_| {
+                mackesd_core::onboard::mesh_dns::apply(&zone, &sink)
+                    .map(|outcome| {
+                        println!("  {} → {} ({})", outcome.names,
+                            mackesd_core::onboard::mesh_dns::DEFAULT_HOSTS_PATH,
+                            if outcome.changed { "updated" } else { "unchanged" });
+                    })
+                    .map_err(|error| error.to_string())
+            });
+            if let Err(error) = result {
+                eprintln!("mesh-dns lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
             }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::SpawnLighthouse { pair, dry_run } => {
             // Plan the spawn: gather this node's facts (mesh-id, CA holder,
@@ -241,21 +492,39 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 return Ok(());
             }
             // Live path: drive the integration-gated Provisioner seam
-            // (provision → push-enroll → migrate-CA).
-            match sl::execute(&plan, &sl::LiveProvisioner::default()) {
-                Ok(sl::SpawnOutcome::Provisioned { endpoint }) => {
-                    println!("  lighthouse provisioned at {}", endpoint.host);
+            // (provision → push-enroll → migrate-CA) under authority.
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("spawn-lighthouse-{node_id}-{generation}"),
+                target_id: node_id,
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["mesh".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for spawn-lighthouse: {error:?}"))?;
+            let result = authority.run_next(|_| {
+                match sl::execute(&plan, &sl::LiveProvisioner::default()) {
+                    Ok(sl::SpawnOutcome::Provisioned { endpoint }) => {
+                        println!("  lighthouse provisioned at {}", endpoint.host);
+                        Ok(())
+                    }
+                    Ok(sl::SpawnOutcome::LanOnly { reason }) => {
+                        println!("  no-op — stays LAN-only ({reason}); retry available");
+                        Ok(())
+                    }
+                    Err(error) => Err(format!("live provisioning failed: {error}")),
                 }
-                Ok(sl::SpawnOutcome::LanOnly { reason }) => {
-                    println!("  no-op — stays LAN-only ({reason}); retry available");
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  spawn-lighthouse failed (live provisioning is integration-gated): {e}"
-                    );
-                    std::process::exit(1);
-                }
+            });
+            if let Err(error) = result {
+                eprintln!("  spawn-lighthouse lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
             }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::FirstDesktop { dry_run } => {
             // Plan the first cloud-backed VM desktop: gather this node's facts
@@ -276,16 +545,36 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 return Ok(());
             }
             // Live path: drive the integration-gated FirstDesktopApply seam
-            // (place → open-session).
-            match fd::execute(&plan, &fd::LiveFirstDesktop::default()) {
-                Ok(outcome) => println!("  {}", outcome.human()),
-                Err(e) => {
-                    eprintln!(
-                        "  first-desktop failed (live libvirt lifecycle placement + session is integration-gated): {e}"
-                    );
-                    std::process::exit(1);
-                }
+            // (place → open-session) under lifecycle authority.
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_root = mackesd_core::default_qnm_shared_root();
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("first-desktop-{node_id}-{generation}"),
+                target_id: node_id,
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["compute".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&lifecycle_root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for first-desktop: {error:?}"))?;
+            let mut outcome = None;
+            let result = authority.run_next(|_| {
+                outcome = Some(fd::execute(&plan, &fd::LiveFirstDesktop::default())
+                    .map_err(|error| format!("live first-desktop apply failed: {error}"))?);
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("  first-desktop lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
             }
+            if let Some(outcome) = outcome {
+                println!("  {}", outcome.human());
+            }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::ServiceAdd {
             kind,
@@ -326,17 +615,49 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            // Live path: drive the integration-gated ServiceApply seam.
-            match sa::execute(&plan, &sa::LiveServiceApply::default()) {
-                Ok(outcome) => println!("  {}", outcome.human()),
-                Err(e) => {
-                    eprintln!(
-                            "  service-add failed (live Navidrome provision / SIP register is integration-gated): {e}"
-                        );
-                    std::process::exit(1);
-                }
+            // Live path: drive the integration-gated ServiceApply seam under
+            // the same lifecycle authority as role provisioning.
+            use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+            let target_id = default_node_id();
+            let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+            let lifecycle_root = mackesd_core::default_qnm_shared_root();
+            let lifecycle_plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("service-add-{target_id}-{generation}"),
+                target_id,
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["configuration".into()],
+            };
+            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&lifecycle_root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for service-add: {error:?}"))?;
+            let mut outcome = None;
+            let result = authority.run_next(|_| {
+                let applied = sa::execute(&plan, &sa::LiveServiceApply::default())
+                    .map_err(|error| format!("live service apply failed: {error}"))?;
+                outcome = Some(applied);
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("  service-add lifecycle authority recorded failure: {error:?}");
+                authority.finish().map_err(|finish_error| anyhow::anyhow!("cannot release lifecycle authority: {finish_error:?}"))?;
+                std::process::exit(1);
             }
+            if let Some(outcome) = outcome {
+                println!("  {}", outcome.human());
+            }
+            authority.finish().map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
     }
     Ok(())
+}
+
+fn parse_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 { return None; }
+    let mut bytes = [0u8; 32];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }

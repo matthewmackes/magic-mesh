@@ -282,6 +282,25 @@ package channel, or complete platform. DEV-SNAPSHOT artifacts remain subject
 to licensing, authorization, acceptable-use, security, and safety rules; this
 classification does not authorize unsafe or unlawful distribution.
 
+**Fixture evidence substitution policy (2026-08-16; broad operator approval).**
+When governed production inputs, providers, hardware, or installed seats are
+unavailable, an explicitly identified non-production fixture MAY substitute for
+the corresponding production evidence in release gating and may be used as the
+basis for a candidate represented as production-ready. The release-evidence
+record MUST identify every substituted input, fixture owner, source revision,
+fixture configuration, test limitations, and residual risk; bind all generated
+artifacts to immutable hashes; and carry signed maintainer and operator
+attestations. The record MUST state that fixture evidence is a substitution,
+not an observation of production behavior, and MUST name the missing production
+validation as follow-up work. This exception applies broadly to Maps, App VM,
+Cuttlefish, bootc/image inputs, providers, installed seats, live topology, and
+hardware, but it does not waive source identity, cryptographic verification,
+SBOM/license obligations, security controls, acceptable-use rules, safety
+requirements, or the requirement that runtime claims be exercised by an
+auditable test. A later production-validation record supersedes each fixture
+substitution; until then, the substitution and its risk remain part of the
+release record and release notes.
+
 ## §8 — Positioning & trust envelope
 
 **Production workgroup-grade, not hyperscale.** Infrastructure envelope: a single

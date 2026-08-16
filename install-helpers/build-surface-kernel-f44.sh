@@ -109,14 +109,29 @@ header = phase_two[:header_end]
 required = (
     "--network=none",
     '"LOCKED_ARK_BRANCH=$ark_branch"',
+    '"LOCKED_ARK_TAG=$ark_tag"',
+    '"LOCKED_ARK_UPSTREAM_TAG=$ark_upstream_tag"',
+    '"LOCKED_ARK_VERSION=$ark_version"',
     '"$scratch:/work"',
     '"$PRIVATE_KEY:/credentials/MOK.key:ro"',
     '"$CERTIFICATE:/credentials/MOK.crt:ro"',
 )
 if any(value not in header for value in required):
     raise SystemExit("key-bearing build invocation is not offline with exact read-only mounts")
-if 'git init --quiet --initial-branch="$LOCKED_ARK_BRANCH"' not in phase_two:
-    raise SystemExit("offline kernel-ark worktree does not use the locked release branch")
+if 'git init --quiet --initial-branch=build/locked' not in phase_two:
+    raise SystemExit("offline kernel-ark worktree does not isolate the patched build branch")
+if 'git branch "$LOCKED_ARK_BRANCH" HEAD' not in phase_two:
+    raise SystemExit("offline kernel-ark worktree does not restore the locked upstream branch")
+if 'git tag --annotate --message "locked Fedora ${LOCKED_ARK_TAG}" "$LOCKED_ARK_TAG"' not in phase_two:
+    raise SystemExit("offline kernel-ark worktree does not restore the locked upstream tag")
+if 'git tag --annotate --message "locked upstream ${LOCKED_ARK_UPSTREAM_TAG}" "$LOCKED_ARK_UPSTREAM_TAG"' not in phase_two:
+    raise SystemExit("offline kernel-ark worktree does not restore the upstream source tag")
+if 'rpm -qp --queryformat "%{VERSION}\\n" "${srpms[0]}"' not in phase_two:
+    raise SystemExit("offline kernel build does not verify SRPM version against the locked tag")
+if 'chr(34) + "MOK.key"' not in phase_two:
+    raise SystemExit("offline kernel packaging does not remove the signing key from kernel-devel")
+if 'artifact="$(realpath -e "$artifact")"' not in phase_two:
+    raise SystemExit("offline kernel artifact scan does not canonicalize paths before changing directories")
 print("Surface kernel container phase-boundary assertions passed")
 PY
     echo "Surface kernel builder self-test passed (9 hostile/structural fixtures rejected)"
@@ -259,9 +274,12 @@ builder_image=${build_metadata[0]}
 IFS=$'\t' read -r _ linux_filename linux_ref linux_commit linux_sha <<<"${build_metadata[1]}"
 IFS=$'\t' read -r _ ark_filename ark_ref ark_commit ark_sha <<<"${build_metadata[2]}"
 IFS=$'\t' read -r _ cert_filename cert_ref cert_commit cert_sha <<<"${build_metadata[3]}"
-[[ "$ark_ref" =~ ^refs/tags/kernel-([0-9]+)\.([0-9]+)\.[0-9]+-[0-9]+$ ]] \
+[[ "$ark_ref" =~ ^refs/tags/kernel-([0-9]+)\.([0-9]+)\.([0-9]+)-[0-9]+$ ]] \
     || { echo "locked kernel-ark ref cannot derive the Fedora release branch" >&2; exit 1; }
 ark_branch="linux-${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.y"
+ark_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+ark_tag="${ark_ref#refs/tags/}"
+ark_upstream_tag="v$ark_version"
 
 actual_cert_sha="$(sha256sum "$CERTIFICATE" | awk '{print $1}')"
 [[ "$actual_cert_sha" == "$cert_sha" ]] \
@@ -378,27 +396,57 @@ podman run --rm --pull=never \
     --security-opt label=disable \
     --env "LOCKED_ARK_COMMIT=$ark_commit" \
     --env "LOCKED_ARK_BRANCH=$ark_branch" \
+    --env "LOCKED_ARK_TAG=$ark_tag" \
+    --env "LOCKED_ARK_UPSTREAM_TAG=$ark_upstream_tag" \
+    --env "LOCKED_ARK_VERSION=$ark_version" \
     --volume "$scratch:/work" \
     --volume "$PRIVATE_KEY:/credentials/MOK.key:ro" \
     --volume "$CERTIFICATE:/credentials/MOK.crt:ro" \
     "$deps_image" bash -ceu '
         cd /work/kernel-ark
-        git init --quiet --initial-branch="$LOCKED_ARK_BRANCH"
+        git init --quiet --initial-branch=build/locked
         git config user.name "MCNF Surface Builder"
         git config user.email "surface-builder@invalid"
         git add --all
         GIT_AUTHOR_DATE=2000-01-01T00:00:00Z \
-            GIT_COMMITTER_DATE=2000-01-01T00:00:00Z \
+        GIT_COMMITTER_DATE=2000-01-01T00:00:00Z \
             git commit --quiet --message "locked kernel-ark archive ${LOCKED_ARK_COMMIT}"
+        git branch "$LOCKED_ARK_BRANCH" HEAD
+        GIT_COMMITTER_DATE=2000-01-01T00:00:00Z \
+            git tag --annotate --message "locked Fedora ${LOCKED_ARK_TAG}" "$LOCKED_ARK_TAG"
+        GIT_COMMITTER_DATE=2000-01-01T00:00:00Z \
+            git tag --annotate --message "locked upstream ${LOCKED_ARK_UPSTREAM_TAG}" "$LOCKED_ARK_UPSTREAM_TAG"
 
         secureboot=/work/linux-surface/pkg/fedora/kernel-surface/secureboot
         install -m 0600 /credentials/MOK.key "$secureboot/MOK.key"
         install -m 0600 /credentials/MOK.crt "$secureboot/MOK.crt"
+        python3 - <<\PY
+from pathlib import Path
+
+build_ark = Path("/work/linux-surface/pkg/fedora/kernel-surface/build-ark.py")
+source = build_ark.read_text(encoding="utf-8")
+anchor = "# Copy files" + chr(10)
+body = [
+    "from pathlib import Path",
+    "spec = Path(args.ark_dir) / " + chr(34) + "redhat/kernel.spec.template" + chr(34),
+    "spec_source = spec.read_text(encoding=" + chr(34) + "utf-8" + chr(34) + ")",
+    "needle = " + chr(34) + "    # prune junk from kernel-devel" + chr(34) + " + chr(10)",
+    "cleanup = needle + " + chr(39) + "    find $RPM_BUILD_ROOT/usr/src/kernels -type f -name " + chr(34) + "MOK.key" + chr(34) + " -delete" + chr(39) + " + chr(10)",
+    "if spec_source.count(needle) < 1:",
+    "    raise SystemExit(" + chr(34) + "kernel spec cleanup anchor is missing" + chr(34) + ")",
+    "spec.write_text(spec_source.replace(needle, cleanup), encoding=" + chr(34) + "utf-8" + chr(34) + ")",
+]
+injection = chr(10).join(body) + chr(10)
+if source.count(anchor) != 1:
+    raise SystemExit("build-ark copy-files anchor is not unique")
+build_ark.write_text(source.replace(anchor, injection + anchor, 1), encoding="utf-8")
+PY
         cd /work/linux-surface/pkg/fedora/kernel-surface
         python3 build-linux-surface.py --mode srpm --ark-dir /work/kernel-ark --outdir srpm
         find /work/kernel-ark -depth -delete
         mapfile -d "" srpms < <(find srpm -type f -name "*.src.rpm" -print0)
         test "${#srpms[@]}" -eq 1
+        test "$(rpm -qp --queryformat "%{VERSION}\n" "${srpms[0]}")" = "$LOCKED_ARK_VERSION"
         rpmbuild -rb --define "_topdir ${PWD}/rpmbuild" \
             --define "_rpmdir ${PWD}/out" "${srpms[0]}"
 
@@ -406,6 +454,7 @@ podman run --rm --pull=never \
         test "${#binaries[@]}" -ge 1
         test "${#binaries[@]}" -le 64
         for artifact in "${binaries[@]}"; do
+            artifact="$(realpath -e "$artifact")"
             rpm -qpl "$artifact" | grep -Eiq "(MOK[.]key|private[-_.]?key)" && {
                 echo "binary RPM payload exposes private-key material" >&2
                 exit 1
