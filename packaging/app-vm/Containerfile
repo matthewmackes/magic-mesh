@@ -51,6 +51,7 @@ pathlib.Path('/etc/mackesd/flatpak-catalog-verification.key').write_bytes(key)
 pathlib.Path('/usr/share/mcnf/app-vm/catalog-trust-receipt.json').write_bytes(receipt_path.read_bytes())
 PY
 RUN set -eux; \
+    dnf -y install gnupg2; \
     chmod 0444 /etc/mackesd/flatpak-catalog-verification.key /usr/share/mcnf/app-vm/catalog-trust-receipt.json; \
     printf '%s\n' "${MCNF_APP_VM_BASE_IMAGE_ID}" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || { \
         echo "FATAL: App VM base image provenance must be a complete sha256 digest" >&2; exit 1; }; \
@@ -87,7 +88,7 @@ RUN set -eux; \
             --source-commit "${MCNF_APP_VM_SOURCE_COMMIT}"; \
     fi; \
     dnf -y install \
-        dbus-daemon dbus-tools gnupg2 \
+        dbus-daemon dbus-tools \
         flatpak \
         sway \
         xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk \
