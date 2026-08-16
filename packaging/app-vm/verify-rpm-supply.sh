@@ -168,8 +168,14 @@ verify_supply() (
     [ "$actual_rpm_digest" = "$manifest_rpm" ] \
         || refuse 'RPM whole-file SHA-256 does not match the candidate manifest'
 
+    local payload_query
+    if rpm --querytags 2>/dev/null | grep -Fxq 'PAYLOADSHA256'; then
+        payload_query='%{PAYLOADSHA256ALGO}\t%{PAYLOADSHA256}'
+    else
+        payload_query='%{PAYLOADDIGESTALGO}\t%{PAYLOADDIGEST}'
+    fi
     rpm_output=$(rpm -qp --qf \
-        '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n%{PAYLOADSHA256ALGO}\t%{PAYLOADSHA256}\n' \
+        "%{NAME}\\t%{EPOCHNUM}\\t%{VERSION}\\t%{RELEASE}\\t%{ARCH}\\n${payload_query}\\n" \
         -- "$rpm" 2>/dev/null) \
         || refuse "RPM package metadata is invalid: $rpm"
     mapfile -t rpm_fields <<<"$rpm_output"
