@@ -392,5 +392,5 @@ if [ -n "$DISK" ]; then
         -v "$OUT:/output" \
         -v /var/lib/containers/storage:/var/lib/containers/storage \
         "$BIB_IMAGE" \
-        --rootfs "$APP_VM_ROOTFS" --type "$DISK" --local "$IMAGE_ID"
+        --rootfs "$APP_VM_ROOTFS" --type "$DISK" --local "$IMAGE"
 fi
