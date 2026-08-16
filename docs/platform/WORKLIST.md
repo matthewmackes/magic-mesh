@@ -418,7 +418,13 @@ behavioral evidence is not completion.
   The current redacted source/license inventory is recorded in
   docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md.
   This epic is the implementation/acquisition lane; downstream release epics
-  remain blocked until its receipts pass preflight.
+  remain blocked until its receipts pass preflight. A complete fixture-backed
+  input set for `afc24782ca9dc8e2e87f5676e403428a82285da1` now passes the
+  canonical preflight on BigBoy, including Maps, App VM trust/base, Cuttlefish
+  declaration/guest/image, RPM signer identity, and bootc receipt admission;
+  the fixture limitations and lack of live provider proof keep this epic
+  `Remaining`. The result is recorded in
+  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: frozen source receipt, Fedora target, architecture, applicable
@@ -557,7 +563,12 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and four verified image roles; no current-revision seven-role set exists.
 - Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, Cuttlefish, and bootc roles.
-- Current state: signing and derivative hostile suites pass; WL-REL-002 has no handoff and the required signer/base/guest/bootc inputs are absent.
+- Current state: a private, promotion-forbidden seven-role preview now exists
+  for `afc24782ca9dc8e2e87f5676e403428a82285da1`, with all three signed RPMs,
+  Browser VM, App VM, Cuttlefish, and bootc receipt identities collected and
+  re-verified. It is not the final release because WL-REL-001 remains blocked
+  on the feature-complete source freeze; durable evidence is recorded in
+  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`.
 - Remaining work:
   1. S1 Materialize and verify the self-signing boundary.
      - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
@@ -610,7 +621,12 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: publication is forbidden until all artifacts, manifests, gates, SBOM data, checksums, and provenance form one exact signed bundle.
 - Required outcome: collect and verify all seven roles, execute mandatory release gates, and sign one immutable publication envelope.
-- Current state: collector and gate controls pass only as self-tests; WL-REL-003 has not produced the seven-role input set.
+- Current state: the canonical seven-role plan and collector pass for the
+  private `afc24782` preview, including fresh App VM and Browser VM manifest
+  verification. The collection is promotion-forbidden and still lacks the
+  signed provenance/SBOM/gate envelope, clean-room publication readback, and
+  final source-freeze authority required to close this epic. Evidence:
+  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`.
 - Remaining work:
   1. S1 Resume and collect the seven-role output.
      - Inputs: WL-REL-002 handoff, WL-REL-003 derivative argv and plan input, frozen revision, and Fedora target.
