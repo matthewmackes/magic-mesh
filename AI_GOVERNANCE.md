@@ -273,12 +273,15 @@ use, authorization, security, or safety restrictions.
 
 **Beta preview distribution exception (2026-08-16; operator-approved).** A
 promotion-forbidden BETA/engineering preview may be distributed to **all
-designated test seats** when the operator explicitly requests that rollout.
+designated test seats and designated test lighthouses** when the operator
+explicitly requests that rollout.
 This is a distribution allowance, not a production-release or acceptance
 waiver. Every seat mutation MUST use the exact preview manifest and immutable
 artifact hashes, emit the red `AI-GENERATED-ALERT`, wait five seconds, record
 the target and result, and stop on a failed integrity, authorization, or
-health check. The preview MUST remain out of public/package production
+health check. Lighthouse replacement MUST be one node at a time, preserving
+the independently governed quorum and authenticated overlay before the next
+node is changed. The preview MUST remain out of public/package production
 channels, and no seat may be represented as having passed live acceptance
 merely because it received the bytes. The existing two-seat limit continues
 to govern live acceptance, chaos/recovery proof, and hardware signoff unless

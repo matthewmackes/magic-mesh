@@ -38,8 +38,10 @@ tasks.
   2026-08-16):** validation, rollout proof, capture, chaos, recovery, and
   acceptance activity remains capped at two physical test seats. A
   promotion-forbidden BETA/engineering preview may nevertheless be distributed
-  to all designated test seats under the operator-approved preview-distribution
-  exception in `AI_GOVERNANCE.md`; distribution is not acceptance evidence.
+  to all designated test seats and designated test lighthouses under the
+  operator-approved preview-distribution exception in `AI_GOVERNANCE.md`;
+  distribution is not acceptance evidence. Lighthouse replacement remains
+  one-at-a-time and must preserve quorum and overlay recovery.
   Each target must receive the exact manifest-bound bytes, the red
   `AI-GENERATED-ALERT`, the five-second mutation delay, and an auditable result.
   Historical three- and five-seat evidence stays factual. Lighthouses are not
@@ -58,10 +60,11 @@ tasks.
   never run filler tests.
 - **Rollout lock:** prove each release activity on no more than two selected
   physical seats and the independently required lighthouses. The approved
-  promotion-forbidden preview may be distributed to all designated test seats,
-  but that wider distribution does not expand the test or acceptance
-  requirement. Publish the red AI-GENERATED-ALERT and wait five seconds before
-  each seat mutation. Recover failures by re-enrollment and corrected-forward
+  promotion-forbidden preview may be distributed to all designated test seats
+  and designated test lighthouses, but that wider distribution does not expand
+  the test or acceptance requirement. Replace lighthouses one at a time while
+  preserving quorum. Publish the red AI-GENERATED-ALERT and wait five seconds
+  before each mutation. Recover failures by re-enrollment and corrected-forward
   deployment, never rollback.
 - **Story format:** execute stories top-to-bottom. Do not start a story until
   every dependency is green. If a dependency or external resource is absent,
