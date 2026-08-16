@@ -346,6 +346,9 @@ if [ -n "$REUSE_IMAGE" ]; then
         echo "FATAL: requested reusable App VM image is not in local storage: $IMAGE" >&2
         exit 1
     }
+    REUSE_TAG="localhost/magic-mesh-app-vm-wayland:checkpoint-${REUSE_IMAGE#sha256:}"
+    podman tag "$REUSE_IMAGE" "$REUSE_TAG"
+    IMAGE="$REUSE_TAG"
     echo "==> reusing immutable App VM image checkpoint: $IMAGE"
 else
     podman build "${cache_args[@]}" "${args[@]}" \
