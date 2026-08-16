@@ -333,8 +333,9 @@ behavioral evidence is not completion.
 - Verification method: focused unit and hostile tests, farm-only integration and
   package fixtures, BigBoy for the longest gate, equivalent GUI/TUI request
   proofs, lifecycle interruption/resume tests, and no more than two physical
-  product-specific acceptance seats. A broader BETA preview distribution is
-  governed separately and is not acceptance proof. Defer exact release and
+  product-specific acceptance seats. The private 13.0.0 production-candidate
+  topology is governed separately and is not public distribution until
+  qualification completes. Defer exact release and
   rollout proof to WL-TEST-002.
 - Origin or merged source IDs: operator-requested ONBOARD & OFFBOARDING
   consolidation, turnkey lifecycle review, Seat 15 and Surface findings,
@@ -365,7 +366,7 @@ behavioral evidence is not completion.
      - Validation: source-revision-receipt.sh --repo .; git diff --quiet; git diff --cached --quiet; compare HEAD with upstream.
      - Done when: one non-null 40-character revision and positive epoch identify the clean pushed source.
   2. S2 Verify every version surface. Complete: the three isolated browser
-     helper manifests/lockfiles and shipped role chooser resolve to 12.1.6;
+     helper manifests/lockfiles and shipped role chooser resolve to 13.0.0;
      the five non-shipped crates are recorded as packaging/test boundaries in
      docs/RELEASE-VERSIONING.md.
      - Inputs: docs/RELEASE-VERSIONING.md, root and isolated Cargo workspaces, package recipes, CLI/About build identity.
