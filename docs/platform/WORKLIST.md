@@ -400,8 +400,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
   The RPM lane still requires one mode-0400 private JSON input bound to the
   clean checkout; Maps contract gates are green, and Cuttlefish guest DEBs are
-  source-bound and verified. Approved provider bytes, the Cuttlefish image and
-  declaration remain outstanding.
+  source-bound and verified. Approved provider bytes, a compatible pinned host
+  tools revision, matching Android CI artifacts, and the declaration remain
+  outstanding.
   Downstream release epics remain blocked until current `13.0.0` receipts pass;
   the historical preview fixture cannot be reused.
 - Remaining work:

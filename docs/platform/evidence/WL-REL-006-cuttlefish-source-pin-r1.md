@@ -1,4 +1,4 @@
-# Cuttlefish Fixture Source Pin
+# Cuttlefish Source Pin and Host-Tool Audit
 
 - Worklist: `WL-REL-006`
 - Target: `x86_64`, `aosp_cf_x86_64_phone`
@@ -7,19 +7,26 @@
 - Retrieved: 2026-08-16
 - License: Apache-2.0 (upstream repository notices govern the checkout)
 
-## Reproducible host-tools recipe
+## Source scope
 
 ```text
 git clone https://android.googlesource.com/device/google/cuttlefish.git
 git -C device/google/cuttlefish checkout --detach a1162ca7a4e6297f1699b65052a8c2dd466fd518
-cd device/google/cuttlefish
-./tools/buildutils/build_packages.sh
 ```
 
-The paired AOSP device image and `cvd-host_package.tar.gz` are not yet built;
-no image digest, package hash, signed declaration, or production claim is made
-by this source pin. The resulting bytes must be recorded in a completed fixture
-substitution record before admission.
+This checkout is the device/google/cuttlefish source tree. It does not contain
+the host-package recipe at `tools/buildutils/build_packages.sh`; the farm probe
+confirmed that path is absent. Cuttlefish's host-tool README directs that build
+to the separate `google/android-cuttlefish` repository. The pinned commit is
+absent from the current host-tools repository (`26e8fe7633395d46a86ab260b81fcd015d6286bc`),
+so selecting a host-tools revision requires an explicit upstream compatibility
+decision. The paired AOSP device image and `cvd-host_package.tar.gz` are also
+not yet available. No image digest, package hash, declaration, or production
+claim is made by this evidence.
+
+The exact external inputs still required are therefore: a compatible pinned
+`google/android-cuttlefish` host-tools revision, and matching CI artifacts for
+`aosp_cf_x86_64_phone` (the OTA image plus `cvd-host_package.tar.gz`).
 
 ## Bootc lane progress
 
