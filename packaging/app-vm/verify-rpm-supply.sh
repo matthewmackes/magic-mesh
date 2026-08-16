@@ -143,10 +143,10 @@ verify_supply() (
     # governed project key.
     signature_output=$(rpmkeys --dbpath "$rpmdb" --checksig --verbose -- "$rpm" 2>&1) \
         || refuse "RPM signature is missing, invalid, or not made by the governed key: $rpm"
-    grep -Eiq 'signature.*key (ID|fingerprint): [0-9a-f]{8,64}.*: OK([[:space:]]|$)' <<<"$signature_output" \
+    grep -Eiq 'signature.*key (ID|fingerprint)[[:space:]]+[0-9a-f]{8,64}[[:space:]]*:[[:space:]]*OK([[:space:]]|$)' <<<"$signature_output" \
         || refuse "RPM verification did not report a governed signature: $rpm"
-    mapfile -t signature_ids < <(grep -Eio 'key (ID|fingerprint): [0-9a-f]{8,64}[[:space:]]*:[[:space:]]*OK' <<<"$signature_output" \
-        | sed -E 's/^key (ID|fingerprint): ([0-9a-fA-F]+).*/\U\2/')
+    mapfile -t signature_ids < <(grep -Eio 'key (ID|fingerprint)[[:space:]]+[0-9a-f]{8,64}[[:space:]]*:[[:space:]]*OK' <<<"$signature_output" \
+        | sed -E 's/^key (ID|fingerprint)[[:space:]]+([0-9a-fA-F]+).*/\U\2/')
     [ "${#signature_ids[@]}" -eq 1 ] || refuse 'RPM signature did not yield exactly one signing key ID'
     signature_key_id=${signature_ids[0]}
     governed_fingerprints=$(gpg --batch --with-colons --show-keys --fingerprint --fingerprint "$KEY" 2>/dev/null \
