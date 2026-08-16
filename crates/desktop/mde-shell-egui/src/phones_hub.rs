@@ -625,7 +625,7 @@ impl PhonesHubState {
     /// Draw the whole hub. Pure over `self` + the polled state (no I/O here — poll
     /// does the reads); the shell mounts it under a `push_id` like every surface.
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        self.header(ui);
+        self.header(ui, true);
         ui.separator();
         ui.horizontal(|ui| {
             for tab in HubTab::ALL {
@@ -665,7 +665,7 @@ impl PhonesHubState {
     /// provider state and feature renderers, but does not expose its legacy tab
     /// strip inside the parent catalog.
     pub(crate) fn show_catalog(&mut self, ui: &mut egui::Ui, label: &str) {
-        self.header(ui);
+        self.header(ui, false);
         if let Some((msg, is_err)) = &self.note {
             ui.colored_label(if *is_err { Style::DANGER } else { Style::OK }, msg);
         }
@@ -682,11 +682,13 @@ impl PhonesHubState {
     }
 
     /// The shared header: the mesh KDC identity + the paired/online counts.
-    fn header(&self, ui: &mut egui::Ui) {
+    fn header(&self, ui: &mut egui::Ui, show_title: bool) {
         let name = self.endpoint_name();
         let paired = self.devices.len();
         let online = self.devices.iter().filter(|d| d.online).count();
-        let _ = AppFrame::new("Phones").leading_title().show(ui);
+        if show_title {
+            let _ = AppFrame::new("Phones").leading_title().show(ui);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.add_space(Style::SP_M);
             ui.colored_label(

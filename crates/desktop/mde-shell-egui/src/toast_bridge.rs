@@ -145,7 +145,7 @@ fn health_kiron_toast(alert: HealthKironAlert) -> Toast {
     let snapshot_generation = alert.snapshot_generation;
     Toast::alert(severity, alert.node, flag, alert.headline)
         .with_dwell(dwell)
-        .with_action("Open Workers", "shell/goto/workers")
+        .with_action("Open Control Panel", "shell/goto/workers")
         .with_health_authority(condition_id, snapshot_generation)
 }
 
@@ -591,7 +591,7 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
 /// Map a `shell/goto/<name>` target to a dock [`Surface`] (case-insensitive).
 fn surface_by_name(name: &str) -> Option<Surface> {
     match name.to_ascii_lowercase().as_str() {
-        "workers" | "worker" => Some(Surface::Workers),
+        "workers" | "worker" | "control-panel" | "controlpanel" => Some(Surface::Workers),
         "fleet-mesh" | "fleetmesh" | "fleet" => Some(Surface::FleetMesh),
         "workbench" => Some(Surface::Workbench),
         "desktop" => Some(Surface::Desktop),
@@ -1645,7 +1645,7 @@ mod tests {
         for retired in ["meshview", "mesh"] {
             assert!(
                 resolve_action(&format!("shell/goto/{retired}")).is_none(),
-                "retired Mesh View alias {retired:?} bypassed Workers routing"
+                "retired Mesh View alias {retired:?} bypassed Control Panel routing"
             );
         }
         // Unknown verbs are a no-op, not a panic.
@@ -1663,7 +1663,7 @@ mod tests {
         for retired in ["explorer", "Explorer", "fleet-explorer"] {
             assert!(
                 resolve_action(&format!("shell/goto/{retired}")).is_none(),
-                "retired Explorer route {retired:?} bypassed Workers authority"
+                "retired Explorer route {retired:?} bypassed Control Panel authority"
             );
         }
     }
@@ -1678,6 +1678,8 @@ mod tests {
         );
         assert_eq!(surface_by_name("car"), Some(Surface::AutoHome));
         assert_eq!(surface_by_name("AUTO-HOME"), Some(Surface::AutoHome));
+        assert_eq!(surface_by_name("CONTROL-PANEL"), Some(Surface::Workers));
+        assert_eq!(surface_by_name("controlpanel"), Some(Surface::Workers));
         assert_eq!(plane_by_name("ThisNode"), Some(Plane::ThisNode));
     }
 
@@ -1813,7 +1815,10 @@ mod tests {
         });
         let output = ctx.run(input(), |ctx| {
             let navigation = bridge.drive(ctx);
-            assert!(navigation.is_none(), "headless frame cannot click Workers");
+            assert!(
+                navigation.is_none(),
+                "headless frame cannot click Control Panel"
+            );
         });
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
         assert!(

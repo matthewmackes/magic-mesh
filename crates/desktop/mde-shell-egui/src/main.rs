@@ -64,6 +64,7 @@ mod network_secrets;
 mod notification_center;
 mod pam_auth;
 mod phones_hub;
+mod power_cycle;
 mod power_honor;
 mod power_settings;
 mod provisioning;
@@ -120,7 +121,7 @@ use web::MediaTransportAction;
 // listener source for `loginctl lock-session` (the trait's `poll`).
 use lock_signal::LockSignals;
 use workbench::Plane;
-use workers_catalog::{CatalogEntry, WorkersDestination};
+use workers_catalog::{CatalogEntry, CatalogGroup, WorkersDestination};
 
 /// perf-11 — the six Workbench data planes share a 5 s `last_poll: None` + `REFRESH`
 /// gate. Polled cold on one frame they all fire together AND re-expire in lockstep
@@ -974,9 +975,13 @@ fn matching_this_node_groups(
 /// provider sections. This is a continuity seam: the providers remain owned by
 /// `SystemState`, while This Node becomes their durable route authority.
 fn this_node_system_section(
+    route: &str,
     section: this_node_catalog::Section,
 ) -> Option<system::SettingsSection> {
     use this_node_catalog::Section;
+    if route == "this-node/audio" {
+        return Some(system::SettingsSection::Audio);
+    }
     Some(match section {
         Section::Connectivity => system::SettingsSection::Network,
         Section::DisplaySound => system::SettingsSection::Displays,
@@ -996,6 +1001,7 @@ fn this_node_system_route(route: &str) -> Option<()> {
         route,
         "this-node/network"
             | "this-node/display-sound"
+            | "this-node/audio"
             | "this-node/input"
             | "this-node/power-performance"
             | "this-node/personalization"
@@ -1253,6 +1259,9 @@ struct Shell {
     this_node_tab: ThisNodeTab,
     /// The canonical top-level Workers workspace mode.
     workers_tab: WorkersTab,
+    /// Final, isolated Control Panel category for governed local and remote
+    /// session/power actions.
+    power_cycle: power_cycle::PowerCycleState,
     /// Search-selected section in the governed This Node hierarchy.
     this_node_section: this_node_catalog::Section,
     /// Search-selected child route in the governed This Node hierarchy.
@@ -1463,6 +1472,7 @@ impl Shell {
             fleet_mesh_tab: FleetMeshTab::default(),
             this_node_tab: ThisNodeTab::default(),
             workers_tab: WorkersTab::default(),
+            power_cycle: power_cycle::PowerCycleState::default(),
             this_node_section: this_node_catalog::Section::default(),
             this_node_page: this_node_catalog::page_index()[0],
             this_node_search: String::new(),
@@ -2206,6 +2216,7 @@ impl Shell {
         self.nav.surface = Surface::Workers;
         self.workers_destination = destination;
         self.workers_tab = match destination {
+            WorkersDestination::Overview => WorkersTab::Control,
             WorkersDestination::MeshMap | WorkersDestination::Network => WorkersTab::Network,
             WorkersDestination::Discovery => WorkersTab::Discovery,
             WorkersDestination::Phones
@@ -2218,7 +2229,8 @@ impl Shell {
             }
             WorkersDestination::Fleet
             | WorkersDestination::Provisioning
-            | WorkersDestination::ActionConsole => WorkersTab::Control,
+            | WorkersDestination::ActionConsole
+            | WorkersDestination::SafePower => WorkersTab::Control,
         };
     }
 
@@ -2237,31 +2249,29 @@ impl Shell {
         self.mesh_view.poll(ctx);
     }
 
-    /// Render Workers from one flat, leaf-only catalog. Provider views are
-    /// mounted below this boundary and cannot contribute navigation chrome.
+    /// Render Workers through one grouped control-center catalog. Provider
+    /// views remain leaves and cannot contribute another workspace rail.
     fn show_workers(&mut self, ui: &mut egui::Ui) {
         self.normalize_surface_aliases();
         let entries = workers_catalog::catalog();
         let mut destination = self.workers_destination;
         ui.push_id("shell-workers", |ui| {
-            let _ = AppFrame::new("Workers").leading_title().show(ui);
+            let _ = AppFrame::new("Control Panel").leading_title().show(ui);
             ui.add_space(Style::SP_S);
             let narrow = ui.available_width() < 900.0 || ui.ctx().zoom_factor() > 1.1;
             if narrow {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    self.show_workers_catalog(ui, &entries, &mut destination)
-                });
+                self.show_workers_compact_picker(ui, &entries, &mut destination);
                 ui.separator();
             } else {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| self.show_workers_catalog(ui, &entries, &mut destination));
                     ui.separator();
                     ui.add_space(Style::SP_M);
-                    ui.vertical(|ui| self.show_workers_destination(ui, destination));
+                    ui.vertical(|ui| self.show_workers_destination(ui, &mut destination));
                 });
                 return;
             }
-            self.show_workers_destination(ui, destination);
+            self.show_workers_destination(ui, &mut destination);
         });
         self.workers_destination = destination;
     }
@@ -2273,24 +2283,107 @@ impl Shell {
         selected: &mut WorkersDestination,
     ) {
         ui.set_min_width(Style::SP_XL * 8.0);
-        for entry in entries {
-            if ui
-                .selectable_label(*selected == entry.destination, entry.label)
-                .clicked()
-            {
-                *selected = entry.destination;
-            }
-        }
+        let selected_group = workers_catalog::group(*selected);
+        egui::ScrollArea::vertical()
+            .id_salt("workers-category-rail")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for group in CatalogGroup::ALL {
+                    let grouped = entries
+                        .iter()
+                        .filter(|entry| entry.group == group)
+                        .collect::<Vec<_>>();
+                    if group == CatalogGroup::Home {
+                        let entry = grouped[0];
+                        if ui
+                            .selectable_label(*selected == entry.destination, entry.label)
+                            .clicked()
+                        {
+                            *selected = entry.destination;
+                        }
+                        continue;
+                    }
+                    if group == CatalogGroup::SafePower {
+                        ui.add_space(Style::SP_XL);
+                        ui.separator();
+                        ui.add_space(Style::SP_M);
+                    }
+                    if ui
+                        .selectable_label(
+                            selected_group == group,
+                            egui::RichText::new(group.label()).strong(),
+                        )
+                        .clicked()
+                    {
+                        *selected = workers_catalog::landing_destination(group);
+                    }
+                    if workers_catalog::group(*selected) == group {
+                        ui.indent(("workers-category", group), |ui| {
+                            let mut prior_section = None;
+                            for entry in grouped {
+                                if entry.section != prior_section {
+                                    if let Some(section) = entry.section {
+                                        ui.label(
+                                            egui::RichText::new(section).small().strong().color(
+                                                Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
+                                            ),
+                                        );
+                                    }
+                                    prior_section = entry.section;
+                                }
+                                if ui
+                                    .selectable_label(*selected == entry.destination, entry.label)
+                                    .clicked()
+                                {
+                                    *selected = entry.destination;
+                                }
+                            }
+                        });
+                    }
+                }
+            });
     }
 
-    fn show_workers_destination(&mut self, ui: &mut egui::Ui, destination: WorkersDestination) {
-        let title = workers_catalog::catalog()
-            .into_iter()
-            .find(|entry| entry.destination == destination)
-            .map_or("This Node", |entry| entry.label);
-        let _ = AppFrame::new(title).show(ui);
-        ui.add_space(Style::SP_S);
-        match destination {
+    fn show_workers_compact_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        entries: &[CatalogEntry],
+        selected: &mut WorkersDestination,
+    ) {
+        let title = entries
+            .iter()
+            .find(|entry| entry.destination == *selected)
+            .map_or("Overview", |entry| entry.label);
+        egui::ComboBox::from_id_salt("workers-compact-category-picker")
+            .selected_text(title)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for group in CatalogGroup::ALL {
+                    if group == CatalogGroup::SafePower {
+                        ui.separator();
+                        ui.add_space(Style::SP_S);
+                    }
+                    ui.label(egui::RichText::new(group.label()).small().strong());
+                    for entry in entries.iter().filter(|entry| entry.group == group) {
+                        let label = entry.section.map_or_else(
+                            || entry.label.to_owned(),
+                            |section| format!("{section} › {}", entry.label),
+                        );
+                        ui.selectable_value(selected, entry.destination, label);
+                    }
+                    ui.separator();
+                }
+            });
+    }
+
+    fn show_workers_destination(
+        &mut self,
+        ui: &mut egui::Ui,
+        destination: &mut WorkersDestination,
+    ) {
+        let current = *destination;
+        match current {
+            WorkersDestination::Overview => self.show_workers_overview(ui, destination),
             WorkersDestination::ThisNode => {
                 if let Some(handoff) = workbench::show_catalog_plane(
                     ui,
@@ -2321,7 +2414,7 @@ impl Shell {
             | WorkersDestination::PhoneServices
             | WorkersDestination::PhoneCommands
             | WorkersDestination::PhonePair => {
-                let tab = match destination {
+                let tab = match current {
                     WorkersDestination::Phones => "Phones",
                     WorkersDestination::PhoneFiles => "Files",
                     WorkersDestination::PhoneServices => "Services",
@@ -2329,9 +2422,24 @@ impl Shell {
                     WorkersDestination::PhonePair => "Pair",
                     _ => unreachable!(),
                 };
+                let title = match current {
+                    WorkersDestination::Phones => "Phones",
+                    WorkersDestination::PhoneFiles => "Phone files",
+                    WorkersDestination::PhoneServices => "Phone services",
+                    WorkersDestination::PhoneCommands => "Phone commands",
+                    WorkersDestination::PhonePair => "Pair a phone",
+                    _ => unreachable!(),
+                };
+                let _ = AppFrame::new(title).show(ui);
+                ui.add_space(Style::SP_S);
                 self.phones_hub.show_catalog(ui, tab);
             }
-            WorkersDestination::ActionConsole => workbench::show_action_console(ui),
+            WorkersDestination::ActionConsole => {
+                let _ = AppFrame::new("Worker runtime").show(ui);
+                ui.add_space(Style::SP_S);
+                workbench::show_action_console(ui);
+            }
+            WorkersDestination::SafePower => self.power_cycle.show(ui, &mut self.system),
             plane @ (WorkersDestination::Network
             | WorkersDestination::Fleet
             | WorkersDestination::Provisioning) => {
@@ -2348,6 +2456,64 @@ impl Shell {
                 );
             }
         }
+    }
+
+    fn show_workers_overview(&mut self, ui: &mut egui::Ui, destination: &mut WorkersDestination) {
+        let _ = AppFrame::new("Overview").show(ui);
+        ui.colored_label(
+            Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
+            "Choose a control area. Scope grows from this workstation to the entire fleet.",
+        );
+        ui.add_space(Style::SP_M);
+        let groups = [
+            CatalogGroup::ThisNode,
+            CatalogGroup::Mesh,
+            CatalogGroup::Fleet,
+            CatalogGroup::ConnectedDevices,
+            CatalogGroup::Advanced,
+        ];
+        let columns = if ui.available_width() >= 900.0 { 2 } else { 1 };
+        for row in groups.chunks(columns) {
+            ui.columns(columns, |panes| {
+                for (pane, group) in panes.iter_mut().zip(row.iter().copied()) {
+                    mde_egui::card().show(pane, |ui| {
+                        ui.label(
+                            egui::RichText::new(group.label())
+                                .strong()
+                                .size(Style::TITLE),
+                        );
+                        ui.colored_label(
+                            Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
+                            group.description(),
+                        );
+                        ui.add_space(Style::SP_S);
+                        if ui.button(format!("Open {}", group.label())).clicked() {
+                            *destination = workers_catalog::landing_destination(group);
+                        }
+                    });
+                }
+            });
+            ui.add_space(Style::SP_S);
+        }
+        ui.add_space(Style::SP_XL);
+        ui.separator();
+        ui.add_space(Style::SP_M);
+        mde_egui::card().show(ui, |ui| {
+            let group = CatalogGroup::SafePower;
+            ui.label(
+                egui::RichText::new(group.label())
+                    .strong()
+                    .size(Style::TITLE),
+            );
+            ui.colored_label(
+                Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
+                group.description(),
+            );
+            ui.add_space(Style::SP_S);
+            if ui.button(format!("Open {}", group.label())).clicked() {
+                *destination = workers_catalog::landing_destination(group);
+            }
+        });
     }
 
     /// Apply the Surface card's navigation-only post-MOK handoff. Authority is
@@ -2486,13 +2652,14 @@ impl Shell {
                     .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
             );
         });
-        if let Some(settings_section) =
-            this_node_system_route(page.route).and_then(|_| this_node_system_section(*section))
+        if let Some(settings_section) = this_node_system_route(page.route)
+            .and_then(|_| this_node_system_section(page.route, *section))
         {
             *tab = ThisNodeTab::System;
             let system = &mut self.system;
-            system.open_settings_section(settings_section);
-            ui.push_id("this-node-system-provider", |ui| system.show(ui));
+            ui.push_id("this-node-system-provider", |ui| {
+                system.show_section(ui, settings_section)
+            });
             return;
         }
         match (page.route, *tab) {
@@ -4783,12 +4950,11 @@ mod tests {
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
-        this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
-        toast_bridge, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
+        this_node_search_is_compact, this_node_system_route, this_node_system_section,
+        toast_bridge, vdi, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
         VideoTextureCache, WorkersDestination, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT,
-        LAYOUT_MODE_BUTTON_TOUCH,
-        LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
-        LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
+        LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W,
+        LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
     };
     use crate::this_node_catalog::{self, Section, SectionGroup};
     use mde_bus::hooks::config::Priority;
@@ -4995,26 +5161,33 @@ mod tests {
         use crate::this_node_catalog::Section;
 
         assert_eq!(
-            this_node_system_section(Section::Connectivity),
+            this_node_system_section("this-node/network", Section::Connectivity),
             Some(SettingsSection::Network)
         );
         assert_eq!(
-            this_node_system_section(Section::DisplaySound),
+            this_node_system_section("this-node/display-sound", Section::DisplaySound),
             Some(SettingsSection::Displays)
         );
         assert_eq!(
-            this_node_system_section(Section::Input),
+            this_node_system_section("this-node/input", Section::Input),
             Some(SettingsSection::Mouse)
         );
         assert_eq!(
-            this_node_system_section(Section::PowerPerformance),
+            this_node_system_section("this-node/power-performance", Section::PowerPerformance),
             Some(SettingsSection::Power)
         );
         assert_eq!(
-            this_node_system_section(Section::Personalization),
+            this_node_system_section("this-node/personalization", Section::Personalization),
             Some(SettingsSection::Theme)
         );
-        assert_eq!(this_node_system_section(Section::Hardware), None);
+        assert_eq!(
+            this_node_system_section("this-node/hardware", Section::Hardware),
+            None
+        );
+        assert_eq!(
+            this_node_system_section("this-node/audio", Section::DisplaySound),
+            Some(SettingsSection::Audio)
+        );
     }
 
     #[test]
@@ -5891,10 +6064,7 @@ mod tests {
         assert!(shell.nav.expanded);
         assert_eq!(shell.nav.surface, Surface::Workers);
         assert_eq!(shell.workers_tab, WorkersTab::Network);
-        assert_eq!(
-            shell.workers_destination,
-            WorkersDestination::MeshMap
-        );
+        assert_eq!(shell.workers_destination, WorkersDestination::MeshMap);
         assert!(toast_bridge::resolve_action("shell/goto/meshview").is_none());
         assert!(toast_bridge::resolve_action("shell/goto/mesh").is_none());
     }
@@ -7119,13 +7289,13 @@ mod tests {
             let primitives = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
             assert!(
                 !primitives.is_empty(),
-                "Workers local-node child did not paint at width={width}, zoom={zoom}"
+                "Control Panel local-node child did not paint at width={width}, zoom={zoom}"
             );
             assert!(
                 painted_text(&out.shapes)
                     .iter()
                     .any(|(text, _)| text.contains("Local node")),
-                "Workers local-node child anchor is missing at width={width}, zoom={zoom}"
+                "Control Panel local-node child anchor is missing at width={width}, zoom={zoom}"
             );
             let text = painted_text(&out.shapes);
             for anchor in ["Find a section", "Workspace", "Overview"] {

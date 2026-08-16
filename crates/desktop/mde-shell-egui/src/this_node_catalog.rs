@@ -35,7 +35,7 @@ impl Section {
         match self {
             Self::Overview => "Overview",
             Self::Connectivity => "Connectivity",
-            Self::DisplaySound => "Display & Sound",
+            Self::DisplaySound => "Display & Audio",
             Self::Input => "Input",
             Self::PowerPerformance => "Power & Performance",
             Self::Hardware => "Hardware",
@@ -48,7 +48,7 @@ impl Section {
         match self {
             Self::Overview => "Node identity, inventory, and available controls.",
             Self::Connectivity => "Wi-Fi, Ethernet, cellular, VPN, DNS, and proxy.",
-            Self::DisplaySound => "Displays, brightness, audio routes, and privacy.",
+            Self::DisplaySound => "Displays, brightness, audio routes, and privacy controls.",
             Self::Input => "Keyboard, pointer, touch, pen, and seat policy.",
             Self::PowerPerformance => "Battery, thermals, performance, and sleep policy.",
             Self::Hardware => "Devices, firmware, storage, docks, and capabilities.",
@@ -355,7 +355,7 @@ const fn provider_for(section: Section) -> PageProvider {
     }
 }
 
-const PAGE_INDEX: [PageEntry; 19] = [
+const PAGE_INDEX: [PageEntry; 20] = [
     PageEntry {
         route: "this-node/overview",
         section: Section::Overview,
@@ -376,16 +376,24 @@ const PAGE_INDEX: [PageEntry; 19] = [
         route: "this-node/display-sound",
         section: Section::DisplaySound,
         provider: provider_for(Section::DisplaySound),
-        label: "Display & Sound",
-        description: "Displays, brightness, audio routes, and privacy.",
+        label: "Displays",
+        description: "Display arrangement, brightness, resolution, and refresh rate.",
         keywords: &[
             "display",
             "monitor",
             "brightness",
-            "audio",
-            "microphone",
-            "camera",
+            "resolution",
+            "refresh rate",
+            "arrangement",
         ],
+    },
+    PageEntry {
+        route: "this-node/audio",
+        section: Section::DisplaySound,
+        provider: provider_for(Section::DisplaySound),
+        label: "Sound",
+        description: "Volume, output and input devices, routes, and mute state.",
+        keywords: &["audio", "sound", "speaker", "microphone", "volume", "mute"],
     },
     PageEntry {
         route: "this-node/input",
@@ -712,6 +720,9 @@ mod tests {
         let display = page_for_route("this-node/display-sound").expect("stable route");
         assert_eq!(display.section, Section::DisplaySound);
         assert!(display.is_available());
+        let audio = page_for_route("this-node/audio").expect("sound has its own stable route");
+        assert_eq!(audio.section, Section::DisplaySound);
+        assert_eq!(search_pages("volume")[0], audio);
         assert_eq!(page_for_route("this-node/not-a-page"), None);
     }
 

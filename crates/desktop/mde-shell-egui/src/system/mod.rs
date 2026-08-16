@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mde_bus::persist::Persist;
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::fonts::{FontSelection, PlatformFont};
 use mde_egui::nav_chrome::{AppFrame, Sidebar, SidebarRow, SidebarSection};
@@ -79,6 +80,11 @@ const REFRESH: Duration = Duration::from_secs(5);
 /// demonstrably live. Three missed pump publications preserve enough tolerance
 /// for a slow probe without leaving old BlueZ object paths actionable forever.
 const BLUETOOTH_STALE_AFTER: Duration = Duration::from_secs(15);
+/// Remote host power approvals are tailed frequently enough to execute before
+/// their short-lived control context becomes misleading, without opening the
+/// shared Bus database every frame.
+const REMOTE_POWER_APPLY_POLL: Duration = Duration::from_secs(1);
+const REMOTE_POWER_APPLY_TOPIC: &str = "action/host/local/apply";
 
 /// The world-readable mesh-status snapshot the SETTINGS-4 Mesh & System sections
 /// fold — the SAME source the chrome bar + the This Node / Network planes already
@@ -285,6 +291,45 @@ mod persisted_config_tests {
 
 // ──────────────────────────── the System state ────────────────────────────
 
+/// Focused subsections of the display control panel.  The provider and action
+/// seams stay shared; this is presentation state that prevents every monitor
+/// card from exposing every control at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DisplayPage {
+    #[default]
+    Overview,
+    Arrangement,
+    Brightness,
+    Advanced,
+}
+
+impl DisplayPage {
+    const ALL: [Self; 4] = [
+        Self::Overview,
+        Self::Arrangement,
+        Self::Brightness,
+        Self::Advanced,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Arrangement => "Arrangement",
+            Self::Brightness => "Brightness",
+            Self::Advanced => "Advanced display",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Overview => "Connected displays, active state, and current mode.",
+            Self::Arrangement => "Relative display order and saved position intent.",
+            Self::Brightness => "Internal backlight and external DDC/CI brightness.",
+            Self::Advanced => "Resolution, refresh rate, and every advertised mode.",
+        }
+    }
+}
+
 /// The System surface's live state: the ONE [`Seat`] (lock 1) plus its latest
 /// snapshot, the editable display arrangement, and the live brightness values.
 pub(crate) struct SystemState {
@@ -319,6 +364,9 @@ pub(crate) struct SystemState {
     panel_brightness: BTreeMap<String, u8>,
     /// Live per-monitor DDC brightness (0–100), keyed by i2c bus label.
     ddc_brightness: BTreeMap<String, u8>,
+    /// The active subsection within Displays. Transient: reopening Displays
+    /// starts with the last subsection used during this shell session.
+    display_page: DisplayPage,
     /// An armed power verb awaiting its second (confirm) click (lock 12).
     confirm: Option<PowerVerb>,
     /// Live battery charge-stop cap (0–100) the POWER-4 threshold slider owns,
@@ -432,6 +480,15 @@ pub(crate) struct SystemState {
     /// mirror (accepted meshes + pending offers) and publishes explicit accept /
     /// refuse actions. A foreign mesh cannot route until the operator accepts it here.
     federation: crate::federation::FederationPanel,
+    /// Cursor for the host-state worker's approved local apply lane. Activation
+    /// always starts at the current tail, so retained destructive requests can
+    /// never replay after a shell or Bus restart.
+    remote_power_apply_cursor: Option<String>,
+    /// Device/inode identity of the Bus index that owns the cursor. An index
+    /// replacement re-arms startup tail skipping before any new action applies.
+    remote_power_apply_identity: Option<(u64, u64)>,
+    /// Render-thread throttle for the cheap apply-lane tail.
+    remote_power_apply_next: Option<Instant>,
 }
 
 impl Default for SystemState {
@@ -446,6 +503,7 @@ impl Default for SystemState {
             layout_key: Vec::new(),
             panel_brightness: BTreeMap::new(),
             ddc_brightness: BTreeMap::new(),
+            display_page: DisplayPage::default(),
             confirm: None,
             charge_threshold: None,
             error: None,
@@ -475,6 +533,9 @@ impl Default for SystemState {
             zoom_base: None,
             animation_base: None,
             federation: crate::federation::FederationPanel::default(),
+            remote_power_apply_cursor: None,
+            remote_power_apply_identity: None,
+            remote_power_apply_next: None,
         }
     }
 }
@@ -632,6 +693,7 @@ impl SystemState {
         // status mirror (accepted meshes + pending offers) for the Pairing section.
         // A cheap read-only Bus probe; never publishes.
         self.federation.refresh();
+        self.poll_remote_power_apply();
         // SETTINGS-5: apply the persisted Personalization → Theme appearance to the
         // live context every frame (poll runs unconditionally in both runners, so this
         // is honored globally + restored on start — not just while Settings is open).
@@ -642,6 +704,58 @@ impl SystemState {
         // and double-click timing before the operator reopens Settings.
         self.apply_mouse_touch(ctx);
         ctx.request_repaint_after(REFRESH);
+    }
+
+    /// Execute only typed power verbs already approved by the host-state worker.
+    /// Other approved host-control variants retain their messages for their own
+    /// future typed consumers; this cursor is private to the power consumer.
+    fn poll_remote_power_apply(&mut self) {
+        let now = Instant::now();
+        if self
+            .remote_power_apply_next
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        self.remote_power_apply_next = Some(now + REMOTE_POWER_APPLY_POLL);
+
+        let Some(root) = mde_bus::client_data_dir() else {
+            return;
+        };
+        let Some(identity) = bus_index_identity(&root) else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return;
+        };
+        if self.remote_power_apply_identity != Some(identity) {
+            self.remote_power_apply_cursor = persist
+                .latest_ulid(REMOTE_POWER_APPLY_TOPIC)
+                .unwrap_or_default();
+            self.remote_power_apply_identity = Some(identity);
+            return;
+        }
+        let Ok(messages) = persist.list_since(
+            REMOTE_POWER_APPLY_TOPIC,
+            self.remote_power_apply_cursor.as_deref(),
+        ) else {
+            return;
+        };
+        for message in messages {
+            // Advance before dispatch so a refusal or provider failure never
+            // replays a suspend/reboot on a later frame.
+            self.remote_power_apply_cursor = Some(message.ulid);
+            let Some(verb) = message.body.as_deref().and_then(decode_remote_power_apply) else {
+                continue;
+            };
+            if !self.dispatch_power_action(verb) && self.error.is_none() {
+                self.error = Some(format!(
+                    "{} was approved remotely but refused by the local power provider.",
+                    verb.label()
+                ));
+                self.record_action_audit("Remote power", false);
+            }
+        }
     }
 
     /// Apply the persisted Personalization → Theme appearance (SETTINGS-5) to the live
@@ -921,7 +1035,7 @@ impl SystemState {
     }
 
     /// Return the latest typed PipeWire mixer graph for This Node's full-page
-    /// Display & Sound detail. The graph remains local to the trusted seat;
+    /// Display and audio detail. The graph remains local to the trusted seat;
     /// application, VM, and peer names never enter the mesh-status snapshot.
     pub(crate) fn mixer_target(&self) -> Option<mde_seat::MixerStatus> {
         match &self.snapshot.as_ref()?.mixer {
@@ -1769,6 +1883,17 @@ impl SystemState {
     /// pass — the bodies + their `apply()`/`SysAction` seams are reused verbatim,
     /// §6). Drives Displays + Power against the seat.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        self.show_impl(ui, None);
+    }
+
+    /// Render one settings leaf inside the Workers control center. The selected
+    /// provider body stays identical, while the legacy System menubar and rail
+    /// are omitted so Workers remains the only navigation authority.
+    pub(crate) fn show_section(&mut self, ui: &mut egui::Ui, section: SettingsSection) {
+        self.show_impl(ui, Some(section));
+    }
+
+    fn show_impl(&mut self, ui: &mut egui::Ui, embedded: Option<SettingsSection>) {
         self.poll_wallpaper_download();
         let mut actions: Vec<SysAction> = Vec::new();
         // Capture the rail selection before the render borrow so a rail click that
@@ -1782,10 +1907,12 @@ impl SystemState {
         // reach every section (incl. the advanced Pairing / Network / Power ones)
         // from the bar (the governing principle). A picked section is applied here so
         // the persist check below saves it exactly like a rail move.
-        if let Some(section) = menubar::show(ui, self.nav.section, self.snapshot()) {
-            self.nav = SettingsNav::at(section);
+        if embedded.is_none() {
+            if let Some(section) = menubar::show(ui, self.nav.section, self.snapshot()) {
+                self.nav = SettingsNav::at(section);
+            }
+            ui.separator();
         }
-        ui.separator();
         // Capture the appearance before the borrow so a Theme-section pick that moves
         // it can be detected + persisted afterwards (SETTINGS-5 — the same collect-
         // then-apply idiom `nav` uses; the live re-tint/zoom happens in the poll).
@@ -1805,6 +1932,7 @@ impl SystemState {
                 layout,
                 panel_brightness,
                 ddc_brightness,
+                display_page,
                 confirm,
                 charge_threshold,
                 error,
@@ -1831,19 +1959,21 @@ impl SystemState {
 
             // PLATFORM-INTERFACES Q27 — the sidebar: the shared Q19 grouped list
             // under an inline search field (see [`settings_rail`]) — the three
-            // domain groups as section headers, the fourteen sections as rows
+            // domain groups as section headers, the fifteen sections as rows
             // wearing their existing YAMIS glyphs. A row pick moves `nav`
             // (persisted after the borrow); the rail rests on the Carbon layer-01
             // page (see [`page_frame`]).
-            egui::SidePanel::left(ui.id().with("settings-rail"))
-                .resizable(false)
-                .exact_width(Style::SP_XL * 6.0)
-                .frame(page_frame(Style::SP_M))
-                .show_inside(ui, |ui| settings_rail(ui, nav, nav_filter));
+            if embedded.is_none() {
+                egui::SidePanel::left(ui.id().with("settings-rail"))
+                    .resizable(false)
+                    .exact_width(Style::SP_XL * 6.0)
+                    .frame(page_frame(Style::SP_M))
+                    .show_inside(ui, |ui| settings_rail(ui, nav, nav_filter));
+            }
 
             // The (possibly just-clicked) selection, copied out so the detail pane's
             // closure doesn't re-borrow `nav`.
-            let selected = nav.section;
+            let selected = embedded.unwrap_or(nav.section);
 
             // The detail pane fills the remaining width and renders only the selected
             // section's body — expressive spacing, the whole right side. It sits
@@ -1853,57 +1983,60 @@ impl SystemState {
             // collapse to one, so there is nothing to go back FROM. It rests on the
             // same Carbon layer-01 page (SETTINGS-2); the section body raises to a
             // layer-02 card inside (see [`settings_detail`]).
-            egui::CentralPanel::default()
-                .frame(page_frame(Style::SP_L))
-                .show_inside(ui, |ui| {
-                    let _ = AppFrame::new(selected.label()).show(ui);
-                    ui.add_space(Style::SP_M);
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if let Some(err) = error.as_deref() {
-                                ui.colored_label(
-                                    Style::DANGER,
-                                    RichText::new(err).size(Style::SMALL),
-                                );
-                                ui.add_space(Style::SP_S);
-                            }
-                            settings_detail(
-                                ui,
-                                selected,
-                                snap,
-                                layout,
-                                panel_brightness,
-                                ddc_brightness,
-                                *confirm,
-                                charge_threshold,
-                                power_honor_config,
-                                mesh,
-                                remote_proofing,
-                                mouse_touch,
-                                wallpaper_service,
-                                wallpaper_download,
-                                appearance,
-                                clock,
-                                car_keys,
-                                agent_active,
-                                prompt_in_flight,
-                                bluetooth_actions_fresh,
-                                &mut actions,
-                            );
-                            // WL-SEC-002 — cross-mesh Federation lives under the same
-                            // Mesh & System → Pairing section (federating with another
-                            // mesh is the cross-mesh sibling of device pairing). Render
-                            // it below the pairing responder so accept/refuse of a
-                            // foreign mesh is one explicit local act.
-                            if selected == SettingsSection::Pairing {
-                                ui.add_space(Style::SP_L);
-                                ui.separator();
-                                ui.add_space(Style::SP_M);
-                                federation.body(ui);
-                            }
-                        });
-                });
+            let mut render_detail = |ui: &mut egui::Ui| {
+                let _ = AppFrame::new(selected.label()).show(ui);
+                ui.add_space(Style::SP_M);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(err) = error.as_deref() {
+                            ui.colored_label(Style::DANGER, RichText::new(err).size(Style::SMALL));
+                            ui.add_space(Style::SP_S);
+                        }
+                        settings_detail(
+                            ui,
+                            selected,
+                            snap,
+                            layout,
+                            panel_brightness,
+                            ddc_brightness,
+                            display_page,
+                            *confirm,
+                            charge_threshold,
+                            power_honor_config,
+                            mesh,
+                            remote_proofing,
+                            mouse_touch,
+                            wallpaper_service,
+                            wallpaper_download,
+                            appearance,
+                            clock,
+                            car_keys,
+                            agent_active,
+                            prompt_in_flight,
+                            bluetooth_actions_fresh,
+                            &mut actions,
+                        );
+                        // WL-SEC-002 — cross-mesh Federation lives under the same
+                        // Mesh & System → Pairing section (federating with another
+                        // mesh is the cross-mesh sibling of device pairing). Render
+                        // it below the pairing responder so accept/refuse of a
+                        // foreign mesh is one explicit local act.
+                        if selected == SettingsSection::Pairing {
+                            ui.add_space(Style::SP_L);
+                            ui.separator();
+                            ui.add_space(Style::SP_M);
+                            federation.body(ui);
+                        }
+                    });
+            };
+            if embedded.is_some() {
+                render_detail(ui);
+            } else {
+                egui::CentralPanel::default()
+                    .frame(page_frame(Style::SP_L))
+                    .show_inside(ui, render_detail);
+            }
 
             // The BlueZ pairing modal (E12-17): a ctx-level dialog that shows only
             // while a PIN/passkey/confirm prompt is in flight, draining the shared
@@ -3375,6 +3508,48 @@ fn bing_absolute_image_url(raw: &str) -> Result<String, String> {
     Err("Bing daily picture metadata used an unsupported image URL.".to_owned())
 }
 
+/// Decode the narrow shell apply contract. Destructive verbs must retain the
+/// worker-approved confirmation bit even though they have already crossed the
+/// daemon's proposal gate; malformed or unrelated host verbs fail closed.
+fn decode_remote_power_apply(body: &str) -> Option<PowerVerb> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    if value.get("verb")?.as_str()? != "power" {
+        return None;
+    }
+    let confirmed = value
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match value.get("action")?.as_str()? {
+        "lock" => Some(PowerVerb::Lock),
+        "suspend" => Some(PowerVerb::Suspend),
+        "reboot" if confirmed => Some(PowerVerb::Reboot),
+        "poweroff" if confirmed => Some(PowerVerb::PowerOff),
+        _ => None,
+    }
+}
+
+fn bus_index_identity(root: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(root.join("index.sqlite")).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+            .try_into()
+            .ok()?;
+        Some((metadata.len(), modified))
+    }
+}
+
 fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4654,6 +4829,7 @@ fn settings_detail(
     layout: &DisplayLayout,
     panel_brightness: &mut BTreeMap<String, u8>,
     ddc_brightness: &mut BTreeMap<String, u8>,
+    display_page: &mut DisplayPage,
     confirm: Option<PowerVerb>,
     charge_threshold: &mut Option<u8>,
     power_honor_config: &mut PowerHonorConfig,
@@ -4674,9 +4850,15 @@ fn settings_detail(
     // starts straight on the Carbon layer-02 card raised above the layer-01 page,
     // ringed by a hairline border (SETTINGS-2 — [`section_card`]).
     section_card(ui, |ui| match section {
-        SettingsSection::Displays => {
-            displays_section(ui, snap, layout, panel_brightness, ddc_brightness, actions)
-        }
+        SettingsSection::Displays => displays_section(
+            ui,
+            snap,
+            layout,
+            panel_brightness,
+            ddc_brightness,
+            display_page,
+            actions,
+        ),
         SettingsSection::Mouse => mouse_touch_section(ui, mouse_touch),
         SettingsSection::Audio => mixer_section(ui, snap, actions),
         SettingsSection::Bluetooth => bluetooth_section(ui, snap, bluetooth_actions_fresh, actions),
@@ -5494,8 +5676,19 @@ fn displays_section(
     layout: &DisplayLayout,
     panel_brightness: &mut BTreeMap<String, u8>,
     ddc_brightness: &mut BTreeMap<String, u8>,
+    page: &mut DisplayPage,
     actions: &mut Vec<SysAction>,
 ) {
+    ui.horizontal_wrapped(|ui| {
+        for candidate in DisplayPage::ALL {
+            ui.selectable_value(page, candidate, candidate.label());
+        }
+    });
+    ui.colored_label(
+        Style::TEXT_DIM,
+        RichText::new(page.description()).size(Style::SMALL),
+    );
+    ui.add_space(Style::SP_M);
     probe_section(
         ui,
         snap,
@@ -5522,18 +5715,21 @@ fn displays_section(
                         ddc,
                         panel_brightness,
                         ddc_brightness,
+                        *page,
                         actions,
                     );
                 });
             });
-            ui.add_space(Style::SP_S);
-            // The arrangement is desired-state intent: the live modeset apply
-            // (panel → the `run_drm` runner's multi-CRTC drive) + EDID-keyed
-            // roaming are integration-gated (E12-19). Honest, never a fake "applied".
-            muted_note(
-                ui,
-                "Arrangement + mode are saved as intent; live re-apply and EDID roam are integration-gated (E12-19).",
-            );
+            if *page == DisplayPage::Arrangement || *page == DisplayPage::Advanced {
+                ui.add_space(Style::SP_S);
+                // Arrangement/mode are desired-state intent until the DRM runner
+                // acknowledges the live modeset. Keep the limitation adjacent to
+                // the controls it qualifies instead of showing it on every page.
+                muted_note(
+                    ui,
+                    "Arrangement and mode are saved as intent; live re-apply and EDID roam remain integration-gated.",
+                );
+            }
         },
     );
 }
@@ -5550,6 +5746,7 @@ fn output_row(
     ddc: Option<&Vec<DdcDisplay>>,
     panel_brightness: &mut BTreeMap<String, u8>,
     ddc_brightness: &mut BTreeMap<String, u8>,
+    page: DisplayPage,
     actions: &mut Vec<SysAction>,
 ) {
     let status = connector.map_or(ConnectorStatus::Unknown, |c| c.status);
@@ -5577,52 +5774,99 @@ fn output_row(
     }
 
     ui.indent((out.connector.as_str(), "disp"), |ui| {
-        // Enable toggle — disabling the last lit output is refused typed on apply.
-        let mut enabled = out.enabled;
-        if ui
-            .checkbox(&mut enabled, RichText::new("Enabled").size(Style::SMALL))
-            .changed()
-        {
-            actions.push(SysAction::ToggleOutput(out.id.clone(), enabled));
-        }
-
-        if out.enabled {
-            // Mode picker over the connector's advertised modes.
-            if let Some(conn) = connector {
-                mode_picker(ui, out, conn, actions);
-            }
-            // Relative arrangement: position + nudges (only meaningful multi-head).
-            ui.horizontal(|ui| {
+        match page {
+            DisplayPage::Overview => {
+                // Enable toggle — disabling the last lit output is refused typed on apply.
+                let mut enabled = out.enabled;
+                if ui
+                    .checkbox(&mut enabled, RichText::new("Enabled").size(Style::SMALL))
+                    .changed()
+                {
+                    actions.push(SysAction::ToggleOutput(out.id.clone(), enabled));
+                }
+                if let Some(mode) = out
+                    .effective_mode()
+                    .or_else(|| connector.and_then(|connector| connector.preferred_mode().copied()))
+                {
+                    field(
+                        ui,
+                        "Resolution",
+                        &format!("{} × {} px", mode.width, mode.height),
+                        Style::TEXT_DIM,
+                    );
+                    field(
+                        ui,
+                        "Refresh rate",
+                        &format!("{} Hz", mode.refresh_hz),
+                        Style::TEXT_DIM,
+                    );
+                }
                 field(
                     ui,
                     "Position",
                     &format!("{}, {}", out.position.0, out.position.1),
                     Style::TEXT_DIM,
                 );
-                if multi {
-                    if settings_icon_button(ui, DISPLAY_NUDGE_LEFT_ICON, "Move display left")
-                        .clicked()
-                    {
-                        actions.push(SysAction::Nudge(out.id.clone(), true));
-                    }
-                    if settings_icon_button(ui, DISPLAY_NUDGE_RIGHT_ICON, "Move display right")
-                        .clicked()
-                    {
-                        actions.push(SysAction::Nudge(out.id.clone(), false));
-                    }
+            }
+            DisplayPage::Arrangement => {
+                if !out.enabled {
+                    muted_note(ui, "Enable this display from Overview before arranging it.");
+                    return;
                 }
-            });
-            // Live brightness: DDC for a matched external, backlight for a panel,
-            // else an honest "not controllable" (lock 13 / §7).
-            brightness_control(
-                ui,
-                out,
-                backlights,
-                ddc,
-                panel_brightness,
-                ddc_brightness,
-                actions,
-            );
+                ui.horizontal(|ui| {
+                    field(
+                        ui,
+                        "Position",
+                        &format!("{}, {}", out.position.0, out.position.1),
+                        Style::TEXT_DIM,
+                    );
+                    if multi {
+                        if settings_icon_button(ui, DISPLAY_NUDGE_LEFT_ICON, "Move display left")
+                            .clicked()
+                        {
+                            actions.push(SysAction::Nudge(out.id.clone(), true));
+                        }
+                        if settings_icon_button(ui, DISPLAY_NUDGE_RIGHT_ICON, "Move display right")
+                            .clicked()
+                        {
+                            actions.push(SysAction::Nudge(out.id.clone(), false));
+                        }
+                    }
+                });
+                if !multi {
+                    muted_note(
+                        ui,
+                        "Connect another active display to change relative order.",
+                    );
+                }
+            }
+            DisplayPage::Brightness => {
+                if !out.enabled {
+                    muted_note(
+                        ui,
+                        "Brightness is unavailable while this display is disabled.",
+                    );
+                    return;
+                }
+                brightness_control(
+                    ui,
+                    out,
+                    backlights,
+                    ddc,
+                    panel_brightness,
+                    ddc_brightness,
+                    actions,
+                );
+            }
+            DisplayPage::Advanced => {
+                if !out.enabled {
+                    muted_note(ui, "Enable this display from Overview to change its mode.");
+                    return;
+                }
+                if let Some(connector) = connector {
+                    mode_picker(ui, out, connector, actions);
+                }
+            }
         }
     });
 }

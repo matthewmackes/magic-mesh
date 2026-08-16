@@ -282,7 +282,7 @@ fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
 
 fn taskbar_surface_label(surface: Surface) -> &'static str {
     match surface {
-        Surface::Workers => "Workers",
+        Surface::Workers => "Control Panel",
         Surface::FleetMesh => "Fleet & Mesh",
         Surface::InfraCode => "Workloads",
         surface => surface.label(),
@@ -305,7 +305,7 @@ fn taskbar_surface_search_terms(surface: Surface) -> &'static str {
         // them on the canonical Workers result so a Start search or the
         // first-boot selector cannot strand the operator on a legacy deep link.
         // Query hyphens are normalized to spaces by `filtered_pin_catalog`.
-        Surface::Workers => "workers fleet mesh fleet & mesh this node node workbench mesh map mesh view meshmap meshview explorer system storage about phones phone",
+        Surface::Workers => "control panel controlpanel settings workers fleet mesh fleet & mesh this node node workbench mesh map mesh view meshmap meshview explorer system storage about phones phone",
         Surface::FleetMesh => {
             "fleet mesh fleet & mesh workbench mesh map mesh view meshmap meshview explorer"
         }
@@ -3561,7 +3561,8 @@ mod tests {
                 Surface::Browser,
             ]
         );
-        assert_eq!(taskbar_surface_label(Surface::Workers), "Workers");
+        assert_eq!(taskbar_surface_label(Surface::Workers), "Control Panel");
+        assert!(taskbar_surface_search_terms(Surface::Workers).contains("control panel"));
         assert_eq!(taskbar_surface_label(Surface::FleetMesh), "Fleet & Mesh");
         assert_eq!(taskbar_surface_label(Surface::InfraCode), "Workloads");
         assert_eq!(filtered_pin_catalog("fleet & mesh"), Vec::<Surface>::new());

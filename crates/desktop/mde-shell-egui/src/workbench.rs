@@ -46,7 +46,7 @@ impl Plane {
 
 /// Render one Workbench plane as a Workers catalog leaf. This intentionally
 /// omits the Workbench menu, plane rail, and Action Console: those controls are
-/// owned by the flat Workers catalog now.
+/// owned by the grouped Workers control center now.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show_catalog_plane(
     ui: &mut egui::Ui,
@@ -137,17 +137,19 @@ mod action_console {
     impl NodeStatusWire {
         fn from_body(body: &str, expected_node: &str, now_ms: u64) -> Result<Self, String> {
             if body.len() > MAX_NODE_STATUS_WIRE_BYTES {
-                return Err("Workers state exceeded the bounded wire size.".to_string());
+                return Err("Control Panel state exceeded the bounded wire size.".to_string());
             }
             let state: Self = serde_json::from_str(body)
-                .map_err(|_| "Workers state failed closed-contract admission.".to_string())?;
+                .map_err(|_| "Control Panel state failed closed-contract admission.".to_string())?;
             if state.schema_version != WORKER_RUNTIME_SCHEMA_VERSION
                 || state.node_id != expected_node
                 || state.observed_at_ms == 0
                 || state.observed_at_ms > now_ms
                 || state.workers.len() > MAX_NODE_WORKERS
             {
-                return Err("Workers state identity, clock, or capacity was invalid.".to_string());
+                return Err(
+                    "Control Panel state identity, clock, or capacity was invalid.".to_string(),
+                );
             }
             let mut previous: Option<(mackes_mesh_types::worker_runtime::WorkerGroup, &str)> = None;
             for row in &state.workers {
@@ -166,7 +168,7 @@ mod action_console {
                 let current = (row.contract.group, row.contract.worker_id.as_str());
                 if previous.is_some_and(|prior| prior >= current) {
                     return Err(
-                        "Workers state was duplicated or not deterministically ordered."
+                        "Control Panel state was duplicated or not deterministically ordered."
                             .to_string(),
                     );
                 }
@@ -486,7 +488,7 @@ mod action_console {
             self.poll(now_ms);
             ui.colored_label(
                 Style::TEXT_DIM,
-                "One live worker selection drives the tree, typed graph, inspector, history, and staged actions.",
+                "Select a worker to inspect health, relations, history, and admitted actions.",
             );
             if self.workers.is_empty() {
                 ui.colored_label(
@@ -494,12 +496,12 @@ mod action_console {
                     "No current worker runtime snapshot is available on this node.",
                 );
             } else if ui.available_width() < 760.0 {
-                self.show_worker_tree(ui, now_ms);
+                self.show_worker_table(ui, now_ms);
                 ui.separator();
                 self.show_inspector(ui, now_ms);
             } else {
                 ui.columns(2, |columns| {
-                    self.show_worker_tree(&mut columns[0], now_ms);
+                    self.show_worker_table(&mut columns[0], now_ms);
                     self.show_inspector(&mut columns[1], now_ms);
                 });
             }
@@ -509,35 +511,45 @@ mod action_console {
             self.show_result(ui);
         }
 
-        fn show_worker_tree(&mut self, ui: &mut egui::Ui, now_ms: u64) {
-            ui.label(RichText::new("Workers").strong());
+        fn show_worker_table(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+            ui.label(RichText::new("Worker runtime").strong());
             let prior_worker = self.selected_worker.clone();
-            for group in WorkerGroup::ALL {
-                let count = self
-                    .workers
-                    .iter()
-                    .filter(|row| row.contract.group == group)
-                    .count();
-                if count == 0 {
-                    continue;
-                }
-                egui::CollapsingHeader::new(format!("{} ({count})", group.as_str()))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for row in self
-                            .workers
-                            .iter()
-                            .filter(|row| row.contract.group == group)
-                        {
+            egui::ScrollArea::horizontal()
+                .id_salt("workers-runtime-table-scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("workers-runtime-table")
+                        .num_columns(5)
+                        .striped(true)
+                        .spacing([Style::SP_M, Style::SP_XS])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Worker").small().strong());
+                            ui.label(RichText::new("Group").small().strong());
+                            ui.label(RichText::new("Status").small().strong());
+                            ui.label(RichText::new("Restarts").small().strong());
+                            ui.label(RichText::new("Generation").small().strong());
+                            ui.end_row();
+                            for row in &self.workers {
                             let state = row.snapshot.effective_state(now_ms);
                             ui.selectable_value(
                                 &mut self.selected_worker,
                                 Some(row.contract.worker_id.clone()),
-                                format!("{}  ·  {}", row.contract.display_name, state.as_str()),
+                                    &row.contract.display_name,
                             );
-                        }
-                    });
-            }
+                                ui.label(row.contract.group.as_str());
+                                let tone = if state
+                                    == mackes_mesh_types::worker_runtime::WorkerRuntimeState::Running
+                                {
+                                    Style::OK
+                                } else {
+                                    Style::TEXT_DIM
+                                };
+                                ui.colored_label(tone, state.as_str());
+                                ui.monospace(row.snapshot.restart_count.to_string());
+                                ui.monospace(row.snapshot.generation.to_string());
+                                ui.end_row();
+                            }
+                        });
+                });
             if self.selected_worker != prior_worker {
                 self.selected_action = None;
                 self.reconcile_selection();
@@ -551,6 +563,7 @@ mod action_console {
                 ui.colored_label(Style::TEXT_DIM, "Select a worker to inspect it.");
                 return;
             };
+            ui.label(RichText::new("Details").strong());
             ui.label(RichText::new(&row.contract.display_name).strong());
             ui.monospace(format!(
                 "{} · {} · generation {}",

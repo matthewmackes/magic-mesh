@@ -5,6 +5,26 @@ use mde_seat::{Battery, BatteryKind, BatteryState, ProfileState};
 use mde_theme::brand::icons::IconId;
 
 #[test]
+fn remote_power_apply_decoder_is_typed_and_confirm_gates_destructive_verbs() {
+    assert_eq!(
+        decode_remote_power_apply(r#"{"verb":"power","action":"suspend","confirm":false}"#),
+        Some(PowerVerb::Suspend)
+    );
+    assert_eq!(
+        decode_remote_power_apply(r#"{"verb":"power","action":"reboot","confirm":true}"#),
+        Some(PowerVerb::Reboot)
+    );
+    assert_eq!(
+        decode_remote_power_apply(r#"{"verb":"power","action":"reboot","confirm":false}"#),
+        None
+    );
+    assert_eq!(
+        decode_remote_power_apply(r#"{"verb":"volume","level":90}"#),
+        None
+    );
+}
+
+#[test]
 fn this_node_action_audit_is_bounded_redacted_and_drained() {
     let mut state = SystemState::default();
     for _ in 0..40 {
@@ -2527,6 +2547,58 @@ fn the_displays_section_lays_outputs_across_and_still_drives_the_layout() {
         disabled,
         "a ToggleOutput still drives the layout after the re-layout"
     );
+}
+
+#[test]
+fn every_display_subsection_renders_from_the_same_live_connector_model() {
+    assert_eq!(
+        DisplayPage::ALL.map(DisplayPage::label),
+        ["Overview", "Arrangement", "Brightness", "Advanced display"]
+    );
+    let mut state = SystemState {
+        nav: SettingsNav::at(SettingsSection::Displays),
+        ..SystemState::default()
+    };
+    let mut snapshot = Seat::new().snapshot();
+    snapshot.displays = Probe::Present(vec![connected_connector("eDP-1")]);
+    state.reconcile(&snapshot);
+    state.snapshot = Some(snapshot);
+
+    for page in DisplayPage::ALL {
+        state.display_page = page;
+        assert!(
+            renders_at(&mut state, 1440.0),
+            "{} display subsection drew nothing",
+            page.label()
+        );
+    }
+}
+
+#[test]
+fn embedded_display_leaf_omits_the_legacy_system_navigation() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut state = SystemState::default();
+    let mut snapshot = Seat::new().snapshot();
+    snapshot.displays = Probe::Present(vec![connected_connector("eDP-1")]);
+    state.reconcile(&snapshot);
+    state.snapshot = Some(snapshot);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))),
+        ..Default::default()
+    };
+    let output = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .show(ctx, |ui| state.show_section(ui, SettingsSection::Displays));
+    });
+    let text = painted_text(&output.shapes)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>();
+    assert!(text.iter().any(|text| text == "Displays"));
+    assert!(text.iter().any(|text| text == "Advanced display"));
+    assert!(!text.iter().any(|text| text == "Search settings"));
+    assert!(!text.iter().any(|text| text == "Mesh & System"));
 }
 
 #[test]

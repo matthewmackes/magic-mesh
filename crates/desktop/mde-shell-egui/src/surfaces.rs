@@ -99,7 +99,7 @@ impl Surface {
     /// Human-facing label shared by every launcher and switcher.
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Surface::Workers => "Workers",
+            Surface::Workers => "Control Panel",
             Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
                 "Fleet & Mesh"
             }
