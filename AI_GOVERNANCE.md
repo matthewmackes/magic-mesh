@@ -259,8 +259,9 @@ GitHub required checks are the release authority; the farm is the heavy
 self-hosted execution backend. A missing, stale, unavailable, or manually
 asserted required gate is a production block.
 
-**Beta release policy (2026-08-15).** From this point forward, a candidate
-explicitly labeled **BETA** may be distributed as an engineering preview before
+**Beta release policy (2026-08-15; reaffirmed 2026-08-16).** Every release
+produced from this point forward is a **BETA** release by definition. It may be
+distributed as an engineering preview before
 live hardware, provider, or installed-seat evidence is complete, provided those
 gaps are stated in the release notes and the candidate is not represented as
 production-ready. Beta status does **not** waive source identity, artifact
