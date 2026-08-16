@@ -241,6 +241,11 @@ PY
     }
 
     mv -- "$work/payload" "$stage_dir"
+    # Keep the authenticated declaration beside the staged payload.  Release
+    # preflight consumes this exact no-longer-mutable copy when it binds the
+    # image receipt to the admitted guest bytes.
+    mv -- "$work/release.json" "$stage_dir/release.json"
+    mv -- "$work/release.json.asc" "$stage_dir/release.json.asc"
     chmod 0700 "$stage_dir" "$stage_dir/packages"
     rm -rf -- "$work"
 }
