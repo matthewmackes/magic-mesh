@@ -87,7 +87,7 @@ RUN set -eux; \
             --source-commit "${MCNF_APP_VM_SOURCE_COMMIT}"; \
     fi; \
     dnf -y install \
-        dbus-daemon dbus-tools \
+        dbus-daemon dbus-tools gnupg2 \
         flatpak \
         sway \
         xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk \
