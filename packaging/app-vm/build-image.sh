@@ -25,6 +25,7 @@ CATALOG_TRUST_RECEIPT=""
 CATALOG_TRUST_KEY=""
 DISK=""
 OUT="$APP_VM_DIR/out"
+REUSE_IMAGE=""
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 
@@ -99,7 +100,8 @@ Usage: packaging/app-vm/build-image.sh --catalog-trust-receipt PATH --catalog-tr
        --base-receipt PATH
        [--rpm PATH --candidate-manifest PATH]
        [--base IMAGE]
-       [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]
+       [--tag IMAGE] [--reuse-image IMAGE_ID]
+       [--disk qcow2|raw|anaconda-iso] [--out DIR]
        packaging/app-vm/build-image.sh --self-test
 
 Builds the fixed wayland-standard App VM guest image. A disk output uses
@@ -155,6 +157,7 @@ while [ "$#" -gt 0 ]; do
         --base-receipt) BASE_RECEIPT="${2:?--base-receipt needs a path}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image}"; shift 2 ;;
         --tag) IMAGE="${2:?--tag needs an image}"; shift 2 ;;
+        --reuse-image) REUSE_IMAGE="${2:?--reuse-image needs an image ID}"; shift 2 ;;
         --disk) DISK="${2:?--disk needs a type}"; shift 2 ;;
         --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -193,6 +196,12 @@ fi
 
 [ -n "$OUT" ] && [ -z "$DISK" ] && [ "$OUT" != "$APP_VM_DIR/out" ] && \
     missing+=("--out only applies to --disk; add --disk or omit --out")
+
+if [ -n "$REUSE_IMAGE" ]; then
+    canonical_image_id "$REUSE_IMAGE" >/dev/null \
+        || missing+=("--reuse-image must be one complete sha256 image ID")
+    IMAGE="$REUSE_IMAGE"
+fi
 
 if [ "${#missing[@]}" -gt 0 ]; then
     echo "REFUSING to run — missing inputs:" >&2
@@ -295,15 +304,23 @@ cache_args=()
 if [ "${MCNF_APP_VM_NO_CACHE:-0}" = 1 ]; then
     cache_args+=(--no-cache)
 fi
-podman build "${cache_args[@]}" "${args[@]}" \
-    --label "org.mcnf.app-vm.profile=$CONTRACT_ID" \
-    --label "org.mcnf.app-vm.base-image=$EFFECTIVE_BASE" \
-    --label "org.mcnf.app-vm.base-image-id=$BASE_ID" \
-    --label "org.mcnf.app-vm.source-commit=$SOURCE_COMMIT" \
-    -t "$IMAGE" \
-    --ignorefile "$APP_VM_DIR/context.containerignore" \
-    -f "$CONTAINERFILE" \
-    "$REPO"
+if [ -n "$REUSE_IMAGE" ]; then
+    podman image exists "$IMAGE" || {
+        echo "FATAL: requested reusable App VM image is not in local storage: $IMAGE" >&2
+        exit 1
+    }
+    echo "==> reusing immutable App VM image checkpoint: $IMAGE"
+else
+    podman build "${cache_args[@]}" "${args[@]}" \
+        --label "org.mcnf.app-vm.profile=$CONTRACT_ID" \
+        --label "org.mcnf.app-vm.base-image=$EFFECTIVE_BASE" \
+        --label "org.mcnf.app-vm.base-image-id=$BASE_ID" \
+        --label "org.mcnf.app-vm.source-commit=$SOURCE_COMMIT" \
+        -t "$IMAGE" \
+        --ignorefile "$APP_VM_DIR/context.containerignore" \
+        -f "$CONTAINERFILE" \
+        "$REPO"
+fi
 
 # Inspect the built image before producing a disk artifact. This is a contents
 # gate, not a boot claim: the image must contain the fixed guest contract and
@@ -315,9 +332,9 @@ if ! IMAGE_ID="$(canonical_image_id "$IMAGE_ID_RAW")"; then
 fi
 "$REPO/packaging/app-vm/verify-image.sh" "$IMAGE_ID"
 
-IMAGE_PROFILE="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.profile\"}}' "$IMAGE_ID" 2>/dev/null || true)"
-IMAGE_BASE_ID="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.base-image-id\"}}' "$IMAGE_ID" 2>/dev/null || true)"
-IMAGE_SOURCE_COMMIT="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.source-commit\"}}' "$IMAGE_ID" 2>/dev/null || true)"
+IMAGE_PROFILE="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.app-vm.profile"}}' "$IMAGE_ID" 2>/dev/null || true)"
+IMAGE_BASE_ID="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.app-vm.base-image-id"}}' "$IMAGE_ID" 2>/dev/null || true)"
+IMAGE_SOURCE_COMMIT="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.app-vm.source-commit"}}' "$IMAGE_ID" 2>/dev/null || true)"
 if [ "$IMAGE_PROFILE" != "$CONTRACT_ID" ] || \
    [ "$IMAGE_BASE_ID" != "$BASE_ID" ] || [ "$IMAGE_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
     echo "FATAL: built App VM image failed immutable provenance verification" >&2
