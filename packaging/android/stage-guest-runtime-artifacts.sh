@@ -69,7 +69,16 @@ revision=$2
 output=$4
 valid_revision "$revision" || fail "source revision must be a full lowercase Git revision"
 [[ $(uname -m) == x86_64 ]] || fail "canonical guest artifacts must be built on x86_64"
-git -C "$SOURCE_REPO" cat-file -e "$revision^{commit}" 2>/dev/null || fail "source revision is not a local commit"
+if git -C "$SOURCE_REPO" cat-file -e "$revision^{commit}" 2>/dev/null; then
+    source_mode=git
+else
+    # xcp-build farm workspaces intentionally omit .git.  They are admitted
+    # only when the caller supplies the exact revision marker used to sync the
+    # immutable source snapshot; arbitrary farm-directory bytes are refused.
+    [[ "${MCNF_BUILD_SOURCE_REVISION:-}" == "$revision" ]] \
+        || fail "source revision is not a local commit and no matching farm snapshot marker was supplied"
+    source_mode=snapshot
+fi
 [[ ! -e $output && ! -L $output ]] || fail "output directory already exists"
 parent=$(dirname -- "$output")
 [[ -d $parent && ! -L $parent ]] || fail "output parent is missing or substituted"
@@ -77,8 +86,14 @@ parent=$(dirname -- "$output")
 for tool in cargo git readelf sha256sum python3; do command -v "$tool" >/dev/null || fail "required tool is unavailable: $tool"; done
 source_tree=$(mktemp -d)
 trap 'rm -rf -- "$source_tree"' EXIT
-git -C "$SOURCE_REPO" archive "$revision" | tar -x -C "$source_tree"
 export MCNF_BUILD_SOURCE_REVISION=$revision
+if [[ "$source_mode" == git ]]; then
+    git -C "$SOURCE_REPO" archive "$revision" | tar -x -C "$source_tree"
+else
+    tar --exclude='./target' --exclude='./target-f43' --exclude='./target-f44' \
+        --exclude='./preview-inputs' --exclude='./.git' -cf - -C "$SOURCE_REPO" . \
+        | tar -x -C "$source_tree"
+fi
 export CARGO_TARGET_DIR=$source_tree/target
 (cd "$source_tree" && cargo build --locked --release --target "$TARGET" -p "$PACKAGE" --bins)
 target_dir=$CARGO_TARGET_DIR
