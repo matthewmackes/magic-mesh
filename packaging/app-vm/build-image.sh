@@ -27,6 +27,7 @@ DISK=""
 OUT="$APP_VM_DIR/out"
 REUSE_IMAGE=""
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
+APP_VM_ROOTFS="${MCNF_APP_VM_ROOTFS:-ext4}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 
 canonical_image_id() { # $1 = raw Podman image ID
@@ -232,6 +233,12 @@ case "$DISK" in
     ""|qcow2|raw|anaconda-iso) ;;
     *) echo "FATAL: invalid --disk" >&2; exit 2 ;;
 esac
+if [ -n "$DISK" ]; then
+    case "$APP_VM_ROOTFS" in
+        ext4|xfs|btrfs) ;;
+        *) echo "FATAL: invalid App VM rootfs: $APP_VM_ROOTFS" >&2; exit 2 ;;
+    esac
+fi
 
 # Re-attest the registry bytes and all release bindings before RPM staging,
 # Podman storage, or the image build context can be mutated.  The receipt
@@ -382,5 +389,5 @@ if [ -n "$DISK" ]; then
         -v "$OUT:/output" \
         -v /var/lib/containers/storage:/var/lib/containers/storage \
         "$BIB_IMAGE" \
-        --type "$DISK" --local "$IMAGE_ID"
+        --rootfs "$APP_VM_ROOTFS" --type "$DISK" --local "$IMAGE_ID"
 fi
