@@ -393,16 +393,13 @@ behavioral evidence is not completion.
   inputs, bind every byte and license to the frozen source revision, and produce
   the exact non-secret receipts required by the canonical preflight. Fixtures
   may exercise contracts but cannot satisfy a production gate.
-- Current state: receipt and local-generation paths exist, but no current-revision
-  production inputs are admitted. App VM uses the registry-resolved receipt;
-  Kiron proves package bytes against the requested source; and the RPM lane uses
-  one mode-0400 private JSON input bound to the clean checkout. Evidence is in
-  `docs/platform/evidence/WL-REL-006-2026-08-15-input-admission-hardening-r1.md`
-  and `docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md`.
-  S6 is now current-revision-bound: the farm regenerated all 18 SVG scenes and
-  6 CC0 audio cues, and the source-bound Kiron package gate passed on commit
-  `60f6d4fa9a7c0ab829710bad54f3dd3e2bd14c50`; evidence is in
+- Current state: receipt and local-generation paths exist, but no complete
+  current-revision production input set is admitted. App VM S3 has a live
+  Fedora receipt and Kiron S6 has passed source-bound package admission.
+  Evidence: `docs/platform/evidence/WL-REL-006-2026-08-16-app-vm-receipt-r1.md`,
   `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
+  The RPM lane still requires one mode-0400 private JSON input bound to the
+  clean checkout; Maps and Cuttlefish inputs remain outstanding.
   Downstream release epics remain blocked until current `13.0.0` receipts pass;
   the historical preview fixture cannot be reused.
 - Remaining work:
