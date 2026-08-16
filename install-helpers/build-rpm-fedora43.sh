@@ -288,6 +288,12 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 # from ONE canonical fragment, shared with xcp-build.sh, so the two RPM cut paths
 # cannot drift. The repo is bind-mounted at /src, so it is present in-container.
 source /src/install-helpers/rpm-features.sh
+# MAPS-2 — the offline catalog verifier is a shipped RPM asset, but it lives
+# in its own standalone Cargo workspace rather than the main application
+# workspace. Build it explicitly in the same pinned target tree before any
+# role variant invokes cargo-generate-rpm.
+echo "[f43] building offline map catalog verifier"
+cargo build --manifest-path /src/packaging/maps/verifier/Cargo.toml --release $MDE_RPM_LOCKED
 # The server variant replaces the base Requires table, which previously left a
 # freshly installed headless compute node without its Quadlet/libvirt runtime.
 # Apply the committed deterministic transform in this disposable farm checkout;
