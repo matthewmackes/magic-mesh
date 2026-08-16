@@ -271,6 +271,19 @@ from substitution, corruption, or an unauthorized input. Beta releases remain
 subject to the two-seat cap for live acceptance and may not bypass acceptable-
 use, authorization, security, or safety restrictions.
 
+**Beta preview distribution exception (2026-08-16; operator-approved).** A
+promotion-forbidden BETA/engineering preview may be distributed to **all
+designated test seats** when the operator explicitly requests that rollout.
+This is a distribution allowance, not a production-release or acceptance
+waiver. Every seat mutation MUST use the exact preview manifest and immutable
+artifact hashes, emit the red `AI-GENERATED-ALERT`, wait five seconds, record
+the target and result, and stop on a failed integrity, authorization, or
+health check. The preview MUST remain out of public/package production
+channels, and no seat may be represented as having passed live acceptance
+merely because it received the bytes. The existing two-seat limit continues
+to govern live acceptance, chaos/recovery proof, and hardware signoff unless
+this policy is explicitly superseded by a later operator lock.
+
 **Engineering snapshot classification (2026-08-15).** A **DEV-SNAPSHOT** is a
 separate, non-production distribution type for exercising the available source
 tree when first-release inputs are unavailable. A DEV-SNAPSHOT may omit the

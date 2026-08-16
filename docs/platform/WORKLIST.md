@@ -34,13 +34,16 @@ tasks.
   Product epics must not duplicate those rollout tasks; they retain only
   product-specific implementation and integration gaps, and cite `WL-TEST-002`
   when its acceptance is a dependency.
-- **Test-seat cap (operator lock 2026-08-14):** no validation, rollout proof,
-  capture, chaos, recovery, or acceptance activity may require or exercise more
-  than two physical test seats. An epic may substitute named seats when its
-  hardware is the subject, but must remain at two or fewer. Historical three- and
-  five-seat evidence stays factual but creates no forward multi-seat requirement.
-  Lighthouses are not test seats and retain their independently governed quorum
-  proof.
+- **Test-seat cap (operator lock 2026-08-14; preview distribution exception
+  2026-08-16):** validation, rollout proof, capture, chaos, recovery, and
+  acceptance activity remains capped at two physical test seats. A
+  promotion-forbidden BETA/engineering preview may nevertheless be distributed
+  to all designated test seats under the operator-approved preview-distribution
+  exception in `AI_GOVERNANCE.md`; distribution is not acceptance evidence.
+  Each target must receive the exact manifest-bound bytes, the red
+  `AI-GENERATED-ALERT`, the five-second mutation delay, and an auditable result.
+  Historical three- and five-seat evidence stays factual. Lighthouses are not
+  test seats and retain their independently governed quorum proof.
 - **Privacy-retention lock (operator lock 2026-08-10):** system logs, Bus
   history, transfer ledgers, collaboration JSONL, application histories, and
   audit records have a fleet-wide maximum lifetime of six hours. No priority or
@@ -54,11 +57,12 @@ tasks.
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
   never run filler tests.
 - **Rollout lock:** prove each release activity on no more than two selected
-  physical seats and the independently required lighthouses. Wider fleet
-  deployment, when needed, proceeds in separately bounded waves and does not
-  expand the test requirement. Publish the red AI-GENERATED-ALERT and wait five
-  seconds before each seat mutation. Recover failures by re-enrollment and
-  corrected-forward deployment, never rollback.
+  physical seats and the independently required lighthouses. The approved
+  promotion-forbidden preview may be distributed to all designated test seats,
+  but that wider distribution does not expand the test or acceptance
+  requirement. Publish the red AI-GENERATED-ALERT and wait five seconds before
+  each seat mutation. Recover failures by re-enrollment and corrected-forward
+  deployment, never rollback.
 - **Story format:** execute stories top-to-bottom. Do not start a story until
   every dependency is green. If a dependency or external resource is absent,
   set the epic to Blocked with the exact missing item; do not invent evidence.
@@ -293,14 +297,16 @@ behavioral evidence is not completion.
       - Validation: source scans and hostile package/first-boot fixtures.
       - Done when: no shipped path uses stale units or weak readiness proxies.
   18. S18 Prove and hand off the implementation.
-      - Inputs: S1-S17, farm inventory, two-seat cap, retention lock, and the
+      - Inputs: S1-S17, farm inventory, two-seat acceptance cap,
+        preview-distribution exception, retention lock, and the
         WL-TEST-002 ownership boundary.
       - Action: run focused unit/integration/hostile farm gates, put the longest
         job on BigBoy, and record product-specific evidence.
       - Deliverable: evidence index, AI/operator runbook, migration notes, and
         exact deferred WL-TEST-002 obligations.
       - Validation: worklist lints pass; detailed history expires within six
-        hours; live proof uses no more than two seats.
+        hours; live proof uses no more than two seats; any broader preview
+        distribution remains manifest-bound and is not counted as proof.
       - Done when: implementation gates pass and exact installed-release/live
         acceptance remains only under WL-TEST-002.
 - Scope: unified local/fleet lifecycle implementation, GUI/TUI rendering,
@@ -324,7 +330,9 @@ behavioral evidence is not completion.
 - Verification method: focused unit and hostile tests, farm-only integration and
   package fixtures, BigBoy for the longest gate, equivalent GUI/TUI request
   proofs, lifecycle interruption/resume tests, and no more than two physical
-  product-specific seats. Defer exact release and rollout proof to WL-TEST-002.
+  product-specific acceptance seats. A broader BETA preview distribution is
+  governed separately and is not acceptance proof. Defer exact release and
+  rollout proof to WL-TEST-002.
 - Origin or merged source IDs: operator-requested ONBOARD & OFFBOARDING
   consolidation, turnkey lifecycle review, Seat 15 and Surface findings,
   clean-fleet requirements, completed 20-question survey, and GPT Luna
