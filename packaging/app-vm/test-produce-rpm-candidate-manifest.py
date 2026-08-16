@@ -33,7 +33,7 @@ def main() -> int:
             tools / "rpm",
             """
 case " $* " in *' --initdb '*|*' --import '*) exit 0 ;; esac
-printf 'magic-mesh\\t0\\t12.1.6\\t33\\tx86_64\\n8\\t%s\\n' "$(printf 'a%.0s' {1..64})"
+printf 'magic-mesh\\t0\\t13.0.0\\t33\\tx86_64\\n8\\t%s\\n' "$(printf 'a%.0s' {1..64})"
 """,
         )
         write_tool(
@@ -60,7 +60,7 @@ read -r ignored
 member=''
 for value in "$@"; do member=$value; done
 case "$member" in ./usr/bin/mackesd|./usr/bin/mde-shell-egui) ;; *) exit 2 ;; esac
-printf '\\177ELF12.1.6Construct{REVISION}2026-08-13dev\\n'
+printf '\\177ELF13.0.0Construct{REVISION}2026-08-13dev\\n'
 """,
         )
         rpm = root / "magic-mesh.rpm"
@@ -89,7 +89,7 @@ printf '\\177ELF12.1.6Construct{REVISION}2026-08-13dev\\n'
         manifest = output / "candidate-manifest.json"
         value = json.loads(manifest.read_text(encoding="utf-8"))
         assert value["app_vm_target_identity"] == "mcnf-app-vm/wayland-standard-v1"
-        assert value["artifact"]["nevra"] == "magic-mesh-12.1.6-33.x86_64"
+        assert value["artifact"]["nevra"] == "magic-mesh-13.0.0-33.x86_64"
         assert value["build_identity"]["source_revision"] == REVISION
         assert value["signing_fingerprint"] == FINGERPRINT
         assert stat.S_IMODE(output.stat().st_mode) == 0o700

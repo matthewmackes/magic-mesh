@@ -2147,7 +2147,7 @@ def fixture_candidate_manifest(
                 b"workstation-mde-shell-egui"
             ).hexdigest()
         record = {
-            "package": f"{package_name_for_role(role)} 12.1.6-1.x86_64",
+        "package": f"{package_name_for_role(role)} 13.0.0-1.x86_64",
             "package_payload_sha256": hashlib.sha256(
                 f"{role}-rpm-payload".encode()
             ).hexdigest(),

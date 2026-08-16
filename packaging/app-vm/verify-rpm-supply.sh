@@ -244,7 +244,7 @@ case "$(basename -- "$last")" in
     old.rpm) name=magic-mesh; payload=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     *) name=magic-mesh; payload=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
 esac
-printf '%s\t%s\t%s\t%s\t%s\n%s\t%s\n' "$name" 0 12.1.6 33 x86_64 8 "$payload"
+printf '%s\t%s\t%s\t%s\t%s\n%s\t%s\n' "$name" 0 13.0.0 33 x86_64 8 "$payload"
 EOF
     cat > "$fixture/bin/gpg" <<'EOF'
 #!/usr/bin/env bash
@@ -275,7 +275,7 @@ member=''
 for item in "$@"; do member=$item; done
 case "$member" in ./usr/bin/mackesd|./usr/bin/mde-shell-egui) ;; *) exit 2 ;; esac
 case "$rpm_name" in old.rpm) revision=1123456789abcdef0123456789abcdef01234567 ;; *) revision=0123456789abcdef0123456789abcdef01234567 ;; esac
-printf '\177ELF12.1.6Construct%s2026-08-11dev\n' "$revision"
+printf '\177ELF13.0.0Construct%s2026-08-11dev\n' "$revision"
 EOF
     chmod 0755 "$fixture/bin/rpm" "$fixture/bin/rpmkeys" "$fixture/bin/rpm2cpio" "$fixture/bin/cpio" "$fixture/bin/gpg"
 
@@ -302,7 +302,7 @@ path, revision, rpm = sys.argv[1:]
 value = {
     "app_vm_target_identity": "mcnf-app-vm/wayland-standard-v1",
     "artifact": {
-        "nevra": "magic-mesh-12.1.6-33.x86_64",
+        "nevra": "magic-mesh-13.0.0-33.x86_64",
         "payload_sha256": "a" * 64,
         "rpm_sha256": hashlib.sha256(open(rpm, "rb").read()).hexdigest(),
     },

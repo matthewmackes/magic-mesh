@@ -1,5 +1,8 @@
 # Platform release versioning
 
+The next production release is `13.0.0`, published as `magic-mesh-v13.0.0`.
+It targets Fedora 44 on x86_64. ARM64 is not part of this release envelope.
+
 This document defines the release identity contract for Magic Mesh. There is
 one numeric release source: the `version` field under `[workspace.package]` in
 the repository-root `Cargo.toml`.

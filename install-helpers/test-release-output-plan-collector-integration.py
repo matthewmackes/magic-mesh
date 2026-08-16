@@ -56,9 +56,9 @@ def digest(path: Path) -> str:
 
 def rpm_manifest(path: Path, rpm: Path, role: str, revision: str) -> Path:
     names = {
-        "workstation-rpm": ("magic-mesh-12.1.6-34.x86_64", "mcnf-app-vm-rpm-candidate-manifest", 2),
-        "server-rpm": ("magic-mesh-server-12.1.6-23.x86_64", "mcnf-server-rpm-candidate-manifest", 1),
-        "lighthouse-rpm": ("magic-mesh-lighthouse-12.1.6-11.x86_64", "mcnf-browser-vm-lighthouse-rpm-candidate-manifest", 1),
+        "workstation-rpm": ("magic-mesh-13.0.0-34.x86_64", "mcnf-app-vm-rpm-candidate-manifest", 2),
+        "server-rpm": ("magic-mesh-server-13.0.0-23.x86_64", "mcnf-server-rpm-candidate-manifest", 1),
+        "lighthouse-rpm": ("magic-mesh-lighthouse-13.0.0-11.x86_64", "mcnf-browser-vm-lighthouse-rpm-candidate-manifest", 1),
     }
     nevra, kind, schema = names[role]
     value: dict[str, object] = {
@@ -170,12 +170,12 @@ rpm=${@: -1}; case "$rpm" in
   *browser-lighthouse-verify-*/candidate.rpm|*lighthouse-rpm.rpm) name=magic-mesh-lighthouse; release=11 ;;
   *) exit 2 ;;
 esac
-printf '%s\\t0\\t12.1.6\\t%s\\tx86_64\\n8\\t%s\\n' "$name" "$release" "$(printf 'a%.0s' {1..64})"
+printf '%s\\t0\\t13.0.0\\t%s\\tx86_64\\n8\\t%s\\n' "$name" "$release" "$(printf 'a%.0s' {1..64})"
 """)
         tool(tools / "rpmkeys", "printf 'Header V4 RSA/SHA256 Signature, key ID d0921c73: OK\\n'\n")
         tool(tools / "gpg", f"printf 'pub:-:4096:1:00000000D0921C73::::::sc:::::::\\n'\nprintf 'fpr:::::::::{SIGNER}:\\n'\n")
         tool(tools / "rpm2cpio", "printf 'archive fixture\\n'\n")
-        tool(tools / "cpio", f"cat >/dev/null\nprintf '\\177ELF12.1.6Construct{revision}bounded\\n'\n")
+        tool(tools / "cpio", f"cat >/dev/null\nprintf '\\177ELF13.0.0Construct{revision}bounded\\n'\n")
         tool(tools / "qemu-img", "printf '{\"format\":\"qcow2\",\"virtual-size\":68719476736}\\n'\n")
         env = dict(os.environ); env["PATH"] = f"{tools}:/usr/bin:/bin"
         inputs, files = fixture(root, env, revision, epoch)

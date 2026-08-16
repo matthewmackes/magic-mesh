@@ -1,6 +1,6 @@
 [package]
 name = "serve-browser-vm-performance-rdp"
-version = "12.1.6"
+version = "13.0.0"
 edition = "2021"
 publish = false
 

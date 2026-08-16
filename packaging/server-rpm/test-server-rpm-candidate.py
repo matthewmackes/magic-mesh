@@ -28,7 +28,7 @@ def main() -> int:
         tool(tools / "rpm", """
 case " $* " in *' --initdb '*|*' --import '*) exit 0 ;; esac
 name=${TEST_RPM_NAME:-magic-mesh-server}; arch=${TEST_RPM_ARCH:-x86_64}
-printf '%s\t0\t12.1.6\t23\t%s\n8\t%s\n' "$name" "$arch" "$(printf 'a%.0s' {1..64})"
+printf '%s\t0\t13.0.0\t23\t%s\n8\t%s\n' "$name" "$arch" "$(printf 'a%.0s' {1..64})"
 """)
         tool(tools / "rpmkeys", """
 [[ ${TEST_UNSIGNED:-0} == 0 ]] || { echo 'digests OK'; exit 1; }
@@ -42,7 +42,7 @@ printf 'pub:-:4096:1:00000000D0921C73::::::sc:::::::\n'
 printf 'fpr:::::::::%s:\n' "$fingerprint"
 """)
         tool(tools / "rpm2cpio", "printf 'archive fixture'\n")
-        tool(tools / "cpio", f"cat >/dev/null\nprintf '\\177ELF12.1.6Construct{REVISION}bounded\\n'\n")
+        tool(tools / "cpio", f"cat >/dev/null\nprintf '\\177ELF13.0.0Construct{REVISION}bounded\\n'\n")
         rpm = root / "magic-mesh-server.rpm"
         rpm.write_bytes(b"\xed\xab\xee\xdbsigned server fixture\n"); rpm.chmod(0o644)
         key = root / "RPM-GPG-KEY-magic-mesh"
@@ -65,7 +65,7 @@ printf 'fpr:::::::::%s:\n' "$fingerprint"
         value = json.loads(manifest.read_text(encoding="utf-8"))
         assert value["release_role"] == "server-rpm"
         assert value["server_variant_identity"] == "magic-mesh-server/headless-workstation-v1"
-        assert value["artifact"]["nevra"] == "magic-mesh-server-12.1.6-23.x86_64"
+        assert value["artifact"]["nevra"] == "magic-mesh-server-13.0.0-23.x86_64"
         assert value["build_identity"]["source_revision"] == REVISION
         assert value["signing_fingerprint"] == FINGERPRINT
         assert candidate.read_bytes() == rpm.read_bytes()
@@ -94,7 +94,7 @@ printf 'fpr:::::::::%s:\n' "$fingerprint"
             "variant": lambda item: item.update(server_variant_identity="magic-mesh-lighthouse/thin-control-plane-v1"),
             "revision": lambda item: item["build_identity"].update(source_revision="1" + REVISION[1:]),
             "signer": lambda item: item.update(signing_fingerprint="B" * 40),
-            "nevra": lambda item: item["artifact"].update(nevra="magic-mesh-12.1.6-23.x86_64"),
+            "nevra": lambda item: item["artifact"].update(nevra="magic-mesh-13.0.0-23.x86_64"),
             "digest": lambda item: item["artifact"].update(rpm_sha256="0" * 64),
         }
         for name, mutate in mutations.items():

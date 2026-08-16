@@ -3473,7 +3473,7 @@ mod tests {
     fn capability() -> ClientCapability {
         ClientCapability::new(
             "construct.ironrdp",
-            "12.1.6",
+            "13.0.0",
             TransportProtocol::Rdp,
             "10.7",
             ClientBoundary::ShellNative,
@@ -4665,7 +4665,7 @@ mod tests {
 
         let duplicate = ClientCapability::new(
             "construct.ironrdp",
-            "12.1.6",
+            "13.0.0",
             TransportProtocol::Rdp,
             "10.7",
             ClientBoundary::ShellNative,

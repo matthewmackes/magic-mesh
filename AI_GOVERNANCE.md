@@ -297,24 +297,23 @@ package channel, or complete platform. DEV-SNAPSHOT artifacts remain subject
 to licensing, authorization, acceptable-use, security, and safety rules; this
 classification does not authorize unsafe or unlawful distribution.
 
-**Fixture evidence substitution policy (2026-08-16; broad operator approval).**
-When governed production inputs, providers, hardware, or installed seats are
-unavailable, an explicitly identified non-production fixture MAY substitute for
-the corresponding production evidence in release gating and may be used as the
-basis for a candidate represented as production-ready. The release-evidence
-record MUST identify every substituted input, fixture owner, source revision,
-fixture configuration, test limitations, and residual risk; bind all generated
-artifacts to immutable hashes; and carry signed maintainer and operator
-attestations. The record MUST state that fixture evidence is a substitution,
-not an observation of production behavior, and MUST name the missing production
-validation as follow-up work. This exception applies broadly to Maps, App VM,
-Cuttlefish, bootc/image inputs, providers, installed seats, live topology, and
-hardware, but it does not waive source identity, cryptographic verification,
-SBOM/license obligations, security controls, acceptable-use rules, safety
-requirements, or the requirement that runtime claims be exercised by an
-auditable test. A later production-validation record supersedes each fixture
-substitution; until then, the substitution and its risk remain part of the
-release record and release notes.
+**Production evidence integrity lock (2026-08-16).** Non-production fixtures
+may exercise code, receipt contracts, and hostile refusal paths, but they MUST
+NOT satisfy or substitute for a production release gate. Production evidence
+requires the real governed input, provider, hardware, installed seat, live
+topology, or recovery path named by the gate. Missing real evidence is a
+blocker, not a production-ready qualification. Historical fixture-backed
+previews remain accurately labeled as previews and cannot be relabeled or
+promoted.
+
+**Production candidate qualification exception (2026-08-16; operator-approved).**
+An exact, fully signed, promotion-unpublished production candidate MAY be
+staged privately onto the named production topology solely to execute the
+required production gates before public publication. Candidate staging MUST
+use immutable manifest-bound bytes, the red `AI-GENERATED-ALERT`, the five-
+second mutation delay, auditable results, quorum-safe lighthouse replacement,
+and corrected-forward recovery. The candidate is not a public release until
+all production gates pass and the final signed evidence envelope is complete.
 
 ## §8 — Positioning & trust envelope
 

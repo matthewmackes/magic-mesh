@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "browser-vm-production-control"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "hmac 0.12.1",
@@ -2410,7 +2410,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "mackes-mesh-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "mde-collab-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "serde",
@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "mde-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "eframe",
  "egui",
@@ -2485,14 +2485,14 @@ dependencies = [
 
 [[package]]
 name = "mde-vdi-core"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-egui",
 ]
 
 [[package]]
 name = "mde-vdi-rdp"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ironrdp-async",
  "ironrdp-cliprdr",

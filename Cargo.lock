@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-config"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mackes-mesh-types",
  "serde",
@@ -4203,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-mesh-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-nebula-https-tunnel"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "bytes",
  "mackes-transport",
@@ -4241,7 +4241,7 @@ dependencies = [
 
 [[package]]
 name = "mackesd"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4347,7 +4347,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcnf-cuttlefish-guest"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mackes-mesh-types",
  "rustix 0.38.44",
@@ -4403,7 +4403,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "mde-bookmarks"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "proptest",
  "rusqlite",
@@ -4417,7 +4417,7 @@ dependencies = [
 
 [[package]]
 name = "mde-bookmarks-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-bookmarks",
  "mde-bus",
@@ -4430,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "mde-bus"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -4455,7 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "mde-chat"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "rand 0.8.7",
@@ -4466,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "mde-collab-core"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
@@ -4482,7 +4482,7 @@ dependencies = [
 
 [[package]]
 name = "mde-collab-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-collab-types",
  "mde-editor-egui",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "mde-collab-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "rand 0.8.7",
@@ -4505,11 +4505,11 @@ dependencies = [
 
 [[package]]
 name = "mde-disclaimer"
-version = "12.1.6"
+version = "13.0.0"
 
 [[package]]
 name = "mde-editor-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "base64",
  "lsp-types",
@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "mde-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "drm",
  "eframe",
@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "mde-enroll"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "mde-files"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -4592,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "mde-files-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "image",
  "mackes-mesh-types",
@@ -4611,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "mde-jellyfin"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "dirs",
  "reqwest",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "mde-maps-location-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "base64",
  "image",
@@ -4672,7 +4672,7 @@ dependencies = [
 
 [[package]]
 name = "mde-media-core"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "libmpv2",
  "mackes-mesh-types",
@@ -4687,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "mde-media-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mackes-mesh-types",
  "mde-bus",
@@ -4700,14 +4700,14 @@ dependencies = [
 
 [[package]]
 name = "mde-mesh-view"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-egui",
 ]
 
 [[package]]
 name = "mde-music-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "image",
  "mde-bus",
@@ -4720,7 +4720,7 @@ dependencies = [
 
 [[package]]
 name = "mde-musicd"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "base64",
  "clap",
@@ -4747,14 +4747,14 @@ dependencies = [
 
 [[package]]
 name = "mde-role"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "rustix 0.38.44",
 ]
 
 [[package]]
 name = "mde-role-chooser"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-disclaimer",
  "mde-egui",
@@ -4763,7 +4763,7 @@ dependencies = [
 
 [[package]]
 name = "mde-seal"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -4773,7 +4773,7 @@ dependencies = [
 
 [[package]]
 name = "mde-seat"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "drm",
  "serde",
@@ -4785,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "mde-shell-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "base64",
  "chrono",
@@ -4831,7 +4831,7 @@ dependencies = [
 
 [[package]]
 name = "mde-term-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "alacritty_terminal",
  "base64",
@@ -4849,21 +4849,21 @@ dependencies = [
 
 [[package]]
 name = "mde-theme"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "resvg",
 ]
 
 [[package]]
 name = "mde-vdi-core"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-egui",
 ]
 
 [[package]]
 name = "mde-vdi-rdp"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ironrdp-async",
  "ironrdp-cliprdr",
@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "mde-vdi-spice"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mackes-mesh-types",
  "mde-egui",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "mde-vdi-vnc"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mackes-mesh-types",
  "mde-egui",
@@ -4908,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "mde-voice-hud"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "cpal",
  "dirs",
@@ -4926,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "mde-wayland-workspace"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4936,7 +4936,7 @@ dependencies = [
 
 [[package]]
 name = "mde-worker-core"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

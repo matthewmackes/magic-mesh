@@ -887,7 +887,7 @@ mod tests {
             schema_version: 1,
             target_id: "seat-15".into(),
             current_version: "12.1.5".into(),
-            target_version: "12.1.6".into(),
+            target_version: "13.0.0".into(),
             target_artifact_digest_hex: "f".repeat(64),
             source_revision: "revision-1".into(),
             generation: 1,

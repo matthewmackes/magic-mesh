@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn retired_runtime_descriptor_fields_are_ignored_and_not_republished() {
         let mut value =
-            serde_json::to_value(PeerRecord::now("anvil", Some("12.1.6".into()), "healthy"))
+            serde_json::to_value(PeerRecord::now("anvil", Some("13.0.0".into()), "healthy"))
                 .unwrap();
         value["descriptors"] = serde_json::json!({
             "containers": [{"name": "old", "state": "running"}],

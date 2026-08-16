@@ -24,7 +24,7 @@ IFS=$'\t' read -r REVISION EPOCH \
 
 (
   cd "$FIXTURE"
-  CARGO_PKG_VERSION=12.1.6 \
+  CARGO_PKG_VERSION=13.0.0 \
   MCNF_BUILD_SOURCE_REVISION="$REVISION" \
   MCNF_BUILD_PROMOTABLE=1 \
   SOURCE_DATE_EPOCH="$EPOCH" \
@@ -34,7 +34,7 @@ grep -Fqx "cargo:rustc-env=MDE_BUILD_GIT_HASH=$REVISION" "$ARTIFACTS/promotable.
 
 if (
   cd "$FIXTURE"
-  CARGO_PKG_VERSION=12.1.6 MCNF_BUILD_PROMOTABLE=1 \
+  CARGO_PKG_VERSION=13.0.0 MCNF_BUILD_PROMOTABLE=1 \
     "$ARTIFACTS/theme-build-script" >"$ARTIFACTS/missing.out" 2>"$ARTIFACTS/missing.err"
 ); then
   printf 'test-source-revision-provenance: missing promotable receipt was accepted\n' >&2
@@ -44,7 +44,7 @@ grep -Fq 'promotable build requires MCNF_BUILD_SOURCE_REVISION' "$ARTIFACTS/miss
 
 if (
   cd "$FIXTURE"
-  CARGO_PKG_VERSION=12.1.6 \
+  CARGO_PKG_VERSION=13.0.0 \
   MCNF_BUILD_SOURCE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   MCNF_BUILD_PROMOTABLE=1 \
     "$ARTIFACTS/theme-build-script" >"$ARTIFACTS/mismatch.out" 2>"$ARTIFACTS/mismatch.err"
@@ -57,7 +57,7 @@ grep -Fq 'source receipt does not match checkout HEAD' "$ARTIFACTS/mismatch.err"
 printf 'dirty\n' >>"$FIXTURE/source"
 if (
   cd "$FIXTURE"
-  CARGO_PKG_VERSION=12.1.6 \
+  CARGO_PKG_VERSION=13.0.0 \
   MCNF_BUILD_SOURCE_REVISION="$REVISION" \
   MCNF_BUILD_PROMOTABLE=1 \
     "$ARTIFACTS/theme-build-script" >"$ARTIFACTS/dirty.out" 2>"$ARTIFACTS/dirty.err"
@@ -70,7 +70,7 @@ grep -Fq 'promotable build checkout is dirty' "$ARTIFACTS/dirty.err"
 mkdir "$WORK/gitless"
 (
   cd "$WORK/gitless"
-  CARGO_PKG_VERSION=12.1.6 "$ARTIFACTS/theme-build-script" >"$ARTIFACTS/gitless.out"
+  CARGO_PKG_VERSION=13.0.0 "$ARTIFACTS/theme-build-script" >"$ARTIFACTS/gitless.out"
 )
 grep -Fqx 'cargo:rustc-env=MDE_BUILD_GIT_HASH=non-promotable-unresolved' "$ARTIFACTS/gitless.out"
 ! grep -Fq 'MDE_BUILD_GIT_HASH=nogit' "$ARTIFACTS/gitless.out"

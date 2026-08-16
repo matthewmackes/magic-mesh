@@ -82,9 +82,9 @@ def verify_stream(source_commit: str, package_version: str, member: str) -> None
 
 def self_test() -> None:
     revision = "a" * 40
-    version = "12.1.6"
+    version = "13.0.0"
     needle = (version + "Construct" + revision).encode()
-    if needle != b"12.1.6Construct" + b"a" * 40:
+    if needle != b"13.0.0Construct" + b"a" * 40:
         fail("identity construction self-test failed")
     if REVISION.fullmatch(revision) is None or REVISION.fullmatch("a" * 39) is not None:
         fail("revision-width self-test failed")

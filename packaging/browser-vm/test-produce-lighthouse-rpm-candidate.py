@@ -31,7 +31,7 @@ def main() -> int:
 case " $* " in *' --initdb '*|*' --import '*) exit 0 ;; esac
 name=${TEST_RPM_NAME:-magic-mesh-lighthouse}
 arch=${TEST_RPM_ARCH:-x86_64}
-printf '%s\t0\t12.1.6\t11\t%s\n8\t%s\n' "$name" "$arch" "$(printf 'a%.0s' {1..64})"
+printf '%s\t0\t13.0.0\t11\t%s\n8\t%s\n' "$name" "$arch" "$(printf 'a%.0s' {1..64})"
 """)
         tool(tools / "rpmkeys", """
 [[ ${TEST_UNSIGNED:-0} == 0 ]] || { echo 'digests OK'; exit 1; }
@@ -46,7 +46,7 @@ printf 'fpr:::::::::%s:\n' "$fingerprint"
         tool(tools / "rpm2cpio", "printf 'archive fixture'\n")
         tool(tools / "cpio", f"""
 cat >/dev/null
-printf '\177ELF12.1.6Construct{REVISION}bounded\n'
+printf '\177ELF13.0.0Construct{REVISION}bounded\n'
 """)
         rpm = root / "magic-mesh-lighthouse.rpm"
         rpm.write_bytes(b"signed lighthouse fixture\n")
@@ -70,7 +70,7 @@ printf '\177ELF12.1.6Construct{REVISION}bounded\n'
         assert good.returncode == 0, good.stderr
         manifest = root / "good/candidate-manifest.json"
         value = json.loads(manifest.read_text(encoding="utf-8"))
-        assert value["artifact"]["nevra"] == "magic-mesh-lighthouse-12.1.6-11.x86_64"
+        assert value["artifact"]["nevra"] == "magic-mesh-lighthouse-13.0.0-11.x86_64"
         assert value["browser_target_identity"] == "mcnf-browser-vm/browser-vm-chromium-v1"
         assert value["lighthouse_variant_identity"] == "magic-mesh-lighthouse/thin-control-plane-v1"
         assert value["build_identity"]["source_revision"] == REVISION
@@ -102,7 +102,7 @@ printf '\177ELF12.1.6Construct{REVISION}bounded\n'
             "target": lambda item: item.update(browser_target_identity="mcnf-app-vm/wayland-standard-v1"),
             "variant": lambda item: item.update(lighthouse_variant_identity="magic-mesh/workstation-v1"),
             "revision": lambda item: item["build_identity"].update(source_revision="1" + REVISION[1:]),
-            "nevra": lambda item: item["artifact"].update(nevra="magic-mesh-12.1.6-11.x86_64"),
+            "nevra": lambda item: item["artifact"].update(nevra="magic-mesh-13.0.0-11.x86_64"),
             "signer": lambda item: item.update(signing_fingerprint="B" * 40),
         }.items():
             hostile = json.loads(json.dumps(value))

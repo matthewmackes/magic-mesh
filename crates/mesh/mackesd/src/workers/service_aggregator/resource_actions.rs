@@ -1716,7 +1716,7 @@ mod tests {
         let mut catalog = catalog(HealthStatus::Available);
         let capability = ClientCapability::new(
             "construct.ironrdp",
-            "12.1.6",
+            "13.0.0",
             TransportProtocol::Rdp,
             "10.7",
             ClientBoundary::ShellNative,

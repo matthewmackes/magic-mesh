@@ -5,16 +5,17 @@ runbooks, and operator notes are inputs, not parallel trackers. Historical
 implementation diaries remain in docs/worklist-archive/ and are not executable
 tasks.
 
-## Current Snapshot - 2026-08-15 executable story rewrite
+## Current Snapshot - 2026-08-16 production 13.0.0 execution
 
 - **8 active epics:** 2 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement the turnkey lifecycle under `WL-FUNC-023`;
-  create governed release inputs under `WL-REL-006`; re-freeze the exact newest
-  feature-complete source under `WL-REL-001`; cut the three RPM roles under
-  `WL-REL-002`; self-sign them and produce the four derivative roles under
-  `WL-REL-003`; assemble the seven-role evidence bundle under `WL-REL-004`;
-  publish under `WL-REL-005`; then run installed acceptance under `WL-TEST-002`.
+  create real release inputs under `WL-REL-006`; re-freeze the exact
+  feature-complete `13.0.0` source under `WL-REL-001`; cut and sign the seven
+  roles under `WL-REL-002`/`WL-REL-003`; stage the unpublished signed candidate
+  on the production topology and run `WL-TEST-002`; complete the final signed
+  evidence envelope under `WL-REL-004`; then publish and read back under
+  `WL-REL-005`.
 - **Single-authority lock:** typed Workload operations are the only VM/container
   lifecycle API; mackesd is the only daemon authority; mde-bus is the only
   platform bus; the shell renders typed bounded projections and sends typed
@@ -34,14 +35,13 @@ tasks.
   Product epics must not duplicate those rollout tasks; they retain only
   product-specific implementation and integration gaps, and cite `WL-TEST-002`
   when its acceptance is a dependency.
-- **Test-seat cap (operator lock 2026-08-14; preview distribution exception
-  2026-08-16):** validation, rollout proof, capture, chaos, recovery, and
-  acceptance activity remains capped at two physical test seats. A
-  promotion-forbidden BETA/engineering preview may nevertheless be distributed
-  to all designated test seats and designated test lighthouses under the
-  operator-approved preview-distribution exception in `AI_GOVERNANCE.md`;
-  distribution is not acceptance evidence. Lighthouse replacement remains
-  one-at-a-time and must preserve quorum and overlay recovery.
+- **Production qualification topology (operator survey 2026-08-16):** deep
+  acceptance is capped at Seat 15 and Dell. Eagle is the third production
+  workstation for the six-node baseline and supplies package/runtime/topology
+  proof. Three lighthouses remain independently required. Surface is
+  experimental and non-blocking; ARM64 is outside the `13.0.0` support envelope.
+  An unpublished signed candidate may be staged on this topology under the
+  production-candidate qualification exception in `AI_GOVERNANCE.md`.
   Each target must receive the exact manifest-bound bytes, the red
   `AI-GENERATED-ALERT`, the five-second mutation delay, and an auditable result.
   Historical three- and five-seat evidence stays factual. Lighthouses are not
@@ -72,22 +72,22 @@ tasks.
 
 ## Active Drain Goal
 
-Implement the unified turnkey seat lifecycle, then cut, self-sign, publish,
-install, and prove the newest feature-complete Construct release from one exact
-clean source revision. Produce all seven canonical roles, retain fail-closed
-provenance, and keep live acceptance within two physical test seats.
+Implement the unified turnkey seat lifecycle, then cut, self-sign, qualify,
+publish, install, and prove production `magic-mesh-v13.0.0` from one exact clean
+protected-default-branch revision. Produce all seven canonical roles, retain
+fail-closed provenance, require real production evidence, and keep deep live
+acceptance within Seat 15 and Dell.
 
 ## Service Release Queue
 
 1. Implement the unified ONBOARD & OFFBOARDING lifecycle.
-2. Create and admit governed open-source release inputs.
-3. Re-freeze the newest feature-complete source and numeric release identity.
-4. Build the Workstation, Server, and Lighthouse RPM handoff.
-5. Self-sign all RPM roles and build Browser VM, App VM, Cuttlefish, and bootc roles.
-6. Assemble and verify the seven-role provenance/evidence bundle.
-7. Publish the immutable tag, GitHub release assets, and signed package metadata.
-8. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance
-   under WL-TEST-002.
+2. Create and admit real production release inputs.
+3. Re-freeze the feature-complete `13.0.0` source on the protected default branch.
+4. Build and self-sign all seven canonical roles.
+5. Stage the exact unpublished candidate on the six-node production topology.
+6. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance.
+7. Assemble and sign the final provenance/evidence bundle.
+8. Publish `magic-mesh-v13.0.0`, verify readback, and complete the staged fleet handoff.
 
 ## Story execution contract
 
@@ -346,8 +346,8 @@ behavioral evidence is not completion.
 - Status: Blocked
 - Priority: P0
 - Complexity: Epic
-- Problem: version 12.1.6 is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
-- Required outcome: freeze one clean, pushed, feature-complete commit and bind every release input, version surface, note, and tag plan to it.
+- Problem: production `13.0.0` is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
+- Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit on the protected default branch and bind every release input, version surface, note, and tag plan to it.
 - Current state: revision 1dfe6906609d71da9ee2ce20c860912a09b32855 and epoch
   1786813297 remain recorded in the r2 source-freeze receipt as the clean
   pre-WL-FUNC-023 candidate. It cannot be the final feature-complete release
@@ -390,7 +390,7 @@ behavioral evidence is not completion.
   4. S4 Freeze release notes and tag plan.
      - Inputs: commits since magic-mesh-v12.1.1, archived epic dispositions, current worklist, and user-visible feature set.
      - Action: draft release notes with features, compatibility, known limitations, upgrade path, and corrected-forward recovery.
-     - Deliverable: versioned release-note source and exact tag name magic-mesh-v12.1.6.
+     - Deliverable: versioned release-note source and exact tag name magic-mesh-v13.0.0.
      - Validation: notes contain no unsupported production/security claim and identify deferred provider/live proof honestly.
      - Done when: notes, tag, source receipt, and input inventory agree on version and revision.
 - Scope: source identity, version authority, mandatory input admission, release notes, and tag planning only; no artifact build or publication.
@@ -408,15 +408,13 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: WL-REL-001 cannot admit the first release while Maps, App VM,
+- Problem: WL-REL-001 cannot admit the production release while Maps, App VM,
   Cuttlefish, bootc, UX-014 assets, and the private preflight argv exist only as
   missing operator inputs or non-production fixtures.
-- Required outcome: create or select open-source-compatible inputs, bind every
-  byte and license to the frozen source revision, and produce the exact
-  non-secret receipts required by the canonical preflight. Where governed
-  production inputs are unavailable, the fixture-evidence substitution policy
-  in `AI_GOVERNANCE.md` permits explicitly labeled fixtures with signed
-  attestations, immutable hashes, limitations, and residual-risk tracking.
+- Required outcome: create or select real open-source-compatible production
+  inputs, bind every byte and license to the frozen source revision, and produce
+  the exact non-secret receipts required by the canonical preflight. Fixtures
+  may exercise contracts but cannot satisfy a production gate.
 - Current state: open-source implementation and local-generation paths exist
   for the receipt contracts, but no current-revision production inputs have
   been admitted. App VM base admission now consumes the canonical registry-
@@ -429,13 +427,9 @@ behavioral evidence is not completion.
   The current redacted source/license inventory is recorded in
   docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md.
   This epic is the implementation/acquisition lane; downstream release epics
-  remain blocked until its receipts pass preflight. A complete fixture-backed
-  input set for `afc24782ca9dc8e2e87f5676e403428a82285da1` now passes the
-  canonical preflight on BigBoy, including Maps, App VM trust/base, Cuttlefish
-  declaration/guest/image, RPM signer identity, and bootc receipt admission;
-  the fixture limitations and lack of live provider proof keep this epic
-  `Remaining`. The result is recorded in
-  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`.
+  remain blocked until current `13.0.0` receipts pass preflight. The historical
+  fixture-backed input set for `afc24782ca9dc8e2e87f5676e403428a82285da1` is
+  evidence for the old preview only and cannot be reused.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: frozen source receipt, Fedora target, architecture, applicable
@@ -532,7 +526,7 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
-- Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable promotion-forbidden handoff.
+- Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable private production-candidate handoff.
 - Current state: prepare-path hostile tests pass, but WL-REL-001 is blocked and no current-revision three-RPM handoff exists.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
@@ -574,7 +568,7 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and four verified image roles; no current-revision seven-role set exists.
 - Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, Cuttlefish, and bootc roles.
-- Current state: a private, promotion-forbidden seven-role preview now exists
+- Current state: a private, promotion-forbidden seven-role preview exists
   for `afc24782ca9dc8e2e87f5676e403428a82285da1`, with all three signed RPMs,
   Browser VM, App VM, Cuttlefish, and bootc receipt identities collected and
   re-verified. It is not the final release because WL-REL-001 remains blocked
@@ -633,7 +627,7 @@ behavioral evidence is not completion.
 - Problem: publication is forbidden until all artifacts, manifests, gates, SBOM data, checksums, and provenance form one exact signed bundle.
 - Required outcome: collect and verify all seven roles, execute mandatory release gates, and sign one immutable publication envelope.
 - Current state: the canonical seven-role plan and collector pass for the
-  private `afc24782` preview, including fresh App VM and Browser VM manifest
+  private historical `afc24782` preview, including fresh App VM and Browser VM manifest
   verification. The collection is promotion-forbidden and still lacks the
   signed provenance/SBOM/gate envelope, clean-room publication readback, and
   final source-freeze authority required to close this epic. Evidence:
@@ -682,7 +676,7 @@ behavioral evidence is not completion.
 - Status: Blocked
 - Priority: P0
 - Complexity: Epic
-- Problem: version 12.1.6 has no immutable current tag or complete public asset set, and partial candidates must never enter the package channel.
+- Problem: version 13.0.0 has no immutable current tag or complete public asset set, and partial candidates must never enter the package channel.
 - Required outcome: publish one immutable tag and GitHub release, verify all assets by readback, then atomically expose only signed package metadata.
 - Current state: tags end at magic-mesh-v12.1.1; WL-REL-004 has no signed seven-role bundle, so publication is correctly refused.
 - Remaining work:
@@ -694,7 +688,7 @@ behavioral evidence is not completion.
      - Done when: the target names are absent and the exact revision/bundle is ready.
   2. S2 Create and push the immutable tag.
      - Inputs: frozen revision, exact tag name, and release-note title.
-     - Action: create a signed annotated magic-mesh-v12.1.6 tag and push that tag only.
+     - Action: create a signed annotated magic-mesh-v13.0.0 tag and push that tag only.
      - Deliverable: remote tag object and tag-signature evidence.
      - Validation: local and remote tag dereference to the frozen revision; tag signature verifies.
      - Done when: no branch tip or alternate commit can masquerade as the release tag.
@@ -736,14 +730,14 @@ behavioral evidence is not completion.
 - Priority: P1
 - Complexity: Epic
 - Problem: exact-release installation, providers, direct-DRM rendering, guest/device integrations, and corrected-forward recovery need live proof.
-- Required outcome: install the WL-REL-005 release on no more than two physical seats and execute every deferred acceptance obligation honestly.
-- Current state: pre-release harnesses pass; WL-REL-005 has no published signed release, so installed/live acceptance cannot begin.
+- Required outcome: qualify the exact unpublished signed production candidate on Seat 15 and Dell, prove Eagle and three-lighthouse topology, then verify the same bytes after WL-REL-005 publication.
+- Current state: pre-release harnesses pass; candidate qualification is blocked on the current-source seven-role candidate and real production inputs.
 - Remaining work:
-  1. S1 Admit the published release.
-     - Inputs: WL-REL-005 publication receipt, clean-room readback, signed package/image identities, and selected seats.
-     - Action: verify release bytes again; record seat hardware, authorization, current package, target package, and recovery identity.
+  1. S1 Admit the unpublished signed candidate.
+     - Inputs: WL-REL-003 candidate manifest, signed package/image identities, real production inputs, and selected seats.
+     - Action: verify candidate bytes; record seat hardware, authorization, current package, target package, and recovery identity.
      - Deliverable: installed-acceptance plan and pre-mutation baseline.
-     - Validation: tested bytes equal public signed bytes; no more than two physical seats are selected.
+     - Validation: tested bytes equal the immutable candidate manifest; no more than two deep-acceptance seats are selected.
      - Done when: exact inputs and targets are unambiguous and recoverable by corrected-forward deployment.
   2. S2 Install and verify the baseline.
      - Inputs: admitted package/image references and governed mutation plan.

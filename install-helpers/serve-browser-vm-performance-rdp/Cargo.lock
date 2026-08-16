@@ -2324,7 +2324,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "mackes-mesh-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "dirs",
  "hmac 0.12.1",
@@ -2374,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "mde-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "eframe",
  "egui",
@@ -2386,14 +2386,14 @@ dependencies = [
 
 [[package]]
 name = "mde-vdi-core"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-egui",
 ]
 
 [[package]]
 name = "mde-vdi-rdp"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ironrdp-async",
  "ironrdp-connector",
@@ -3889,7 +3889,7 @@ dependencies = [
 
 [[package]]
 name = "serve-browser-vm-performance-rdp"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "mde-vdi-core",
  "mde-vdi-rdp",

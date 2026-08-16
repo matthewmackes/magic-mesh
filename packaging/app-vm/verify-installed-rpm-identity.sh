@@ -115,7 +115,7 @@ case " $* " in
         printf '/usr/bin/mackesd\t%s\t8\n' "${FIXTURE_MACKESD_DIGEST:?}"
         printf '/usr/bin/mde-shell-egui\t%s\t8\n' "${FIXTURE_SHELL_DIGEST:?}"
         ;;
-    *) printf '%s\t%s\n' magic-mesh 12.1.6 ;;
+    *) printf '%s\t%s\n' magic-mesh 13.0.0 ;;
 esac
 EOF
     cat > "$fixture/bin/stat" <<'EOF'
@@ -129,8 +129,8 @@ case " $* " in
 esac
 EOF
     chmod 0755 "$fixture/bin/rpm" "$fixture/bin/stat"
-    printf '\177ELF12.1.6Construct%s\n' "$revision" > "$fixture/root/usr/bin/mackesd"
-    printf '\177ELF12.1.6Construct%s\n' "$revision" > "$fixture/root/usr/bin/mde-shell-egui"
+    printf '\177ELF13.0.0Construct%s\n' "$revision" > "$fixture/root/usr/bin/mackesd"
+    printf '\177ELF13.0.0Construct%s\n' "$revision" > "$fixture/root/usr/bin/mde-shell-egui"
     chmod 0555 "$fixture/root/usr/bin/mackesd" "$fixture/root/usr/bin/mde-shell-egui"
     FIXTURE_MACKESD_DIGEST=$(sha256sum "$fixture/root/usr/bin/mackesd" | awk '{print $1}')
     FIXTURE_SHELL_DIGEST=$(sha256sum "$fixture/root/usr/bin/mde-shell-egui" | awk '{print $1}')
@@ -151,10 +151,10 @@ EOF
     fi
 
     # Model a correctly signed/installable repo package whose payload is stale:
-    # authoritative RPM metadata still resolves magic-mesh 12.1.6, but one
+    # authoritative RPM metadata still resolves magic-mesh 13.0.0, but one
     # installed production ELF carries a different compile-time revision.
     chmod 0755 "$fixture/root/usr/bin/mackesd"
-    printf '\177ELF12.1.6Construct%s\n' "$stale_revision" > "$fixture/root/usr/bin/mackesd"
+    printf '\177ELF13.0.0Construct%s\n' "$stale_revision" > "$fixture/root/usr/bin/mackesd"
     chmod 0555 "$fixture/root/usr/bin/mackesd"
     FIXTURE_MACKESD_DIGEST=$(sha256sum "$fixture/root/usr/bin/mackesd" | awk '{print $1}')
     export FIXTURE_MACKESD_DIGEST

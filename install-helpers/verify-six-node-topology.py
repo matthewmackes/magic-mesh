@@ -741,7 +741,7 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                 node["candidate"] = {
                     "revision": "test-revision",
                     "manifest_sha256": manifest_sha256,
-                    "package": f"magic-mesh-{role} 12.1.6-1.x86_64",
+                    "package": f"magic-mesh-{role} 13.0.0-1.x86_64",
                     "package_payload_sha256": hashlib.sha256(
                         f"{role}-rpm-payload".encode()
                     ).hexdigest(),
