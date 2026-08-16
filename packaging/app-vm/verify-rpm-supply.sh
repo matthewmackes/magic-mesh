@@ -167,7 +167,7 @@ verify_supply() (
         || refuse 'RPM whole-file SHA-256 does not match the candidate manifest'
 
     rpm_output=$(rpm -qp --qf \
-        '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n%{PAYLOADDIGESTALGO}\t%{PAYLOADDIGEST}\n' \
+        '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n%{PAYLOADSHA256ALGO}\t%{PAYLOADSHA256}\n' \
         -- "$rpm" 2>/dev/null) \
         || refuse "RPM package metadata is invalid: $rpm"
     mapfile -t rpm_fields <<<"$rpm_output"
