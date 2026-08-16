@@ -89,7 +89,8 @@ fi
 
 SOURCE_COMMIT="${MCNF_APP_VM_SOURCE_COMMIT:-$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null || true)}"
 
-if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ "$SOURCE_COMMIT" == 0000000000000000000000000000000000000000 ]]; then
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]+$ ]] || [ "${#SOURCE_COMMIT}" -ne 40 ] || \
+   [[ "$SOURCE_COMMIT" == 0000000000000000000000000000000000000000 ]]; then
     echo "FATAL: App VM source provenance is not a non-null 40-character Git revision" >&2
     exit 2
 fi
