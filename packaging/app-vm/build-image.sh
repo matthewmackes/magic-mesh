@@ -291,7 +291,11 @@ args=(
 # retargeted after resolve/inspect; FROM consumes the captured immutable ID.
 # The registry receipt, not mutable local image storage, owns the FROM input.
 append_pinned_base_arg "$EFFECTIVE_BASE" "$BASE_ID" "$PINNED_BASE"
-podman build "${args[@]}" \
+cache_args=()
+if [ "${MCNF_APP_VM_NO_CACHE:-0}" = 1 ]; then
+    cache_args+=(--no-cache)
+fi
+podman build "${cache_args[@]}" "${args[@]}" \
     --label "org.mcnf.app-vm.profile=$CONTRACT_ID" \
     --label "org.mcnf.app-vm.base-image=$EFFECTIVE_BASE" \
     --label "org.mcnf.app-vm.base-image-id=$BASE_ID" \
