@@ -259,21 +259,19 @@ GitHub required checks are the release authority; the farm is the heavy
 self-hosted execution backend. A missing, stale, unavailable, or manually
 asserted required gate is a production block.
 
-**Beta release policy (2026-08-15; reaffirmed 2026-08-16).** Every release
-produced from this point forward is a **BETA** release by definition. It may be
-distributed as an engineering preview before
-live hardware, provider, or installed-seat evidence is complete, provided those
-gaps are stated in the release notes and the candidate is not represented as
-production-ready. Beta status does **not** waive source identity, artifact
-hashes, license attribution, signer verification, SBOM, or signed release
-evidence. Every Beta artifact must remain traceable to the exact source and
-build inputs so that a tester can distinguish an intentional preview limitation
-from substitution, corruption, or an unauthorized input. Beta releases remain
-subject to the two-seat cap for live acceptance and may not bypass acceptable-
-use, authorization, security, or safety restrictions.
+**Production release policy (2026-08-16; supersedes the forward-looking Beta
+classification).** Every release produced from this point forward is
+production-intended and MUST satisfy the production release gate. It may not be
+distributed as a release while live hardware, provider, installed-seat,
+recovery, SBOM, provenance, or required-check evidence is incomplete. The
+release must remain traceable to one exact clean source revision and immutable
+build inputs, with verified signatures, artifact hashes, licensing, target
+compatibility, live topology, recovery results, and signed release evidence.
+The existing BETA exception applies only to previews already created under the
+prior policy; it does not qualify the next release for production.
 
-**Beta preview distribution exception (2026-08-16; operator-approved).** A
-promotion-forbidden BETA/engineering preview may be distributed to **all
+**Historical Beta preview distribution exception (2026-08-16; operator-approved).** A
+promotion-forbidden BETA/engineering preview created under the prior policy may be distributed to **all
 designated test seats and designated test lighthouses** when the operator
 explicitly requests that rollout.
 This is a distribution allowance, not a production-release or acceptance
