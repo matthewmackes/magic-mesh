@@ -399,6 +399,10 @@ behavioral evidence is not completion.
   one mode-0400 private JSON input bound to the clean checkout. Evidence is in
   `docs/platform/evidence/WL-REL-006-2026-08-15-input-admission-hardening-r1.md`
   and `docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md`.
+  S6 is now current-revision-bound: the farm regenerated all 18 SVG scenes and
+  6 CC0 audio cues, and the source-bound Kiron package gate passed on commit
+  `60f6d4fa9a7c0ab829710bad54f3dd3e2bd14c50`; evidence is in
+  `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
   Downstream release epics remain blocked until current `13.0.0` receipts pass;
   the historical preview fixture cannot be reused.
 - Remaining work:
