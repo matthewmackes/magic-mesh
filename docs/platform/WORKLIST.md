@@ -352,7 +352,7 @@ behavioral evidence is not completion.
   1786813297 remain recorded in the r2 source-freeze receipt as the clean
   pre-WL-FUNC-023 candidate. It cannot be the final feature-complete release
   source because WL-FUNC-023 must land first. Browser helpers and the shipped
-  role chooser resolve to 12.1.6, and the five internal non-release crates are
+  role chooser resolve to 13.0.0, and the five internal non-release crates are
   documented in docs/RELEASE-VERSIONING.md. Re-run S1-S4 after WL-FUNC-023 and
   WL-REL-006 are complete.
 - Remaining work:
@@ -372,7 +372,7 @@ behavioral evidence is not completion.
      - Action: run Cargo metadata; compare shipped package versions; scan runtime sources for competing numeric release authorities.
      - Deliverable: bounded version matrix naming each shipped surface, source, observed value, and exception.
      - Validation: farm metadata/package checks on .50; no runtime version authority other than workspace/package reflection.
-     - Done when: every current release surface resolves to 12.1.6 or a documented packaging release suffix.
+     - Done when: every current release surface resolves to 13.0.0 or a documented packaging release suffix.
   3. S3 Admit all governed release inputs. BLOCKED: no private preflight argv
      file exists; the RPM signer receipt has been generated and inspected
      privately for the superseded f095b8ce revision; it must be regenerated for
@@ -539,7 +539,7 @@ behavioral evidence is not completion.
      - Inputs: frozen source and admitted inputs.
      - Action: run the full Fedora 44 RPM lane on BigBoy through run-first-full-release.sh prepare.
      - Deliverable: exactly one magic-mesh RPM and one magic-mesh-lighthouse RPM in the private pull directory.
-     - Validation: farm command succeeds; rpm -qp reports expected names, version 12.1.6, architecture, and SHA-256 payload digest.
+     - Validation: farm command succeeds; rpm -qp reports expected names, version 13.0.0, architecture, and SHA-256 payload digest.
      - Done when: no duplicate, stale, symlinked, mutable, or unexpected full-lane RPM remains in the candidate set.
   3. S3 Build the Server RPM.
      - Inputs: same frozen source and admitted inputs.
