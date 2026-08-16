@@ -329,11 +329,13 @@ fn run_remove_peer(wiz: &mut Wizard, node_id: &str) {
 }
 
 fn run_status(wiz: &mut Wizard) {
-    let role = mde_role::load()
-        .map(|r| r.to_string())
-        .unwrap_or_else(|_| "unpinned".to_string());
-    wiz.push_log(format!("— status — role: {role} —"));
-    for unit in wizard_services(role) {
+    let role = mde_role::load().unwrap_or(mde_role::Role::Workstation);
+    let setup_role = match role {
+        mde_role::Role::Lighthouse => SetupRole::Lighthouse,
+        mde_role::Role::Workstation => SetupRole::Workstation,
+    };
+    wiz.push_log(format!("— status — role: {} —", role));
+    for unit in wizard_services(setup_role) {
         let mut state = String::from("unknown");
         run_streaming(&is_active_argv(unit), |l| state = l);
         let glyph = if state == "active" { "✓" } else { "✗" };
