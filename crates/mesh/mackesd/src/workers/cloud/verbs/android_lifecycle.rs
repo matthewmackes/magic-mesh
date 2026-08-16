@@ -7,7 +7,7 @@
 //! its workload generation. Retry, guest app launch, and VDI presentation remain
 //! explicit refusal boundaries until their exact typed contracts exist.
 
-use mackes_mesh_types::android_apps::{AndroidSignedCatalog, AospStarterApp};
+use mackes_mesh_types::android_apps::{AndroidRuntimeCatalog, AospStarterApp};
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmedToken, CloudReply, DeliveryType};
 use mackes_mesh_types::workloads::{
     WorkloadBackend, WorkloadId, WorkloadOperationAction, WorkloadOperationRequest,
@@ -155,7 +155,7 @@ fn publish_workload_operation(
 fn publish_workload_operation_against_catalog(
     worker: &CloudWorker,
     source: &Request,
-    catalog: &AndroidSignedCatalog,
+    catalog: &AndroidRuntimeCatalog,
     now: u64,
 ) -> Result<mackes_mesh_types::cloud::WorkloadSpec, String> {
     publish_workload_operation_with_catalog(worker, source, Some(catalog), now)
@@ -164,7 +164,7 @@ fn publish_workload_operation_against_catalog(
 fn publish_workload_operation_with_catalog(
     worker: &CloudWorker,
     source: &Request,
-    catalog: Option<&AndroidSignedCatalog>,
+    catalog: Option<&AndroidRuntimeCatalog>,
     now: u64,
 ) -> Result<mackes_mesh_types::cloud::WorkloadSpec, String> {
     if source.node != worker.host {
@@ -321,18 +321,17 @@ fn failure(verb: &str, error: impl Into<String>) -> CloudReply {
 mod tests {
     use super::*;
     use crate::workers::cloud::{verify_token, HmacTokenSigner, TokenVerdict};
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
         AndroidAppCapability, AndroidAppPermission, AndroidCatalogAppPolicy,
         AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidImageManifest,
         AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
         AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterCatalog,
-        ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use std::fs;
     use std::sync::Arc;
 
-    fn current_catalog(now: u64) -> AndroidSignedCatalog {
+    fn current_catalog(now: u64) -> AndroidRuntimeCatalog {
         let image_manifest = AndroidImageManifest::new(
             "android_vm-golden",
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -373,11 +372,9 @@ mod tests {
                 guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
             })
             .collect();
-        let key = SigningKey::from_bytes(&[29; 32]);
-        AndroidSignedCatalog::sign(
-            "android-release-v1",
-            AndroidCatalogPayload {
-                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AndroidRuntimeCatalog {
+            payload: AndroidCatalogPayload {
+                schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: "android-production".into(),
                 revision: 8,
                 issued_at_unix_ms: now.saturating_sub(1_000),
@@ -386,11 +383,9 @@ mod tests {
                 package_manifest,
                 app_policies,
             },
-            &key,
-        )
-        .expect("signed catalog")
-        .admit("android-release-v1", &key.verifying_key(), now)
-        .expect("current admitted catalog")
+        }
+        .admit(now)
+        .expect("current runtime catalog")
     }
 
     #[test]
@@ -707,7 +702,7 @@ mod tests {
         document["armed_token"] = serde_json::Value::String(token.encode());
         let request = parse(&document.to_string()).expect("generation-bound Stop request");
 
-        // No signed catalog or package-manifest state is installed. Cleanup
+        // No catalog or package-manifest state is installed. Cleanup
         // must still reach the sole Workloads actuator for the exact admitted
         // Android desired row; requiring launch provenance here would strand a
         // running outer VM precisely when the provider/catalog has failed.

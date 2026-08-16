@@ -504,7 +504,7 @@ pub(crate) struct FrontDoorPeerApp {
     pub(crate) icon: String,
     pub(crate) health: String,
     pub(crate) state: String,
-    /// Signed catalog revision carried by a validated Flatpak catalog.
+    /// Catalog revision carried by a validated Flatpak catalog.
     pub(crate) catalog_revision: Option<String>,
     /// Exact guest package/source revision carried by the admitted row.
     pub(crate) source_revision: Option<String>,
@@ -553,7 +553,7 @@ pub(crate) struct FrontDoorPeerAppTarget {
     /// Catalog provenance. Flatpak targets are guest-owned and must use the
     /// guest App VM mode; they must never be treated as host `.desktop` apps.
     pub(crate) source: String,
-    /// Signed catalog revision required for App VM provisioning.
+    /// Catalog revision required for App VM provisioning.
     pub(crate) catalog_revision: Option<String>,
     /// Approved guest profile required for App VM provisioning.
     pub(crate) guest_profile: Option<String>,
@@ -1089,7 +1089,7 @@ enum FrontDoorPeerAppLaunchState {
     NotInstalled,
     Denied,
     StaleCatalog,
-    UnsignedCatalog,
+    InvalidCatalog,
     Unavailable,
     Failed,
 }
@@ -1108,7 +1108,7 @@ impl FrontDoorPeerAppLaunchState {
             Self::NotInstalled => "Not installed",
             Self::Denied => "Launch denied",
             Self::StaleCatalog => "Stale catalog",
-            Self::UnsignedCatalog => "Unsigned catalog",
+            Self::InvalidCatalog => "Invalid catalog",
             Self::Unavailable => "Unavailable",
             Self::Failed => "Launch failed",
         }
@@ -1127,7 +1127,7 @@ impl FrontDoorPeerAppLaunchState {
             | Self::StartingApp
             | Self::Connected
             | Self::Denied
-            | Self::UnsignedCatalog
+            | Self::InvalidCatalog
             | Self::Unavailable
             | Self::Failed => "Unavailable",
         }
@@ -1155,8 +1155,8 @@ impl FrontDoorPeerAppLaunchState {
             }
             Self::NotInstalled => "Guest content is not installed; no host fallback is available.",
             Self::Denied => "The catalog or guest policy denied this launch.",
-            Self::StaleCatalog => "Refresh the signed catalog before launching this revision.",
-            Self::UnsignedCatalog => "A signed catalog is required before this app can launch.",
+            Self::StaleCatalog => "Refresh the catalog before launching this revision.",
+            Self::InvalidCatalog => "A valid catalog row is required before this app can launch.",
             Self::Unavailable => "The guest provider is unavailable; retry when it recovers.",
             Self::Failed => {
                 "The guest session failed; retry keeps the app identity and placement intent."
@@ -1189,7 +1189,7 @@ fn peer_app_launch_state(target: &FrontDoorPeerAppTarget) -> FrontDoorPeerAppLau
         }
         "denied" => FrontDoorPeerAppLaunchState::Denied,
         "stale" | "stale_catalog" | "stale catalog" => FrontDoorPeerAppLaunchState::StaleCatalog,
-        "unsigned" | "unsigned catalog" => FrontDoorPeerAppLaunchState::UnsignedCatalog,
+        "invalid" | "invalid catalog" => FrontDoorPeerAppLaunchState::InvalidCatalog,
         "failed" => FrontDoorPeerAppLaunchState::Failed,
         "unavailable" | "availability unknown" => FrontDoorPeerAppLaunchState::Unavailable,
         _ => FrontDoorPeerAppLaunchState::Unavailable,
@@ -2291,10 +2291,7 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
         ui.painter()
             .rect_stroke(rect, Style::RADIUS_M, stroke, egui::StrokeKind::Inside);
         ui.painter()
-            .with_clip_rect(rect.shrink2(egui::vec2(
-                Style::SP_XS - Style::STROKE_HAIRLINE,
-                0.0,
-            )))
+            .with_clip_rect(rect.shrink2(egui::vec2(Style::SP_XS - Style::STROKE_HAIRLINE, 0.0)))
             .text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -2390,10 +2387,7 @@ fn source_status_note(ui: &mut egui::Ui, note: FrontDoorSourceNote) {
     ui.painter().rect_stroke(
         row_rect,
         5.0,
-        egui::Stroke::new(
-            Style::STROKE_HAIRLINE,
-            Style::WARN.linear_multiply(0.55),
-        ),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::WARN.linear_multiply(0.55)),
         egui::StrokeKind::Inside,
     );
 
@@ -2480,10 +2474,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
         egui::StrokeKind::Inside,
     );
     ui.painter()
-        .with_clip_rect(domain_rect.shrink2(egui::vec2(
-            Style::SP_XS - Style::STROKE_HAIRLINE,
-            0.0,
-        )))
+        .with_clip_rect(domain_rect.shrink2(egui::vec2(Style::SP_XS - Style::STROKE_HAIRLINE, 0.0)))
         .text(
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -2571,10 +2562,7 @@ fn option_row(
         egui::StrokeKind::Inside,
     );
     painter
-        .with_clip_rect(domain_rect.shrink2(egui::vec2(
-            Style::SP_XS - Style::STROKE_HAIRLINE,
-            0.0,
-        )))
+        .with_clip_rect(domain_rect.shrink2(egui::vec2(Style::SP_XS - Style::STROKE_HAIRLINE, 0.0)))
         .text(
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -3018,7 +3006,7 @@ pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(S
 
 /// Build the authorized Workloads declaration for a catalog-backed Flatpak.
 /// XDG targets deliberately remain on [`peer_app_launch_wire`]; a Flatpak
-/// target reaches the cloud desired-state plane only when its signed catalog
+/// target reaches the cloud desired-state plane only when its catalog
 /// policy is present and its bounded App VM identities can be derived.
 pub(crate) fn peer_app_provision_wire(
     target: &FrontDoorPeerAppTarget,
@@ -3557,10 +3545,7 @@ fn result_action_panel(
     ui.painter().rect_stroke(
         panel_rect,
         5.0,
-        egui::Stroke::new(
-            Style::STROKE_HAIRLINE,
-            Style::ACCENT.linear_multiply(0.42),
-        ),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT.linear_multiply(0.42)),
         egui::StrokeKind::Inside,
     );
 
@@ -4048,10 +4033,7 @@ fn run_command_action_panel(ui: &mut egui::Ui, command: &str) -> egui::Response 
     ui.painter().rect_stroke(
         panel_rect,
         5.0,
-        egui::Stroke::new(
-            Style::STROKE_HAIRLINE,
-            Style::ACCENT.linear_multiply(0.42),
-        ),
+        egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT.linear_multiply(0.42)),
         egui::StrokeKind::Inside,
     );
 
@@ -6468,8 +6450,7 @@ mod tests {
             for expanded in [false, true] {
                 let panel = front_door_panel_rect(screen, expanded);
                 assert!(
-                    panel.left() >= screen.left() - 0.01
-                        && panel.right() <= screen.right() + 0.01,
+                    panel.left() >= screen.left() - 0.01 && panel.right() <= screen.right() + 0.01,
                     "shared-token panel escaped horizontal bounds at {size:?}: {panel:?}"
                 );
                 assert!(
@@ -7641,7 +7622,7 @@ mod tests {
         assert!(target.launch_blocked_reason.is_some());
         assert!(peer_app_launch_wire(target).is_none());
         assert!(peer_app_accessibility_value(target).contains("Stale catalog"));
-        assert!(peer_app_accessibility_value(target).contains("Refresh the signed catalog"));
+        assert!(peer_app_accessibility_value(target).contains("Refresh the catalog"));
     }
 
     #[test]

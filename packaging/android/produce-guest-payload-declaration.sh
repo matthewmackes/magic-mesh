@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# WL-FUNC-020 — produce the canonical signed Cuttlefish guest-payload contract.
+# WL-FUNC-020 — produce the canonical Cuttlefish content declaration.
 set -euo pipefail
 umask 077
 
 PRODUCER_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly PRODUCER_DIR
-readonly PROJECT_SIGNING_IDENTITY=${MAGIC_MESH_SIGN_KEY:-Magic Mesh Release Signing}
-readonly PROJECT_PRIMARY_FINGERPRINT=06B1C27EA0E08A225155EB3314018AA1497DDC7C
 readonly IMAGE_RECEIPT_TOOL="$PRODUCER_DIR/produce-image-receipt.py"
 
 producer_fail() {
@@ -27,44 +25,10 @@ Usage: produce-guest-payload-declaration.sh \
   --output-dir NEW_DIRECTORY
        produce-guest-payload-declaration.sh --self-test
 
-Hashes the exact Cuttlefish packages, readiness relay, and VDI agent, emits a
-canonical release.json, and signs it with the existing project release
-authority selected by MAGIC_MESH_SIGN_KEY (default: Magic Mesh Release Signing).
-The output directory must not exist. Private-key paths are intentionally not
-accepted.
+Hashes the exact Cuttlefish packages, readiness relay, and VDI agent and emits
+a canonical release.json. This declaration records content identity for
+reproducibility; it is not signed and is not a security authority.
 EOF
-}
-
-resolve_signer() {
-    local identity=$1 expected=$2 listing primary count
-    listing=$(gpg --batch --with-colons --fingerprint --list-secret-keys "$identity" 2>/dev/null) \
-        || { producer_fail "secret key '$identity' is unavailable; run on the release operator machine"; return 1; }
-    primary=$(awk -F: '
-        $1 == "sec" { need_fingerprint = 1; next }
-        need_fingerprint && $1 == "fpr" { print toupper($10); need_fingerprint = 0 }
-    ' <<<"$listing")
-    count=$(sed '/^$/d' <<<"$primary" | wc -l)
-    [[ $count -eq 1 ]] \
-        || { producer_fail "release identity must resolve to exactly one primary secret key"; return 1; }
-    primary=$(sed '/^$/d' <<<"$primary")
-    [[ $primary == "$expected" ]] \
-        || { producer_fail "release identity does not match the governed project authority"; return 1; }
-    printf '%s\n' "$primary"
-}
-
-verify_signature_identity() {
-    local signature=$1 declaration=$2 expected=$3 status identities
-    status=$(gpg --batch --status-fd 1 --verify "$signature" "$declaration" 2>/dev/null) \
-        || { producer_fail "detached declaration signature did not verify"; return 1; }
-    identities=$(awk '
-        $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
-            print toupper($3) ":" toupper($NF)
-        }
-    ' <<<"$status")
-    [[ $(sed '/^$/d' <<<"$identities" | wc -l) -eq 1 ]] \
-        || { producer_fail "declaration signature did not yield exactly one signer"; return 1; }
-    [[ ${identities%%:*} == "$expected" || ${identities#*:} == "$expected" ]] \
-        || { producer_fail "declaration signature was produced by an unexpected signer"; return 1; }
 }
 
 publish_noreplace() {
@@ -92,13 +56,10 @@ PY
 produce_declaration() {
     local release_id=$1 compatibility=$2 source_revision=$3 provider_identity=$4
     local image_receipt=$5 relay=$6 agent=$7 output_dir=$8
-    local signer_identity=$9 expected_fingerprint=${10}
-    shift 10
+    shift 8
     local -a packages=("$@")
-    local parent output_name work signer
+    local parent output_name work
 
-    command -v gpg >/dev/null 2>&1 \
-        || { producer_fail "required command not found: gpg"; return 1; }
     command -v python3 >/dev/null 2>&1 \
         || { producer_fail "required command not found: python3"; return 1; }
     [[ ${#packages[@]} -gt 0 ]] \
@@ -110,9 +71,6 @@ produce_declaration() {
     [[ -d $parent && ! -L $parent && $output_name != . && $output_name != .. ]] \
         || { producer_fail "output parent is missing, substituted, or unsafe"; return 1; }
 
-    # Resolve and pin the existing operator key before creating any candidate
-    # output. There is intentionally no private-key path or alternate keyring.
-    signer=$(resolve_signer "$signer_identity" "$expected_fingerprint") || return 1
     work=$(mktemp -d -- "$parent/.cuttlefish-declaration.XXXXXX") \
         || { producer_fail "could not create private candidate directory"; return 1; }
 
@@ -233,17 +191,7 @@ PY
         return 1
     fi
 
-    if ! gpg --batch --armor --detach-sign --local-user "$signer" --yes \
-        --output "$work/release.json.asc" "$work/release.json"; then
-        rm -rf -- "$work"
-        producer_fail "could not sign the declaration with the governed authority"
-        return 1
-    fi
-    if ! verify_signature_identity "$work/release.json.asc" "$work/release.json" "$expected_fingerprint"; then
-        rm -rf -- "$work"
-        return 1
-    fi
-    chmod 0600 "$work/release.json" "$work/release.json.asc"
+    chmod 0600 "$work/release.json"
     if ! publish_noreplace "$work" "$output_dir"; then
         rm -rf -- "$work"
         return 1
@@ -252,18 +200,11 @@ PY
 }
 
 self_test() {
-    local fixture fingerprint revision image_digest before
+    local fixture revision image_digest before
     fixture=$(mktemp -d)
     MCNF_CUTTLEFISH_PRODUCER_FIXTURE=$fixture
     trap 'rm -rf -- "$MCNF_CUTTLEFISH_PRODUCER_FIXTURE"' EXIT
-    export GNUPGHOME="$fixture/gnupg"
-    mkdir -m 700 "$GNUPGHOME" "$fixture/input" "$fixture/output"
-    gpg --batch --pinentry-mode loopback --passphrase '' \
-        --quick-generate-key 'Cuttlefish producer fixture <fixture@example.invalid>' \
-        ed25519 sign 1d >/dev/null 2>&1
-    fingerprint=$(gpg --batch --with-colons --fingerprint --list-secret-keys \
-        'Cuttlefish producer fixture' | awk -F: '$1 == "fpr" { print toupper($10); exit }')
-    gpg --batch --armor --export "$fingerprint" >"$fixture/key.asc"
+    mkdir -m 700 "$fixture/input" "$fixture/output"
     printf 'relay bytes\n' >"$fixture/input/readiness-relay.sh"
     printf 'agent bytes\n' >"$fixture/input/mcnf-cuttlefish-vdi-agent"
     printf 'base package bytes\n' >"$fixture/input/cuttlefish-base.deb"
@@ -287,16 +228,15 @@ PY
     produce_declaration fixture-r1 2026.08.1 "$revision" provider-fixture \
         "$fixture/image-receipt.json" "$fixture/input/readiness-relay.sh" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/good" \
-        'Cuttlefish producer fixture' "$fingerprint" \
         "$fixture/input/cuttlefish-base.deb" "$fixture/input/cuttlefish-user.deb" >/dev/null
 
-    # Source the production verifier's function without weakening its fixed CLI
-    # trust boundary, then consume the producer's exact contract end to end.
+    # Source the production verifier and consume the producer's exact content
+    # declaration end to end.
     # shellcheck source=packaging/android/verify-guest-payload.sh
     source "$PRODUCER_DIR/verify-guest-payload.sh"
-    verify_payload "$fixture/output/good/release.json" "$fixture/output/good/release.json.asc" \
+    verify_payload "$fixture/output/good/release.json" \
         "$fixture/input/readiness-relay.sh" "$fixture/input/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stage" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stage" \
         "$fixture/input/cuttlefish-base.deb" "$fixture/input/cuttlefish-user.deb"
     [[ -f $fixture/stage/packages/cuttlefish-base.deb \
         && -f $fixture/stage/packages/cuttlefish-user.deb ]] \
@@ -306,7 +246,6 @@ PY
     if produce_declaration fixture-r2 2026.08.1 "$revision" provider-fixture \
         "$fixture/image-receipt.json" "$fixture/input/readiness-relay.sh" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/good" \
-        'Cuttlefish producer fixture' "$fingerprint" \
         "$fixture/input/cuttlefish-base.deb" >/dev/null 2>&1; then
         producer_fail "producer replaced an existing output directory"
     fi
@@ -316,53 +255,12 @@ PY
     if produce_declaration fixture-r3 2026.08.1 "$revision" provider-fixture \
         "$fixture/image-receipt.json" "$fixture/input/missing.deb" \
         "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/missing" \
-        'Cuttlefish producer fixture' "$fingerprint" \
         "$fixture/input/cuttlefish-base.deb" >/dev/null 2>&1; then
         producer_fail "producer admitted a missing artifact"
     fi
     [[ ! -e $fixture/output/missing ]] \
         || { producer_fail "missing input published an output"; return 1; }
 
-    if produce_declaration fixture-r4 2026.08.1 "$revision" provider-fixture \
-        "$fixture/image-receipt.json" "$fixture/input/readiness-relay.sh" \
-        "$fixture/input/mcnf-cuttlefish-vdi-agent" "$fixture/output/no-key" \
-        'missing release key' "$fingerprint" "$fixture/input/cuttlefish-base.deb" \
-        >/dev/null 2>&1; then
-        producer_fail "producer admitted a missing signing key"
-    fi
-    [[ ! -e $fixture/output/no-key ]] \
-        || { producer_fail "missing key published an output"; return 1; }
-
-    python3 - "$fixture/output/good/release.json" <<'PY'
-import json, sys
-path = sys.argv[1]
-document = json.load(open(path, encoding="utf-8"))
-for field, replacement in (
-    ("source_revision", "f" * 40),
-    ("provider_identity", "substituted-provider"),
-):
-    changed = json.loads(json.dumps(document))
-    changed[field] = replacement
-    with open(path + ".tampered", "w", encoding="utf-8") as stream:
-        json.dump(changed, stream, sort_keys=True, separators=(",", ":"))
-    # The caller checks the original detached signature against each mutation.
-    if __import__("subprocess").run(
-        ["gpg", "--batch", "--verify", path + ".asc", path + ".tampered"],
-        stdout=__import__("subprocess").DEVNULL,
-        stderr=__import__("subprocess").DEVNULL,
-    ).returncode == 0:
-        raise SystemExit(f"signed declaration did not bind {field}")
-changed = json.loads(json.dumps(document))
-changed["image_identity"]["android_release_id"] = "substituted-image"
-with open(path + ".tampered", "w", encoding="utf-8") as stream:
-    json.dump(changed, stream, sort_keys=True, separators=(",", ":"))
-if __import__("subprocess").run(
-    ["gpg", "--batch", "--verify", path + ".asc", path + ".tampered"],
-    stdout=__import__("subprocess").DEVNULL,
-    stderr=__import__("subprocess").DEVNULL,
-).returncode == 0:
-    raise SystemExit("signed declaration did not bind image identity")
-PY
     echo "Cuttlefish guest payload producer/verifier hostile integration passed"
 }
 
@@ -425,5 +323,4 @@ python3 "$IMAGE_RECEIPT_TOOL" --repo "$PRODUCER_DIR/../.." inspect \
 
 produce_declaration "$release_id" "$compatibility" "$source_revision" \
     "$provider_identity" "$inspected_receipt" "$relay" "$agent" \
-    "$output_dir" "$PROJECT_SIGNING_IDENTITY" "$PROJECT_PRIMARY_FINGERPRINT" \
-    "${packages[@]}"
+    "$output_dir" "${packages[@]}"

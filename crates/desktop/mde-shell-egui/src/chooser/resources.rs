@@ -16,13 +16,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::cloud::{decode_cloud_arm_credential, CloudArmSigner, CLOUD_ARM_CREDENTIAL};
 use mackes_mesh_types::resources::{
-    resource_publisher_attestation_topic, ActionAvailabilityStatus, AuthMethod, AuthStatus,
-    AuthenticatedResourceCatalog, HealthStatus, ResourceActionTarget, ResourceActionVerb,
-    ResourceCard, ResourceCatalog, ResourceClass, ResourceDiscoveryEntry,
-    ResourceDiscoveryProjection, ResourcePublisherAttestation, ServiceCategory,
-    ServiceConfigurationFieldKind, ServiceLifecycleStatus, ServiceStackTier, TransportEndpoint,
-    TransportProtocol, RESOURCE_CATALOG_TOPIC, RESOURCE_DISCOVERY_TOPIC,
-    RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
+    ActionAvailabilityStatus, AuthMethod, AuthStatus, HealthStatus, ResourceActionTarget,
+    ResourceActionVerb, ResourceCard, ResourceCatalog, ResourceClass, ResourceDiscoveryEntry,
+    ResourceDiscoveryProjection, ServiceCategory, ServiceConfigurationFieldKind,
+    ServiceLifecycleStatus, ServiceStackTier, TransportEndpoint, TransportProtocol,
+    RESOURCE_CATALOG_TOPIC, RESOURCE_DISCOVERY_TOPIC,
 };
 use mde_bus::persist::Persist;
 use mde_egui::egui::{self, Color32, FontId, RichText, Sense, Stroke, StrokeKind};
@@ -234,37 +232,9 @@ impl CatalogFilter {
 struct AdmittedResourceSnapshot {
     catalog: ResourceCatalog,
     discovery: ResourceDiscoveryProjection,
-    authenticated: Option<AuthenticatedResourceCatalog>,
 }
 
-/// The exact systemd credential name provisioned from the approved
-/// `resource/publisher-hmac` secret-store entry. The shell never accepts a
-/// credential name, path, command, or key value from a caller.
-pub(super) const RESOURCE_PUBLISHER_HMAC_CREDENTIAL: &str = "resource-publisher-hmac";
-/// Keep the private systemd credential bounded before it becomes an in-memory
-/// HMAC key. The producer stores a UTF-8 secret, so malformed/control-bearing
-/// bytes are rejected rather than normalized into a different key.
-const MAX_RESOURCE_PUBLISHER_KEY_BYTES: usize = 4 * 1024;
-
-/// Read the exact resource-publisher credential from a systemd-provided
-/// directory. This is the shell-side seam for the daemon's approved secret
-/// store: systemd decrypts the host-bound credential, and the shell receives
-/// only its private read-only directory. Missing or malformed material returns
-/// `None`, which intentionally leaves the browser on its untrusted,
-/// read-only compatibility path.
-fn publisher_key_from_systemd_credentials(directory: Option<&Path>) -> Option<Vec<u8>> {
-    let directory = directory.filter(|path| path.is_absolute())?;
-    let path = directory.join(RESOURCE_PUBLISHER_HMAC_CREDENTIAL);
-    let raw = read_systemd_credential(&path).ok()?;
-    if raw.is_empty()
-        || raw.len() > MAX_RESOURCE_PUBLISHER_KEY_BYTES
-        || std::str::from_utf8(&raw).is_err()
-        || raw.iter().any(u8::is_ascii_control)
-    {
-        return None;
-    }
-    Some(raw)
-}
+const MAX_SYSTEMD_CREDENTIAL_BYTES: usize = 4 * 1024;
 
 /// Load the same host-bound HMAC authority used by mackesd for resource-action
 /// completions. The root shell already receives this credential to mint its
@@ -300,35 +270,35 @@ fn read_systemd_credential(path: &Path) -> Result<Vec<u8>, String> {
     }
     #[cfg(not(target_os = "linux"))]
     if !std::fs::symlink_metadata(path)
-        .map_err(|_| "resource publisher credential is unavailable".to_owned())?
+        .map_err(|_| "systemd credential is unavailable".to_owned())?
         .file_type()
         .is_file()
     {
-        return Err("resource publisher credential is not a regular file".to_owned());
+        return Err("systemd credential is not a regular file".to_owned());
     }
 
     let file = options
         .open(path)
-        .map_err(|_| "resource publisher credential is unavailable".to_owned())?;
+        .map_err(|_| "systemd credential is unavailable".to_owned())?;
     let metadata = file
         .metadata()
-        .map_err(|_| "resource publisher credential cannot be inspected".to_owned())?;
+        .map_err(|_| "systemd credential cannot be inspected".to_owned())?;
     if !metadata.file_type().is_file() {
-        return Err("resource publisher credential is not a regular file".to_owned());
+        return Err("systemd credential is not a regular file".to_owned());
     }
-    if metadata.len() > MAX_RESOURCE_PUBLISHER_KEY_BYTES as u64 {
-        return Err("resource publisher credential is oversized".to_owned());
+    if metadata.len() > MAX_SYSTEMD_CREDENTIAL_BYTES as u64 {
+        return Err("systemd credential is oversized".to_owned());
     }
 
     let mut raw = Vec::with_capacity(
-        MAX_RESOURCE_PUBLISHER_KEY_BYTES
-            .min(usize::try_from(metadata.len()).unwrap_or(MAX_RESOURCE_PUBLISHER_KEY_BYTES)),
+        MAX_SYSTEMD_CREDENTIAL_BYTES
+            .min(usize::try_from(metadata.len()).unwrap_or(MAX_SYSTEMD_CREDENTIAL_BYTES)),
     );
-    file.take((MAX_RESOURCE_PUBLISHER_KEY_BYTES + 1) as u64)
+    file.take((MAX_SYSTEMD_CREDENTIAL_BYTES + 1) as u64)
         .read_to_end(&mut raw)
-        .map_err(|_| "resource publisher credential cannot be read".to_owned())?;
-    if raw.len() > MAX_RESOURCE_PUBLISHER_KEY_BYTES {
-        return Err("resource publisher credential is oversized".to_owned());
+        .map_err(|_| "systemd credential cannot be read".to_owned())?;
+    if raw.len() > MAX_SYSTEMD_CREDENTIAL_BYTES {
+        return Err("systemd credential is oversized".to_owned());
     }
     Ok(raw)
 }
@@ -337,15 +307,6 @@ fn read_systemd_credential(path: &Path) -> Result<Vec<u8>, String> {
 pub(super) struct ResourceBrowserState {
     bus_root: Option<PathBuf>,
     catalog: Option<ResourceCatalog>,
-    authenticated_catalog: Option<AuthenticatedResourceCatalog>,
-    /// The key is injected by the approved desktop credential wiring. The
-    /// default shell remains untrusted until that wiring supplies a key.
-    publisher_key: Option<Vec<u8>>,
-    /// Production credentials are re-read at every snapshot boundary. Keeping
-    /// the directory (rather than only the decoded key) prevents a deleted or
-    /// replaced systemd credential from leaving stale action authority alive
-    /// for the lifetime of the shell process.
-    publisher_credential_directory: Option<PathBuf>,
     /// Separately published, safe browser projection bound to the admitted
     /// catalog. The card remains the action source; this projection owns
     /// discovery/filter facets so the shell never infers health or capability
@@ -373,37 +334,9 @@ impl ResourceBrowserState {
     }
 
     pub(super) fn new(bus_root: Option<PathBuf>) -> Self {
-        Self::with_publisher_key(bus_root, None)
-    }
-
-    /// Construct the production chooser resource state. The only secret input
-    /// is the exact systemd credential named above; absent/unreadable input is
-    /// represented by `None`, so actions remain disabled while inspection can
-    /// continue through the explicit compatibility path.
-    pub(super) fn from_systemd_publisher_credential(bus_root: Option<PathBuf>) -> Self {
-        let directory = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
-        let publisher_key = if rustix::process::geteuid().is_root() {
-            publisher_key_from_systemd_credentials(directory.as_deref())
-        } else {
-            None
-        };
-        let mut state = Self::with_publisher_key(bus_root, publisher_key);
-        if rustix::process::geteuid().is_root() {
-            state.publisher_credential_directory = directory;
-        }
-        state
-    }
-
-    pub(super) fn with_publisher_key(
-        bus_root: Option<PathBuf>,
-        publisher_key: Option<Vec<u8>>,
-    ) -> Self {
         Self {
             bus_root,
             catalog: None,
-            authenticated_catalog: None,
-            publisher_key,
-            publisher_credential_directory: None,
             discovery: None,
             filter: CatalogFilter::All,
             stack_expanded: false,
@@ -423,7 +356,6 @@ impl ResourceBrowserState {
     }
 
     pub(super) fn refresh(&mut self) {
-        self.reload_managed_publisher_key();
         let Some(root) = self.bus_root.as_ref() else {
             return;
         };
@@ -458,42 +390,15 @@ impl ResourceBrowserState {
                             .to_owned(),
                     );
                 }
-                let attestation_body = persist
-                    .read_latest(&resource_publisher_attestation_topic(&catalog.publisher))
-                    .map_err(|error| error.to_string())?
-                    .and_then(|message| message.body);
-                Ok(admit_resource_snapshot(
-                    &catalog_body,
-                    &discovery_body,
-                    attestation_body.as_deref(),
-                    self.publisher_key.as_deref(),
-                    current_unix_millis(),
-                )?)
+                admit_resource_snapshot(&catalog_body, &discovery_body)
             });
         self.apply_refresh_result(result);
-    }
-
-    fn reload_managed_publisher_key(&mut self) {
-        let Some(directory) = self.publisher_credential_directory.as_deref() else {
-            return;
-        };
-        let next = publisher_key_from_systemd_credentials(Some(directory));
-        if next != self.publisher_key {
-            // Rotation and loss both invalidate every authorization derived
-            // from the previous key. A later coherent refresh may promote the
-            // catalog under `next`; until then inspection is deliberately
-            // untrusted and a prepared/live VDI request is revoked exactly.
-            self.authenticated_catalog = None;
-            self.cancel_vdi_handoff();
-        }
-        self.publisher_key = next;
     }
 
     fn apply_refresh_result(&mut self, result: Result<AdmittedResourceSnapshot, String>) {
         match result {
             Ok(snapshot) => {
                 self.catalog = Some(snapshot.catalog);
-                self.authenticated_catalog = snapshot.authenticated;
                 self.discovery = Some(snapshot.discovery);
                 self.error = None;
                 if self.vdi_approval.as_ref().is_some_and(|approval| {
@@ -510,17 +415,14 @@ impl ResourceBrowserState {
                         )
                         .is_none_or(|current| !same_vdi_binding(&current, &active.binding))
                     })
-                }) || self.authenticated_catalog.is_none()
-                {
+                }) {
                     self.cancel_vdi_handoff();
                 }
             }
             Err(error) => {
                 // A retained card may remain useful for inspection, but a failed
                 // newer read can represent an equivocated catalog/projection pair.
-                // Never let the last authenticated generation continue to arm
-                // actions or a prepared VDI handoff across that ambiguity.
-                self.authenticated_catalog = None;
+                // A mismatched catalog/projection pair cannot drive actions.
                 self.cancel_vdi_handoff();
                 self.error = Some(error);
             }
@@ -538,7 +440,6 @@ impl ResourceBrowserState {
         let Some(discovery) = self.discovery.clone() else {
             return false;
         };
-        let authenticated = self.authenticated_catalog.is_some();
         let cards: Vec<_> = catalog
             .cards
             .iter()
@@ -570,20 +471,12 @@ impl ResourceBrowserState {
                 .color(Style::ACCENT_COMMS),
             );
             ui.label(
-                RichText::new(if authenticated {
-                    "AUTHENTICATED PUBLISHER"
-                } else {
-                    "UNTRUSTED COMPATIBILITY PATH"
-                })
-                .font(Style::typography_font_with_size(
-                    TypographyRole::Mono,
-                    Style::TYPE_CAPTION,
-                ))
-                .color(if authenticated {
-                    Style::OK
-                } else {
-                    Style::WARN
-                }),
+                RichText::new("MESH CATALOG · CONTENT VALIDATED")
+                    .font(Style::typography_font_with_size(
+                        TypographyRole::Mono,
+                        Style::TYPE_CAPTION,
+                    ))
+                    .color(Style::OK),
             );
         });
         ui.add_space(Style::SP_XS);
@@ -619,7 +512,6 @@ impl ResourceBrowserState {
                                     &catalog,
                                     card,
                                     discovery_entry(&discovery, card.resource_id()),
-                                    authenticated,
                                 )
                             },
                         );
@@ -628,7 +520,7 @@ impl ResourceBrowserState {
                 ui.add_space(Style::SP_S);
             }
         }
-        self.selected_detail(ui, &catalog, &discovery, authenticated);
+        self.selected_detail(ui, &catalog, &discovery);
         true
     }
 
@@ -637,10 +529,9 @@ impl ResourceBrowserState {
     }
 
     pub(super) fn vdi_card_is_current(&self, resource_id: &str) -> bool {
-        self.authenticated_catalog.is_some()
-            && self.catalog.as_ref().is_some_and(|catalog| {
-                vdi_connect_binding(catalog, resource_id, current_unix_millis()).is_some()
-            })
+        self.catalog.as_ref().is_some_and(|catalog| {
+            vdi_connect_binding(catalog, resource_id, current_unix_millis()).is_some()
+        })
     }
 
     pub(super) fn cancel_active_vdi(&mut self) {
@@ -767,10 +658,9 @@ impl ResourceBrowserState {
         catalog: &ResourceCatalog,
         card: &ResourceCard,
         discovery: Option<&ResourceDiscoveryEntry>,
-        authenticated: bool,
     ) {
         let Some(service) = card.service.as_ref() else {
-            self.plain_resource_card(ui, catalog, card, discovery, authenticated);
+            self.plain_resource_card(ui, catalog, card, discovery);
             return;
         };
         let selected = self.selected_resource.as_deref() == Some(card.resource_id());
@@ -838,11 +728,7 @@ impl ResourceBrowserState {
                                 | ResourceActionVerb::Remove
                         );
                         let button = ui.add_enabled(
-                            service_action_is_admitted(
-                                action,
-                                authenticated,
-                                action_now_ms,
-                            )
+                            service_action_is_admitted(action, action_now_ms)
                                 && locally_handled
                                 && self.action_pending.is_none(),
                             egui::Button::new(
@@ -863,11 +749,7 @@ impl ResourceBrowserState {
                                 );
                             }
                         }
-                        if !authenticated {
-                            let _ = mde_egui::disabled_hover_text(button,
-                                "Detached publisher proof is missing or invalid; this catalog remains untrusted.",
-                            );
-                        } else if !locally_handled {
+                        if !locally_handled {
                             let _ = mde_egui::disabled_hover_text(button,
                                 "This action remains disabled until its typed daemon provider publishes readiness.",
                             );
@@ -887,7 +769,6 @@ impl ResourceBrowserState {
         catalog: &ResourceCatalog,
         card: &ResourceCard,
         discovery: Option<&ResourceDiscoveryEntry>,
-        authenticated: bool,
     ) {
         let selected = self.selected_resource.as_deref() == Some(card.resource_id());
         let color = match card.health.status {
@@ -940,8 +821,7 @@ impl ResourceBrowserState {
                         .vdi_approval
                         .as_ref()
                         .is_some_and(|approval| same_vdi_binding(approval, &binding));
-                    let enabled = authenticated
-                        && self.vdi_pending.is_none()
+                    let enabled = self.vdi_pending.is_none()
                         && self.vdi_close_pending.is_none()
                         && self.vdi_active.is_none();
                     let label = if approved {
@@ -964,11 +844,6 @@ impl ResourceBrowserState {
                             );
                         }
                     }
-                    if !authenticated {
-                        let _ = mde_egui::disabled_hover_text(button,
-                            "Detached publisher proof is missing or invalid; approval is disabled.",
-                        );
-                    }
                     if (approved || self.vdi_pending.is_some() || self.vdi_active.is_some())
                         && ui.button("CANCEL RDP HANDOFF").clicked()
                     {
@@ -987,7 +862,6 @@ impl ResourceBrowserState {
         ui: &mut egui::Ui,
         catalog: &ResourceCatalog,
         discovery: &ResourceDiscoveryProjection,
-        authenticated: bool,
     ) {
         let Some(selected_id) = self.selected_resource.clone() else {
             return;
@@ -1023,15 +897,7 @@ impl ResourceBrowserState {
                     mono_row(ui, "CLASS", &format!("{:?}", card.identity.class));
                     mono_row(ui, "IDENTITY", card.resource_id());
                     mono_row(ui, "HEALTH", &format!("{:?}", card.health.status));
-                    mono_row(
-                        ui,
-                        "TRUST",
-                        if authenticated {
-                            "authenticated publisher proof"
-                        } else {
-                            "untrusted compatibility path"
-                        },
-                    );
+                    mono_row(ui, "TRUST", "Nebula mesh catalog · content validated");
                     if let Some(entry) = discovery_entry(discovery, card.resource_id()) {
                         discovery_rows(ui, entry);
                     }
@@ -1119,15 +985,6 @@ impl ResourceBrowserState {
                         service.stack.bus_topics.join(" · ")
                     },
                 );
-                if !authenticated {
-                    ui.label(
-                        RichText::new(
-                            "Publisher proof missing or invalid. Inspection remains available; service actions are disabled.",
-                        )
-                        .small()
-                        .color(Style::WARN),
-                    );
-                }
                 if let Some(entry) = discovery_entry(discovery, card.resource_id()) {
                     discovery_rows(ui, entry);
                 }
@@ -1184,12 +1041,11 @@ impl ResourceBrowserState {
                     );
                     if ui
                         .add_enabled(
-                            authenticated
-                                && current_resource_action_count(
-                                    card,
-                                    ResourceActionVerb::Configure,
-                                    current_unix_millis(),
-                                ) == 1
+                            current_resource_action_count(
+                                card,
+                                ResourceActionVerb::Configure,
+                                current_unix_millis(),
+                            ) == 1
                                 && self.action_pending.is_none(),
                             egui::Button::new("SAVE SEALED CONFIGURATION"),
                         )
@@ -1246,7 +1102,7 @@ impl ResourceBrowserState {
     }
 
     fn start_vdi_action(&mut self, binding: VdiConnectBinding) {
-        if self.vdi_pending.is_some() || self.authenticated_catalog.is_none() {
+        if self.vdi_pending.is_some() {
             return;
         }
         let client_peer = crate::discovery::local_peer();
@@ -1465,11 +1321,9 @@ fn vdi_connect_binding(
 
 fn service_action_is_admitted(
     action: &mackes_mesh_types::resources::ResourceAction,
-    authenticated: bool,
     now_ms: u64,
 ) -> bool {
-    authenticated
-        && action.availability.status == ActionAvailabilityStatus::Ready
+    action.availability.status == ActionAvailabilityStatus::Ready
         && action.target == ResourceActionTarget::Resource
         && action.issued_at_ms <= now_ms
         && action.expires_at_ms > now_ms
@@ -1482,7 +1336,7 @@ fn current_resource_action_count(
 ) -> usize {
     card.actions
         .iter()
-        .filter(|action| action.verb == verb && service_action_is_admitted(action, true, now_ms))
+        .filter(|action| action.verb == verb && service_action_is_admitted(action, now_ms))
         .count()
 }
 
@@ -1866,18 +1720,10 @@ fn validate_vdi_reply(
     Ok(())
 }
 
-/// Admit a retained catalog/projection pair and, when all trusted inputs are
-/// present, promote the exact catalog into authenticated resource state.
-///
-/// Missing or malformed publisher evidence deliberately does not reject the
-/// legacy catalog view: it returns the validated catalog as untrusted state.
-/// Only [`ResourceCatalog::admit_authenticated`] can populate `authenticated`.
+/// Admit a retained catalog/projection pair after structural and digest checks.
 fn admit_resource_snapshot(
     catalog_body: &str,
     discovery_body: &str,
-    attestation_body: Option<&str>,
-    publisher_key: Option<&[u8]>,
-    now_ms: u64,
 ) -> Result<AdmittedResourceSnapshot, String> {
     let catalog = ResourceCatalog::from_json(catalog_body).map_err(|error| error.to_string())?;
     let discovery: ResourceDiscoveryProjection = serde_json::from_str(discovery_body)
@@ -1892,22 +1738,7 @@ fn admit_resource_snapshot(
         return Err("resource discovery projection does not match the retained catalog".to_owned());
     }
 
-    let authenticated = match (attestation_body, publisher_key) {
-        (Some(body), Some(key)) => serde_json::from_str::<ResourcePublisherAttestation>(body)
-            .ok()
-            .and_then(|attestation| {
-                catalog
-                    .clone()
-                    .admit_authenticated(attestation, key, now_ms)
-                    .ok()
-            }),
-        _ => None,
-    };
-    Ok(AdmittedResourceSnapshot {
-        catalog,
-        discovery,
-        authenticated,
-    })
+    Ok(AdmittedResourceSnapshot { catalog, discovery })
 }
 
 fn current_unix_millis() -> u64 {
@@ -2067,7 +1898,6 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_700_000_000_000;
-    const KEY: &[u8] = b"resource-consumer-test-key";
 
     fn catalog() -> ResourceCatalog {
         ResourceCatalog {
@@ -2106,220 +1936,16 @@ mod tests {
             expires_at_ms: NOW,
         };
 
-        assert!(!service_action_is_admitted(&action, true, NOW));
-        assert!(service_action_is_admitted(&action, true, NOW - 1));
+        assert!(!service_action_is_admitted(&action, NOW));
+        assert!(service_action_is_admitted(&action, NOW - 1));
     }
 
     #[test]
-    fn consumer_promotes_only_a_matching_fresh_verified_proof() {
+    fn consumer_admits_matching_catalog_and_discovery_content() {
         let (catalog_body, discovery_body) = snapshot_bodies();
-        let catalog = catalog();
-        let attestation = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            KEY,
-            NOW,
-            NOW + 60_000,
-        )
-        .expect("publisher proof");
-        let attestation_body = serde_json::to_string(&attestation).expect("proof JSON");
-
-        let admitted = admit_resource_snapshot(
-            &catalog_body,
-            &discovery_body,
-            Some(&attestation_body),
-            Some(KEY),
-            NOW + 1,
-        )
-        .expect("validated snapshot");
-        assert!(admitted.authenticated.is_some());
-
-        let wrong_key = admit_resource_snapshot(
-            &catalog_body,
-            &discovery_body,
-            Some(&attestation_body),
-            Some(b"wrong-key"),
-            NOW + 1,
-        )
-        .expect("untrusted fallback snapshot");
-        assert!(wrong_key.authenticated.is_none());
-    }
-
-    #[test]
-    fn consumer_preserves_legacy_catalog_as_untrusted_when_proof_is_missing_or_stale() {
-        let (catalog_body, discovery_body) = snapshot_bodies();
-        let catalog = catalog();
-        let stale = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            KEY,
-            NOW,
-            NOW + 1_000,
-        )
-        .expect("stale proof shape");
-        let stale_body = serde_json::to_string(&stale).expect("proof JSON");
-
-        let missing =
-            admit_resource_snapshot(&catalog_body, &discovery_body, None, Some(KEY), NOW + 1)
-                .expect("legacy snapshot");
-        assert_eq!(missing.catalog, catalog);
-        assert!(missing.authenticated.is_none());
-
-        let expired = admit_resource_snapshot(
-            &catalog_body,
-            &discovery_body,
-            Some(&stale_body),
-            Some(KEY),
-            NOW + 1_000,
-        )
-        .expect("expired proof falls back");
-        assert_eq!(expired.catalog, catalog);
-        assert!(expired.authenticated.is_none());
-    }
-
-    #[test]
-    fn publisher_credential_loader_is_exact_bounded_and_fail_closed() {
-        let temp = tempfile::tempdir().expect("credential directory");
-        let path = temp.path().join(RESOURCE_PUBLISHER_HMAC_CREDENTIAL);
-        let key = b"publisher-key-from-secret-store";
-        std::fs::write(&path, key).expect("publisher credential");
-        assert_eq!(
-            publisher_key_from_systemd_credentials(Some(temp.path())).as_deref(),
-            Some(key.as_slice())
-        );
-
-        std::fs::write(&path, []).expect("empty credential");
-        assert!(
-            publisher_key_from_systemd_credentials(Some(temp.path())).is_none(),
-            "an unavailable key must not enable service actions"
-        );
-
-        std::fs::write(&path, [b'k'; MAX_RESOURCE_PUBLISHER_KEY_BYTES + 1])
-            .expect("oversized credential");
-        assert!(publisher_key_from_systemd_credentials(Some(temp.path())).is_none());
-
-        assert!(publisher_key_from_systemd_credentials(Some(Path::new("relative"))).is_none());
-        assert!(publisher_key_from_systemd_credentials(None).is_none());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn publisher_credential_loader_rejects_a_final_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("credential directory");
-        let target = temp.path().join("outside-key");
-        let link = temp.path().join(RESOURCE_PUBLISHER_HMAC_CREDENTIAL);
-        std::fs::write(&target, b"publisher-key").expect("target credential");
-        symlink(&target, &link).expect("credential symlink");
-
-        assert!(
-            publisher_key_from_systemd_credentials(Some(temp.path())).is_none(),
-            "the shell must not follow a replaced credential leaf"
-        );
-    }
-
-    #[test]
-    fn default_constructor_is_the_explicit_untrusted_compatibility_path() {
-        let state = ResourceBrowserState::new(None);
-        assert!(state.publisher_key.is_none());
-        assert!(state.authenticated_catalog.is_none());
-    }
-
-    #[test]
-    fn managed_publisher_credential_loss_revokes_retained_action_authority() {
-        let temp = tempfile::tempdir().expect("credential directory");
-        let path = temp.path().join(RESOURCE_PUBLISHER_HMAC_CREDENTIAL);
-        std::fs::write(&path, KEY).expect("publisher credential");
-
-        let (catalog_body, discovery_body) = snapshot_bodies();
-        let catalog = catalog();
-        let proof = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            KEY,
-            NOW,
-            NOW + 60_000,
-        )
-        .expect("publisher proof");
-        let admitted = admit_resource_snapshot(
-            &catalog_body,
-            &discovery_body,
-            Some(&serde_json::to_string(&proof).expect("proof JSON")),
-            Some(KEY),
-            NOW + 1,
-        )
-        .expect("authenticated snapshot");
-
-        let mut state = ResourceBrowserState::with_publisher_key(None, Some(KEY.to_vec()));
-        state.publisher_credential_directory = Some(temp.path().to_path_buf());
-        state.apply_refresh_result(Ok(admitted));
-        state.vdi_handoff = Some(ApprovedCatalogDesktop {
-            resource_id: "resource:credential-bound".into(),
-            display_name: "Credential-bound desktop".into(),
-            host: "172.20.146.54".into(),
-            port: 3_389,
-        });
-        assert!(state.authenticated_catalog.is_some());
-
-        std::fs::remove_file(path).expect("remove publisher credential");
-        state.reload_managed_publisher_key();
-
-        assert!(state.publisher_key.is_none());
-        assert!(state.authenticated_catalog.is_none());
-        assert!(state.take_vdi_handoff().is_none());
-        assert!(state
-            .action_feedback
-            .as_deref()
-            .is_some_and(|feedback| feedback.contains("CANCELLED BEFORE DISPATCH")));
-    }
-
-    #[test]
-    fn mismatched_newer_snapshot_cannot_retain_prior_launch_authority() {
-        let (catalog_body, discovery_body) = snapshot_bodies();
-        let catalog = catalog();
-        let proof = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            KEY,
-            NOW,
-            NOW + 60_000,
-        )
-        .expect("publisher proof");
-        let proof_body = serde_json::to_string(&proof).expect("proof JSON");
-        let admitted = admit_resource_snapshot(
-            &catalog_body,
-            &discovery_body,
-            Some(&proof_body),
-            Some(KEY),
-            NOW + 1,
-        )
-        .expect("authenticated snapshot");
-
-        let mut state = ResourceBrowserState::with_publisher_key(None, Some(KEY.to_vec()));
-        state.apply_refresh_result(Ok(admitted.clone()));
-        assert!(state.authenticated_catalog.is_some());
-        state.vdi_handoff = Some(ApprovedCatalogDesktop {
-            resource_id: "resource:prior-generation".into(),
-            display_name: "Prior desktop".into(),
-            host: "172.20.146.54".into(),
-            port: 3_389,
-        });
-
-        state.apply_refresh_result(Err(
-            "resource discovery projection does not match the retained catalog".into(),
-        ));
-        assert_eq!(state.catalog.as_ref(), Some(&admitted.catalog));
-        assert!(state.authenticated_catalog.is_none());
-        assert!(state.take_vdi_handoff().is_none());
-        assert!(state
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("does not match")));
-
-        state.apply_refresh_result(Ok(admitted));
-        assert!(state.authenticated_catalog.is_some());
-        assert!(state.error.is_none());
+        let admitted =
+            admit_resource_snapshot(&catalog_body, &discovery_body).expect("validated snapshot");
+        assert_eq!(admitted.catalog, catalog());
     }
 
     #[test]

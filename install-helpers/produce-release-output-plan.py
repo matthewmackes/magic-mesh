@@ -132,17 +132,19 @@ def path_field(row: dict[str, object], field: str, role: str) -> Path:
     return immutable(Path(raw), f"{role} {field}")
 
 
-def output_row(role: str, artifact: Path, revision: str, signer: str,
+def output_row(role: str, artifact: Path, revision: str, signer: str | None,
                companions: dict[str, Path], verifier: list[str]) -> dict[str, object]:
-    return {
+    row: dict[str, object] = {
         "role": role,
         "path": str(artifact),
         "media_type": MEDIA[role],
         "source_revision": revision,
-        "signing_identity": signer,
         "companions": {name: str(path) for name, path in companions.items()},
         "verifier": verifier,
     }
+    if signer is not None:
+        row["signing_identity"] = signer
+    return row
 
 
 def produce(value: dict[str, object]) -> dict[str, object]:
@@ -198,7 +200,7 @@ def produce(value: dict[str, object]) -> dict[str, object]:
     browser_manifest = claim(path_field(browser, "manifest", "browser-vm"), "browser-vm manifest")
     browser_profile = claim(path_field(browser, "frozen_profile", "browser-vm"), "browser-vm frozen profile")
     browser_companions = {"manifest": browser_manifest, "frozen_profile": browser_profile}
-    rows.append(output_row("browser-vm", browser_artifact, revision, signer, browser_companions, [
+    rows.append(output_row("browser-vm", browser_artifact, revision, None, browser_companions, [
         str(REPO / "packaging/browser-vm/verify-image-manifest.py"), "verify",
         "--repo-root", str(REPO), "--profile", "{companion:frozen_profile}", "--image", "{artifact}",
         "--manifest", "{companion:manifest}", "--source-revision", "{source_revision}",
@@ -207,7 +209,7 @@ def produce(value: dict[str, object]) -> dict[str, object]:
     app = role_row(value, "app-vm")
     app_artifact = claim(path_field(app, "artifact", "app-vm"), "app-vm artifact")
     app_manifest = claim(path_field(app, "manifest", "app-vm"), "app-vm manifest")
-    rows.append(output_row("app-vm", app_artifact, revision, signer, {"manifest": app_manifest}, [
+    rows.append(output_row("app-vm", app_artifact, revision, None, {"manifest": app_manifest}, [
         str(REPO / "packaging/app-vm/verify-qcow2-manifest.py"), "--image", "{artifact}",
         "--manifest", "{companion:manifest}", "--source-revision", "{source_revision}",
     ]))
@@ -232,7 +234,7 @@ def produce(value: dict[str, object]) -> dict[str, object]:
         "--media-type", media_type, "--artifact-format", artifact_format,
         "--receipt", "{companion:receipt}",
     ]
-    rows.append(output_row("cuttlefish-image", cuttlefish_artifact, revision, signer,
+    rows.append(output_row("cuttlefish-image", cuttlefish_artifact, revision, None,
                            {"receipt": cuttlefish_receipt}, cuttlefish_argv))
 
     bootc = role_row(value, "bootc-image")
@@ -247,7 +249,7 @@ def produce(value: dict[str, object]) -> dict[str, object]:
     if image_reference.startswith("docker://"):
         refuse("bootc image reference must omit its transport prefix")
     bootc_role = string(bootc, "release_role", re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z"))
-    rows.append(output_row("bootc-image", bootc_receipt, revision, signer, {}, [
+    rows.append(output_row("bootc-image", bootc_receipt, revision, None, {}, [
         str(REPO / "install-helpers/produce-bootc-digest-receipt.py"), "inspect",
         "--receipt", "{artifact}", "--expected-image-reference", image_reference,
         "--expected-architecture", bootc_arch, "--expected-source-revision", "{source_revision}",

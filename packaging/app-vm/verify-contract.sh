@@ -12,7 +12,6 @@ IMAGE_VERIFY="$APP_VM/verify-image.sh"
 BUILD="$APP_VM/build-image.sh"
 BASE_RECEIPT="$APP_VM/produce-base-image-receipt.py"
 BASE_RECEIPT_TEST="$APP_VM/test-produce-base-image-receipt.py"
-CATALOG_TRUST_VERIFY="$ROOT/install-helpers/verify-app-vm-catalog-trust.py"
 RPM_SUPPLY_VERIFY="$APP_VM/verify-rpm-supply.sh"
 RPM_BUILD_IDENTITY_VERIFY="$APP_VM/verify-rpm-build-identity.py"
 INSTALLED_RPM_IDENTITY_VERIFY="$APP_VM/verify-installed-rpm-identity.sh"
@@ -34,8 +33,8 @@ if [[ "${1:-}" == --base-receipt-self-test ]]; then
     require '--base-receipt is required' "$BUILD"
     require 'produce-base-image-receipt.py' "$BUILD"
     require 'App VM base-image receipt admission failed' "$BUILD"
-    receipt_line=$(grep -n 'BASE_RECEIPT_JSON=' "$BUILD" | cut -d: -f1)
-    mutation_line=$(grep -nF "find \"\$RPMS_DIR\"" "$BUILD" | cut -d: -f1)
+    receipt_line=$(awk '/BASE_RECEIPT_JSON=/ { print NR; exit }' "$BUILD")
+    mutation_line=$(awk 'index($0, "find \"$RPMS_DIR\"") { print NR; exit }' "$BUILD")
     [[ "$receipt_line" =~ ^[0-9]+$ && "$mutation_line" =~ ^[0-9]+$ && "$receipt_line" -lt "$mutation_line" ]] || {
         echo "FATAL: App VM builder admits its base receipt after RPM/image mutation" >&2
         exit 1
@@ -109,40 +108,13 @@ python3 "$BASE_RECEIPT_TEST"
 
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
-mkdir -p "$fixture/bin" "$fixture/trust-stage"
+mkdir -p "$fixture/bin"
 cat > "$fixture/bin/podman" <<'EOF'
 #!/usr/bin/env bash
 printf 'podman invoked\n' >> "${MCNF_FAKE_PODMAN_MARKER:?}"
 exit 99
 EOF
 chmod 0755 "$fixture/bin/podman"
-printf '%s\n' '07' '07' '07' '07' '07' '07' '07' '07' \
-    '07' '07' '07' '07' '07' '07' '07' '07' \
-    '07' '07' '07' '07' '07' '07' '07' '07' \
-    '07' '07' '07' '07' '07' '07' '07' '07' \
-    | tr -d '\n' > "$fixture/catalog.key"
-printf '\n' >> "$fixture/catalog.key"
-cat > "$fixture/catalog-trust.json" <<'EOF'
-{"schema_version":1,"kind":"mcnf-flatpak-catalog-trust","signer_id":"flatpak-release-v1","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verification_key_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}
-EOF
-chmod 0400 "$fixture/catalog.key" "$fixture/catalog-trust.json"
-set +e
-MCNF_APP_VM_SOURCE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-MCNF_FAKE_PODMAN_MARKER="$fixture/podman-invoked" \
-PATH="$fixture/bin:$PATH" \
-    "$BUILD" --catalog-trust-receipt "$fixture/catalog-trust.json" \
-    --catalog-trust-key "$fixture/catalog.key" >"$fixture/trust-refusal.out" 2>&1
-trust_rc=$?
-set -e
-if [ "$trust_rc" -ne 2 ] || ! grep -Fq 'catalog verification key digest does not match' "$fixture/trust-refusal.out"; then
-    echo "FATAL: production builder did not fail closed on mismatched catalog trust" >&2
-    cat "$fixture/trust-refusal.out" >&2
-    exit 1
-fi
-[ ! -e "$fixture/podman-invoked" ] || {
-    echo "FATAL: production builder reached Podman before catalog trust admission" >&2
-    exit 1
-}
 printf '%s\n' \
     '[Service]' \
     '# ExecStart=/usr/local/libexec/mcnf-app-vm-runtime' \
@@ -441,7 +413,6 @@ if command -v shellcheck >/dev/null 2>&1; then
     shellcheck "$VALIDATOR" "$PROBE" "$APP_VM/build-image.sh" "$RPM_SUPPLY_VERIFY" \
         "$INSTALLED_RPM_IDENTITY_VERIFY" "$0"
 fi
-"$CATALOG_TRUST_VERIFY" --self-test
 
 require 'COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate' "$APP_VM/Containerfile"
 require 'COPY packaging/app-vm/mcnf-app-vm-runtime-probe.sh /tmp/mcnf-app-vm-runtime-probe' "$APP_VM/Containerfile"
@@ -454,11 +425,6 @@ require_unique_container_arg APP_VM_BASE \
 require_governed_container_base "$APP_VM/Containerfile"
 require 'ARG MCNF_APP_VM_SOURCE_COMMIT' "$APP_VM/Containerfile"
 require 'ARG MCNF_APP_VM_BASE_IMAGE_ID' "$APP_VM/Containerfile"
-require 'ARG MCNF_FLATPAK_CATALOG_SIGNER_ID' "$APP_VM/Containerfile"
-require 'mcnf_catalog_trust_receipt,required=true' "$APP_VM/Containerfile"
-require 'mcnf_catalog_verification_key,required=true' "$APP_VM/Containerfile"
-require 'flatpak-catalog-verification.key' "$APP_VM/Containerfile"
-require 'catalog-trust-receipt.json' "$APP_VM/Containerfile"
 require 'source-commit' "$APP_VM/Containerfile"
 require 'image-provenance' "$APP_VM/Containerfile"
 require 'runtime-readiness' "$APP_VM/Containerfile"
@@ -495,19 +461,15 @@ require 'org.mcnf.app-vm.profile' "$BUILD"
 require 'base-image-id' "$BUILD"
 require 'MCNF_APP_VM_SOURCE_COMMIT' "$BUILD"
 require 'MCNF_APP_VM_BASE_IMAGE_ID' "$BUILD"
-require '--catalog-trust-receipt is required' "$BUILD"
-require '--catalog-trust-key is required' "$BUILD"
 require '--base-receipt is required' "$BUILD"
 require 'produce-base-image-receipt.py' "$BUILD"
 require 'App VM base-image receipt admission failed' "$BUILD"
-receipt_line=$(grep -n 'BASE_RECEIPT_JSON=' "$BUILD" | cut -d: -f1)
-mutation_line=$(grep -nF "find \"\$RPMS_DIR\"" "$BUILD" | cut -d: -f1)
+receipt_line=$(awk '/BASE_RECEIPT_JSON=/ { print NR; exit }' "$BUILD")
+mutation_line=$(awk 'index($0, "find \"$RPMS_DIR\"") { print NR; exit }' "$BUILD")
 [[ "$receipt_line" =~ ^[0-9]+$ && "$mutation_line" =~ ^[0-9]+$ && "$receipt_line" -lt "$mutation_line" ]] || {
     echo "FATAL: App VM builder admits its base receipt after RPM/image mutation" >&2
     exit 1
 }
-require 'verify-app-vm-catalog-trust.py' "$BUILD"
-require 'mcnf_catalog_trust_receipt' "$BUILD"
 require 'org.mcnf.app-vm.source-commit' "$BUILD"
 require 'immutable profile provenance' "$IMAGE_VERIFY"
 require 'complete immutable base-image digest' "$IMAGE_VERIFY"

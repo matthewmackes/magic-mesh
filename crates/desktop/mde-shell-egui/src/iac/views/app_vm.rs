@@ -525,7 +525,6 @@ struct AppVmCatalogProjection {
 enum LaunchAvailability {
     Ready,
     NotInstalled,
-    UnsignedCatalog,
     StaleCatalog,
     Unavailable,
     NoAdmittedSession,
@@ -542,9 +541,6 @@ impl LaunchAvailability {
         match self {
             Self::Ready => None,
             Self::NotInstalled => Some("Launch unavailable: the guest app is not installed."),
-            Self::UnsignedCatalog => {
-                Some("Launch unavailable: the catalog identity is not admitted.")
-            }
             Self::StaleCatalog => {
                 Some("Launch unavailable: the admitted catalog revision is stale.")
             }
@@ -603,7 +599,7 @@ fn render_model(row: &WorkloadRow, session: Option<AppVmSessionProjection>) -> A
     let valid_request = request.as_ref().is_some_and(valid_app_vm_request);
     let state = request.as_ref().map(|request| {
         if !valid_request {
-            return FlatpakInstallState::Unsigned;
+            return FlatpakInstallState::Unavailable;
         }
         catalog_install_state(request, session.as_ref())
     });
@@ -661,7 +657,6 @@ fn launch_availability(
         return LaunchAvailability::NotInstalled;
     };
     match state {
-        FlatpakInstallState::Unsigned => LaunchAvailability::UnsignedCatalog,
         FlatpakInstallState::Stale => LaunchAvailability::StaleCatalog,
         FlatpakInstallState::Unavailable => LaunchAvailability::Unavailable,
         FlatpakInstallState::Available => match session {
@@ -854,7 +849,6 @@ fn catalog_state_label(state: Option<FlatpakInstallState>) -> &'static str {
         None | Some(FlatpakInstallState::Available) => "not installed",
         Some(FlatpakInstallState::Installed) => "installed",
         Some(FlatpakInstallState::Stale) => "stale",
-        Some(FlatpakInstallState::Unsigned) => "unsigned",
         Some(FlatpakInstallState::Unavailable) => "unavailable",
     }
 }
@@ -870,9 +864,7 @@ fn catalog_tone(state: Option<FlatpakInstallState>) -> Color32 {
     match state {
         Some(FlatpakInstallState::Installed) => Style::SUPPORT_SUCCESS,
         Some(FlatpakInstallState::Available | FlatpakInstallState::Stale) => Style::WARN,
-        Some(FlatpakInstallState::Unsigned | FlatpakInstallState::Unavailable) | None => {
-            Style::DANGER
-        }
+        Some(FlatpakInstallState::Unavailable) | None => Style::DANGER,
     }
 }
 

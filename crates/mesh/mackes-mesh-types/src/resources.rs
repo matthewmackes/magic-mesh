@@ -17,17 +17,6 @@ use std::fmt::{self, Write as _};
 pub const RESOURCE_CATALOG_TOPIC: &str = "state/resources/catalog";
 /// Canonical retained-latest Bus topic for the safe resource discovery projection.
 pub const RESOURCE_DISCOVERY_TOPIC: &str = "state/resources/discovery";
-/// Prefix for the publisher-attestation topic keyed by catalog publisher.
-///
-/// Catalogs and proofs are retained separately for backward-compatible
-/// consumers, but a publisher-specific topic prevents one node's proof from
-/// being mistaken for another node's latest catalog.
-pub const RESOURCE_PUBLISHER_ATTESTATION_TOPIC_PREFIX: &str =
-    "state/resources/publisher-attestation";
-/// Secret-store key identifier used for resource-catalog HMAC publication.
-pub const RESOURCE_PUBLISHER_ATTESTATION_KEY_ID: &str = "resource-publisher-hmac-v1";
-/// Freshness window for a resource-publisher HMAC proof.
-pub const RESOURCE_PUBLISHER_ATTESTATION_TTL_MS: u64 = 5 * 60 * 1_000;
 /// The only resource-contract schema currently admitted by consumers.
 pub const RESOURCE_CONTRACT_VERSION: u16 = 1;
 /// Minimum useful freshness lifetime for a published observation.
@@ -67,14 +56,6 @@ const CAPABILITY_FINGERPRINT_PREFIX: &str = "capability:v1:";
 const TRANSPORT_FINGERPRINT_PREFIX: &str = "transport:v1:";
 /// Prefix for the deterministic catalog content digest.
 pub const RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX: &str = "catalog:v1:";
-/// Prefix for a detached HMAC-SHA256 publisher attestation.
-pub const RESOURCE_PUBLISHER_ATTESTATION_PREFIX: &str = "publisher-attestation:v1:";
-
-/// Return the retained publisher-attestation topic for one validated publisher.
-#[must_use]
-pub fn resource_publisher_attestation_topic(publisher: &str) -> String {
-    format!("{RESOURCE_PUBLISHER_ATTESTATION_TOPIC_PREFIX}/{publisher}")
-}
 const SECRET_SHAPE_MARKERS: &[&str] = &[
     "authorization:",
     "proxy-authorization:",
@@ -2610,9 +2591,8 @@ pub struct ResourceDiscoveryProjection {
     pub revision: String,
     /// Optional integrity reference to the source catalog's content digest.
     ///
-    /// This is a deterministic integrity digest, not a cryptographic
-    /// signature. It detects content drift under an honest publisher; use the
-    /// catalog's detached publisher attestation for authenticated admission.
+    /// This deterministic integrity digest detects content drift between the
+    /// catalog and its projection; it is not an authentication authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_content_digest: Option<String>,
     /// Node that published the source catalog.
@@ -2709,11 +2689,8 @@ pub struct ResourceCatalog {
     /// cards, excluding this field itself.
     ///
     /// The digest is an integrity reference, not a cryptographic signature or
-    /// proof of publisher identity. A detached
-    /// [`ResourcePublisherAttestation`] provides that stronger admission
-    /// boundary when a trusted key is available. It is optional only for
-    /// backward-compatible decoding of legacy retained catalog JSON; new
-    /// publication paths attach it before emitting a catalog.
+    /// proof of publisher identity. Nebula membership is the network security
+    /// boundary; this field detects accidental content drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
     /// One card per stable resource ID.
@@ -2831,9 +2808,7 @@ impl ResourceCatalog {
     /// Metadata is included explicitly and cards are serialized in stable
     /// resource-ID order, so card arrival order does not affect the result.
     /// The catalog's own `content_digest` field is intentionally excluded.
-    /// This is not a cryptographic signature; use
-    /// [`ResourcePublisherAttestation`] when publisher authentication is
-    /// required.
+    /// This is not a cryptographic signature or an authorization control.
     ///
     /// # Panics
     ///
@@ -2910,58 +2885,6 @@ impl ResourceCatalog {
         Ok(projection)
     }
 
-    /// Verify a detached publisher attestation before trusting this catalog.
-    ///
-    /// The attestation is HMAC-SHA256 over a canonical envelope containing the
-    /// publisher, key ID, exact catalog content digest, and bounded validity
-    /// window. The key itself is never serialized into the resource contract.
-    /// This is the verification primitive for authenticated admission;
-    /// [`Self::admit_authenticated`] produces the typed authenticated state.
-    /// [`Self::validate`] remains the compatibility path for legacy catalogs
-    /// without a detached proof.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the catalog, attestation shape, publisher binding,
-    /// freshness window, digest, or HMAC does not validate.
-    pub fn validate_publisher_attestation(
-        &self,
-        attestation: &ResourcePublisherAttestation,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<(), ResourceValidationError> {
-        attestation.verify_at(self, key, now_ms)
-    }
-
-    /// Admit this catalog into authenticated resource state.
-    ///
-    /// The detached proof must use the currently trusted publisher key ID and
-    /// must verify against the supplied trusted key at `now_ms`. The ordinary
-    /// [`Self::admitted`] path remains available for backward-compatible,
-    /// explicitly untrusted consumers; it never produces this wrapper.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the proof names an unsupported key ID, is stale or
-    /// malformed, does not bind this exact catalog, or fails HMAC verification.
-    pub fn admit_authenticated(
-        self,
-        attestation: ResourcePublisherAttestation,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<AuthenticatedResourceCatalog, ResourceValidationError> {
-        if attestation.key_id != RESOURCE_PUBLISHER_ATTESTATION_KEY_ID {
-            return Err(ResourceValidationError::InvalidField(
-                "resource_publisher_attestation.key_id",
-            ));
-        }
-        self.validate_publisher_attestation(&attestation, key, now_ms)?;
-        Ok(AuthenticatedResourceCatalog {
-            catalog: self,
-            publisher_attestation: attestation,
-        })
-    }
-
     /// Consume and return only a fully validated catalog.
     ///
     /// # Errors
@@ -2970,206 +2893,6 @@ impl ResourceCatalog {
     pub fn admitted(self) -> Result<Self, ResourceValidationError> {
         self.validate()?;
         Ok(self)
-    }
-}
-
-/// A resource catalog that crossed the cryptographic publisher-admission gate.
-///
-/// Keeping the proof alongside the catalog makes the stronger state explicit
-/// to consumers. A plain [`ResourceCatalog`] is still valid for the legacy
-/// untrusted path, but it cannot be mistaken for this authenticated wrapper.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthenticatedResourceCatalog {
-    catalog: ResourceCatalog,
-    publisher_attestation: ResourcePublisherAttestation,
-}
-
-impl AuthenticatedResourceCatalog {
-    /// Borrow the catalog covered by the verified detached proof.
-    #[must_use]
-    pub const fn catalog(&self) -> &ResourceCatalog {
-        &self.catalog
-    }
-
-    /// Borrow the detached proof that authenticated the catalog.
-    #[must_use]
-    pub const fn publisher_attestation(&self) -> &ResourcePublisherAttestation {
-        &self.publisher_attestation
-    }
-
-    /// Return the catalog and discard the in-memory proof wrapper.
-    #[must_use]
-    pub fn into_catalog(self) -> ResourceCatalog {
-        self.catalog
-    }
-}
-
-/// Detached, bounded HMAC-SHA256 proof that a trusted publisher emitted a
-/// particular resource catalog.
-///
-/// The attestation is intentionally separate from [`ResourceCatalog`] so the
-/// existing retained JSON shape remains backward compatible. A producer may
-/// publish this envelope alongside the catalog, and a consumer should call
-/// [`ResourceCatalog::admit_authenticated`] before treating the catalog as
-/// authenticated. The shared key is supplied by the surrounding trusted key
-/// store and is never present in this value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourcePublisherAttestation {
-    /// Resource-contract schema discriminator.
-    pub schema_version: u16,
-    /// Publisher identity bound to the catalog.
-    pub publisher: String,
-    /// Trusted-key-store identifier, not the secret key material.
-    pub key_id: String,
-    /// Exact catalog content digest covered by the HMAC.
-    pub catalog_content_digest: String,
-    /// Unix epoch milliseconds at which this proof becomes valid.
-    pub issued_at_ms: u64,
-    /// Unix epoch milliseconds at which this proof expires.
-    pub expires_at_ms: u64,
-    /// Lowercase hexadecimal HMAC-SHA256 with the attestation prefix.
-    pub signature: String,
-}
-
-impl ResourcePublisherAttestation {
-    /// Mint an attestation for a validated catalog using a trusted shared key.
-    ///
-    /// The catalog's computed digest is covered even when the optional
-    /// `content_digest` field is absent, so this method can authenticate a
-    /// legacy-shaped catalog without weakening the proof. The caller remains
-    /// responsible for distributing the resulting envelope with the catalog.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the catalog, key ID, key, or validity window is
-    /// malformed.
-    pub fn mint(
-        catalog: &ResourceCatalog,
-        key_id: impl Into<String>,
-        key: &[u8],
-        issued_at_ms: u64,
-        expires_at_ms: u64,
-    ) -> Result<Self, ResourceValidationError> {
-        catalog.validate()?;
-        if key.is_empty() {
-            return Err(ResourceValidationError::InvalidField(
-                "resource_publisher_attestation.key",
-            ));
-        }
-
-        let mut attestation = Self {
-            schema_version: RESOURCE_CONTRACT_VERSION,
-            publisher: catalog.publisher.clone(),
-            key_id: key_id.into(),
-            catalog_content_digest: catalog.computed_content_digest(),
-            issued_at_ms,
-            expires_at_ms,
-            signature: String::new(),
-        };
-        attestation.validate_unsigned_shape()?;
-        attestation.signature = hmac_signature(key, &attestation.signing_payload()).ok_or(
-            ResourceValidationError::InvalidField("resource_publisher_attestation.key"),
-        )?;
-        attestation.validate_shape()?;
-        Ok(attestation)
-    }
-
-    /// Return the canonical unsigned envelope covered by the HMAC.
-    #[must_use]
-    pub fn signing_payload(&self) -> String {
-        let mut payload = String::new();
-        push_canonical(&mut payload, "resource-publisher-attestation");
-        push_canonical(&mut payload, &self.schema_version.to_string());
-        push_canonical(&mut payload, &self.publisher);
-        push_canonical(&mut payload, &self.key_id);
-        push_canonical(&mut payload, &self.catalog_content_digest);
-        push_canonical(&mut payload, &self.issued_at_ms.to_string());
-        push_canonical(&mut payload, &self.expires_at_ms.to_string());
-        payload
-    }
-
-    /// Verify this proof against a catalog and a trusted key at `now_ms`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for malformed or expired proofs, a publisher/digest
-    /// mismatch, or a signature that does not verify under `key`.
-    pub fn verify_at(
-        &self,
-        catalog: &ResourceCatalog,
-        key: &[u8],
-        now_ms: u64,
-    ) -> Result<(), ResourceValidationError> {
-        use hmac::{Hmac, Mac};
-
-        catalog.validate()?;
-        self.validate_shape()?;
-        if key.is_empty() {
-            return Err(ResourceValidationError::InvalidField(
-                "resource_publisher_attestation.key",
-            ));
-        }
-        if self.publisher != catalog.publisher {
-            return Err(ResourceValidationError::InvalidRelationship(
-                "resource_publisher_attestation.publisher",
-            ));
-        }
-        if self.catalog_content_digest != catalog.computed_content_digest() {
-            return Err(ResourceValidationError::FingerprintMismatch(
-                "resource_publisher_attestation.catalog_content_digest",
-            ));
-        }
-        if catalog.generated_at_ms > now_ms {
-            return Err(ResourceValidationError::InvalidTimestamp(
-                "resource_publisher_attestation.catalog_generation",
-            ));
-        }
-        if now_ms < self.issued_at_ms || now_ms >= self.expires_at_ms {
-            return Err(ResourceValidationError::InvalidTimestamp(
-                "resource_publisher_attestation.window",
-            ));
-        }
-
-        let signature = self
-            .signature
-            .strip_prefix(RESOURCE_PUBLISHER_ATTESTATION_PREFIX)
-            .and_then(decode_hex_32)
-            .ok_or(ResourceValidationError::InvalidField(
-                "resource_publisher_attestation.signature",
-            ))?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| {
-            ResourceValidationError::InvalidField("resource_publisher_attestation.key")
-        })?;
-        mac.update(self.signing_payload().as_bytes());
-        mac.verify_slice(&signature).map_err(|_| {
-            ResourceValidationError::FingerprintMismatch("resource_publisher_attestation.signature")
-        })
-    }
-
-    fn validate_unsigned_shape(&self) -> Result<(), ResourceValidationError> {
-        validate_version("resource_publisher_attestation", self.schema_version)?;
-        validate_identifier("resource_publisher_attestation.publisher", &self.publisher)?;
-        validate_identifier("resource_publisher_attestation.key_id", &self.key_id)?;
-        validate_fingerprint_field(
-            "resource_publisher_attestation.catalog_content_digest",
-            &self.catalog_content_digest,
-            RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX,
-        )?;
-        validate_freshness(
-            "resource_publisher_attestation",
-            self.issued_at_ms,
-            self.expires_at_ms,
-        )
-    }
-
-    fn validate_shape(&self) -> Result<(), ResourceValidationError> {
-        self.validate_unsigned_shape()?;
-        validate_fingerprint_field(
-            "resource_publisher_attestation.signature",
-            &self.signature,
-            RESOURCE_PUBLISHER_ATTESTATION_PREFIX,
-        )
     }
 }
 
@@ -3392,46 +3115,6 @@ fn push_optional_number<T: ToString>(output: &mut String, value: Option<T>) {
     match value {
         Some(value) => push_optional_canonical(output, Some(&value.to_string())),
         None => push_optional_canonical(output, None),
-    }
-}
-
-fn hmac_signature(key: &[u8], payload: &str) -> Option<String> {
-    use hmac::{Hmac, Mac};
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
-    mac.update(payload.as_bytes());
-    let signature = mac.finalize().into_bytes();
-    Some(format!(
-        "{RESOURCE_PUBLISHER_ATTESTATION_PREFIX}{}",
-        hex_encode(&signature)
-    ))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
-fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let mut decoded = [0_u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
-        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Some(decoded)
-}
-
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
     }
 }
 
@@ -3696,161 +3379,6 @@ mod tests {
                 "resource_catalog.content_digest"
             ))
         );
-    }
-
-    #[test]
-    fn publisher_attestation_round_trips_and_binds_exact_catalog() {
-        const KEY: &[u8] = b"publisher-attestation-test-key";
-
-        let catalog = valid_catalog();
-        let attestation = ResourcePublisherAttestation::mint(
-            &catalog,
-            "mesh/seat-15/catalog",
-            KEY,
-            NOW,
-            NOW + FRESH,
-        )
-        .expect("publisher attestation");
-        assert_eq!(
-            attestation.catalog_content_digest,
-            catalog.computed_content_digest()
-        );
-        assert!(attestation
-            .signature
-            .starts_with(RESOURCE_PUBLISHER_ATTESTATION_PREFIX));
-
-        let json = serde_json::to_string(&attestation).expect("attestation JSON");
-        let decoded: ResourcePublisherAttestation =
-            serde_json::from_str(&json).expect("attestation JSON round trip");
-        assert_eq!(decoded, attestation);
-        catalog
-            .validate_publisher_attestation(&decoded, KEY, NOW + 1)
-            .expect("authenticated publisher admission");
-    }
-
-    #[test]
-    fn publisher_attestation_rejects_tamper_wrong_key_and_expiry() {
-        const KEY: &[u8] = b"publisher-attestation-test-key";
-
-        let catalog = valid_catalog();
-        let attestation = ResourcePublisherAttestation::mint(
-            &catalog,
-            "mesh/seat-15/catalog",
-            KEY,
-            NOW,
-            NOW + FRESH,
-        )
-        .expect("publisher attestation");
-
-        let mut tampered = catalog.clone();
-        tampered.cards[0].display_name = "Forged Browser VM".into();
-        assert_eq!(
-            tampered.validate_publisher_attestation(&attestation, KEY, NOW + 1),
-            Err(ResourceValidationError::FingerprintMismatch(
-                "resource_publisher_attestation.catalog_content_digest"
-            ))
-        );
-        let mut wrong_publisher = attestation.clone();
-        wrong_publisher.publisher = "attacker".into();
-        assert_eq!(
-            catalog.validate_publisher_attestation(&wrong_publisher, KEY, NOW + 1),
-            Err(ResourceValidationError::InvalidRelationship(
-                "resource_publisher_attestation.publisher"
-            ))
-        );
-        assert_eq!(
-            catalog.validate_publisher_attestation(&attestation, b"wrong-key", NOW + 1),
-            Err(ResourceValidationError::FingerprintMismatch(
-                "resource_publisher_attestation.signature"
-            ))
-        );
-        assert_eq!(
-            catalog.validate_publisher_attestation(&attestation, KEY, NOW + FRESH),
-            Err(ResourceValidationError::InvalidTimestamp(
-                "resource_publisher_attestation.window"
-            ))
-        );
-    }
-
-    #[test]
-    fn restarted_browser_cannot_admit_future_catalog_under_current_attestation() {
-        const KEY: &[u8] = b"publisher-attestation-test-key";
-        let mut future = valid_catalog();
-        future.generated_at_ms = NOW + 1_000;
-        future.cards[0].first_seen_at_ms = NOW + 1_000;
-        future.cards[0].last_seen_at_ms = NOW + 1_000;
-        future.cards[0].expires_at_ms = NOW + FRESH;
-        future.cards[0].health.observed_at_ms = NOW + 1_000;
-        future.cards[0].health.expires_at_ms = NOW + FRESH;
-        future.cards[0].auth.updated_at_ms = NOW + 1_000;
-        for provenance in &mut future.cards[0].provenance {
-            provenance.observed_at_ms = NOW + 1_000;
-            provenance.expires_at_ms = NOW + FRESH;
-        }
-        for transport in &mut future.cards[0].transports {
-            transport.last_seen_at_ms = NOW + 1_000;
-            transport.expires_at_ms = NOW + FRESH;
-            transport.health.observed_at_ms = NOW + 1_000;
-            transport.health.expires_at_ms = NOW + FRESH;
-        }
-        for action in &mut future.cards[0].actions {
-            action.issued_at_ms = NOW + 1_000;
-            action.expires_at_ms = NOW + FRESH;
-        }
-        let future = future.with_content_digest().expect("future catalog shape");
-        let attestation = ResourcePublisherAttestation::mint(
-            &future,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            KEY,
-            NOW,
-            NOW + FRESH,
-        )
-        .expect("current proof over future catalog");
-
-        assert_eq!(
-            future.admit_authenticated(attestation, KEY, NOW),
-            Err(ResourceValidationError::InvalidTimestamp(
-                "resource_publisher_attestation.catalog_generation"
-            ))
-        );
-    }
-
-    #[test]
-    fn authenticated_catalog_requires_the_current_key_id() {
-        const KEY: &[u8] = b"publisher-attestation-test-key";
-
-        let catalog = valid_catalog();
-        let legacy_key_id = ResourcePublisherAttestation::mint(
-            &catalog,
-            "mesh/seat-15/catalog",
-            KEY,
-            NOW,
-            NOW + FRESH,
-        )
-        .expect("legacy proof");
-        assert_eq!(
-            catalog
-                .clone()
-                .admit_authenticated(legacy_key_id, KEY, NOW + 1),
-            Err(ResourceValidationError::InvalidField(
-                "resource_publisher_attestation.key_id"
-            ))
-        );
-
-        let current = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            KEY,
-            NOW,
-            NOW + FRESH,
-        )
-        .expect("current proof");
-        let authenticated = catalog
-            .clone()
-            .admit_authenticated(current.clone(), KEY, NOW + 1)
-            .expect("authenticated catalog");
-        assert_eq!(authenticated.catalog(), &catalog);
-        assert_eq!(authenticated.publisher_attestation(), &current);
     }
 
     #[test]

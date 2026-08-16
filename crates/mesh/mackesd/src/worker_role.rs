@@ -1026,45 +1026,32 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // WL-FUNC-017 S6 — node-scoped route and navigation authority. The worker
     // is reachable by default on seated nodes and remains honestly unavailable
     // until an approved production route provider is provisioned.
-    WorkerSpec::tier(
-        "navigation",
-        1,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Data,
-    )
-    .with_cadence(CadencePolicy::Periodic {
-        min_interval_secs: 1,
-        max_interval_secs: 5,
-    }),
+    WorkerSpec::tier("navigation", 1, RestartPolicy::OnFailure, WorkerGroup::Data).with_cadence(
+        CadencePolicy::Periodic {
+            min_interval_secs: 1,
+            max_interval_secs: 5,
+        },
+    ),
     // WL-FUNC-022 S2 — local persisted Clock deadline authority. Workstation
     // scoped because this first slice executes local alarms/timers only.
-    WorkerSpec::tier(
-        "clock",
-        1,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Data,
-    )
-    .with_cadence(CadencePolicy::Periodic {
-        min_interval_secs: 1,
-        max_interval_secs: 5,
-    }),
-    // WL-FUNC-020 S1 — workstation Android catalog trust boundary. The worker
-    // remains alive but fail-closed until both local public-key settings exist.
+    WorkerSpec::tier("clock", 1, RestartPolicy::OnFailure, WorkerGroup::Data).with_cadence(
+        CadencePolicy::Periodic {
+            min_interval_secs: 1,
+            max_interval_secs: 5,
+        },
+    ),
+    // WL-FUNC-020 S1 — workstation Android runtime catalog importer.
     WorkerSpec::tier(
         "android_catalog",
         1,
         RestartPolicy::OnFailure,
         WorkerGroup::Data,
     )
-    .with_config(ConfigPredicate::EnvironmentPresent(
-        "MDE_ANDROID_CATALOG_TRUST_KEY_FILE",
-    ))
     .with_cadence(CadencePolicy::Periodic {
         min_interval_secs: 1,
         max_interval_secs: 1,
     }),
-    // WL-FUNC-018 S2 — workstation Flatpak catalog trust boundary. The worker
-    // stays registered but fail-closed until its public trust anchor is present.
+    // WL-FUNC-018 S2 — workstation Flatpak runtime catalog importer.
     WorkerSpec::tier(
         "app_catalog",
         1,
@@ -1542,10 +1529,7 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         WorkerGroup::Integrations,
     ),
     WorkerSpec::responder("nebula_bus_responder", WorkerGroup::Control),
-    WorkerSpec::responder(
-        "nebula_control_signal_dispatcher",
-        WorkerGroup::Control,
-    ),
+    WorkerSpec::responder("nebula_control_signal_dispatcher", WorkerGroup::Control),
     WorkerSpec::responder(
         "nebula_observation_signal_dispatcher",
         WorkerGroup::Observation,
@@ -1565,10 +1549,7 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         "worker_runtime_status_actions_publisher",
         WorkerGroup::Actions,
     ),
-    WorkerSpec::responder(
-        "worker_runtime_status_data_publisher",
-        WorkerGroup::Data,
-    ),
+    WorkerSpec::responder("worker_runtime_status_data_publisher", WorkerGroup::Data),
     WorkerSpec::responder(
         "worker_runtime_status_compute_publisher",
         WorkerGroup::Compute,

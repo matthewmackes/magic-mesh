@@ -131,8 +131,8 @@ hostile = {
     "grouped owner enabled before reload": script.replace(
         "systemctl daemon-reload >/dev/null 2>&1 || :\n", "", 1
     ).replace(
-        " >/dev/null 2>&1 || :\ntimeout 45 systemctl restart mcnf-resource-publisher-credential.service",
-        " >/dev/null 2>&1 || :\nsystemctl daemon-reload >/dev/null 2>&1 || :\ntimeout 45 systemctl restart mcnf-resource-publisher-credential.service",
+        '\nif [ "$mackesd_was_active" -eq 1 ]; then',
+        '\nsystemctl daemon-reload >/dev/null 2>&1 || :\nif [ "$mackesd_was_active" -eq 1 ]; then',
         1,
     ),
     "unguarded migration start": script.replace(

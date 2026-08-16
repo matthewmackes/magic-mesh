@@ -24,14 +24,14 @@ pub mod aircraft;
 pub mod android_apps;
 /// WL-FUNC-020 — bounded Cuttlefish Android VM provider/lifecycle contracts.
 pub mod android_provider;
-/// WL-FUNC-020 — shared host/guest Cuttlefish relay wire protocol.
-pub mod cuttlefish_guest;
 /// WL-FUNC-018 — versioned, signed-provenance Flatpak catalog records for App VMs.
 pub mod app_catalog;
 /// WL-FUNC-012 / OVERLAY-5 — Caltrans CWWP2 camera snapshots shared by the
 /// workstation adapter and Maps & Location.
 pub mod caltrans_camera;
 pub mod cap_tags;
+/// WL-FUNC-020 — shared host/guest Cuttlefish relay wire protocol.
+pub mod cuttlefish_guest;
 // WL-ARCH-001 (2026-07-18) — provider-neutral Construct Cloud shared contracts.
 // The SOLE definition site for the mesh cloud's catalog/resource/health/stack
 // shapes + the `action/cloud/*` lifecycle command contract; all consumers bind
@@ -76,11 +76,11 @@ pub mod lighthouse;
 // to `compute/lighthouse-probe/<name>` and the Workbench Lighthouses tab renders.
 // The replicated directory carries only binary health; these live operational
 // facts need a per-lighthouse probe lane (LIGHTHOUSE follow-on, now filled).
+/// WL-FUNC-023 — bounded local ONBOARD & OFFBOARDING intent contract.
+pub mod lifecycle;
 pub mod lighthouse_probe;
 /// WL-FUNC-017 — bounded weather-location preference and effective-location contracts.
 pub mod location;
-/// WL-FUNC-023 — bounded local ONBOARD & OFFBOARDING intent contract.
-pub mod lifecycle;
 /// WL-FUNC-015 — shared `state/media/sources` wire records published by
 /// `mackesd` and consumed by the Media Workspace without a daemon dependency.
 pub mod media_sources;
@@ -182,10 +182,10 @@ pub use android_apps::{
     AndroidCatalogAppPolicy, AndroidCatalogGuestReadiness, AndroidCatalogPayload,
     AndroidImageManifest, AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
     AndroidLaunchIntent, AndroidLaunchReadiness, AndroidPackageVersion, AndroidResourceClass,
-    AndroidResourceProfile, AndroidSignedCatalog, AndroidStarterAppDescriptor, AospPackageId,
+    AndroidResourceProfile, AndroidRuntimeCatalog, AndroidStarterAppDescriptor, AospPackageId,
     AospStarterApp, AospStarterCatalog, ANDROID_CATALOG_IMPORT_TOPIC_PREFIX,
-    ANDROID_CATALOG_SIGNATURE_DOMAIN, ANDROID_CATALOG_STATE_TOPIC_PREFIX,
-    ANDROID_SIGNED_CATALOG_SCHEMA_VERSION, MAX_ANDROID_CATALOG_TTL_MS,
+    ANDROID_CATALOG_STATE_TOPIC_PREFIX, ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
+    MAX_ANDROID_CATALOG_TTL_MS,
 };
 pub use connect::{BatterySnapshot, ConnectFacts, PairingState, PeerKind};
 pub use nebula::{NebulaFacts, NebulaRole};

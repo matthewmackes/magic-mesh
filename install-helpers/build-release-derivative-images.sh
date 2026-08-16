@@ -24,8 +24,7 @@ usage() {
 Usage: build-release-derivative-images.sh \
   --source-revision REVISION --signed-workstation-rpm PATH \
   --app-rpm-candidate-manifest PATH --app-base-receipt PATH \
-  --app-base-image IMAGE --app-catalog-trust-receipt PATH \
-  --app-catalog-trust-key PATH --signed-lighthouse-rpm PATH \
+  --app-base-image IMAGE --signed-lighthouse-rpm PATH \
   --browser-rpm-candidate-manifest PATH --browser-base-receipt PATH \
   --browser-base-image IMAGE --output DIR
 
@@ -35,7 +34,7 @@ EOF
 }
 
 source_revision='' workstation_rpm='' app_candidate='' app_base_receipt=''
-app_base='' app_trust_receipt='' app_trust_key='' lighthouse_rpm=''
+app_base='' lighthouse_rpm=''
 browser_candidate='' browser_base_receipt='' browser_base='' output=''
 while (($#)); do
     case "$1" in
@@ -44,8 +43,6 @@ while (($#)); do
         --app-rpm-candidate-manifest) app_candidate=${2:-}; shift 2 ;;
         --app-base-receipt) app_base_receipt=${2:-}; shift 2 ;;
         --app-base-image) app_base=${2:-}; shift 2 ;;
-        --app-catalog-trust-receipt) app_trust_receipt=${2:-}; shift 2 ;;
-        --app-catalog-trust-key) app_trust_key=${2:-}; shift 2 ;;
         --signed-lighthouse-rpm) lighthouse_rpm=${2:-}; shift 2 ;;
         --browser-rpm-candidate-manifest) browser_candidate=${2:-}; shift 2 ;;
         --browser-base-receipt) browser_base_receipt=${2:-}; shift 2 ;;
@@ -63,8 +60,6 @@ for pair in \
     'App VM RPM candidate manifest' "$app_candidate" \
     'App VM base receipt' "$app_base_receipt" \
     'App VM base image' "$app_base" \
-    'App VM catalog trust receipt' "$app_trust_receipt" \
-    'App VM catalog trust key' "$app_trust_key" \
     'signed Lighthouse RPM' "$lighthouse_rpm" \
     'Browser RPM candidate manifest' "$browser_candidate" \
     'Browser base receipt' "$browser_base_receipt" \
@@ -86,8 +81,6 @@ regular_input() { # label path maximum-bytes
 regular_input 'signed Workstation RPM' "$workstation_rpm" 1073741824
 regular_input 'App VM RPM candidate manifest' "$app_candidate" 1048576
 regular_input 'App VM base receipt' "$app_base_receipt" 1048576
-regular_input 'App VM catalog trust receipt' "$app_trust_receipt" 1048576
-regular_input 'App VM catalog trust key' "$app_trust_key" 1048576
 regular_input 'signed Lighthouse RPM' "$lighthouse_rpm" 1073741824
 regular_input 'Browser RPM candidate manifest' "$browser_candidate" 1048576
 regular_input 'Browser base receipt' "$browser_base_receipt" 1048576
@@ -132,7 +125,6 @@ python3 "$BROWSER_RPM_VERIFY" verify --rpm "$inputs/lighthouse.rpm" \
 
 MCNF_APP_VM_SOURCE_COMMIT="$source_revision" "$APP_BUILDER" \
     --rpm "$inputs/workstation.rpm" --candidate-manifest "$inputs/app-candidate.json" \
-    --catalog-trust-receipt "$app_trust_receipt" --catalog-trust-key "$app_trust_key" \
     --base-receipt "$app_base_receipt" --base "$app_base" \
     --disk qcow2 --out "$app_out" \
     || refuse 'App VM derivative build or verification failed'

@@ -13,9 +13,8 @@ use std::sync::Arc;
 use mackes_mesh_types::android_apps::AospStarterApp;
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mackes_mesh_types::resources::{
-    resource_publisher_attestation_topic, ActionAvailabilityStatus, AuthStatus, HealthStatus,
-    ResourceActionTarget, ResourceActionVerb, ResourceCatalog, ResourceClass,
-    ResourcePublisherAttestation, RESOURCE_CATALOG_TOPIC,
+    ActionAvailabilityStatus, AuthStatus, HealthStatus, ResourceActionTarget, ResourceActionVerb,
+    ResourceCatalog, ResourceClass, RESOURCE_CATALOG_TOPIC,
 };
 use mackes_mesh_types::vdi_clipboard::{
     vdi_clipboard_session_topic, VdiClipboardLeaseV2, VdiClipboardMessageV2,
@@ -33,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use crate::ipc::action_auth::{
     production_action_signer, ActionAuthorizer, MutationContext, MAX_AUTH_TTL_MS,
 };
-use crate::ipc::secret_store::SecretStore;
 
 /// Sole resource-action ingress. No caller-controlled topic suffix is accepted.
 pub const RESOURCE_ACTION_TOPIC: &str = "action/resources/invoke";
@@ -384,13 +382,12 @@ pub struct ResourceActionWorker {
     cursor: Option<String>,
     authorizer: Arc<ActionAuthorizer>,
     signer: Option<CloudArmSigner>,
-    publisher_store: SecretStore,
 }
 
 impl ResourceActionWorker {
     /// Construct the fail-closed production router.
     #[must_use]
-    pub fn production(bus_root: Option<PathBuf>, publisher_store: SecretStore) -> Self {
+    pub fn production(bus_root: Option<PathBuf>) -> Self {
         let signer = production_action_signer()
             .map_err(|error| {
                 tracing::error!(
@@ -406,7 +403,6 @@ impl ResourceActionWorker {
             cursor: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
             signer,
-            publisher_store,
         }
     }
 
@@ -491,28 +487,6 @@ impl ResourceActionWorker {
             else {
                 return refused(invocation.request_id, RefusalCode::AuthorityUnavailable);
             };
-            let attestation = persist
-                .read_latest(&resource_publisher_attestation_topic(&catalog.publisher))
-                .ok()
-                .flatten()
-                .and_then(|message| message.body)
-                .and_then(|body| serde_json::from_str::<ResourcePublisherAttestation>(&body).ok());
-            let publisher_key = self
-                .publisher_store
-                .get(super::RESOURCE_PUBLISHER_KEY_REF)
-                .ok()
-                .flatten();
-            if attestation
-                .as_ref()
-                .zip(publisher_key.as_ref())
-                .is_none_or(|(attestation, key)| {
-                    catalog
-                        .validate_publisher_attestation(attestation, key.as_bytes(), now_ms)
-                        .is_err()
-                })
-            {
-                return refused(invocation.request_id, RefusalCode::Unauthorized);
-            }
             match plan(&catalog, &invocation, signer, now_ms) {
                 Ok(planned) => planned,
                 Err(RefusalCode::CancellationUnsupported) => {
@@ -1573,7 +1547,6 @@ mod tests {
         HealthState, IdentityAuthority, ProvenanceTrust, ResourceAction, ResourceCard,
         ResourceIdentity, ResourceOperatingRole, ResourceScope, SourceProvenance,
         TransportCandidate, TransportEndpoint, TransportProtocol, RESOURCE_CONTRACT_VERSION,
-        RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
     };
     use mackes_mesh_types::vdi_clipboard::{
         ClipboardEnvelopeV2, VdiClipboardDisclosureV2, VdiClipboardText,
@@ -1585,7 +1558,6 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000_000;
     const ACTION_KEY: &[u8] = b"resource-action-ingress-test-key";
-    const PUBLISHER_KEY: &[u8] = b"resource-publisher-test-key";
 
     fn signer() -> CloudArmSigner {
         CloudArmSigner::new(vec![0x5a; 32]).expect("test signer")
@@ -2034,45 +2006,11 @@ mod tests {
         (lease, message)
     }
 
-    fn local_publisher_store(root: &std::path::Path) -> SecretStore {
-        let key_path = root.join("mesh-age-key");
-        std::fs::write(
-            &key_path,
-            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
-        )
-        .expect("write test age key");
-        SecretStore::LocalAead {
-            dir: root.join("sealed"),
-            key_path,
-        }
-    }
-
     fn persisted_worker_fixture(
         catalog: &ResourceCatalog,
         authorization_state: &str,
-    ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        Persist,
-        ResourceActionWorker,
-    ) {
+    ) -> (tempfile::TempDir, Persist, ResourceActionWorker) {
         let bus = tempfile::tempdir().expect("bus tempdir");
-        let secrets = tempfile::tempdir().expect("secret tempdir");
-        let store = local_publisher_store(secrets.path());
-        store
-            .put(
-                super::super::RESOURCE_PUBLISHER_KEY_REF,
-                std::str::from_utf8(PUBLISHER_KEY).expect("publisher key text"),
-            )
-            .expect("store publisher key");
-        let attestation = ResourcePublisherAttestation::mint(
-            catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            PUBLISHER_KEY,
-            NOW,
-            NOW + 30_000,
-        )
-        .expect("publisher attestation");
         let persist = Persist::open(bus.path().to_path_buf()).expect("persisted Bus");
         persist
             .write(
@@ -2082,14 +2020,6 @@ mod tests {
                 Some(&serde_json::to_string(catalog).expect("catalog JSON")),
             )
             .expect("publish catalog");
-        persist
-            .write(
-                &resource_publisher_attestation_topic(&catalog.publisher),
-                Priority::Default,
-                None,
-                Some(&serde_json::to_string(&attestation).expect("attestation JSON")),
-            )
-            .expect("publish attestation");
         let worker = ResourceActionWorker {
             bus_root: Some(bus.path().to_path_buf()),
             cursor: None,
@@ -2099,9 +2029,8 @@ mod tests {
                 i64::try_from(NOW + 1).expect("test time"),
             )),
             signer: Some(signer()),
-            publisher_store: store,
         };
-        (bus, secrets, persist, worker)
+        (bus, persist, worker)
     }
 
     fn signed_ingress(invocation: &ResourceActionInvocation, nonce: &str) -> String {
@@ -2369,7 +2298,7 @@ mod tests {
     #[test]
     fn signed_approval_gated_rdp_open_can_route_its_receipt_bound_close() {
         let (catalog, open) = approval_gated_vdi();
-        let (_bus, _secrets, persist, worker) =
+        let (_bus, persist, worker) =
             persisted_worker_fixture(&catalog, "action-auth-external-rdp-close");
         let open_reply = worker.handle(
             &persist,
@@ -2868,7 +2797,7 @@ mod tests {
     fn persisted_clipboard_unsupported_completion_is_signed_and_replay_safe() {
         let catalog = clipboard_catalog();
         let invocation = clipboard_cancellation(&catalog);
-        let (_bus, _secrets, persist, mut worker) =
+        let (_bus, persist, mut worker) =
             persisted_worker_fixture(&catalog, "action-auth-clipboard-cancel");
         let signed = signed_ingress(&invocation, "resource-clipboard-cancel-once");
         let ingress = persist
@@ -2949,7 +2878,7 @@ mod tests {
     fn persisted_android_cancel_completion_is_correlated_signed_and_replay_safe() {
         let catalog = android_catalog();
         let invocation = android_cancellation(&catalog);
-        let (_bus, _secrets, persist, mut worker) =
+        let (_bus, persist, mut worker) =
             persisted_worker_fixture(&catalog, "action-auth-android-cancel");
         let signed = signed_ingress(&invocation, "resource-android-cancel-once");
         let ingress = persist
@@ -3040,23 +2969,7 @@ mod tests {
     #[test]
     fn persisted_bus_signed_ingress_attestation_reply_and_cursor_are_idempotent() {
         let bus = tempfile::tempdir().expect("bus tempdir");
-        let secrets = tempfile::tempdir().expect("secret tempdir");
-        let store = local_publisher_store(secrets.path());
-        store
-            .put(
-                super::super::RESOURCE_PUBLISHER_KEY_REF,
-                std::str::from_utf8(PUBLISHER_KEY).expect("publisher key text"),
-            )
-            .expect("store publisher key");
         let catalog = catalog(HealthStatus::Available);
-        let attestation = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            PUBLISHER_KEY,
-            NOW,
-            NOW + 30_000,
-        )
-        .expect("publisher attestation");
         let persist = Persist::open(bus.path().to_path_buf()).expect("persisted Bus");
         persist
             .write(
@@ -3066,14 +2979,6 @@ mod tests {
                 Some(&serde_json::to_string(&catalog).expect("catalog JSON")),
             )
             .expect("publish catalog");
-        persist
-            .write(
-                &resource_publisher_attestation_topic(&catalog.publisher),
-                Priority::Default,
-                None,
-                Some(&serde_json::to_string(&attestation).expect("attestation JSON")),
-            )
-            .expect("publish attestation");
 
         let invocation = invocation(&catalog);
         let unsigned = serde_json::to_string(&invocation).expect("unsigned invocation");
@@ -3107,7 +3012,6 @@ mod tests {
                 i64::try_from(NOW + 1).expect("test time"),
             )),
             signer: Some(signer()),
-            publisher_store: store,
         };
         worker.tick(NOW + 1);
 
@@ -3202,23 +3106,7 @@ mod tests {
     #[test]
     fn persisted_vdi_cancel_completion_is_correlated_signed_and_replay_safe() {
         let bus = tempfile::tempdir().expect("bus tempdir");
-        let secrets = tempfile::tempdir().expect("secret tempdir");
-        let store = local_publisher_store(secrets.path());
-        store
-            .put(
-                super::super::RESOURCE_PUBLISHER_KEY_REF,
-                std::str::from_utf8(PUBLISHER_KEY).expect("publisher key text"),
-            )
-            .expect("store publisher key");
         let catalog = vdi_catalog();
-        let attestation = ResourcePublisherAttestation::mint(
-            &catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            PUBLISHER_KEY,
-            NOW,
-            NOW + 30_000,
-        )
-        .expect("publisher attestation");
         let persist = Persist::open(bus.path().to_path_buf()).expect("persisted Bus");
         persist
             .write(
@@ -3228,14 +3116,6 @@ mod tests {
                 Some(&serde_json::to_string(&catalog).expect("catalog JSON")),
             )
             .expect("publish catalog");
-        persist
-            .write(
-                &resource_publisher_attestation_topic(&catalog.publisher),
-                Priority::Default,
-                None,
-                Some(&serde_json::to_string(&attestation).expect("attestation JSON")),
-            )
-            .expect("publish attestation");
 
         let invocation = vdi_cancellation(&catalog);
         let unsigned = serde_json::to_string(&invocation).expect("unsigned cancellation");
@@ -3270,7 +3150,6 @@ mod tests {
                 i64::try_from(NOW + 1).expect("test time"),
             )),
             signer: Some(completion_signer.clone()),
-            publisher_store: store,
         };
         worker.tick(NOW + 1);
 

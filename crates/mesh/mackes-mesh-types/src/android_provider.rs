@@ -44,7 +44,7 @@ pub struct AndroidVdiSource {
     pub workload_id: String,
     /// Exact admitted image provenance served by this session.
     pub image_provenance: CuttlefishImageProvenanceRef,
-    /// SHA-256 digest of the admitted signed catalog payload.
+    /// SHA-256 digest of the validated catalog payload.
     pub catalog_digest: String,
     /// Exact lifecycle generation that owns the session.
     pub generation: u64,
@@ -123,7 +123,7 @@ impl AndroidVdiSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AndroidProviderReadiness {
-    /// Every signed-image, host-capability, capacity, and provider-health check passed.
+    /// Every image-integrity, host-capability, capacity, and provider-health check passed.
     Ready,
     /// Placement is refused; [`AndroidProviderAdmission::refusal`] names why.
     Unavailable,
@@ -133,7 +133,7 @@ pub enum AndroidProviderReadiness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AndroidProviderRefusal {
-    /// No admitted signed catalog is available from the catalog worker.
+    /// No validated catalog is available from the catalog worker.
     CatalogUnavailable,
     /// The admitted catalog validity window has elapsed.
     CatalogExpired,
@@ -141,13 +141,13 @@ pub enum AndroidProviderRefusal {
     CatalogImageMismatch,
     /// The host-local exact package manifest is absent or invalid.
     PackageManifestUnavailable,
-    /// The package manifest does not equal the signed catalog binding.
+    /// The package manifest does not equal the catalog binding.
     PackageManifestMismatch,
     /// Desired image identity, digest, or resources do not match policy.
     DesiredImageMismatch,
     /// No readable immutable image artifact is configured.
     ImageArtifactUnavailable,
-    /// The artifact bytes do not match the signed digest.
+    /// The artifact bytes do not match the declared digest.
     ImageDigestMismatch,
     /// The KVM device is unavailable.
     KvmUnavailable,
@@ -590,13 +590,19 @@ impl CuttlefishGuestReadinessEvidence {
     pub fn validate(&self) -> Result<(), CuttlefishContractError> {
         let valid_pair = matches!(
             (self.boot_state, self.readiness),
-            (CuttlefishGuestBootState::Pending,
-CuttlefishGuestReadiness::Unknown | CuttlefishGuestReadiness::NotReady) |
-(CuttlefishGuestBootState::Booting | CuttlefishGuestBootState::Stopped,
-CuttlefishGuestReadiness::NotReady) |
-(CuttlefishGuestBootState::Ready, CuttlefishGuestReadiness::Ready) |
-(CuttlefishGuestBootState::Failed | CuttlefishGuestBootState::Unavailable,
-CuttlefishGuestReadiness::Unavailable)
+            (
+                CuttlefishGuestBootState::Pending,
+                CuttlefishGuestReadiness::Unknown | CuttlefishGuestReadiness::NotReady
+            ) | (
+                CuttlefishGuestBootState::Booting | CuttlefishGuestBootState::Stopped,
+                CuttlefishGuestReadiness::NotReady
+            ) | (
+                CuttlefishGuestBootState::Ready,
+                CuttlefishGuestReadiness::Ready
+            ) | (
+                CuttlefishGuestBootState::Failed | CuttlefishGuestBootState::Unavailable,
+                CuttlefishGuestReadiness::Unavailable
+            )
         );
         if !valid_pair {
             return Err(CuttlefishContractError::InvalidGuestEvidence);
@@ -800,15 +806,23 @@ impl CuttlefishLifecycleOperation {
     pub const fn is_allowed_from(self, state: CuttlefishVmLifecycleState) -> bool {
         matches!(
             (self, state),
-            (Self::Provision, CuttlefishVmLifecycleState::Absent) |
-(Self::Start, CuttlefishVmLifecycleState::Stopped) |
-(Self::Stop | Self::Reboot,
-CuttlefishVmLifecycleState::Starting | CuttlefishVmLifecycleState::Running |
-CuttlefishVmLifecycleState::Rebooting) |
-(Self::Destroy,
-CuttlefishVmLifecycleState::Stopped | CuttlefishVmLifecycleState::Starting |
-CuttlefishVmLifecycleState::Running | CuttlefishVmLifecycleState::Rebooting |
-CuttlefishVmLifecycleState::Unavailable | CuttlefishVmLifecycleState::Failed)
+            (Self::Provision, CuttlefishVmLifecycleState::Absent)
+                | (Self::Start, CuttlefishVmLifecycleState::Stopped)
+                | (
+                    Self::Stop | Self::Reboot,
+                    CuttlefishVmLifecycleState::Starting
+                        | CuttlefishVmLifecycleState::Running
+                        | CuttlefishVmLifecycleState::Rebooting
+                )
+                | (
+                    Self::Destroy,
+                    CuttlefishVmLifecycleState::Stopped
+                        | CuttlefishVmLifecycleState::Starting
+                        | CuttlefishVmLifecycleState::Running
+                        | CuttlefishVmLifecycleState::Rebooting
+                        | CuttlefishVmLifecycleState::Unavailable
+                        | CuttlefishVmLifecycleState::Failed
+                )
         )
     }
 }

@@ -30,7 +30,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from typing import Any, Callable, NoReturn, Optional
 
 
@@ -49,10 +48,6 @@ MAX_FUTURE_SKEW_SECONDS = 300
 MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_RELEASE_ARTIFACT_BYTES = 8 * 1024**3
-MAX_SIGNATURE_BYTES = 1024 * 1024
-MAX_KEYRING_BYTES = 16 * 1024 * 1024
-TRUSTED_RELEASE_PUBLIC_KEY = Path("/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh")
-TRUSTED_RELEASE_PRIMARY_FINGERPRINT = "06B1C27EA0E08A225155EB3314018AA1497DDC7C"
 
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/ -]{0,127}$")
@@ -83,7 +78,6 @@ RELEASE_ARTIFACT_FIELDS = frozenset(
     {
         "path",
         "digest",
-        "signature_path",
         "package_manifest_digest",
         "installed_guest_payload_digest",
         "architecture",
@@ -201,7 +195,6 @@ class PlacementConfig:
     image_digest: str
     release_artifact_path: Path
     release_artifact_digest: str
-    release_artifact_signature_path: Path
     package_manifest_digest: str
     installed_guest_payload_digest: str
     architecture: str
@@ -263,9 +256,6 @@ def parse_config(value: dict[str, Any]) -> PlacementConfig:
         ),
         release_artifact_digest=bounded_digest(
             release_artifact["digest"], "release_artifact.digest"
-        ),
-        release_artifact_signature_path=bounded_path(
-            release_artifact["signature_path"], "release_artifact.signature_path"
         ),
         package_manifest_digest=bounded_digest(
             release_artifact["package_manifest_digest"],
@@ -419,12 +409,7 @@ def digest_regular_path(path: Path, maximum: int) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def check_release_artifact(
-    config: PlacementConfig,
-    runner: CommandRunner,
-    trusted_public_key_path: Path,
-    trusted_primary_fingerprint: str,
-) -> dict[str, str]:
+def check_release_artifact(config: PlacementConfig) -> dict[str, str]:
     try:
         artifact_digest = digest_regular_path(
             config.release_artifact_path, MAX_RELEASE_ARTIFACT_BYTES
@@ -433,65 +418,6 @@ def check_release_artifact(
         return unavailable("release_artifact", "release_artifact_unavailable")
     if artifact_digest != config.release_artifact_digest:
         return unavailable("release_artifact", "release_artifact_digest_mismatch")
-    try:
-        digest_regular_path(config.release_artifact_signature_path, MAX_SIGNATURE_BYTES)
-    except (OSError, Unavailable):
-        return unavailable("release_artifact", "release_signature_unavailable")
-    try:
-        digest_regular_path(trusted_public_key_path, MAX_KEYRING_BYTES)
-    except (OSError, Unavailable):
-        return unavailable("release_artifact", "trusted_keyring_unavailable")
-    with tempfile.TemporaryDirectory(prefix="mcnf-android-keyring-") as temporary:
-        trusted_keyring = Path(temporary) / "trusted-release-signers.gpg"
-        dearmor = runner(
-            [
-                "gpg",
-                "--batch",
-                "--no-options",
-                "--dearmor",
-                "--output",
-                str(trusted_keyring),
-                str(trusted_public_key_path),
-            ]
-        )
-        if dearmor is None or dearmor.returncode != 0:
-            return unavailable("release_artifact", "trusted_keyring_unavailable")
-        try:
-            digest_regular_path(trusted_keyring, MAX_KEYRING_BYTES)
-        except (OSError, Unavailable):
-            return unavailable("release_artifact", "trusted_keyring_unavailable")
-        signature = runner(
-            [
-                "gpgv",
-                "--status-fd=1",
-                "--keyring",
-                str(trusted_keyring),
-                str(config.release_artifact_signature_path),
-                str(config.release_artifact_path),
-            ]
-        )
-    if signature is None:
-        return unavailable("release_artifact", "signature_verifier_unavailable")
-    if signature.returncode != 0:
-        return unavailable("release_artifact", "release_signature_invalid")
-    if len(signature.stdout.encode("utf-8")) > MAX_COMMAND_OUTPUT_BYTES:
-        return unavailable("release_artifact", "signature_status_oversized")
-    valid_signers = [
-        (fields[0], fields[-1])
-        for line in signature.stdout.splitlines()
-        if line.startswith("[GNUPG:] VALIDSIG ")
-        and (fields := line.removeprefix("[GNUPG:] VALIDSIG ").split())
-    ]
-    if len(valid_signers) != 1 or trusted_primary_fingerprint not in valid_signers[0]:
-        return unavailable("release_artifact", "release_signer_mismatch")
-    try:
-        verified_digest = digest_regular_path(
-            config.release_artifact_path, MAX_RELEASE_ARTIFACT_BYTES
-        )
-    except (OSError, Unavailable):
-        return unavailable("release_artifact", "release_artifact_unavailable")
-    if verified_digest != config.release_artifact_digest:
-        return unavailable("release_artifact", "release_artifact_changed_during_signature")
     try:
         manifest_digest = digest_regular_path(config.manifest_path, MAX_CONFIG_BYTES)
     except (OSError, Unavailable):
@@ -679,20 +605,13 @@ def readiness_report(
     verifier: Path | None = None,
     kvm_path: Path = Path("/dev/kvm"),
     kvm_opener: KvmOpener = default_kvm_opener,
-    trusted_public_key_path: Path = TRUSTED_RELEASE_PUBLIC_KEY,
-    trusted_primary_fingerprint: str = TRUSTED_RELEASE_PRIMARY_FINGERPRINT,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     checks = [
         check_image(config, runner),
         check_manifest(config, runner, verifier or manifest_verifier_path()),
-        check_release_artifact(
-            config,
-            runner,
-            trusted_public_key_path,
-            trusted_primary_fingerprint,
-        ),
+        check_release_artifact(config),
         check_kvm(kvm_path, kvm_opener),
         *check_libvirt(config, runner),
         check_guest_tools(config, now),
@@ -714,7 +633,7 @@ def self_test() -> None:
 
     image_bytes = b"fixture"
     digest = "sha256:" + hashlib.sha256(image_bytes).hexdigest()
-    release_bytes = b"signed Cuttlefish release artifact fixture"
+    release_bytes = b"Cuttlefish release artifact fixture"
     release_digest = "sha256:" + hashlib.sha256(release_bytes).hexdigest()
     payload_digest = "sha256:" + hashlib.sha256(b"installed cvd and adb payload").hexdigest()
     now = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
@@ -723,14 +642,9 @@ def self_test() -> None:
         image = root / "base.qcow2"
         manifest = root / "manifest.json"
         release_artifact = root / "cuttlefish-guest-tools.deb"
-        release_signature = root / "cuttlefish-guest-tools.deb.asc"
-        trusted_keyring = root / "android-release-signers.gpg"
         receipt = root / "guest-receipt.json"
         image.write_bytes(image_bytes)
         release_artifact.write_bytes(release_bytes)
-        release_signature.write_bytes(b"detached OpenPGP signature fixture")
-        trusted_keyring.write_bytes(b"trusted OpenPGP keyring fixture")
-        signer_fingerprint = "A1B2C3D4E5F60718293A4B5C6D7E8F9012345678"
 
         starter = [
             ("browser", "com.android.browser"),
@@ -802,7 +716,6 @@ def self_test() -> None:
             "release_artifact": {
                 "path": str(release_artifact),
                 "digest": release_digest,
-                "signature_path": str(release_signature),
                 "package_manifest_digest": manifest_digest,
                 "installed_guest_payload_digest": payload_digest,
                 "architecture": "x86_64",
@@ -826,11 +739,6 @@ def self_test() -> None:
                 if argv[-2:] == ["net-list", "--name"]:
                     return CommandResult(0, config.network + "\n")
                 raise AssertionError(f"unexpected virsh command: {argv}")
-            if argv[0] == "gpg":
-                Path(argv[-2]).write_bytes(b"binary OpenPGP keyring fixture")
-                return CommandResult(0, "")
-            if argv[0] == "gpgv":
-                return CommandResult(0, f"[GNUPG:] VALIDSIG {signer_fingerprint} 2026-08-09 0 4 0 22 8 00\n")
             if argv[0] == str(verifier):
                 return default_command_runner(argv)
             raise AssertionError(f"unexpected command: {argv}")
@@ -840,8 +748,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert report["status"] == "ready_for_provisioning"
@@ -851,12 +757,7 @@ def self_test() -> None:
         assert calls[0][:4] == ["qemu-img", "info", "--output=json", "--force-share"]
         assert ["virsh", "--connect", "qemu:///system", "pool-list", "--name"] in calls
         assert ["virsh", "--connect", "qemu:///system", "net-list", "--name"] in calls
-        assert any(
-            call[:3] == ["gpgv", "--status-fd=1", "--keyring"]
-            and call[-2:] == [str(release_signature), str(release_artifact)]
-            for call in calls
-        )
-        assert all("shell" not in argument for call in calls for argument in call)
+        assert all(Path(call[0]).name not in {"sh", "bash", "dash"} for call in calls)
 
         legacy_config = json.loads(json.dumps(config_value))
         legacy_config["schema_version"] = 1
@@ -873,8 +774,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {
@@ -886,74 +785,12 @@ def self_test() -> None:
         assert report["provisioning_eligible"] is False
         release_artifact.write_bytes(release_bytes)
 
-        release_signature.unlink()
-        report = readiness_report(
-            config,
-            runner=fake_runner,
-            verifier=verifier,
-            kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
-            now=now,
-        )
-        assert {
-            check["reason"]
-            for check in report["checks"]
-            if check["name"] == "release_artifact"
-        } == {"release_signature_unavailable"}
-        assert report["provisioning_eligible"] is False
-        release_signature.write_bytes(b"detached OpenPGP signature fixture")
-
-        def substituted_signer_runner(argv: list[str]) -> CommandResult | None:
-            if argv[0] == "gpgv":
-                return CommandResult(0, "[GNUPG:] VALIDSIG 00112233445566778899AABBCCDDEEFF00112233 2026-08-09 0 4 0 22 8 00\n")
-            return fake_runner(argv)
-
-        report = readiness_report(
-            config,
-            runner=substituted_signer_runner,
-            verifier=verifier,
-            kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
-            now=now,
-        )
-        assert {
-            check["reason"]
-            for check in report["checks"]
-            if check["name"] == "release_artifact"
-        } == {"release_signer_mismatch"}
-        assert report["provisioning_eligible"] is False
-
-        def rejected_signature_runner(argv: list[str]) -> CommandResult | None:
-            if argv[0] == "gpgv":
-                return CommandResult(1, "[GNUPG:] BADSIG fixture\n")
-            return fake_runner(argv)
-
-        report = readiness_report(
-            config,
-            runner=rejected_signature_runner,
-            verifier=verifier,
-            kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
-            now=now,
-        )
-        assert {
-            check["reason"]
-            for check in report["checks"]
-            if check["name"] == "release_artifact"
-        } == {"release_signature_invalid"}
-        assert report["provisioning_eligible"] is False
-
         image.write_bytes(b"tampered")
         report = readiness_report(
             config,
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {check["reason"] for check in report["checks"] if check["name"] == "base_image"} == {
@@ -967,8 +804,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {
@@ -988,8 +823,6 @@ def self_test() -> None:
             verifier=verifier,
             kvm_path=Path("/dev/null"),
             kvm_opener=denied_kvm,
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {check["reason"] for check in report["checks"] if check["name"] == "kvm"} == {
@@ -1006,8 +839,6 @@ def self_test() -> None:
             runner=inactive_pool_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {
@@ -1022,8 +853,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {
@@ -1063,8 +892,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {
@@ -1102,8 +929,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {check["reason"] for check in report["checks"] if check["name"] == "guest_tools"} == {
@@ -1119,8 +944,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {check["reason"] for check in report["checks"] if check["name"] == "guest_tools"} == {
@@ -1133,8 +956,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert report["status"] == "unavailable"
@@ -1149,8 +970,6 @@ def self_test() -> None:
             runner=fake_runner,
             verifier=verifier,
             kvm_path=Path("/dev/null"),
-            trusted_public_key_path=trusted_keyring,
-            trusted_primary_fingerprint=signer_fingerprint,
             now=now,
         )
         assert {check["reason"] for check in report["checks"] if check["name"] == "base_image"} == {

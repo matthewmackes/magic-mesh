@@ -111,7 +111,7 @@ def load_plan(path: Path) -> dict[str, object]:
 
 
 def verifier_argv(raw: object, artifact: Path, companions: dict[str, Path],
-                  revision: str, signer: str, require_signer: bool) -> list[str]:
+                  revision: str, signer: str | None, require_signer: bool) -> list[str]:
     if not isinstance(raw, list) or not 1 <= len(raw) <= 64:
         refuse("verifier must be a bounded non-empty argv array")
     result: list[str] = []
@@ -126,6 +126,8 @@ def verifier_argv(raw: object, artifact: Path, companions: dict[str, Path],
         elif item == "{source_revision}":
             result.append(revision); saw_revision = True
         elif item == "{signing_identity}":
+            if signer is None:
+                refuse("non-RPM verifier cannot request a signing identity")
             result.append(signer); saw_signer = True
         elif item.startswith("{companion:") and item.endswith("}"):
             name = item[11:-1]
@@ -195,7 +197,7 @@ def collect(plan_path: Path, output: Path) -> dict[str, object]:
     seen_files: set[tuple[int, int]] = set()
     seen_paths: set[Path] = set()
     for index, row in enumerate(rows):
-        if not isinstance(row, dict) or set(row) != {"role", "path", "media_type", "source_revision", "signing_identity", "companions", "verifier"}:
+        if not isinstance(row, dict) or not {"role", "media_type"}.issubset(row):
             refuse(f"output[{index}] has an unsupported shape")
         role = row["role"]
         if not isinstance(role, str) or role not in ROLES or role in seen_roles:
@@ -203,10 +205,16 @@ def collect(plan_path: Path, output: Path) -> dict[str, object]:
         seen_roles.add(role)
         if row["media_type"] != ROLES[role]:
             refuse(f"{role} media type does not match its canonical role")
+        rpm = row["media_type"] == "application/x-rpm"
+        expected_fields = {"role", "path", "media_type", "source_revision", "companions", "verifier"}
+        if rpm:
+            expected_fields.add("signing_identity")
+        if set(row) != expected_fields:
+            refuse(f"{role} has an unsupported output shape")
         if row["source_revision"] != plan["source_revision"]:
             refuse(f"{role} source revision differs from the collection")
-        signer = row["signing_identity"]
-        if not isinstance(signer, str) or not FINGERPRINT.fullmatch(signer) or set(signer) == {"0"}:
+        signer = row.get("signing_identity")
+        if rpm and (not isinstance(signer, str) or not FINGERPRINT.fullmatch(signer) or set(signer) == {"0"}):
             refuse(f"{role} signing identity is malformed or null")
         if not isinstance(row["path"], str) or not row["path"]:
             refuse(f"{role} path is malformed")
@@ -228,7 +236,7 @@ def collect(plan_path: Path, output: Path) -> dict[str, object]:
             companions[name] = companion
         argv = verifier_argv(row["verifier"], artifact, companions,
                              str(plan["source_revision"]), signer,
-                             row["media_type"] == "application/x-rpm")
+                             rpm)
         try:
             result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, timeout=300, check=False)
@@ -255,9 +263,12 @@ def collect(plan_path: Path, output: Path) -> dict[str, object]:
             refuse(f"{role} changed while being measured")
         if not DIGEST.fullmatch(sha256) or sha256 == "sha256:" + "0" * 64:
             refuse(f"{role} produced a null or malformed digest")
-        admitted.append({"media_type": row["media_type"], "path": str(artifact), "role": role,
-                         "sha256": sha256, "signing_identity": signer,
-                         "size": before.st_size, "source_revision": plan["source_revision"]})
+        admitted_row = {"media_type": row["media_type"], "path": str(artifact), "role": role,
+                        "sha256": sha256, "size": before.st_size,
+                        "source_revision": plan["source_revision"]}
+        if rpm:
+            admitted_row["signing_identity"] = signer
+        admitted.append(admitted_row)
     if seen_roles != set(ROLES):
         refuse("required output roles are missing")
     document = {"schema_version": 1, "kind": "mcnf-immutable-release-output-manifest",

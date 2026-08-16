@@ -119,7 +119,6 @@ install-helpers/release-evidence.sh write \
   --sbom-manifest /new/publication/sbom.json \
   --gate-manifest /new/publication/release-gate-matrix.json \
   --ci-gate-status /new/publication/ci-gate-status.json \
-  --resource-publisher-attestation /new/publication/resource-attestation.json \
   --topology-evidence /new/publication/six-node-topology.json \
   --vdi-evidence /new/publication/vdi-live-proof.json \
   --fedora-target fedora-44=pass \
@@ -140,8 +139,7 @@ install-helpers/sign-release.sh \
 ```
 
 Supplying artifacts to `sign-release.sh` without either `--prepare-rpms` or
-`--evidence` is refused. Production-pass publication also requires the governed
-resource-publisher credential described by `sign-release.sh --help`.
+`--evidence` is refused.
 
 Run the focused refusal fixtures with:
 

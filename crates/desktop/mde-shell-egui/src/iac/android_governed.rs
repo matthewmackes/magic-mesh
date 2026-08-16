@@ -7,7 +7,7 @@
 
 use mackes_mesh_types::android_apps::{
     AndroidAppCapability, AndroidAppInventory, AndroidAppPermission, AndroidCatalogAppPolicy,
-    AndroidSignedCatalog, AospStarterApp, MAX_ANDROID_OBSERVATION_AGE_MS,
+    AndroidRuntimeCatalog, AospStarterApp, MAX_ANDROID_OBSERVATION_AGE_MS,
 };
 use mackes_mesh_types::android_provider::{
     AndroidProviderAdmission, AndroidProviderRefusal, AndroidVdiProtocol, AndroidVdiSource,
@@ -23,13 +23,13 @@ const ADMITTED_CACHE_SCHEMA_VERSION: u16 = 1;
 #[serde(deny_unknown_fields)]
 struct AdmittedCatalogCache {
     schema_version: u16,
-    catalog: AndroidSignedCatalog,
+    catalog: AndroidRuntimeCatalog,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct CatalogSnapshot {
     pub(super) node: String,
-    pub(super) catalog: AndroidSignedCatalog,
+    pub(super) catalog: AndroidRuntimeCatalog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -197,7 +197,7 @@ pub(super) struct AppCard {
 pub(super) struct WorkloadProjection {
     pub(super) node: String,
     pub(super) workload_id: String,
-    pub(super) signed_identity: String,
+    pub(super) catalog_identity: String,
     pub(super) availability: WorkloadAvailability,
     pub(super) expected_generation: u64,
     pub(super) cards: Vec<AppCard>,
@@ -239,9 +239,9 @@ pub(super) fn decode_catalog_snapshot(topic: &str, body: &str) -> Option<Catalog
     {
         return None;
     }
-    let catalog: AndroidSignedCatalog = serde_json::from_str(body).ok()?;
+    let catalog: AndroidRuntimeCatalog = serde_json::from_str(body).ok()?;
     catalog.payload.validate().ok()?;
-    valid_signature_envelope_shape(&catalog).then_some(CatalogSnapshot { node, catalog })
+    Some(CatalogSnapshot { node, catalog })
 }
 
 /// Read only the digest from a daemon-owned admitted cache. Production passes
@@ -287,7 +287,6 @@ pub(super) fn read_admitted_catalog_digest(
     let cache: AdmittedCatalogCache = serde_json::from_str(&body).ok()?;
     if cache.schema_version != ADMITTED_CACHE_SCHEMA_VERSION
         || cache.catalog.payload.validate().is_err()
-        || !valid_signature_envelope_shape(&cache.catalog)
     {
         return None;
     }
@@ -300,18 +299,6 @@ pub(super) fn read_admitted_catalog_digest(
     _required_uid: u32,
 ) -> Option<String> {
     None
-}
-
-/// Syntactic decode only. This does not verify Ed25519 and callers must bind the
-/// payload digest to daemon-owned admitted evidence before displaying policy.
-fn valid_signature_envelope_shape(catalog: &AndroidSignedCatalog) -> bool {
-    !catalog.signer_id.is_empty()
-        && catalog.signer_id.len() <= 128
-        && catalog.signature.len() == 128
-        && catalog
-            .signature
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 pub(super) fn project(input: ModelInput<'_>) -> WorkloadProjection {
@@ -365,23 +352,23 @@ pub(super) fn project(input: ModelInput<'_>) -> WorkloadProjection {
             )
             && pending.app.is_some()
     });
-    let signed_identity = catalog.filter(|_| catalog_bound).map_or_else(
-        || "No admitted signed catalog".to_owned(),
+    let catalog_identity = catalog.filter(|_| catalog_bound).map_or_else(
+        || "No admitted runtime catalog".to_owned(),
         |catalog| {
             let digest = catalog
                 .payload
                 .content_digest()
                 .unwrap_or_else(|_| "invalid digest".to_owned());
             format!(
-                "Daemon-admitted signed catalog · signer {} · revision {} · {}",
-                catalog.signer_id, catalog.payload.revision, digest
+                "Daemon-validated runtime catalog · revision {} · {}",
+                catalog.payload.revision, digest
             )
         },
     );
     WorkloadProjection {
         node: input.workload.node.clone(),
         workload_id: input.workload.workload_id.clone(),
-        signed_identity,
+        catalog_identity,
         availability: lifecycle,
         expected_generation: generation,
         cards,
@@ -396,21 +383,21 @@ fn projection_refusal(input: &ModelInput<'_>) -> Option<String> {
         .catalog
         .filter(|snapshot| snapshot.node == input.workload.node)
     else {
-        return Some("no admitted signed catalog for this placement".to_owned());
+        return Some("no validated runtime catalog for this placement".to_owned());
     };
     if catalog.catalog.payload.validate().is_err()
         || input.now_unix_ms < catalog.catalog.payload.issued_at_unix_ms
         || input.now_unix_ms > catalog.catalog.payload.expires_at_unix_ms
     {
-        return Some("the signed catalog is invalid or outside its validity window".to_owned());
+        return Some("the runtime catalog is invalid or outside its validity window".to_owned());
     }
     let digest = match catalog.catalog.payload.content_digest() {
         Ok(digest) => digest,
-        Err(_) => return Some("the signed catalog payload digest is invalid".to_owned()),
+        Err(_) => return Some("the runtime catalog payload digest is invalid".to_owned()),
     };
     if input.admitted_cache_digest != Some(digest.as_str()) {
         return Some(
-            "daemon-admitted catalog cache is absent or mismatched; the writable Bus envelope is not signature authority"
+            "daemon-validated catalog cache is absent or mismatched; the writable Bus is not the durable source"
                 .to_owned(),
         );
     }
@@ -434,7 +421,7 @@ fn projection_refusal(input: &ModelInput<'_>) -> Option<String> {
             && admitted.source_revision == provenance.source_revision
             && admitted.catalog_revision == provenance.catalog_revision
     }) {
-        return Some("provider image identity does not match the signed catalog".to_owned());
+        return Some("provider image identity does not match the runtime catalog".to_owned());
     }
     let inventory = match input.inventory {
         Some(inventory) if inventory.workload_id == input.workload.workload_id => inventory,
@@ -448,7 +435,9 @@ fn projection_refusal(input: &ModelInput<'_>) -> Option<String> {
         return Some("guest package inventory is invalid or stale".to_owned());
     }
     if inventory.image_provenance.as_ref() != Some(provenance) {
-        return Some("guest inventory image identity does not match the signed catalog".to_owned());
+        return Some(
+            "guest inventory image identity does not match the runtime catalog".to_owned(),
+        );
     }
     None
 }
@@ -557,7 +546,7 @@ fn lifecycle_availability(
 
 fn app_card(
     policy: &AndroidCatalogAppPolicy,
-    catalog: &AndroidSignedCatalog,
+    catalog: &AndroidRuntimeCatalog,
     inventory: Option<&AndroidAppInventory>,
     ready: bool,
     retry: bool,
@@ -592,10 +581,7 @@ fn app_card(
         package_id: policy.app.package_id().as_str(),
         permissions: joined_permissions(&policy.permissions),
         capabilities: joined_capabilities(&policy.capabilities),
-        approval: format!(
-            "Explicit approval · signer {} · catalog revision {}",
-            catalog.signer_id, catalog.payload.revision
-        ),
+        approval: format!("Catalog policy · revision {}", catalog.payload.revision),
         evidence,
         can_start: ready && launchable,
         can_retry: retry && launchable,
@@ -644,8 +630,8 @@ fn joined_capabilities(values: &[AndroidAppCapability]) -> String {
 
 fn provider_refusal_text(reason: AndroidProviderRefusal) -> &'static str {
     match reason {
-        AndroidProviderRefusal::CatalogUnavailable => "signed catalog unavailable",
-        AndroidProviderRefusal::CatalogExpired => "signed catalog expired",
+        AndroidProviderRefusal::CatalogUnavailable => "runtime catalog unavailable",
+        AndroidProviderRefusal::CatalogExpired => "runtime catalog expired",
         AndroidProviderRefusal::CatalogImageMismatch => "catalog image identity mismatch",
         AndroidProviderRefusal::PackageManifestUnavailable => "package manifest unavailable",
         AndroidProviderRefusal::PackageManifestMismatch => "package manifest mismatch",
@@ -678,7 +664,7 @@ pub(super) fn panel(
     );
     muted_note(
         ui,
-        "Cards below come only from an admitted signed catalog plus exact provider, package, launcher, lifecycle, and VDI projections.",
+        "Cards below come from a validated runtime catalog plus exact provider, package, launcher, lifecycle, and VDI projections.",
     );
     if projections.is_empty() {
         muted_note(
@@ -703,7 +689,7 @@ pub(super) fn panel(
                 );
             });
             ui.label(
-                RichText::new(&projection.signed_identity)
+                RichText::new(&projection.catalog_identity)
                     .small()
                     .monospace()
                     .color(Style::TEXT_DIM),
@@ -759,7 +745,7 @@ pub(super) fn panel(
             if projection.cards.is_empty() {
                 ui.colored_label(
                     Style::DANGER,
-                    "No signed app policy cards are available; start and retry are disabled.",
+                    "No validated app policy cards are available; start and retry are disabled.",
                 );
             }
             for card_model in &projection.cards {

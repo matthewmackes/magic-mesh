@@ -174,7 +174,7 @@ pub struct LaunchRequest {
     pub session_id: Option<String>,
     /// Explicit admitted App VM identity; placement is never guessed here.
     pub vm_id: Option<String>,
-    /// Signed catalog revision required for guest resolution.
+    /// Catalog revision required for guest resolution.
     pub catalog_revision: Option<String>,
     /// Named guest profile, never an image path or command.
     pub guest_profile: Option<String>,

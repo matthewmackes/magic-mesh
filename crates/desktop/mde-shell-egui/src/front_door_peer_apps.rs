@@ -356,11 +356,7 @@ fn fold_peer_apps_reply(
                                     .any(|action| action.trim().eq_ignore_ascii_case("launch"));
                             let state =
                                 if !launchable && entry.state == FlatpakInstallState::Installed {
-                                    if entry.provenance.signature.is_some() {
-                                        "unavailable".to_owned()
-                                    } else {
-                                        "unsigned".to_owned()
-                                    }
+                                    "unavailable".to_owned()
                                 } else {
                                     flatpak_state_label(entry.state).to_owned()
                                 };
@@ -435,7 +431,6 @@ fn flatpak_state_label(state: FlatpakInstallState) -> &'static str {
         FlatpakInstallState::Installed => "installed",
         FlatpakInstallState::Available => "available",
         FlatpakInstallState::Stale => "stale",
-        FlatpakInstallState::Unsigned => "unsigned",
         FlatpakInstallState::Unavailable => "unavailable",
     }
 }
@@ -474,7 +469,6 @@ mod tests {
                 supported_actions: vec!["launch".into()],
                 provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
                     source: "curated".into(),
-                    signature: Some("sig-42".into()),
                 },
                 state: FlatpakInstallState::Installed,
             }],
@@ -631,26 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_catalog_row_is_preserved_but_never_launchable() {
-        let mut catalog = catalog();
-        catalog.entries[0].provenance.signature = None;
-        let (apps, note) = fold_peer_apps_reply(
-            "oak",
-            PeerAppsReply {
-                ok: true,
-                node: "oak".into(),
-                entries: Vec::new(),
-                catalog: Some(catalog),
-                error: None,
-            },
-        );
-        assert!(note.is_none());
-        assert_eq!(apps[0].state, "unsigned");
-        assert_eq!(apps[0].health, "unavailable");
-        assert_eq!(peer_app_search_items(apps, 0).len(), 1);
-    }
-
-    #[test]
     fn catalog_preserves_not_installed_and_unavailable_rows_without_promoting_them() {
         let mut catalog = catalog();
         catalog
@@ -666,7 +640,6 @@ mod tests {
                 supported_actions: vec!["launch".into()],
                 provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
                     source: "curated".into(),
-                    signature: Some("sig-42".into()),
                 },
                 state: FlatpakInstallState::Available,
             });
@@ -683,7 +656,6 @@ mod tests {
                 supported_actions: vec!["launch".into()],
                 provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
                     source: "curated".into(),
-                    signature: Some("sig-42".into()),
                 },
                 state: FlatpakInstallState::Unavailable,
             });

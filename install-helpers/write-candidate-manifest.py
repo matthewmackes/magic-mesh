@@ -34,16 +34,10 @@ ROLE_BINARIES = {
 REQUIRED_PAYLOAD = {
     "lighthouse": {
         "/usr/bin/mackesd",
-        "/usr/libexec/mackesd/provision-resource-publisher-credential",
-        "/usr/libexec/mackesd/resource-publisher-hmac.conf",
-        "/usr/lib/systemd/system/mcnf-resource-publisher-credential.service",
     },
     "workstation": {
         "/usr/bin/mackesd",
         "/usr/bin/mde-shell-egui",
-        "/usr/libexec/mackesd/provision-resource-publisher-credential",
-        "/usr/libexec/mackesd/resource-publisher-hmac.conf",
-        "/usr/lib/systemd/system/mcnf-resource-publisher-credential.service",
     },
 }
 

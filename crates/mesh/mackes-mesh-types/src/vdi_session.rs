@@ -43,7 +43,7 @@ pub fn is_supported_app_vm_guest_profile(value: &str) -> bool {
 pub struct AppVmLaunchRequest {
     /// Stable reverse-DNS Flatpak identity.
     pub app_id: String,
-    /// Signed catalog revision used to select the guest declaration.
+    /// Catalog revision used to select the guest declaration.
     pub catalog_revision: String,
     /// Named, approved guest profile; never an image path or command line.
     pub guest_profile: String,
@@ -190,17 +190,45 @@ impl AppVmLifecycleState {
         }
         matches!(
             (self, next),
-            (Self::WaitingForPlacement,
-                Self::Installing | Self::StartingGuest | Self::Denied | Self::StaleCatalog | Self::Failed)
-                | (Self::Installing, Self::StartingGuest | Self::Denied | Self::StaleCatalog | Self::Failed)
-                | (Self::StartingGuest, Self::Installing | Self::StartingApp | Self::Unavailable | Self::Failed)
-                | (Self::StartingApp, Self::Connected | Self::Unavailable | Self::Failed)
-                | (Self::Connected, Self::Paused | Self::Reconnecting | Self::Unavailable | Self::Failed)
-                | (Self::Paused, Self::StartingGuest | Self::Reconnecting | Self::Connected | Self::Failed)
-                | (Self::Reconnecting, Self::StartingGuest | Self::StartingApp | Self::Connected | Self::Unavailable | Self::Failed)
-                | (Self::Unavailable, Self::WaitingForPlacement | Self::Installing | Self::StartingGuest | Self::Failed)
-                | (Self::Denied | Self::StaleCatalog, Self::WaitingForPlacement | Self::Installing)
-                | (Self::Failed, Self::WaitingForPlacement | Self::Installing | Self::StartingGuest)
+            (
+                Self::WaitingForPlacement,
+                Self::Installing
+                    | Self::StartingGuest
+                    | Self::Denied
+                    | Self::StaleCatalog
+                    | Self::Failed
+            ) | (
+                Self::Installing,
+                Self::StartingGuest | Self::Denied | Self::StaleCatalog | Self::Failed
+            ) | (
+                Self::StartingGuest,
+                Self::Installing | Self::StartingApp | Self::Unavailable | Self::Failed
+            ) | (
+                Self::StartingApp,
+                Self::Connected | Self::Unavailable | Self::Failed
+            ) | (
+                Self::Connected,
+                Self::Paused | Self::Reconnecting | Self::Unavailable | Self::Failed
+            ) | (
+                Self::Paused,
+                Self::StartingGuest | Self::Reconnecting | Self::Connected | Self::Failed
+            ) | (
+                Self::Reconnecting,
+                Self::StartingGuest
+                    | Self::StartingApp
+                    | Self::Connected
+                    | Self::Unavailable
+                    | Self::Failed
+            ) | (
+                Self::Unavailable,
+                Self::WaitingForPlacement | Self::Installing | Self::StartingGuest | Self::Failed
+            ) | (
+                Self::Denied | Self::StaleCatalog,
+                Self::WaitingForPlacement | Self::Installing
+            ) | (
+                Self::Failed,
+                Self::WaitingForPlacement | Self::Installing | Self::StartingGuest
+            )
         )
     }
 }
@@ -446,7 +474,7 @@ pub enum SessionRequest {
         client_peer: String,
         /// Stable Flatpak app identity.
         app_id: String,
-        /// Signed catalog revision selected for this launch.
+        /// Catalog revision selected for this launch.
         catalog_revision: String,
         /// Approved named guest profile.
         guest_profile: String,

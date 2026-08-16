@@ -132,11 +132,6 @@ readonly GROUPED_MACKESD_ASSETS=(
   "packaging/systemd/mackesd-compute.service"
   "packaging/systemd/mackesd-integrations.service"
 )
-readonly CANDIDATE_CREDENTIAL_ASSETS=(
-  "install-helpers/provision-resource-publisher-credential.sh|/usr/libexec/mackesd/provision-resource-publisher-credential"
-  "packaging/systemd/resource-publisher-hmac.conf|/usr/libexec/mackesd/resource-publisher-hmac.conf"
-  "packaging/systemd/mcnf-resource-publisher-credential.service|/usr/lib/systemd/system/mcnf-resource-publisher-credential.service"
-)
 readonly MUSIC_PACKAGE_ASSETS=(
   "target/release/mde-musicd|/usr/bin/mde-musicd"
   "install-helpers/provision-music-action-credential.sh|/usr/libexec/mackesd/provision-music-action-credential"
@@ -328,34 +323,6 @@ check_grouped_mackesd_assets() {
     else
       fail "upgrade lifecycle MISSING: $lifecycle_token"
     fi
-  done
-}
-
-# WL-CRIT-006 — both production roles publish or validate governed resource
-# catalog state. Variant asset arrays replace the base list, so make the
-# credential materializer an explicit candidate invariant instead of relying on
-# a broad file-exists scan that cannot detect a dropped lighthouse row.
-check_candidate_credential_assets() {
-  hdr "candidate resource-publisher credential payload — production roles"
-  local label parser source dest pair expected expected_dest
-  for label in base lighthouse; do
-    case "$label" in
-      base) parser=parse_assets ;;
-      lighthouse) parser=parse_lighthouse_assets ;;
-    esac
-    local -A present=()
-    while IFS=$'\t' read -r source dest; do
-      [ -n "$source" ] && present["$source"]="$dest"
-    done < <($parser "$CARGO_TOML")
-    for pair in "${CANDIDATE_CREDENTIAL_ASSETS[@]}"; do
-      expected="${pair%%|*}"
-      expected_dest="${pair#*|}"
-      if [ "${present["$expected"]:-}" = "$expected_dest" ]; then
-        ok "$label candidate $expected -> $expected_dest"
-      else
-        fail "$label candidate $expected MISSING or has the wrong destination"
-      fi
-    done
   done
 }
 
@@ -903,7 +870,6 @@ check_payload_dryrun() {
   check_android_vm_payload
   check_browser_vm_payload
   check_grouped_mackesd_assets
-  check_candidate_credential_assets
   check_music_package
 }
 
@@ -958,7 +924,6 @@ check_payload_rpm() {
   esac
 
   check_grouped_mackesd_assets
-  check_candidate_credential_assets
 
   # Key bins: exact install-path assertions (the DoD line for a strip/replace).
   hdr "key replacement binaries present in payload"
@@ -1697,7 +1662,6 @@ main() {
       ;;
     overlay-claims-package) check_overlay_claims_package ;;
     grouped-process) check_grouped_mackesd_assets ;;
-    candidate-payload) check_candidate_credential_assets ;;
     music-package) check_music_package ;;
     maps-package) shift; check_maps_package "${1:-}" ;;
     app-vm-payload) shift; check_app_vm_payload "${1:-}" ;;

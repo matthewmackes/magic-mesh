@@ -103,39 +103,20 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: new, upgraded, repaired, and retired systems are not turnkey. Setup,
-  enrollment, upgrade, status, repair, reset, and offboarding are fragmented and
-  can leave seats partially active. Seat 15 exposed missing collaboration
-  identity, etcd inputs, credentials, compute orchestration, and grouped services
-  after an apparently successful deployment.
+- Problem: setup, enrollment, upgrade, repair, reset, and offboarding are
+  fragmented and can leave seats partially active. Seat 15 exposed missing
+  identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed
-  by one resumable mackesd lifecycle authority. It must onboard, upgrade, verify
-  and correct, offboard, and reset/recommission local or fleet targets; support
-  capsule and token bootstrap; accept operator-selected signed or confirmed
-  unsigned artifacts; and produce signed terminal-state evidence.
-- Current state: `magic-setup`, role provisioning, `meshctl doctor`, package
-  scripts, first-boot enrollment, and Construct lifecycle routes use divergent
-  service lists and completion rules. Role pinning and target activity can appear
-  healthy without functional identity, mesh, compute, or hardware capabilities.
-  A resumable local authority and typed contracts now cover checkpoint locking,
-  readiness checks, artifact/capsule admission, signed confirmations, and
-  terminal evidence; the downstream package, service, enrollment, renderer,
-  and full-system offboarding side effects remain incomplete. The live
-  `mackesd leave --yes` destructive sequence now executes inside one durable
-  Offboard authority step after consuming signed confirmation, while broader
-  fleet offboarding remains; remote `mackesd decommission` now also acquires
-  an Offboard authority step for its role/audit mutation. Live role
-  provisioning now acquires the authority for its configuration mutation;
-  service-add, first-desktop, spawn-lighthouse, mesh-dns, network, mesh-create,
-  invite-issue, `mackesd join`, `mackesd found`, and coordinated upgrade publication now also
-  acquire the authority for their live identity/configuration/compute/mesh
-  mutations; legacy-import audit logging remains outside the lifecycle
-  mutation surface. The upgrade-intent watcher’s later package-manager mutation is
-  now fail closed without a signed typed `LifecycleArtifactSelectionV1` (or
-  compatibility 64-hex artifact digest); the coordinate CLI accepts
-  `--artifact-selection-json` and `--artifact-digest`. Downstream package
-  execution evidence remains.
-  Evidence:
+  by one resumable mackesd authority for local or fleet onboarding, upgrade,
+  verification/correction, offboarding, reset, and recommissioning.
+- Current state: the resumable authority and typed contracts cover locking,
+  readiness, artifact/capsule admission, destructive confirmation, and terminal
+  evidence. Live leave, decommission, role provisioning, service-add,
+  first-desktop, spawn-lighthouse, mesh-dns/network/create, invite/join/found,
+  and coordinated-upgrade mutations now acquire that authority. Upgrade
+  execution requires a typed artifact selection or compatibility digest.
+  Downstream package, service, enrollment, renderer, fleet-offboarding, and
+  full execution evidence remain. Evidence:
   `docs/platform/evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md`.
 - Remaining work:
   GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
@@ -330,17 +311,11 @@ behavioral evidence is not completion.
   ResetAndOnboard cannot retain an old identity; unsigned artifacts require
   digest confirmation; core failures block; capability failures remain
   prominent `ReadyWithWarnings`.
-- Verification method: focused unit and hostile tests, farm-only integration and
-  package fixtures, BigBoy for the longest gate, equivalent GUI/TUI request
-  proofs, lifecycle interruption/resume tests, and no more than two physical
-  product-specific acceptance seats. The private 13.0.0 production-candidate
-  topology is governed separately and is not public distribution until
-  qualification completes. Defer exact release and
-  rollout proof to WL-TEST-002.
-- Origin or merged source IDs: operator-requested ONBOARD & OFFBOARDING
-  consolidation, turnkey lifecycle review, Seat 15 and Surface findings,
-  clean-fleet requirements, completed 20-question survey, and GPT Luna
-  execution assignment dated 2026-08-15.
+- Verification method: focused hostile/unit tests, farm integration and package
+  fixtures, GUI/TUI parity, interruption/resume proof, and at most two physical
+  acceptance seats; defer exact release/rollout proof to WL-TEST-002.
+- Origin or merged source IDs: operator lifecycle consolidation, Seat 15 and
+  Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
 
@@ -348,7 +323,9 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - Problem: production `13.0.0` is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
-- Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit on the protected default branch and bind every release input, version surface, note, and tag plan to it.
+- Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit
+  on the protected default branch and bind every release input, version surface,
+  note, and tag plan to it.
 - Current state: revision 1dfe6906609d71da9ee2ce20c860912a09b32855 and epoch
   1786813297 remain recorded in the r2 source-freeze receipt as the clean
   pre-WL-FUNC-023 candidate. It cannot be the final feature-complete release
@@ -378,12 +355,12 @@ behavioral evidence is not completion.
      file exists; the RPM signer receipt has been generated and inspected
      privately for the superseded f095b8ce revision; it must be regenerated for
      the frozen 1dfe6906609d71da9ee2ce20c860912a09b32855 revision at epoch
-     1786813297. Maps approval/source, App VM trust receipt/
-     key, Cuttlefish declarations/packages/image receipt, and bootc receipt are
+     1786813297. Maps approval/source, App VM image/catalog receipt,
+     Cuttlefish declarations/packages/image receipt, and bootc receipt are
      not admitted for the frozen revision. Maps provider/live proof
      is explicitly deferred to WL-TEST-002; that deferral does not create a
      release-input approval. Do not run a build with historical loose artifacts.
-     - Inputs: Maps approval/source, App VM trust receipt/key, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
+     - Inputs: Maps approval/source, App VM image/catalog receipt, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
      - Action: create one private JSON argv file containing every mandatory release-input-preflight argument.
      - Deliverable: immutable preflight argument file plus redacted input inventory; never commit credentials or private keys.
      - Validation: release-input-preflight.sh against the frozen revision and epoch; missing/substituted input fixture must refuse.
@@ -416,21 +393,14 @@ behavioral evidence is not completion.
   inputs, bind every byte and license to the frozen source revision, and produce
   the exact non-secret receipts required by the canonical preflight. Fixtures
   may exercise contracts but cannot satisfy a production gate.
-- Current state: open-source implementation and local-generation paths exist
-  for the receipt contracts, but no current-revision production inputs have
-  been admitted. App VM base admission now consumes the canonical registry-
-  resolved receipt instead of a raw digest, and Kiron admission proves its
-  package bytes against the requested source revision. The canonical RPM lane
-  now consumes one strict mode-0400 private JSON document, binds its revision
-  and epoch to the clean checkout, and no longer reconstructs release inputs
-  from many environment variables. Focused evidence is recorded in
-  docs/platform/evidence/WL-REL-006-2026-08-15-input-admission-hardening-r1.md.
-  The current redacted source/license inventory is recorded in
-  docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md.
-  This epic is the implementation/acquisition lane; downstream release epics
-  remain blocked until current `13.0.0` receipts pass preflight. The historical
-  fixture-backed input set for `afc24782ca9dc8e2e87f5676e403428a82285da1` is
-  evidence for the old preview only and cannot be reused.
+- Current state: receipt and local-generation paths exist, but no current-revision
+  production inputs are admitted. App VM uses the registry-resolved receipt;
+  Kiron proves package bytes against the requested source; and the RPM lane uses
+  one mode-0400 private JSON input bound to the clean checkout. Evidence is in
+  `docs/platform/evidence/WL-REL-006-2026-08-15-input-admission-hardening-r1.md`
+  and `docs/platform/evidence/WL-REL-006-open-source-input-inventory-r1.md`.
+  Downstream release epics remain blocked until current `13.0.0` receipts pass;
+  the historical preview fixture cannot be reused.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: frozen source receipt, Fedora target, architecture, applicable
@@ -457,10 +427,10 @@ behavioral evidence is not completion.
      - Done when: preflight admits the Maps input without claiming live service.
   3. S3 Produce the App VM input.
      - Inputs: reproducible open-source base image or authorized registry
-       manifest, architecture, catalog trust root, and frozen source receipt.
+       manifest, architecture, catalog metadata, and frozen source receipt.
      - Action: build or inspect the base image without pulling unpinned layers;
-       produce the canonical App VM base-image receipt and catalog trust record.
-     - Deliverable: immutable App VM digest, receipt, trust metadata, and
+       produce the canonical App VM base-image receipt and catalog content record.
+     - Deliverable: immutable App VM digest, receipt, compatibility metadata, and
        license record.
      - Validation: App VM producer/inspector and build-image admission pass;
        registry or local bytes are bound to the frozen revision.
@@ -470,7 +440,7 @@ behavioral evidence is not completion.
        release/compatibility identity, architecture, guest package sources,
        and frozen source receipt.
      - Action: build or inspect the image, generate the immutable image receipt,
-       and create the signed guest declaration over exact package bytes.
+       and create the guest declaration over exact package bytes.
      - Deliverable: Cuttlefish image receipt, declaration, package manifest,
        hashes, and license record.
      - Validation: guest payload, declaration, image, and preflight verifiers
@@ -589,19 +559,19 @@ behavioral evidence is not completion.
      - Validation: rpm -Kv verifies signatures; payload digests and NEVRAs equal the unsigned handoff; partial failure leaves no mixed set.
      - Done when: all three signatures verify and no payload identity changed.
   3. S3 Produce RPM candidate manifests and base receipts.
-     - Inputs: signed RPMs, frozen source, App/Browser base images, trust receipts, and release key.
+     - Inputs: signed RPMs, frozen source, App/Browser base images, reproducibility receipts, and release key.
      - Action: run each role's canonical supply/candidate verifier and freeze Browser/App base-image profiles.
      - Deliverable: three RPM candidate manifests and exact App VM/Browser VM base receipts.
      - Validation: app-vm, server-rpm, and lighthouse candidate tools accept only their corresponding signed RPM.
      - Done when: every manifest names one immutable artifact, revision, signer, NEVRA, and payload digest.
   4. S4 Build Browser VM and App VM derivatives.
-     - Inputs: signed Workstation/Lighthouse RPMs, candidate manifests, base images/receipts, and App catalog trust inputs.
+     - Inputs: signed Workstation/Lighthouse RPMs, candidate manifests, base images/receipts, and App catalog inputs.
      - Action: run build-release-derivative-images.sh with an absent private output path.
      - Deliverable: immutable Browser VM and App VM images, manifests, and frozen Browser profile.
      - Validation: image manifest verifiers, qcow2 checks, source revision checks, and hostile substitution fixture.
      - Done when: both derivatives verify and the helper publishes no partial output.
   5. S5 Admit Cuttlefish and bootc roles.
-     - Inputs: Cuttlefish artifact/declaration/signature/image receipt and bootc digest receipt/reference/architecture/role.
+     - Inputs: Cuttlefish artifact/declaration/image receipt and bootc digest receipt/reference/architecture/role.
      - Action: verify governed Cuttlefish bytes and bootc receipt; do not rebuild or relabel ungoverned third-party bytes.
      - Deliverable: Cuttlefish artifact/receipt fields and bootc receipt fields ready for the seven-role plan.
      - Validation: verify-guest-payload.sh, verify-guest-debs.sh, image receipt verifier, and bootc digest receipt verifier.
@@ -731,11 +701,14 @@ behavioral evidence is not completion.
 - Priority: P1
 - Complexity: Epic
 - Problem: exact-release installation, providers, direct-DRM rendering, guest/device integrations, and corrected-forward recovery need live proof.
-- Required outcome: qualify the exact unpublished signed production candidate on Seat 15 and Dell, prove Eagle and three-lighthouse topology, then verify the same bytes after WL-REL-005 publication.
+- Required outcome: qualify the exact unpublished production candidate on Seat
+  15 and Dell, prove Eagle and three-lighthouse topology, then verify the same
+  bytes after WL-REL-005 publication.
 - Current state: pre-release harnesses pass; candidate qualification is blocked on the current-source seven-role candidate and real production inputs.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
-     - Inputs: WL-REL-003 candidate manifest, signed package/image identities, real production inputs, and selected seats.
+     - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
+       real production inputs, and selected seats.
      - Action: verify candidate bytes; record seat hardware, authorization, current package, target package, and recovery identity.
      - Deliverable: installed-acceptance plan and pre-mutation baseline.
      - Validation: tested bytes equal the immutable candidate manifest; no more than two deep-acceptance seats are selected.

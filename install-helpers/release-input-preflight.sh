@@ -5,7 +5,6 @@ umask 077
 
 ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 KIRON_VERIFY="${MCNF_KIRON_VERIFY:-$ROOT/packaging/kiron/verify-package.sh}"
-APP_TRUST_VERIFY="${MCNF_APP_TRUST_VERIFY:-$ROOT/install-helpers/verify-app-vm-catalog-trust.py}"
 APP_VM_BASE_RECEIPT="${MCNF_APP_VM_BASE_RECEIPT_INSPECTOR:-$ROOT/packaging/app-vm/produce-base-image-receipt.py}"
 CUTTLEFISH_VERIFY="${MCNF_CUTTLEFISH_VERIFY:-$ROOT/packaging/android/verify-guest-payload.sh}"
 CUTTLEFISH_DEB_VERIFY="${MCNF_CUTTLEFISH_DEB_VERIFY:-$ROOT/packaging/android/verify-guest-debs.sh}"
@@ -19,9 +18,9 @@ MAPS_MATERIALIZER="${MCNF_MAPS_MATERIALIZER:-$ROOT/packaging/maps/materialize-of
 
 die() { printf 'release-input-preflight: REFUSED: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${2:-}" ]] || die "missing mandatory input: $1"; }
-source_revision='' source_epoch='' app_receipt='' app_key=''
+source_revision='' source_epoch=''
 maps_approval='' maps_source_root='' maps_quota='' maps_verifier=''
-cuttlefish_declaration='' cuttlefish_signature='' cuttlefish_relay='' cuttlefish_agent=''
+cuttlefish_declaration='' cuttlefish_relay='' cuttlefish_agent=''
 rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
 app_vm_base_receipt='' app_vm_base_reference='' app_vm_base_architecture=''
 cuttlefish_image_receipt='' cuttlefish_image_source_kind=''
@@ -38,10 +37,7 @@ while (($#)); do
     --maps-tile-source-root) maps_source_root=${2:-}; shift 2 ;;
     --maps-quota-bytes) maps_quota=${2:-}; shift 2 ;;
     --maps-verifier) maps_verifier=${2:-}; shift 2 ;;
-    --app-vm-catalog-trust-receipt) app_receipt=${2:-}; shift 2 ;;
-    --app-vm-catalog-trust-key) app_key=${2:-}; shift 2 ;;
     --cuttlefish-declaration) cuttlefish_declaration=${2:-}; shift 2 ;;
-    --cuttlefish-signature) cuttlefish_signature=${2:-}; shift 2 ;;
     --cuttlefish-readiness-relay) cuttlefish_relay=${2:-}; shift 2 ;;
     --cuttlefish-vdi-agent) cuttlefish_agent=${2:-}; shift 2 ;;
     --cuttlefish-guest-package) cuttlefish_packages+=("${2:-}"); shift 2 ;;
@@ -70,8 +66,7 @@ for pair in \
   'source revision' "$source_revision" 'source epoch' "$source_epoch" \
   'Maps approval' "$maps_approval" 'Maps tile source root' "$maps_source_root" \
   'Maps quota bytes' "$maps_quota" 'Maps production verifier' "$maps_verifier" \
-  'App VM catalog trust receipt' "$app_receipt" 'App VM catalog trust key' "$app_key" \
-  'Cuttlefish declaration' "$cuttlefish_declaration" 'Cuttlefish signature' "$cuttlefish_signature" \
+  'Cuttlefish declaration' "$cuttlefish_declaration" \
   'Cuttlefish readiness relay' "$cuttlefish_relay" 'Cuttlefish VDI agent' "$cuttlefish_agent" \
   'RPM signing identity receipt' "$rpm_signing_receipt" 'bootc base digest receipt' "$bootc_receipt" \
   'bootc base image reference' "$bootc_reference" 'bootc base architecture' "$bootc_architecture" \
@@ -99,7 +94,6 @@ python3 "$APP_VM_BASE_RECEIPT" --repo "$ROOT" inspect \
   --receipt "$app_vm_base_receipt" >/dev/null \
   || die 'App VM base-image receipt admission failed'
 
-trust_stage=$(mktemp -d)
 payload_parent=$(mktemp -d)
 deb_stage=$(mktemp -d)
 maps_stage=$(mktemp -d)
@@ -109,7 +103,7 @@ cleanup() {
   # our private mktemp tree, so restore owner write permission solely to erase
   # the preflight copy; approved source bytes are never modified.
   chmod -R u+w -- "$maps_stage" 2>/dev/null || true
-  rm -rf -- "$trust_stage" "$payload_parent" "$deb_stage" "$maps_stage"
+  rm -rf -- "$payload_parent" "$deb_stage" "$maps_stage"
   rm -f -- "$image_identity"
 }
 trap cleanup EXIT
@@ -128,11 +122,7 @@ python3 "$MAPS_MATERIALIZER" --bundle "$maps_stage/bundle" \
   --source-revision "$source_revision" --source-epoch "$source_epoch" \
   --quota-bytes "$maps_quota" >/dev/null \
   || die 'offline Maps bundle admission/materialization failed'
-"$APP_TRUST_VERIFY" --receipt "$app_receipt" --key "$app_key" \
-  --expected-source-revision "$source_revision" --stage-dir "$trust_stage" >/dev/null \
-  || die 'App VM catalog trust admission failed'
-
-cuttlefish_args=(--declaration "$cuttlefish_declaration" --signature "$cuttlefish_signature"
+cuttlefish_args=(--declaration "$cuttlefish_declaration"
   --readiness-relay "$cuttlefish_relay" --vdi-agent "$cuttlefish_agent"
   --stage-dir "$payload_parent/admitted")
 for package in "${cuttlefish_packages[@]}"; do
@@ -140,9 +130,9 @@ for package in "${cuttlefish_packages[@]}"; do
   cuttlefish_args+=(--guest-package "$package")
 done
 "$CUTTLEFISH_VERIFY" "${cuttlefish_args[@]}" >/dev/null \
-  || die 'Cuttlefish signed guest payload admission failed'
+  || die 'Cuttlefish content-declared guest payload admission failed'
 
-# The signed declaration alone does not prove that release engineering supplied
+# The declaration alone does not prove that release engineering supplied
 # the deterministic package set. Require the exact two package names from one
 # manifest-bearing directory, then bind their archived binaries and units to
 # the same admitted relay/agent bytes through the owning package verifier.
@@ -181,7 +171,7 @@ python3 "$CUTTLEFISH_IMAGE_RECEIPT" --repo "$CUTTLEFISH_IMAGE_REPO" inspect \
   || die 'Cuttlefish image receipt admission failed'
 
 python3 - "$payload_parent/admitted/release.json" "$image_identity" <<'PY' \
-  || die 'signed Cuttlefish declaration does not bind the admitted image receipt'
+  || die 'Cuttlefish declaration does not bind the admitted image receipt'
 import json
 import sys
 

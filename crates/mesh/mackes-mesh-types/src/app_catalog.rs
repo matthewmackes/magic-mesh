@@ -5,15 +5,14 @@
 //! validate the catalog before projecting it into Front Door or creating an
 //! [`crate::vdi_session::AppVmLaunchRequest`].
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// The only catalog schema currently admitted by the App VM path.
 pub const FLATPAK_CATALOG_SCHEMA_VERSION: u16 = 1;
-/// Schema admitted for cryptographically signed Flatpak catalogs.
-pub const SIGNED_FLATPAK_CATALOG_SCHEMA_VERSION: u16 = 1;
+/// Schema admitted for runtime Flatpak catalogs.
+pub const FLATPAK_RUNTIME_CATALOG_SCHEMA_VERSION: u16 = 1;
 const MAX_ID_BYTES: usize = 255;
 const MAX_TEXT_BYTES: usize = 1024;
 const MAX_CATALOG_ENTRIES: usize = 512;
@@ -22,19 +21,17 @@ const MAX_SEARCH_TERMS: usize = 24;
 const MAX_SEARCH_TERM_BYTES: usize = 96;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const MAX_VERSION_BYTES: usize = 128;
-const MAX_SIGNER_ID_BYTES: usize = 128;
-const MAX_SIGNED_CATALOG_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_RUNTIME_CATALOG_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_SEARCH_WEIGHT: u16 = 1_000;
-const MAX_SIGNED_CATALOG_WIRE_BYTES: usize = 512 * 1024;
-const FLATPAK_CATALOG_SIGNATURE_DOMAIN: &str = "magic-mesh/flatpak-app-catalog/v1";
+const MAX_RUNTIME_CATALOG_WIRE_BYTES: usize = 512 * 1024;
 
-/// A signed, versioned set of curated guest applications.
+/// A versioned set of curated guest applications.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlatpakAppCatalog {
     /// Schema discriminator for deterministic consumer behavior.
     pub schema_version: u16,
-    /// Monotonic catalog revision selected by the signed provider.
+    /// Monotonic catalog revision selected by the provider.
     pub revision: String,
     /// Catalog rows, with unique app IDs after validation.
     pub entries: Vec<FlatpakCatalogEntry>,
@@ -61,7 +58,7 @@ pub struct FlatpakCatalogEntry {
     pub guest_profile: String,
     /// Actions exposed by the curated guest declaration.
     pub supported_actions: Vec<String>,
-    /// Source and signature provenance.
+    /// Source provenance.
     pub provenance: FlatpakCatalogProvenance,
     /// Explicit install/readiness state.
     pub state: FlatpakInstallState,
@@ -73,8 +70,6 @@ pub struct FlatpakCatalogEntry {
 pub struct FlatpakCatalogProvenance {
     /// Curated provider or repository identity.
     pub source: String,
-    /// Detached signature or equivalent signed-evidence reference.
-    pub signature: Option<String>,
 }
 
 /// Installation/readiness is explicit so missing or stale content is never a
@@ -82,14 +77,12 @@ pub struct FlatpakCatalogProvenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlatpakInstallState {
-    /// Guest content is installed and may be launchable if signed.
+    /// Guest content is installed and may be launchable.
     Installed,
     /// Catalog metadata exists but guest content is not installed.
     Available,
     /// Installed content no longer matches the admitted catalog revision.
     Stale,
-    /// The row lacks trusted provenance.
-    Unsigned,
     /// The guest provider cannot currently supply the app.
     Unavailable,
 }
@@ -171,13 +164,10 @@ impl FlatpakCatalogEntry {
         }
         validate_list(&self.supported_actions, "supported_actions")?;
         validate_text("provenance.source", &self.provenance.source, MAX_ID_BYTES)?;
-        if let Some(signature) = &self.provenance.signature {
-            validate_text("provenance.signature", signature, MAX_TEXT_BYTES)?;
-        }
         Ok(())
     }
 
-    /// Only installed, signed rows that explicitly grant the typed launch
+    /// Only installed rows that explicitly grant the typed launch
     /// action can be handed to the App VM launch layer.
     #[must_use]
     pub fn is_launchable(&self) -> bool {
@@ -187,11 +177,6 @@ impl FlatpakCatalogEntry {
                 .supported_actions
                 .iter()
                 .any(|action| action.eq_ignore_ascii_case("launch"))
-            && self
-                .provenance
-                .signature
-                .as_deref()
-                .is_some_and(|signature| !signature.trim().is_empty())
     }
 }
 
@@ -234,7 +219,7 @@ fn validate_list(values: &[String], field: &'static str) -> Result<(), FlatpakCa
     Ok(())
 }
 
-/// Stable source identities bound into a signed catalog payload.
+/// Stable source identities bound into a catalog document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlatpakCatalogOrigin {
@@ -254,20 +239,20 @@ pub struct FlatpakSearchMetadata {
     pub weight: u16,
 }
 
-/// One deterministic result from a validated signed catalog search.
+/// One deterministic result from a validated runtime catalog search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlatpakSearchMatch<'a> {
     /// Admitted catalog row; no metadata is synthesized by search.
-    pub entry: &'a SignedFlatpakCatalogEntry,
-    /// Stable score derived only from signed fields and the normalized query.
+    pub entry: &'a FlatpakCatalogItem,
+    /// Stable score derived only from validated fields and the normalized query.
     pub score: u32,
 }
 
-/// One complete row in the signed catalog. All launch-relevant metadata is
-/// covered by the envelope signature rather than supplied by a UI or importer.
+/// One complete row in the runtime catalog. All launch-relevant metadata is
+/// structurally validated rather than supplied by a UI launcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignedFlatpakCatalogEntry {
+pub struct FlatpakCatalogItem {
     /// Stable reverse-DNS Flatpak application identity.
     pub app_id: String,
     /// Bounded user-facing application name.
@@ -290,41 +275,37 @@ pub struct SignedFlatpakCatalogEntry {
     pub state: FlatpakInstallState,
 }
 
-/// Canonical unsigned payload covered by a Flatpak catalog signature.
+/// Canonical runtime catalog document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignedFlatpakCatalogPayload {
-    /// Signed-catalog schema discriminator.
+pub struct FlatpakCatalogDocument {
+    /// Runtime-catalog schema discriminator.
     pub schema_version: u16,
     /// Stable catalog identity.
     pub catalog_id: String,
     /// Positive monotonic provider revision.
     pub revision: u64,
-    /// Signature issue time in Unix epoch milliseconds.
+    /// Publication time in Unix epoch milliseconds.
     pub issued_at_unix_ms: u64,
-    /// Signature expiry time in Unix epoch milliseconds.
+    /// Freshness expiry time in Unix epoch milliseconds.
     pub expires_at_unix_ms: u64,
     /// Stable provider/repository provenance.
     pub origin: FlatpakCatalogOrigin,
     /// Canonically ordered application rows.
-    pub entries: Vec<SignedFlatpakCatalogEntry>,
+    pub entries: Vec<FlatpakCatalogItem>,
 }
 
-/// Ed25519-signed Flatpak catalog admitted by a future importer.
+/// Content-addressed Flatpak catalog admitted by the runtime importer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignedFlatpakAppCatalog {
-    /// Stable key-rotation identity selected by local trust policy.
-    pub signer_id: String,
+pub struct FlatpakRuntimeCatalog {
     /// Canonical catalog payload.
-    pub payload: SignedFlatpakCatalogPayload,
-    /// Lowercase 64-byte Ed25519 signature encoded as 128 hex characters.
-    pub signature: String,
+    pub payload: FlatpakCatalogDocument,
 }
 
-/// Why a signed Flatpak catalog failed closed.
+/// Why a Flatpak runtime catalog failed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignedFlatpakCatalogError {
+pub enum FlatpakRuntimeCatalogError {
     /// The consumer does not implement the payload schema.
     UnsupportedSchema(u16),
     /// A required identity or text field is malformed or unsafe.
@@ -337,38 +318,32 @@ pub enum SignedFlatpakCatalogError {
     NotYetValid,
     /// The catalog has reached or passed its expiry time.
     StaleCatalog,
-    /// The envelope signer does not exactly match local trust policy.
-    UntrustedSigner,
     /// Two rows claim the same stable application identity.
     DuplicateAppId,
-    /// A signed list is not strictly sorted and unique.
+    /// A canonical list is not strictly sorted and unique.
     NonCanonicalOrder(&'static str),
     /// A collection exceeds its item limit.
     ResourceLimitExceeded(&'static str),
     /// The App VM profile cannot safely provide a requested permission.
     UnsupportedPermission(String),
-    /// Signature text is not exactly lowercase Ed25519 hex.
-    MalformedSignature,
-    /// Signature verification failed for the canonical payload.
-    SignatureMismatch,
     /// The untrusted JSON body exceeds the pre-parse allocation bound.
     WirePayloadTooLarge,
     /// The untrusted JSON body is malformed, duplicated, or otherwise closed.
     MalformedJson,
-    /// The validated payload could not be serialized for signing.
+    /// The validated payload could not be serialized canonically.
     CanonicalEncodingFailed,
 }
 
-impl SignedFlatpakCatalogPayload {
-    /// Validate intrinsic bounds and canonical ordering before signing.
+impl FlatpakCatalogDocument {
+    /// Validate intrinsic bounds and canonical ordering.
     ///
     /// # Errors
     ///
     /// Returns an error when the schema, validity window, bounded fields,
     /// entry contents, or canonical ordering is invalid.
-    pub fn validate(&self) -> Result<(), SignedFlatpakCatalogError> {
-        if self.schema_version != SIGNED_FLATPAK_CATALOG_SCHEMA_VERSION {
-            return Err(SignedFlatpakCatalogError::UnsupportedSchema(
+    pub fn validate(&self) -> Result<(), FlatpakRuntimeCatalogError> {
+        if self.schema_version != FLATPAK_RUNTIME_CATALOG_SCHEMA_VERSION {
+            return Err(FlatpakRuntimeCatalogError::UnsupportedSchema(
                 self.schema_version,
             ));
         }
@@ -376,9 +351,9 @@ impl SignedFlatpakCatalogPayload {
         if self.revision == 0
             || self.issued_at_unix_ms == 0
             || self.expires_at_unix_ms <= self.issued_at_unix_ms
-            || self.expires_at_unix_ms - self.issued_at_unix_ms > MAX_SIGNED_CATALOG_TTL_MS
+            || self.expires_at_unix_ms - self.issued_at_unix_ms > MAX_RUNTIME_CATALOG_TTL_MS
         {
-            return Err(SignedFlatpakCatalogError::InvalidValidityWindow);
+            return Err(FlatpakRuntimeCatalogError::InvalidValidityWindow);
         }
         validate_stable_identity("origin.provider_id", &self.origin.provider_id, MAX_ID_BYTES)?;
         validate_stable_identity(
@@ -387,7 +362,7 @@ impl SignedFlatpakCatalogPayload {
             MAX_ID_BYTES,
         )?;
         if self.entries.len() > MAX_CATALOG_ENTRIES {
-            return Err(SignedFlatpakCatalogError::ResourceLimitExceeded("entries"));
+            return Err(FlatpakRuntimeCatalogError::ResourceLimitExceeded("entries"));
         }
 
         let mut previous_app_id: Option<&str> = None;
@@ -395,9 +370,9 @@ impl SignedFlatpakCatalogPayload {
             entry.validate()?;
             if previous_app_id.is_some_and(|previous| previous >= entry.app_id.as_str()) {
                 return Err(if previous_app_id == Some(entry.app_id.as_str()) {
-                    SignedFlatpakCatalogError::DuplicateAppId
+                    FlatpakRuntimeCatalogError::DuplicateAppId
                 } else {
-                    SignedFlatpakCatalogError::NonCanonicalOrder("entries")
+                    FlatpakRuntimeCatalogError::NonCanonicalOrder("entries")
                 });
             }
             previous_app_id = Some(&entry.app_id);
@@ -405,32 +380,25 @@ impl SignedFlatpakCatalogPayload {
         Ok(())
     }
 
-    fn signing_bytes(&self) -> Result<Vec<u8>, SignedFlatpakCatalogError> {
+    fn canonical_bytes(&self) -> Result<Vec<u8>, FlatpakRuntimeCatalogError> {
         self.validate()?;
-        let payload = serde_json::to_vec(self)
-            .map_err(|_| SignedFlatpakCatalogError::CanonicalEncodingFailed)?;
-        let mut signed =
-            Vec::with_capacity(FLATPAK_CATALOG_SIGNATURE_DOMAIN.len() + payload.len() + 1);
-        signed.extend_from_slice(FLATPAK_CATALOG_SIGNATURE_DOMAIN.as_bytes());
-        signed.push(0);
-        signed.extend_from_slice(&payload);
-        Ok(signed)
+        serde_json::to_vec(self).map_err(|_| FlatpakRuntimeCatalogError::CanonicalEncodingFailed)
     }
 
-    /// Stable lowercase SHA-256 address of the canonical signed payload.
+    /// Stable lowercase SHA-256 address of the canonical catalog content.
     ///
     /// # Errors
     ///
     /// Returns an error when the payload fails validation or cannot be
-    /// serialized into its canonical signing representation.
-    pub fn content_digest(&self) -> Result<String, SignedFlatpakCatalogError> {
+    /// serialized into its canonical representation.
+    pub fn content_digest(&self) -> Result<String, FlatpakRuntimeCatalogError> {
         Ok(format!(
             "sha256:{}",
-            encode_hex(&Sha256::digest(self.signing_bytes()?))
+            encode_hex(&Sha256::digest(self.canonical_bytes()?))
         ))
     }
 
-    /// Search validated rows using only signed deterministic ranking inputs.
+    /// Search validated rows using only deterministic ranking inputs.
     /// Match class sorts before provider weight; stable app identity breaks ties.
     ///
     /// # Errors
@@ -440,7 +408,7 @@ impl SignedFlatpakCatalogPayload {
     pub fn search(
         &self,
         query: &str,
-    ) -> Result<Vec<FlatpakSearchMatch<'_>>, SignedFlatpakCatalogError> {
+    ) -> Result<Vec<FlatpakSearchMatch<'_>>, FlatpakRuntimeCatalogError> {
         self.validate()?;
         let query = normalize_search_query(query)?;
         let query_terms: Vec<&str> = query.split_whitespace().collect();
@@ -485,10 +453,10 @@ impl SignedFlatpakCatalogPayload {
     }
 }
 
-impl SignedFlatpakCatalogEntry {
-    fn validate(&self) -> Result<(), SignedFlatpakCatalogError> {
+impl FlatpakCatalogItem {
+    fn validate(&self) -> Result<(), FlatpakRuntimeCatalogError> {
         if !is_flatpak_app_id(&self.app_id) {
-            return Err(SignedFlatpakCatalogError::InvalidField("app_id"));
+            return Err(FlatpakRuntimeCatalogError::InvalidField("app_id"));
         }
         validate_display_text("display_name", &self.display_name, MAX_TEXT_BYTES)?;
         validate_display_text("summary", &self.summary, MAX_TEXT_BYTES)?;
@@ -503,7 +471,7 @@ impl SignedFlatpakCatalogEntry {
         )?;
         for permission in &self.permissions {
             if !crate::cloud::APP_VM_ALLOWED_CAPABILITIES.contains(&permission.as_str()) {
-                return Err(SignedFlatpakCatalogError::UnsupportedPermission(
+                return Err(FlatpakRuntimeCatalogError::UnsupportedPermission(
                     permission.clone(),
                 ));
             }
@@ -526,67 +494,29 @@ impl SignedFlatpakCatalogEntry {
             .iter()
             .any(|term| term != &term.to_ascii_lowercase())
         {
-            return Err(SignedFlatpakCatalogError::InvalidField("search.terms"));
+            return Err(FlatpakRuntimeCatalogError::InvalidField("search.terms"));
         }
         if self.search.weight > MAX_SEARCH_WEIGHT {
-            return Err(SignedFlatpakCatalogError::InvalidField("search.weight"));
+            return Err(FlatpakRuntimeCatalogError::InvalidField("search.weight"));
         }
         Ok(())
     }
 }
 
-impl SignedFlatpakAppCatalog {
-    /// Sign an intrinsically valid payload with an offline/provider key.
+impl FlatpakRuntimeCatalog {
+    /// Validate freshness, bounds, and canonicality.
     ///
     /// # Errors
     ///
-    /// Returns an error when the signer identity or payload is invalid.
-    pub fn sign(
-        signer_id: impl Into<String>,
-        payload: SignedFlatpakCatalogPayload,
-        signing_key: &SigningKey,
-    ) -> Result<Self, SignedFlatpakCatalogError> {
-        let signer_id = signer_id.into();
-        validate_stable_identity("signer_id", &signer_id, MAX_SIGNER_ID_BYTES)?;
-        let signature = signing_key.sign(&payload.signing_bytes()?);
-        Ok(Self {
-            signer_id,
-            payload,
-            signature: encode_hex(&signature.to_bytes()),
-        })
-    }
-
-    /// Verify exact signer trust, freshness, signature, bounds, and canonicality.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when trust, freshness, signature, bounds, or
-    /// canonicality verification fails.
-    pub fn admit(
-        self,
-        trusted_signer_id: &str,
-        verifying_key: &VerifyingKey,
-        now_unix_ms: u64,
-    ) -> Result<Self, SignedFlatpakCatalogError> {
-        validate_stable_identity("signer_id", &self.signer_id, MAX_SIGNER_ID_BYTES)?;
-        validate_stable_identity("trusted_signer_id", trusted_signer_id, MAX_SIGNER_ID_BYTES)?;
-        if self.signer_id != trusted_signer_id {
-            return Err(SignedFlatpakCatalogError::UntrustedSigner);
-        }
+    /// Returns an error when freshness, bounds, or canonicality validation fails.
+    pub fn admit(self, now_unix_ms: u64) -> Result<Self, FlatpakRuntimeCatalogError> {
+        self.payload.validate()?;
         if now_unix_ms < self.payload.issued_at_unix_ms {
-            return Err(SignedFlatpakCatalogError::NotYetValid);
+            return Err(FlatpakRuntimeCatalogError::NotYetValid);
         }
         if now_unix_ms >= self.payload.expires_at_unix_ms {
-            return Err(SignedFlatpakCatalogError::StaleCatalog);
+            return Err(FlatpakRuntimeCatalogError::StaleCatalog);
         }
-        let signature_bytes =
-            decode_hex_64(&self.signature).ok_or(SignedFlatpakCatalogError::MalformedSignature)?;
-        verifying_key
-            .verify(
-                &self.payload.signing_bytes()?,
-                &Signature::from_bytes(&signature_bytes),
-            )
-            .map_err(|_| SignedFlatpakCatalogError::SignatureMismatch)?;
         Ok(self)
     }
 
@@ -598,16 +528,14 @@ impl SignedFlatpakAppCatalog {
     /// fails catalog admission.
     pub fn decode_and_admit_json(
         body: &[u8],
-        trusted_signer_id: &str,
-        verifying_key: &VerifyingKey,
         now_unix_ms: u64,
-    ) -> Result<Self, SignedFlatpakCatalogError> {
-        if body.len() > MAX_SIGNED_CATALOG_WIRE_BYTES {
-            return Err(SignedFlatpakCatalogError::WirePayloadTooLarge);
+    ) -> Result<Self, FlatpakRuntimeCatalogError> {
+        if body.len() > MAX_RUNTIME_CATALOG_WIRE_BYTES {
+            return Err(FlatpakRuntimeCatalogError::WirePayloadTooLarge);
         }
         let catalog: Self =
-            serde_json::from_slice(body).map_err(|_| SignedFlatpakCatalogError::MalformedJson)?;
-        catalog.admit(trusted_signer_id, verifying_key, now_unix_ms)
+            serde_json::from_slice(body).map_err(|_| FlatpakRuntimeCatalogError::MalformedJson)?;
+        catalog.admit(now_unix_ms)
     }
 }
 
@@ -615,26 +543,26 @@ fn validate_display_text(
     field: &'static str,
     value: &str,
     max_bytes: usize,
-) -> Result<(), SignedFlatpakCatalogError> {
+) -> Result<(), FlatpakRuntimeCatalogError> {
     if value.trim().is_empty()
         || value.trim() != value
         || value.chars().any(char::is_control)
         || contains_secret_material(value)
     {
-        return Err(SignedFlatpakCatalogError::InvalidField(field));
+        return Err(FlatpakRuntimeCatalogError::InvalidField(field));
     }
     if value.len() > max_bytes {
-        return Err(SignedFlatpakCatalogError::FieldTooLong(field));
+        return Err(FlatpakRuntimeCatalogError::FieldTooLong(field));
     }
     Ok(())
 }
 
-fn normalize_search_query(query: &str) -> Result<String, SignedFlatpakCatalogError> {
+fn normalize_search_query(query: &str) -> Result<String, FlatpakRuntimeCatalogError> {
     if query.len() > MAX_SEARCH_QUERY_BYTES {
-        return Err(SignedFlatpakCatalogError::FieldTooLong("search_query"));
+        return Err(FlatpakRuntimeCatalogError::FieldTooLong("search_query"));
     }
     if query.chars().any(char::is_control) || contains_secret_material(query) {
-        return Err(SignedFlatpakCatalogError::InvalidField("search_query"));
+        return Err(FlatpakRuntimeCatalogError::InvalidField("search_query"));
     }
     let normalized = query
         .split_whitespace()
@@ -642,7 +570,7 @@ fn normalize_search_query(query: &str) -> Result<String, SignedFlatpakCatalogErr
         .join(" ")
         .to_ascii_lowercase();
     if normalized.is_empty() {
-        return Err(SignedFlatpakCatalogError::InvalidField("search_query"));
+        return Err(FlatpakRuntimeCatalogError::InvalidField("search_query"));
     }
     Ok(normalized)
 }
@@ -651,7 +579,7 @@ fn validate_stable_identity(
     field: &'static str,
     value: &str,
     max_bytes: usize,
-) -> Result<(), SignedFlatpakCatalogError> {
+) -> Result<(), FlatpakRuntimeCatalogError> {
     if value.trim().is_empty()
         || value.trim() != value
         || value.chars().any(char::is_control)
@@ -662,10 +590,10 @@ fn validate_stable_identity(
         || value.to_ascii_lowercase().starts_with("file:")
         || contains_secret_material(value)
     {
-        return Err(SignedFlatpakCatalogError::InvalidField(field));
+        return Err(FlatpakRuntimeCatalogError::InvalidField(field));
     }
     if value.len() > max_bytes {
-        return Err(SignedFlatpakCatalogError::FieldTooLong(field));
+        return Err(FlatpakRuntimeCatalogError::FieldTooLong(field));
     }
     Ok(())
 }
@@ -675,15 +603,15 @@ fn validate_canonical_list(
     field: &'static str,
     max_items: usize,
     max_bytes: usize,
-) -> Result<(), SignedFlatpakCatalogError> {
+) -> Result<(), FlatpakRuntimeCatalogError> {
     if values.len() > max_items {
-        return Err(SignedFlatpakCatalogError::ResourceLimitExceeded(field));
+        return Err(FlatpakRuntimeCatalogError::ResourceLimitExceeded(field));
     }
     let mut previous: Option<&str> = None;
     for value in values {
         validate_stable_identity(field, value, max_bytes)?;
         if previous.is_some_and(|prior| prior >= value.as_str()) {
-            return Err(SignedFlatpakCatalogError::NonCanonicalOrder(field));
+            return Err(FlatpakRuntimeCatalogError::NonCanonicalOrder(field));
         }
         previous = Some(value);
     }
@@ -714,29 +642,6 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
-}
-
-fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
-    if value.len() != 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return None;
-    }
-    let mut output = [0_u8; 64];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        output[index] = (decode_nibble(chunk[0])? << 4) | decode_nibble(chunk[1])?;
-    }
-    Some(output)
-}
-
-const fn decode_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
 }
 
 fn is_flatpak_app_id(value: &str) -> bool {
@@ -784,14 +689,13 @@ mod tests {
             supported_actions: vec!["launch".into(), "resume".into()],
             provenance: FlatpakCatalogProvenance {
                 source: "curated".into(),
-                signature: Some("sig-42".into()),
             },
             state: FlatpakInstallState::Installed,
         }
     }
 
-    fn signed_entry(app_id: &str) -> SignedFlatpakCatalogEntry {
-        SignedFlatpakCatalogEntry {
+    fn runtime_catalog_item(app_id: &str) -> FlatpakCatalogItem {
+        FlatpakCatalogItem {
             app_id: app_id.into(),
             display_name: "Editor".into(),
             summary: "A guest-owned editor".into(),
@@ -808,9 +712,9 @@ mod tests {
         }
     }
 
-    fn signed_payload() -> SignedFlatpakCatalogPayload {
-        SignedFlatpakCatalogPayload {
-            schema_version: SIGNED_FLATPAK_CATALOG_SCHEMA_VERSION,
+    fn runtime_catalog_document() -> FlatpakCatalogDocument {
+        FlatpakCatalogDocument {
+            schema_version: FLATPAK_RUNTIME_CATALOG_SCHEMA_VERSION,
             catalog_id: "flatpak-curated".into(),
             revision: 42,
             issued_at_unix_ms: NOW - 1_000,
@@ -820,14 +724,14 @@ mod tests {
                 repository_id: "flathub-stable".into(),
             },
             entries: vec![
-                signed_entry("org.example.Editor"),
-                signed_entry("org.example.Terminal"),
+                runtime_catalog_item("org.example.Editor"),
+                runtime_catalog_item("org.example.Terminal"),
             ],
         }
     }
 
     #[test]
-    fn catalog_admits_unique_signed_installed_rows() {
+    fn catalog_admits_unique_installed_rows() {
         let catalog = FlatpakAppCatalog {
             schema_version: FLATPAK_CATALOG_SCHEMA_VERSION,
             revision: "catalog-42".into(),
@@ -881,11 +785,8 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_or_uninstalled_rows_are_not_launchable() {
+    fn uninstalled_rows_are_not_launchable() {
         let mut row = entry("org.example.Editor");
-        row.provenance.signature = None;
-        assert!(!row.is_launchable());
-        row.provenance.signature = Some("sig-42".into());
         row.state = FlatpakInstallState::Stale;
         assert!(!row.is_launchable());
     }
@@ -898,7 +799,7 @@ mod tests {
         assert!(row.validate().is_ok(), "the row remains discoverable");
         assert!(
             !row.is_launchable(),
-            "installed and signed metadata is not implicit launch authority"
+            "installed metadata without a launch action is not implicit launch authority"
         );
     }
 
@@ -914,104 +815,85 @@ mod tests {
     }
 
     #[test]
-    fn signed_catalog_admits_exact_trusted_fresh_untampered_payload() {
-        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let catalog =
-            SignedFlatpakAppCatalog::sign("flatpak-release-2026", signed_payload(), &signing_key)
-                .expect("valid signed catalog");
-
-        assert_eq!(catalog.signature.len(), 128);
+    fn runtime_catalog_admits_fresh_validated_content() {
+        let catalog = FlatpakRuntimeCatalog {
+            payload: runtime_catalog_document(),
+        };
         assert!(catalog
             .payload
             .content_digest()
             .unwrap()
             .starts_with("sha256:"));
-        assert!(catalog
-            .admit("flatpak-release-2026", &verifying_key, NOW)
-            .is_ok());
+        assert!(catalog.admit(NOW).is_ok());
     }
 
     #[test]
-    fn signed_catalog_rejects_time_signer_and_signature_failures() {
-        let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let catalog =
-            SignedFlatpakAppCatalog::sign("trusted", signed_payload(), &signing_key).unwrap();
-
+    fn runtime_catalog_rejects_invalid_freshness_and_addresses_content_changes() {
+        let catalog = FlatpakRuntimeCatalog {
+            payload: runtime_catalog_document(),
+        };
         assert_eq!(
-            catalog.clone().admit("other", &verifying_key, NOW),
-            Err(SignedFlatpakCatalogError::UntrustedSigner)
+            catalog.clone().admit(catalog.payload.issued_at_unix_ms - 1),
+            Err(FlatpakRuntimeCatalogError::NotYetValid)
         );
         assert_eq!(
-            catalog.clone().admit(
-                "trusted",
-                &verifying_key,
-                catalog.payload.issued_at_unix_ms - 1
-            ),
-            Err(SignedFlatpakCatalogError::NotYetValid)
-        );
-        assert_eq!(
-            catalog.clone().admit(
-                "trusted",
-                &verifying_key,
-                catalog.payload.expires_at_unix_ms
-            ),
-            Err(SignedFlatpakCatalogError::StaleCatalog)
+            catalog.clone().admit(catalog.payload.expires_at_unix_ms),
+            Err(FlatpakRuntimeCatalogError::StaleCatalog)
         );
 
+        let original_digest = catalog.payload.content_digest().unwrap();
         let mut tampered = catalog;
         tampered.payload.entries[0].display_name = "Tampered".into();
-        assert_eq!(
-            tampered.admit("trusted", &verifying_key, NOW),
-            Err(SignedFlatpakCatalogError::SignatureMismatch)
-        );
+        assert!(tampered.clone().admit(NOW).is_ok());
+        assert_ne!(tampered.payload.content_digest().unwrap(), original_digest);
     }
 
     #[test]
-    fn signed_catalog_rejects_duplicate_noncanonical_and_oversized_metadata() {
-        let mut duplicate = signed_payload();
+    fn runtime_catalog_rejects_duplicate_noncanonical_and_oversized_metadata() {
+        let mut duplicate = runtime_catalog_document();
         duplicate.entries[1].app_id = duplicate.entries[0].app_id.clone();
         assert_eq!(
             duplicate.validate(),
-            Err(SignedFlatpakCatalogError::DuplicateAppId)
+            Err(FlatpakRuntimeCatalogError::DuplicateAppId)
         );
 
-        let mut unordered = signed_payload();
+        let mut unordered = runtime_catalog_document();
         unordered.entries.swap(0, 1);
         assert_eq!(
             unordered.validate(),
-            Err(SignedFlatpakCatalogError::NonCanonicalOrder("entries"))
+            Err(FlatpakRuntimeCatalogError::NonCanonicalOrder("entries"))
         );
 
-        let mut oversized = signed_payload();
+        let mut oversized = runtime_catalog_document();
         oversized.entries[0].search.terms = (0..=MAX_SEARCH_TERMS)
             .map(|index| format!("term-{index:02}"))
             .collect();
         assert_eq!(
             oversized.validate(),
-            Err(SignedFlatpakCatalogError::ResourceLimitExceeded(
+            Err(FlatpakRuntimeCatalogError::ResourceLimitExceeded(
                 "search.terms"
             ))
         );
 
-        let mut unstable_ranking = signed_payload();
+        let mut unstable_ranking = runtime_catalog_document();
         unstable_ranking.entries[0].search.terms = vec!["text".into(), "editor".into()];
         assert_eq!(
             unstable_ranking.validate(),
-            Err(SignedFlatpakCatalogError::NonCanonicalOrder("search.terms"))
+            Err(FlatpakRuntimeCatalogError::NonCanonicalOrder(
+                "search.terms"
+            ))
         );
     }
 
     #[test]
-    fn signed_catalog_rejects_locators_secrets_and_unsupported_permissions() {
+    fn runtime_catalog_rejects_locators_secrets_and_unsupported_permissions() {
         for (field, poison) in [
             ("version", "https://repo.invalid/app"),
             ("icon_id", "/var/lib/icons/editor.svg"),
             ("guest_profile", "file:///etc/passwd"),
             ("version", "token=super-secret"),
         ] {
-            let mut payload = signed_payload();
+            let mut payload = runtime_catalog_document();
             match field {
                 "version" => payload.entries[0].version = poison.into(),
                 "icon_id" => payload.entries[0].icon_id = poison.into(),
@@ -1020,34 +902,34 @@ mod tests {
             }
             assert_eq!(
                 payload.validate(),
-                Err(SignedFlatpakCatalogError::InvalidField(field))
+                Err(FlatpakRuntimeCatalogError::InvalidField(field))
             );
         }
 
-        let mut unsupported = signed_payload();
+        let mut unsupported = runtime_catalog_document();
         unsupported.entries[0].permissions = vec!["host-filesystem".into()];
         assert_eq!(
             unsupported.validate(),
-            Err(SignedFlatpakCatalogError::UnsupportedPermission(
+            Err(FlatpakRuntimeCatalogError::UnsupportedPermission(
                 "host-filesystem".into()
             ))
         );
     }
 
     #[test]
-    fn signed_catalog_json_refuses_unknown_fields_and_schema_skew() {
-        let mut value = serde_json::to_value(signed_payload()).unwrap();
+    fn runtime_catalog_json_refuses_unknown_fields_and_schema_skew() {
+        let mut value = serde_json::to_value(runtime_catalog_document()).unwrap();
         value
             .as_object_mut()
             .unwrap()
             .insert("download_url".into(), serde_json::json!("https://invalid"));
-        assert!(serde_json::from_value::<SignedFlatpakCatalogPayload>(value).is_err());
+        assert!(serde_json::from_value::<FlatpakCatalogDocument>(value).is_err());
 
-        let mut skewed = signed_payload();
+        let mut skewed = runtime_catalog_document();
         skewed.schema_version += 1;
         assert_eq!(
             skewed.validate(),
-            Err(SignedFlatpakCatalogError::UnsupportedSchema(2))
+            Err(FlatpakRuntimeCatalogError::UnsupportedSchema(2))
         );
 
         let legacy_unknown = r#"{"schema_version":1,"revision":"r","entries":[],"extra":true}"#;
@@ -1055,47 +937,29 @@ mod tests {
     }
 
     #[test]
-    fn signed_catalog_bounds_json_before_parsing_and_rejects_duplicate_keys() {
-        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let catalog =
-            SignedFlatpakAppCatalog::sign("trusted", signed_payload(), &signing_key).unwrap();
+    fn runtime_catalog_bounds_json_before_parsing_and_rejects_duplicate_keys() {
+        let catalog = FlatpakRuntimeCatalog {
+            payload: runtime_catalog_document(),
+        };
         let body = serde_json::to_vec(&catalog).unwrap();
-        assert!(SignedFlatpakAppCatalog::decode_and_admit_json(
-            &body,
-            "trusted",
-            &verifying_key,
-            NOW
-        )
-        .is_ok());
+        assert!(FlatpakRuntimeCatalog::decode_and_admit_json(&body, NOW).is_ok());
 
-        let oversized = vec![b' '; MAX_SIGNED_CATALOG_WIRE_BYTES + 1];
+        let oversized = vec![b' '; MAX_RUNTIME_CATALOG_WIRE_BYTES + 1];
         assert_eq!(
-            SignedFlatpakAppCatalog::decode_and_admit_json(
-                &oversized,
-                "trusted",
-                &verifying_key,
-                NOW
-            ),
-            Err(SignedFlatpakCatalogError::WirePayloadTooLarge)
+            FlatpakRuntimeCatalog::decode_and_admit_json(&oversized, NOW),
+            Err(FlatpakRuntimeCatalogError::WirePayloadTooLarge)
         );
 
-        let duplicate =
-            br#"{"signer_id":"trusted","signer_id":"trusted","payload":{},"signature":"00"}"#;
+        let duplicate = br#"{"payload":{},"payload":{}}"#;
         assert_eq!(
-            SignedFlatpakAppCatalog::decode_and_admit_json(
-                duplicate,
-                "trusted",
-                &verifying_key,
-                NOW
-            ),
-            Err(SignedFlatpakCatalogError::MalformedJson)
+            FlatpakRuntimeCatalog::decode_and_admit_json(duplicate, NOW),
+            Err(FlatpakRuntimeCatalogError::MalformedJson)
         );
     }
 
     #[test]
-    fn signed_catalog_search_is_validated_ranked_and_stably_tied() {
-        let mut payload = signed_payload();
+    fn runtime_catalog_search_is_validated_ranked_and_stably_tied() {
+        let mut payload = runtime_catalog_document();
         let tied = payload.search("  EDITOR  ").expect("normalized query");
         assert_eq!(tied.len(), 2);
         assert_eq!(tied[0].score, tied[1].score);
@@ -1109,11 +973,11 @@ mod tests {
 
         assert_eq!(
             payload.search("token=do-not-search"),
-            Err(SignedFlatpakCatalogError::InvalidField("search_query"))
+            Err(FlatpakRuntimeCatalogError::InvalidField("search_query"))
         );
         assert_eq!(
             payload.search(&"q".repeat(MAX_SEARCH_QUERY_BYTES + 1)),
-            Err(SignedFlatpakCatalogError::FieldTooLong("search_query"))
+            Err(FlatpakRuntimeCatalogError::FieldTooLong("search_query"))
         );
     }
 }

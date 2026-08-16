@@ -10,7 +10,6 @@
     reason = "this established wire contract exposes validation errors through its typed Result APIs"
 )]
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -27,15 +26,13 @@ pub const ANDROID_IMAGE_PACKAGE_MANIFEST_SCHEMA_VERSION: u16 = 1;
 /// The only version of the per-Android-VM guest inventory currently admitted.
 pub const ANDROID_GUEST_INVENTORY_SCHEMA_VERSION: u16 = 2;
 
-/// The only signed Android catalog envelope schema currently admitted.
-pub const ANDROID_SIGNED_CATALOG_SCHEMA_VERSION: u16 = 1;
-/// Domain separator for Android catalog Ed25519 signatures.
-pub const ANDROID_CATALOG_SIGNATURE_DOMAIN: &str = "magic-mesh:android-catalog:v1";
-/// Maximum validity period of one signed catalog.
+/// The only Android runtime catalog schema currently admitted.
+pub const ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION: u16 = 1;
+/// Maximum freshness period of one runtime catalog.
 pub const MAX_ANDROID_CATALOG_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Mesh state topic prefix for admitted Android catalogs.
 pub const ANDROID_CATALOG_STATE_TOPIC_PREFIX: &str = "state/android/catalog/";
-/// Mesh action topic prefix for importing a signed Android catalog.
+/// Mesh action topic prefix for importing an Android catalog.
 pub const ANDROID_CATALOG_IMPORT_TOPIC_PREFIX: &str = "action/android/catalog/import/";
 
 /// Maximum age a producer may put on one Android guest observation.
@@ -819,7 +816,7 @@ pub enum AndroidResourceClass {
     Media,
 }
 
-/// Bounded resource ceiling signed for one governed Android application.
+/// Bounded resource ceiling for one governed Android application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AndroidResourceProfile {
@@ -857,7 +854,7 @@ pub enum AndroidCatalogGuestReadiness {
     BootedInventoryAndLauncherReady,
 }
 
-/// Signed policy metadata for one existing governed starter-app identity.
+/// Policy metadata for one existing governed starter-app identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AndroidCatalogAppPolicy {
@@ -881,19 +878,19 @@ impl AndroidCatalogAppPolicy {
     }
 }
 
-/// Canonical unsigned payload covered by an Android catalog signature.
+/// Canonical Android runtime catalog document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AndroidCatalogPayload {
-    /// Signed-catalog schema discriminator.
+    /// Runtime-catalog schema discriminator.
     pub schema_version: u16,
     /// Bounded stable catalog identity.
     pub catalog_id: String,
     /// Positive monotonic provider revision.
     pub revision: u64,
-    /// Signature issue time in Unix epoch milliseconds.
+    /// Publication time in Unix epoch milliseconds.
     pub issued_at_unix_ms: u64,
-    /// Signature expiry time in Unix epoch milliseconds.
+    /// Freshness expiry time in Unix epoch milliseconds.
     pub expires_at_unix_ms: u64,
     /// Existing governed image and starter-app catalog authority.
     pub image_manifest: AndroidImageManifest,
@@ -904,9 +901,9 @@ pub struct AndroidCatalogPayload {
 }
 
 impl AndroidCatalogPayload {
-    /// Validate the complete unsigned payload before signing or verification.
+    /// Validate the complete catalog document.
     pub fn validate(&self) -> Result<(), AndroidCatalogAdmissionError> {
-        if self.schema_version != ANDROID_SIGNED_CATALOG_SCHEMA_VERSION {
+        if self.schema_version != ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION {
             return Err(AndroidCatalogAdmissionError::UnsupportedSchema(
                 self.schema_version,
             ));
@@ -951,89 +948,46 @@ impl AndroidCatalogPayload {
         Ok(())
     }
 
-    fn signing_bytes(&self) -> Result<Vec<u8>, AndroidCatalogAdmissionError> {
+    fn canonical_bytes(&self) -> Result<Vec<u8>, AndroidCatalogAdmissionError> {
         self.validate()?;
-        let payload = serde_json::to_vec(self)
-            .map_err(|_| AndroidCatalogAdmissionError::CanonicalEncodingFailed)?;
-        let mut signed =
-            Vec::with_capacity(ANDROID_CATALOG_SIGNATURE_DOMAIN.len() + payload.len() + 1);
-        signed.extend_from_slice(ANDROID_CATALOG_SIGNATURE_DOMAIN.as_bytes());
-        signed.push(0);
-        signed.extend_from_slice(&payload);
-        Ok(signed)
+        serde_json::to_vec(self).map_err(|_| AndroidCatalogAdmissionError::CanonicalEncodingFailed)
     }
 
-    /// Stable lowercase SHA-256 content address of the canonical signed payload.
+    /// Stable lowercase SHA-256 content address of the canonical catalog.
     pub fn content_digest(&self) -> Result<String, AndroidCatalogAdmissionError> {
-        let digest = Sha256::digest(self.signing_bytes()?);
+        let digest = Sha256::digest(self.canonical_bytes()?);
         Ok(format!("sha256:{}", encode_hex(&digest)))
     }
 }
 
-/// Ed25519-signed Android catalog envelope admitted by provider importers.
+/// Content-addressed Android catalog admitted by provider importers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AndroidSignedCatalog {
-    /// Bounded key-rotation identity selected by local trust policy.
-    pub signer_id: String,
+pub struct AndroidRuntimeCatalog {
     /// Canonical catalog payload.
     pub payload: AndroidCatalogPayload,
-    /// Lowercase 64-byte Ed25519 signature encoded as 128 hex characters.
-    pub signature: String,
 }
 
-impl AndroidSignedCatalog {
-    /// Sign an intrinsically valid payload with an offline/provider key.
-    pub fn sign(
-        signer_id: impl Into<String>,
-        payload: AndroidCatalogPayload,
-        signing_key: &SigningKey,
-    ) -> Result<Self, AndroidCatalogAdmissionError> {
-        let signer_id = signer_id.into();
-        validate_catalog_route_identity(&signer_id)?;
-        let signature = signing_key.sign(&payload.signing_bytes()?);
-        Ok(Self {
-            signer_id,
-            payload,
-            signature: encode_hex(&signature.to_bytes()),
-        })
-    }
-
-    /// Verify signer scope, validity window, payload signature, and every bound.
-    pub fn admit(
-        self,
-        trusted_signer_id: &str,
-        verifying_key: &VerifyingKey,
-        now_unix_ms: u64,
-    ) -> Result<Self, AndroidCatalogAdmissionError> {
-        validate_catalog_route_identity(&self.signer_id)?;
-        if self.signer_id != trusted_signer_id {
-            return Err(AndroidCatalogAdmissionError::UntrustedSigner);
-        }
+impl AndroidRuntimeCatalog {
+    /// Validate freshness and every structural/content bound.
+    pub fn admit(self, now_unix_ms: u64) -> Result<Self, AndroidCatalogAdmissionError> {
+        self.payload.validate()?;
         if now_unix_ms < self.payload.issued_at_unix_ms {
             return Err(AndroidCatalogAdmissionError::NotYetValid);
         }
         if now_unix_ms > self.payload.expires_at_unix_ms {
             return Err(AndroidCatalogAdmissionError::StaleCatalog);
         }
-        let signature_bytes = decode_hex_64(&self.signature)
-            .ok_or(AndroidCatalogAdmissionError::MalformedSignature)?;
-        verifying_key
-            .verify(
-                &self.payload.signing_bytes()?,
-                &Signature::from_bytes(&signature_bytes),
-            )
-            .map_err(|_| AndroidCatalogAdmissionError::SignatureMismatch)?;
         Ok(self)
     }
 }
 
-/// Why a signed Android app/image catalog failed closed.
+/// Why an Android app/image catalog failed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AndroidCatalogAdmissionError {
     /// The consumer does not implement this signed envelope version.
     UnsupportedSchema(u16),
-    /// Catalog or signer identity is unsafe or over its wire bound.
+    /// Catalog identity is unsafe or over its wire bound.
     InvalidCatalogIdentity,
     /// Issue/expiry timestamps are invalid or exceed the maximum TTL.
     InvalidValidityWindow,
@@ -1041,12 +995,6 @@ pub enum AndroidCatalogAdmissionError {
     NotYetValid,
     /// The catalog has expired.
     StaleCatalog,
-    /// The signer is not the exact locally trusted identity.
-    UntrustedSigner,
-    /// Signature text is not exactly lowercase Ed25519 hex.
-    MalformedSignature,
-    /// Signature verification failed.
-    SignatureMismatch,
     /// Existing Android app/image contract admission failed.
     InvalidAppContract(AndroidAppContractError),
     /// Package versions are not bound to the same immutable image manifest.
@@ -1074,7 +1022,7 @@ pub fn android_catalog_state_topic(node: &str) -> Result<String, AndroidCatalogA
     Ok(format!("{ANDROID_CATALOG_STATE_TOPIC_PREFIX}{node}"))
 }
 
-/// Build the node-scoped signed Android catalog import action topic.
+/// Build the node-scoped Android catalog import action topic.
 pub fn android_catalog_import_topic(node: &str) -> Result<String, AndroidCatalogAdmissionError> {
     validate_catalog_route_identity(node)?;
     Ok(format!("{ANDROID_CATALOG_IMPORT_TOPIC_PREFIX}{node}"))
@@ -1105,29 +1053,6 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
-    if value.len() != 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return None;
-    }
-    let mut decoded = [0_u8; 64];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Some(decoded)
-}
-
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
-}
-
 /// Closed state of the inner Android guest at inventory observation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1143,7 +1068,6 @@ pub enum AndroidGuestBootState {
     /// The guest cannot currently provide an inventory.
     Unavailable,
 }
-
 
 impl AndroidGuestBootState {
     /// Honest user-facing boot-state label.
@@ -1220,7 +1144,6 @@ pub enum AndroidLauncherResolvability {
     /// The package exists or was expected, but its launcher is not usable.
     Unavailable,
 }
-
 
 /// Bounded package version evidence from the Android guest package manager.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2310,7 +2233,7 @@ mod tests {
             .expect("valid Android image package manifest")
     }
 
-    fn valid_signed_catalog_payload() -> AndroidCatalogPayload {
+    fn valid_runtime_catalog_payload() -> AndroidCatalogPayload {
         let policies = AospStarterApp::ALL
             .into_iter()
             .map(|app| AndroidCatalogAppPolicy {
@@ -2330,7 +2253,7 @@ mod tests {
             })
             .collect();
         AndroidCatalogPayload {
-            schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+            schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
             catalog_id: "aosp-starter-production".into(),
             revision: 7,
             issued_at_unix_ms: 1_786_000_000_200,
@@ -2342,26 +2265,20 @@ mod tests {
     }
 
     #[test]
-    fn signed_catalog_admission_binds_image_packages_policy_and_topics() {
-        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
-        let payload = valid_signed_catalog_payload();
+    fn runtime_catalog_admission_binds_image_packages_policy_and_topics() {
+        let payload = valid_runtime_catalog_payload();
         let digest = payload.content_digest().expect("catalog content digest");
         assert!(digest.starts_with("sha256:"));
         assert_eq!(digest.len(), 71);
 
-        let catalog = AndroidSignedCatalog::sign("android-release-v1", payload, &signing_key)
-            .expect("signed catalog");
-        let body = serde_json::to_string(&catalog).expect("serialize signed catalog");
-        let decoded: AndroidSignedCatalog =
-            serde_json::from_str(&body).expect("deserialize signed catalog");
+        let catalog = AndroidRuntimeCatalog { payload };
+        let body = serde_json::to_string(&catalog).expect("serialize runtime catalog");
+        let decoded: AndroidRuntimeCatalog =
+            serde_json::from_str(&body).expect("deserialize runtime catalog");
         assert_eq!(
             decoded
-                .admit(
-                    "android-release-v1",
-                    &signing_key.verifying_key(),
-                    1_786_000_000_300,
-                )
-                .expect("admitted signed catalog"),
+                .admit(1_786_000_000_300)
+                .expect("admitted runtime catalog"),
             catalog
         );
         assert_eq!(
@@ -2375,66 +2292,41 @@ mod tests {
     }
 
     #[test]
-    fn signed_catalog_refuses_unsigned_tampered_untrusted_and_stale_input() {
-        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
-        let catalog = AndroidSignedCatalog::sign(
-            "android-release-v1",
-            valid_signed_catalog_payload(),
-            &signing_key,
-        )
-        .expect("signed catalog");
-        let mut unsigned = serde_json::to_value(&catalog).expect("catalog JSON");
-        unsigned
-            .as_object_mut()
-            .expect("catalog object")
-            .remove("signature");
-        assert!(serde_json::from_value::<AndroidSignedCatalog>(unsigned).is_err());
-
+    fn runtime_catalog_tracks_content_and_refuses_stale_input() {
+        let catalog = AndroidRuntimeCatalog {
+            payload: valid_runtime_catalog_payload(),
+        };
+        let original_digest = catalog.payload.content_digest().expect("content digest");
         let mut tampered = catalog.clone();
         tampered.payload.revision += 1;
-        assert_eq!(
-            tampered.admit(
-                "android-release-v1",
-                &signing_key.verifying_key(),
-                1_786_000_000_300,
-            ),
-            Err(AndroidCatalogAdmissionError::SignatureMismatch)
+        assert_ne!(
+            tampered.payload.content_digest().expect("changed digest"),
+            original_digest
         );
+        assert!(tampered.admit(1_786_000_000_300).is_ok());
         assert_eq!(
-            catalog.clone().admit(
-                "other-release-key",
-                &signing_key.verifying_key(),
-                1_786_000_000_300,
-            ),
-            Err(AndroidCatalogAdmissionError::UntrustedSigner)
-        );
-        assert_eq!(
-            catalog.admit(
-                "android-release-v1",
-                &signing_key.verifying_key(),
-                1_786_000_060_201,
-            ),
+            catalog.admit(1_786_000_060_201),
             Err(AndroidCatalogAdmissionError::StaleCatalog)
         );
     }
 
     #[test]
     fn catalog_payload_refuses_incompatible_over_limit_and_hostile_policy() {
-        let mut incompatible = valid_signed_catalog_payload();
+        let mut incompatible = valid_runtime_catalog_payload();
         incompatible.schema_version += 1;
         assert_eq!(
             incompatible.validate(),
             Err(AndroidCatalogAdmissionError::UnsupportedSchema(2))
         );
 
-        let mut over_limit = valid_signed_catalog_payload();
+        let mut over_limit = valid_runtime_catalog_payload();
         over_limit.app_policies[0].resources.memory_mib = MAX_ANDROID_MEMORY_MIB + 1;
         assert_eq!(
             over_limit.validate(),
             Err(AndroidCatalogAdmissionError::ResourceLimitExceeded)
         );
 
-        let mut duplicate_permission = valid_signed_catalog_payload();
+        let mut duplicate_permission = valid_runtime_catalog_payload();
         duplicate_permission.app_policies[0].permissions =
             vec![AndroidAppPermission::Network, AndroidAppPermission::Network];
         assert_eq!(
@@ -2442,14 +2334,14 @@ mod tests {
             Err(AndroidCatalogAdmissionError::InvalidPolicyList)
         );
 
-        let mut wrong_image = valid_signed_catalog_payload();
+        let mut wrong_image = valid_runtime_catalog_payload();
         wrong_image.package_manifest.image_provenance.image_id = "different-image".into();
         assert_eq!(
             wrong_image.validate(),
             Err(AndroidCatalogAdmissionError::ImageBindingMismatch)
         );
 
-        let mut reordered = valid_signed_catalog_payload();
+        let mut reordered = valid_runtime_catalog_payload();
         reordered.app_policies.swap(0, 1);
         assert_eq!(
             reordered.validate(),
@@ -2463,7 +2355,7 @@ mod tests {
             android_catalog_import_topic("../node"),
             Err(AndroidCatalogAdmissionError::InvalidCatalogIdentity)
         );
-        let body = serde_json::to_string(&valid_signed_catalog_payload()).expect("payload JSON");
+        let body = serde_json::to_string(&valid_runtime_catalog_payload()).expect("payload JSON");
         let hostile = body.replacen('{', r#"{"command":"adb shell","#, 1);
         assert!(serde_json::from_str::<AndroidCatalogPayload>(&hostile).is_err());
     }

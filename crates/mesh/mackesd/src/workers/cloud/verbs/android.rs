@@ -35,7 +35,7 @@ use mackes_mesh_types::android_apps::{
     AndroidAppContractError, AndroidAppInventory, AndroidGuestBoundaryError,
     AndroidGuestInventoryRequest, AndroidGuestInventoryResponse, AndroidGuestLaunchOutcome,
     AndroidGuestLaunchRequest, AndroidGuestRequest, AndroidGuestResponse, AndroidImageManifest,
-    AndroidImagePackageManifest, AndroidSignedCatalog,
+    AndroidImagePackageManifest, AndroidRuntimeCatalog,
 };
 use mackes_mesh_types::android_provider::AndroidVdiSource;
 use mackes_mesh_types::cloud::{CloudReply, DeliveryType, HealthState, WorkloadSpec};
@@ -671,7 +671,7 @@ fn persistence_error(path: &Path, error: impl std::fmt::Display) -> AndroidInven
 /// This is deliberately pure: it validates the closed image manifest, then
 /// copies only its immutable identity and digest into the existing
 /// [`WorkloadSpec`] fields. The production `android-provision` path supplies the
-/// manifest from the re-verified durable signed catalog; request fields never
+/// manifest from the re-validated durable catalog; request fields never
 /// select or override it.
 pub(super) fn android_spec_from_manifest(
     node: &str,
@@ -693,7 +693,7 @@ fn build_reply(
     state_root: &Path,
     verb_name: &str,
     body: &CloudActionBody,
-    catalog: &AndroidSignedCatalog,
+    catalog: &AndroidRuntimeCatalog,
     artifact: Option<&Path>,
     host_probe: &dyn AndroidHostProbe,
     provider_healthy: bool,
@@ -933,14 +933,13 @@ pub(super) fn android_spec(node: &str, name: &str) -> WorkloadSpec {
 mod tests {
     use super::*;
     use crate::workers::cloud::android_provider::AndroidHostFacts;
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
         AndroidAppAvailability, AndroidAppCapability, AndroidAppPermission, AndroidAppReadiness,
         AndroidCatalogAppPolicy, AndroidCatalogGuestReadiness, AndroidCatalogPayload,
         AndroidGuestBootState, AndroidGuestInventoryResponse, AndroidImagePackage,
         AndroidImageProvenance, AndroidLaunchReadiness, AndroidLauncherResolvability,
         AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterApp,
-        AospStarterCatalog, ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AospStarterCatalog, ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use std::io;
     use std::sync::Arc;
@@ -963,7 +962,7 @@ mod tests {
         .expect("valid Android image manifest")
     }
 
-    fn admitted_catalog() -> AndroidSignedCatalog {
+    fn admitted_catalog() -> AndroidRuntimeCatalog {
         let image_manifest = valid_android_image_manifest();
         let image_provenance =
             AndroidImageProvenance::from_manifest(&image_manifest).expect("valid image provenance");
@@ -995,11 +994,9 @@ mod tests {
                 guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
             })
             .collect();
-        let key = SigningKey::from_bytes(&[19; 32]);
-        AndroidSignedCatalog::sign(
-            "android-release-v1",
-            AndroidCatalogPayload {
-                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AndroidRuntimeCatalog {
+            payload: AndroidCatalogPayload {
+                schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: "android-production".into(),
                 revision: 7,
                 issued_at_unix_ms: NOW - 1_000,
@@ -1008,11 +1005,9 @@ mod tests {
                 package_manifest,
                 app_policies,
             },
-            &key,
-        )
-        .expect("signed catalog")
-        .admit("android-release-v1", &key.verifying_key(), NOW)
-        .expect("admitted signed catalog")
+        }
+        .admit(NOW)
+        .expect("admitted runtime catalog")
     }
 
     struct ReadyProbe {

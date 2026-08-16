@@ -16,7 +16,6 @@
 #     --farm-job <job-id> --farm-slot <host/slot> \
 #     --sbom package=pass --sbom-manifest sbom.json \
 #     --gate-manifest gate-manifest.json --ci-gate-status ci-gate-status.json \
-#     --resource-publisher-attestation resource-publisher-attestation.json \
 #     --vdi-evidence vdi-evidence.json \
 #     --fedora-target fedora-44=pass \
 #     --live-gate dell-gui=unavailable \
@@ -53,7 +52,6 @@ Commands:
         --check GITHUB_CHECK=STATUS... --farm-job ID... --farm-slot ID...
         --sbom NAME=STATUS... --sbom-manifest FILE
         --gate-manifest FILE --ci-gate-status FILE \
-        --resource-publisher-attestation FILE \
         --topology-evidence FILE \
         --vdi-evidence FILE \
         --fedora-target TARGET=STATUS...
@@ -66,11 +64,6 @@ Statuses:
   pass | fail | blocked | not-run | unavailable
 
 The production verdict additionally accepts: not-promoted.
---resource-publisher-attestation is optional for preview/not-promoted evidence,
-but mandatory for a production pass. It is a detached
-ResourcePublisherAttestation JSON envelope carrying the existing HMAC
-publisher-attestation:v1 proof; this helper never accepts or invents a secret
-key. The --resource-publication-attestation spelling is accepted as an alias.
 All required sections must be present and non-empty except
 unavailable_evidence, which may be an explicit empty array.
 `write-binding` re-verifies the supplied green CI gate status and its sibling
@@ -239,43 +232,6 @@ manifest_json() {
     '{path: $path, size_bytes: $size, sha256: $sha256}'
 }
 
-resource_publisher_attestation_shape() {
-  local path="$1"
-  jq -e '
-    def identifier_ok:
-      (type == "string") and (length > 0) and (length <= 255) and
-      test("^[A-Za-z0-9._:/@+-]+$") and
-      (startswith("/") | not) and (endswith("/") | not) and
-      (contains("//") | not) and
-      (split("/") | all(.[]; . != "." and . != ".."));
-    (type == "object") and
-    (keys == ["catalog_content_digest", "expires_at_ms", "issued_at_ms", "key_id", "publisher", "schema_version", "signature"]) and
-    (.schema_version | type == "number" and floor == . and . == 1) and
-    (.publisher | identifier_ok) and
-    (.key_id | type == "string" and . == "resource-publisher-hmac-v1") and
-    (.catalog_content_digest | type == "string" and test("^catalog:v1:[0-9a-f]{64}$")) and
-    (.issued_at_ms | type == "number" and floor == . and . > 0) and
-    (.expires_at_ms | type == "number" and floor == . and . > 0) and
-    (.expires_at_ms > .issued_at_ms) and
-    ((.expires_at_ms - .issued_at_ms) >= 1000) and
-    ((.expires_at_ms - .issued_at_ms) <= 604800000) and
-    (.signature | type == "string" and test("^publisher-attestation:v1:[0-9a-f]{64}$"))
-  ' "$path" >/dev/null
-}
-
-resource_publisher_attestation_json() {
-  local path="$1" descriptor attestation
-  [ -s "$path" ] || die "resource publisher attestation is missing or empty: $path"
-  [ -f "$path" ] && [ ! -L "$path" ] || die "resource publisher attestation is not a regular, non-symlink file: $path"
-  resource_publisher_attestation_shape "$path" \
-    || die "resource publisher attestation is not a valid HMAC publisher-attestation:v1 envelope: $path"
-  descriptor="$(manifest_json "resource publisher attestation" "$path")"
-  attestation="$(jq -cS . "$path")" \
-    || die "resource publisher attestation is not valid JSON: $path"
-  jq -cn --argjson descriptor "$descriptor" --argjson attestation "$attestation" \
-    '$descriptor + $attestation'
-}
-
 binding_payload() {
   jq -cS '{source_commit,
     artifacts,
@@ -285,12 +241,7 @@ binding_payload() {
     topology_evidence: .provenance.topology_evidence,
     vdi_evidence: .provenance.vdi_evidence,
     gates: {checks, farm, sbom, fedora_matrix, live_gates,
-      unavailable_evidence, verdict}} +
-    (if .schema_version == 5 then
-       {resource_publisher_attestation: .provenance.resource_publisher_attestation}
-     else
-       {}
-     end)' "$1"
+      unavailable_evidence, verdict}}' "$1"
 }
 
 # The ci-gate status proves a revision/job/host/slot run and authenticates its
@@ -620,23 +571,6 @@ close_stable_descriptor() {
     || die "could not remove private $descriptor_kind validation snapshot directory"
 }
 
-verify_resource_publisher_attestation() {
-  local descriptor="$1" path input identity metadata digest fd
-  local expected_attestation actual_attestation
-  open_stable_descriptor "resource publisher attestation" \
-    "$(jq -c '{path, sha256, size_bytes}' <<<"$descriptor")" \
-    path input identity metadata digest fd
-  resource_publisher_attestation_shape "$input" \
-    || die "resource publisher attestation is not a valid HMAC publisher-attestation:v1 envelope: $path"
-  expected_attestation="$(jq -cS 'del(.path, .sha256, .size_bytes)' <<<"$descriptor")"
-  actual_attestation="$(jq -cS . "$input")" \
-    || die "resource publisher attestation is not valid JSON: $path"
-  [ "$actual_attestation" = "$expected_attestation" ] \
-    || die "resource publisher attestation descriptor does not match its file: $path"
-  close_stable_descriptor "resource publisher attestation" "$path" "$identity" "$fd" \
-    "$input" "$metadata" "$digest"
-}
-
 verify_production_gate_manifest() {
   local gate_manifest="$1" source_commit="$2"
   [ -x "$SCRIPT_DIR/verify-release-gate-matrix.py" ] \
@@ -710,26 +644,9 @@ validate_file() {
     def ci_farm_slots_ok:
       (.provenance.ci_gate_status == null) or
       all(.farm.slot_ids[]; farm_host_slot);
-    def resource_publisher_attestation_descriptor_ok:
-      (type == "object") and
-      (keys == ["catalog_content_digest", "expires_at_ms", "issued_at_ms", "key_id", "path", "publisher", "schema_version", "sha256", "signature", "size_bytes"]) and
-      (.path | type == "string" and length > 0) and
-      (.size_bytes | type == "number" and floor == . and . > 0) and
-      (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
-      (.schema_version | type == "number" and floor == . and . == 1) and
-      (.publisher | type == "string" and length > 0 and length <= 255 and test("^[A-Za-z0-9._:/@+-]+$")) and
-      (.key_id | type == "string" and . == "resource-publisher-hmac-v1") and
-      (.catalog_content_digest | type == "string" and test("^catalog:v1:[0-9a-f]{64}$")) and
-      (.issued_at_ms | type == "number" and floor == . and . > 0) and
-      (.expires_at_ms | type == "number" and floor == . and . > 0) and
-      (.expires_at_ms > .issued_at_ms) and
-      ((.expires_at_ms - .issued_at_ms) >= 1000) and
-      ((.expires_at_ms - .issued_at_ms) <= 604800000) and
-      (.signature | type == "string" and test("^publisher-attestation:v1:[0-9a-f]{64}$"));
     def production_verdict_ok:
       # Production promotion is valid only when every declared release gate is
-      # an observed pass, no live or hardware evidence is unavailable, and a
-      # current authenticated resource-publication proof is attached.
+      # an observed pass and no live or hardware evidence is unavailable.
       (.verdict.production != "pass") or
       (
         (.checks | all(.[]; .status == "pass")) and
@@ -742,10 +659,7 @@ validate_file() {
         (.provenance.topology_evidence | type == "object") and
         (.provenance.topology_evidence.verification.live_required == true) and
         (.provenance.topology_evidence.verification.revision == .source_commit) and
-        (.provenance.vdi_evidence | type == "object") and
-        (.provenance.resource_publisher_attestation | resource_publisher_attestation_descriptor_ok) and
-        (.provenance.resource_publisher_attestation.issued_at_ms <= (now * 1000 | floor)) and
-        (.provenance.resource_publisher_attestation.expires_at_ms > (now * 1000 | floor))
+        (.provenance.vdi_evidence | type == "object")
       );
 
     (type == "object") and
@@ -781,7 +695,7 @@ validate_file() {
       (. == (sort | unique))) and
     (if .schema_version == $schema_version then
        (.provenance | type == "object" and
-        (keys == ["binding_sha256", "ci_gate_status", "gate_manifest", "resource_publisher_attestation", "sbom_manifest", "schema_version", "topology_evidence", "vdi_evidence"]) and
+        (keys == ["binding_sha256", "ci_gate_status", "gate_manifest", "sbom_manifest", "schema_version", "topology_evidence", "vdi_evidence"]) and
         (.schema_version == 1) and
         (.binding_sha256 | type == "string" and test("^[0-9a-f]{64}$")))
      elif .schema_version == $legacy_schema_version then
@@ -818,8 +732,6 @@ validate_file() {
        (.provenance.vdi_evidence.path | type == "string" and length > 0) and
        (.provenance.vdi_evidence.size_bytes | type == "number" and floor == . and . > 0) and
        (.provenance.vdi_evidence.sha256 | type == "string" and test("^[0-9a-f]{64}$")))) and
-    ((.provenance.resource_publisher_attestation == null) or
-      (.provenance.resource_publisher_attestation | resource_publisher_attestation_descriptor_ok)) and
     (.verdict | type == "object" and (keys == ["preview", "production"]) and
       (.preview | verdict_ok) and (.production | verdict_ok))
     and production_verdict_ok
@@ -837,12 +749,6 @@ validate_file() {
       "$gate_input" \
       "$(jq -r '.source_commit' "$file")" \
       || die "production gate manifest is not the complete canonical matrix for the source revision: $gate_path"
-  fi
-  if [ "$(jq -r '.provenance.resource_publisher_attestation // empty' "$file")" ]; then
-    verify_resource_publisher_attestation \
-      "$(jq -c '.provenance.resource_publisher_attestation' "$file")"
-  elif [ "$(jq -r '.verdict.production' "$file")" = "pass" ]; then
-    die "production pass requires an authenticated resource publisher attestation descriptor"
   fi
   if [ "$(jq -r '.provenance.topology_evidence // empty' "$file")" ]; then
     local topology_path
@@ -920,7 +826,7 @@ validate_file() {
 }
 
 write_evidence() {
-  local out="" source_commit="" preview="" production="" sbom_manifest="" gate_manifest="" ci_gate_status="" resource_publisher_attestation="" topology_evidence="" vdi_evidence="" arg parent parent_identity current_parent_identity tmp binding topology_verification topology_descriptor farm
+  local out="" source_commit="" preview="" production="" sbom_manifest="" gate_manifest="" ci_gate_status="" topology_evidence="" vdi_evidence="" arg parent parent_identity current_parent_identity tmp binding topology_verification topology_descriptor farm
   local -a topology_verify_args=()
   local -a artifacts=() checks=() farm_jobs=() farm_slots=() sbom=()
   local -a fedora=() live_gates=() unavailable=()
@@ -961,13 +867,6 @@ write_evidence() {
         [ "$#" -ge 2 ] || die "--ci-gate-status needs a file"
         [ -z "$ci_gate_status" ] || die "--ci-gate-status may be supplied only once"
         ci_gate_status="$2"
-        shift 2
-        ;;
-      --resource-publisher-attestation|--resource-publication-attestation)
-        [ "$#" -ge 2 ] || die "$1 needs a file"
-        [ -z "$resource_publisher_attestation" ] \
-          || die "resource publisher attestation may be supplied only once"
-        resource_publisher_attestation="$2"
         shift 2
         ;;
       --topology-evidence)
@@ -1025,9 +924,6 @@ write_evidence() {
   if [ "$production" = "pass" ] && [ -z "$topology_evidence" ]; then
     die "production pass requires --topology-evidence with live six-node proof"
   fi
-  if [ "$production" = "pass" ] && [ -z "$resource_publisher_attestation" ]; then
-    die "production pass requires --resource-publisher-attestation with an authenticated resource-publication proof"
-  fi
 
   parent="$(dirname -- "$out")"
   [ -d "$parent" ] && [ ! -L "$parent" ] \
@@ -1039,7 +935,7 @@ write_evidence() {
       || die "evidence output is not a regular, non-symlink file: $out"
   fi
   tmp="$(mktemp "$parent/.release-evidence.XXXXXX")"
-  trap 'rm -f -- "$tmp" "$tmp.bound" "$tmp.artifacts" "$tmp.sbom" "$tmp.gate" "$tmp.ci-gate" "$tmp.resource-publisher-attestation" "$tmp.vdi" "$tmp.topology"' EXIT
+  trap 'rm -f -- "$tmp" "$tmp.bound" "$tmp.artifacts" "$tmp.sbom" "$tmp.gate" "$tmp.ci-gate" "$tmp.vdi" "$tmp.topology"' EXIT
 
   {
     for arg in "${artifacts[@]}"; do artifact_json "$arg"; done
@@ -1050,11 +946,6 @@ write_evidence() {
     manifest_json "ci-gate status" "$ci_gate_status" >"$tmp.ci-gate"
   else
     printf 'null\n' >"$tmp.ci-gate"
-  fi
-  if [ -n "$resource_publisher_attestation" ]; then
-    resource_publisher_attestation_json "$resource_publisher_attestation" >"$tmp.resource-publisher-attestation"
-  else
-    printf 'null\n' >"$tmp.resource-publisher-attestation"
   fi
   if [ -n "$topology_evidence" ]; then
     manifest_json "topology evidence" "$topology_evidence" >"$tmp.topology"
@@ -1081,7 +972,6 @@ write_evidence() {
     --slurpfile sbom_manifest "$tmp.sbom" \
     --slurpfile gate_manifest "$tmp.gate" \
     --slurpfile ci_gate_status "$tmp.ci-gate" \
-    --slurpfile resource_publisher_attestation "$tmp.resource-publisher-attestation" \
     --slurpfile vdi_evidence "$tmp.vdi" \
     --argjson topology_evidence "$topology_descriptor" \
     --argjson checks "$(named_status_json name "${checks[@]}")" \
@@ -1105,13 +995,11 @@ write_evidence() {
       provenance: {schema_version: 1, binding_sha256: "",
         sbom_manifest: $sbom_manifest[0], gate_manifest: $gate_manifest[0],
         ci_gate_status: $ci_gate_status[0],
-        resource_publisher_attestation: $resource_publisher_attestation[0],
         topology_evidence: $topology_evidence,
         vdi_evidence: $vdi_evidence[0]}}' \
     | jq -S . >"$tmp"
   rm -f -- "$tmp.artifacts"
   rm -f -- "$tmp.sbom" "$tmp.gate" "$tmp.ci-gate"
-  rm -f -- "$tmp.resource-publisher-attestation"
   rm -f -- "$tmp.vdi"
   rm -f -- "$tmp.topology"
   binding="$(binding_payload "$tmp" | sha256sum | awk '{print $1}')"
@@ -1179,8 +1067,8 @@ self_test_ci_status() {
 }
 
 self_test() {
-  local work evidence_a evidence_b broken broken_farm short_source invalid_farm_slot ci_pair_mismatch production_pass topology wrong_roster_topology farm_topology preview_farm topology_revision_mismatch topology_revision_mismatch_raw missing_ci_gate missing_github_check failed_gate unavailable_pass missing_source changed_sbom changed_gate legacy_preview legacy_production missing_resource_attestation invalid_resource_attestation descriptor_mismatch artifact_missing artifact_changed expected_a_sha expected_binding symlink_artifact reused_ci_artifact replacement_descriptor rc
-  local ci_status ci_status_single vdi_evidence resource_attestation attestation_issued_ms attestation_expires_ms two_artifacts single_artifact
+  local work evidence_a evidence_b broken broken_farm short_source invalid_farm_slot ci_pair_mismatch production_pass topology wrong_roster_topology farm_topology preview_farm topology_revision_mismatch topology_revision_mismatch_raw missing_ci_gate missing_github_check failed_gate unavailable_pass missing_source changed_sbom changed_gate legacy_preview legacy_production artifact_missing artifact_changed expected_a_sha expected_binding symlink_artifact reused_ci_artifact replacement_descriptor rc
+  local ci_status ci_status_single vdi_evidence two_artifacts single_artifact
   local roundtrip_status roundtrip_binding roundtrip_binding_reordered roundtrip_evidence
   local hostile_status hostile_status_changed hostile_output duplicate_status duplicate_binding
   local hostile_descriptor_status hostile_descriptor_binding hostile_descriptor_evidence
@@ -1191,7 +1079,6 @@ self_test() {
   local artifact_replacement artifact_replacement_original artifact_replacement_marker
   local gate_replacement gate_replacement_marker gate_original_identity real_sha256sum
   local gate_mutation_source gate_mutation_original gate_mutation_marker gate_mutation_tmp
-  local attestation_replacement attestation_replacement_marker attestation_original_identity
   local duplicate_claim_output duplicate_gate_claim
   work="$(mktemp -d)"
   trap 'rm -rf -- "$work"' RETURN
@@ -1215,20 +1102,6 @@ self_test() {
   cat >"$vdi_evidence" <<'EOF'
 {"frame":{"fnv1a64":"0x0123456789abcdef","height":768,"width":1024},"image_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_observation":"echoed","probe":{"log_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","returncode":0,"source":"mde-shell-egui ignored live worker test"},"protocol":"vnc","recorded_at":"2026-08-01T00:00:00Z","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","status":"observed","target":{"host":"127.0.0.1","port":15903}}
 EOF
-  resource_attestation="$work/resource-publisher-attestation.json"
-  attestation_issued_ms="$(jq -nr '((now * 1000) | floor)')"
-  attestation_expires_ms=$((attestation_issued_ms + 300000))
-  # Structural fixture only: no live secret or key material is invented here.
-  # Cryptographic HMAC verification remains the trusted key-store consumer's job.
-  jq -n --argjson issued_at_ms "$attestation_issued_ms" --argjson expires_at_ms "$attestation_expires_ms" '
-    {schema_version: 1,
-     publisher: "self-test-publisher",
-     key_id: "resource-publisher-hmac-v1",
-     catalog_content_digest: ("catalog:v1:" + ("a" * 64)),
-     issued_at_ms: $issued_at_ms,
-     expires_at_ms: $expires_at_ms,
-     signature: ("publisher-attestation:v1:" + ("0" * 64))}' \
-    >"$resource_attestation"
   expected_a_sha="$(sha256sum -- "$work/a.rpm" | awk '{print $1}')"
   two_artifacts="$({ artifact_json "$work/browser.rpm"; artifact_json "$work/a.rpm"; } | jq -s 'sort_by(.path)')"
   single_artifact="$(artifact_json "$work/a.rpm" | jq -s 'sort_by(.path)')"
@@ -1725,7 +1598,6 @@ EOF
   expected_binding="$(binding_payload "$evidence_a" | sha256sum | awk '{print $1}')"
   jq -e --arg binding "$expected_binding" \
     '.schema_version == 5 and .provenance.binding_sha256 == $binding and
-     .provenance.resource_publisher_attestation == null and
      (.provenance.sbom_manifest.sha256 | test("^[0-9a-f]{64}$")) and
      (.provenance.gate_manifest.sha256 | test("^[0-9a-f]{64}$"))' \
     "$evidence_a" >/dev/null || die "self-test: provenance binding was not recorded"
@@ -1824,8 +1696,7 @@ EOF
   [ "$rc" -ne 0 ] || die "self-test: CI job/slot cross-pair was accepted"
 
   legacy_preview="$work/legacy-preview.json"
-  jq 'del(.provenance.resource_publisher_attestation) |
-      .schema_version = 4 |
+  jq '.schema_version = 4 |
       .farm.slot_ids |= (sort | unique)' \
     "$evidence_a" >"$legacy_preview"
   binding="$(binding_payload "$legacy_preview" | sha256sum | awk '{print $1}')"
@@ -1911,35 +1782,6 @@ module._materialize_fixture(bundle, root)
 Path(output_name).write_text(json.dumps(bundle), encoding="utf-8")
 PY
   ci_status="$ci_status_single"
-  missing_resource_attestation="$work/production-missing-resource-attestation.json"
-  set +e
-  "$0" write --out "$missing_resource_attestation" --source-commit 0123456789abcdef0123456789abcdef01234567 \
-    --artifact "$work/a.rpm" --check github-required=pass --check github-policy=pass --check github-cargo-test=pass \
-    --farm-job farm-job-1 --farm-slot 172.20.0.90/1 \
-    --sbom rpm=pass --sbom-manifest "$work/sbom.json" --gate-manifest "$work/gates.json" \
-    --ci-gate-status "$ci_status" --fedora-target fedora-44=pass \
-    --live-gate dell-install=pass --topology-evidence "$topology" --vdi-evidence "$vdi_evidence" \
-    --preview-verdict pass --production-verdict pass >/dev/null 2>&1
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || die "self-test: production pass accepted missing resource publisher attestation"
-
-  invalid_resource_attestation="$work/invalid-resource-publisher-attestation.json"
-  jq '.signature = "not-an-authenticated-publisher-proof"' "$resource_attestation" \
-    >"$invalid_resource_attestation"
-  set +e
-  "$0" write --out "$work/invalid-resource-attestation-write.json" --source-commit 0123456789abcdef0123456789abcdef01234567 \
-    --artifact "$work/a.rpm" --check github-required=pass --check github-policy=pass --check github-cargo-test=pass \
-    --farm-job farm-job-1 --farm-slot 172.20.0.90/1 \
-    --sbom rpm=pass --sbom-manifest "$work/sbom.json" --gate-manifest "$work/gates.json" \
-    --ci-gate-status "$ci_status" --fedora-target fedora-44=pass \
-    --live-gate dell-install=pass --topology-evidence "$topology" --vdi-evidence "$vdi_evidence" \
-    --resource-publisher-attestation "$invalid_resource_attestation" \
-    --preview-verdict pass --production-verdict pass >/dev/null 2>&1
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || die "self-test: malformed resource publisher attestation was accepted"
-
   set +e
   "$0" write --out "$work/production-wrong-node-roster.json" --source-commit 0123456789abcdef0123456789abcdef01234567 \
     --artifact "$work/a.rpm" --check github-required=pass --check github-policy=pass --check github-cargo-test=pass \
@@ -1947,7 +1789,6 @@ PY
     --sbom rpm=pass --sbom-manifest "$work/sbom.json" --gate-manifest "$work/gates.json" \
     --ci-gate-status "$ci_status" --fedora-target fedora-44=pass \
     --live-gate dell-install=pass --topology-evidence "$wrong_roster_topology" --vdi-evidence "$vdi_evidence" \
-    --resource-publisher-attestation "$resource_attestation" \
     --preview-verdict pass --production-verdict pass >/dev/null 2>&1
   rc=$?
   set -e
@@ -1960,65 +1801,16 @@ PY
     --sbom rpm=pass --sbom-manifest "$work/sbom.json" --gate-manifest "$work/gates.json" \
     --ci-gate-status "$ci_status" --fedora-target fedora-44=pass \
     --live-gate dell-install=pass --topology-evidence "$topology" --vdi-evidence "$vdi_evidence" \
-    --resource-publisher-attestation "$resource_attestation" \
     --preview-verdict pass --production-verdict pass >/dev/null
   "$0" validate "$production_pass" >/dev/null \
     || die "self-test: complete all-pass production evidence was rejected"
-  jq -e --arg publisher self-test-publisher \
-    '.schema_version == 5 and
-     .provenance.resource_publisher_attestation.publisher == $publisher and
-     .provenance.resource_publisher_attestation.key_id == "resource-publisher-hmac-v1" and
-     (.provenance.resource_publisher_attestation.signature | startswith("publisher-attestation:v1:"))' \
+  jq -e '.schema_version == 5 and
+     (.provenance | keys == ["binding_sha256", "ci_gate_status", "gate_manifest", "sbom_manifest", "schema_version", "topology_evidence", "vdi_evidence"])' \
     "$production_pass" >/dev/null \
-    || die "self-test: resource publisher attestation descriptor was not recorded"
-
-  # Keep attestation parsing bound to the directory member admitted by its
-  # digest, even when an atomic replacement carries byte-identical content.
-  attestation_replacement="$work/resource-publisher-attestation-identical.json"
-  attestation_replacement_marker="$work/resource-publisher-attestation-replacement.marker"
-  attestation_original_identity="$(stat -Lc '%d:%i' -- "$resource_attestation")"
-  cp -- "$resource_attestation" "$attestation_replacement"
-  set +e
-  PATH="$work/hostile-sha256sum:$PATH" \
-    RELEASE_EVIDENCE_REAL_SHA256SUM="$real_sha256sum" \
-    RELEASE_EVIDENCE_GATE_SWAP_MARKER="$attestation_replacement_marker" \
-    RELEASE_EVIDENCE_GATE_SWAP_SOURCE="$attestation_replacement" \
-    RELEASE_EVIDENCE_GATE_SWAP_TARGET="$resource_attestation" \
-    "$0" validate "$production_pass" >/dev/null 2>&1
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] && [ -e "$attestation_replacement_marker" ] \
-    && [ "$(stat -Lc '%d:%i' -- "$resource_attestation")" != "$attestation_original_identity" ] \
-    || die "self-test: byte-identical resource-attestation pathname replacement was accepted"
-
-  missing_resource_attestation="$work/production-missing-resource-attestation-evidence.json"
-  jq '.provenance.resource_publisher_attestation = null' "$production_pass" \
-    >"$missing_resource_attestation"
-  binding="$(binding_payload "$missing_resource_attestation" | sha256sum | awk '{print $1}')"
-  jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' \
-    "$missing_resource_attestation" >"$missing_resource_attestation.bound"
-  mv -- "$missing_resource_attestation.bound" "$missing_resource_attestation"
-  set +e
-  "$0" validate "$missing_resource_attestation" >/dev/null 2>&1
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || die "self-test: production evidence accepted missing resource publisher attestation"
-
-  descriptor_mismatch="$work/production-resource-descriptor-mismatch.json"
-  jq '.provenance.resource_publisher_attestation.publisher = "other-publisher"' \
-    "$production_pass" >"$descriptor_mismatch"
-  binding="$(binding_payload "$descriptor_mismatch" | sha256sum | awk '{print $1}')"
-  jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' \
-    "$descriptor_mismatch" >"$descriptor_mismatch.bound"
-  mv -- "$descriptor_mismatch.bound" "$descriptor_mismatch"
-  set +e
-  "$0" validate "$descriptor_mismatch" >/dev/null 2>&1
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || die "self-test: detached resource publisher attestation descriptor mismatch was accepted"
+    || die "self-test: production provenance shape was not recorded"
 
   legacy_production="$work/legacy-production.json"
-  jq 'del(.provenance.resource_publisher_attestation) | .schema_version = 4' \
+  jq '.schema_version = 4' \
     "$production_pass" >"$legacy_production"
   binding="$(binding_payload "$legacy_production" | sha256sum | awk '{print $1}')"
   jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' \
@@ -2028,7 +1820,7 @@ PY
   "$0" validate "$legacy_production" >/dev/null 2>&1
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || die "self-test: legacy production pass bypassed resource publisher attestation"
+  [ "$rc" -ne 0 ] || die "self-test: legacy schema accepted a production pass"
 
   topology_revision_mismatch_raw="$work/topology-revision-mismatch-raw.json"
   jq '.revision = "different-source"' "$topology" >"$topology_revision_mismatch_raw"

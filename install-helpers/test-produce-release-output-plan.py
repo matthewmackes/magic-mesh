@@ -89,8 +89,14 @@ def assert_schema(value: dict[str, object], source: dict[str, object]) -> None:
         "app-vm", "cuttlefish-image", "bootc-image",
     ]
     by_role = {row["role"]: row for row in rows}
-    common = {"role", "path", "media_type", "source_revision", "signing_identity", "companions", "verifier"}
-    assert all(set(row) == common and row["source_revision"] == REVISION and row["signing_identity"] == SIGNER for row in rows)
+    common = {"role", "path", "media_type", "source_revision", "companions", "verifier"}
+    rpm_roles = {"workstation-rpm", "server-rpm", "lighthouse-rpm"}
+    assert all(row["source_revision"] == REVISION for row in rows)
+    assert all(
+        set(row) == common | {"signing_identity"} and row["signing_identity"] == SIGNER
+        for row in rows if row["role"] in rpm_roles
+    )
+    assert all(set(row) == common for row in rows if row["role"] not in rpm_roles)
     assert by_role["workstation-rpm"]["verifier"] == [
         str(ROOT / "packaging/app-vm/verify-rpm-supply.sh"), "--key", "{companion:release_key}",
         "--source-commit", "{source_revision}", "--candidate-manifest", "{companion:candidate_manifest}",
@@ -102,6 +108,10 @@ def assert_schema(value: dict[str, object], source: dict[str, object]) -> None:
     assert browser_argv[-2:] == ["--source-revision", "{source_revision}"]
     assert browser_argv[1] == "verify" and "{companion:frozen_profile}" in browser_argv and "{companion:manifest}" in browser_argv
     assert by_role["app-vm"]["verifier"][-2:] == ["--source-revision", "{source_revision}"]
+    assert all(
+        "{signing_identity}" not in row["verifier"]
+        for row in rows if row["role"] not in rpm_roles
+    )
     cuttle_argv = by_role["cuttlefish-image"]["verifier"]
     assert "--source-kind" in cuttle_argv and cuttle_argv[cuttle_argv.index("--source-kind") + 1] == "artifact"
     assert cuttle_argv[cuttle_argv.index("--original-source") + 1] == "{artifact}"

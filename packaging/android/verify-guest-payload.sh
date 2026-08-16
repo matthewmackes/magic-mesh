@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WL-FUNC-020 — authenticate and stage the Cuttlefish guest payload handoff.
+# WL-FUNC-020 — identify and stage the Cuttlefish guest payload handoff.
 #
 # The production Ansible role consumes only the private staged copies emitted by
 # this gate.  That closes the gap between checking controller-side paths and apt
@@ -7,10 +7,7 @@
 set -euo pipefail
 umask 077
 
-readonly PROJECT_KEY=/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh
-readonly PROJECT_FINGERPRINT=06B1C27EA0E08A225155EB3314018AA1497DDC7C
 readonly MAX_DECLARATION_BYTES=262144
-readonly MAX_SIGNATURE_BYTES=65536
 readonly MAX_PAYLOAD_BYTES=$((1024 * 1024 * 1024))
 
 fail() {
@@ -20,20 +17,20 @@ fail() {
 
 usage() {
     cat <<'EOF'
-Usage: verify-guest-payload.sh --declaration FILE --signature FILE \
+Usage: verify-guest-payload.sh --declaration FILE \
   --readiness-relay FILE --vdi-agent FILE --stage-dir DIR \
   [--guest-package FILE ...]
        verify-guest-payload.sh --self-test
 
-Authenticates one signed Cuttlefish release declaration and atomically stages
-the exact declared readiness relay, VDI agent, and guest package bytes.
+Validates one Cuttlefish content declaration and atomically stages the exact
+declared readiness relay, VDI agent, and guest package bytes. The declaration
+is integrity metadata, not a trust or signature authority.
 EOF
 }
 
 verify_payload() {
-    local declaration=$1 signature=$2 relay=$3 agent=$4 stage_dir=$5
-    local key=$6 fingerprint=$7
-    shift 7
+    local declaration=$1 relay=$2 agent=$3 stage_dir=$4
+    shift 4
 
     [[ ! -e "$stage_dir" ]] || fail "stage directory already exists"
     local parent
@@ -43,8 +40,8 @@ verify_payload() {
     local work
     work=$(mktemp -d -- "$parent/.cuttlefish-payload.XXXXXX")
 
-    python3 - "$declaration" "$signature" "$relay" "$agent" "$work" \
-        "$MAX_DECLARATION_BYTES" "$MAX_SIGNATURE_BYTES" "$MAX_PAYLOAD_BYTES" "$@" <<'PY'
+    python3 - "$declaration" "$relay" "$agent" "$work" \
+        "$MAX_DECLARATION_BYTES" "$MAX_PAYLOAD_BYTES" "$@" <<'PY'
 import hashlib
 import json
 import os
@@ -53,9 +50,9 @@ import stat
 import sys
 from pathlib import Path
 
-declaration, signature, relay, agent, work = map(Path, sys.argv[1:6])
-max_declaration, max_signature, max_payload = map(int, sys.argv[6:9])
-packages = [Path(value) for value in sys.argv[9:]]
+declaration, relay, agent, work = map(Path, sys.argv[1:5])
+max_declaration, max_payload = map(int, sys.argv[5:7])
+packages = [Path(value) for value in sys.argv[7:]]
 digest_re = re.compile(r"sha256:[0-9a-f]{64}\Z")
 name_re = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:-]{0,254}\Z")
 
@@ -123,8 +120,6 @@ def stable_copy(source, destination, maximum, label):
 
 
 stable_copy(declaration, work / "release.json", max_declaration, "release declaration")
-stable_copy(signature, work / "release.json.asc", max_signature, "release signature")
-
 try:
     document = json.loads(
         (work / "release.json").read_text(encoding="utf-8"),
@@ -199,7 +194,7 @@ declared_packages = [descriptor(value, f"guest_packages[{index}]") for index, va
 if len({name for name, _ in declared_packages}) != len(declared_packages):
     reject("guest package names are not unique")
 if len(packages) != len(declared_packages):
-    reject("configured guest package count differs from the signed declaration")
+    reject("configured guest package count differs from the declaration")
 
 actual = [(relay, relay_name, relay_digest, work / "payload" / "readiness-relay"),
           (agent, agent_name, agent_digest, work / "payload" / "vdi-agent")]
@@ -222,30 +217,11 @@ PY
         return "$admission_status"
     fi
 
-    local keyring="$work/release-key.gpg" status="$work/gpg.status"
-    if ! gpg --batch --no-options --dearmor --output "$keyring" "$key" >/dev/null 2>&1; then
-        echo "cuttlefish guest payload: trusted release key cannot be materialized" >&2
-        rm -rf -- "$work"
-        return 1
-    fi
-    gpgv --status-fd 1 --keyring "$keyring" "$work/release.json.asc" "$work/release.json" \
-        >"$status" 2>/dev/null || {
-            echo "cuttlefish guest payload: release declaration signature is invalid" >&2
-            rm -rf -- "$work"
-            return 1
-        }
-    grep -Fq "[GNUPG:] VALIDSIG $fingerprint " "$status" || {
-        echo "cuttlefish guest payload: release declaration signer is not the pinned project authority" >&2
-        rm -rf -- "$work"
-        return 1
-    }
-
     mv -- "$work/payload" "$stage_dir"
-    # Keep the authenticated declaration beside the staged payload.  Release
+    # Keep the validated declaration beside the staged payload. Release
     # preflight consumes this exact no-longer-mutable copy when it binds the
     # image receipt to the admitted guest bytes.
     mv -- "$work/release.json" "$stage_dir/release.json"
-    mv -- "$work/release.json.asc" "$stage_dir/release.json.asc"
     chmod 0700 "$stage_dir" "$stage_dir/packages"
     rm -rf -- "$work"
 }
@@ -254,14 +230,7 @@ self_test() {
     MCNF_CUTTLEFISH_FIXTURE=$(mktemp -d)
     trap 'rm -rf -- "$MCNF_CUTTLEFISH_FIXTURE"' EXIT
     local fixture=$MCNF_CUTTLEFISH_FIXTURE
-    export GNUPGHOME="$fixture/gnupg"
-    mkdir -m 700 "$GNUPGHOME" "$fixture/source" "$fixture/stages"
-    gpg --batch --pinentry-mode loopback --passphrase '' \
-        --quick-generate-key 'Cuttlefish payload fixture <fixture@example.invalid>' \
-        ed25519 sign 1d >/dev/null 2>&1
-    local fingerprint
-    fingerprint=$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "fpr" { print $10; exit }')
-    gpg --batch --armor --export >"$fixture/key.asc"
+    mkdir -m 700 "$fixture/source" "$fixture/stages"
     printf 'readiness relay bytes\n' >"$fixture/source/readiness-relay.sh"
     printf 'vdi agent bytes\n' >"$fixture/source/mcnf-cuttlefish-vdi-agent"
     printf 'guest package bytes\n' >"$fixture/source/cuttlefish-base.deb"
@@ -298,66 +267,65 @@ document = {
 }
 open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(document, separators=(",", ":")))
 PY
-    gpg --batch --armor --detach-sign "$fixture/release.json"
-    verify_payload "$fixture/release.json" "$fixture/release.json.asc" \
+    verify_payload "$fixture/release.json" \
         "$fixture/source/readiness-relay.sh" "$fixture/source/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stages/good" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stages/good" \
         "$fixture/source/cuttlefish-base.deb"
     [[ -f "$fixture/stages/good/readiness-relay" && -f "$fixture/stages/good/vdi-agent" \
         && -f "$fixture/stages/good/packages/cuttlefish-base.deb" ]] \
         || fail "self-test did not stage the complete payload"
 
     printf 'substituted package\n' >"$fixture/source/cuttlefish-base.deb"
-    if verify_payload "$fixture/release.json" "$fixture/release.json.asc" \
+    if verify_payload "$fixture/release.json" \
         "$fixture/source/readiness-relay.sh" "$fixture/source/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stages/substituted" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stages/substituted" \
         "$fixture/source/cuttlefish-base.deb" >/dev/null 2>&1; then
         fail "self-test admitted a substituted guest package"
     fi
     [[ ! -e "$fixture/stages/substituted" ]] \
         || fail "rejected payload escaped into an installable stage"
     rm "$fixture/source/cuttlefish-base.deb"
-    if verify_payload "$fixture/release.json" "$fixture/release.json.asc" \
+    if verify_payload "$fixture/release.json" \
         "$fixture/source/readiness-relay.sh" "$fixture/source/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stages/missing" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stages/missing" \
         "$fixture/source/cuttlefish-base.deb" >/dev/null 2>&1; then
         fail "self-test admitted a missing guest package"
     fi
 
     printf 'guest package bytes\n' >"$fixture/source/cuttlefish-base.deb"
     cp "$fixture/source/mcnf-cuttlefish-vdi-agent" "$fixture/source/agent.original"
-    printf 'same signed name, different agent bytes\n' >"$fixture/source/mcnf-cuttlefish-vdi-agent"
-    if verify_payload "$fixture/release.json" "$fixture/release.json.asc" \
+    printf 'same declared name, different agent bytes\n' >"$fixture/source/mcnf-cuttlefish-vdi-agent"
+    if verify_payload "$fixture/release.json" \
         "$fixture/source/readiness-relay.sh" "$fixture/source/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stages/agent-mismatch" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stages/agent-mismatch" \
         "$fixture/source/cuttlefish-base.deb" >/dev/null 2>&1; then
         fail "self-test admitted substituted VDI-agent bytes"
     fi
     mv "$fixture/source/agent.original" "$fixture/source/mcnf-cuttlefish-vdi-agent"
 
     ln "$fixture/source/readiness-relay.sh" "$fixture/source/readiness-relay.alias"
-    if verify_payload "$fixture/release.json" "$fixture/release.json.asc" \
+    if verify_payload "$fixture/release.json" \
         "$fixture/source/readiness-relay.sh" "$fixture/source/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stages/mutable-relay" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stages/mutable-relay" \
         "$fixture/source/cuttlefish-base.deb" >/dev/null 2>&1; then
         fail "self-test admitted a readiness relay with a mutable hard-link alias"
     fi
     rm "$fixture/source/readiness-relay.alias"
 
-    cp "$fixture/release.json" "$fixture/release.signed"
-    printf '\n' >>"$fixture/release.json"
-    if verify_payload "$fixture/release.json" "$fixture/release.json.asc" \
+    cp "$fixture/release.json" "$fixture/release.original"
+    sed -i 's/sha256:[0-9a-f]\{64\}/sha256:0000000000000000000000000000000000000000000000000000000000000000/' "$fixture/release.json"
+    if verify_payload "$fixture/release.json" \
         "$fixture/source/readiness-relay.sh" "$fixture/source/mcnf-cuttlefish-vdi-agent" \
-        "$fixture/stages/tampered-declaration" "$fixture/key.asc" "$fingerprint" \
+        "$fixture/stages/tampered-declaration" \
         "$fixture/source/cuttlefish-base.deb" >/dev/null 2>&1; then
-        fail "self-test admitted a declaration changed after signing"
+        fail "self-test admitted a declaration with invalid content identity"
     fi
-    mv "$fixture/release.signed" "$fixture/release.json"
+    mv "$fixture/release.original" "$fixture/release.json"
     for rejected in missing agent-mismatch mutable-relay tampered-declaration; do
         [[ ! -e "$fixture/stages/$rejected" ]] \
             || fail "rejected $rejected payload escaped into an installable stage"
     done
-    echo "Cuttlefish signed guest payload self-test passed"
+    echo "Cuttlefish content-declared guest payload self-test passed"
 }
 
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
@@ -370,12 +338,11 @@ if [[ ${1:-} == --self-test ]]; then
     exit 0
 fi
 
-declaration='' signature='' relay='' agent='' stage_dir=''
+declaration='' relay='' agent='' stage_dir=''
 packages=()
 while (($#)); do
     case $1 in
         --declaration) declaration=${2:-}; shift 2 ;;
-        --signature) signature=${2:-}; shift 2 ;;
         --readiness-relay) relay=${2:-}; shift 2 ;;
         --vdi-agent) agent=${2:-}; shift 2 ;;
         --stage-dir) stage_dir=${2:-}; shift 2 ;;
@@ -384,9 +351,7 @@ while (($#)); do
         *) usage >&2; exit 2 ;;
     esac
 done
-[[ -n $declaration && -n $signature && -n $relay && -n $agent && -n $stage_dir ]] \
+[[ -n $declaration && -n $relay && -n $agent && -n $stage_dir ]] \
     || { usage >&2; exit 2; }
-[[ -r $PROJECT_KEY ]] || fail "installed project release key is unavailable"
-verify_payload "$declaration" "$signature" "$relay" "$agent" "$stage_dir" \
-    "$PROJECT_KEY" "$PROJECT_FINGERPRINT" "${packages[@]}"
-echo "Cuttlefish signed guest payload staged: $stage_dir"
+verify_payload "$declaration" "$relay" "$agent" "$stage_dir" "${packages[@]}"
+echo "Cuttlefish content-declared guest payload staged: $stage_dir"

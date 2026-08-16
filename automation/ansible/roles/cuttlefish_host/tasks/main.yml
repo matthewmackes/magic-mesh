@@ -10,11 +10,10 @@
 # is a Debian base and not a mackesd mesh node, it is NOT in the cloud_vm group —
 # the base cloud_vm convergence does not run here.
 
-- name: Refuse an incomplete signed Cuttlefish guest payload handoff
+- name: Refuse an incomplete Cuttlefish guest payload handoff
   ansible.builtin.assert:
     that:
       - cuttlefish_release_declaration | length > 0
-      - cuttlefish_release_signature | length > 0
       - cuttlefish_readiness_relay | length > 0
       - cuttlefish_vdi_agent | length > 0
       - cuttlefish_debs | length > 0
@@ -27,11 +26,11 @@
       - (cuttlefish_webrtc_port | int) <= 65535
       - cuttlefish_session_id is match('^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$')
     fail_msg: >-
-      Cuttlefish provisioning requires a signed release declaration, detached
-      signature, readiness relay, VDI agent, at least one guest package, and a
+      Cuttlefish provisioning requires a content declaration, readiness relay,
+      VDI agent, at least one guest package, and a
       bounded session attachment identity matching the packaged service paths.
 
-- name: Create private parent for the authenticated payload stage
+- name: Create private parent for the verified payload stage
   ansible.builtin.file:
     path: "{{ cuttlefish_payload_stage_dir | dirname }}"
     state: directory
@@ -44,12 +43,11 @@
     path: "{{ cuttlefish_payload_stage_dir }}"
     state: absent
 
-- name: Authenticate and stage the exact signed Cuttlefish guest payload
+- name: Verify and stage the exact content-declared Cuttlefish guest payload
   ansible.builtin.script:
     cmd: >-
       {{ role_path }}/../../../../packaging/android/verify-guest-payload.sh
       --declaration {{ cuttlefish_release_declaration | quote }}
-      --signature {{ cuttlefish_release_signature | quote }}
       --readiness-relay {{ cuttlefish_readiness_relay | quote }}
       --vdi-agent {{ cuttlefish_vdi_agent | quote }}
       --stage-dir {{ cuttlefish_payload_stage_dir | quote }}
@@ -57,7 +55,7 @@
   register: cuttlefish_payload_admission
   changed_when: true
 
-- name: Install the authenticated readiness relay
+- name: Install the verified readiness relay
   ansible.builtin.copy:
     src: "{{ cuttlefish_payload_stage_dir }}/readiness-relay"
     dest: "{{ cuttlefish_readiness_relay_install_path }}"
@@ -66,7 +64,7 @@
     group: root
     mode: "0755"
 
-- name: Install the authenticated VDI agent
+- name: Install the verified VDI agent
   ansible.builtin.copy:
     src: "{{ cuttlefish_payload_stage_dir }}/vdi-agent"
     dest: "{{ cuttlefish_vdi_agent_install_path }}"
@@ -147,7 +145,7 @@
   # guard: only start when nothing is already up.
   when: cuttlefish_status.rc != 0
 
-- name: Enable the authenticated readiness relay after Cuttlefish is available
+- name: Enable the readiness relay after Cuttlefish is available
   ansible.builtin.systemd:
     name: mcnf-cuttlefish-readiness-relay.service
     enabled: true

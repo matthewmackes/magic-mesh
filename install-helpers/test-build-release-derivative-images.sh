@@ -9,7 +9,7 @@ mkdir -m 0700 "$work/bin" "$work/out-parent"
 APP_BASE_IMAGE="registry.invalid/app@sha256:$(printf 'a%.0s' {1..64})"
 BROWSER_BASE_IMAGE="registry.invalid/browser@sha256:$(printf 'b%.0s' {1..64})"
 
-for name in workstation.rpm lighthouse.rpm app-candidate.json browser-candidate.json app-base.json browser-base.json trust.json trust.key release.key; do
+for name in workstation.rpm lighthouse.rpm app-candidate.json browser-candidate.json app-base.json browser-base.json release.key; do
     printf 'admitted-%s\n' "$name" >"$work/$name"; chmod 0400 "$work/$name"
 done
 printf 'BROWSER_VM_SOURCE_COMMIT=@RELEASE_REVISION@\n' >"$work/profile.env"
@@ -74,7 +74,6 @@ common=(
   --signed-workstation-rpm "$work/workstation.rpm"
   --app-rpm-candidate-manifest "$work/app-candidate.json"
   --app-base-receipt "$work/app-base.json" --app-base-image "$APP_BASE_IMAGE"
-  --app-catalog-trust-receipt "$work/trust.json" --app-catalog-trust-key "$work/trust.key"
   --signed-lighthouse-rpm "$work/lighthouse.rpm"
   --browser-rpm-candidate-manifest "$work/browser-candidate.json"
   --browser-base-receipt "$work/browser-base.json" --browser-base-image "$BROWSER_BASE_IMAGE"

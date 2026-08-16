@@ -231,7 +231,7 @@ pub(crate) struct CloudActionBody {
     /// Stable reverse-DNS Flatpak identity for `app-provision`.
     #[serde(default)]
     pub app_id: Option<String>,
-    /// Signed catalog revision selected for the launch.
+    /// Catalog revision selected for the launch.
     #[serde(default)]
     pub catalog_revision: Option<String>,
     /// Approved named guest profile.

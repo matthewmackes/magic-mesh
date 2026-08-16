@@ -374,7 +374,9 @@ pub fn workload_entries_from_state_document(doc: &serde_json::Value) -> Vec<AppE
     };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
     if snapshot.validate(now_ms).is_err() {
         return Vec::new();
     }
@@ -496,7 +498,7 @@ pub fn read_peer_installed(workgroup_root: &Path, node: &str) -> Vec<AppEntry> {
 
 /// Read the signed Flatpak catalog replicated beside a peer's installed-app
 /// projection. Catalogs are optional for backwards compatibility, but an
-/// invalid or unsigned catalog is rejected rather than forwarded to the shell.
+/// invalid catalog content is rejected rather than forwarded to the shell.
 #[must_use]
 pub fn read_peer_flatpak_catalog(workgroup_root: &Path, node: &str) -> Option<FlatpakAppCatalog> {
     let path = workgroup_root.join(node).join("flatpak-catalog.json");

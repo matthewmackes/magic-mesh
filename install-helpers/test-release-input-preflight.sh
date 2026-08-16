@@ -21,7 +21,7 @@ bootc_architecture='amd64'
 bootc_role='unified-seat-server'
 app_vm_reference='registry.invalid/fedora/app-vm-base:44'
 app_vm_architecture='amd64'
-for verifier in source app; do
+for verifier in source; do
   cat >"$fixture/$verifier" <<'EOF'
 #!/usr/bin/env bash
 exit "${FAKE_VERIFIER_RC:-0}"
@@ -124,7 +124,7 @@ printf 'sec:-:4096:1:DEADBEEF:0:0:::::::23::0:\n'
 printf 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n'
 EOF
 chmod 0755 "$fixture/bin/gpg"
-touch "$fixture/receipt" "$fixture/key" "$fixture/signature" "$fixture/relay" "$fixture/agent" "$fixture/signing-receipt.json"
+touch "$fixture/relay" "$fixture/agent" "$fixture/signing-receipt.json"
 mkdir "$fixture/maps-tiles"
 printf 'governed release tile\n' >"$fixture/maps-tiles/tile.bin"
 chmod 0444 "$fixture/maps-tiles/tile.bin"
@@ -231,8 +231,7 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --maps-tile-source-root "$fixture/maps-tiles"
   --maps-quota-bytes 1024
   --maps-verifier "$fixture/maps-verifier"
-  --app-vm-catalog-trust-receipt "$fixture/receipt" --app-vm-catalog-trust-key "$fixture/key"
-  --cuttlefish-declaration "$fixture/declaration" --cuttlefish-signature "$fixture/signature"
+  --cuttlefish-declaration "$fixture/declaration"
   --cuttlefish-readiness-relay "$fixture/relay" --cuttlefish-vdi-agent "$fixture/agent"
   --cuttlefish-guest-package "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
   --cuttlefish-guest-package "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
@@ -254,7 +253,7 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --cuttlefish-image-media-type application/vnd.mcnf.cuttlefish.image.v1+tar
   --cuttlefish-image-artifact-format android-cuttlefish-image-archive)
 envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_VERIFY="$fixture/kiron"
-  MCNF_APP_TRUST_VERIFY="$fixture/app" MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
+  MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
   MCNF_CUTTLEFISH_DEB_VERIFY="$fixture/guest-debs"
   PREFLIGHT_TEST_REVISION="$source_revision"
   PREFLIGHT_TEST_KIRON_MARKER="$fixture/kiron-revision-verified"

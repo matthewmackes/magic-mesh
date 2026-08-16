@@ -8,8 +8,7 @@
 
 use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
 use mackes_mesh_types::cloud::{
-    cloud_request_digest, AppVmProfile, CloudArmedToken, CloudReply,
-    CLOUD_ACTION_SCHEMA_VERSION,
+    cloud_request_digest, AppVmProfile, CloudArmedToken, CloudReply, CLOUD_ACTION_SCHEMA_VERSION,
 };
 use mackes_mesh_types::vdi_session::{AppVmLaunchRequest, SessionRequest};
 use mackes_mesh_types::workloads::{
@@ -158,13 +157,9 @@ fn build_reply_with_profile(
                 DeclarationPersistence::Created | DeclarationPersistence::HandoffRetry
             ) {
                 if let Some((worker, bus_root)) = workload_handoff {
-                    if let Err(error) = publish_start_and_attach(
-                        worker,
-                        bus_root,
-                        &spec,
-                        &image_version,
-                        now_ms(),
-                    ) {
+                    if let Err(error) =
+                        publish_start_and_attach(worker, bus_root, &spec, &image_version, now_ms())
+                    {
                         return CloudReply {
                             ok: false,
                             verb: verb_name.to_string(),
@@ -285,10 +280,7 @@ fn persist_declaration(
             // first declaration must be allowed to cold boot. Existing usable
             // evidence may recover desired state only when resume was requested;
             // stale, terminal, malformed, or cross-VM evidence always refuses.
-            let cold_start = matches!(
-                &runtime,
-                app_image::AppVmRuntimeAdmission::Missing(_)
-            );
+            let cold_start = matches!(&runtime, app_image::AppVmRuntimeAdmission::Missing(_));
             let admitted_recovery = requested_app.resume && runtime.is_usable();
             if !cold_start && !admitted_recovery {
                 return Err(format!(
@@ -374,10 +366,7 @@ fn publish_start_and_attach(
             memory_mb: spec.memory_mb,
             disk_gb: spec.disk_gb,
         },
-        image_ref: Some(format!(
-            "{}:{image_version}",
-            app_image::APP_VM_IMAGE_NAME
-        )),
+        image_ref: Some(format!("{}:{image_version}", app_image::APP_VM_IMAGE_NAME)),
         target_node: worker.workload_node_id.clone(),
         expected_generation: 0,
         action: WorkloadOperationAction::StartAndAttach,
@@ -421,9 +410,7 @@ fn publish_start_and_attach(
     Ok(())
 }
 
-fn workload_request_id(
-    spec: &mackes_mesh_types::cloud::WorkloadSpec,
-) -> Result<String, String> {
+fn workload_request_id(spec: &mackes_mesh_types::cloud::WorkloadSpec) -> Result<String, String> {
     let app = spec
         .app
         .as_ref()
@@ -701,8 +688,7 @@ mod tests {
                 "guest_profile": "wayland-standard",
                 "sha256": sha,
                 "issued_at_ms": now.saturating_sub(1000),
-                "expires_at_ms": now + 60_000,
-                "signature": "publisher-signature"
+                "expires_at_ms": now + 60_000
             })
             .to_string(),
         )
@@ -933,11 +919,9 @@ mod tests {
         assert!(replay.ok, "handoff retry failed: {:?}", replay.error);
         let messages = persist.list_since(WORKLOAD_OPERATION_TOPIC, None).unwrap();
         assert_eq!(messages.len(), 2);
-        let replay_request = WorkloadOperationRequest::from_json(
-            messages[1].body.as_deref().unwrap(),
-            now_ms(),
-        )
-        .unwrap();
+        let replay_request =
+            WorkloadOperationRequest::from_json(messages[1].body.as_deref().unwrap(), now_ms())
+                .unwrap();
         assert_eq!(replay_request.request_id, first_request.request_id);
         assert_ne!(replay_request.armed_token, first_request.armed_token);
         let open_messages = persist
@@ -947,8 +931,7 @@ mod tests {
         let replay_open_body = open_messages[1].body.as_deref().unwrap();
         let replay_open: SessionRequest = serde_json::from_str(replay_open_body).unwrap();
         assert_eq!(replay_open, first_open);
-        let replay_open_value: serde_json::Value =
-            serde_json::from_str(replay_open_body).unwrap();
+        let replay_open_value: serde_json::Value = serde_json::from_str(replay_open_body).unwrap();
         assert_ne!(
             replay_open_value["armed_token"].as_str(),
             Some(first_open_token)
@@ -996,7 +979,10 @@ mod tests {
 
         let persist = Persist::open(bus.path().to_path_buf()).unwrap();
         assert_eq!(
-            persist.list_since(WORKLOAD_OPERATION_TOPIC, None).unwrap().len(),
+            persist
+                .list_since(WORKLOAD_OPERATION_TOPIC, None)
+                .unwrap()
+                .len(),
             1,
             "rejected client substitution emitted another workload operation"
         );
@@ -1164,7 +1150,10 @@ mod tests {
         }));
         assert_eq!(std::fs::read(desired_path).unwrap(), desired_before);
         assert_eq!(
-            persist.list_since(WORKLOAD_OPERATION_TOPIC, None).unwrap().len(),
+            persist
+                .list_since(WORKLOAD_OPERATION_TOPIC, None)
+                .unwrap()
+                .len(),
             1,
             "conflicting retry published another Workload action"
         );
@@ -1319,14 +1308,8 @@ mod tests {
             vcpu: 0,
             ..AppVmProfile::default()
         };
-        let reply = build_reply_with_profile(
-            tmp.path(),
-            None,
-            "app-provision",
-            &request,
-            profile,
-            None,
-        );
+        let reply =
+            build_reply_with_profile(tmp.path(), None, "app-provision", &request, profile, None);
         assert!(!reply.ok);
         assert!(reply
             .error

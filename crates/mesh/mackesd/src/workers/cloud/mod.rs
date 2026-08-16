@@ -52,7 +52,7 @@ use mackes_mesh_types::android_apps::{
     android_catalog_state_topic, AndroidAppAvailability, AndroidAppInventory, AndroidAppReadiness,
     AndroidGuestBootState, AndroidGuestInventoryRequest, AndroidGuestRequest, AndroidGuestResponse,
     AndroidImagePackageManifest, AndroidLaunchReadiness, AndroidLauncherResolvability,
-    AndroidSignedCatalog, AndroidUnavailableReason, MAX_ANDROID_OBSERVATION_AGE_MS,
+    AndroidRuntimeCatalog, AndroidUnavailableReason, MAX_ANDROID_OBSERVATION_AGE_MS,
 };
 use mackes_mesh_types::android_provider::{
     AndroidProviderAdmission, AndroidVdiSource, CuttlefishGuestBootState as ProviderGuestBootState,
@@ -1313,7 +1313,7 @@ impl CloudWorker {
         provider_generations
     }
 
-    fn load_admitted_android_catalog(&self) -> Option<AndroidSignedCatalog> {
+    fn load_admitted_android_catalog(&self) -> Option<AndroidRuntimeCatalog> {
         const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
         let root = self.bus_root()?;
         let persist = Persist::open(root).ok()?;
@@ -1389,11 +1389,13 @@ impl CloudWorker {
             };
             let inventory_admitted = match self.admit_android_inventory_response(&request, response)
             {
-                Ok(AndroidInventoryLedgerAdmission::Inserted
-                    | AndroidInventoryLedgerAdmission::Replaced) => {
-                        changed = true;
-                        true
-                    }
+                Ok(
+                    AndroidInventoryLedgerAdmission::Inserted
+                    | AndroidInventoryLedgerAdmission::Replaced,
+                ) => {
+                    changed = true;
+                    true
+                }
                 Ok(AndroidInventoryLedgerAdmission::Unchanged) => true,
                 Err(error) => {
                     tracing::warn!(
@@ -1674,8 +1676,7 @@ impl Worker for CloudWorker {
                         // an empty registry cannot be used as its own scheduling
                         // prerequisite. Production starts empty by design.
                         let inventory_due = drift_due
-                            || last_android_inventory.elapsed()
-                                >= self.android_inventory_interval;
+                            || last_android_inventory.elapsed() >= self.android_inventory_interval;
                         if inventory_due {
                             last_android_inventory = Instant::now();
                             state_dirty |= self.refresh_android_inventories();
@@ -1808,7 +1809,6 @@ mod tests {
     use super::runner::fake::{instance, FakeRunner};
     use super::runner::{TOOL_LIBVIRT, TOOL_TOFU};
     use super::*;
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
         AndroidAppAvailability, AndroidAppCapability, AndroidAppInventoryEntry,
         AndroidAppPermission, AndroidAppReadiness, AndroidCatalogAppPolicy,
@@ -1818,7 +1818,7 @@ mod tests {
         AndroidImagePackageManifest, AndroidImageProvenance, AndroidLaunchReadiness,
         AndroidLauncherResolvability, AndroidPackageVersion, AndroidResourceClass,
         AndroidResourceProfile, AndroidUnavailableReason, AospStarterApp, AospStarterCatalog,
-        ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use mackes_mesh_types::cloud::{CloudProviderAdapter, HealthState};
     use tempfile::tempdir;
@@ -1947,11 +1947,9 @@ mod tests {
                 guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
             })
             .collect();
-        let key = SigningKey::from_bytes(&[41; 32]);
-        let catalog = AndroidSignedCatalog::sign(
-            "android-release-v1",
-            AndroidCatalogPayload {
-                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        let catalog = AndroidRuntimeCatalog {
+            payload: AndroidCatalogPayload {
+                schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: "android-provision-test".to_owned(),
                 revision: 1,
                 issued_at_unix_ms: now.saturating_sub(500),
@@ -1960,20 +1958,10 @@ mod tests {
                 package_manifest,
                 app_policies,
             },
-            &key,
-        )
-        .unwrap();
+        };
 
-        let trust_key = root.join("android-catalog-trust.hex");
         let state_file = root.join("android-catalog-state.json");
         let artifact = root.join("android-test-image.raw");
-        let trust_key_hex = key
-            .verifying_key()
-            .to_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        fs::write(&trust_key, trust_key_hex).unwrap();
         fs::write(
             &state_file,
             serde_json::json!({"schema_version": 1, "catalog": catalog}).to_string(),
@@ -1982,14 +1970,9 @@ mod tests {
         fs::write(&artifact, image_bytes).unwrap();
 
         let mut environment = ScopedEnvironment::default();
-        environment.set("MDE_ANDROID_CATALOG_SIGNER_ID", "android-release-v1");
-        environment.set("MDE_ANDROID_CATALOG_TRUST_KEY_FILE", &trust_key);
         environment.set("MDE_ANDROID_CATALOG_STATE_FILE", &state_file);
         environment.set("MDE_ANDROID_IMAGE_FILE", &artifact);
-        (
-            environment,
-            Arc::new(ReadyAndroidHostProbe { digest }),
-        )
+        (environment, Arc::new(ReadyAndroidHostProbe { digest }))
     }
 
     fn signer() -> HmacTokenSigner {

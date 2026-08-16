@@ -1932,7 +1932,7 @@ mod tests {
             receiver,
         });
 
-        model.mark_unavailable("publisher credential disappeared");
+        model.mark_unavailable("catalog feed disappeared");
         assert!(model.cancellable_actions.is_empty());
         model
             .install_projection(admitted)

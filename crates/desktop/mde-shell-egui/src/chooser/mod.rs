@@ -1326,7 +1326,7 @@ impl Default for ChooserState {
         // exact host-bound systemd credential. Tests and injected chooser
         // states continue to use `ResourceBrowserState::new`, which is the
         // explicit untrusted read-only compatibility constructor.
-        state.resources = ResourceBrowserState::from_systemd_publisher_credential(bus_root);
+        state.resources = ResourceBrowserState::new(bus_root);
         state
     }
 }

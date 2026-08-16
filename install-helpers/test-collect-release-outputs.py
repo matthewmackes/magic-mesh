@@ -44,15 +44,22 @@ def main() -> None:
         outputs = []
         for role, (media, payload) in ROLES.items():
             artifact = artifacts / role; write(artifact, payload)
-            outputs.append({"role": role, "path": str(artifact), "media_type": media,
-                            "source_revision": revision, "signing_identity": SIGNER,
-                            "companions": {}, "verifier": [str(verifier), "{artifact}",
-                            "{source_revision}", "{signing_identity}"]})
+            row = {"role": role, "path": str(artifact), "media_type": media,
+                   "source_revision": revision, "companions": {},
+                   "verifier": [str(verifier), "{artifact}", "{source_revision}"]}
+            if media == "application/x-rpm":
+                row["signing_identity"] = SIGNER
+                row["verifier"].append("{signing_identity}")
+            outputs.append(row)
         plan = {"schema_version": 1, "kind": "mcnf-release-output-collection-plan", "source_revision": revision, "outputs": outputs}
         run(collector, root, plan, "good", True)
         value = json.loads((root / "good.out").read_text())
         assert value["promotion"] == "forbidden" and len(value["outputs"]) == 7
         assert all(row["sha256"].startswith("sha256:") and row["size"] > 0 for row in value["outputs"])
+        assert all(
+            ("signing_identity" in row) == (row["media_type"] == "application/x-rpm")
+            for row in value["outputs"]
+        )
 
         mutations = {}
         duplicate = copy.deepcopy(plan); duplicate["outputs"][-1]["role"] = "app-vm"; mutations["duplicate-role"] = duplicate

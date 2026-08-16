@@ -1,8 +1,8 @@
-//! WL-FUNC-018 — fail-closed admission of the signed App VM base image.
+//! WL-FUNC-018 — bounded admission of the content-addressed App VM base image.
 //!
 //! The image store is replicated state, not live guest proof.  This module only
 //! admits an image when the promoted version, manifest, artifact digest, and a
-//! bounded detached-signature evidence envelope agree.  It deliberately does
+//! bounded content declaration agree. It deliberately does
 //! not claim that a guest has booted or that a compositor is reachable.
 
 use std::io::Read;
@@ -24,16 +24,13 @@ const ADMISSION_EVIDENCE: &str = "admission.json";
 const SCHEMA_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_ID_BYTES: usize = 255;
-const MAX_SIGNATURE_BYTES: usize = 4096;
 /// A guest observation is a point-in-time readiness proof, not a lease.  A
 /// resume/reconcile request must obtain a fresh observation rather than
 /// treating an old `connected` record as proof that the guest is still alive.
 pub(super) const APP_VM_RUNTIME_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 
-/// The bounded, publisher-written evidence required before an App VM image is
-/// selected.  `signature` is a detached signed-evidence reference; cryptographic
-/// verification belongs to the release publisher/trust-store lane.  Presence is
-/// still mandatory here, so an unsigned local build can never be admitted.
+/// The bounded content declaration required before an App VM image is selected.
+/// It is reproducibility and freshness metadata, not a trust authority.
 #[derive(Debug, Clone, Deserialize)]
 struct AppVmImageEvidence {
     schema_version: u16,
@@ -43,8 +40,6 @@ struct AppVmImageEvidence {
     sha256: String,
     issued_at_ms: u64,
     expires_at_ms: u64,
-    #[serde(default)]
-    signature: Option<String>,
 }
 
 /// The only outcomes the typed App VM admission path exposes to callers.
@@ -52,8 +47,6 @@ struct AppVmImageEvidence {
 pub(super) enum AppVmImageAdmission {
     /// No complete image/evidence record is currently available.
     Unavailable(String),
-    /// The record exists but has no detached signature reference.
-    Unsigned(String),
     /// The record was once usable but its bounded freshness window is invalid.
     Stale(String),
     /// Local replicated evidence is internally consistent and currently fresh.
@@ -64,7 +57,6 @@ impl AppVmImageAdmission {
     pub(super) fn reason(&self) -> String {
         match self {
             Self::Unavailable(reason) => format!("unavailable: {reason}"),
-            Self::Unsigned(reason) => format!("unsigned: {reason}"),
             Self::Stale(reason) => format!("stale: {reason}"),
             Self::Admitted { version } => format!("admitted version {version}"),
         }
@@ -312,27 +304,18 @@ pub(super) fn check(state_root: &Path, guest_profile: &str, now_ms: u64) -> AppV
 
     let evidence_path = version_dir.join(ADMISSION_EVIDENCE);
     let Some(raw_evidence) = read_text(&evidence_path, ADMISSION_EVIDENCE) else {
-        return AppVmImageAdmission::Unsigned(format!(
-            "promoted version {version} has no detached signature evidence"
+        return AppVmImageAdmission::Unavailable(format!(
+            "promoted version {version} has no content declaration"
         ));
     };
     let evidence = match serde_json::from_str::<AppVmImageEvidence>(&raw_evidence) {
         Ok(evidence) => evidence,
         Err(_) => {
-            return AppVmImageAdmission::Unsigned(
-                "signature evidence is malformed or not admitted".to_owned(),
+            return AppVmImageAdmission::Unavailable(
+                "image content declaration is malformed".to_owned(),
             );
         }
     };
-    if evidence
-        .signature
-        .as_deref()
-        .is_none_or(|s| s.trim().is_empty())
-    {
-        return AppVmImageAdmission::Unsigned(
-            "signature evidence has no detached signature reference".to_owned(),
-        );
-    }
     if evidence.schema_version != SCHEMA_VERSION
         || evidence.image_name != APP_VM_IMAGE_NAME
         || evidence.image_version != version
@@ -342,18 +325,14 @@ pub(super) fn check(state_root: &Path, guest_profile: &str, now_ms: u64) -> AppV
         || !is_safe_text(&evidence.image_version, MAX_ID_BYTES)
         || !is_safe_text(&evidence.guest_profile, MAX_ID_BYTES)
         || !is_sha256(&evidence.sha256)
-        || evidence
-            .signature
-            .as_deref()
-            .is_none_or(|s| !is_safe_text(s, MAX_SIGNATURE_BYTES))
     {
         return AppVmImageAdmission::Unavailable(
-            "signature evidence does not match the promoted App VM image".to_owned(),
+            "image content declaration does not match the promoted App VM image".to_owned(),
         );
     }
     if evidence.issued_at_ms > now_ms || evidence.expires_at_ms <= now_ms {
         return AppVmImageAdmission::Stale(
-            "signature evidence is outside its issued/expiry window".to_owned(),
+            "image content declaration is outside its issued/expiry window".to_owned(),
         );
     }
 
@@ -496,7 +475,7 @@ mod tests {
             .as_millis() as u64
     }
 
-    fn fixture(root: &Path, signature: Option<&str>, expires_at_ms: u64) {
+    fn fixture(root: &Path, expires_at_ms: u64) {
         let version = "2026.07.31";
         let dir = images_dir(root).join(APP_VM_IMAGE_NAME).join(version);
         std::fs::create_dir_all(&dir).unwrap();
@@ -527,7 +506,6 @@ mod tests {
             "sha256": sha,
             "issued_at_ms": now.saturating_sub(1000),
             "expires_at_ms": expires_at_ms,
-            "signature": signature,
         });
         std::fs::write(dir.join(ADMISSION_EVIDENCE), evidence.to_string()).unwrap();
     }
@@ -581,23 +559,26 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_image_is_not_admitted() {
+    fn image_without_content_declaration_is_not_admitted() {
         let root = tempdir().unwrap();
-        fixture(root.path(), None, now() + 60_000);
+        fixture(root.path(), now() + 60_000);
+        std::fs::remove_file(
+            images_dir(root.path())
+                .join(APP_VM_IMAGE_NAME)
+                .join("2026.07.31")
+                .join(ADMISSION_EVIDENCE),
+        )
+        .unwrap();
         assert!(matches!(
             check(root.path(), "wayland-standard", now()),
-            AppVmImageAdmission::Unsigned(_)
+            AppVmImageAdmission::Unavailable(_)
         ));
     }
 
     #[test]
-    fn expired_signature_evidence_is_stale() {
+    fn expired_content_declaration_is_stale() {
         let root = tempdir().unwrap();
-        fixture(
-            root.path(),
-            Some("publisher-signature"),
-            now().saturating_sub(1),
-        );
+        fixture(root.path(), now().saturating_sub(1));
         assert!(matches!(
             check(root.path(), "wayland-standard", now()),
             AppVmImageAdmission::Stale(_)
@@ -605,9 +586,9 @@ mod tests {
     }
 
     #[test]
-    fn matching_signed_fresh_image_is_admitted() {
+    fn matching_fresh_content_addressed_image_is_admitted() {
         let root = tempdir().unwrap();
-        fixture(root.path(), Some("publisher-signature"), now() + 60_000);
+        fixture(root.path(), now() + 60_000);
         assert_eq!(
             check(root.path(), "wayland-standard", now()),
             AppVmImageAdmission::Admitted {

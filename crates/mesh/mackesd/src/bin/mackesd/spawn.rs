@@ -1481,16 +1481,14 @@ pub(crate) fn start_nebula_signal_dispatcher(
     // sender on their next tick. Relocated out of the retired
     // Fleet.Files D-Bus arm — it never depended on that connection.
     let worker_name = if responders_admitted(&["nebula_control_signal_dispatcher"]) {
-        let _nebula_sender =
-            mackesd_core::ipc::nebula::spawn_signal_dispatcher(nebula_signal_slot);
+        let _nebula_sender = mackesd_core::ipc::nebula::spawn_signal_dispatcher(nebula_signal_slot);
         worker_names
             .lock()
             .expect("worker_names mutex")
             .push("nebula_control_signal_dispatcher".into());
         "nebula_control_signal_dispatcher"
     } else if responders_admitted(&["nebula_observation_signal_dispatcher"]) {
-        let _nebula_sender =
-            mackesd_core::ipc::nebula::spawn_signal_dispatcher(nebula_signal_slot);
+        let _nebula_sender = mackesd_core::ipc::nebula::spawn_signal_dispatcher(nebula_signal_slot);
         worker_names
             .lock()
             .expect("worker_names mutex")
@@ -1864,9 +1862,8 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             db_path.clone(),
         )
     });
-    // WL-FUNC-020 S1 — fail-closed signed Android app/image catalog importer.
-    // The release signer remains offline; this consumes only the node-scoped
-    // Bus import topic and a locally provisioned public trust anchor.
+    // WL-FUNC-020 S1 — validated Android app/image catalog importer. The
+    // catalog is discovery data; Nebula membership is the network boundary.
     spawn_tiered(sup, worker_names, role_rank, "android_catalog", || {
         mackesd_core::workers::android_catalog::AndroidCatalogWorker::new(
             node_id
@@ -3990,14 +3987,23 @@ mod process_group_thread_admission_tests {
         }
 
         let publishers = [
-            ("worker_runtime_status_control_publisher", WorkerGroup::Control),
+            (
+                "worker_runtime_status_control_publisher",
+                WorkerGroup::Control,
+            ),
             (
                 "worker_runtime_status_observation_publisher",
                 WorkerGroup::Observation,
             ),
-            ("worker_runtime_status_actions_publisher", WorkerGroup::Actions),
+            (
+                "worker_runtime_status_actions_publisher",
+                WorkerGroup::Actions,
+            ),
             ("worker_runtime_status_data_publisher", WorkerGroup::Data),
-            ("worker_runtime_status_compute_publisher", WorkerGroup::Compute),
+            (
+                "worker_runtime_status_compute_publisher",
+                WorkerGroup::Compute,
+            ),
             (
                 "worker_runtime_status_integrations_publisher",
                 WorkerGroup::Integrations,
@@ -4066,24 +4072,17 @@ mod process_group_thread_admission_tests {
             ("mesh_service_key_reconciler", WorkerGroup::Control),
             ("etcd_startup_probe", WorkerGroup::Observation),
             ("process_watchdog_control", WorkerGroup::Control),
-            (
-                "process_watchdog_observation",
-                WorkerGroup::Observation,
-            ),
+            ("process_watchdog_observation", WorkerGroup::Observation),
             ("process_watchdog_actions", WorkerGroup::Actions),
             ("process_watchdog_data", WorkerGroup::Data),
             ("process_watchdog_compute", WorkerGroup::Compute),
-            (
-                "process_watchdog_integrations",
-                WorkerGroup::Integrations,
-            ),
+            ("process_watchdog_integrations", WorkerGroup::Integrations),
         ];
-        let registered: BTreeSet<(&str, WorkerGroup)> =
-            mackesd_core::worker_role::worker_specs()
-                .iter()
-                .filter(|worker| worker.spawn_binding == SpawnBinding::ProcessInfrastructure)
-                .map(|worker| (worker.name, worker.group))
-                .collect();
+        let registered: BTreeSet<(&str, WorkerGroup)> = mackesd_core::worker_role::worker_specs()
+            .iter()
+            .filter(|worker| worker.spawn_binding == SpawnBinding::ProcessInfrastructure)
+            .map(|worker| (worker.name, worker.group))
+            .collect();
         assert_eq!(registered, BTreeSet::from(expected));
 
         for (name, owner) in expected {

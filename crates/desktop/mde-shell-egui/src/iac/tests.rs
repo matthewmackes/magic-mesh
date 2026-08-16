@@ -652,7 +652,7 @@ fn run_route_uses_dense_resource_table_before_configure_lens() {
 }
 
 #[test]
-fn android_apps_fail_closed_without_an_admitted_signed_catalog() {
+fn android_apps_fail_closed_without_a_validated_catalog() {
     for route in [WorkloadsRoute::Plan, WorkloadsRoute::Run] {
         let mut state = state_on(DeliveryView::AndroidVm, route);
         state.states[0]
@@ -662,11 +662,11 @@ fn android_apps_fail_closed_without_an_admitted_signed_catalog() {
         let text = rendered_text_at_height(1_400.0, |ui| route_body(ui, &mut state));
         assert!(text.contains("Governed Android apps"), "{route:?}: {text}");
         assert!(
-            text.contains("Unavailable · no admitted signed catalog for this placement"),
+            text.contains("Unavailable · no validated runtime catalog for this placement"),
             "{route:?}: {text}"
         );
         assert!(
-            text.contains("No signed app policy cards are available"),
+            text.contains("No validated app policy cards are available"),
             "{route:?}: {text}"
         );
     }
@@ -1488,13 +1488,13 @@ const ANDROID_NOW: u64 = 1_800_000_000_000;
 const ANDROID_IMAGE_DIGEST: &str =
     "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn governed_android_catalog() -> mackes_mesh_types::android_apps::AndroidSignedCatalog {
+fn governed_android_catalog() -> mackes_mesh_types::android_apps::AndroidRuntimeCatalog {
     use mackes_mesh_types::android_apps::{
         AndroidAppCapability, AndroidAppPermission, AndroidCatalogAppPolicy,
         AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidImageManifest,
         AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
         AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterApp,
-        AospStarterCatalog, ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AospStarterCatalog, ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
 
     let image = AndroidImageManifest::new(
@@ -1538,10 +1538,9 @@ fn governed_android_catalog() -> mackes_mesh_types::android_apps::AndroidSignedC
             guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
         })
         .collect();
-    mackes_mesh_types::android_apps::AndroidSignedCatalog::sign(
-        "android-release-v1",
-        AndroidCatalogPayload {
-            schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+    mackes_mesh_types::android_apps::AndroidRuntimeCatalog {
+        payload: AndroidCatalogPayload {
+            schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
             catalog_id: "aosp-production".to_owned(),
             revision: 4,
             issued_at_unix_ms: ANDROID_NOW - 1_000,
@@ -1550,9 +1549,7 @@ fn governed_android_catalog() -> mackes_mesh_types::android_apps::AndroidSignedC
             package_manifest,
             app_policies,
         },
-        &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-    )
-    .expect("signed catalog")
+    }
 }
 
 fn governed_android_inventory() -> mackes_mesh_types::android_apps::AndroidAppInventory {
@@ -1690,7 +1687,7 @@ fn governed_android_vdi_source(generation: u64) -> AndroidVdiSource {
 }
 
 #[test]
-fn governed_android_model_uses_exact_signed_permissions_and_refuses_missing_preflight() {
+fn governed_android_model_uses_exact_catalog_permissions_and_refuses_missing_preflight() {
     let projection = governed_android_projection();
     assert_eq!(
         projection.availability,
@@ -1704,7 +1701,7 @@ fn governed_android_model_uses_exact_signed_permissions_and_refuses_missing_pref
         .expect("camera card");
     assert_eq!(camera.permissions, "Camera, Network");
     assert_eq!(camera.capabilities, "VDI display");
-    assert!(camera.approval.contains("android-release-v1"));
+    assert_eq!(camera.approval, "Catalog policy · revision 4");
     assert!(camera.can_start);
 
     let workload = android_governed::WorkloadInput {
@@ -1751,10 +1748,10 @@ fn governed_android_model_uses_exact_signed_permissions_and_refuses_missing_pref
     assert!(matches!(
         spoofed.availability,
         android_governed::WorkloadAvailability::Unavailable(ref reason)
-            if reason.contains("not signature authority")
+            if reason.contains("writable Bus is not the durable source")
     ));
     assert!(spoofed.cards.is_empty());
-    assert_eq!(spoofed.signed_identity, "No admitted signed catalog");
+    assert_eq!(spoofed.catalog_identity, "No admitted runtime catalog");
 }
 
 #[test]

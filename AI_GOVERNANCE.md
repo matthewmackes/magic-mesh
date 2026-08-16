@@ -265,7 +265,7 @@ production-intended and MUST satisfy the production release gate. It may not be
 distributed as a release while live hardware, provider, installed-seat,
 recovery, SBOM, provenance, or required-check evidence is incomplete. The
 release must remain traceable to one exact clean source revision and immutable
-build inputs, with verified signatures, artifact hashes, licensing, target
+build inputs, with applicable RPM/repository signatures, artifact hashes, licensing, target
 compatibility, live topology, recovery results, and signed release evidence.
 The existing BETA exception applies only to previews already created under the
 prior policy; it does not qualify the next release for production.
@@ -305,6 +305,18 @@ topology, or recovery path named by the gate. Missing real evidence is a
 blocker, not a production-ready qualification. Historical fixture-backed
 previews remain accurately labeled as previews and cannot be relabeled or
 promoted.
+
+**Mesh security boundary and workload-input policy (2026-08-16;
+operator-approved).** Nebula certificate membership and its encrypted overlay
+are the security boundary between trusted mesh participants and untrusted
+networks. Image, container, App VM catalog, and Cuttlefish payload metadata are
+not independent trust authorities and MUST NOT require a signing key, trusted
+signer, or catalog-trust receipt. Content hashes, immutable references, source
+revision, architecture, and runtime readiness MAY remain as reproducibility,
+corruption-detection, and compatibility evidence, but must not be described as
+authentication or authorization. RPM/repository signing remains a separate
+software-distribution integrity control until explicitly changed by the
+operator.
 
 **Production candidate qualification exception (2026-08-16; operator-approved).**
 An exact, fully signed, promotion-unpublished production candidate MAY be
@@ -456,7 +468,7 @@ The preflight must fail closed unless all of these are true:
    allowance. Image/export jobs must reserve the complete qcow2/raw output
    size *and* build-layer/osbuild/qemu scratch; a final export must never be the
    first capacity check.
-2. Source, signed inputs, base images, toolchain/target release, and cache
+2. Source, inputs, base images, toolchain/target release, and cache
    identity are immutable and digest-bound. A cache hit is usable only when its
    key matches the complete input identity; a stale cache must be invalidated,
    never silently reused. The admission record must distinguish “same source,

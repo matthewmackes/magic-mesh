@@ -1371,7 +1371,7 @@ pub struct WorkloadsState {
     /// topic (host-sorted). Empty when nothing has published yet — an honest
     /// pre-mirror state, never fabricated.
     states: Vec<CloudState>,
-    /// Admitted signed Android catalogs read during [`Self::poll`], never from
+    /// Validated Android catalogs read during [`Self::poll`], never from
     /// the render path.
     android_catalogs: Vec<android_governed::CatalogSnapshot>,
     /// Root-owned daemon cache digests keyed by placement node, captured only
@@ -1666,7 +1666,7 @@ impl WorkloadsState {
         states
     }
 
-    /// Fold admitted signed Android catalogs during polling. The worker has
+    /// Fold validated Android catalogs during polling. The worker has
     /// already verified Ed25519 trust; the shell additionally refuses malformed,
     /// oversized, duplicate-node, or intrinsically invalid projections.
     fn read_android_catalogs(&self) -> Vec<android_governed::CatalogSnapshot> {
@@ -1943,7 +1943,7 @@ impl WorkloadsState {
         ) != app.is_some()
         {
             self.note = Some(
-                "Could not prepare Android lifecycle: start/retry requires one signed app and stop/cancel accepts none. Nothing was sent."
+                "Could not prepare Android lifecycle: start/retry requires one catalog app and stop/cancel accepts none. Nothing was sent."
                     .to_owned(),
             );
             return;

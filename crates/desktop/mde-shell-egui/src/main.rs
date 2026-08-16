@@ -20,10 +20,10 @@ mod auth;
 mod backdrop;
 mod bt_pairing;
 mod bus_reader;
+mod calendar;
 mod car_home;
 mod car_keymap;
 mod car_motion_policy;
-mod calendar;
 // WL-FUNC-011 Phase-2 retired the standalone Surface::Chat render. This module
 // remains only for the shared calendar helper and compatibility tests while the
 // canonical Communications read model owns live collaboration notifications.
@@ -6858,71 +6858,14 @@ mod tests {
     }
 
     #[test]
-    fn notification_fixture_mounts_chat_edge_and_accesskit_together() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bus_root = tmp.path().join("bus");
-        let persist = Persist::open(bus_root.clone()).expect("fixture bus");
-
-        let mut roster = Roster::new("eagle");
-        roster.upsert(Contact::new("eagle", NodeRole::Workstation));
-        persist
-            .write(
-                "state/chat/roster",
-                Priority::Default,
-                None,
-                Some(&serde_json::to_string(&roster).unwrap()),
-            )
-            .unwrap();
-        let mut alert_fields = std::collections::BTreeMap::new();
-        alert_fields.insert("summary".to_string(), "thermal critical".to_string());
-        let alert = Message::new(
-            "eagle",
-            42,
-            MessageKind::Alert {
-                severity: Severity::Critical,
-                flag: "thermal".to_string(),
-                fields: alert_fields,
-                action_verb: None,
-                actions: vec![
-                    AlertAction {
-                        id: "ack".to_string(),
-                        label: "Ack".to_string(),
-                        verb: None,
-                        kind: AlertActionKind::Ack,
-                    },
-                    AlertAction {
-                        id: "restart".to_string(),
-                        label: "Restart".to_string(),
-                        verb: Some("action/systemd/restart".to_string()),
-                        kind: AlertActionKind::Safe,
-                    },
-                ],
-            },
-        );
-        let mut conv = Conversation::new("alert:eagle");
-        conv.insert(alert);
-        let msgs: Vec<_> = conv.messages().iter().cloned().collect();
-        persist
-            .write(
-                "state/chat/conversation/alert:eagle",
-                Priority::Default,
-                None,
-                Some(&serde_json::to_string(&msgs).unwrap()),
-            )
-            .unwrap();
-
+    fn critical_alert_fixture_mounts_edge_and_accesskit_together() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.local_host = "eagle".to_string();
         shell.nav.expanded = true;
-        // WL-FUNC-011 Phase-2 retired the standalone Chat surface; the chat model
-        // still polls (feeding the tray badge + Communications), and the tray
-        // status/critical-edge chrome under test renders on any surface.
         shell.nav.surface = Surface::Desktop;
-        shell.chat = chat::ChatState::with_bus_root(bus_root);
-        shell.chat.select_notifications_for_test();
         shell
             .notify_status
             .set_segments_for_test(status::StatusSegments {
@@ -6963,11 +6906,6 @@ mod tests {
             shell.critical_edge.visible(),
             "own-seat critical remains live after the fixture frame"
         );
-        assert!(
-            shell.chat.notification_count_for_test() > 0,
-            "chat read-model folded the fixture alert (the model survives the surface retire)"
-        );
-
         let nodes = out
             .platform_output
             .accesskit_update

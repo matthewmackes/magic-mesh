@@ -6,21 +6,18 @@
 # mutates artifacts: it validates the release-evidence envelope, represents it
 # with a canonical PROVENANCE.json, and emits SHA256SUMS plus its detached
 # signature. That final path binds the source, exact artifact set, SBOM
-# manifest, gate manifest, and verified publisher-attestation descriptor before
-# a signature can be published. The publisher HMAC itself covers the
-# attestation/catalog digest, not the Git revision; checkout equality and the
-# final GPG-signed bundle provide that separate revision binding.
+# manifest and gate manifest before a signature can be published. Checkout
+# equality and the final GPG-signed bundle provide revision binding.
 #
 # Usage:
 #   ./install-helpers/sign-release.sh --prepare-rpms <rpm>...
 #   ./install-helpers/sign-release.sh --evidence evidence.json
-#     [--resource-publisher-credential /absolute/path] <artifact>...
+#     <artifact>...
 #   ./install-helpers/sign-release.sh --self-test
 #
 # Requires: gpg; rpmsign and rpm for --prepare-rpms; jq, python3, realpath,
-# stat, sha256sum, git, release-evidence.sh,
-# and verify-resource-publisher-attestation.py when publishing production-pass
-# provenance. RPM artifacts must already carry their governed signatures so
+# stat, sha256sum, git, and release-evidence.sh. RPM artifacts must already
+# carry their governed signatures so
 # their evidence-bound bytes are never rewritten here.
 set -euo pipefail
 
@@ -36,7 +33,7 @@ usage() {
   cat <<'USAGE'
 usage: sign-release.sh --prepare-rpms RPM...
        sign-release.sh --evidence EVIDENCE.json
-                       [--resource-publisher-credential ABSOLUTE_PATH] ARTIFACT...
+                       ARTIFACT...
        sign-release.sh --self-test
 
 --prepare-rpms is the only artifact-mutation stage. It accepts only regular,
@@ -45,11 +42,8 @@ and emits no release checksums, detached signature, or provenance.
 
 Final publication requires an evidence envelope whose artifact list, SBOM
 manifest, and gate manifest must all be present and unchanged.  The same
-directory then receives a signed PROVENANCE.json publication. Production-pass
-evidence additionally requires a fresh resource-publisher HMAC proof verified
-with the dedicated credential at ABSOLUTE_PATH, or resource-publisher-hmac
-under CREDENTIALS_DIRECTORY. Supplying artifacts without either explicit mode
-is always refused.
+directory then receives a signed PROVENANCE.json publication. Supplying
+artifacts without either explicit mode is always refused.
 USAGE
 }
 
@@ -192,17 +186,13 @@ require_provenance_inputs() {
   "$SCRIPT_DIR/release-evidence.sh" validate "$evidence" >/dev/null
 }
 
-enforce_production_publisher_attestation() {
+enforce_production_revision() {
   local evidence="$1" production revision evidence_revision before after
-  local verifier="$SCRIPT_DIR/verify-resource-publisher-attestation.py"
-  local -a verifier_args
   production="$(jq -er '.verdict.production | strings' "$evidence")" \
     || die "evidence has no production verdict"
   [ "$production" = "pass" ] || return 0
 
   command -v git >/dev/null 2>&1 || die "required command not found: git"
-  command -v python3 >/dev/null 2>&1 || die "required command not found: python3"
-  [ -x "$verifier" ] || die "resource-publisher attestation verifier is unavailable"
   revision="$(git -C "$SCRIPT_DIR/.." rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
     || die "could not determine the signing checkout revision"
   [[ "$revision" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
@@ -215,14 +205,8 @@ enforce_production_publisher_attestation() {
     || die "production evidence source revision is not an exact Git object ID"
   [ "$evidence_revision" = "$revision" ] \
     || die "production evidence source revision does not match the signing checkout"
-  verifier_args=(--evidence "$evidence" --expected-revision "$revision")
-  if [ -n "$RESOURCE_PUBLISHER_CREDENTIAL" ]; then
-    verifier_args+=(--credential "$RESOURCE_PUBLISHER_CREDENTIAL")
-  fi
-  "$verifier" "${verifier_args[@]}" >/dev/null \
-    || die "production resource-publisher attestation did not verify"
   after="$(sha256sum -- "$evidence" | awk '{print $1}')"
-  [ "$before" = "$after" ] || die "production evidence changed during attestation verification"
+  [ "$before" = "$after" ] || die "production evidence changed during revision verification"
   VERIFIED_PRODUCTION_EVIDENCE_SHA256="$after"
 }
 
@@ -299,10 +283,7 @@ prepare_provenance() {
       artifacts: .artifacts,
       sbom_manifest: .provenance.sbom_manifest,
       gate_manifest: .provenance.gate_manifest,
-      binding_sha256: .provenance.binding_sha256} +
-     (if .provenance.resource_publisher_attestation == null then {}
-      else {resource_publisher_attestation: .provenance.resource_publisher_attestation}
-      end)' \
+      binding_sha256: .provenance.binding_sha256}' \
     "$evidence" >"$provenance"
 }
 
@@ -490,7 +471,7 @@ publish() {
   [ "$(file_descriptor "$EVIDENCE")" = "$evidence_descriptor" ] \
     || die "evidence changed while it was validated"
   record_verified_input "$EVIDENCE" "$evidence_descriptor"
-  enforce_production_publisher_attestation "$EVIDENCE"
+  enforce_production_revision "$EVIDENCE"
   outdir="$(dirname -- "$(realpath -e -- "${ARTIFACTS[0]}")")"
   same_directory "$outdir" "$EVIDENCE" "${ARTIFACTS[@]}"
   verify_publication_artifacts "$EVIDENCE"
@@ -673,7 +654,6 @@ fi
 exit 2
 FAKE_RPM
   chmod +x "$fakebin/gpg" "$fakebin/rpmsign" "$fakebin/rpm"
-  "$SCRIPT_DIR/verify-resource-publisher-attestation.py" --self-test >/dev/null
   prepare_dir="$work/prepare"
   mkdir -p -- "$prepare_dir"
   printf 'first rpm\n' >"$prepare_dir/first.rpm"
@@ -936,7 +916,6 @@ FAKE_PYTHON
     require_provenance_inputs() { :; }
     EVIDENCE="$production_probe"
     ARTIFACTS=("$production_dir/artifact.bin")
-    RESOURCE_PUBLISHER_CREDENTIAL=""
     VERIFIED_PRODUCTION_EVIDENCE_SHA256=""
     PATH="$fakebin:$PATH" FAKE_GPG_LOG="$fake_gpg_log" publish
   ) >/dev/null 2>&1
@@ -953,7 +932,6 @@ FAKE_PYTHON
 
 EVIDENCE=""
 PREPARE_RPMS=0
-RESOURCE_PUBLISHER_CREDENTIAL=""
 VERIFIED_PRODUCTION_EVIDENCE_SHA256=""
 ARTIFACTS=()
 while [ "$#" -gt 0 ]; do
@@ -969,14 +947,6 @@ while [ "$#" -gt 0 ]; do
       EVIDENCE="$2"
       shift 2
       ;;
-    --resource-publisher-credential)
-      [ "$#" -ge 2 ] || die "--resource-publisher-credential needs an absolute path"
-      [ -z "$RESOURCE_PUBLISHER_CREDENTIAL" ] \
-        || die "--resource-publisher-credential may be supplied only once"
-      [[ "$2" = /* ]] || die "--resource-publisher-credential needs an absolute path"
-      RESOURCE_PUBLISHER_CREDENTIAL="$2"
-      shift 2
-      ;;
     --self-test) self_test; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; ARTIFACTS+=("$@"); break ;;
@@ -987,11 +957,7 @@ done
 
 [ "$PREPARE_RPMS" -eq 0 ] || [ -z "$EVIDENCE" ] \
   || die "--prepare-rpms and --evidence are mutually exclusive"
-[ "$PREPARE_RPMS" -eq 0 ] || [ -z "$RESOURCE_PUBLISHER_CREDENTIAL" ] \
-  || die "--resource-publisher-credential is invalid with --prepare-rpms"
 [ "$PREPARE_RPMS" -eq 0 ] || { prepare_rpms; exit 0; }
-[ -z "$RESOURCE_PUBLISHER_CREDENTIAL" ] || [ -n "$EVIDENCE" ] \
-  || die "--resource-publisher-credential requires --evidence"
 [ -n "$EVIDENCE" ] \
   || die "--evidence is mandatory; unsigned evidence gaps cannot enter the release signing path"
 [ "${#ARTIFACTS[@]}" -gt 0 ] || { usage >&2; exit 2; }

@@ -1,4 +1,4 @@
-//! WL-FUNC-018 S2 — production signed Flatpak catalog importer.
+//! WL-FUNC-018 S2 — production content-addressed Flatpak catalog importer.
 //!
 //! Registration note: after the concurrent Clock registration work lands, add
 //! `pub mod app_catalog;` to `workers/mod.rs`, add an `app_catalog` role entry to
@@ -10,9 +10,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::VerifyingKey;
 use mackes_mesh_types::app_catalog::{
-    FlatpakInstallState, SignedFlatpakAppCatalog, SignedFlatpakCatalogEntry,
+    FlatpakCatalogItem, FlatpakInstallState, FlatpakRuntimeCatalog,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -22,7 +21,6 @@ use crate::workers::{ShutdownToken, Worker};
 
 const POLL: Duration = Duration::from_secs(1);
 const SYSTEM_BUS_ROOT: &str = mde_bus::SYSTEM_BUS_ROOT;
-const MAX_TRUST_KEY_BYTES: u64 = 256;
 const MAX_CATALOG_WIRE_BYTES: u64 = 512 * 1024;
 const MAX_CURSOR_BYTES: u64 = 128;
 const MAX_IMPORTS_PER_POLL: usize = 32;
@@ -30,12 +28,10 @@ const PROJECTION_SCHEMA_VERSION: u16 = 1;
 const STATUS_SCHEMA_VERSION: u16 = 1;
 const PRODUCTION_OWNER_UID: u32 = 0;
 
-const SIGNER_ID_ENV: &str = "MDE_FLATPAK_CATALOG_SIGNER_ID";
-const TRUST_KEY_ENV: &str = "MDE_FLATPAK_CATALOG_TRUST_KEY_FILE";
 const LAST_GOOD_ENV: &str = "MDE_FLATPAK_CATALOG_LAST_GOOD_FILE";
 const CURSOR_ENV: &str = "MDE_FLATPAK_CATALOG_CURSOR_FILE";
 
-/// Bus projection containing only signed, admitted, installed application rows.
+/// Bus projection containing only validated, installed application rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedFlatpakCatalogProjection {
@@ -83,7 +79,7 @@ pub enum AppCatalogImportOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum AppCatalogStatusReason {
     None,
-    TrustUnavailable,
+    ConfigurationUnavailable,
     MissingPayload,
     AdmissionFailed,
     CatalogIdentityChanged,
@@ -99,7 +95,7 @@ pub enum AppCatalogStatusReason {
 #[serde(rename_all = "snake_case")]
 pub enum AppCatalogRemedy {
     None,
-    ConfigureTrust,
+    RepairConfiguration,
     PublishValidCatalog,
     PublishNewerRevision,
     RepairStateStorage,
@@ -121,8 +117,6 @@ pub struct AppCatalogImportStatus {
 
 #[derive(Debug, Clone)]
 struct CatalogConfig {
-    signer_id: String,
-    verifying_key: VerifyingKey,
     last_good_file: PathBuf,
     cursor_file: PathBuf,
     required_owner_uid: u32,
@@ -143,7 +137,7 @@ struct CatalogWatermark {
 }
 
 impl CatalogWatermark {
-    fn from_catalog(catalog: &SignedFlatpakAppCatalog) -> io::Result<Self> {
+    fn from_catalog(catalog: &FlatpakRuntimeCatalog) -> io::Result<Self> {
         Ok(Self {
             catalog_id: catalog.payload.catalog_id.clone(),
             revision: catalog.payload.revision,
@@ -155,11 +149,11 @@ impl CatalogWatermark {
 #[derive(Debug)]
 struct RecoveredCatalog {
     watermark: CatalogWatermark,
-    catalog: SignedFlatpakAppCatalog,
+    catalog: FlatpakRuntimeCatalog,
     is_fresh: bool,
 }
 
-/// Workstation authority for one node's signed Flatpak catalog.
+/// Workstation importer for one node's Flatpak catalog.
 pub struct AppCatalogWorker {
     host: String,
     /// Explicit override for tests/deployments. `None` resolves the user Bus
@@ -180,7 +174,7 @@ struct BusIdentity {
 #[derive(Debug, Clone, Default)]
 struct ImportState {
     cursor: Option<String>,
-    current: Option<SignedFlatpakAppCatalog>,
+    current: Option<FlatpakRuntimeCatalog>,
     watermark: Option<CatalogWatermark>,
     last_status: Option<AppCatalogImportStatus>,
     recovery_attempted: bool,
@@ -188,12 +182,12 @@ struct ImportState {
 }
 
 impl AppCatalogWorker {
-    /// Build from root-owned production trust configuration.
+    /// Build from root-owned production state configuration.
     #[must_use]
     pub fn new(host: String) -> Self {
         let config = load_environment_config(&host)
             .map_err(|error| {
-                tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog trust unavailable; importer is fail-closed");
+                tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog state configuration unavailable");
                 error
             })
             .ok();
@@ -219,7 +213,7 @@ impl AppCatalogWorker {
         &self,
         persist: &mut Persist,
         cursor: &mut Option<String>,
-        current: &mut Option<SignedFlatpakAppCatalog>,
+        current: &mut Option<FlatpakRuntimeCatalog>,
         watermark: &mut Option<CatalogWatermark>,
         last_status: &mut Option<AppCatalogImportStatus>,
         now_ms: u64,
@@ -247,7 +241,7 @@ impl AppCatalogWorker {
         &self,
         persist: &mut Persist,
         cursor: &mut Option<String>,
-        current: &mut Option<SignedFlatpakAppCatalog>,
+        current: &mut Option<FlatpakRuntimeCatalog>,
         watermark: &mut Option<CatalogWatermark>,
         last_status: &mut Option<AppCatalogImportStatus>,
         now_ms: u64,
@@ -280,8 +274,8 @@ impl AppCatalogWorker {
                 &status_for(
                     &self.host,
                     AppCatalogImportOutcome::Unavailable,
-                    AppCatalogStatusReason::TrustUnavailable,
-                    AppCatalogRemedy::ConfigureTrust,
+                    AppCatalogStatusReason::ConfigurationUnavailable,
+                    AppCatalogRemedy::RepairConfiguration,
                     watermark.as_ref(),
                     now_ms,
                 ),
@@ -318,10 +312,8 @@ impl AppCatalogWorker {
                 continue;
             };
 
-            let candidate = match SignedFlatpakAppCatalog::decode_and_admit_json(
+            let candidate = match FlatpakRuntimeCatalog::decode_and_admit_json(
                 body.as_bytes(),
-                &config.signer_id,
-                &config.verifying_key,
                 now_ms,
             ) {
                 Ok(candidate) => candidate,
@@ -622,9 +614,7 @@ impl Worker for AppCatalogWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        // No signed catalog can be admitted without the locally provisioned
-        // public trust anchor. Stay fully quiescent instead of opening Bus
-        // state and waking every second to repeat the same unavailable result.
+        // Invalid state-path configuration cannot be repaired by polling.
         if self.config.is_none() {
             shutdown.wait().await;
             return Ok(());
@@ -668,12 +658,6 @@ impl Worker for AppCatalogWorker {
 
 fn load_environment_config(host: &str) -> io::Result<CatalogConfig> {
     validate_host(host)?;
-    let signer_id = std::env::var(SIGNER_ID_ENV)
-        .map_err(|_| io::Error::other(format!("{SIGNER_ID_ENV} is unset")))?;
-    let trust_path = std::env::var_os(TRUST_KEY_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other(format!("{TRUST_KEY_ENV} is unset")))?;
-    let verifying_key = load_verifying_key(&trust_path, PRODUCTION_OWNER_UID)?;
     let last_good_file = std::env::var_os(LAST_GOOD_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -683,22 +667,10 @@ fn load_environment_config(host: &str) -> io::Result<CatalogConfig> {
         .map(PathBuf::from)
         .unwrap_or_else(|| last_good_file.with_extension("cursor"));
     Ok(CatalogConfig {
-        signer_id,
-        verifying_key,
         last_good_file,
         cursor_file,
         required_owner_uid: PRODUCTION_OWNER_UID,
     })
-}
-
-fn load_verifying_key(path: &Path, required_owner_uid: u32) -> io::Result<VerifyingKey> {
-    let mut file = open_secure_regular_nofollow(path, MAX_TRUST_KEY_BYTES, required_owner_uid)?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    let bytes = decode_hex_32(text.trim()).ok_or_else(|| {
-        io::Error::other("Flatpak catalog trust key must be 64 lowercase hex characters")
-    })?;
-    VerifyingKey::from_bytes(&bytes).map_err(io_other)
 }
 
 fn recover_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<RecoveredCatalog>> {
@@ -709,24 +681,14 @@ fn recover_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<R
     ) {
         Ok(mut file) => {
             let body = read_bounded(&mut file, MAX_CATALOG_WIRE_BYTES)?;
-            let parsed: SignedFlatpakAppCatalog =
-                serde_json::from_slice(&body).map_err(io_other)?;
-            let signature_check_time = parsed.payload.issued_at_unix_ms;
-            let verified = SignedFlatpakAppCatalog::decode_and_admit_json(
+            let parsed: FlatpakRuntimeCatalog = serde_json::from_slice(&body).map_err(io_other)?;
+            let verified = FlatpakRuntimeCatalog::decode_and_admit_json(
                 &body,
-                &config.signer_id,
-                &config.verifying_key,
-                signature_check_time,
+                parsed.payload.issued_at_unix_ms,
             )
             .map_err(io_other)?;
             let watermark = CatalogWatermark::from_catalog(&verified)?;
-            let is_fresh = SignedFlatpakAppCatalog::decode_and_admit_json(
-                &body,
-                &config.signer_id,
-                &config.verifying_key,
-                now_ms,
-            )
-            .is_ok();
+            let is_fresh = FlatpakRuntimeCatalog::decode_and_admit_json(&body, now_ms).is_ok();
             Ok(Some(RecoveredCatalog {
                 watermark,
                 catalog: verified,
@@ -738,7 +700,7 @@ fn recover_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<R
     }
 }
 
-fn store_last_good(config: &CatalogConfig, catalog: &SignedFlatpakAppCatalog) -> io::Result<()> {
+fn store_last_good(config: &CatalogConfig, catalog: &FlatpakRuntimeCatalog) -> io::Result<()> {
     let path = &config.last_good_file;
     let parent = path
         .parent()
@@ -792,8 +754,8 @@ fn load_cursor(config: &CatalogConfig) -> io::Result<Option<String>> {
         config.required_owner_uid,
     ) {
         Ok(mut file) => {
-            let body = String::from_utf8(read_bounded(&mut file, MAX_CURSOR_BYTES)?)
-                .map_err(io_other)?;
+            let body =
+                String::from_utf8(read_bounded(&mut file, MAX_CURSOR_BYTES)?).map_err(io_other)?;
             let cursor = body.trim();
             if cursor.is_empty()
                 || cursor.len() > usize::try_from(MAX_CURSOR_BYTES).unwrap_or(usize::MAX)
@@ -990,7 +952,7 @@ fn reject_symlink_parent(path: &Path) -> io::Result<()> {
 
 fn projection_from(
     host: &str,
-    catalog: &SignedFlatpakAppCatalog,
+    catalog: &FlatpakRuntimeCatalog,
     include_installed: bool,
 ) -> io::Result<AdmittedFlatpakCatalogProjection> {
     let entries = if include_installed {
@@ -1024,7 +986,7 @@ fn projection_from(
     })
 }
 
-fn project_entry(entry: &SignedFlatpakCatalogEntry) -> AdmittedFlatpakAppProjection {
+fn project_entry(entry: &FlatpakCatalogItem) -> AdmittedFlatpakAppProjection {
     AdmittedFlatpakAppProjection {
         app_id: entry.app_id.clone(),
         display_name: entry.display_name.clone(),
@@ -1069,7 +1031,7 @@ fn write_bus(persist: &Persist, topic: &str, body: &str) -> io::Result<()> {
 fn publish_projection(
     persist: &mut Persist,
     host: &str,
-    catalog: &SignedFlatpakAppCatalog,
+    catalog: &FlatpakRuntimeCatalog,
 ) -> io::Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_PROJECTION_WRITE.with(|fail| fail.replace(false)) {
@@ -1083,7 +1045,7 @@ fn publish_projection(
 fn publish_empty_projection(
     persist: &mut Persist,
     host: &str,
-    catalog: &SignedFlatpakAppCatalog,
+    catalog: &FlatpakRuntimeCatalog,
 ) -> io::Result<()> {
     let projection = projection_from(host, catalog, false)?;
     let body = serde_json::to_string(&projection).map_err(io_other)?;
@@ -1164,29 +1126,6 @@ fn validate_host(host: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64
-        || value
-            .bytes()
-            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return None;
-    }
-    let mut out = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        out[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Some(out)
-}
-
-const fn hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
-}
-
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1201,18 +1140,17 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::app_catalog::{
-        FlatpakCatalogOrigin, FlatpakSearchMetadata, SignedFlatpakCatalogPayload,
-        SIGNED_FLATPAK_CATALOG_SCHEMA_VERSION,
+        FlatpakCatalogDocument, FlatpakCatalogOrigin, FlatpakSearchMetadata,
+        FLATPAK_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::TempDir;
 
     const NOW: u64 = 1_800_000_000_000;
 
-    fn entry(app_id: &str, state: FlatpakInstallState) -> SignedFlatpakCatalogEntry {
-        SignedFlatpakCatalogEntry {
+    fn entry(app_id: &str, state: FlatpakInstallState) -> FlatpakCatalogItem {
+        FlatpakCatalogItem {
             app_id: app_id.into(),
             display_name: app_id.rsplit('.').next().unwrap().into(),
             summary: "Governed guest application".into(),
@@ -1229,25 +1167,19 @@ mod tests {
         }
     }
 
-    fn signed_catalog(
-        key: &SigningKey,
-        catalog_id: &str,
-        revision: u64,
-    ) -> SignedFlatpakAppCatalog {
-        signed_catalog_window(key, catalog_id, revision, NOW - 1_000, NOW + 60_000)
+    fn runtime_catalog(catalog_id: &str, revision: u64) -> FlatpakRuntimeCatalog {
+        runtime_catalog_window(catalog_id, revision, NOW - 1_000, NOW + 60_000)
     }
 
-    fn signed_catalog_window(
-        key: &SigningKey,
+    fn runtime_catalog_window(
         catalog_id: &str,
         revision: u64,
         issued_at_unix_ms: u64,
         expires_at_unix_ms: u64,
-    ) -> SignedFlatpakAppCatalog {
-        SignedFlatpakAppCatalog::sign(
-            "flatpak-release-v1",
-            SignedFlatpakCatalogPayload {
-                schema_version: SIGNED_FLATPAK_CATALOG_SCHEMA_VERSION,
+    ) -> FlatpakRuntimeCatalog {
+        FlatpakRuntimeCatalog {
+            payload: FlatpakCatalogDocument {
+                schema_version: FLATPAK_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: catalog_id.into(),
                 revision,
                 issued_at_unix_ms,
@@ -1261,16 +1193,14 @@ mod tests {
                     entry("org.example.Editor", FlatpakInstallState::Installed),
                 ],
             },
-            key,
-        )
-        .unwrap()
+        }
     }
 
     fn owner_uid() -> u32 {
         rustix::process::getuid().as_raw()
     }
 
-    fn worker(temp: &TempDir, key: &SigningKey) -> AppCatalogWorker {
+    fn worker(temp: &TempDir) -> AppCatalogWorker {
         let state_dir = temp.path().join("state");
         fs::create_dir(&state_dir).unwrap();
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1278,8 +1208,6 @@ mod tests {
             host: "node-01".into(),
             bus_root: Some(temp.path().join("bus")),
             config: Some(CatalogConfig {
-                signer_id: "flatpak-release-v1".into(),
-                verifying_key: key.verifying_key(),
                 last_good_file: state_dir.join("catalog.json"),
                 cursor_file: state_dir.join("catalog.cursor"),
                 required_owner_uid: owner_uid(),
@@ -1288,7 +1216,7 @@ mod tests {
         }
     }
 
-    fn import(persist: &Persist, catalog: &SignedFlatpakAppCatalog) {
+    fn import(persist: &Persist, catalog: &FlatpakRuntimeCatalog) {
         persist
             .write(
                 &app_catalog_import_topic("node-01").unwrap(),
@@ -1309,10 +1237,9 @@ mod tests {
     #[test]
     fn admits_persists_and_projects_only_installed_rows() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        import(&persist, &runtime_catalog("flatpak-production", 7));
         let mut cursor = None;
         let mut current = None;
         let mut watermark = None;
@@ -1379,15 +1306,8 @@ mod tests {
 
     #[test]
     fn installed_row_without_launch_action_is_not_projected() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let mut catalog = signed_catalog(&key, "flatpak-production", 7);
+        let mut catalog = runtime_catalog("flatpak-production", 7);
         catalog.payload.entries[1].supported_actions = vec!["resume".into()];
-        let catalog = SignedFlatpakAppCatalog::sign(
-            "flatpak-release-v1",
-            catalog.payload,
-            &key,
-        )
-        .unwrap();
 
         let projection = projection_from("node-01", &catalog, true).unwrap();
         assert!(projection.entries.is_empty());
@@ -1395,15 +1315,8 @@ mod tests {
 
     #[test]
     fn installed_row_with_canonicalized_launch_action_is_projected() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let mut catalog = signed_catalog(&key, "flatpak-production", 7);
+        let mut catalog = runtime_catalog("flatpak-production", 7);
         catalog.payload.entries[0].supported_actions = vec!["LAUNCH".into()];
-        let catalog = SignedFlatpakAppCatalog::sign(
-            "flatpak-release-v1",
-            catalog.payload,
-            &key,
-        )
-        .unwrap();
 
         let projection = projection_from("node-01", &catalog, true).unwrap();
         assert_eq!(projection.entries.len(), 1);
@@ -1413,19 +1326,16 @@ mod tests {
     #[test]
     fn exact_digest_replay_is_idempotent_and_revision_rules_retain_last_good() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        let good = signed_catalog(&key, "flatpak-production", 7);
+        let good = runtime_catalog("flatpak-production", 7);
         import(&persist, &good);
         import(&persist, &good);
-        import(&persist, &signed_catalog(&key, "flatpak-production", 6));
-        let mut conflict = signed_catalog(&key, "flatpak-production", 7);
+        import(&persist, &runtime_catalog("flatpak-production", 6));
+        let mut conflict = runtime_catalog("flatpak-production", 7);
         conflict.payload.entries[1].search.weight = 600;
-        conflict =
-            SignedFlatpakAppCatalog::sign("flatpak-release-v1", conflict.payload, &key).unwrap();
         import(&persist, &conflict);
-        import(&persist, &signed_catalog(&key, "other-catalog", 8));
+        import(&persist, &runtime_catalog("other-catalog", 8));
         let mut cursor = None;
         let mut current = None;
         let mut watermark = None;
@@ -1469,10 +1379,9 @@ mod tests {
     #[test]
     fn projection_failure_does_not_acknowledge_import_and_retry_admits_once() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        import(&persist, &runtime_catalog("flatpak-production", 7));
         let mut cursor = None;
         let mut current = None;
         let mut watermark = None;
@@ -1536,11 +1445,10 @@ mod tests {
     #[test]
     fn status_publication_failure_rolls_back_pass_state_and_retries() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let bus_root = temp.path().join("bus");
         let mut persist = Persist::open(bus_root.clone()).unwrap();
-        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        import(&persist, &runtime_catalog("flatpak-production", 7));
         let mut state = ImportState::default();
         let status_topic = app_catalog_status_topic("node-01").unwrap();
         FAIL_NEXT_BUS_WRITE_TOPIC.with(|fail| *fail.borrow_mut() = Some(status_topic));
@@ -1590,11 +1498,10 @@ mod tests {
     #[test]
     fn durable_cursor_skips_committed_rows_after_restart() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let initial_worker = worker(&temp, &key);
+        let initial_worker = worker(&temp);
         let bus_root = temp.path().join("bus");
         let mut persist = Persist::open(bus_root.clone()).unwrap();
-        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        import(&persist, &runtime_catalog("flatpak-production", 7));
         let mut cursor = None;
         let mut current = None;
         let mut watermark = None;
@@ -1658,16 +1565,11 @@ mod tests {
     #[test]
     fn hostile_imports_publish_payload_free_status_and_preserve_last_good() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let hostile_key = SigningKey::from_bytes(&[8; 32]);
-        let worker = worker(&temp, &key);
-        let good = signed_catalog(&key, "flatpak-production", 7);
+        let worker = worker(&temp);
+        let good = runtime_catalog("flatpak-production", 7);
         store_last_good(worker.config.as_ref().unwrap(), &good).unwrap();
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(
-            &persist,
-            &signed_catalog(&hostile_key, "flatpak-production", 8),
-        );
+        import(&persist, &runtime_catalog("flatpak-production", 8));
         persist
             .write(
                 &app_catalog_import_topic("node-01").unwrap(),
@@ -1720,69 +1622,38 @@ mod tests {
     }
 
     #[test]
-    fn trust_and_state_files_enforce_owner_mode_regular_bounds_and_nofollow() {
+    fn state_files_enforce_owner_mode_regular_bounds_and_nofollow() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let key_path = temp.path().join("trust.hex");
-        fs::write(&key_path, hex(&key.verifying_key().to_bytes())).unwrap();
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            load_verifying_key(&key_path, owner_uid()).unwrap(),
-            key.verifying_key()
-        );
-        assert!(load_verifying_key(&key_path, owner_uid().saturating_add(1)).is_err());
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o620)).unwrap();
-        assert!(load_verifying_key(&key_path, owner_uid()).is_err());
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-
-        let symlink = temp.path().join("trust-link.hex");
-        std::os::unix::fs::symlink(&key_path, &symlink).unwrap();
-        assert!(load_verifying_key(&symlink, owner_uid()).is_err());
-        assert!(validate_secure_metadata(
-            true,
-            MAX_TRUST_KEY_BYTES + 1,
-            owner_uid(),
-            0o100600,
-            MAX_TRUST_KEY_BYTES,
-            owner_uid()
-        )
-        .is_err());
-
         let real_parent = temp.path().join("real-state");
         fs::create_dir(&real_parent).unwrap();
         fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o700)).unwrap();
         let linked_parent = temp.path().join("linked-state");
         std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
         let linked_config = CatalogConfig {
-            signer_id: "flatpak-release-v1".into(),
-            verifying_key: key.verifying_key(),
             last_good_file: linked_parent.join("catalog.json"),
             cursor_file: linked_parent.join("catalog.cursor"),
             required_owner_uid: owner_uid(),
         };
-        assert!(store_last_good(
-            &linked_config,
-            &signed_catalog(&key, "flatpak-production", 7)
-        )
-        .is_err());
+        assert!(
+            store_last_good(&linked_config, &runtime_catalog("flatpak-production", 7)).is_err()
+        );
         assert!(!real_parent.join("catalog.json").exists());
         assert!(validate_secure_metadata(
             false,
             64,
             owner_uid(),
             0o040700,
-            MAX_TRUST_KEY_BYTES,
+            MAX_CATALOG_WIRE_BYTES,
             owner_uid()
         )
         .is_err());
     }
 
     #[test]
-    fn startup_recovery_readmits_exact_trust_and_refuses_stale_or_tampered_cache() {
+    fn startup_recovery_revalidates_content_and_refuses_stale_or_tampered_cache() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
-        let catalog = signed_catalog(&key, "flatpak-production", 7);
+        let worker = worker(&temp);
+        let catalog = runtime_catalog("flatpak-production", 7);
         store_last_good(worker.config.as_ref().unwrap(), &catalog).unwrap();
         let fresh = recover_last_good(worker.config.as_ref().unwrap(), NOW)
             .unwrap()
@@ -1803,8 +1674,7 @@ mod tests {
         publish_empty_projection(&mut persist, "node-01", &expired.catalog).unwrap();
         import(
             &persist,
-            &signed_catalog_window(
-                &key,
+            &runtime_catalog_window(
                 "other-catalog",
                 8,
                 RESTART_NOW - 1_000,
@@ -1813,8 +1683,7 @@ mod tests {
         );
         import(
             &persist,
-            &signed_catalog_window(
-                &key,
+            &runtime_catalog_window(
                 "flatpak-production",
                 6,
                 RESTART_NOW - 1_000,
@@ -1899,8 +1768,7 @@ mod tests {
             1
         );
 
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let configured = worker(&temp, &key);
+        let configured = worker(&temp);
         for _ in 0..2 {
             persist
                 .write(
@@ -1960,7 +1828,6 @@ mod tests {
     #[tokio::test]
     async fn same_worker_recovers_late_and_replaced_bus_with_governed_replay() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
         let bus_root = temp.path().join("late-bus");
         fs::write(&bus_root, b"temporarily unavailable").unwrap();
 
@@ -1969,8 +1836,7 @@ mod tests {
         let wall_now = now_unix_ms();
         import(
             &seeded,
-            &signed_catalog_window(
-                &key,
+            &runtime_catalog_window(
                 "flatpak-production",
                 7,
                 wall_now.saturating_sub(1_000),
@@ -1979,7 +1845,7 @@ mod tests {
         );
         drop(seeded);
 
-        let mut worker = worker(&temp, &key).with_poll(Duration::from_millis(10));
+        let mut worker = worker(&temp).with_poll(Duration::from_millis(10));
         worker.bus_root = Some(bus_root.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task =
@@ -1995,7 +1861,7 @@ mod tests {
         assert_eq!(
             latest_status(&Persist::open(bus_root.clone()).unwrap()).outcome,
             AppCatalogImportOutcome::Admitted,
-            "retained signed import remains governed by signature/watermark authority"
+            "retained import remains governed by content and revision watermarks"
         );
 
         let replacement_root = temp.path().join("replacement-bus");
@@ -2010,8 +1876,7 @@ mod tests {
         let live = Persist::open(bus_root.clone()).unwrap();
         import(
             &live,
-            &signed_catalog_window(
-                &key,
+            &runtime_catalog_window(
                 "flatpak-production",
                 8,
                 wall_now.saturating_sub(1_000),
@@ -2062,15 +1927,5 @@ mod tests {
             .expect("quiescent worker exits promptly")
             .expect("worker task joins")
             .expect("worker shutdown succeeds");
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut value = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            value.push(char::from(DIGITS[usize::from(byte >> 4)]));
-            value.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-        }
-        value
     }
 }

@@ -90,10 +90,7 @@ def fixture(root: Path, env: dict[str, str], revision: str, epoch: str) -> tuple
         files[f"{role}-manifest"] = rpm_manifest(artifacts / f"{role}.json", rpm, role, revision)
 
     browser = write(artifacts / "browser.qcow2", b"QFI\xfbgoverned Browser fixture\n")
-    profile_body = subprocess.run(
-        ["git", "-C", str(ROOT), "show", f"{revision}:packaging/browser-vm/profile.env"],
-        check=True, capture_output=True,
-    ).stdout.decode("utf-8")
+    profile_body = (ROOT / "packaging/browser-vm/profile.env").read_text(encoding="utf-8")
     lines = [f"BROWSER_VM_SOURCE_COMMIT={revision}" if line.startswith("BROWSER_VM_SOURCE_COMMIT=") else line
              for line in profile_body.splitlines()]
     profile = write(artifacts / "browser.env", ("\n".join(lines) + "\n").encode())
@@ -155,10 +152,8 @@ def fixture(root: Path, env: dict[str, str], revision: str, epoch: str) -> tuple
 
 
 def main() -> None:
-    revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True,
-                              text=True, capture_output=True).stdout.strip()
-    epoch = subprocess.run(["git", "-C", str(ROOT), "show", "-s", "--format=%ct", revision], check=True,
-                           text=True, capture_output=True).stdout.strip()
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    epoch = "1700000000"
     with tempfile.TemporaryDirectory(prefix="release-output-e2e-") as raw:
         root = Path(raw); root.chmod(0o700)
         tools = root / "bin"; tools.mkdir(mode=0o700)
@@ -177,6 +172,15 @@ printf '%s\\t0\\t13.0.0\\t%s\\tx86_64\\n8\\t%s\\n' "$name" "$release" "$(printf 
         tool(tools / "rpm2cpio", "printf 'archive fixture\\n'\n")
         tool(tools / "cpio", f"cat >/dev/null\nprintf '\\177ELF13.0.0Construct{revision}bounded\\n'\n")
         tool(tools / "qemu-img", "printf '{\"format\":\"qcow2\",\"virtual-size\":68719476736}\\n'\n")
+        tool(tools / "git", f"""
+case "$3" in
+  rev-parse) printf '{revision}\\n' ;;
+  show) printf '{epoch}\\n' ;;
+  ls-tree) printf '100755 blob 0000000000000000000000000000000000000000\\t%s\\n' "${{@: -1}}" ;;
+  diff) exit 0 ;;
+  *) exit 2 ;;
+esac
+""")
         env = dict(os.environ); env["PATH"] = f"{tools}:/usr/bin:/bin"
         inputs, files = fixture(root, env, revision, epoch)
 
@@ -194,7 +198,11 @@ printf '%s\\t0\\t13.0.0\\t%s\\tx86_64\\n8\\t%s\\n' "$name" "$release" "$(printf 
         for row in rows:
             artifact = expected_files[row["role"]]
             assert row["media_type"] == MEDIA[row["role"]]
-            assert row["source_revision"] == revision and row["signing_identity"] == SIGNER
+            assert row["source_revision"] == revision
+            if row["role"].endswith("-rpm"):
+                assert row["signing_identity"] == SIGNER
+            else:
+                assert "signing_identity" not in row
             assert row["sha256"] == "sha256:" + digest(artifact) and row["size"] == artifact.stat().st_size
         assert stat.S_IMODE(output.stat().st_mode) == 0o400
 

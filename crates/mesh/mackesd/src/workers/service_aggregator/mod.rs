@@ -38,9 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::resources::{
-    resource_publisher_attestation_topic, ClientCapabilityRegistry, ResourceCatalog,
-    ResourcePublisherAttestation, RESOURCE_CATALOG_TOPIC, RESOURCE_DISCOVERY_TOPIC,
-    RESOURCE_PUBLISHER_ATTESTATION_KEY_ID, RESOURCE_PUBLISHER_ATTESTATION_TTL_MS,
+    ClientCapabilityRegistry, ResourceCatalog, RESOURCE_CATALOG_TOPIC, RESOURCE_DISCOVERY_TOPIC,
 };
 use mackes_mesh_types::service_record::ServicesState;
 use mde_bus::hooks::config::Priority;
@@ -57,16 +55,6 @@ use super::upnp_sources::{
     decode_sources_state as decode_upnp_sources_state, UpnpSourcesState, UPNP_SOURCES_TOPIC,
 };
 use super::{ShutdownToken, Worker};
-use crate::ipc::secret_store::{repo_root, SecretStore};
-
-const RESOURCE_PUBLISHER_KEY_REF: &str = "resource/publisher-hmac";
-
-/// A missing/unreachable publisher-key backend must not turn every catalog
-/// fold into a process-spawning retry storm. Keep the first retry reasonably
-/// fresh, then widen the interval while the failure persists; a successful
-/// lookup resets the delay immediately.
-const PUBLISHER_RETRY_BASE: Duration = Duration::from_secs(30);
-const PUBLISHER_RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// Startup retry lower bound for an unresolved, unopenable, or unsafe Bus.
 const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -79,36 +67,6 @@ type BusReadGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
 
 #[cfg(test)]
 type BusWriteGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
-
-#[derive(Debug, Default)]
-struct PublisherRetryState {
-    next_attempt: Option<Instant>,
-    backoff: Duration,
-}
-
-impl PublisherRetryState {
-    fn allowed(&self, now: Instant) -> bool {
-        self.next_attempt.is_none_or(|next| now >= next)
-    }
-
-    fn record_failure(&mut self, now: Instant) {
-        let delay = if self.backoff.is_zero() {
-            PUBLISHER_RETRY_BASE
-        } else {
-            self.backoff
-                .checked_mul(2)
-                .unwrap_or(PUBLISHER_RETRY_MAX)
-                .min(PUBLISHER_RETRY_MAX)
-        };
-        self.backoff = delay;
-        self.next_attempt = Some(now + delay);
-    }
-
-    fn record_success(&mut self) {
-        self.next_attempt = None;
-        self.backoff = Duration::ZERO;
-    }
-}
 
 /// Fold cadence — one directory + inventory read per interval. Same order of cost
 /// as the sibling `unit_aggregator` worker's heartbeat.
@@ -500,10 +458,6 @@ pub struct ServiceAggregatorWorker {
     heartbeat: Duration,
     /// Stale-entry age-out window.
     ttl: Duration,
-    /// Approved secret-store backend for detached catalog publisher proofs.
-    publisher_store: SecretStore,
-    /// Negative-result cache for the optional publisher-proof lookup.
-    publisher_retry: std::sync::Mutex<PublisherRetryState>,
     #[cfg(test)]
     bus_read_gate: Option<Arc<BusReadGateFn>>,
     #[cfg(test)]
@@ -525,8 +479,6 @@ impl ServiceAggregatorWorker {
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
             ttl: DEFAULT_TTL,
-            publisher_store: SecretStore::resolve(&repo_root(), &workgroup_root),
-            publisher_retry: std::sync::Mutex::new(PublisherRetryState::default()),
             #[cfg(test)]
             bus_read_gate: None,
             #[cfg(test)]
@@ -580,14 +532,6 @@ impl ServiceAggregatorWorker {
     #[must_use]
     pub const fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
-        self
-    }
-
-    /// Override the publisher key store for deterministic tests or a controlled
-    /// deployment. The key value itself never enters the catalog or logs.
-    #[must_use]
-    pub fn with_publisher_store(mut self, publisher_store: SecretStore) -> Self {
-        self.publisher_store = publisher_store;
         self
     }
 
@@ -740,7 +684,6 @@ impl ServiceAggregatorWorker {
             "client capabilities admitted for resource publication"
         );
 
-        let publisher_attestation = self.publisher_attestation(&catalog)?;
         let discovery = catalog
             .discovery_projection()
             .map_err(|error| format!("derive resource discovery projection: {error}"))?;
@@ -753,13 +696,6 @@ impl ServiceAggregatorWorker {
             serde_json::to_string(&catalog)
                 .map_err(|error| format!("encode resource catalog: {error}"))?,
         )];
-        if let Some(attestation) = publisher_attestation {
-            outputs.push((
-                resource_publisher_attestation_topic(&catalog.publisher),
-                serde_json::to_string(&attestation)
-                    .map_err(|error| format!("encode resource publisher attestation: {error}"))?,
-            ));
-        }
         outputs.push((
             RESOURCE_DISCOVERY_TOPIC.to_owned(),
             serde_json::to_string(&discovery)
@@ -889,74 +825,6 @@ impl ServiceAggregatorWorker {
             },
         )
     }
-
-    /// Mint a detached proof from the approved secret store. A missing key is
-    /// an honest compatibility state: the catalog remains available to legacy
-    /// consumers, but no authenticated publication is claimed.
-    fn publisher_attestation(
-        &self,
-        catalog: &ResourceCatalog,
-    ) -> Result<Option<ResourcePublisherAttestation>, String> {
-        let now = Instant::now();
-        let allowed = self
-            .publisher_retry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .allowed(now);
-        if !allowed {
-            tracing::debug!(
-                host = %self.host,
-                key_ref = RESOURCE_PUBLISHER_KEY_REF,
-                "publisher key lookup still in bounded retry backoff"
-            );
-            return Ok(None);
-        }
-
-        let record_failure = |state: &std::sync::Mutex<PublisherRetryState>| {
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record_failure(now);
-        };
-        let key = match self.publisher_store.get(RESOURCE_PUBLISHER_KEY_REF) {
-            Ok(Some(key)) => {
-                self.publisher_retry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .record_success();
-                key
-            }
-            Ok(None) => {
-                record_failure(&self.publisher_retry);
-                tracing::warn!(
-                    host = %self.host,
-                    key_ref = RESOURCE_PUBLISHER_KEY_REF,
-                    "resource catalog publisher key is not distributed; authenticated proof withheld"
-                );
-                return Ok(None);
-            }
-            Err(error) => {
-                record_failure(&self.publisher_retry);
-                return Err(format!(
-                    "resource catalog publisher key lookup failed: {error}"
-                ));
-            }
-        };
-        let issued_at_ms = u64::try_from(now_ms()).unwrap_or(1).max(1);
-        let expires_at_ms = issued_at_ms.saturating_add(RESOURCE_PUBLISHER_ATTESTATION_TTL_MS);
-        let attestation = ResourcePublisherAttestation::mint(
-            catalog,
-            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
-            key.as_bytes(),
-            issued_at_ms,
-            expires_at_ms,
-        )
-        .map_err(|error| format!("mint resource publisher attestation: {error}"))?;
-        catalog
-            .validate_publisher_attestation(&attestation, key.as_bytes(), issued_at_ms)
-            .map_err(|error| format!("validate staged resource publisher attestation: {error}"))?;
-        Ok(Some(attestation))
-    }
 }
 
 #[async_trait::async_trait]
@@ -1002,10 +870,8 @@ impl Worker for ServiceAggregatorWorker {
         }
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
-        let mut action_worker = resource_actions::ResourceActionWorker::production(
-            Some(self.bus_root.clone()),
-            self.publisher_store.clone(),
-        );
+        let mut action_worker =
+            resource_actions::ResourceActionWorker::production(Some(self.bus_root.clone()));
         let mut action_tick = tokio::time::interval(mde_bus::rpc::CONTROL_POLL_INTERVAL);
         action_tick.tick().await;
         loop {
@@ -1036,7 +902,7 @@ mod tests {
     use mackes_mesh_types::resources::{
         AuthMethod, ClientBoundary, ClientCapability, ClientCapabilityLimits, ClientFeature,
         ResourceActionVerb, ResourceCatalog, ResourceClass, ResourceDiscoveryProjection,
-        ResourcePublisherAttestation, TransportProtocol,
+        TransportProtocol,
     };
     use mackes_mesh_types::service_record::{ServiceHealth, ServiceProvenance};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1075,19 +941,6 @@ mod tests {
         assert!(first < MAX_INITIAL_PHASE);
         assert!(initial_phase("seat-oak", Duration::from_millis(100)) < Duration::from_millis(100));
         assert_eq!(initial_phase("seat-oak", Duration::ZERO), Duration::ZERO);
-    }
-
-    fn local_publisher_store(root: &Path) -> SecretStore {
-        let key_path = root.join("mesh-age-key");
-        std::fs::write(
-            &key_path,
-            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
-        )
-        .expect("write test age key");
-        SecretStore::LocalAead {
-            dir: root.join("sealed"),
-            key_path,
-        }
     }
 
     fn valid_desktop_state() -> DesktopSourcesState {
@@ -1496,92 +1349,6 @@ mod tests {
             serde_json::from_str(&projection_body).expect("projection JSON");
         projection.validate().expect("published projection");
         assert_eq!(projection.catalog_content_digest, published.content_digest);
-    }
-
-    #[test]
-    fn publication_mints_and_retains_a_publisher_attestation_from_secret_store() {
-        let bus = tempfile::tempdir().expect("bus tempdir");
-        let secrets = tempfile::tempdir().expect("secret tempdir");
-        let store = local_publisher_store(secrets.path());
-        store
-            .put(RESOURCE_PUBLISHER_KEY_REF, "publisher-test-key")
-            .expect("seal publisher key");
-        let worker = worker_with(vec![], vec![])
-            .with_bus_root(Some(bus.path().to_path_buf()))
-            .with_publisher_store(store);
-        let catalog = catalog_with_capabilities(vec![]);
-
-        worker
-            .publish_resource_mirrors(&catalog)
-            .expect("publish resource mirrors");
-
-        let persist = mde_bus::persist::Persist::open(bus.path().to_path_buf()).expect("persist");
-        let catalog_body = persist
-            .read_latest(RESOURCE_CATALOG_TOPIC)
-            .expect("read catalog")
-            .and_then(|message| message.body)
-            .expect("catalog body");
-        let published = ResourceCatalog::from_json(&catalog_body).expect("published catalog");
-        let attestation_body = persist
-            .read_latest(&resource_publisher_attestation_topic(&published.publisher))
-            .expect("read publisher attestation")
-            .and_then(|message| message.body)
-            .expect("publisher attestation body");
-        let attestation: ResourcePublisherAttestation =
-            serde_json::from_str(&attestation_body).expect("publisher attestation JSON");
-        published
-            .validate_publisher_attestation(&attestation, b"publisher-test-key", now_ms() as u64)
-            .expect("publisher attestation validates");
-        assert_eq!(attestation.publisher, published.publisher);
-        assert_eq!(
-            attestation.key_id,
-            mackes_mesh_types::resources::RESOURCE_PUBLISHER_ATTESTATION_KEY_ID
-        );
-    }
-
-    #[test]
-    fn publication_without_a_distributed_publisher_key_withholds_only_the_proof() {
-        let bus = tempfile::tempdir().expect("bus tempdir");
-        let worker = worker_with(vec![], vec![]).with_bus_root(Some(bus.path().to_path_buf()));
-        let catalog = catalog_with_capabilities(vec![]);
-
-        worker
-            .publish_resource_mirrors(&catalog)
-            .expect("publish resource mirrors");
-
-        let persist = mde_bus::persist::Persist::open(bus.path().to_path_buf()).expect("persist");
-        let catalog_body = persist
-            .read_latest(RESOURCE_CATALOG_TOPIC)
-            .expect("read catalog")
-            .and_then(|message| message.body)
-            .expect("legacy catalog remains available");
-        let published = ResourceCatalog::from_json(&catalog_body).expect("published catalog");
-        assert!(persist
-            .read_latest(&resource_publisher_attestation_topic(&published.publisher))
-            .expect("read missing publisher attestation")
-            .is_none());
-    }
-
-    #[test]
-    fn publisher_retry_state_is_bounded_and_resets_after_success() {
-        let mut state = PublisherRetryState::default();
-        let start = Instant::now();
-        assert!(state.allowed(start));
-
-        state.record_failure(start);
-        assert!(!state.allowed(start + PUBLISHER_RETRY_BASE - Duration::from_nanos(1)));
-        assert!(state.allowed(start + PUBLISHER_RETRY_BASE));
-
-        for _ in 0..16 {
-            state.record_failure(start + PUBLISHER_RETRY_MAX);
-        }
-        assert_eq!(state.backoff, PUBLISHER_RETRY_MAX);
-        assert!(!state.allowed(start + PUBLISHER_RETRY_MAX));
-
-        state.record_success();
-        assert!(state.allowed(start));
-        assert_eq!(state.backoff, Duration::ZERO);
-        assert!(state.next_attempt.is_none());
     }
 
     #[test]

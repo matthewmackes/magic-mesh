@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use mackes_mesh_types::android_apps::{AndroidImagePackageManifest, AndroidSignedCatalog};
+use mackes_mesh_types::android_apps::{AndroidImagePackageManifest, AndroidRuntimeCatalog};
 use mackes_mesh_types::android_provider::{
     AndroidProviderAdmission, AndroidProviderReadiness, AndroidProviderRefusal,
     CuttlefishImageProvenanceRef, ANDROID_PROVIDER_ADMISSION_SCHEMA_VERSION,
@@ -105,7 +105,7 @@ impl AndroidHostProbe for ProductionAndroidHostProbe {
 
 pub(super) struct AndroidPreflightInput<'a> {
     pub workload: &'a WorkloadSpec,
-    pub catalog: Option<&'a AndroidSignedCatalog>,
+    pub catalog: Option<&'a AndroidRuntimeCatalog>,
     pub package_manifest: Option<&'a AndroidImagePackageManifest>,
     pub artifact: Option<&'a Path>,
     pub provider_healthy: bool,
@@ -348,13 +348,12 @@ fn image_fingerprint(path: &Path) -> io::Result<ImageFingerprint> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
         AndroidAppCapability, AndroidAppPermission, AndroidCatalogAppPolicy,
         AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidImageManifest,
         AndroidImagePackage, AndroidImageProvenance, AndroidPackageVersion, AndroidResourceClass,
         AndroidResourceProfile, AospStarterApp, AospStarterCatalog,
-        ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use mackes_mesh_types::cloud::StoragePool;
 
@@ -379,7 +378,7 @@ mod tests {
         }
     }
 
-    fn catalog() -> AndroidSignedCatalog {
+    fn catalog() -> AndroidRuntimeCatalog {
         let image = AndroidImageManifest::new(
             "aosp-cuttlefish-production",
             DIGEST,
@@ -416,10 +415,9 @@ mod tests {
                 guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
             })
             .collect();
-        AndroidSignedCatalog::sign(
-            "android-release-v1",
-            AndroidCatalogPayload {
-                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AndroidRuntimeCatalog {
+            payload: AndroidCatalogPayload {
+                schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: "aosp-production".into(),
                 revision: 1,
                 issued_at_unix_ms: NOW - 2_000,
@@ -428,9 +426,7 @@ mod tests {
                 package_manifest,
                 app_policies,
             },
-            &SigningKey::from_bytes(&[7; 32]),
-        )
-        .unwrap()
+        }
     }
 
     fn workload() -> WorkloadSpec {
@@ -464,7 +460,7 @@ mod tests {
     }
 
     fn run(
-        catalog: &AndroidSignedCatalog,
+        catalog: &AndroidRuntimeCatalog,
         probe: &FakeProbe,
         now: u64,
         healthy: bool,
@@ -474,7 +470,7 @@ mod tests {
 
     fn run_with_workload(
         workload: &WorkloadSpec,
-        catalog: &AndroidSignedCatalog,
+        catalog: &AndroidRuntimeCatalog,
         probe: &FakeProbe,
         now: u64,
         healthy: bool,
@@ -615,7 +611,7 @@ mod tests {
 
         // Preserve every attacker-controlled cache key: path, inode, length,
         // and mtime.  Linux ctime still advances for this in-place rewrite and
-        // must invalidate the previously admitted signed-image digest.
+        // must invalidate the previously validated image digest.
         std::thread::sleep(std::time::Duration::from_millis(2));
         fs::write(&image, b"hostile-image-two").unwrap();
         File::options()

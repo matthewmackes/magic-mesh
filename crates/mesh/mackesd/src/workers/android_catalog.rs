@@ -1,17 +1,16 @@
-//! WL-FUNC-020 S1 — signed Android catalog runtime importer.
+//! WL-FUNC-020 S1 — Android runtime catalog importer.
 //!
-//! The release signer stays offline.  This worker reads one locally provisioned
-//! Ed25519 *public* trust anchor, drains the node-scoped typed import topic, and
-//! publishes only catalogs that pass the shared contract's complete admission.
+//! The catalog is discovery and policy data, not a security authority. This
+//! worker drains the node-scoped typed import topic and publishes only catalogs
+//! that pass the shared structural, freshness, and revision contract.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::VerifyingKey;
 use mackes_mesh_types::android_apps::{
-    android_catalog_import_topic, android_catalog_state_topic, AndroidSignedCatalog,
+    android_catalog_import_topic, android_catalog_state_topic, AndroidRuntimeCatalog,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -22,19 +21,14 @@ use super::{ShutdownToken, Worker};
 const POLL: Duration = Duration::from_secs(1);
 const SYSTEM_BUS_ROOT: &str = mde_bus::SYSTEM_BUS_ROOT;
 const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TRUST_BYTES: u64 = 256;
 const MAX_ROWS_PER_POLL: usize = 32;
 const MAX_CACHE_TEMP_ATTEMPTS: usize = 32;
 const CACHE_SCHEMA: u16 = 1;
 
-const SIGNER_ID_ENV: &str = "MDE_ANDROID_CATALOG_SIGNER_ID";
-const TRUST_KEY_ENV: &str = "MDE_ANDROID_CATALOG_TRUST_KEY_FILE";
 const STATE_FILE_ENV: &str = "MDE_ANDROID_CATALOG_STATE_FILE";
 
 #[derive(Debug, Clone)]
 struct CatalogConfig {
-    signer_id: String,
-    verifying_key: VerifyingKey,
     state_file: PathBuf,
 }
 
@@ -42,10 +36,10 @@ struct CatalogConfig {
 #[serde(deny_unknown_fields)]
 struct PersistedCatalog {
     schema_version: u16,
-    catalog: AndroidSignedCatalog,
+    catalog: AndroidRuntimeCatalog,
 }
 
-/// Workstation runtime authority for one node's signed Android catalog.
+/// Workstation importer for one node's Android runtime catalog.
 pub struct AndroidCatalogWorker {
     host: String,
     /// Explicit override for tests/deployments. `None` resolves the user Bus
@@ -67,18 +61,18 @@ struct BusIdentity {
 struct ImportState {
     published_replay: bool,
     cursor: Option<String>,
-    current: Option<AndroidSignedCatalog>,
+    current: Option<AndroidRuntimeCatalog>,
     bus_identity: Option<BusIdentity>,
 }
 
 impl AndroidCatalogWorker {
-    /// Build from the production environment contract. Missing or invalid trust
-    /// configuration leaves the worker alive but fail-closed and non-publishing.
+    /// Build from the production environment contract. Invalid node or state
+    /// configuration leaves the worker alive but quiescent.
     #[must_use]
     pub fn new(host: String) -> Self {
         let config = load_environment_config(&host)
             .map_err(|error| {
-                tracing::warn!(target: "mackesd::android_catalog", %error, "Android catalog trust is unavailable; importer is fail-closed");
+                tracing::warn!(target: "mackesd::android_catalog", %error, "Android catalog configuration is unavailable; importer is quiescent");
                 error
             })
             .ok();
@@ -104,7 +98,7 @@ impl AndroidCatalogWorker {
         &self,
         persist: &mut Persist,
         cursor: &mut Option<String>,
-        current: &mut Option<AndroidSignedCatalog>,
+        current: &mut Option<AndroidRuntimeCatalog>,
         now_ms: u64,
     ) -> io::Result<usize> {
         let Some(config) = self.config.as_ref() else {
@@ -126,7 +120,7 @@ impl AndroidCatalogWorker {
                 *cursor = Some(row_ulid);
                 continue;
             }
-            let candidate = match serde_json::from_str::<AndroidSignedCatalog>(&body) {
+            let candidate = match serde_json::from_str::<AndroidRuntimeCatalog>(&body) {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     tracing::warn!(target: "mackesd::android_catalog", %error, "refused malformed Android catalog import");
@@ -134,11 +128,10 @@ impl AndroidCatalogWorker {
                     continue;
                 }
             };
-            let candidate = match candidate.admit(&config.signer_id, &config.verifying_key, now_ms)
-            {
+            let candidate = match candidate.admit(now_ms) {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    tracing::warn!(target: "mackesd::android_catalog", ?error, "refused untrusted Android catalog import");
+                    tracing::warn!(target: "mackesd::android_catalog", ?error, "refused invalid Android catalog import");
                     *cursor = Some(row_ulid);
                     continue;
                 }
@@ -150,7 +143,7 @@ impl AndroidCatalogWorker {
                 tracing::warn!(
                     target: "mackesd::android_catalog",
                     catalog_id = %candidate.payload.catalog_id,
-                    "refused signed Android catalog identity switch"
+                    "refused Android catalog identity switch"
                 );
                 *cursor = Some(row_ulid);
                 continue;
@@ -183,17 +176,14 @@ impl AndroidCatalogWorker {
             return Ok(());
         }
 
-        // Imports are durable, signed commands. A replacement index is a new
-        // history, so replay it from the beginning under the same admission
-        // authority after restoring the durable last-good projection.
+        // Imports are durable content declarations. A replacement index is a new
+        // history, so replay it from the beginning after restoring the durable
+        // last-good projection.
         let mut staged = state.clone();
         staged.cursor = None;
         staged.published_replay = false;
-        if let (Some(config), Some(catalog)) = (self.config.as_ref(), staged.current.as_ref()) {
-            match catalog
-                .clone()
-                .admit(&config.signer_id, &config.verifying_key, now_ms)
-            {
+        if let Some(catalog) = staged.current.as_ref() {
+            match catalog.clone().admit(now_ms) {
                 Ok(catalog) => publish_admitted(persist, &self.host, &catalog)?,
                 Err(error) => tracing::warn!(
                     target: "mackesd::android_catalog",
@@ -233,14 +223,13 @@ impl AndroidCatalogWorker {
     }
 }
 
-/// Load the host's durable last-good catalog under the same trust policy used
-/// by the importer.
+/// Load the host's durable last-good catalog under the same validation policy
+/// used by the importer.
 ///
 /// Mutation consumers use the durable cache instead of trusting an arbitrary
-/// publication on the shared Bus.  Loading re-checks the pinned signer,
-/// Ed25519 signature, complete payload contract, and validity window, so a
-/// catalog that has expired since import cannot authorize new desired state.
-pub(crate) fn load_admitted_catalog(host: &str, now_ms: u64) -> io::Result<AndroidSignedCatalog> {
+/// publication on the shared Bus. Loading re-checks the complete payload
+/// contract and validity window, so an expired catalog cannot drive new state.
+pub(crate) fn load_admitted_catalog(host: &str, now_ms: u64) -> io::Result<AndroidRuntimeCatalog> {
     let config = load_environment_config(host)?;
     load_last_good(&config, now_ms)?.ok_or_else(|| {
         io::Error::other(format!(
@@ -304,8 +293,7 @@ impl Worker for AndroidCatalogWorker {
         if self.config.is_none() {
             tracing::info!(
                 target: "mackesd::android_catalog",
-                env = TRUST_KEY_ENV,
-                "Android catalog trust is unavailable; worker quiescent until shutdown"
+                "Android catalog configuration is unavailable; worker quiescent until shutdown"
             );
             shutdown.wait().await;
             return Ok(());
@@ -328,7 +316,7 @@ impl Worker for AndroidCatalogWorker {
                         tracing::warn!(
                             target: "mackesd::android_catalog",
                             %error,
-                            "Android catalog durable authority is invalid; importer remains fail-closed"
+                            "Android catalog durable state is invalid; importer remains quiescent"
                         );
                         tokio::select! {
                             () = shutdown.wait() => break,
@@ -362,44 +350,18 @@ impl Worker for AndroidCatalogWorker {
 
 fn load_environment_config(host: &str) -> io::Result<CatalogConfig> {
     android_catalog_state_topic(host).map_err(io_other)?;
-    let signer_id = std::env::var(SIGNER_ID_ENV)
-        .map_err(|_| io::Error::other(format!("{SIGNER_ID_ENV} is unset")))?;
-    let key_path = std::env::var_os(TRUST_KEY_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other(format!("{TRUST_KEY_ENV} is unset")))?;
-    let verifying_key = load_verifying_key(&key_path)?;
     let state_file = std::env::var_os(STATE_FILE_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from("/var/lib/mackesd/android-catalog").join(format!("{host}.json"))
         });
-    Ok(CatalogConfig {
-        signer_id,
-        verifying_key,
-        state_file,
-    })
+    Ok(CatalogConfig { state_file })
 }
 
-fn load_verifying_key(path: &Path) -> io::Result<VerifyingKey> {
-    let mut file = open_regular_nofollow(path, MAX_TRUST_BYTES)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if file.metadata()?.mode() & 0o022 != 0 {
-            return Err(io::Error::other(
-                "Android catalog trust key is group/world writable",
-            ));
-        }
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    let bytes = decode_hex_32(text.trim()).ok_or_else(|| {
-        io::Error::other("Android catalog trust key must be 64 lowercase hex characters")
-    })?;
-    VerifyingKey::from_bytes(&bytes).map_err(io_other)
-}
-
-fn load_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<AndroidSignedCatalog>> {
+fn load_last_good(
+    config: &CatalogConfig,
+    now_ms: u64,
+) -> io::Result<Option<AndroidRuntimeCatalog>> {
     ensure_directory_chain_nofollow(
         config
             .state_file
@@ -416,17 +378,13 @@ fn load_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<Andr
     if persisted.schema_version != CACHE_SCHEMA {
         return Err(io::Error::other("unsupported Android catalog cache schema"));
     }
-    persisted
-        .catalog
-        .admit(&config.signer_id, &config.verifying_key, now_ms)
-        .map(Some)
-        .map_err(io_other)
+    persisted.catalog.admit(now_ms).map(Some).map_err(io_other)
 }
 
 fn publish_admitted(
     persist: &mut Persist,
     host: &str,
-    catalog: &AndroidSignedCatalog,
+    catalog: &AndroidRuntimeCatalog,
 ) -> io::Result<()> {
     let topic = android_catalog_state_topic(host).map_err(io_other)?;
     let body = serde_json::to_string(catalog).map_err(io_other)?;
@@ -447,7 +405,7 @@ std::thread_local! {
     static FAIL_NEXT_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()> {
+fn store_last_good(path: &Path, catalog: &AndroidRuntimeCatalog) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("Android catalog state path has no parent"))?;
@@ -555,29 +513,6 @@ fn open_regular_nofollow(path: &Path, max_bytes: u64) -> io::Result<File> {
     Ok(file)
 }
 
-fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64
-        || value
-            .bytes()
-            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return None;
-    }
-    let mut out = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        out[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Some(out)
-}
-
-const fn hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
-}
-
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -592,40 +527,34 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
         AndroidAppCapability, AndroidAppPermission, AndroidCatalogAppPolicy,
         AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidImageManifest,
         AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
         AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterApp,
-        AospStarterCatalog, ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AospStarterCatalog, ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use tempfile::TempDir;
 
     const NOW: u64 = 1_786_000_000_300;
 
-    fn signed_catalog(key: &SigningKey, revision: u64) -> AndroidSignedCatalog {
-        signed_catalog_with_id(key, revision, "aosp-starter-production")
+    fn runtime_catalog(revision: u64) -> AndroidRuntimeCatalog {
+        runtime_catalog_with_id(revision, "aosp-starter-production")
     }
 
-    fn signed_catalog_with_id(
-        key: &SigningKey,
-        revision: u64,
-        catalog_id: &str,
-    ) -> AndroidSignedCatalog {
-        signed_catalog_at_with_id(key, revision, NOW, catalog_id)
+    fn runtime_catalog_with_id(revision: u64, catalog_id: &str) -> AndroidRuntimeCatalog {
+        runtime_catalog_at_with_id(revision, NOW, catalog_id)
     }
 
-    fn signed_catalog_at(key: &SigningKey, revision: u64, now_ms: u64) -> AndroidSignedCatalog {
-        signed_catalog_at_with_id(key, revision, now_ms, "aosp-starter-production")
+    fn runtime_catalog_at(revision: u64, now_ms: u64) -> AndroidRuntimeCatalog {
+        runtime_catalog_at_with_id(revision, now_ms, "aosp-starter-production")
     }
 
-    fn signed_catalog_at_with_id(
-        key: &SigningKey,
+    fn runtime_catalog_at_with_id(
         revision: u64,
         now_ms: u64,
         catalog_id: &str,
-    ) -> AndroidSignedCatalog {
+    ) -> AndroidRuntimeCatalog {
         let image = AndroidImageManifest::new(
             "aosp-cuttlefish-2026-08",
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -665,10 +594,9 @@ mod tests {
                 guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
             })
             .collect();
-        AndroidSignedCatalog::sign(
-            "android-release-v1",
-            AndroidCatalogPayload {
-                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AndroidRuntimeCatalog {
+            payload: AndroidCatalogPayload {
+                schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: catalog_id.into(),
                 revision,
                 issued_at_unix_ms: now_ms - 100,
@@ -677,25 +605,21 @@ mod tests {
                 package_manifest,
                 app_policies,
             },
-            key,
-        )
-        .unwrap()
+        }
     }
 
-    fn worker(temp: &TempDir, key: &SigningKey) -> AndroidCatalogWorker {
+    fn worker(temp: &TempDir) -> AndroidCatalogWorker {
         AndroidCatalogWorker {
             host: "node-01".into(),
             bus_root: Some(temp.path().join("bus")),
             config: Some(CatalogConfig {
-                signer_id: "android-release-v1".into(),
-                verifying_key: key.verifying_key(),
                 state_file: temp.path().join("state/catalog.json"),
             }),
             poll: POLL,
         }
     }
 
-    fn import(persist: &Persist, catalog: &AndroidSignedCatalog) {
+    fn import(persist: &Persist, catalog: &AndroidRuntimeCatalog) {
         persist
             .write(
                 &android_catalog_import_topic("node-01").unwrap(),
@@ -709,11 +633,10 @@ mod tests {
     #[test]
     fn imports_and_publishes_only_newer_valid_revisions() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(&persist, &signed_catalog(&key, 7));
-        import(&persist, &signed_catalog(&key, 6));
+        import(&persist, &runtime_catalog(7));
+        import(&persist, &runtime_catalog(6));
         let mut cursor = None;
         let mut current = None;
         assert_eq!(
@@ -733,16 +656,16 @@ mod tests {
     }
 
     #[test]
-    fn tampered_or_untrusted_input_preserves_last_good() {
+    fn malformed_or_identity_switching_input_preserves_last_good() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let hostile_key = SigningKey::from_bytes(&[8; 32]);
-        let worker = worker(&temp, &key);
-        let good = signed_catalog(&key, 7);
+        let worker = worker(&temp);
+        let good = runtime_catalog(7);
         store_last_good(&worker.config.as_ref().unwrap().state_file, &good).unwrap();
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(&persist, &signed_catalog(&hostile_key, 8));
-        let mut tampered = signed_catalog(&key, 9);
+        let mut malformed = runtime_catalog(8);
+        malformed.payload.app_policies.clear();
+        import(&persist, &malformed);
+        let mut tampered = runtime_catalog(9);
         tampered.payload.catalog_id = "tampered".into();
         import(&persist, &tampered);
         let mut cursor = None;
@@ -761,16 +684,15 @@ mod tests {
     }
 
     #[test]
-    fn trusted_higher_revision_cannot_switch_catalog_identity() {
+    fn higher_revision_cannot_switch_catalog_identity() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
-        let good = signed_catalog(&key, 7);
+        let worker = worker(&temp);
+        let good = runtime_catalog(7);
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
         import(&persist, &good);
         import(
             &persist,
-            &signed_catalog_with_id(&key, 8, "aosp-alternate-production"),
+            &runtime_catalog_with_id(8, "aosp-alternate-production"),
         );
         let mut cursor = None;
         let mut current = None;
@@ -795,9 +717,8 @@ mod tests {
     #[test]
     fn restart_replays_persisted_valid_catalog_and_refuses_corruption() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
-        let catalog = signed_catalog(&key, 7);
+        let worker = worker(&temp);
+        let catalog = runtime_catalog(7);
         let path = &worker.config.as_ref().unwrap().state_file;
         store_last_good(path, &catalog).unwrap();
         let replay = load_last_good(worker.config.as_ref().unwrap(), NOW)
@@ -822,9 +743,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
-        let catalog = signed_catalog(&key, 7);
+        let worker = worker(&temp);
+        let catalog = runtime_catalog(7);
         let real_parent = temp.path().join("real-state");
         let real_path = real_parent.join("catalog.json");
         store_last_good(&real_path, &catalog).unwrap();
@@ -848,15 +768,14 @@ mod tests {
     }
 
     #[test]
-    fn transient_side_effect_failure_keeps_signed_import_retryable() {
+    fn transient_side_effect_failure_keeps_catalog_import_retryable() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let state_parent = worker.config.as_ref().unwrap().state_file.parent().unwrap();
         fs::write(state_parent, b"hostile non-directory").unwrap();
 
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(&persist, &signed_catalog(&key, 7));
+        import(&persist, &runtime_catalog(7));
         let mut cursor = None;
         let mut current = None;
         assert!(worker
@@ -885,17 +804,16 @@ mod tests {
     }
 
     #[test]
-    fn stale_cache_staging_file_cannot_wedge_signed_catalog_updates() {
+    fn stale_cache_staging_file_cannot_wedge_catalog_updates() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let path = &worker.config.as_ref().unwrap().state_file;
         let parent = path.parent().unwrap();
         fs::create_dir_all(parent).unwrap();
         let stale = parent.join(format!(".android-catalog-{}-0.tmp", std::process::id()));
         fs::write(&stale, b"incomplete catalog from killed importer").unwrap();
 
-        let catalog = signed_catalog(&key, 7);
+        let catalog = runtime_catalog(7);
         store_last_good(path, &catalog).unwrap();
 
         assert_eq!(
@@ -913,11 +831,10 @@ mod tests {
     #[test]
     fn replay_and_import_publication_failures_preserve_state_for_retry() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let bus_root = temp.path().join("bus");
         let mut persist = Persist::open(bus_root.clone()).unwrap();
-        let catalog_7 = signed_catalog(&key, 7);
+        let catalog_7 = runtime_catalog(7);
         store_last_good(&worker.config.as_ref().unwrap().state_file, &catalog_7).unwrap();
         let mut state = ImportState {
             current: Some(catalog_7),
@@ -939,7 +856,7 @@ mod tests {
         assert!(state.published_replay);
         assert!(state.bus_identity.is_some());
 
-        import(&persist, &signed_catalog(&key, 8));
+        import(&persist, &runtime_catalog(8));
         FAIL_NEXT_PUBLICATION.with(|fail| fail.set(true));
         assert!(worker
             .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
@@ -977,11 +894,10 @@ mod tests {
     #[test]
     fn expired_catalog_cannot_replay_into_replaced_bus() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let bus_root = temp.path().join("replacement-bus");
         let mut persist = Persist::open(bus_root.clone()).unwrap();
-        let expired = signed_catalog(&key, 7);
+        let expired = runtime_catalog(7);
         let mut state = ImportState {
             current: Some(expired.clone()),
             ..ImportState::default()
@@ -1005,7 +921,7 @@ mod tests {
             "expired authority remains only as the anti-rollback revision anchor"
         );
 
-        import(&persist, &signed_catalog_at(&key, 8, after_expiry));
+        import(&persist, &runtime_catalog_at(8, after_expiry));
         worker
             .process_bus_pass(&mut persist, &bus_root, &mut state, after_expiry)
             .unwrap();
@@ -1019,11 +935,10 @@ mod tests {
     #[test]
     fn replacement_after_open_cannot_strand_catalog_replay_on_retired_index() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let worker = worker(&temp, &key);
+        let worker = worker(&temp);
         let bus_root = temp.path().join("bus");
         let mut retired = Persist::open(bus_root.clone()).unwrap();
-        let catalog = signed_catalog(&key, 7);
+        let catalog = runtime_catalog(7);
         let mut state = ImportState {
             current: Some(catalog),
             ..ImportState::default()
@@ -1059,7 +974,7 @@ mod tests {
                         persist.read_latest(&android_catalog_state_topic("node-01").unwrap())
                     {
                         if row.body.as_deref().is_some_and(|body| {
-                            serde_json::from_str::<AndroidSignedCatalog>(body)
+                            serde_json::from_str::<AndroidRuntimeCatalog>(body)
                                 .is_ok_and(|catalog| catalog.payload.revision == revision)
                         }) {
                             break;
@@ -1076,17 +991,16 @@ mod tests {
     #[tokio::test]
     async fn same_worker_recovers_late_and_replaced_bus_with_governed_replay() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
         let bus_root = temp.path().join("late-bus");
         fs::write(&bus_root, b"temporarily unavailable").unwrap();
 
         let wall_now = now_unix_ms();
         let seeded_root = temp.path().join("seeded-bus");
         let seeded = Persist::open(seeded_root.clone()).unwrap();
-        import(&seeded, &signed_catalog_at(&key, 7, wall_now));
+        import(&seeded, &runtime_catalog_at(7, wall_now));
         drop(seeded);
 
-        let mut worker = worker(&temp, &key).with_poll(Duration::from_millis(10));
+        let mut worker = worker(&temp).with_poll(Duration::from_millis(10));
         worker.bus_root = Some(bus_root.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task =
@@ -1113,7 +1027,7 @@ mod tests {
         wait_for_revision(&bus_root, 7).await;
 
         let live = Persist::open(bus_root.clone()).unwrap();
-        import(&live, &signed_catalog_at(&key, 8, wall_now));
+        import(&live, &runtime_catalog_at(8, wall_now));
         wait_for_revision(&bus_root, 8).await;
 
         shutdown_tx.send(true).unwrap();
@@ -1131,17 +1045,16 @@ mod tests {
     #[tokio::test]
     async fn corrupt_restart_cache_cannot_erase_catalog_identity_authority() {
         let temp = TempDir::new().unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
         let wall_now = now_unix_ms();
         let bus_root = temp.path().join("bus");
         let persist = Persist::open(bus_root.clone()).unwrap();
         import(
             &persist,
-            &signed_catalog_at_with_id(&key, 8, wall_now, "aosp-hostile-alternate"),
+            &runtime_catalog_at_with_id(8, wall_now, "aosp-hostile-alternate"),
         );
         drop(persist);
 
-        let mut worker = worker(&temp, &key).with_poll(Duration::from_millis(10));
+        let mut worker = worker(&temp).with_poll(Duration::from_millis(10));
         worker.bus_root = Some(bus_root.clone());
         let state_file = worker.config.as_ref().unwrap().state_file.clone();
         fs::create_dir_all(state_file.parent().unwrap()).unwrap();
@@ -1160,7 +1073,7 @@ mod tests {
                 .read_latest(&android_catalog_state_topic("node-01").unwrap())
                 .unwrap()
                 .is_none(),
-            "invalid durable authority must block signed Bus replay"
+            "invalid durable authority must block Bus replay"
         );
         assert_eq!(
             fs::read(&state_file).unwrap(),
@@ -1168,21 +1081,13 @@ mod tests {
             "fail-closed startup must not replace the identity anchor from Bus history"
         );
 
-        let baseline = signed_catalog_at(&key, 7, wall_now);
+        let baseline = runtime_catalog_at(7, wall_now);
         store_last_good(&state_file, &baseline).unwrap();
         wait_for_revision(&bus_root, 7).await;
         assert_eq!(
-            load_last_good(
-                &CatalogConfig {
-                    signer_id: "android-release-v1".into(),
-                    verifying_key: key.verifying_key(),
-                    state_file,
-                },
-                wall_now,
-            )
-            .unwrap(),
+            load_last_good(&CatalogConfig { state_file }, wall_now,).unwrap(),
             Some(baseline),
-            "repair restores the original identity; the signed alternate stays refused"
+            "repair restores the original identity; the alternate stays refused"
         );
 
         shutdown_tx.send(true).unwrap();

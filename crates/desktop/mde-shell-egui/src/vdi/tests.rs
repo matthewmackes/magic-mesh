@@ -2550,11 +2550,18 @@ fn guest_input_requires_framebuffer_ownership_and_releases_pointer_capture() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     };
-    assert!(!guest_input_event_admitted(
+    assert!(guest_input_event_admitted(
         &key,
         rect,
         false,
         Some(inside),
+        &mut captured
+    ));
+    assert!(!guest_input_event_admitted(
+        &key,
+        rect,
+        false,
+        Some(outside),
         &mut captured
     ));
     assert!(guest_input_event_admitted(

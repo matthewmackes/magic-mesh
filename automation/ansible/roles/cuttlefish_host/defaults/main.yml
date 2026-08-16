@@ -7,11 +7,10 @@
 # (re)starts the device.
 cuttlefish_debs: []
 
-# Signed first-release handoff. These controller-side paths are mandatory: the
-# role refuses before apt, service, or cvd effects unless their exact bytes are
-# authenticated by the project release signer and staged privately.
+# Content-declared release handoff. These controller-side paths are mandatory:
+# the role refuses before apt, service, or cvd effects unless their hashes match
+# the declaration and the exact payload is staged privately.
 cuttlefish_release_declaration: ""
-cuttlefish_release_signature: ""
 cuttlefish_readiness_relay: ""
 cuttlefish_vdi_agent: ""
 cuttlefish_payload_stage_dir: /var/lib/mcnf/cuttlefish-release-payload

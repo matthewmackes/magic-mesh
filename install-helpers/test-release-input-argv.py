@@ -48,8 +48,7 @@ def main() -> None:
         preflight.chmod(0o755)
 
         names = (
-            "maps-approval.json", "maps-verifier", "app-receipt.json", "app-key.asc",
-            "release.json", "release.json.asc", "relay", "agent", "rpm-receipt.json",
+            "maps-approval.json", "maps-verifier", "release.json", "relay", "agent", "rpm-receipt.json",
             "bootc-receipt.json", "app-base-receipt.json", "cuttlefish-receipt.json", "cuttlefish-image.tar",
             "mcnf-cuttlefish-readiness-relay.deb", "mcnf-cuttlefish-vdi-agent.deb",
         )
@@ -67,10 +66,7 @@ def main() -> None:
             "maps_tile_source_root": str(maps_root),
             "maps_quota_bytes": "4096",
             "maps_verifier": str(inputs / "maps-verifier"),
-            "app_vm_catalog_trust_receipt": str(inputs / "app-receipt.json"),
-            "app_vm_catalog_trust_key": str(inputs / "app-key.asc"),
             "cuttlefish_declaration": str(inputs / "release.json"),
-            "cuttlefish_signature": str(inputs / "release.json.asc"),
             "cuttlefish_readiness_relay": str(inputs / "relay"),
             "cuttlefish_vdi_agent": str(inputs / "agent"),
             "cuttlefish_guest_packages": [

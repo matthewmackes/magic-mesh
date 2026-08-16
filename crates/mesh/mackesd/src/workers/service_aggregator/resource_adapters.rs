@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use mackes_mesh_types::android_apps::{android_catalog_state_topic, AndroidSignedCatalog};
+use mackes_mesh_types::android_apps::{android_catalog_state_topic, AndroidRuntimeCatalog};
 use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
 use mackes_mesh_types::cloud::{cloud_state_topic, CloudState, DeliveryType};
 use mackes_mesh_types::media_sources::{
@@ -59,7 +59,7 @@ pub enum ResourceAdapterKind {
     PeerDirectory,
     /// Authoritative typed Workload state projection.
     Workload,
-    /// Node-scoped projection emitted only after signed App VM catalog admission.
+    /// Node-scoped projection emitted only after App VM catalog validation.
     AppVmCatalog,
     /// Node-scoped signed Android catalog retained after importer admission.
     AndroidCatalog,
@@ -145,12 +145,7 @@ pub fn augment_from_production(
         );
     adapt_peers(&peers, directory_current, now_ms, &mut adapted);
 
-    match approved_nodes_for_resources(
-        &peers,
-        &catalog.publisher,
-        directory_current,
-        now_ms,
-    ) {
+    match approved_nodes_for_resources(&peers, &catalog.publisher, directory_current, now_ms) {
         Some(approved_nodes) => {
             adapt_workloads(bus_root, &approved_nodes, now_ms, &mut adapted);
             adapt_app_vm_catalogs(bus_root, &approved_nodes, now_ms, &mut adapted);
@@ -479,7 +474,7 @@ fn adapt_app_vm_body(
                 ResourceClass::Application,
                 format!("app-vm/{node}/{}", entry.app_id),
                 entry.display_name.clone(),
-                format!("Signed App VM catalog on {node}"),
+                format!("Validated App VM catalog on {node}"),
                 now_ms,
                 expires,
                 readiness.health,
@@ -539,7 +534,7 @@ fn app_vm_readiness(
         .iter()
         .any(|action| action == "launch")
     {
-        return unavailable_app_vm("signed App catalog does not admit launch");
+        return unavailable_app_vm("App catalog does not admit launch");
     }
     let Some(snapshot) = workload_snapshot else {
         return unavailable_app_vm("App VM workload readiness has not been observed");
@@ -662,7 +657,7 @@ fn adapt_android_body(
         return;
     };
     let catalog = if catalog_body.len() <= MAX_ANDROID_CATALOG_WIRE_BYTES {
-        serde_json::from_str::<AndroidSignedCatalog>(catalog_body).ok()
+        serde_json::from_str::<AndroidRuntimeCatalog>(catalog_body).ok()
     } else {
         None
     };
@@ -679,9 +674,7 @@ fn adapt_android_body(
         && catalog.payload.image_manifest.validate_at(now_ms).is_ok()
         && catalog.payload.issued_at_unix_ms <= now_ms
         && catalog.payload.expires_at_unix_ms > now_ms
-        && catalog.payload.app_policies.len() <= MAX_ANDROID_ROWS
-        && is_safe_id(&catalog.signer_id)
-        && is_lower_hex(&catalog.signature, 128);
+        && catalog.payload.app_policies.len() <= MAX_ANDROID_ROWS;
     if !valid {
         adapted.statuses.push(status(
             ResourceAdapterKind::AndroidCatalog,
@@ -1653,8 +1646,8 @@ fn android_start_action(observed: u64, expires: u64) -> ResourceAction {
         verb: ResourceActionVerb::Start,
         target: ResourceActionTarget::Resource,
         availability: ActionAvailability {
-            // A signed catalog proves that this app/workload pairing is
-            // governed, but it does not prove that the guest is booted and
+            // A validated catalog records this app/workload pairing, but it
+            // does not prove that the guest is booted and
             // launcher-ready. Keep Start visible as evidence while making
             // the browser's executable-action projection truthful.
             status: ActionAvailabilityStatus::Unavailable,
@@ -1692,13 +1685,12 @@ fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::android_apps::{
         AndroidAppCapability, AndroidAppPermission, AndroidCatalogAppPolicy,
         AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidImageManifest,
         AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
         AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterApp,
-        AospStarterCatalog, ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AospStarterCatalog, ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
     };
     use mackes_mesh_types::media_sources::{
         LaneStatus as MediaLaneStatus, MediaSource, MediaSourcesState,
@@ -1790,13 +1782,9 @@ mod tests {
         conflicting.last_seen_ms += 1;
         conflicting.health = "degraded".into();
 
-        let approved = approved_nodes_for_resources(
-            &[first.clone(), conflicting],
-            "seat193",
-            true,
-            NOW,
-        )
-        .expect("safe peer rows remain a valid directory input");
+        let approved =
+            approved_nodes_for_resources(&[first.clone(), conflicting], "seat193", true, NOW)
+                .expect("safe peer rows remain a valid directory input");
         assert!(!approved.contains("alpha"));
         assert!(approved.contains("seat193"));
 
@@ -1814,21 +1802,16 @@ mod tests {
         let mut future = peer("future");
         future.last_seen_ms = NOW + 1;
 
-        let approved = approved_nodes_for_resources(
-            &[current.clone(), stale, future],
-            "seat193",
-            true,
-            NOW,
-        )
-        .expect("bounded directory");
+        let approved =
+            approved_nodes_for_resources(&[current.clone(), stale, future], "seat193", true, NOW)
+                .expect("bounded directory");
         assert_eq!(
             approved,
             BTreeSet::from(["current".to_owned(), "seat193".to_owned()])
         );
 
-        let unavailable =
-            approved_nodes_for_resources(&[current], "seat193", false, NOW)
-                .expect("bounded fallback directory");
+        let unavailable = approved_nodes_for_resources(&[current], "seat193", false, NOW)
+            .expect("bounded fallback directory");
         assert_eq!(unavailable, BTreeSet::from(["seat193".to_owned()]));
     }
 
@@ -1837,13 +1820,8 @@ mod tests {
         let mut malformed = peer("hostile");
         malformed.role = Some("workstation\nforged-authority".into());
 
-        let approved = approved_nodes_for_resources(
-            &[malformed],
-            "seat193",
-            true,
-            NOW,
-        )
-        .expect("bounded directory");
+        let approved = approved_nodes_for_resources(&[malformed], "seat193", true, NOW)
+            .expect("bounded directory");
 
         assert_eq!(approved, BTreeSet::from(["seat193".to_owned()]));
     }
@@ -1892,7 +1870,7 @@ mod tests {
         }
     }
 
-    fn android_catalog() -> AndroidSignedCatalog {
+    fn android_catalog() -> AndroidRuntimeCatalog {
         let image = AndroidImageManifest::new(
             "aosp-cuttlefish-2026-08",
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -1932,10 +1910,9 @@ mod tests {
                 guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
             })
             .collect();
-        AndroidSignedCatalog::sign(
-            "android-release-v1",
-            AndroidCatalogPayload {
-                schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+        AndroidRuntimeCatalog {
+            payload: AndroidCatalogPayload {
+                schema_version: ANDROID_RUNTIME_CATALOG_SCHEMA_VERSION,
                 catalog_id: "aosp-starter-production".into(),
                 revision: 7,
                 issued_at_unix_ms: NOW - 1_000,
@@ -1944,9 +1921,7 @@ mod tests {
                 package_manifest,
                 app_policies,
             },
-            &SigningKey::from_bytes(&[7; 32]),
-        )
-        .unwrap()
+        }
     }
 
     fn android_cloud_state(workloads: &[&str]) -> String {
