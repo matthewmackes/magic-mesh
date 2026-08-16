@@ -25,7 +25,11 @@ const TARGET_REFRESH: Duration = Duration::from_secs(2);
 const REMOTE_FRESHNESS: Duration = Duration::from_secs(30);
 const MIRROR_PREFIX: &str = "state/host/";
 const MIRROR_SUFFIX: &str = "/seat";
-const ONBOARDING_BIN: &str = "/usr/bin/mde-onboarding-offboarding";
+// WL-FUNC-023 S4 — the legacy Construct entry point must reach the one
+// shipped lifecycle authority. Keep the environment override for an
+// installed renderer-specific launcher, but default to the shared TUI rather
+// than a binary that is not packaged by the RPM.
+const ONBOARDING_BIN: &str = "/usr/bin/magic-setup";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PowerCycleAction {
