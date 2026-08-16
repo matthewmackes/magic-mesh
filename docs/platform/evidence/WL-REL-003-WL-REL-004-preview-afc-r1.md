@@ -46,6 +46,14 @@ one source revision, and one signer. Browser and App VM qcow2 manifests were
 verified against their complete compressed disk bytes; the App VM is a 10 GiB
 virtual disk occupying about 1.91 GiB compressed.
 
+The same verified bytes are materialized as a private preview directory on
+BigBoy at `/home/mm/preview-release-afc-v1`. Its role inventory is
+`metadata/PREVIEW-RELEASE.json` (SHA-256
+`1dba98a7c0907917f7f29c46a3c4b1a872252a0b0a715d30089dfea47bc2b37c`), with
+mode-0400 metadata and mode-0700 parent directories. Independent BigBoy
+readback reproduced the seven role hashes above; no public or package-channel
+upload was performed.
+
 ## Current-source farm verification
 
 The current checkout was routed through the governed farm with explicit host
