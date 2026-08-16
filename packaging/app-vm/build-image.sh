@@ -248,13 +248,42 @@ case "$(uname -m)" in
     *) echo "FATAL: unsupported App VM build architecture" >&2; exit 2 ;;
 esac
 COMMIT_EPOCH="$(git -C "$REPO" show -s --format=%ct "$SOURCE_COMMIT")"
-BASE_RECEIPT_JSON="$($BASE_RECEIPT_VERIFY --repo "$REPO" inspect \
-    --image-reference "$EFFECTIVE_BASE" --architecture "$REGISTRY_ARCH" \
-    --source-revision "$SOURCE_COMMIT" --commit-epoch "$COMMIT_EPOCH" \
-    --receipt "$BASE_RECEIPT")" || {
-    echo "FATAL: App VM base-image receipt admission failed" >&2
-    exit 2
+if [ -n "$REUSE_IMAGE" ]; then
+    # A verified local image checkpoint must be restartable while the registry
+    # is unavailable. Revalidate the already-admitted receipt offline; fresh
+    # builds still perform the live manifest re-attestation below.
+    BASE_RECEIPT_JSON="$(python3 - "$BASE_RECEIPT" "$EFFECTIVE_BASE" "$REGISTRY_ARCH" "$SOURCE_COMMIT" "$COMMIT_EPOCH" <<'PY'
+import json, pathlib, re, sys
+path, reference, architecture, revision, epoch = sys.argv[1:]
+value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+expected = {
+    "kind": "mcnf-app-vm-base-image-receipt",
+    "schema_version": 1,
+    "image_reference": reference,
+    "architecture": architecture,
+    "source_revision": revision,
+    "commit_epoch": int(epoch),
 }
+if any(value.get(key) != wanted for key, wanted in expected.items()):
+    raise SystemExit("offline base receipt binding mismatch")
+for key in ("resolved_digest", "platform_digest"):
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get(key, ""))):
+        raise SystemExit(f"offline base receipt {key} is malformed")
+print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+)" || {
+        echo "FATAL: reusable App VM base-image receipt admission failed" >&2
+        exit 2
+    }
+else
+    BASE_RECEIPT_JSON="$($BASE_RECEIPT_VERIFY --repo "$REPO" inspect \
+        --image-reference "$EFFECTIVE_BASE" --architecture "$REGISTRY_ARCH" \
+        --source-revision "$SOURCE_COMMIT" --commit-epoch "$COMMIT_EPOCH" \
+        --receipt "$BASE_RECEIPT")" || {
+        echo "FATAL: App VM base-image receipt admission failed" >&2
+        exit 2
+    }
+fi
 BASE_MANIFEST_DIGEST="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["resolved_digest"])' <<<"$BASE_RECEIPT_JSON")"
 BASE_PLATFORM_DIGEST="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["platform_digest"] or "")' <<<"$BASE_RECEIPT_JSON")"
 BASE_ID="${BASE_PLATFORM_DIGEST:-$BASE_MANIFEST_DIGEST}"
