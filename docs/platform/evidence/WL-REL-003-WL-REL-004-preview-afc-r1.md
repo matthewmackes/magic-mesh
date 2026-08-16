@@ -46,6 +46,28 @@ one source revision, and one signer. Browser and App VM qcow2 manifests were
 verified against their complete compressed disk bytes; the App VM is a 10 GiB
 virtual disk occupying about 1.91 GiB compressed.
 
+## Current-source farm verification
+
+The current checkout was routed through the governed farm with explicit host
+and slot assignments. All gates passed:
+
+- BigBoy `.130` slot 1: `cargo test -p mackesd --lib --locked --
+  --test-threads=1` — `5023 passed; 0 failed; 1 ignored`.
+- `.90` slot 2: `cargo test -p mackesd --lib onboard --locked -- --nocapture` —
+  `229 passed; 0 failed`.
+- `.170` slot 1: `cargo test -p mackesd --lib lifecycle_authority --locked --
+  --nocapture` — `17 passed; 0 failed`.
+- `.90` slot 1: `cargo test -p mackes-mesh-types lifecycle --locked --
+  --nocapture` — `20 passed; 0 failed`.
+- `.50` slot 1: `cargo test -p mde-enroll --lib --locked --
+  --test-threads=1` — `33 passed; 0 failed`.
+- `.196` slot 1: `cargo check -p mde-enroll --bin magic-setup --locked` —
+  completed successfully.
+
+Local release controls also passed: the release plan/collector seven-verifier
+integration, release-evidence self-test, sign-release self-test, worklist lint
+self-test, and `git diff --check`.
+
 ## Remaining release work
 
 This evidence does not close WL-REL-001, WL-REL-004, or WL-REL-005. The
