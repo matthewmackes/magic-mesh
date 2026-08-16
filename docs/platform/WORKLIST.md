@@ -117,7 +117,8 @@ behavioral evidence is not completion.
   execution requires a typed artifact selection or compatibility digest.
   Downstream package, service, enrollment, renderer, fleet-offboarding, and
   full execution evidence remain. Evidence:
-  `docs/platform/evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md`.
+  `docs/platform/evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md` and
+  `docs/platform/evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r1.md`.
 - Remaining work:
   GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
   deliverable, farm command, result, revision, and evidence; do not close a story
