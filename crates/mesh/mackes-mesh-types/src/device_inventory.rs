@@ -527,7 +527,7 @@ mod tests {
         // An unknown future key degrades to a readable label, never a panic.
         assert_eq!(category_label("future-thing"), "future thing");
         // The order list carries the full locked taxonomy.
-        assert_eq!(category::ORDER.len(), 13);
+        assert_eq!(category::ORDER.len(), 15);
     }
 
     #[test]
