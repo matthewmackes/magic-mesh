@@ -52,6 +52,8 @@ pathlib.Path('/usr/share/mcnf/app-vm/catalog-trust-receipt.json').write_bytes(re
 PY
 RUN set -eux; \
     dnf -y install gnupg2; \
+    install -d -m 0700 /tmp/mcnf-gnupg; \
+    export GNUPGHOME=/tmp/mcnf-gnupg; \
     chmod 0444 /etc/mackesd/flatpak-catalog-verification.key /usr/share/mcnf/app-vm/catalog-trust-receipt.json; \
     printf '%s\n' "${MCNF_APP_VM_BASE_IMAGE_ID}" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || { \
         echo "FATAL: App VM base image provenance must be a complete sha256 digest" >&2; exit 1; }; \
@@ -134,7 +136,7 @@ RUN set -eux; \
         > /usr/share/mcnf/app-vm/runtime-readiness; \
     rm -rf /tmp/mcnf-rpms /tmp/mcnf-app-vm-validate /tmp/mcnf-app-vm-launch /tmp/mcnf-app-vm-runtime-probe \
         /tmp/mcnf-app-vm-verify-rpm-supply /tmp/verify-rpm-build-identity.py \
-        /tmp/verify-installed-rpm-identity.sh /tmp/RPM-GPG-KEY-magic-mesh; \
+        /tmp/verify-installed-rpm-identity.sh /tmp/RPM-GPG-KEY-magic-mesh /tmp/mcnf-gnupg; \
     dnf clean all
 
 # The curated Flatpak remote is deliberately not created here. Its signed
