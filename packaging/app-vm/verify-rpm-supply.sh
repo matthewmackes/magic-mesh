@@ -2,6 +2,8 @@
 # Fail-closed admission for the governed RPM baked into the App VM image.
 set -euo pipefail
 
+# Fedora 44 exposes the package payload identity as PAYLOADSHA256* RPM tags.
+
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BUILD_IDENTITY_VERIFY="$SCRIPT_DIR/verify-rpm-build-identity.py"
 MAX_RPM_BYTES="${MCNF_APP_VM_MAX_RPM_BYTES:-1073741824}"
