@@ -411,10 +411,10 @@ jobs (single small crates, per-crate tests/clippy). This composes with the ≤-c
 spread (`docs/BUILD-ENVIRONMENT.md`): spread the *count* to honor per-node caps,
 but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI
 build on a small node while BigBoy runs a trivial one. The **canonical farm
-roster** is `install-helpers/farm-topology.sh` — **4 dom0s / 4 build VMs / 9 heavy
-slots** (`.50`/`.90`/`.170` at cap 2 · BigBoy `.130` at cap 3; the 4th dom0 is
-XEN-194 → `mcnf-build-53` → `.170`). Run `./install-helpers/farm-topology.sh table`
-at the start of every run for a **verified** utilization table — it probes all 4
+roster** is `install-helpers/farm-topology.sh` — **5 dom0s / 5 build VMs / 10 heavy
+slots** (`.50`/`.90`/`.170` at cap 2 · BigBoy `.130` at cap 3 · `.196` at cap 1;
+the XEN-194 dom0 is `.170`). Run `./install-helpers/farm-topology.sh table`
+at the start of every run for a **verified** utilization table — it probes all 5
 nodes and **fails if one is missing** (XEN-194/.170 sat idle a whole session once,
 under a stale 3-node roster). Never hardcode the node list or chart from memory.
 Stale `10.0.0.x` farm pins are invalid; the build VMs live on the `172.20.0.x`
@@ -424,6 +424,56 @@ the guest image contract and the approved live VDI proof runner; cold guest
 image/browser builds can exhaust small-node slot disks through Rust or image
 incremental caches, so put those long-pole jobs on BigBoy and use
 `CARGO_INCREMENTAL=0` after any ENOSPC failure.
+
+**§10.0.3 — Farm admission and retry lock (newest lock 2026-08-16).** A farm
+job may not start, sync, build, or export until an executable preflight has
+admitted the exact job on a reserved host/slot. “The host is reachable” is not
+capacity evidence. The admission record must bind the job ID, source revision,
+input/artifact digests, requested output size, scratch multiplier, cache key,
+host, slot, and expiry; it must be retained with the job evidence. The
+canonical roster is the five-node / ten-slot topology in
+`install-helpers/farm-topology.sh` (`.50`/`.90`/`.170` cap 2, `.130` cap 3,
+`.196` cap 1), not the historical four-node/nine-slot description.
+
+The preflight must fail closed unless all of these are true:
+
+1. The selected node is live, its slot is reserved exclusively, and its
+   `/home` free space covers source sync plus the declared output and scratch
+   allowance. Image/export jobs must reserve the complete qcow2/raw output
+   size *and* build-layer/osbuild/qemu scratch; a final export must never be the
+   first capacity check.
+2. Source, signed inputs, base images, toolchain/target release, and cache
+   identity are immutable and digest-bound. A cache hit is usable only when its
+   key matches the complete input identity; a stale cache must be invalidated,
+   never silently reused. The admission record must distinguish “same source,
+   different packaging/tooling” from a rebuilt runtime artifact.
+3. Build, export, and verification are separate restart-safe checkpoints. A
+   failed export may resume from the verified build checkpoint, and a failed
+   verification may resume from the immutable artifact; neither condition may
+   trigger an unnecessary rebuild. Partial outputs are quarantined and are
+   never published as candidates.
+4. On an admission or infrastructure failure (unreachable host, exhausted
+   slot, insufficient space, broken container runtime, or failed export
+   infrastructure), the scheduler releases the reservation and reassigns the
+   same immutable job to a qualifying node/slot. It must not duplicate a job
+   that is still running, and it must not retry a source/test failure as if it
+   were infrastructure. BigBoy receives the long-pole job first; small nodes
+   receive only jobs whose declared resource envelope fits.
+5. A retry is permitted only with the same immutable job identity, a new
+   admission record, and a classified reason. Normal expectation is one build;
+   repeated builds require evidence of a source/test failure or transient
+   infrastructure failure. ENOSPC after admission is a farm correctness bug
+   and must create a capacity incident, not be normalized as a routine retry.
+6. Before releasing a reservation, the runner must record the checkpoint,
+   artifact digest/size, verifier result, and cleanup status. Cleanup may remove
+   only the job's quarantined output and explicitly disposable slot/cache data;
+   shared source checkouts, warm caches, and unrelated jobs are protected.
+
+These are release and gate invariants, including preview releases. A preview
+with unavailable live hardware may disclose that evidence gap, but it may not
+waive source identity, capacity, checkpoint, artifact-integrity, or
+virtualization/image-contract checks. `docs/BUILD-ENVIRONMENT.md` is the
+operator procedure; this subsection is the durable authority.
 
 ---
 

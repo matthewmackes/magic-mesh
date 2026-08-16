@@ -42,6 +42,47 @@ Avoid containers when a direct farm-host fixture is enough. Farm/test hosts are
 safe for destructive reboot/recovery operations unless the task explicitly says
 otherwise.
 
+### Farm admission preflight (mandatory before every job)
+
+The governance lock is `AI_GOVERNANCE.md §10.0.3`. Every build, test, gate,
+image build, export, and release derivative must have one admission record for
+one immutable job identity and one reserved host/slot. The record binds:
+
+- source revision and epoch;
+- every input/base-image/signing/toolchain digest;
+- the declared output size and build-layer/osbuild/qemu scratch allowance;
+- the cache key and whether the cache was hit or invalidated;
+- host, slot, reservation expiry, checkpoint state, artifact digest/size, and
+  verifier result.
+
+The free-space check must happen before source sync and must include the final
+qcow2/raw export, not merely the container build. For image work, leave enough
+headroom for the complete output plus scratch and temporary conversion files;
+the `.170` Browser failure demonstrated why a node with several gigabytes free
+can still be inadmissible. A reservation is exclusive for the slot and expires
+only after its checkpoint/evidence is written. A node that fails admission is
+reassigned to another qualifying lane; it is not forced to build and it does
+not cause a second copy of an already-running job.
+
+Build, export, and verification are resumable phases. Preserve verified build
+checkpoints and quarantine partial exports. Retry the same immutable job only
+after classifying the failure as infrastructure or source/test failure; do not
+rebuild merely because an export or verifier phase failed. Cleanup is limited
+to the failed job's disposable output and slot directories. Never remove a
+shared checkout, warm cache, or another job's workspace. Run the slot GC after
+releasing a job and before admitting a cold image build:
+
+```bash
+install-helpers/farm-topology.sh table
+MCNF_FARM_KEY=/root/.ssh/mackes_mesh_ed25519 install-helpers/farm-slot-gc.sh --remote
+df -h /home
+```
+
+The scheduler must report capacity as `active/capacity` for all five nodes and
+ten heavy slots, including why any idle lane was not assigned work. An ENOSPC
+after admission is a capacity incident and a preflight defect, not a normal
+retry condition.
+
 **Browser/runtime note (learned 2026-07-14):** the live build-VM addresses are
 the `172.20.0.x` farm lanes above; inherited `10.0.0.x` pins are stale and time
 out. For direct live probes outside `xcp-build.sh`, ssh as the build user with

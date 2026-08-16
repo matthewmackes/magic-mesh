@@ -30,6 +30,8 @@
 #   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
 #   MCNF_BUILD_SHAPE (big|small) — force the job shape, overriding the cargo-args
 #   inference (FA-6 shape-aware routing).
+#   MCNF_BUILD_OUTPUT_BYTES — declared final artifact bytes reserved before sync.
+#   MCNF_BUILD_SCRATCH_BYTES — declared export/build scratch bytes reserved before sync.
 #   MCNF_COVERAGE_FLOOR (default 80) — hard line-coverage floor for `coverage`.
 #   MCNF_CARGO_LLVM_COV_VERSION (default 0.8.7) — pinned farm coverage tool.
 #
@@ -72,18 +74,33 @@ REMOTE_DIR="${MCNF_BUILD_DIR:-magic-mesh-farm}${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SL
 ARTIFACTS="${MCNF_BUILD_ARTIFACTS:-$HOME/mcnf-release-artifacts}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
 MIN_SYNC_FREE_KIB="${MCNF_BUILD_MIN_SYNC_FREE_KIB:-8388608}"
+BUILD_OUTPUT_BYTES="${MCNF_BUILD_OUTPUT_BYTES:-0}"
+BUILD_SCRATCH_BYTES="${MCNF_BUILD_SCRATCH_BYTES:-0}"
 
 log()  { echo "==> xcp-build: $*"; }
 warn() { echo "==> xcp-build: $*" >&2; }
 
 assert_sync_space() {
-  local free_kib
+  local free_kib output_bytes scratch_bytes extra_kib required_kib
   case "$MIN_SYNC_FREE_KIB" in
     ''|*[!0-9]*)
       warn "MCNF_BUILD_MIN_SYNC_FREE_KIB must be a non-negative integer (got '$MIN_SYNC_FREE_KIB')"
       return 2
       ;;
   esac
+  for value_name in BUILD_OUTPUT_BYTES BUILD_SCRATCH_BYTES; do
+    value="${!value_name}"
+    case "$value" in
+      ''|*[!0-9]*)
+        warn "$value_name must be a non-negative byte count (got '$value')"
+        return 2
+        ;;
+    esac
+  done
+  output_bytes="$BUILD_OUTPUT_BYTES"
+  scratch_bytes="$BUILD_SCRATCH_BYTES"
+  extra_kib=$(( (output_bytes + scratch_bytes + 1023) / 1024 ))
+  required_kib=$(( MIN_SYNC_FREE_KIB + extra_kib ))
   free_kib="$("${SSH[@]}" "$DEST" 'df -Pk "$HOME" | awk "NR == 2 { print \$4 }"')"
   case "$free_kib" in
     ''|*[!0-9]*)
@@ -91,12 +108,13 @@ assert_sync_space() {
       return 2
       ;;
   esac
-  if [ "$free_kib" -lt "$MIN_SYNC_FREE_KIB" ]; then
-    warn "refusing sync to $BUILD_HOST: /home has ${free_kib} KiB free; ${MIN_SYNC_FREE_KIB} KiB required"
+  if [ "$free_kib" -lt "$required_kib" ]; then
+    warn "refusing sync to $BUILD_HOST: /home has ${free_kib} KiB free; ${required_kib} KiB required"
+    warn "capacity envelope: ${output_bytes} output bytes + ${scratch_bytes} scratch bytes + ${MIN_SYNC_FREE_KIB} KiB sync headroom"
     warn "remove only abandoned magic-mesh-farm slots or select another farm host"
     return 1
   fi
-  log "remote sync capacity: ${free_kib} KiB free (minimum ${MIN_SYNC_FREE_KIB})"
+  log "remote admission capacity: ${free_kib} KiB free (required ${required_kib} KiB; output ${output_bytes}B, scratch ${scratch_bytes}B)"
 }
 
 do_sync() {
