@@ -196,7 +196,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--source-revision")
-    parser.add_argument("--release-key-id", default=os.environ.get("MAGIC_MESH_SIGN_KEY", "B546CC2EF9489F1899657AC9E6C820DAFBD1B07A"))
+    parser.add_argument("--release-key-id", default=os.environ.get("MAGIC_MESH_SIGN_KEY", "06B1C27EA0E08A225155EB3314018AA1497DDC7C"))
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1], help=argparse.SUPPRESS)
     parser.add_argument("--gpg", default="gpg", help=argparse.SUPPRESS)
     args = parser.parse_args()

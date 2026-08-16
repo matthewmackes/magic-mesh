@@ -18,7 +18,7 @@ IMAGE_RECEIPT_TEST="$ANDROID/test-produce-image-receipt.py"
 DECLARATION_PRODUCER="$ANDROID/produce-guest-payload-declaration.sh"
 PACKAGE_MANIFEST="$ROOT/crates/mesh/mackesd/Cargo.toml"
 PROJECT_RELEASE_KEY="$ROOT/packaging/repo/RPM-GPG-KEY-magic-mesh"
-PROJECT_RELEASE_FINGERPRINT="B546CC2EF9489F1899657AC9E6C820DAFBD1B07A"
+PROJECT_RELEASE_FINGERPRINT="06B1C27EA0E08A225155EB3314018AA1497DDC7C"
 CUTTLEFISH_TASKS="$ROOT/automation/ansible/roles/cuttlefish_host/tasks/main.yml"
 CUTTLEFISH_DEFAULTS="$ROOT/automation/ansible/roles/cuttlefish_host/defaults/main.yml"
 

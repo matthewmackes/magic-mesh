@@ -14,7 +14,7 @@ from pathlib import Path
 def main() -> int:
     repo = Path(__file__).resolve().parents[1]
     producer = repo / "install-helpers/produce-app-vm-catalog-trust.py"
-    fingerprint = "B546CC2EF9489F1899657AC9E6C820DAFBD1B07A"
+    fingerprint = "06B1C27EA0E08A225155EB3314018AA1497DDC7C"
     point = "40" + "3b2eee92223984dbf6bcfb44461669a577390810584023734561e7875ed7cc1d"
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -36,7 +36,7 @@ def main() -> int:
 import os, sys
 point = os.environ.get('TEST_POINT', '403b2eee92223984dbf6bcfb44461669a577390810584023734561e7875ed7cc1d')
 kind = 'sec' if '--list-secret-keys' in sys.argv else 'pub'
-fpr = os.environ.get('TEST_SECRET_FPR', 'B546CC2EF9489F1899657AC9E6C820DAFBD1B07A') if kind == 'sec' else 'B546CC2EF9489F1899657AC9E6C820DAFBD1B07A'
+fpr = os.environ.get('TEST_SECRET_FPR', '06B1C27EA0E08A225155EB3314018AA1497DDC7C') if kind == 'sec' else '06B1C27EA0E08A225155EB3314018AA1497DDC7C'
 if kind == 'sec' and os.environ.get('TEST_NO_SECRET') == '1':
     print('gpg: no secret key', file=sys.stderr); raise SystemExit(2)
 algo = os.environ.get('TEST_ALGO', '22')
