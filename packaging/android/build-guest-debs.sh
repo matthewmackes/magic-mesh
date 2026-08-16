@@ -35,7 +35,13 @@ PY
 )
 [[ ${#identity[@]} -eq 2 ]] || fail "stage build identity is invalid"
 version=${identity[0]}; release=${identity[1]}; deb_version="$version-$release"
-epoch=$(git -C "$SOURCE_REPO" show -s --format=%ct "$revision")
+if epoch=$(git -C "$SOURCE_REPO" show -s --format=%ct "$revision" 2>/dev/null); then
+    :
+else
+    [[ "${MCNF_BUILD_SOURCE_REVISION:-}" == "$revision" && "${MCNF_SOURCE_COMMIT_EPOCH:-}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "source epoch is unavailable and no matching farm snapshot markers were supplied"
+    epoch=$MCNF_SOURCE_COMMIT_EPOCH
+fi
 [[ $epoch =~ ^[1-9][0-9]*$ ]] || fail "commit epoch is invalid"
 export SOURCE_DATE_EPOCH=$epoch TZ=UTC LC_ALL=C
 
