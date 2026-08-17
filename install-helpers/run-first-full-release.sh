@@ -269,7 +269,7 @@ python3 - "$plan_input" "$revision" >"$signed_paths" <<'PY' || refuse 'plan inpu
 import json, pathlib, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 outputs = value.get("outputs")
-roles={"workstation-rpm","server-rpm","lighthouse-rpm","browser-vm","app-vm","cuttlefish-image","bootc-image"}
+roles={"workstation-rpm","server-rpm","lighthouse-rpm","browser-vm","app-vm","bootc-image"}
 if value.get("schema_version") != 1 or value.get("kind") != "mcnf-release-output-plan-input" or value.get("source_revision") != sys.argv[2] or not isinstance(outputs, dict) or set(outputs) != roles:
     raise SystemExit("plan identity or roles are not exact")
 for role in ("workstation-rpm", "server-rpm", "lighthouse-rpm"):
@@ -313,4 +313,4 @@ assert value["source_revision"] == sys.argv[2] and value["promotion"] == "forbid
 PY
 "$DERIVATIVES" --source-revision "$revision" "${derivative_args[@]}" --output "$staged/derivatives"
 publish_dir "$staged" "$output"
-printf 'first-full-release: PASS: verified seven-role output %s (promotion forbidden)\n' "$output"
+printf 'first-full-release: PASS: verified six-role output %s (promotion forbidden)\n' "$output"

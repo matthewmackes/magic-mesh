@@ -133,7 +133,7 @@ python3 - "$WORK/plan-input.json" "$WORK" <<'PY'
 import json, pathlib, sys
 root=pathlib.Path(sys.argv[2])
 outputs={f"{role}-rpm":{"artifact":str(root/f"signed-{role}.rpm"),"candidate_manifest":str(root/f"{role}.json")} for role in ("workstation","server","lighthouse")}
-outputs.update({"browser-vm":{},"app-vm":{},"cuttlefish-image":{},"bootc-image":{}})
+outputs.update({"browser-vm":{},"app-vm":{},"bootc-image":{}})
 value={"schema_version":1,"kind":"mcnf-release-output-plan-input","source_revision":"a"*40,
        "commit_epoch":"1776038400","signing_identity":"A"*40,"release_key":str(root/"key"),"outputs":outputs}
 pathlib.Path(sys.argv[1]).write_text(json.dumps(value))
