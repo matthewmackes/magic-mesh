@@ -294,10 +294,12 @@ behavioral evidence is not completion.
   first-desktop, spawn-lighthouse, mesh-dns/network/create, invite/join/found,
   and coordinated-upgrade mutations now acquire that authority. Upgrade
   execution requires a typed artifact selection or compatibility digest; downstream package, service, enrollment, renderer, fleet-offboarding, and full execution evidence remain.
-  Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md`, `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r1.md`, and
-  `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; the farm baseline passes, live transports remain open.
-- Remaining work:
-  GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
+  Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md`,
+  `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r1.md`,
+  `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`, and
+  `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; the focused
+  authority core passes, while live transports remain open.
+- Remaining work: GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
   deliverable, farm command, result, revision, and evidence; do not close a story
   from compilation alone.
   1. S1 Define the canonical lifecycle and readiness model.
