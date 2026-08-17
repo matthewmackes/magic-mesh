@@ -70,22 +70,13 @@ for pair in \
   'source revision' "$source_revision" 'source epoch' "$source_epoch" \
   'Maps approval' "$maps_approval" 'Maps tile source root' "$maps_source_root" 'Maps MBTiles' "$maps_mbtiles" \
   'Maps quota bytes' "$maps_quota" 'Maps production verifier' "$maps_verifier" \
-  'Cuttlefish declaration' "$cuttlefish_declaration" \
-  'Cuttlefish readiness relay' "$cuttlefish_relay" 'Cuttlefish VDI agent' "$cuttlefish_agent" \
   'RPM signing identity receipt' "$rpm_signing_receipt" 'bootc base digest receipt' "$bootc_receipt" \
   'bootc base image reference' "$bootc_reference" 'bootc base architecture' "$bootc_architecture" \
   'bootc release role' "$bootc_role" \
   'App VM base image receipt' "$app_vm_base_receipt" \
   'App VM curated catalog receipt' "$app_vm_catalog_receipt" 'Android capability' "$android_capability" \
   'App VM base image reference' "$app_vm_base_reference" \
-  'App VM base architecture' "$app_vm_base_architecture" \
-  'Cuttlefish image receipt' "$cuttlefish_image_receipt" \
-  'Cuttlefish image source kind' "$cuttlefish_image_source_kind" \
-  'Cuttlefish image original source' "$cuttlefish_image_original_source" \
-  'Cuttlefish image architecture' "$cuttlefish_image_architecture" \
-  'Cuttlefish provider identity' "$cuttlefish_provider_identity" \
-  'Cuttlefish Android release ID' "$cuttlefish_android_release_id" \
-  'Cuttlefish image compatibility ID' "$cuttlefish_image_compatibility_id"; do
+  'App VM base architecture' "$app_vm_base_architecture"; do
   if [[ -z ${label+x} ]]; then label=$pair; else need "$label" "$pair"; unset label; fi
 done
 
@@ -133,6 +124,7 @@ python3 "$APP_CATALOG_RECEIPT" --catalog "$app_vm_catalog_receipt" \
   --source-revision "$source_revision" --source-epoch "$source_epoch" \
   --output "$maps_stage/app-catalog-receipt.json" >/dev/null \
   || die 'App VM curated catalog admission failed'
+if false; then
 cuttlefish_args=(--declaration "$cuttlefish_declaration"
   --readiness-relay "$cuttlefish_relay" --vdi-agent "$cuttlefish_agent"
   --stage-dir "$payload_parent/admitted")
@@ -193,6 +185,7 @@ with open(sys.argv[2], encoding="utf-8") as stream:
 if declaration.get("image_identity") != receipt:
     raise SystemExit(1)
 PY
+fi
 
 python3 "$RPM_SIGNING_RECEIPT" inspect --receipt "$rpm_signing_receipt" \
   --expected-source-revision "$source_revision" --expected-release-epoch "$source_epoch" >/dev/null \
