@@ -43,42 +43,6 @@ cat >"$fixture/maps-verifier" <<'EOF'
 [[ -f ${1:?}/manifest.json && -f $1/catalog.json && -f $1/payload/index.json ]]
 EOF
 chmod 0755 "$fixture/maps-verifier"
-cat >"$fixture/cuttlefish" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-declaration='' stage=''
-while (($#)); do
-  case "$1" in
-    --declaration) declaration=$2; shift 2 ;;
-    --stage-dir) stage=$2; shift 2 ;;
-    *) shift 2 ;;
-  esac
-done
-[[ ${FAKE_VERIFIER_RC:-0} -eq 0 ]] || exit "${FAKE_VERIFIER_RC}"
-mkdir -p "$stage"
-cp "$declaration" "$stage/release.json"
-EOF
-chmod 0755 "$fixture/cuttlefish"
-cat >"$fixture/guest-debs" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-revision='' stage='' packages=''
-while (($#)); do
-  case "$1" in
-    --source-revision) revision=$2; shift 2 ;;
-    --stage-dir) stage=$2; shift 2 ;;
-    --package-dir) packages=$2; shift 2 ;;
-    *) exit 2 ;;
-  esac
-done
-[[ ${FAKE_VERIFIER_RC:-0} -eq 0 ]] || exit "${FAKE_VERIFIER_RC}"
-[[ $revision =~ ^[0-9a-f]{40}$ ]]
-cmp -s "$stage/mcnf-cuttlefish-readiness-relay" "$PREFLIGHT_TEST_RELAY"
-cmp -s "$stage/mcnf-cuttlefish-vdi-agent" "$PREFLIGHT_TEST_AGENT"
-[[ -f $packages/guest-deb-manifest.json ]]
-touch "$PREFLIGHT_TEST_DEB_MARKER"
-EOF
-chmod 0755 "$fixture/guest-debs"
 cat >"$fixture/signing-receipt.py" <<'EOF'
 #!/usr/bin/env python3
 import os
@@ -124,7 +88,7 @@ printf 'sec:-:4096:1:DEADBEEF:0:0:::::::23::0:\n'
 printf 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n'
 EOF
 chmod 0755 "$fixture/bin/gpg"
-touch "$fixture/relay" "$fixture/agent" "$fixture/signing-receipt.json"
+touch "$fixture/signing-receipt.json"
 mkdir "$fixture/maps-tiles"
 printf 'governed release tile\n' >"$fixture/maps-tiles/tile.bin"
 chmod 0444 "$fixture/maps-tiles/tile.bin"
@@ -172,28 +136,6 @@ PY
 chmod 0444 "$fixture/maps.mbtiles"
 printf '%s\n' '{"schema_version":1,"remote":"curated","refs":["org.example.App@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}' >"$fixture/app-catalog.json"
 chmod 0444 "$fixture/app-catalog.json"
-mkdir "$fixture/guest-debs-input"
-touch "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
-touch "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
-touch "$fixture/guest-debs-input/guest-deb-manifest.json"
-printf 'immutable Cuttlefish image fixture\n' >"$fixture/cuttlefish-image.tar"
-python3 "$ROOT/packaging/android/produce-image-receipt.py" --repo "$fixture/source-repo" produce \
-  --source-kind artifact --original-source "$fixture/cuttlefish-image.tar" \
-  --architecture amd64 --provider-identity mcnf-cuttlefish \
-  --android-release-id android-15.0.0_r1 --compatibility-id mcnf-cuttlefish-v1 \
-  --source-revision "$source_revision" --commit-epoch "$source_epoch" \
-  --media-type application/vnd.mcnf.cuttlefish.image.v1+tar \
-  --artifact-format android-cuttlefish-image-archive \
-  --output "$fixture/cuttlefish-image-receipt.json" >/dev/null
-python3 - "$fixture/cuttlefish-image-receipt.json" "$fixture/declaration" "$source_revision" <<'PY'
-import json, sys
-image = json.load(open(sys.argv[1], encoding="utf-8"))
-json.dump({"schema_version":3,"kind":"cuttlefish_guest_payload_release",
-           "release_id":"fixture-r1","compatibility_version":"2026.08.1",
-           "source_revision":sys.argv[3],"provider_identity":"mcnf-cuttlefish",
-           "image_identity":image,"artifacts":{}},
-          open(sys.argv[2], "w", encoding="utf-8"), sort_keys=True, separators=(",", ":"))
-PY
 python3 - "$fixture/bootc-receipt.json" "$bootc_reference" "$bootc_architecture" \
   "$source_revision" "$source_epoch" "$bootc_role" <<'PY'
 import json
@@ -257,17 +199,11 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --app-vm-base-architecture "$app_vm_architecture"
   --app-vm-catalog-receipt "$fixture/app-catalog.json")
 envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_VERIFY="$fixture/kiron"
-  MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
-  MCNF_CUTTLEFISH_DEB_VERIFY="$fixture/guest-debs"
   PREFLIGHT_TEST_REVISION="$source_revision"
   PREFLIGHT_TEST_KIRON_MARKER="$fixture/kiron-revision-verified"
-  PREFLIGHT_TEST_RELAY="$fixture/relay" PREFLIGHT_TEST_AGENT="$fixture/agent"
-  PREFLIGHT_TEST_DEB_MARKER="$fixture/guest-debs-verified"
   MCNF_RPM_SIGNING_RECEIPT_INSPECTOR="$fixture/signing-receipt.py"
   MCNF_BOOTC_DIGEST_RECEIPT_INSPECTOR="$fixture/bootc-inspector"
   MCNF_APP_VM_BASE_RECEIPT_INSPECTOR="$fixture/app-vm-base-inspector"
-  MCNF_CUTTLEFISH_IMAGE_RECEIPT_INSPECTOR="$ROOT/packaging/android/produce-image-receipt.py"
-  MCNF_CUTTLEFISH_IMAGE_REPO="$fixture/source-repo"
   BOOTC_TEST_INSPECTOR="$ROOT/install-helpers/produce-bootc-digest-receipt.py"
   BOOTC_TEST_REPO="$fixture/source-repo"
   APP_VM_TEST_INSPECTOR="$ROOT/packaging/app-vm/produce-base-image-receipt.py"
@@ -402,7 +338,7 @@ required = (
     '--expected-source-revision',
     '--expected-source-epoch',
 )
-forbidden = ('MCNF_BOOTC_BASE_', 'MCNF_APP_VM_BASE_', 'MCNF_CUTTLEFISH_IMAGE_', 'preflight_args=(')
+forbidden = ('MCNF_BOOTC_BASE_', 'MCNF_APP_VM_BASE_', 'preflight_args=(')
 if any(item not in rpm_body for item in required) or any(item in rpm_body for item in forbidden):
     raise SystemExit("preflight self-test: canonical RPM entry does not exclusively consume the private argv document")
 PY
