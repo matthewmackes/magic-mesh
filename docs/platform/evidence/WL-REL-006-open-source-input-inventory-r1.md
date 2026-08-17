@@ -1,4 +1,11 @@
-# WL-REL-006 open-source input inventory — r1
+# HISTORICAL / SUPERSEDED — WL-REL-006 open-source input inventory — r1
+
+Superseded on 2026-08-17 by the six-role release contract. This fixture-only
+inventory is bound to an obsolete source revision and includes the deferred
+Android/Cuttlefish family; it cannot be used for 13.0.0 release admission. A
+replacement must be generated only after WL-REL-001 establishes the clean
+candidate revision and WL-REL-006 materializes candidate-bound production
+bytes.
 
 Date: 2026-08-16 UTC  
 Source revision: `daf3c695928e96553fe839450bd86aa6f371e3aa`  
