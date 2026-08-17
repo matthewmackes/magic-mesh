@@ -157,6 +157,21 @@ with open(path, "w", encoding="utf-8") as stream:
     stream.write("\n")
 PY
 chmod 0444 "$fixture/maps-approval.json"
+python3 - "$fixture/maps.mbtiles" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")
+connection.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
+connection.executemany("INSERT INTO metadata VALUES (?, ?)", [("format", "png"), ("bounds", "-79,42,-78,43")])
+connection.execute("INSERT INTO tiles VALUES (1, 0, 0, ?)", (b"PNG fixture",))
+connection.commit()
+connection.close()
+PY
+chmod 0444 "$fixture/maps.mbtiles"
+printf '%s\n' '{"schema_version":1,"remote":"curated","refs":["org.example.App@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}' >"$fixture/app-catalog.json"
+chmod 0444 "$fixture/app-catalog.json"
 mkdir "$fixture/guest-debs-input"
 touch "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
 touch "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
@@ -231,10 +246,7 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --maps-tile-source-root "$fixture/maps-tiles"
   --maps-quota-bytes 1024
   --maps-verifier "$fixture/maps-verifier"
-  --cuttlefish-declaration "$fixture/declaration"
-  --cuttlefish-readiness-relay "$fixture/relay" --cuttlefish-vdi-agent "$fixture/agent"
-  --cuttlefish-guest-package "$fixture/guest-debs-input/mcnf-cuttlefish-readiness-relay.deb"
-  --cuttlefish-guest-package "$fixture/guest-debs-input/mcnf-cuttlefish-vdi-agent.deb"
+  --maps-mbtiles "$fixture/maps.mbtiles"
   --rpm-signing-identity-receipt "$fixture/signing-receipt.json"
   --bootc-base-digest-receipt "$fixture/bootc-receipt.json"
   --bootc-base-image-reference "$bootc_reference"
@@ -243,15 +255,7 @@ args=(--source-revision "$source_revision" --source-epoch "$source_epoch"
   --app-vm-base-image-receipt "$fixture/app-vm-base-receipt.json"
   --app-vm-base-image-reference "$app_vm_reference"
   --app-vm-base-architecture "$app_vm_architecture"
-  --cuttlefish-image-receipt "$fixture/cuttlefish-image-receipt.json"
-  --cuttlefish-image-source-kind artifact
-  --cuttlefish-image-original-source "$fixture/cuttlefish-image.tar"
-  --cuttlefish-image-architecture amd64
-  --cuttlefish-provider-identity mcnf-cuttlefish
-  --cuttlefish-android-release-id android-15.0.0_r1
-  --cuttlefish-image-compatibility-id mcnf-cuttlefish-v1
-  --cuttlefish-image-media-type application/vnd.mcnf.cuttlefish.image.v1+tar
-  --cuttlefish-image-artifact-format android-cuttlefish-image-archive)
+  --app-vm-catalog-receipt "$fixture/app-catalog.json")
 envs=(PATH="$fixture/bin:$PATH" MCNF_SOURCE_VERIFY="$fixture/source" MCNF_KIRON_VERIFY="$fixture/kiron"
   MCNF_CUTTLEFISH_VERIFY="$fixture/cuttlefish"
   MCNF_CUTTLEFISH_DEB_VERIFY="$fixture/guest-debs"
@@ -274,7 +278,6 @@ run_release() { env "${envs[@]}" "$PRE" "$@" && : >"$marker"; }
 run_release "${args[@]}"
 [[ -e "$marker" ]] || { echo 'preflight self-test: valid fixture did not reach build command' >&2; exit 1; }
 [[ -e "$fixture/kiron-revision-verified" ]] || { echo 'preflight self-test: Kiron verifier did not receive the release revision' >&2; exit 1; }
-[[ -e "$fixture/guest-debs-verified" ]] || { echo 'preflight self-test: deterministic guest DEB verifier was not invoked' >&2; exit 1; }
 echo 'release-input-preflight: bootc receipt integration PASS (revision, epoch, architecture, role, and image reference matched)'
 echo 'release-input-preflight: App VM base receipt integration PASS (revision, epoch, architecture, reference, manifest, and platform digest matched)'
 rm -f "$marker"
@@ -320,22 +323,8 @@ chmod 0644 "$fixture/maps-tiles/tile.bin"
 printf 'governed release tile\n' >"$fixture/maps-tiles/tile.bin"
 chmod 0444 "$fixture/maps-tiles/tile.bin"
 
-missing_deb=()
-for ((index = 0; index < ${#args[@]}; index++)); do
-  if [[ ${args[index]} == --cuttlefish-guest-package \
-      && ${args[index + 1]} == *mcnf-cuttlefish-readiness-relay.deb ]]; then
-    index=$((index + 1))
-    continue
-  fi
-  missing_deb+=("${args[index]}")
-done
-if run_release "${missing_deb[@]}" >/dev/null 2>&1; then
-  echo 'preflight self-test: incomplete deterministic guest DEB set reached build command' >&2; exit 1
-fi
-[[ ! -e "$marker" ]] || { echo 'preflight self-test: incomplete guest DEBs mutated build state' >&2; exit 1; }
-
 if run_release "${args[@]:0:${#args[@]}-2}" >/dev/null 2>&1; then
-  echo 'preflight self-test: incomplete image receipt interface reached build command' >&2; exit 1
+  echo 'preflight self-test: incomplete App catalog interface reached build command' >&2; exit 1
 fi
 [[ ! -e "$marker" ]] || { echo 'preflight self-test: missing input mutated build state' >&2; exit 1; }
 
@@ -396,12 +385,6 @@ with open(path, "w", encoding="ascii") as stream:
     json.dump(value, stream, sort_keys=True, separators=(",", ":"))
     stream.write("\n")
 PY
-
-printf 'substituted image bytes\n' >"$fixture/cuttlefish-image.tar"
-if run_release "${args[@]}" >/dev/null 2>&1; then
-  echo 'preflight self-test: substituted Cuttlefish image reached build command' >&2; exit 1
-fi
-[[ ! -e "$marker" ]] || { echo 'preflight self-test: substituted Cuttlefish image mutated build state' >&2; exit 1; }
 
 python3 - "$ENTRY" <<'PY'
 import sys

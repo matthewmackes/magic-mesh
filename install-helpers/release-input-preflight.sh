@@ -23,7 +23,7 @@ source_revision='' source_epoch=''
 maps_approval='' maps_source_root='' maps_quota='' maps_verifier='' maps_mbtiles=''
 cuttlefish_declaration='' cuttlefish_relay='' cuttlefish_agent=''
 rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
-app_vm_base_receipt='' app_vm_base_reference='' app_vm_base_architecture='' app_vm_catalog_receipt='' android_capability=''
+app_vm_base_receipt='' app_vm_base_reference='' app_vm_base_architecture='' app_vm_catalog_receipt=''
 cuttlefish_image_receipt='' cuttlefish_image_source_kind=''
 cuttlefish_image_original_source='' cuttlefish_image_architecture=''
 cuttlefish_provider_identity='' cuttlefish_android_release_id=''
@@ -52,7 +52,6 @@ while (($#)); do
     --app-vm-base-image-reference) app_vm_base_reference=${2:-}; shift 2 ;;
     --app-vm-base-architecture) app_vm_base_architecture=${2:-}; shift 2 ;;
     --app-vm-catalog-receipt) app_vm_catalog_receipt=${2:-}; shift 2 ;;
-    --android-capability) android_capability=${2:-}; shift 2 ;;
     --cuttlefish-image-receipt) cuttlefish_image_receipt=${2:-}; shift 2 ;;
     --cuttlefish-image-source-kind) cuttlefish_image_source_kind=${2:-}; shift 2 ;;
     --cuttlefish-image-original-source) cuttlefish_image_original_source=${2:-}; shift 2 ;;
@@ -74,7 +73,7 @@ for pair in \
   'bootc base image reference' "$bootc_reference" 'bootc base architecture' "$bootc_architecture" \
   'bootc release role' "$bootc_role" \
   'App VM base image receipt' "$app_vm_base_receipt" \
-  'App VM curated catalog receipt' "$app_vm_catalog_receipt" 'Android capability' "$android_capability" \
+  'App VM curated catalog receipt' "$app_vm_catalog_receipt" \
   'App VM base image reference' "$app_vm_base_reference" \
   'App VM base architecture' "$app_vm_base_architecture"; do
   if [[ -z ${label+x} ]]; then label=$pair; else need "$label" "$pair"; unset label; fi
@@ -110,7 +109,6 @@ trap cleanup EXIT
 # before any release build mutation. A caller-authored bundle cannot bypass the
 # producer.
 [[ "$maps_quota" =~ ^[1-9][0-9]*$ ]] || die 'Maps quota bytes must be a positive integer'
-[[ "$android_capability" == deferred ]] || die 'Android capability is deferred for this release'
 python3 "$MAPS_PRODUCER" --approval "$maps_approval" \
   --source-root "$maps_source_root" --output "$maps_stage/bundle" >/dev/null \
   || die 'offline Maps approved bundle production failed'
