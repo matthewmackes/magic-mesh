@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -289,6 +290,28 @@ def materialize(args: argparse.Namespace) -> None:
     )
     run_verifier(args.verifier, bundle)
 
+    mbtiles_arg = getattr(args, "mbtiles", None)
+    mbtiles = Path(mbtiles_arg).resolve(strict=True) if mbtiles_arg else None
+    if mbtiles is not None:
+        info = mbtiles.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o222:
+            raise Refusal("MBTiles input must be an immutable single-link regular file")
+        try:
+            connection = sqlite3.connect(f"file:{mbtiles}?mode=ro", uri=True)
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"metadata", "tiles"}.issubset(tables):
+                raise Refusal("MBTiles input lacks metadata and tiles tables")
+            metadata = dict(connection.execute("SELECT name, value FROM metadata"))
+            if metadata.get("format") != "png" or not metadata.get("bounds"):
+                raise Refusal("MBTiles input must be PNG raster data with bounds metadata")
+            if connection.execute("SELECT COUNT(*) FROM tiles").fetchone()[0] < 1:
+                raise Refusal("MBTiles input contains no tiles")
+        except sqlite3.Error as error:
+            raise Refusal(f"MBTiles input is not readable SQLite: {error}") from error
+        finally:
+            if 'connection' in locals():
+                connection.close()
+
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
     os.chmod(stage, 0o700)
     try:
@@ -299,6 +322,12 @@ def materialize(args: argparse.Namespace) -> None:
             destination = stage.joinpath(*relative.parts)
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             durable_write(destination, data)
+        if mbtiles is not None:
+            region_id = json.loads((bundle / "manifest.json").read_bytes())["regions"][0]["region_id"]
+            destination = stage / region_id / f"{region_id}.mbtiles"
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            source = mbtiles.read_bytes()
+            durable_write(destination, source)
         for directory, _, _ in os.walk(stage, topdown=False):
             fsync_directory(Path(directory))
         os.rename(stage, output)
@@ -316,6 +345,7 @@ def main() -> int:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--source-epoch", type=int, required=True)
     parser.add_argument("--quota-bytes", type=int, required=True)
+    parser.add_argument("--mbtiles", type=Path)
     args = parser.parse_args()
     if len(args.source_revision) != 40 or any(c not in "0123456789abcdef" for c in args.source_revision):
         print("materialize-offline-catalog: refusal: source revision is not a full lower-case Git revision", file=sys.stderr)

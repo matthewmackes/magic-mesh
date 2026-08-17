@@ -1,12 +1,23 @@
 //! WL-FUNC-023 — the bounded public lifecycle intent contract.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const LIFECYCLE_CONTRACT_SCHEMA_VERSION: u16 = 1;
 pub const LIFECYCLE_INTENT_TOPIC: &str = "action/lifecycle/intent";
 pub const MAX_LIFECYCLE_INTENT_BYTES: usize = 64 * 1024;
 pub const MAX_LIFECYCLE_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_LIFECYCLE_COLLECTION_ITEMS: usize = 256;
+
+/// Decode a lifecycle message only after enforcing its transport bound.  All
+/// public lifecycle envelopes should use this entry point rather than an
+/// unbounded `serde_json::from_slice`.
+pub fn decode_bounded<T: DeserializeOwned>(payload: &[u8]) -> Result<T, LifecycleIntentError> {
+    if payload.len() > MAX_LIFECYCLE_INTENT_BYTES {
+        return Err(LifecycleIntentError::PayloadTooLarge);
+    }
+    serde_json::from_slice(payload).map_err(|_| LifecycleIntentError::InvalidField("payload"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +125,8 @@ pub struct LifecycleCorrectionV1 {
     pub check_id: String,
     pub step: String,
     pub reason: String,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +136,8 @@ pub struct LifecycleCorrectionPlanV1 {
     pub target_id: String,
     pub generation: u64,
     pub corrections: Vec<LifecycleCorrectionV1>,
+    #[serde(default)]
+    pub edges: Vec<(String, String)>,
     pub rollback_forbidden: bool,
 }
 
@@ -162,7 +177,7 @@ impl LifecycleCorrectionPlanV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
         validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id), ("target_id", &self.target_id)])?;
         if self.corrections.is_empty()
-            || self.corrections.len() > 256
+            || self.corrections.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
             || !self.rollback_forbidden
             || self.corrections.iter().any(|correction| {
                 correction.check_id.is_empty()
@@ -170,10 +185,27 @@ impl LifecycleCorrectionPlanV1 {
                     || LifecycleStepKind::parse(&correction.step).is_none()
                     || correction.reason.is_empty()
                     || correction.reason.len() > 1024
+                    || correction.prerequisites.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
             })
         {
             return Err(LifecycleIntentError::InvalidField("correction_plan"));
         }
+        let ids = self.corrections.iter().map(|c| c.check_id.as_str()).collect::<std::collections::HashSet<_>>();
+        if self.edges.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
+            || self.edges.iter().any(|(from, to)| from == to || !ids.contains(from.as_str()) || !ids.contains(to.as_str()))
+        {
+            return Err(LifecycleIntentError::InvalidField("correction_edges"));
+        }
+        // Kahn's algorithm rejects cycles and makes execution order explicit.
+        let mut indegree = ids.iter().map(|id| (*id, 0usize)).collect::<std::collections::HashMap<_, _>>();
+        for (_, to) in &self.edges { *indegree.get_mut(to.as_str()).unwrap() += 1; }
+        let mut ready = indegree.iter().filter_map(|(id, count)| (*count == 0).then_some(*id)).collect::<Vec<_>>();
+        let mut visited = 0usize;
+        while let Some(id) = ready.pop() {
+            visited += 1;
+            for (from, to) in &self.edges { if from == id { let entry = indegree.get_mut(to.as_str()).unwrap(); *entry -= 1; if *entry == 0 { ready.push(to.as_str()); } } }
+        }
+        if visited != ids.len() { return Err(LifecycleIntentError::InvalidField("correction_cycle")); }
         Ok(())
     }
 }
@@ -352,6 +384,7 @@ impl LifecycleStepKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleIntentV1 {
     pub schema_version: u16,
     pub request_id: String,
@@ -401,6 +434,11 @@ pub struct LifecycleBaselineEntryV1 {
     pub requirement_id: String,
     pub owner_step: LifecycleStepKind,
     pub required: bool,
+    pub provider: String,
+    pub critical: bool,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+    pub correction_step: LifecycleStepKind,
 }
 
 pub fn canonical_lifecycle_baseline() -> Vec<LifecycleBaselineEntryV1> {
@@ -415,12 +453,16 @@ pub fn canonical_lifecycle_baseline() -> Vec<LifecycleBaselineEntryV1> {
         ("verification", LifecycleStepKind::Verify),
     ]
     .into_iter()
-    .map(|(requirement_id, owner_step)| LifecycleBaselineEntryV1 {
-        schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
-        requirement_id: requirement_id.into(),
-        owner_step,
-        required: true,
-    })
+        .map(|(requirement_id, owner_step)| LifecycleBaselineEntryV1 {
+            schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
+            requirement_id: requirement_id.into(),
+            owner_step,
+            required: true,
+            provider: "mackesd".into(),
+            critical: true,
+            prerequisites: Vec::new(),
+            correction_step: owner_step,
+        })
     .collect()
 }
 
@@ -533,8 +575,7 @@ impl LifecycleIntentV1 {
         if body.len() > MAX_LIFECYCLE_INTENT_BYTES {
             return Err(LifecycleIntentError::PayloadTooLarge);
         }
-        let intent: Self = serde_json::from_str(body)
-            .map_err(|_| LifecycleIntentError::InvalidField("wire"))?;
+        let intent: Self = decode_bounded(body.as_bytes())?;
         intent.validate()?;
         Ok(intent)
     }
@@ -590,7 +631,13 @@ impl LifecyclePlanV1 {
 
 impl LifecycleBaselineEntryV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, 1, &[("requirement_id", &self.requirement_id)])
+        validate_common(self.schema_version, 1, &[("requirement_id", &self.requirement_id), ("provider", &self.provider)])?;
+        if self.prerequisites.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
+            || self.prerequisites.iter().any(|item| item.is_empty() || item.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES)
+        {
+            return Err(LifecycleIntentError::InvalidField("baseline_prerequisites"));
+        }
+        Ok(())
     }
 }
 
@@ -872,7 +919,9 @@ mod tests {
                 check_id: "mesh-identity".into(),
                 step: "mesh".into(),
                 reason: "identity is absent".into(),
+                prerequisites: Vec::new(),
             }],
+            edges: Vec::new(),
             rollback_forbidden: true,
         };
         assert!(plan.validate().is_ok());

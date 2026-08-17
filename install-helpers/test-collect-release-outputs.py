@@ -14,7 +14,6 @@ ROLES = {
     "lighthouse-rpm": ("application/x-rpm", b"\xed\xab\xee\xdblighthouse"),
     "browser-vm": ("application/x-qemu-disk", b"QFI\xfbbrowser"),
     "app-vm": ("application/x-qemu-disk", b"QFI\xfbapp"),
-    "cuttlefish-image": ("application/vnd.mcnf.cuttlefish-image", b"cuttlefish"),
     "bootc-image": ("application/vnd.mcnf.bootc-image-receipt+json", b'{"resolved_digest":"sha256:fixture"}'),
 }
 
@@ -54,7 +53,7 @@ def main() -> None:
         plan = {"schema_version": 1, "kind": "mcnf-release-output-collection-plan", "source_revision": revision, "outputs": outputs}
         run(collector, root, plan, "good", True)
         value = json.loads((root / "good.out").read_text())
-        assert value["promotion"] == "forbidden" and len(value["outputs"]) == 7
+        assert value["promotion"] == "forbidden" and len(value["outputs"]) == 6
         assert all(row["sha256"].startswith("sha256:") and row["size"] > 0 for row in value["outputs"])
         assert all(
             ("signing_identity" in row) == (row["media_type"] == "application/x-rpm")

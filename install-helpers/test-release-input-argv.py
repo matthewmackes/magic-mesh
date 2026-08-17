@@ -57,8 +57,8 @@ def main() -> None:
         preflight.chmod(0o755)
 
         names = (
-            "maps-approval.json", "maps-verifier", "release.json", "relay", "agent", "rpm-receipt.json",
-            "bootc-receipt.json", "app-base-receipt.json", "cuttlefish-receipt.json", "cuttlefish-image.tar",
+            "maps-approval.json", "maps-verifier", "maps.mbtiles", "release.json", "relay", "agent", "rpm-receipt.json",
+            "bootc-receipt.json", "app-base-receipt.json", "app-catalog.json", "cuttlefish-receipt.json", "cuttlefish-image.tar",
             "mcnf-cuttlefish-readiness-relay.deb", "mcnf-cuttlefish-vdi-agent.deb",
         )
         for name in names:
@@ -75,6 +75,8 @@ def main() -> None:
             "maps_tile_source_root": str(maps_root),
             "maps_quota_bytes": "4096",
             "maps_verifier": str(inputs / "maps-verifier"),
+            "maps_mbtiles": str(inputs / "maps.mbtiles"),
+            "android_capability": "deferred",
             "cuttlefish_declaration": str(inputs / "release.json"),
             "cuttlefish_readiness_relay": str(inputs / "relay"),
             "cuttlefish_vdi_agent": str(inputs / "agent"),
@@ -88,6 +90,7 @@ def main() -> None:
             "bootc_base_architecture": "amd64",
             "bootc_release_role": "unified-seat-server",
             "app_vm_base_image_receipt": str(inputs / "app-base-receipt.json"),
+            "app_vm_catalog_receipt": str(inputs / "app-catalog.json"),
             "app_vm_base_image_reference": "registry.invalid/mcnf/app@sha256:" + "3" * 64,
             "app_vm_base_architecture": "amd64",
             "cuttlefish_image_receipt": str(inputs / "cuttlefish-receipt.json"),

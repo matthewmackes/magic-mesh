@@ -19,6 +19,6 @@ type=rpm-md
 skip_if_unavailable=True
 gpgcheck=1
 gpgkey=https://matthewmackes.github.io/magic-mesh/RPM-GPG-KEY-magic-mesh
-repo_gpgcheck=0
+repo_gpgcheck=1
 enabled=1
 enabled_metadata=1

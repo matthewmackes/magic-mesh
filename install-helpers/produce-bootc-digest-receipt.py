@@ -87,6 +87,8 @@ def validate_identity(reference: str, architecture: str, role: str) -> None:
         raise Refusal("architecture is invalid")
     if not ROLE_RE.fullmatch(role):
         raise Refusal("release role is invalid")
+    if role != "all-roles":
+        raise Refusal("bootc receipt must use the canonical all-roles release role")
 
 
 def resolve(skopeo: str, reference: str, architecture: str) -> tuple[str, str]:

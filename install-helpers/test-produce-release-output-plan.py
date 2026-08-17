@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hostile tests for the canonical seven-role release-output plan producer."""
+"""Hostile tests for the canonical six-role release-output plan producer."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def fixture(root: Path) -> dict[str, object]:
     for name in (
         "workstation.rpm", "workstation.json", "server.rpm", "server.json",
         "lighthouse.rpm", "lighthouse.json", "browser.qcow2", "browser.json",
-        "browser.env", "app.qcow2", "app.json", "cuttlefish.tar", "cuttlefish.json",
+        "browser.env", "app.qcow2", "app.json",
         "bootc.json", "release.asc",
     ):
         payload = b"QFI\xfbfixture" if name.endswith(".qcow2") else b"fixture\n"
@@ -63,13 +63,6 @@ def fixture(root: Path) -> dict[str, object]:
             "lighthouse-rpm": {"artifact": files["lighthouse.rpm"], "candidate_manifest": files["lighthouse.json"]},
             "browser-vm": {"artifact": files["browser.qcow2"], "manifest": files["browser.json"], "frozen_profile": files["browser.env"]},
             "app-vm": {"artifact": files["app.qcow2"], "manifest": files["app.json"]},
-            "cuttlefish-image": {
-                "artifact": files["cuttlefish.tar"], "receipt": files["cuttlefish.json"],
-                "architecture": "amd64", "provider_identity": "mcnf-cuttlefish",
-                "android_release_id": "android-15.0.0_r1", "compatibility_id": "mcnf-cuttlefish-v1",
-                "media_type": "application/vnd.mcnf.cuttlefish.image.v1+tar",
-                "artifact_format": "android-cuttlefish-image-archive",
-            },
             "bootc-image": {
                 "receipt": files["bootc.json"],
                 "image_reference": "registry.invalid/mcnf/construct@sha256:" + "b" * 64,
@@ -86,7 +79,7 @@ def assert_schema(value: dict[str, object], source: dict[str, object]) -> None:
     rows = value["outputs"]
     assert isinstance(rows, list) and [row["role"] for row in rows] == [
         "workstation-rpm", "server-rpm", "lighthouse-rpm", "browser-vm",
-        "app-vm", "cuttlefish-image", "bootc-image",
+        "app-vm", "bootc-image",
     ]
     by_role = {row["role"]: row for row in rows}
     common = {"role", "path", "media_type", "source_revision", "companions", "verifier"}
@@ -112,9 +105,6 @@ def assert_schema(value: dict[str, object], source: dict[str, object]) -> None:
         "{signing_identity}" not in row["verifier"]
         for row in rows if row["role"] not in rpm_roles
     )
-    cuttle_argv = by_role["cuttlefish-image"]["verifier"]
-    assert "--source-kind" in cuttle_argv and cuttle_argv[cuttle_argv.index("--source-kind") + 1] == "artifact"
-    assert cuttle_argv[cuttle_argv.index("--original-source") + 1] == "{artifact}"
     bootc = by_role["bootc-image"]
     bootc_input = source["outputs"]["bootc-image"]
     assert bootc["media_type"] == "application/vnd.mcnf.bootc-image-receipt+json"
@@ -147,7 +137,6 @@ def main() -> None:
         unsigned = copy.deepcopy(good); unsigned["signing_identity"] = "0" * 40; mutations["null-signer"] = unsigned
         bad_epoch = copy.deepcopy(good); bad_epoch["commit_epoch"] = 1700000000; mutations["numeric-epoch"] = bad_epoch
         transport = copy.deepcopy(good); transport["outputs"]["bootc-image"]["image_reference"] = "docker://bad"; mutations["transport-reference"] = transport
-        registry_cuttle = copy.deepcopy(good); registry_cuttle["outputs"]["cuttlefish-image"]["source_kind"] = "registry"; mutations["caller-source-kind"] = registry_cuttle
         duplicate = copy.deepcopy(good); duplicate["outputs"]["app-vm"]["manifest"] = duplicate["outputs"]["browser-vm"]["manifest"]; mutations["duplicate-file"] = duplicate
         duplicate_key = copy.deepcopy(good); duplicate_key["release_key"] = duplicate_key["outputs"]["app-vm"]["manifest"]; mutations["duplicate-release-key"] = duplicate_key
         relative = copy.deepcopy(good); relative["outputs"]["app-vm"]["artifact"] = "relative.qcow2"; mutations["relative-path"] = relative

@@ -5,7 +5,7 @@ runbooks, and operator notes are inputs, not parallel trackers. Historical
 implementation diaries remain in docs/worklist-archive/ and are not executable
 tasks.
 
-## Current Snapshot - 2026-08-16 production 13.0.0 execution
+## Current Snapshot - 2026-08-17 fully automated production 13.0.0 execution
 
 - **9 active epics:** 3 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
@@ -14,7 +14,7 @@ tasks.
   under `WL-REL-001` S1; materialize and admit the already-selected production
   inputs under `WL-REL-006` against that exact candidate; reconfirm that the
   candidate did not move and promote the same revision to the final source
-  freeze; cut and sign the seven roles under `WL-REL-002`/`WL-REL-003`; stage
+  freeze; cut and sign the six roles under `WL-REL-002`/`WL-REL-003`; stage
   the unpublished signed candidate on the production topology and run
   `WL-TEST-002`; complete the final signed evidence envelope under
   `WL-REL-004`; then publish and read back under `WL-REL-005`. If source changes
@@ -32,15 +32,33 @@ tasks.
   LizardFS/cloud-hypervisor path.
 - **Evidence lock:** a story is incomplete until its deliverable, focused hostile
   tests, farm command and result, and required live/package evidence are recorded
-  in docs/platform/evidence/. Missing hardware or provider access is a named
-  blocker, not a passing substitute.
+  in docs/platform/evidence/. Missing hardware, provider access, credentials, or
+  capacity fails the owning automated gate; it is never a passing substitute or
+  an interactive operator handoff.
+- **Unattended-release lock (2026-08-17):** approval of a signed,
+  revision-bound `ReleaseIntentV1` on protected `master` is the sole release
+  authorization. From that point the release coordinator must provision,
+  build, sign, stage, qualify, publish, read back, clean up, and archive without
+  interactive steps. Credentials are named systemd-credential/mde-seal inputs,
+  not argv, logs, Git data, or evidence. A failed dependency receives bounded
+  automated remediation and retry, then reopens its exact owning `WL-*` story;
+  no `operator needed`, manual assertion, unavailable-feature waiver, or
+  synthetic production pass is admissible.
+- **Android deferral lock (2026-08-17):** all Android and Cuttlefish build,
+  package, guest, VDI, input, runtime, hardware, and live-proof capability is
+  deferred beyond `13.0.0` and is not a release input, role, gate, artifact, or
+  acceptance obligation. The production set is exactly six roles: Workstation
+  RPM, Server RPM, Lighthouse RPM, Browser VM, App VM, and bootc image. Preserve
+  historical Android evidence as non-promotable history and render Android as
+  visibly `Deferred`; reactivation requires a new active epic and a newer
+  governance lock after this release.
 - **Shared release-proof ownership:** first-release input admission, signed
   artifact/package proof, installed baseline acceptance, corrected-forward
   recovery, and deferred provider/live proofs are owned by `WL-TEST-002`.
   Product epics must not duplicate those rollout tasks; they retain only
   product-specific implementation and integration gaps, and cite `WL-TEST-002`
   when its acceptance is a dependency.
-- **Production qualification topology (operator lock 2026-08-16):** deep
+- **Production qualification topology (release lock 2026-08-16):** deep
   acceptance for `13.0.0` is exactly Seat 15, Dell, and Surface. Eagle and T480
   are non-gating inspection/deployment-wave seats. Three lighthouses remain
   independently required. Surface is promoted into the `13.0.0` production
@@ -51,7 +69,7 @@ tasks.
   `AI-GENERATED-ALERT`, the five-second mutation delay, and an auditable result.
   Historical three- and five-seat evidence stays factual. Lighthouses are not
   test seats and retain their independently governed quorum proof.
-- **Privacy-retention lock (operator lock 2026-08-10):** system logs, Bus
+- **Privacy-retention lock (release lock 2026-08-10):** system logs, Bus
   history, transfer ledgers, collaboration JSONL, application histories, and
   audit records have a fleet-wide maximum lifetime of six hours. No priority or
   audit class is exempt. Configuration, identities, credentials, current
@@ -62,11 +80,10 @@ tasks.
   recorded in `docs/platform/evidence/WL-ARCH-008-WL-ARCH-009-WL-ARCH-010-WL-CRIT-007-2026-08-10-dell-churn-release33-r134.md`.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
-  never run filler tests. The reproducible Android 14 AOSP/Cuttlefish source
-  build is the sole `13.0.0` exception: run it on one temporary, dedicated
-  KVM-XCP1 builder created only for that use case, export and independently
-  verify its governed artifacts, destroy the builder, then restore the normal
-  `.90` farm lane. BigBoy remains the long-pole host for every non-Android job.
+  report the current five hosts and ten heavy slots (`.50` cap 2, `.90` cap 2,
+  `.130` cap 3, `.170` cap 2, `.196` cap 1), and never run filler tests. BigBoy
+  remains the long-pole host; no Android-only builder or storage is provisioned
+  for `13.0.0`.
 - **Rollout lock:** for `13.0.0`, prove each release activity on exactly the
   three selected physical seats (Dell, Seat 15, Surface) and the independently
   required lighthouses. The approved
@@ -76,15 +93,22 @@ tasks.
   preserving quorum. Publish the red AI-GENERATED-ALERT and wait five seconds
   before each mutation. Recover failures by re-enrollment and corrected-forward
   deployment, never rollback.
+- **Objective-qualification lock:** replace human listening, visual review, and
+  physical-observer dispositions with hash-bound machine observations from
+  permanent self-testing fixtures: DRM/KMS capture, audio chirp correlation,
+  HID/sensor/camera/power telemetry, and controlled Cast/DLNA receivers. A
+  missing or unhealthy fixture fails its owning gate; all six roles and every
+  selected feature must pass before publication.
 - **Story format:** execute stories top-to-bottom. Do not start a story until
-  every dependency is green. If a dependency or external resource is absent,
-  set the epic to Blocked with the exact missing item; do not invent evidence.
+  every dependency is green. If a dependency is absent, set the epic to
+  Blocked with the exact owning story and machine-readable failed gate; do not
+  invent evidence or delegate resolution to an operator.
 
 ## Active Drain Goal
 
 Implement the unified turnkey seat lifecycle, then cut, self-sign, qualify,
 publish, install, and prove production `magic-mesh-v13.0.0` from one exact clean
-protected-default-branch revision. Produce all seven canonical roles, retain
+protected-default-branch revision. Produce all six canonical roles, retain
 fail-closed provenance, require real production evidence, and keep deep live
 acceptance within Seat 15, Dell, and Surface.
 
@@ -93,7 +117,7 @@ acceptance within Seat 15, Dell, and Surface.
 1. Implement the unified ONBOARD & OFFBOARDING lifecycle.
 2. Create and admit real production release inputs.
 3. Re-freeze the feature-complete `13.0.0` source on the protected default branch.
-4. Build and self-sign all seven canonical roles.
+4. Build and self-sign all six canonical roles.
 5. Stage the exact unpublished candidate on the six-node production topology.
 6. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance.
 7. Assemble and sign the final provenance/evidence bundle.
@@ -108,6 +132,38 @@ revision, command, result, and evidence path; and mark the story complete only
 when the Done when condition is true. A passing compile without the named
 behavioral evidence is not completion.
 
+## Non-stall execution contract
+
+- A blocked story parks only its dependent lane. While any implementation,
+  remediation, verification, documentation, or cleanup story is ready,
+  `WL-REL-007` remains `Remaining`, Luna immediately assigns the next disjoint
+  story, and the drain does not stop for status reporting or clarification.
+- Before candidate freeze, synchronize `AI_GOVERNANCE.md`, release schemas,
+  helpers, CI, and documentation to the unattended six-role release lock. Until
+  that source change lands, continue lifecycle and release-tool implementation
+  but do not freeze or publish a candidate.
+- Preserve and integrate owned dirty work on the current branch; never discard
+  it to obtain a clean receipt. A separate clean protected-`master` checkout is
+  created only after reviewed changes merge and `github-required` is enforced
+  through the repository ruleset using the scoped release credential.
+- Credential preflight loads named systemd/mde-seal credentials, tests them
+  without disclosure, renews through supported provider APIs, and retries at
+  30 seconds, 2 minutes, and 10 minutes. A still-failing credential parks its
+  live/publication lane while source, package, and evidence work continues.
+- If a lighthouse rejects SSH, the coordinator uses provider APIs to create a
+  replacement with an ephemeral pinned bootstrap key, joins and catches it up,
+  retires the unreachable member, and repeats one node at a time while two
+  voters remain healthy. No console or password handoff is required.
+- Farm admission first reclaims only expired owned slots, then reassigns the
+  immutable job. Native Fedora 44 capacity is provisioned on the declared
+  BigBoy lane and `rpm-sign` is installed through configuration management;
+  neither condition is a request for manual setup.
+- Objective qualification uses automatically started software receivers plus
+  each seat's DRM readback, speakers/microphones, cameras, input-device
+  capability reports, sensors, and RTC wake. Missing observations reopen the
+  exact implementation or hardware-support story without blocking unrelated
+  lanes; production publication remains fail-closed.
+
 ### WL-REL-007 - Execute the SOL Luna AI production 13.0.0 completion plan
 
 - Status: Remaining
@@ -116,41 +172,41 @@ behavioral evidence is not completion.
 - Problem: the active lifecycle, release-input, source-freeze, build, signing,
   qualification, evidence, and publication epics form one production release
   dependency chain, but their cross-epic execution, farm ownership, temporary
-  Android build capacity, and final reconciliation need one explicit governing
-  plan so no blocker is skipped or satisfied with historical fixture evidence.
-- Required outcome: SOL Luna AI coordinates the owning epics to produce,
+  infrastructure remediation, and final reconciliation need one explicit
+  governing plan so no blocker is skipped or satisfied with historical fixture evidence.
+- Required outcome: one restart-safe release coordinator executes the owning
+  epics to produce,
   qualify, publish, read back, and archive production
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
-  with exactly seven canonical roles and no fabricated or substituted evidence.
+  with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: the eight owning epics below contain their product and release
-  acceptance criteria. A historical promotion-forbidden preview and several
-  source-bound receipts exist, but they predate the final lifecycle source and
-  cannot satisfy this plan. Surface is approved for `13.0.0` qualification.
-  Android 14 AOSP/Cuttlefish requires a one-use builder outside BigBoy's normal
-  farm lane; all other long-pole builds remain assigned to BigBoy. Operator
-  production-input selections are complete: do not run another selection
-  survey or treat the selected input families as missing clarification. The
-  remaining input work is to materialize exact bytes, bind receipts to the
-  release-candidate revision, and pass canonical preflight. Self-signing is
-  authorized; key and publication access are execution-time checks, not
-  presumed blockers. Exact acceptance remains Dell, Seat 15, Surface, and three lighthouses.
+  criteria. Historical preview and source-bound receipts predate the final
+  lifecycle source and cannot satisfy this plan. Surface is approved for
+  `13.0.0`; Android/Cuttlefish is deferred and creates no release dependency.
+  Input selections and self-signing are authorized; remaining work
+  is to materialize candidate-bound bytes and pass canonical preflight. Keys,
+  provider credentials, farm authority, and publication access are named
+  system credentials verified by unattended preflight. Exact acceptance is
+  Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      - Inputs: this worklist, governance locks, farm topology, the eight owning
        epics, and the clean integration branch.
-     - Action: keep one Luna integration authority and use two to five workers
-       only for disjoint lifecycle, surfaces, inputs, Android, and release
+     - Action: keep one integration authority and use two to five workers
+       only for disjoint lifecycle, surfaces, inputs, infrastructure, and release
        scopes. Execute `WL-FUNC-023`; establish the `WL-REL-001` S1 candidate
        identity; execute `WL-REL-006` against it; reconfirm and finalize
        `WL-REL-001`; then execute `WL-REL-002`, `WL-REL-003`, pre-publication
        `WL-TEST-002`, `WL-REL-004`, `WL-REL-005`, and final `WL-TEST-002`
        reconciliation.
-     - Deliverable: one dependency/ownership record citing each owning epic and
-       its current exact blocker; this epic must not duplicate their product
-       implementation or acceptance evidence.
+     - Deliverable: strict signed `ReleaseIntentV1`, `ReleaseStateV1`, and
+       `ReleaseStageReceiptV1` contracts plus a restart-safe stage journal under
+       `/var/lib/mcnf-release/<revision>/` binding version, source, six roles,
+       six targets, credential names, destructive scope, retries, and
+       input/output hashes; this journal is execution state, not a worklist.
      - Validation: every worker has a disjoint write scope; every mutation and
-       gate maps to one owning story; no parallel tracker or filler farm job is
-       created.
+       gate maps to one owning story; compare-and-swap stage receipts resume
+       after interruption; no parallel tracker or filler farm job is created.
      - Done when: every ready story has one owner and no downstream story starts
        before its dependencies are green.
   2. S2 Complete the unified lifecycle under WL-FUNC-023.
@@ -160,8 +216,9 @@ behavioral evidence is not completion.
        selection, audit/correction, onboarding, upgrade, warning handling,
        offboarding, reset, fleet execution, packaging, and first-boot behavior.
        Mint the enrollment bearer through the existing lifecycle authority and
-       wire the existing typed SSH transport seam; do not add a parallel trust
-       service or pass a command template as a credential. Prove minting,
+       wire the existing typed SSH transport seam; pass target-bound enrollment
+       material through stdin or a credential descriptor with pinned host
+       identity, never argv or command text. Prove minting,
        redaction, refusal, replay, SSH result, and Bus acknowledgement with farm
        fixtures now; defer exact-candidate target execution to `WL-TEST-002`.
      - Deliverable: all S1-S18 deliverables and focused farm/live evidence owned
@@ -179,9 +236,8 @@ behavioral evidence is not completion.
        clipped to official Erie and Niagara county boundaries using the existing
        Maps approval, producer, materializer, and verifier contracts; enforce
        the aggregate quota and deterministic transport; regenerate App VM,
-       bootc, and Kiron receipts; build matching Android 14 x86_64 Cuttlefish
-       host/image bytes and current-source guest DEBs; generate the existing
-       signer receipt; and materialize canonical private mode-0400 preflight
+       bootc, and Kiron receipts; generate the existing signer receipt; and
+       materialize canonical private mode-0400 preflight
        inputs outside Git. Do not add a platform-wide trust root, new security
        subsystem, or unrelated runtime security surface.
      - Deliverable: immutable, licensed, current-revision receipts, declarations,
@@ -192,28 +248,19 @@ behavioral evidence is not completion.
        existing governed verifiers; no new security contract is required.
      - Done when: `release-input-preflight.sh` accepts every real production
        input and no preview fixture or historical receipt is admitted.
-  4. S4 Build Android 14 on a one-use KVM-XCP1 host.
-     - Inputs: the locked Android 14 manifest, KVM-XCP1 capacity, OpenTofu/XAPI
-       authority, and immutable private artifact storage.
-     - Action: drain and stop the normal `.90` VM; create
-       `mcnf-build-android14` on KVM-XCP1 with 4 vCPU, 18 GiB RAM, a 32 GiB root,
-       a dedicated 400 GiB build volume, and bounded 32 GiB swap. Build only the
-       matching `aosp_cf_x86_64_phone-userdebug` image and host package in a
-       digest-pinned environment. If the local SR cannot admit the volume, add a
-       dedicated 400 GiB build SR before starting rather than consuming another
-       farm VM's disk.
-     - Deliverable: matching `cvd-host_package.tar.gz`, image archive, build
-       fingerprint, compatibility identity, image receipt, guest declaration,
-       license inventory, capacity record, and OpenTofu plan/apply record.
-     - Validation: boot the resulting Cuttlefish instance; prove `cvd`, Android
-       boot completion, `adb`, guest package installation, readiness/VDI,
-       input, reconnect, and clean shutdown. Export immutable outputs and verify
-       their hashes from a separate farm host.
-     - Done when: verified outputs are outside the temporary VM, the VM/build
-       volume/swap are destroyed, the destroy record is preserved, and the
-       restored `.90` lane passes normal farm admission. The temporary builder
-       never executes unrelated work or becomes a permanent farm lane.
-  5. S5 Freeze source and cut the seven-role candidate.
+  4. S4 Apply the Android/Cuttlefish deferral across release contracts.
+     - Inputs: the Android deferral lock, durable governance, release schemas,
+       role collectors, preflight, CI, GUI/TUI capability projections, and docs.
+     - Action: synchronize every live source and policy surface to the six-role
+       `13.0.0` set; reject Android inputs for this version and render the
+       capability visibly `Deferred` without building or provisioning it.
+     - Deliverable: governance/schema migration, six-role producer/verifier
+       contracts, and renderer-neutral deferred-capability state.
+     - Validation: source scans and hostile fixtures reject stale seven-role or
+       required-Cuttlefish assumptions while preserving historical evidence.
+     - Done when: no `13.0.0` gate, helper, role, or UI readiness result requires
+       Android bytes, infrastructure, credentials, or live proof.
+  5. S5 Freeze source and cut the six-role candidate.
      - Inputs: completed lifecycle and input epics, the clean pushed candidate
        revision used by S3, protected `master`, required GitHub checks,
        authorized signing material, and Fedora 44 builders.
@@ -223,20 +270,20 @@ behavioral evidence is not completion.
        and return to S3. Once stable, build exactly three unsigned RPMs; seal
        the handoff; verify access to the already-authorized self-signing key;
        sign all three atomically without payload drift; build Browser VM and App
-       VM derivatives; and admit Cuttlefish and bootc.
+       VM derivatives; and admit bootc.
      - Deliverable: one immutable private candidate containing exactly
-       Workstation RPM, Server RPM, Lighthouse RPM, Browser VM, App VM,
-       Cuttlefish image, and bootc image.
-     - Validation: BigBoy runs the non-Android long poles; every permanent farm
+       Workstation RPM, Server RPM, Lighthouse RPM, Browser VM, App VM, and
+       bootc image.
+     - Validation: BigBoy runs the long poles; every permanent farm
        host runs a unique meaningful build or gate; handoff, signature, NEVRA,
-       payload, receipt, manifest, collector, and seven-role hostile checks pass.
+       payload, receipt, manifest, collector, and six-role hostile checks pass.
      - Done when: `WL-REL-001`, `WL-REL-002`, and `WL-REL-003` are complete and
        the unpublished signed candidate binds exactly to the frozen source.
   6. S6 Qualify the unpublished candidate on production topology.
-     - Inputs: the signed seven-role candidate, Dell, Seat 15, Surface, three
+     - Inputs: the signed six-role candidate, Dell, Seat 15, Surface, three
        lighthouses, provider authority, and corrected-forward recovery identity.
-     - Action: inspect all designated seats, then perform deep acceptance on
-       exactly Dell, Seat 15, and Surface. Publish the red
+     - Action: run unattended read-only admission on all designated seats, then
+       perform deep acceptance on exactly Dell, Seat 15, and Surface. Publish the red
        `AI-GENERATED-ALERT` and wait five seconds before every mutation. Upgrade
        lighthouses one at a time while preserving quorum. Eagle and T480 remain
        non-gating inspection/deployment-wave seats.
@@ -244,21 +291,25 @@ behavioral evidence is not completion.
        Maps, collaboration, media/device, guest-role, Surface-hardware,
        resilience, privacy-retention, lighthouse, and recovery evidence owned
        by `WL-TEST-002`.
-     - Validation: tested bytes match the candidate; unavailable capabilities
-       remain honest; every failure recovers by corrected-forward action or
-       re-enrollment, never rollback.
+     - Validation: tested bytes match the candidate; DRM, audio, HID, sensor,
+       camera, power, Cast/DLNA, provider, and guest evidence is captured by
+       objective fixtures; every failure recovers by corrected-forward action
+       or re-enrollment, never rollback or manual assertion.
      - Done when: `WL-TEST-002` S1-S7 pass or reopen one exact owning
        implementation blocker with no invented success.
   7. S7 Assemble, sign, publish, and independently read back the release.
-     - Inputs: qualified seven-role candidate, gate matrix, SBOM producers,
+     - Inputs: qualified six-role candidate, gate matrix, SBOM producers,
        release key, release notes, GitHub authority, and package repository.
-     - Action: collect exactly seven roles; run all mandatory farm and GitHub
-       gates; generate SBOM, compatibility, provenance, checksums, and evidence;
+     - Action: collect exactly six roles; require `github-required` through
+       branch protection for the frozen revision; consume a typed gate-result
+       manifest; generate aggregate six-role SBOM/license, compatibility,
+       provenance, checksums, and evidence;
        sign the complete envelope; create signed tag
        `magic-mesh-v13.0.0`; publish the exact asset set; download it into a new
-       directory; and atomically promote signed repository metadata only after
-       clean-room verification.
-     - Deliverable: immutable tag and release, signed seven-role evidence
+       directory; verify the remote tag and strict asset allowlist; and
+       atomically promote signed repository metadata with `repo_gpgcheck=1`
+       only after clean-room verification.
+     - Deliverable: immutable tag and release, signed six-role evidence
        bundle, public asset/readback receipt, and signed package-channel receipt.
      - Validation: omitted, extra, changed, stale, linked, unsigned, HOLD, or
        cross-revision files refuse; downloaded bytes reproduce the qualified
@@ -268,37 +319,38 @@ behavioral evidence is not completion.
   8. S8 Reconcile and archive the complete plan.
      - Inputs: every owning epic's evidence, public readback, installed
        acceptance, worklist stewardship rules, and archive dispositions.
-     - Action: complete `WL-TEST-002` S8; map every obligation to evidence, a
-       reopened implementation story, or one exact external-authority blocker;
-       archive every completed owning epic and finally this coordination epic.
+     - Action: complete `WL-TEST-002` S8; map every obligation to evidence or a
+       reopened implementation/infrastructure story; archive every completed
+       owning epic and finally this coordination epic in an automated
+       post-release documentation commit so the frozen revision does not move.
      - Deliverable: final signed acceptance index, release disposition, blocker
        inventory, and archive entries.
      - Validation: worklist self-test and lint pass; snapshot counts match; no
-       deferred obligation, private secret, temporary Android resource,
+       deferred obligation, private secret, temporary release resource,
        abandoned worktree, or parallel tracker remains.
      - Done when: production `13.0.0` is published and independently verified,
-       all completed epics are removed from the active worklist, and any genuine
-       external blocker names one concrete operator action.
+       all completed epics are removed from the active worklist, and no manual
+       release action, deferred feature, or unresolved external handoff remains.
 - Scope: coordination and dependency enforcement for the existing lifecycle and
-  release epics, plus the narrowly authorized temporary Android build capacity.
+  release epics, including the explicit non-gating Android deferral.
   Existing epics remain the sole owners of implementation and acceptance work.
 - Relevant files/components: `docs/platform/WORKLIST.md`, release/farm helpers,
   OpenTofu farm declarations, lifecycle components, release input producers,
   packaging, evidence collectors, and publication verifiers.
-- Dependencies: the eight owning epics, authorized signing/publication/provider
-  access, KVM-XCP1 capacity, Dell/Seat 15/Surface access, and three lighthouse
-  targets. Story-level dependencies are enforced in S1-S8 order.
-- Acceptance criteria: one clean source produces exactly seven signed roles;
-  real governed inputs pass preflight; the one-use Android builder leaves no
-  residual resource; production topology passes; signed evidence and public
+- Dependencies: the eight owning epics and automated credential,
+  Dell/Seat 15/Surface, and three-lighthouse preflight gates. Story-level
+  dependencies are enforced in S1-S8 order; a failed gate reopens its owning
+  story rather than requesting interactive resolution.
+- Acceptance criteria: one clean source produces exactly six signed roles;
+  real governed inputs pass preflight; production topology passes; signed evidence and public
   readback agree; no fixture, rollback, filler build, or fabricated proof
   satisfies a gate.
 - Verification method: worklist lint, focused hostile tests, meaningful gates
-  across all permanent farm hosts, Android live boot proof, exact three-seat and
+  across all permanent farm hosts, exact three-seat and
   three-lighthouse acceptance, signed evidence verification, clean-room public
   readback, and repository query.
-- Origin or merged source IDs: operator SOL Luna AI completion plan and
-  Android-only KVM-XCP1 build-host exception (2026-08-16).
+- Origin or merged source IDs: SOL Luna AI completion plan and Android deferral
+  direction (2026-08-17).
 
 ### WL-FUNC-023 - Create the unified ONBOARD & OFFBOARDING lifecycle
 
@@ -385,7 +437,7 @@ behavioral evidence is not completion.
      - Validation: expiration, replay, revocation, target mismatch, conflict,
        disconnect, and redaction tests.
      - Done when: bootstrap material is erased only after confirmed enrollment.
-  7. S7 Implement operator-controlled artifact selection.
+  7. S7 Implement authority-controlled artifact selection.
      - Inputs: release catalog, RPM/image inputs, local artifact import, release
        signatures, architecture, and migration metadata.
      - Action: allow signed Stable, Candidate, or Dev selection or another
@@ -398,7 +450,7 @@ behavioral evidence is not completion.
      - Inputs: selected digest, administrator identity, typed confirmation, and
        readiness reports.
      - Action: require `INSTALL UNSIGNED <SHORT-DIGEST>` and record the digest,
-       operator, warning, and confirmation.
+       authorized issuer, warning, and confirmation.
      - Deliverable: visible `UnverifiedBuild` state without mesh quarantine.
      - Validation: confirmation cannot authorize different bytes or targets.
      - Done when: a core-health-passing unsigned build may participate normally
@@ -490,7 +542,7 @@ behavioral evidence is not completion.
         WL-TEST-002 ownership boundary.
       - Action: run focused unit/integration/hostile farm gates, put the longest
         job on BigBoy, and record product-specific evidence.
-      - Deliverable: evidence index, AI/operator runbook, migration notes, and
+      - Deliverable: evidence index, unattended execution runbook, migration notes, and
         exact deferred WL-TEST-002 obligations.
       - Validation: worklist lints pass; detailed history expires within six
         hours; live proof uses exactly Dell, Seat 15, and Surface; any broader preview
@@ -509,16 +561,16 @@ behavioral evidence is not completion.
   only platform bus; typed Workload operations remain the only VM/container
   lifecycle API; WL-TEST-002 owns exact installed and live acceptance.
 - Acceptance criteria: ONBOARD & OFFBOARDING is the only human lifecycle
-  interface; all renderers share one engine; capsule onboarding is zero-touch;
-  token onboarding needs one interaction; upgrades need no manual repair;
-  destructive work is authority-bound; Offboard drains and erases completely;
+  interface; all renderers share one engine; capsule and release-driven token
+  onboarding consume preloaded credentials without interaction; upgrades need
+  no manual repair; destructive work is authority-bound; Offboard drains and erases completely;
   ResetAndOnboard cannot retain an old identity; unsigned artifacts require
   digest confirmation; core failures block; capability failures remain
   prominent `ReadyWithWarnings`.
 - Verification method: focused hostile/unit tests, farm integration and package
   fixtures, GUI/TUI parity, interruption/resume proof, and exactly three physical
   acceptance seats; defer exact release/rollout proof to WL-TEST-002.
-- Origin or merged source IDs: operator lifecycle consolidation, Seat 15 and Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
+- Origin or merged source IDs: lifecycle consolidation direction, Seat 15 and Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
 
@@ -549,7 +601,9 @@ behavioral evidence is not completion.
        candidate. After WL-REL-006 preflight succeeds, fetch again and require
        the same revision, epoch, and tree before declaring it the final freeze.
        Any source change invalidates candidate-bound receipts and returns
-       execution to WL-REL-006.
+       execution to WL-REL-006. Require the exact revision's `github-required`
+       result through branch protection/rulesets; a job with that name that is
+       not required is not release authority.
      - Deliverable: docs/platform/evidence/WL-REL-001-source-freeze-r1.md with exact commands and outputs.
      - Validation: source-revision-receipt.sh --repo .; git diff --quiet; git diff --cached --quiet; compare HEAD with upstream.
      - Done when: one non-null 40-character revision and positive epoch identify
@@ -565,19 +619,20 @@ behavioral evidence is not completion.
      - Validation: farm metadata/package checks on .50; no runtime version authority other than workspace/package reflection.
      - Done when: every current release surface resolves to 13.0.0 or a documented packaging release suffix.
   3. S3 Admit all governed release inputs. BLOCKED on executable materialization,
-     not operator clarification: the production choices are final, but the
+     not unresolved product clarification: the production choices are final, but the
      release-input loader has no final private preflight object. The RPM signer
      receipt has been generated and inspected
      privately for the superseded f095b8ce revision; it must be regenerated for
      the new S1 candidate revision and epoch. The recorded 1dfe6906 revision is
      also superseded and must not receive new release inputs. Maps
      approval/source, App VM image/catalog receipt,
-     Cuttlefish declarations/packages/image receipt, and bootc receipt are
-     not admitted for the frozen revision. Maps provider/live proof
+     bootc receipt is not admitted for the frozen revision. Android/Cuttlefish
+     is deferred and must not appear in the `13.0.0` preflight object. Maps provider/live proof
      is explicitly deferred to WL-TEST-002; that deferral does not create a
      release-input approval. Execute WL-REL-006 against the S1 candidate and do
      not run a build with historical loose artifacts.
-     - Inputs: Maps approval/source, App VM image/catalog receipt, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
+     - Inputs: Maps approval/source, App VM image/catalog receipt, RPM signer
+       receipt, bootc receipt, and the six-role deferral migration.
      - Action: create one private strict-object JSON document containing every
        mandatory release-input-preflight argument, then derive the separate
        prepare-driver argv array with `release-input-argv.py
@@ -598,8 +653,8 @@ behavioral evidence is not completion.
 - Dependencies: WL-FUNC-023 must complete before the S1 candidate identity is
   selected; WL-REL-006 must complete against that candidate before final S1/S4
   freeze disposition. This is a two-phase reconfirmation, not a circular
-  requirement for two source revisions. Operator self-sign authorization is
-  recorded; exact installed/live proof remains deferred to WL-TEST-002.
+  requirement for two source revisions. Signed release intent authorizes
+  self-signing; exact installed/live proof remains deferred to WL-TEST-002.
 - Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
 - Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
 - Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
@@ -610,7 +665,7 @@ behavioral evidence is not completion.
 - Priority: P0
 - Complexity: Epic
 - Problem: WL-REL-001 cannot admit the production release until the already
-  selected Maps, App VM, Cuttlefish, bootc, and UX-014 inputs are materialized
+  selected Maps, App VM, bootc, and UX-014 inputs are materialized
   as exact candidate-bound bytes and receipts and the private preflight object
   passes; historical or non-production fixtures cannot satisfy that gate.
 - Required outcome: create or select real open-source-compatible production
@@ -624,10 +679,9 @@ behavioral evidence is not completion.
   Evidence: `docs/platform/evidence/WL-REL-006-2026-08-16-app-vm-receipt-r1.md`,
   `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
   The RPM lane still requires one mode-0400 private JSON input bound to the
-  clean checkout; Maps contract gates are green, and Cuttlefish guest DEBs are
-  source-bound and verified. Approved provider bytes, a compatible pinned host
-  tools revision, matching Android CI artifacts, and the declaration remain
-  outstanding. Operator selection is complete; materialize the choices named
+  clean checkout and Maps contract gates are green. Android/Cuttlefish and its
+  former guest-DEB/image inputs are deferred and must be removed from the
+  production schema. Input selection is complete; materialize the choices named
   in S1-S6 without another survey or clarification cycle.
   Downstream release epics remain blocked until current receipts pass; the preview cannot be reused.
 - Remaining work:
@@ -636,62 +690,67 @@ behavioral evidence is not completion.
        licenses, and the existing receipt/verifier contracts.
      - Action: record the already-selected reproducible open-source sources and
        local build recipes for each role; record upstream project, license,
-       version, digest method, and whether credentials or operator authorization
-       are required. Do not reopen source selection unless an exact selected
+       version, digest method, and required named system credentials. Do not
+       reopen source selection unless an exact selected
        source is proven unavailable or unlicensed.
      - Deliverable: redacted open-source input inventory and license manifest.
-      - Validation: every source is redistributable or explicitly operator-gated;
+      - Validation: every source is redistributable and its credential/preflight
+       requirements are machine-verifiable;
        any fixture substitution follows the governed evidence template and is
        not presented as observed production behavior.
-     - Done when: all six input families have a named reproducible source or an
-       exact external-provider blocker.
+     - Done when: all admitted input families have a named reproducible source and an
+       automated producer/verifier; missing inputs fail the owning story.
   2. S2 Produce the Maps input.
-     - Inputs: open map data/provider, immutable tile or catalog source,
-       approved offline-cache policy, candidate source receipt, and license terms.
-     - Action: materialize the approved OpenStreetMap-derived Buffalo-Niagara
-       catalog/tile set clipped to official Erie and Niagara county boundaries
-       and generate a candidate-revision approval receipt; preserve attribution,
-       enforce the aggregate quota and deterministic transport, and defer live
-       provider proof to WL-TEST-002.
-     - Deliverable: immutable Maps source manifest, hashes, attribution, and
-       approval receipt.
-     - Validation: Maps verifier rejects changed bytes, wrong revision,
-       unapproved provider, quota violation, and path substitution.
-     - Done when: preflight admits the Maps input without claiming live service.
+     - Inputs: a digest-pinned New York OpenStreetMap PBF, versioned official
+       Erie/Niagara county geometry, approved offline-cache policy, candidate
+       source receipt, and license terms.
+     - Action: render the Buffalo-Niagara catalog/tile set locally from those
+       immutable sources into raster PNG MBTiles consumed by the production GUI
+       at `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`; preserve
+       the PBF, boundary, clip, renderer/style/font identities, ODbL attribution,
+       aggregate quota, and deterministic transport. Never bulk-fetch the public
+       OSM tile service; defer exact installed runtime proof to WL-TEST-002.
+     - Deliverable: immutable `buffalo-niagara.mbtiles`, source/build manifest,
+       hashes, attribution, license, approval receipt, and package install path.
+     - Validation: verify MBTiles schema, PNG payloads, TMS coordinates,
+       bounds/zoom/quota, source hashes, revision, and installed-byte identity;
+       changed bytes, wrong provider, or path substitution refuse.
+     - Done when: preflight and release assembly preserve the exact MBTiles file
+       that the production GUI will open.
   3. S3 Produce the App VM input.
-     - Inputs: reproducible open-source base image or authorized registry
-       manifest, architecture, catalog metadata, and candidate source receipt.
-     - Action: build or inspect the base image without pulling unpinned layers;
-       produce the canonical App VM base-image receipt and catalog content record.
-     - Deliverable: immutable App VM digest, receipt, compatibility metadata, and
-       license record.
+     - Inputs: digest-pinned `quay.io/fedora/fedora-bootc:44`, architecture,
+       the approved real application refs/licenses, and candidate source receipt.
+     - Action: inspect the immutable base manifest, deterministically generate
+       the production catalog, provision the system Flatpak remote named
+       `curated`, and bind installation of the exact refs into the App VM image.
+     - Deliverable: immutable App VM digest, base receipt, catalog publication
+       object, exact-ref inventory, compatibility metadata, and license record.
      - Validation: App VM producer/inspector and build-image admission pass;
        registry or local bytes are bound to the frozen revision.
-     - Done when: App VM inputs pass preflight before image-context mutation.
-  4. S4 Produce the Cuttlefish input.
-     - Inputs: open-source Cuttlefish image or authorized artifact, Android
-       release/compatibility identity, architecture, guest package sources,
-       and candidate source receipt.
-     - Action: build Android 14 `aosp_cf_x86_64_phone-userdebug`, matching host
-       tools, and exact guest packages on the temporary Android-only KVM-XCP1
-       builder governed by WL-REL-007 S4; export and independently hash the
-       outputs, generate the immutable image receipt, and create the guest
-       declaration over exact package bytes. Destroy the temporary resources
-       and restore `.90` after verified export.
-     - Deliverable: Cuttlefish image receipt, declaration, package manifest,
-       hashes, and license record.
-     - Validation: guest payload, declaration, image, and preflight verifiers
-       reject substitution, wrong provider, architecture, release, or revision.
-     - Done when: the Cuttlefish role is admissible without undocumented bytes.
+     - Done when: App VM inputs and real `curated` catalog pass preflight before
+       image-context mutation; fixture IDs and mutable tags refuse.
+  4. S4 Remove Android/Cuttlefish from production input admission.
+     - Inputs: Android deferral lock, private-object schema, release driver,
+       output-plan producer, role collector, CI, and historical fixtures.
+     - Action: remove Android/Cuttlefish fields from the `13.0.0` strict input
+       object and six-role release path; preserve old fixtures only as explicit
+       non-production compatibility tests and refuse them as release inputs.
+     - Deliverable: versioned six-role schema migration plus producer,
+       preflight, collector, and hostile-fixture evidence.
+     - Validation: no Android path, byte, provider, builder, package, or receipt
+       is required; stale seven-role and Cuttlefish-bearing production objects refuse.
+     - Done when: canonical preflight reaches the other inputs without an
+       Android dependency and the deferred capability is visible but non-gating.
   5. S5 Produce the bootc input.
-     - Inputs: reproducible open-source bootc base or authorized registry
-       manifest, architecture, expected role, and candidate source receipt.
+     - Inputs: digest-pinned `quay.io/fedora/fedora-bootc:44`, architecture,
+       canonical role `all-roles`, and candidate source receipt.
      - Action: inspect exact manifest bytes and produce the canonical bootc
        digest receipt; integrate receipt consumption into release preflight.
      - Deliverable: immutable bootc receipt and preflight integration evidence.
      - Validation: architecture, role, digest, revision, epoch, and media type
        are all fail-closed; unavailable registry access refuses admission.
-     - Done when: preflight consumes the receipt rather than a raw digest.
+     - Done when: preflight consumes the receipt rather than a raw digest and
+       rejects legacy `base` or `unified-seat-server` role identities.
   6. S6 Create UX-014 release assets.
      - Inputs: existing open-source UI assets, Kiron verifier contract, license
        attribution, candidate source receipt, and required asset dimensions.
@@ -703,8 +762,8 @@ behavioral evidence is not completion.
        substituted, stale, or unlicensed assets.
      - Done when: WL-REL-003/004 can consume the exact asset manifest.
   7. S7 Materialize private first-release preflight argv.
-     - Inputs: all current-revision receipts from S2-S6, RPM signer receipt,
-       private paths, target architecture, and release epoch.
+     - Inputs: all current-revision receipts from S2-S6, App catalog object, RPM
+       signer receipt, private paths, target architecture, and release epoch.
      - Action: write one mode-0400 private JSON object outside Git, derive the
        release-driver array from that object, and run release-input-preflight
        before any build mutation.
@@ -717,17 +776,17 @@ behavioral evidence is not completion.
 - Scope: open-source source selection, reproducible input generation, receipts,
   licenses, and preflight admission; no public release or live-seat testing.
 - Relevant files/components: install-helpers/release-input-preflight.sh,
-  packaging/app-vm, packaging/android, install-helpers/produce-bootc-digest-receipt.py,
+  packaging/app-vm, install-helpers/produce-bootc-digest-receipt.py,
   Maps catalog/verifier tools, and the Kiron asset verifier.
 - Dependencies: the provisional clean candidate identity from WL-REL-001 S1 and
-  its completed S2 version matrix; external registry/provider access only where
-  the selected reproducible source actually requires it. There is no remaining
-  input-selection dependency. Record an external blocker only after the owning
-  producer or inspector identifies one exact unavailable service, credential,
-  byte set, or capacity requirement.
+  its completed S2 version matrix; registry/provider credentials are named
+  system credentials consumed only where the selected reproducible source
+  requires them. There is no remaining input-selection dependency. The
+  coordinator must provision capacity, refresh credentials through supported
+  APIs, or fail and reopen the exact producer/infrastructure story.
 - Acceptance criteria: every mandatory first-release input is reproducible,
-  licensed, immutable, current-revision-bound, and admitted by preflight, or is
-  recorded as one exact external blocker.
+  licensed, immutable, current-revision-bound, and admitted by preflight; no
+  fixture, unavailable input, or external handoff can satisfy the gate.
 - Verification method: farm-only source/image/package gates, receipt inspectors,
   hostile substitution tests, license review, and canonical preflight.
 - Origin or merged source IDs: WL-CRIT-006, WL-FUNC-017, WL-FUNC-018,
@@ -748,13 +807,19 @@ behavioral evidence is not completion.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
-     - Action: verify source receipt again; verify preflight again; reserve BigBoy for full RPM and a distinct farm slot for Server RPM.
+     - Action: verify source receipt again; verify preflight again; admit a
+       native Fedora 44 builder on XEN-BIGBOY for the full RPM lane and a
+       distinct native Fedora 44 slot for Server RPM. If the `.130` Fedora 42 VM
+       conflicts with the `.131` Fedora 44 builder, drain and stop `.130`, run
+       the admitted release lanes, then restore `.130`; container-F44 output is
+       compatibility evidence, not the production RPM cut.
      - Deliverable: build invocation record with host, slot, revision, epoch, target, and output parent.
      - Validation: run-first-full-release.sh must refuse dirty, moving, cross-epoch, or non-Fedora-44 input.
      - Done when: both build lanes are pinned before either artifact is admitted.
   2. S2 Build Workstation and Lighthouse RPMs.
      - Inputs: frozen source and admitted inputs.
-     - Action: run the full Fedora 44 RPM lane on BigBoy through run-first-full-release.sh prepare.
+     - Action: run the full native Fedora 44 RPM lane on the admitted BigBoy
+       builder through run-first-full-release.sh prepare.
      - Deliverable: exactly one magic-mesh RPM and one magic-mesh-lighthouse RPM in the private pull directory.
      - Validation: farm command succeeds; rpm -qp reports expected names, version 13.0.0, architecture, and SHA-256 payload digest.
      - Done when: no duplicate, stale, symlinked, mutable, or unexpected full-lane RPM remains in the candidate set.
@@ -783,24 +848,29 @@ behavioral evidence is not completion.
 - Status: Blocked
 - Priority: P0
 - Complexity: Epic
-- Problem: a complete release requires three signed RPM roles and four verified image roles; no current-revision seven-role set exists.
-- Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, Cuttlefish, and bootc roles.
-- Current state: a private, promotion-forbidden seven-role preview exists
-  for `afc24782ca9dc8e2e87f5676e403428a82285da1`, with all three signed RPMs,
-  Browser VM, App VM, Cuttlefish, and bootc receipt identities collected and
-  re-verified. It is not the final release because WL-REL-001 remains blocked
+- Problem: a complete release requires three signed RPM roles and three verified image roles; no current-revision six-role set exists.
+- Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, and bootc roles.
+- Current state: a private, promotion-forbidden historical seven-role preview
+  exists for `afc24782ca9dc8e2e87f5676e403428a82285da1`, including now-deferred
+  Cuttlefish bytes. It cannot define the final six-role set and remains
+  non-promotable. WL-REL-001 also remains blocked
   on the feature-complete source freeze; durable evidence is recorded in
   `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`. Self-signing
   authorization is recorded. Do not ask for another signing-policy decision;
-  verify access to the matching private key at S1 and name that exact key access
-  as an external blocker only if the private verification fails.
+  load the matching private key from a named system credential into an
+  ephemeral mode-0700 keyring and fail the signing gate if verification fails.
 - Remaining work:
   1. S1 Materialize and verify the self-signing boundary.
      - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
-     - Action: confirm public fingerprint and receipt; copy only the three handoff RPMs into one private signing directory.
+     - Action: ensure `rpm-sign` is present on the signing host, require public
+       fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C`, confirm its
+       receipt, import that system credential into an ephemeral
+       keyring, and copy only the three handoff RPMs into one private signing
+       directory. Destroy the keyring after signing.
      - Deliverable: redacted signer identity evidence and exact pre-sign payload identity table.
      - Validation: sign-release.sh --self-test; receipt inspector; rpm -Kv before mutation; no secret bytes enter logs or Git.
-     - Done when: one authorized fingerprint is selected and all three inputs match handoff.json exactly.
+     - Done when: the exact governed fingerprint is selected, every other secret
+       key refuses, and all three inputs match handoff.json exactly.
   2. S2 Sign all three RPM roles atomically.
      - Inputs: verified signing directory.
      - Action: run sign-release.sh --prepare-rpms on all three RPMs in one invocation.
@@ -815,60 +885,71 @@ behavioral evidence is not completion.
      - Done when: every manifest names one immutable artifact, revision, signer, NEVRA, and payload digest.
   4. S4 Build Browser VM and App VM derivatives.
      - Inputs: signed Workstation/Lighthouse RPMs, candidate manifests, base images/receipts, and App catalog inputs.
-     - Action: run build-release-derivative-images.sh with an absent private output path.
+     - Action: run build-release-derivative-images.sh exactly once with an
+       absent private output path, then construct the release-output plan from
+       those exact derivative files; never collect an earlier input-plan pair
+       and silently rebuild a second set.
      - Deliverable: immutable Browser VM and App VM images, manifests, and frozen Browser profile.
      - Validation: image manifest verifiers, qcow2 checks, source revision checks, and hostile substitution fixture.
      - Done when: both derivatives verify and the helper publishes no partial output.
-  5. S5 Admit Cuttlefish and bootc roles.
-     - Inputs: Cuttlefish artifact/declaration/image receipt and bootc digest receipt/reference/architecture/role.
-     - Action: verify governed Cuttlefish bytes and bootc receipt; do not rebuild or relabel ungoverned third-party bytes.
-     - Deliverable: Cuttlefish artifact/receipt fields and bootc receipt fields ready for the seven-role plan.
-     - Validation: verify-guest-payload.sh, verify-guest-debs.sh, image receipt verifier, and bootc digest receipt verifier.
-     - Done when: both roles bind to the frozen revision and reject changed bytes, identity, architecture, or provider.
-  6. S6 Create the exact seven-role plan input.
-     - Inputs: three signed RPMs/manifests, two derivative images/manifests, Cuttlefish fields, and bootc fields.
-     - Action: write one private mcnf-release-output-plan-input JSON object containing exactly the seven canonical roles.
+  5. S5 Admit the bootc role.
+     - Inputs: bootc digest receipt, reference, architecture, and `all-roles` identity.
+     - Action: verify the governed bootc receipt; do not rebuild or relabel ungoverned third-party bytes.
+     - Deliverable: bootc receipt fields ready for the six-role plan.
+     - Validation: bootc digest receipt and source-revision verifiers reject
+       changed bytes, identity, architecture, role, or provider.
+     - Done when: bootc binds to the frozen revision and Android remains absent.
+  6. S6 Create the exact six-role plan input.
+     - Inputs: three signed RPMs/manifests, two derivative images/manifests, and bootc fields.
+     - Action: write one private mcnf-release-output-plan-input JSON object containing exactly the six canonical roles.
      - Deliverable: immutable plan input and a redacted role inventory.
      - Validation: produce-release-output-plan.py accepts it; missing, duplicate, extra, relative, mutable, or cross-revision inputs refuse.
-     - Done when: exactly seven role records are accepted and no artifact path is ambiguous.
+     - Done when: exactly six role records are accepted and no artifact path is ambiguous.
 - Scope: self-signing, candidate manifests, derivative generation, and plan input; no final evidence signing, publication, or installation.
 - Relevant files/components: install-helpers/sign-release.sh, install-helpers/build-release-derivative-images.sh,
-  install-helpers/produce-release-output-plan.py, packaging/app-vm, packaging/browser-vm, packaging/android, bootc receipt tools.
-- Dependencies: WL-REL-002 and local access to authorized self-signing key material.
-- Acceptance criteria: three RPM signatures verify without payload drift; four derivative roles verify; exactly seven roles bind to one revision.
+  install-helpers/produce-release-output-plan.py, packaging/app-vm, packaging/browser-vm, and bootc receipt tools.
+- Dependencies: WL-REL-002 and the automated signing-credential preflight.
+- Acceptance criteria: three RPM signatures verify without payload drift; three image roles verify; exactly six roles bind to one revision.
 - Verification method: signing and role-specific verifiers, derivative hostile suite, plan producer, and independent hash/identity comparison.
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016, WL-FUNC-017, and WL-CRIT-006 release roles.
 
-### WL-REL-004 - Assemble the signed seven-role release evidence bundle
+### WL-REL-004 - Assemble the signed six-role release evidence bundle
 
 - Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: publication is forbidden until all artifacts, manifests, gates, SBOM data, checksums, and provenance form one exact signed bundle.
-- Required outcome: collect and verify all seven roles, execute mandatory release gates, and sign one immutable publication envelope.
-- Current state: the canonical seven-role plan and collector pass for the
+- Required outcome: collect and verify all six roles, execute mandatory release gates, and sign one immutable publication envelope.
+- Current state: the historical seven-role plan and collector pass for the
   private historical `afc24782` preview, including fresh App VM and Browser VM manifest
   verification. The collection is promotion-forbidden and still lacks the
   signed provenance/SBOM/gate envelope, clean-room publication readback, and
   final source-freeze authority required to close this epic. Evidence:
   `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`.
 - Remaining work:
-  1. S1 Resume and collect the seven-role output.
+  1. S1 Resume and collect the six-role output.
      - Inputs: WL-REL-002 handoff, WL-REL-003 derivative argv and plan input, frozen revision, and Fedora target.
      - Action: run run-first-full-release.sh resume into an absent private output path.
      - Deliverable: collection-plan.json, release-outputs.json, verified derivatives, and promotion-forbidden output directory.
      - Validation: resume compares signed RPM payloads to the handoff and collectors re-run every canonical owning verifier.
-     - Done when: collection is atomic, immutable, revision-bound, and contains exactly seven verified roles.
+     - Done when: collection is atomic, immutable, revision-bound, and contains exactly six verified roles.
   2. S2 Execute the canonical gate matrix.
-     - Inputs: release-gate-matrix.json, frozen revision, collected artifacts, and all named evidence commands.
-     - Action: run every mandatory gate; route heavy package/workspace gates to the farm and preserve exact commands/results.
+     - Inputs: the revision-independent release-gate-matrix template, frozen
+       revision, collected artifacts, and all named evidence commands.
+     - Action: generate the matrix for the frozen revision, run every mandatory
+       gate, route heavy package/workspace gates to the farm, and preserve a
+       typed result manifest with command, owner, timestamps, artifact, and
+       revision.
      - Deliverable: complete gate manifest with pass/fail, owner, command, artifact, revision, and timestamps.
      - Validation: verify-release-gate-matrix.py --expected-revision; omitted, vacuous, stale, or altered gate results refuse.
      - Done when: all mandatory gates are genuinely green or the epic is marked Blocked with the exact failing implementation.
   3. S3 Generate SBOM and release evidence.
-     - Inputs: seven-role collection, dependency closure outputs, build identities, and gate manifest.
-     - Action: run existing SBOM/evidence producers; bind every artifact hash and candidate manifest into one evidence envelope.
-     - Deliverable: SBOM manifest, evidence JSON, release-output inventory, and artifact-to-source traceability table.
+     - Inputs: six-role collection, dependency closure outputs, build identities, and gate manifest.
+     - Action: generate an aggregate SBOM/license manifest requiring exactly the
+       six canonical roles; bind every artifact hash, candidate manifest, and
+       gate result into one evidence envelope.
+     - Deliverable: six-role SBOM/license manifest, evidence JSON,
+       release-output inventory, and artifact-to-source traceability table.
      - Validation: all evidence paths are immutable regular files; hashes and source revisions match collector output.
      - Done when: every published artifact has one verifiable source, role, checksum, signer, manifest, and gate lineage.
   4. S4 Sign checksums and provenance.
@@ -886,8 +967,9 @@ behavioral evidence is not completion.
 - Scope: evidence collection, release gates, SBOM, provenance, signatures, and publication preflight; no public mutation or seat installation.
 - Relevant files/components: install-helpers/run-first-full-release.sh, produce-release-output-plan.py,
   collect-release-outputs.py, release-gate-matrix.json, verify-release-gate-matrix.py, sign-release.sh.
-- Dependencies: WL-REL-003.
-- Acceptance criteria: one signed immutable seven-role evidence bundle passes all mandatory gates and rejects any artifact-set drift.
+- Dependencies: WL-REL-003 and prepublication WL-TEST-002 S1-S7 qualification
+  of those exact private candidate bytes.
+- Acceptance criteria: one signed immutable six-role evidence bundle passes all mandatory gates and rejects any artifact-set drift.
 - Verification method: farm gates, collector and gate verifiers, SBOM/evidence checks, detached-signature verification, and publication preflight.
 - Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006 production-evidence responsibilities.
 
@@ -899,7 +981,7 @@ behavioral evidence is not completion.
 - Problem: version 13.0.0 has no immutable current tag or complete public asset set, and partial candidates must never enter the package channel.
 - Required outcome: publish one immutable tag and GitHub release, verify all assets by readback, then atomically expose only signed package metadata.
 - Current state: tags end at magic-mesh-v12.1.1; WL-REL-004 has no signed
-  seven-role bundle, so publication is correctly refused. Publication access is
+  six-role bundle, so publication is correctly refused. Publication access is
   an S1 execution-time verification, not a presumed current blocker. Never
   substitute an unsigned or promotion-forbidden preview if access is absent.
 - Remaining work:
@@ -916,8 +998,10 @@ behavioral evidence is not completion.
      - Validation: local and remote tag dereference to the frozen revision; tag signature verifies.
      - Done when: no branch tip or alternate commit can masquerade as the release tag.
   3. S3 Publish the GitHub release and exact assets.
-     - Inputs: remote tag, release notes, seven artifacts, manifests, SBOM, gates, provenance, checksums, and signatures.
-     - Action: create one release and upload the complete admitted set; do not publish a draft/partial set as final.
+     - Inputs: remote tag, release notes, six artifacts, manifests, SBOM, gates, provenance, checksums, and signatures.
+     - Action: create a draft release, upload the complete admitted set without
+       clobbering, verify the remote draft through the strict tag/asset/readback
+       verifier, then publish it; never expose a partial set as final.
      - Deliverable: public release URL, asset inventory, sizes, hashes, and publication receipt.
      - Validation: verify-github-release-binding.sh against remote metadata; asset count and names equal the admitted bundle.
      - Done when: every required asset is downloadable and no unadmitted asset is attached.
@@ -926,19 +1010,24 @@ behavioral evidence is not completion.
      - Action: download every asset; verify SHA256SUMS.asc, checksums, provenance, SBOM/gates, RPM signatures, and role identities.
      - Deliverable: clean-room readback transcript and downloaded-asset digest table.
      - Validation: no local artifact path is reused; all downloaded bytes match the signed bundle.
-     - Done when: public readback independently reconstructs the exact seven-role release identity.
+     - Done when: public readback independently reconstructs the exact six-role release identity.
   5. S5 Promote signed package metadata atomically.
-     - Inputs: verified published RPMs, signed repository policy, HOLD boundary, and current channel metadata.
-     - Action: stage metadata privately; ensure HOLD/unsigned candidates are excluded; atomically publish signed repodata.
+     - Inputs: verified downloaded RPMs, signed repository policy, HOLD
+       boundary, and current channel metadata.
+     - Action: stage metadata privately from the downloaded release RPMs;
+       ensure HOLD/unsigned candidates are excluded; sign `repomd.xml`; require
+       `repo_gpgcheck=1`; re-read the remote package branch and publish only by
+       checked fast-forward.
      - Deliverable: repository metadata receipt and package query output for all three RPM roles.
      - Validation: fresh repository query resolves only signed admitted NEVRAs; partial/unsigned fixture cannot enter metadata.
      - Done when: package clients can resolve the complete release and no stale or unsigned higher candidate blocks upgrades.
-  6. S6 Hand off to installed acceptance.
+  6. S6 Hand off to post-publication acceptance reconciliation.
      - Inputs: publication receipt, download verifier results, package/image references, and corrected-forward recovery identity.
      - Action: update WL-TEST-002 with exact release inputs and select exactly Dell, Seat 15, and Surface as physical proof seats.
      - Deliverable: acceptance handoff naming immutable artifacts, seats, lighthouses, providers, and rollback-forbidden recovery plan.
      - Validation: all references resolve and every seat mutation requires the governed alert/wait sequence.
-     - Done when: WL-TEST-002 can begin without guessing any release, package, image, seat, or recovery identity.
+     - Done when: WL-TEST-002 S8 can compare public bytes with the already
+       qualified private candidate without guessing any identity.
 - Scope: tag, GitHub release, asset readback, signed package metadata promotion, and acceptance handoff.
 - Relevant files/components: Git remote/tag tooling, GitHub release workflow, verify-github-release-binding.sh,
   packaging/repo, dnf-channel helpers, release notes, and WL-TEST-002.
@@ -958,12 +1047,13 @@ behavioral evidence is not completion.
   same bytes after WL-REL-005 publication. Eagle and T480 remain non-gating
   inspection/deployment-wave seats.
 - Current state: pre-release harnesses pass; candidate qualification waits for
-  the current-source signed seven-role candidate and admitted production-input
+  the current-source signed six-role candidate and admitted production-input
   receipts. The production inputs and topology have already been selected; do
   not reopen those decisions. When the candidate exists, use exactly Dell,
   Seat 15, Surface, and the three independently required lighthouses. Probe
-  access at execution time and record only an exact unreachable target or
-  unavailable provider as an external blocker.
+  access and all permanent qualification fixtures are unattended preflight
+  gates. A failure reopens its exact infrastructure/provider story; it cannot
+  waive a feature or request an interactive handoff.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
@@ -983,25 +1073,37 @@ behavioral evidence is not completion.
      - Action: test Calls lifecycle, mute, consent, revocation, reconnect, chat/alerts, files/transfers, editor, and clipboard.
      - Deliverable: redacted provider/readiness, command, failure, and recovery evidence.
      - Validation: missing providers remain visible; no fake connected state; signed attribution and revocation remain auditable.
-     - Done when: available provider paths pass and unavailable paths are named external blockers, not passes.
+     - Done when: every required provider path passes; absence or failure keeps
+       the release red and reopens the owning provider/infrastructure story.
   4. S4 Capture Construct direct-DRM acceptance.
      - Inputs: selected display seat, exact release, Dark/Light and required text/layout profiles.
      - Action: capture shell, taskbar, Front Door, Workers, Kiron/health, Maps, Editor, Music, Files, and key error states.
-     - Deliverable: native readback images/metadata, hashes, route identity, dimensions, and human-review disposition.
-     - Validation: captures come from the direct-DRM seat and exact release; boot curtains, stale routes, or clipped required controls fail.
+     - Deliverable: native readback images/metadata, hashes, route identity,
+       dimensions, and machine-verifier disposition.
+     - Validation: captures come from the direct-DRM seat and exact release;
+       deterministic pixel/geometry/route checks reject boot curtains, stale
+       routes, or clipped required controls without manual review.
      - Done when: required visual routes pass or reopen a named implementation epic.
   5. S5 Prove media and physical integrations.
      - Inputs: audio/video fixtures, authorized Cast/DLNA devices, catalog/server paths, and network-loss controls.
      - Action: test playback, cache/offline, audio/video, renderer recovery, Cast, DLNA, typed handoff, and provider loss.
      - Deliverable: device identity, media command/result, continuity, loss, recovery, and CPU/package observations.
      - Validation: device/provider discovery is real; media state never claims success after transport failure.
-     - Done when: each available integration passes or has one exact external blocker.
+     - Done when: every required integration passes objective transport,
+       rendered-media, audio-correlation, loss, and recovery checks.
   6. S6 Prove guest and device roles.
-     - Inputs: signed Browser VM, App VM, Cuttlefish, bootc artifacts, GPU/audio/input fixtures, and nested-KVM capability.
-     - Action: launch and reconnect Browser/VDI/App/Android roles; test input, audio, GPU, upgrade identity, and failure recovery.
+     - Inputs: signed Browser VM, App VM, and bootc artifacts plus governed
+       Workloads compute and GPU/audio/input fixtures.
+     - Action: schedule each guest on a capability-advertised KVM node, then
+       launch and reconnect Browser/VDI/App/bootc roles from each proof seat;
+       test input, audio, GPU, upgrade identity, and failure recovery. A seat
+       without local KVM uses the governed remote Workloads path rather than
+       blocking the run. Android is visibly `Deferred` and is not launched,
+       scored, or accepted for this release.
      - Deliverable: artifact-to-runtime identity, readiness, connection, detach/reconnect, and failure evidence.
      - Validation: runtime bytes match signed artifacts; missing capability is visible and cannot become a healthy state.
-     - Done when: every available guest role passes exact identity and lifecycle checks or records a named hardware blocker.
+     - Done when: every guest role passes exact identity and lifecycle checks;
+       missing hardware or fixtures fail and reopen their owning story.
   7. S7 Execute recovery and resilience drills.
      - Inputs: installed baseline, corrected-forward candidate, service/network/storage controls, and recovery verifier.
      - Action: test process restart, display/session recovery, lock/sleep, network/storage loss, generation change, reboot, and re-enrollment.
@@ -1010,9 +1112,11 @@ behavioral evidence is not completion.
      - Done when: failures converge by corrected-forward action without invented health or unrecorded data loss.
   8. S8 Reconcile and archive acceptance.
      - Inputs: all S1-S7 evidence and every archived source-epic proof queue.
-     - Action: map results to owning epics; reopen implementation regressions; retain external blockers; create final release disposition.
+     - Action: map results to owning epics; reopen implementation or
+       infrastructure regressions; create the final release disposition.
      - Deliverable: signed acceptance index, blocker list, reopened work references, and WL-TEST-002 archive disposition.
-     - Validation: every deferred obligation has evidence, a reopened implementation item, or one exact external-input blocker.
+     - Validation: every obligation has passing evidence or a reopened owning
+       story; no external-input waiver or manual assertion is accepted.
      - Done when: no obligation is silently dropped and the epic can be removed from the active worklist.
 - Scope: exact-release admission, exactly Dell, Seat 15, and Surface as physical proof seats, providers, direct DRM, media/devices, guests, resilience, and reconciliation.
 - Relevant files/components: docs/platform/release-evidence, install-helpers release/live/recovery verifiers,

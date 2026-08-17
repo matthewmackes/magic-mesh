@@ -270,6 +270,21 @@ compatibility, live topology, recovery results, and signed release evidence.
 The existing BETA exception applies only to previews already created under the
 prior policy; it does not qualify the next release for production.
 
+**Unattended six-role release and Android deferral lock (2026-08-17; newer
+than the preceding release wording).** For `magic-mesh-v13.0.0`, Android and
+Cuttlefish build, package, guest, VDI, input, runtime, and live-proof
+capability is deferred and is not a release input or acceptance gate. The
+production bundle contains exactly six roles: Workstation RPM, Server RPM,
+Lighthouse RPM, Browser VM, App VM, and bootc image. Historical seven-role or
+Cuttlefish evidence remains non-promotable history. A signed,
+revision-bound `ReleaseIntentV1` approved on protected `master` is the sole
+release authorization; after it is admitted, the coordinator performs all
+build, signing, staging, qualification, publication, readback, cleanup, and
+archival steps without interactive operator handoff. This does not weaken the
+production evidence, signature, source-integrity, red-alert/five-second,
+quorum, privacy, or corrected-forward requirements. Re-enabling Android
+requires a new worklist epic and a newer governance lock.
+
 **Historical Beta preview distribution exception (2026-08-16; operator-approved).** A
 promotion-forbidden BETA/engineering preview created under the prior policy may be distributed to **all
 designated test seats and designated test lighthouses** when the operator
@@ -293,7 +308,7 @@ three-seat lock supersedes the preceding two-seat limit for `13.0.0` only.
 separate, non-production distribution type for exercising the available source
 tree when first-release inputs are unavailable. A DEV-SNAPSHOT may omit the
 Maps, App VM, Cuttlefish, bootc, provider, and installed-seat obligations and
-may ship without the complete seven-role release bundle. It must be labeled
+may ship without the complete six-role release bundle. It must be labeled
 `DEV-SNAPSHOT — NOT A FULL RELEASE`, identify its source revision and build
 result, and may not be presented as a release, production candidate, supported
 package channel, or complete platform. DEV-SNAPSHOT artifacts remain subject

@@ -271,6 +271,7 @@ COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-sh
 COPY install-helpers/mcnf-boot-status.sh /usr/libexec/mackesd/mcnf-boot-status
 COPY packaging/systemd/mcnf-boot-status.service /usr/lib/systemd/system/mcnf-boot-status.service
 COPY packaging/systemd/mackesd.target /usr/lib/systemd/system/mackesd.target
+COPY packaging/systemd/mcnf-lifecycle-firstboot.service /usr/lib/systemd/system/mcnf-lifecycle-firstboot.service
 COPY packaging/systemd/mackesd-control.service /usr/lib/systemd/system/mackesd-control.service
 COPY packaging/systemd/mackesd-observation.service /usr/lib/systemd/system/mackesd-observation.service
 COPY packaging/systemd/mackesd-actions.service /usr/lib/systemd/system/mackesd-actions.service
@@ -310,7 +311,7 @@ RUN set -eux; \
     systemctl disable mackesd.service 2>/dev/null || true; \
     rm -f /usr/lib/systemd/system/mackesd.service; \
     systemctl enable mcnf-boot-status.service; \
-    systemctl enable mackesd.target; \
+    systemctl enable mackesd.target mcnf-lifecycle-firstboot.service; \
     systemctl enable mde-shell-egui.service; \
     for u in podman.socket qemu-guest-agent.service openvswitch.service \
              cloud-init.target cloud-init-local.service cloud-init-network.service \

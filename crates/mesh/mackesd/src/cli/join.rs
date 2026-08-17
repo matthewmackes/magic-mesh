@@ -542,6 +542,17 @@ fn run_inner(
     workgroup_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // No token → hand off to the enrollment TUI (ONBOARD-5, `mde-enroll`).
+    let token = token.or_else(|| {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            None
+        } else {
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut raw).ok()?;
+            let raw = raw.trim().to_string();
+            (!raw.is_empty()).then_some(raw)
+        }
+    });
     let Some(raw_token) = token else {
         let launched = std::process::Command::new("mde-enroll").status();
         return match launched {

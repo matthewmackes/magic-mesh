@@ -22,7 +22,9 @@ PATH_FIELDS = {
     "maps_approval",
     "maps_tile_source_root",
     "maps_verifier",
+    "maps_mbtiles",
     "app_vm_base_image_receipt",
+    "app_vm_catalog_receipt",
     "cuttlefish_declaration",
     "cuttlefish_readiness_relay",
     "cuttlefish_vdi_agent",
@@ -35,6 +37,7 @@ SCALAR_FIELDS = {
     "source_revision",
     "source_epoch",
     "maps_quota_bytes",
+    "android_capability",
     *PATH_FIELDS,
     "rpm_signing_identity_receipt",
     "bootc_base_image_reference",
@@ -61,6 +64,7 @@ ARGUMENTS = (
     ("maps_tile_source_root", "--maps-tile-source-root"),
     ("maps_quota_bytes", "--maps-quota-bytes"),
     ("maps_verifier", "--maps-verifier"),
+    ("maps_mbtiles", "--maps-mbtiles"),
     ("cuttlefish_declaration", "--cuttlefish-declaration"),
     ("cuttlefish_readiness_relay", "--cuttlefish-readiness-relay"),
     ("cuttlefish_vdi_agent", "--cuttlefish-vdi-agent"),
@@ -72,6 +76,7 @@ ARGUMENTS = (
     ("app_vm_base_image_receipt", "--app-vm-base-image-receipt"),
     ("app_vm_base_image_reference", "--app-vm-base-image-reference"),
     ("app_vm_base_architecture", "--app-vm-base-architecture"),
+    ("app_vm_catalog_receipt", "--app-vm-catalog-receipt"),
     ("cuttlefish_image_receipt", "--cuttlefish-image-receipt"),
     ("cuttlefish_image_source_kind", "--cuttlefish-image-source-kind"),
     ("cuttlefish_image_original_source", "--cuttlefish-image-original-source"),
@@ -192,6 +197,8 @@ def validate(document: dict[str, object]) -> dict[str, str | list[str]]:
         raise Refusal("source_epoch must be a positive integer string")
     if not str(values["maps_quota_bytes"]).isdigit() or int(str(values["maps_quota_bytes"])) <= 0:
         raise Refusal("maps_quota_bytes must be a positive integer string")
+    if values["android_capability"] != "deferred":
+        raise Refusal("Android capability is deferred for this release")
     if values["cuttlefish_image_source_kind"] not in {"registry", "artifact"}:
         raise Refusal("cuttlefish_image_source_kind is unsupported")
     if values["cuttlefish_image_architecture"] not in {"amd64", "arm64"}:

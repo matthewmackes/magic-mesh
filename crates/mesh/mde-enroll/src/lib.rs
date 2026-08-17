@@ -6,6 +6,7 @@
 pub mod app;
 /// WL-FUNC-023 S4 — the renderer-neutral lifecycle session projection.
 pub mod lifecycle_view;
+pub mod lifecycle_controller;
 pub mod public_roster;
 pub mod setup;
 pub mod setup_action;

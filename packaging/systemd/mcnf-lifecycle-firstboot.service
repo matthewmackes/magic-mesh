@@ -1,0 +1,15 @@
+[Unit]
+Description=MCNF lifecycle baseline first-boot convergence
+After=network-online.target mackesd.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/mde/role.toml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mackesd status
+ExecStartPost=/usr/bin/install -d -m 0750 /var/lib/mackesd/lifecycle
+ExecStartPost=/usr/bin/touch /var/lib/mackesd/lifecycle/firstboot-converged
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

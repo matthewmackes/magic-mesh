@@ -44,6 +44,7 @@ pub enum MenuItem {
     ManagePeers,
     /// Show mesh + service status (configured only).
     Status,
+    Lifecycle,
     /// Leave the wizard.
     Quit,
 }
@@ -57,6 +58,7 @@ impl MenuItem {
             MenuItem::JoinMesh => "Join an existing mesh",
             MenuItem::ManagePeers => "Manage peers & lighthouses",
             MenuItem::Status => "Status & services",
+            MenuItem::Lifecycle => "Lifecycle session",
             MenuItem::Quit => "Quit",
         }
     }
@@ -76,6 +78,7 @@ impl MenuItem {
                 "Invite peers, add lighthouses, and remove nodes from the mesh."
             }
             MenuItem::Status => "Check the overlay, role daemons, and mesh services.",
+            MenuItem::Lifecycle => "Review readiness, warnings, offboard, reset, and fleet plans.",
             MenuItem::Quit => "Leave the wizard.",
         }
     }
@@ -88,6 +91,7 @@ impl MenuItem {
             MenuItem::JoinMesh => Some(Screen::Join),
             MenuItem::ManagePeers => Some(Screen::Manage),
             MenuItem::Status => Some(Screen::Status),
+            MenuItem::Lifecycle => Some(Screen::Status),
             MenuItem::Quit => None,
         }
     }
@@ -145,7 +149,7 @@ impl Wizard {
     #[must_use]
     pub fn menu_for(configured: bool) -> Vec<MenuItem> {
         if configured {
-            vec![MenuItem::ManagePeers, MenuItem::Status, MenuItem::Quit]
+            vec![MenuItem::ManagePeers, MenuItem::Status, MenuItem::Lifecycle, MenuItem::Quit]
         } else {
             vec![MenuItem::CreateMesh, MenuItem::JoinMesh, MenuItem::Quit]
         }
@@ -262,6 +266,7 @@ mod tests {
             MenuItem::JoinMesh,
             MenuItem::ManagePeers,
             MenuItem::Status,
+            MenuItem::Lifecycle,
             MenuItem::Quit,
         ] {
             assert!(
@@ -276,7 +281,7 @@ mod tests {
         let w = Wizard::new(true);
         assert_eq!(
             w.menu_items,
-            vec![MenuItem::ManagePeers, MenuItem::Status, MenuItem::Quit]
+            vec![MenuItem::ManagePeers, MenuItem::Status, MenuItem::Lifecycle, MenuItem::Quit]
         );
     }
 

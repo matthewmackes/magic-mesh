@@ -15,14 +15,15 @@ CUTTLEFISH_IMAGE_RECEIPT="${MCNF_CUTTLEFISH_IMAGE_RECEIPT_INSPECTOR:-$ROOT/packa
 CUTTLEFISH_IMAGE_REPO="${MCNF_CUTTLEFISH_IMAGE_REPO:-$ROOT}"
 MAPS_PRODUCER="${MCNF_MAPS_PRODUCER:-$ROOT/packaging/maps/produce-offline-catalog.py}"
 MAPS_MATERIALIZER="${MCNF_MAPS_MATERIALIZER:-$ROOT/packaging/maps/materialize-offline-catalog.py}"
+APP_CATALOG_RECEIPT="${MCNF_APP_CATALOG_RECEIPT:-$ROOT/packaging/app-vm/produce-catalog-receipt.py}"
 
 die() { printf 'release-input-preflight: REFUSED: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${2:-}" ]] || die "missing mandatory input: $1"; }
 source_revision='' source_epoch=''
-maps_approval='' maps_source_root='' maps_quota='' maps_verifier=''
+maps_approval='' maps_source_root='' maps_quota='' maps_verifier='' maps_mbtiles=''
 cuttlefish_declaration='' cuttlefish_relay='' cuttlefish_agent=''
 rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
-app_vm_base_receipt='' app_vm_base_reference='' app_vm_base_architecture=''
+app_vm_base_receipt='' app_vm_base_reference='' app_vm_base_architecture='' app_vm_catalog_receipt='' android_capability=''
 cuttlefish_image_receipt='' cuttlefish_image_source_kind=''
 cuttlefish_image_original_source='' cuttlefish_image_architecture=''
 cuttlefish_provider_identity='' cuttlefish_android_release_id=''
@@ -37,6 +38,7 @@ while (($#)); do
     --maps-tile-source-root) maps_source_root=${2:-}; shift 2 ;;
     --maps-quota-bytes) maps_quota=${2:-}; shift 2 ;;
     --maps-verifier) maps_verifier=${2:-}; shift 2 ;;
+    --maps-mbtiles) maps_mbtiles=${2:-}; shift 2 ;;
     --cuttlefish-declaration) cuttlefish_declaration=${2:-}; shift 2 ;;
     --cuttlefish-readiness-relay) cuttlefish_relay=${2:-}; shift 2 ;;
     --cuttlefish-vdi-agent) cuttlefish_agent=${2:-}; shift 2 ;;
@@ -49,6 +51,8 @@ while (($#)); do
     --app-vm-base-image-receipt) app_vm_base_receipt=${2:-}; shift 2 ;;
     --app-vm-base-image-reference) app_vm_base_reference=${2:-}; shift 2 ;;
     --app-vm-base-architecture) app_vm_base_architecture=${2:-}; shift 2 ;;
+    --app-vm-catalog-receipt) app_vm_catalog_receipt=${2:-}; shift 2 ;;
+    --android-capability) android_capability=${2:-}; shift 2 ;;
     --cuttlefish-image-receipt) cuttlefish_image_receipt=${2:-}; shift 2 ;;
     --cuttlefish-image-source-kind) cuttlefish_image_source_kind=${2:-}; shift 2 ;;
     --cuttlefish-image-original-source) cuttlefish_image_original_source=${2:-}; shift 2 ;;
@@ -64,7 +68,7 @@ done
 
 for pair in \
   'source revision' "$source_revision" 'source epoch' "$source_epoch" \
-  'Maps approval' "$maps_approval" 'Maps tile source root' "$maps_source_root" \
+  'Maps approval' "$maps_approval" 'Maps tile source root' "$maps_source_root" 'Maps MBTiles' "$maps_mbtiles" \
   'Maps quota bytes' "$maps_quota" 'Maps production verifier' "$maps_verifier" \
   'Cuttlefish declaration' "$cuttlefish_declaration" \
   'Cuttlefish readiness relay' "$cuttlefish_relay" 'Cuttlefish VDI agent' "$cuttlefish_agent" \
@@ -72,6 +76,7 @@ for pair in \
   'bootc base image reference' "$bootc_reference" 'bootc base architecture' "$bootc_architecture" \
   'bootc release role' "$bootc_role" \
   'App VM base image receipt' "$app_vm_base_receipt" \
+  'App VM curated catalog receipt' "$app_vm_catalog_receipt" 'Android capability' "$android_capability" \
   'App VM base image reference' "$app_vm_base_reference" \
   'App VM base architecture' "$app_vm_base_architecture" \
   'Cuttlefish image receipt' "$cuttlefish_image_receipt" \
@@ -114,14 +119,20 @@ trap cleanup EXIT
 # before any release build mutation. A caller-authored bundle cannot bypass the
 # producer.
 [[ "$maps_quota" =~ ^[1-9][0-9]*$ ]] || die 'Maps quota bytes must be a positive integer'
+[[ "$android_capability" == deferred ]] || die 'Android capability is deferred for this release'
 python3 "$MAPS_PRODUCER" --approval "$maps_approval" \
   --source-root "$maps_source_root" --output "$maps_stage/bundle" >/dev/null \
   || die 'offline Maps approved bundle production failed'
 python3 "$MAPS_MATERIALIZER" --bundle "$maps_stage/bundle" \
   --cache-root "$maps_stage/cache" --verifier "$maps_verifier" \
   --source-revision "$source_revision" --source-epoch "$source_epoch" \
+  --mbtiles "$maps_mbtiles" \
   --quota-bytes "$maps_quota" >/dev/null \
   || die 'offline Maps bundle admission/materialization failed'
+python3 "$APP_CATALOG_RECEIPT" --catalog "$app_vm_catalog_receipt" \
+  --source-revision "$source_revision" --source-epoch "$source_epoch" \
+  --output "$maps_stage/app-catalog-receipt.json" >/dev/null \
+  || die 'App VM curated catalog admission failed'
 cuttlefish_args=(--declaration "$cuttlefish_declaration"
   --readiness-relay "$cuttlefish_relay" --vdi-agent "$cuttlefish_agent"
   --stage-dir "$payload_parent/admitted")

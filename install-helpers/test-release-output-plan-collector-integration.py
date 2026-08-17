@@ -22,7 +22,6 @@ MEDIA = {
     "app-vm": "application/x-qemu-disk",
     "bootc-image": "application/vnd.mcnf.bootc-image-receipt+json",
     "browser-vm": "application/x-qemu-disk",
-    "cuttlefish-image": "application/vnd.mcnf.cuttlefish-image",
     "lighthouse-rpm": "application/x-rpm",
     "server-rpm": "application/x-rpm",
     "workstation-rpm": "application/x-rpm",
@@ -111,17 +110,6 @@ def fixture(root: Path, env: dict[str, str], revision: str, epoch: str) -> tuple
     })
     files.update(app=app, app_manifest=app_manifest)
 
-    cuttlefish = write(artifacts / "cuttlefish.tar", b"governed Cuttlefish image archive\n")
-    cuttlefish_receipt = canonical(artifacts / "cuttlefish.json", {
-        "android_release_id": "android-15.0.0_r1", "architecture": "amd64",
-        "commit_epoch": int(epoch), "compatibility_id": "mcnf-cuttlefish-v1",
-        "digest": "sha256:" + digest(cuttlefish), "format": "android-cuttlefish-image-archive",
-        "kind": "mcnf-cuttlefish-image-receipt", "media_type": "application/vnd.mcnf.cuttlefish.image.v1+tar",
-        "original_source": str(cuttlefish), "platform_digest": None, "provider_identity": "mcnf-cuttlefish",
-        "schema_version": 1, "source_kind": "artifact", "source_revision": revision,
-    })
-    files.update(cuttlefish=cuttlefish, cuttlefish_receipt=cuttlefish_receipt)
-
     image_reference = "registry.invalid/mcnf/construct@sha256:" + "b" * 64
     bootc_receipt = canonical(artifacts / "bootc.json", {
         "architecture": "amd64", "commit_epoch": int(epoch), "image_reference": image_reference,
@@ -140,10 +128,6 @@ def fixture(root: Path, env: dict[str, str], revision: str, epoch: str) -> tuple
             "lighthouse-rpm": {"artifact": str(files["lighthouse-rpm"]), "candidate_manifest": str(files["lighthouse-rpm-manifest"])},
             "browser-vm": {"artifact": str(browser), "frozen_profile": str(profile), "manifest": str(browser_manifest)},
             "app-vm": {"artifact": str(app), "manifest": str(app_manifest)},
-            "cuttlefish-image": {"android_release_id": "android-15.0.0_r1", "architecture": "amd64",
-                "artifact": str(cuttlefish), "artifact_format": "android-cuttlefish-image-archive",
-                "compatibility_id": "mcnf-cuttlefish-v1", "media_type": "application/vnd.mcnf.cuttlefish.image.v1+tar",
-                "provider_identity": "mcnf-cuttlefish", "receipt": str(cuttlefish_receipt)},
             "bootc-image": {"architecture": "amd64", "image_reference": image_reference,
                 "receipt": str(bootc_receipt), "release_role": "all-roles"},
         },
@@ -191,10 +175,10 @@ esac
         manifest = json.loads(output.read_text(encoding="utf-8"))
         assert manifest["promotion"] == "forbidden" and manifest["source_revision"] == revision
         rows = manifest["outputs"]
-        assert len(rows) == 7 and {row["role"] for row in rows} == set(MEDIA)
+        assert len(rows) == 6 and {row["role"] for row in rows} == set(MEDIA)
         expected_files = {role: files[role] for role in ("workstation-rpm", "server-rpm", "lighthouse-rpm")}
         expected_files.update({"browser-vm": files["browser"], "app-vm": files["app"],
-                               "cuttlefish-image": files["cuttlefish"], "bootc-image": files["bootc"]})
+                               "bootc-image": files["bootc"]})
         for row in rows:
             artifact = expected_files[row["role"]]
             assert row["media_type"] == MEDIA[row["role"]]
@@ -227,7 +211,7 @@ esac
         mutation_files["app"].chmod(0o400)
         run([sys.executable, str(COLLECT), "--plan", str(mutation_plan),
              "--output", str(mutation_root / "output.json")], env, ok=False)
-    print("release-output plan/collector seven-verifier integration: PASS")
+    print("release-output plan/collector six-role integration: PASS")
 
 
 if __name__ == "__main__":

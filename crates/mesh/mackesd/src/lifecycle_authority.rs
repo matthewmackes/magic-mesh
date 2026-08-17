@@ -22,7 +22,9 @@ use mackes_mesh_types::lifecycle::{
 use serde::{Deserialize, Serialize};
 
 const CHECKPOINT: &str = "checkpoint.json";
+const JOURNAL: &str = "journal.jsonl";
 const LOCK: &str = "lifecycle.lock";
+const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleCheckpointV1 {
@@ -40,6 +42,10 @@ pub struct LifecycleCheckpointV1 {
     pub revoked_capsule_ids: Vec<String>,
     #[serde(default)]
     pub artifact_selection: Option<LifecycleArtifactSelectionV1>,
+    #[serde(default)]
+    pub retry_count: u8,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -134,7 +140,7 @@ impl LifecycleAuthority {
             completed_steps: 0,
             total_steps: plan.steps.len() as u32,
         };
-        let authority = Self { dir, lock, checkpoint: LifecycleCheckpointV1 { plan, progress, checks: Vec::new(), confirmation: None, consumed_capsule_ids: Vec::new(), pending_capsule_ids: Vec::new(), revoked_capsule_ids: Vec::new(), artifact_selection: None } };
+        let authority = Self { dir, lock, checkpoint: LifecycleCheckpointV1 { plan, progress, checks: Vec::new(), confirmation: None, consumed_capsule_ids: Vec::new(), pending_capsule_ids: Vec::new(), revoked_capsule_ids: Vec::new(), artifact_selection: None, retry_count: 0, last_error: None } };
         authority.persist()?;
         Ok(authority)
     }
@@ -349,6 +355,13 @@ impl LifecycleAuthority {
                 return Err(LifecycleAuthorityError::InvalidTransition("correction check not blocking"));
             }
         }
+        for correction in &correction_plan.corrections {
+            for prerequisite in &correction.prerequisites {
+                if !correction_plan.corrections.iter().any(|candidate| candidate.check_id == *prerequisite) {
+                    return Err(LifecycleAuthorityError::InvalidTransition("correction prerequisite missing"));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -447,13 +460,37 @@ impl LifecycleAuthority {
         if step == "packages" && self.checkpoint.artifact_selection.is_none() {
             return Err(LifecycleAuthorityError::InvalidTransition("artifact selection missing"));
         }
-        if let Err(error) = action(&step) {
-            let mut failed = self.checkpoint.progress.clone();
-            failed.phase = LifecyclePhase::Failed;
-            self.update(failed)?;
-            return Err(LifecycleAuthorityError::StepFailed(error));
+        self.run_next_with_retry(index, step, action)
+    }
+
+    /// Retry transient provider failures without losing the checkpoint. A
+    /// reboot or process restart can call this again through `resume`; the
+    /// bounded counter prevents an endless mutation loop.
+    pub fn run_next_with_retry<F>(&mut self, index: u32, step: String, mut action: F) -> Result<(), LifecycleAuthorityError>
+    where F: FnMut(&str) -> Result<(), String> {
+        for attempt in self.checkpoint.retry_count..=MAX_RETRIES {
+            match action(&step) {
+                Ok(()) => {
+                    self.checkpoint.retry_count = 0;
+                    self.checkpoint.last_error = None;
+                    self.persist()?;
+                    return self.complete_step(index);
+                }
+                Err(error) => {
+                    self.checkpoint.retry_count = attempt.saturating_add(1);
+                    self.checkpoint.last_error = Some(error.clone());
+                    self.append_journal("step_failed", &step, &error)?;
+                    self.persist()?;
+                    if attempt >= MAX_RETRIES {
+                        let mut failed = self.checkpoint.progress.clone();
+                        failed.phase = LifecyclePhase::Failed;
+                        self.update(failed)?;
+                        return Err(LifecycleAuthorityError::StepFailed(error));
+                    }
+                }
+            }
         }
-        self.complete_step(index)
+        Err(LifecycleAuthorityError::InvalidTransition("retry state"))
     }
 
     /// Project the signed-boundary input for an offboarding receipt only after
@@ -489,8 +526,20 @@ impl LifecycleAuthority {
 
     fn persist(&self) -> Result<(), LifecycleAuthorityError> {
         let tmp = self.dir.join(".checkpoint.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.checkpoint)?)?;
+        let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+        use std::io::Write;
+        file.write_all(&serde_json::to_vec_pretty(&self.checkpoint)?)?;
+        file.sync_all()?;
         std::fs::rename(tmp, self.dir.join(CHECKPOINT))?;
+        Ok(())
+    }
+
+    fn append_journal(&self, event: &str, step: &str, detail: &str) -> Result<(), LifecycleAuthorityError> {
+        use std::io::Write;
+        let mut file = OpenOptions::new().create(true).append(true).open(self.dir.join(JOURNAL))?;
+        serde_json::to_writer(&mut file, &serde_json::json!({"event": event, "step": step, "detail": detail}))?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
         Ok(())
     }
 
@@ -637,6 +686,7 @@ mod tests {
             schema_version: 1, request_id: "request-1".into(), target_id: "seat-15".into(), generation: 1,
             corrections: vec![mackes_mesh_types::lifecycle::LifecycleCorrectionV1 {
                 check_id: "mesh".into(), step: "mesh".into(), reason: "enroll target".into(),
+                prerequisites: Vec::new(),
             }], rollback_forbidden: true,
         };
         authority.admit_correction_plan(correction).unwrap();

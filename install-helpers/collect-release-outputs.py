@@ -20,7 +20,6 @@ ROLES = {
     "lighthouse-rpm": "application/x-rpm",
     "browser-vm": "application/x-qemu-disk",
     "app-vm": "application/x-qemu-disk",
-    "cuttlefish-image": "application/vnd.mcnf.cuttlefish-image",
     "bootc-image": "application/vnd.mcnf.bootc-image-receipt+json",
 }
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
@@ -185,7 +184,7 @@ def collect(plan_path: Path, output: Path) -> dict[str, object]:
     plan = load_plan(plan_path)
     rows = plan["outputs"]
     if not isinstance(rows, list) or len(rows) != len(ROLES):
-        refuse("plan must contain exactly one output for every required release role")
+        refuse("plan must contain exactly one output for every six-role release")
     if output.exists() or output.is_symlink():
         refuse("output manifest already exists or is substituted")
     parent = output.parent
@@ -270,7 +269,7 @@ def collect(plan_path: Path, output: Path) -> dict[str, object]:
             admitted_row["signing_identity"] = signer
         admitted.append(admitted_row)
     if seen_roles != set(ROLES):
-        refuse("required output roles are missing")
+        refuse("required six-role output set is incomplete")
     document = {"schema_version": 1, "kind": "mcnf-immutable-release-output-manifest",
                 "source_revision": plan["source_revision"], "promotion": "forbidden",
                 "outputs": sorted(admitted, key=lambda item: str(item["role"]))}

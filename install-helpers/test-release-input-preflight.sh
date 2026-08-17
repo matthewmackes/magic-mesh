@@ -18,7 +18,7 @@ source_revision=$(git -C "$fixture/source-repo" rev-parse HEAD)
 source_epoch=$(git -C "$fixture/source-repo" show -s --format=%ct "$source_revision")
 bootc_reference='registry.invalid/mcnf/bootc:release'
 bootc_architecture='amd64'
-bootc_role='unified-seat-server'
+bootc_role='all-roles'
 app_vm_reference='registry.invalid/fedora/app-vm-base:44'
 app_vm_architecture='amd64'
 for verifier in source; do

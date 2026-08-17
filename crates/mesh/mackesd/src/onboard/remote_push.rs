@@ -556,10 +556,10 @@ pub fn process_apply(
 ///   does over the single-use enroll bearer is run enroll (§8/§9 blast radius).
 ///
 /// Reaching the box over live SSH and running the RPM-shipped enroll is the
-/// integration-gated live path (operator/live acceptance 2): with no live SSH
-/// runner wired on this build, [`RemotePush::apply`] returns a typed
-/// [`RemotePushError::NotWired`] — a real error, never a fake success (§7). The
-/// target is left completely unchanged.
+/// bootstrap-only live path. The executor uses a fixed argv (never a shell
+/// string), requires an explicitly provisioned `MACKESD_BOOTSTRAP_SSH_KEY`,
+/// and returns a typed error before touching the target when that prerequisite
+/// is absent (§7).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SshBootstrap;
 
@@ -589,10 +589,126 @@ impl RemotePush for SshBootstrap {
                 });
             }
         }
-        Err(RemotePushError::NotWired {
-            transport: "ssh-bootstrap (bearer-scoped SSH enroll)",
-        })
+        #[cfg(feature = "async-services")]
+        {
+            let Target::Bootstrap { host } = target else {
+                unreachable!("enrolled targets return above")
+            };
+            let [Action::RunEnroll { bearer }] = actions else {
+                unreachable!("the action allow-list above admits only one action")
+            };
+            if bearer.is_empty()
+                || bearer.len() > crate::nebula_enroll::JOIN_TOKEN_MAX_LEN
+                || bearer.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+            {
+                return Err(RemotePushError::BundleRejected {
+                    why: "enrollment bearer is not a valid bounded token".to_string(),
+                });
+            }
+            let key = std::env::var_os("MACKESD_BOOTSTRAP_SSH_KEY")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| RemotePushError::NotWired {
+                    transport: "ssh-bootstrap (MACKESD_BOOTSTRAP_SSH_KEY missing)",
+                })?;
+            let known_hosts = std::env::var_os("MACKESD_BOOTSTRAP_KNOWN_HOSTS")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| RemotePushError::NotWired {
+                    transport: "ssh-bootstrap (MACKESD_BOOTSTRAP_KNOWN_HOSTS missing)",
+                })?;
+            let args = bootstrap_ssh_argv(host, &key, &known_hosts)?;
+            let mut child = std::process::Command::new("ssh")
+                .args(&args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| RemotePushError::Unreachable {
+                    target: host.clone(),
+                    why: format!("spawn ssh: {error}"),
+                })?;
+            use std::io::Write;
+            child.stdin.take().ok_or_else(|| RemotePushError::Unreachable {
+                target: host.clone(),
+                why: "ssh stdin unavailable".to_string(),
+            })?.write_all(format!("{bearer}\n").as_bytes()).map_err(|error| RemotePushError::Unreachable {
+                target: host.clone(),
+                why: format!("send enrollment credential: {error}"),
+            })?;
+            let output = child.wait_with_output().map_err(|error| RemotePushError::Unreachable {
+                target: host.clone(),
+                why: format!("wait for ssh enroll: {error}"),
+            })?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                Err(RemotePushError::Unreachable {
+                    target: host.clone(),
+                    why: format!("ssh enroll exited {:?}: {}", output.status.code(), redact_ssh_detail(&detail)),
+                })
+            }
+        }
+
+        #[cfg(not(feature = "async-services"))]
+        {
+            let _ = target;
+            let _ = actions;
+            Err(RemotePushError::NotWired {
+                transport: "ssh-bootstrap (async-services feature disabled)",
+            })
+        }
     }
+}
+
+#[cfg(feature = "async-services")]
+fn bootstrap_ssh_argv(
+    host: &str,
+    key: &std::path::Path,
+    known_hosts: &std::path::Path,
+) -> Result<Vec<String>, RemotePushError> {
+    if host.is_empty()
+        || host.len() > 253
+        || host.starts_with('-')
+        || host.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return Err(RemotePushError::BundleRejected {
+            why: "bootstrap host is not a safe SSH host value".to_string(),
+        });
+    }
+    if !key.is_file() || !known_hosts.is_file() {
+        return Err(RemotePushError::NotWired {
+            transport: "ssh-bootstrap (configured key or known-hosts file is unavailable)",
+        });
+    }
+    Ok(vec![
+        "-i".to_string(),
+        key.display().to_string(),
+        "-o".to_string(),
+        "IdentitiesOnly=yes".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        format!("UserKnownHostsFile={}", known_hosts.display()),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        format!("root@{host}"),
+        "mackesd".to_string(),
+        "join".to_string(),
+        "--role".to_string(),
+        "lighthouse".to_string(),
+    ])
+}
+
+#[cfg(feature = "async-services")]
+fn redact_ssh_detail(detail: &str) -> String {
+    detail
+        .lines()
+        .take(8)
+        .map(|line| line.chars().take(512).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Production [`RemotePush`] for **day-2** targets — the §9-native signed-bundle
@@ -1342,6 +1458,40 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, RemotePushError::NotWired { .. }));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn ssh_bootstrap_builds_bounded_argv_without_a_shell_command() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("bootstrap-key");
+        std::fs::write(&key, b"placeholder").unwrap();
+        let known_hosts = root.path().join("known_hosts");
+        std::fs::write(&known_hosts, "203.0.113.7 ssh-ed25519 AAAA\n").unwrap();
+        let args = bootstrap_ssh_argv("203.0.113.7", &key, &known_hosts).unwrap();
+        assert_eq!(args.last().map(String::as_str), Some("lighthouse"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "mackesd" && pair[1] == "join"));
+        assert!(args.iter().any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7"));
+        assert!(!args.iter().any(|arg| arg.contains("sh -c")));
+        assert!(!args.iter().any(|arg| arg.contains("bearer")));
+        assert!(args.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn ssh_bootstrap_rejects_host_and_bearer_injection_shapes() {
+        let key = std::path::Path::new("/tmp/nonexistent-bootstrap-key");
+        let known_hosts = std::path::Path::new("/tmp/nonexistent-known-hosts");
+        assert!(matches!(
+            bootstrap_ssh_argv("host name", key, known_hosts),
+            Err(RemotePushError::BundleRejected { .. })
+        ));
+        assert!(matches!(
+            bootstrap_ssh_argv("host", key, known_hosts),
+            Err(RemotePushError::NotWired { .. })
+        ));
     }
 
     #[test]

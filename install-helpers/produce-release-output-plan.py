@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Produce the canonical bounded seven-role release-output collection plan."""
+"""Produce the canonical bounded six-role release-output collection plan."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ MAX_FILE = 256 * 1024**3
 MAX_PLAN = 1024 * 1024
 ROLES = (
     "workstation-rpm", "server-rpm", "lighthouse-rpm", "browser-vm",
-    "app-vm", "cuttlefish-image", "bootc-image",
+    "app-vm", "bootc-image",
 )
 MEDIA = {
     "workstation-rpm": "application/x-rpm",
@@ -32,7 +32,6 @@ MEDIA = {
     "lighthouse-rpm": "application/x-rpm",
     "browser-vm": "application/x-qemu-disk",
     "app-vm": "application/x-qemu-disk",
-    "cuttlefish-image": "application/vnd.mcnf.cuttlefish-image",
     "bootc-image": "application/vnd.mcnf.bootc-image-receipt+json",
 }
 ROLE_FIELDS = {
@@ -41,10 +40,6 @@ ROLE_FIELDS = {
     "lighthouse-rpm": {"artifact", "candidate_manifest"},
     "browser-vm": {"artifact", "manifest", "frozen_profile"},
     "app-vm": {"artifact", "manifest"},
-    "cuttlefish-image": {
-        "artifact", "receipt", "architecture", "provider_identity",
-        "android_release_id", "compatibility_id", "media_type", "artifact_format",
-    },
     "bootc-image": {"receipt", "image_reference", "architecture", "release_role"},
 }
 
@@ -105,7 +100,7 @@ def load(path: Path) -> dict[str, object]:
         refuse("commit epoch must be one non-null bounded decimal string")
     outputs = value["outputs"]
     if not isinstance(outputs, dict) or set(outputs) != set(ROLES):
-        refuse("outputs must contain exactly the seven canonical release roles")
+        refuse("outputs must contain exactly the six canonical release roles")
     return value
 
 
@@ -214,29 +209,6 @@ def produce(value: dict[str, object]) -> dict[str, object]:
         "--manifest", "{companion:manifest}", "--source-revision", "{source_revision}",
     ]))
 
-    cuttlefish = role_row(value, "cuttlefish-image")
-    cuttlefish_artifact = claim(path_field(cuttlefish, "artifact", "cuttlefish-image"), "cuttlefish-image artifact")
-    cuttlefish_receipt = claim(path_field(cuttlefish, "receipt", "cuttlefish-image"), "cuttlefish-image receipt")
-    architecture = string(cuttlefish, "architecture")
-    if architecture not in {"amd64", "arm64"}:
-        refuse("cuttlefish-image architecture is unsupported")
-    artifact_format = string(cuttlefish, "artifact_format")
-    if artifact_format not in {"android-cuttlefish-host-package", "android-cuttlefish-image-archive"}:
-        refuse("cuttlefish-image artifact format is unsupported")
-    media_type = string(cuttlefish, "media_type", REFERENCE)
-    cuttlefish_argv = [
-        str(REPO / "packaging/android/produce-image-receipt.py"), "--repo", str(REPO), "inspect",
-        "--source-kind", "artifact", "--original-source", "{artifact}", "--architecture", architecture,
-        "--provider-identity", string(cuttlefish, "provider_identity"),
-        "--android-release-id", string(cuttlefish, "android_release_id"),
-        "--compatibility-id", string(cuttlefish, "compatibility_id"),
-        "--source-revision", "{source_revision}", "--commit-epoch", epoch,
-        "--media-type", media_type, "--artifact-format", artifact_format,
-        "--receipt", "{companion:receipt}",
-    ]
-    rows.append(output_row("cuttlefish-image", cuttlefish_artifact, revision, None,
-                           {"receipt": cuttlefish_receipt}, cuttlefish_argv))
-
     bootc = role_row(value, "bootc-image")
     # A registry-native bootc image has no local image file. Its immutable digest
     # receipt is therefore the exact collected artifact; the owning inspector
@@ -302,7 +274,7 @@ def main() -> int:
     except (OSError, Refusal, UnicodeError, ValueError) as exc:
         print(f"release-output-plan: REFUSED: {exc}", file=sys.stderr)
         return 2
-    print(f"release-output-plan: PASS: wrote seven canonical roles to {args.output}")
+    print(f"release-output-plan: PASS: wrote six canonical roles to {args.output}")
     return 0
 
 

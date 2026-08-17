@@ -31,12 +31,12 @@ def main() -> None:
         fake.chmod(0o755)
         receipt = root / "receipt.json"
         base = ("--repo",str(repo),"--skopeo",str(fake))
-        produce = ("produce","--image-reference","registry.invalid/mcnf/bootc:release","--architecture","amd64","--source-revision",revision,"--commit-epoch","1700000000","--release-role","unified-seat-server","--output",str(receipt))
+        produce = ("produce","--image-reference","registry.invalid/mcnf/bootc:release","--architecture","amd64","--source-revision",revision,"--commit-epoch","1700000000","--release-role","all-roles","--output",str(receipt))
         call(*base,*produce)
         assert stat.S_IMODE(receipt.stat().st_mode) == 0o400
         value = json.loads(receipt.read_text())
         assert value["resolved_digest"] == "sha256:" + __import__("hashlib").sha256(manifest.encode()).hexdigest()
-        inspect = ("inspect","--receipt",str(receipt),"--expected-image-reference","registry.invalid/mcnf/bootc:release","--expected-architecture","amd64","--expected-source-revision",revision,"--expected-commit-epoch","1700000000","--expected-release-role","unified-seat-server")
+        inspect = ("inspect","--receipt",str(receipt),"--expected-image-reference","registry.invalid/mcnf/bootc:release","--expected-architecture","amd64","--expected-source-revision",revision,"--expected-commit-epoch","1700000000","--expected-release-role","all-roles")
         call(*base,*inspect)
         call(*base,*produce,ok=False)  # no replacement
         call(*base,*inspect[:-1],"foreign-role",ok=False)
