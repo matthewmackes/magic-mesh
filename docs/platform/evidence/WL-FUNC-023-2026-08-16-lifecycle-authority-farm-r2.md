@@ -168,3 +168,33 @@ MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=1 \
   evade the erase boundary. A completed checkpoint can then project only the
   empty-retention receipt. This does not claim the separate fleet drain and
   remote target executor required by WL-FUNC-023 S14/S16.
+
+## Unattended lighthouse lifecycle handoff — 2026-08-17
+
+- Source revision: `d43cf9c23361bd0e7ead99cc74b6d610da7c6146`
+- Farm host/slot:
+
+  ```text
+  MCNF_BUILD_HOST=172.20.0.196 MCNF_BUILD_SLOT=1 \
+    install-helpers/xcp-build.sh cargo test -p mackesd --bin mackesd \
+    cli::node_admin::tests --locked -- --nocapture
+  ```
+
+  Result: `2 passed, 0 failed, 73 filtered out`.
+
+- Local helper validation:
+
+  ```text
+  bash -n install-helpers/do-lighthouse-join.sh \
+    install-helpers/do-lighthouse-join-cloudinit.sh
+  ```
+
+  Result: passed.
+
+- Lighthouse add no longer prints a bearer-bearing command when its provisioner
+  is missing: it fails closed for automated remediation/retry. Lighthouse retire
+  requires a nonempty provider droplet id before drain/revoke and fails when the
+  provider deletion fails. The minted join bearer travels from `mackesd` to the
+  provisioner through private stdin, then from cloud-init to `mackesd join`
+  through stdin; it is not added to either command argv. Live provider proof
+  remains owned by WL-TEST-002.
