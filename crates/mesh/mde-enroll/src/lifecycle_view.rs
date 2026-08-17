@@ -37,6 +37,9 @@ impl LifecycleSessionView {
         {
             return Err("readiness target is outside session scope".to_owned());
         }
+        if readiness.generation != session.generation {
+            return Err("readiness generation does not match session".to_owned());
+        }
         Ok(Self {
             session_id: session.session_id,
             intent: session.intent,
@@ -101,5 +104,20 @@ mod tests {
         assert!(
             LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).is_err()
         );
+    }
+
+    #[test]
+    fn rejects_stale_readiness_generation() {
+        let session = serde_json::json!({
+            "schema_version": 1, "session_id": "session-1", "operator_id": "operator-1",
+            "intent": "upgrade", "target_ids": ["seat-15"], "generation": 2, "phase": "running"
+        });
+        let readiness = serde_json::json!({
+            "schema_version": 1, "target_id": "seat-15", "generation": 1,
+            "ready": true, "missing_requirements": [], "warnings": []
+        });
+        let error = LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string())
+            .expect_err("stale readiness must not project into a newer session");
+        assert_eq!(error, "readiness generation does not match session");
     }
 }
