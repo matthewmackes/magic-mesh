@@ -57,9 +57,8 @@ def main() -> None:
         preflight.chmod(0o755)
 
         names = (
-            "maps-approval.json", "maps-verifier", "maps.mbtiles", "release.json", "relay", "agent", "rpm-receipt.json",
-            "bootc-receipt.json", "app-base-receipt.json", "app-catalog.json", "cuttlefish-receipt.json", "cuttlefish-image.tar",
-            "mcnf-cuttlefish-readiness-relay.deb", "mcnf-cuttlefish-vdi-agent.deb",
+            "maps-approval.json", "maps-verifier", "maps.mbtiles", "rpm-receipt.json",
+            "bootc-receipt.json", "app-base-receipt.json", "app-catalog.json",
         )
         for name in names:
             (inputs / name).write_text(name + "\n", encoding="utf-8")
@@ -76,14 +75,6 @@ def main() -> None:
             "maps_quota_bytes": "4096",
             "maps_verifier": str(inputs / "maps-verifier"),
             "maps_mbtiles": str(inputs / "maps.mbtiles"),
-            "android_capability": "deferred",
-            "cuttlefish_declaration": str(inputs / "release.json"),
-            "cuttlefish_readiness_relay": str(inputs / "relay"),
-            "cuttlefish_vdi_agent": str(inputs / "agent"),
-            "cuttlefish_guest_packages": [
-                str(inputs / "mcnf-cuttlefish-readiness-relay.deb"),
-                str(inputs / "mcnf-cuttlefish-vdi-agent.deb"),
-            ],
             "rpm_signing_identity_receipt": str(inputs / "rpm-receipt.json"),
             "bootc_base_digest_receipt": str(inputs / "bootc-receipt.json"),
             "bootc_base_image_reference": "registry.invalid/mcnf/bootc@sha256:" + "2" * 64,
@@ -93,15 +84,6 @@ def main() -> None:
             "app_vm_catalog_receipt": str(inputs / "app-catalog.json"),
             "app_vm_base_image_reference": "registry.invalid/mcnf/app@sha256:" + "3" * 64,
             "app_vm_base_architecture": "amd64",
-            "cuttlefish_image_receipt": str(inputs / "cuttlefish-receipt.json"),
-            "cuttlefish_image_source_kind": "artifact",
-            "cuttlefish_image_original_source": str(inputs / "cuttlefish-image.tar"),
-            "cuttlefish_image_architecture": "amd64",
-            "cuttlefish_provider_identity": "mcnf-cuttlefish",
-            "cuttlefish_android_release_id": "android-15.0.0_r1",
-            "cuttlefish_image_compatibility_id": "mcnf-cuttlefish-v1",
-            "cuttlefish_image_media_type": "application/vnd.mcnf.cuttlefish.image.v1+tar",
-            "cuttlefish_image_artifact_format": "android-cuttlefish-image-archive",
         }
 
         def publish(name: str, value: object, mode: int = 0o400) -> Path:
@@ -114,7 +96,7 @@ def main() -> None:
         result = invoke(loader, good)
         check(result.returncode == 0, f"valid document refused: {result.stderr}")
         args = json.loads(recorded.read_text(encoding="utf-8"))
-        check(args.count("--cuttlefish-guest-package") == 2, "canonical argv omitted package paths")
+        check(not any("cuttlefish" in argument.lower() for argument in args), "canonical argv retained deferred Android input")
         reference_index = args.index("--bootc-base-image-reference") + 1
         check(args[reference_index] == document["bootc_base_image_reference"], "image reference changed in transit")
         identity = (
@@ -173,9 +155,9 @@ def main() -> None:
         check(invoke(loader, mutable).returncode == 2, "mutable image reference was accepted")
 
         substituted_value = dict(document)
-        substituted_value["cuttlefish_image_original_source"] = str(inputs / "missing-image.tar")
+        substituted_value["cuttlefish_image_receipt"] = str(inputs / "missing-image.tar")
         substituted = publish("substituted-reference.json", substituted_value)
-        check(invoke(loader, substituted).returncode == 2, "substituted artifact reference was accepted")
+        check(invoke(loader, substituted).returncode == 2, "deferred Cuttlefish input was accepted")
 
     print("release-input-argv self-test: PASS")
 

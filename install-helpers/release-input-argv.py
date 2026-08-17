@@ -25,19 +25,14 @@ PATH_FIELDS = {
     "maps_mbtiles",
     "app_vm_base_image_receipt",
     "app_vm_catalog_receipt",
-    "cuttlefish_declaration",
-    "cuttlefish_readiness_relay",
-    "cuttlefish_vdi_agent",
     "rpm_signing_identity_receipt",
     "bootc_base_digest_receipt",
-    "cuttlefish_image_receipt",
 }
 FILE_FIELDS = PATH_FIELDS - {"maps_tile_source_root"}
 SCALAR_FIELDS = {
     "source_revision",
     "source_epoch",
     "maps_quota_bytes",
-    "android_capability",
     *PATH_FIELDS,
     "rpm_signing_identity_receipt",
     "bootc_base_image_reference",
@@ -45,17 +40,8 @@ SCALAR_FIELDS = {
     "bootc_release_role",
     "app_vm_base_image_reference",
     "app_vm_base_architecture",
-    "cuttlefish_image_receipt",
-    "cuttlefish_image_source_kind",
-    "cuttlefish_image_original_source",
-    "cuttlefish_image_architecture",
-    "cuttlefish_provider_identity",
-    "cuttlefish_android_release_id",
-    "cuttlefish_image_compatibility_id",
-    "cuttlefish_image_media_type",
-    "cuttlefish_image_artifact_format",
 }
-EXPECTED_FIELDS = {"schema_version", "kind", "cuttlefish_guest_packages", *SCALAR_FIELDS}
+EXPECTED_FIELDS = {"schema_version", "kind", *SCALAR_FIELDS}
 
 ARGUMENTS = (
     ("source_revision", "--source-revision"),
@@ -65,9 +51,6 @@ ARGUMENTS = (
     ("maps_quota_bytes", "--maps-quota-bytes"),
     ("maps_verifier", "--maps-verifier"),
     ("maps_mbtiles", "--maps-mbtiles"),
-    ("cuttlefish_declaration", "--cuttlefish-declaration"),
-    ("cuttlefish_readiness_relay", "--cuttlefish-readiness-relay"),
-    ("cuttlefish_vdi_agent", "--cuttlefish-vdi-agent"),
     ("rpm_signing_identity_receipt", "--rpm-signing-identity-receipt"),
     ("bootc_base_digest_receipt", "--bootc-base-digest-receipt"),
     ("bootc_base_image_reference", "--bootc-base-image-reference"),
@@ -77,15 +60,6 @@ ARGUMENTS = (
     ("app_vm_base_image_reference", "--app-vm-base-image-reference"),
     ("app_vm_base_architecture", "--app-vm-base-architecture"),
     ("app_vm_catalog_receipt", "--app-vm-catalog-receipt"),
-    ("cuttlefish_image_receipt", "--cuttlefish-image-receipt"),
-    ("cuttlefish_image_source_kind", "--cuttlefish-image-source-kind"),
-    ("cuttlefish_image_original_source", "--cuttlefish-image-original-source"),
-    ("cuttlefish_image_architecture", "--cuttlefish-image-architecture"),
-    ("cuttlefish_provider_identity", "--cuttlefish-provider-identity"),
-    ("cuttlefish_android_release_id", "--cuttlefish-android-release-id"),
-    ("cuttlefish_image_compatibility_id", "--cuttlefish-image-compatibility-id"),
-    ("cuttlefish_image_media_type", "--cuttlefish-image-media-type"),
-    ("cuttlefish_image_artifact_format", "--cuttlefish-image-artifact-format"),
 )
 
 
@@ -197,24 +171,10 @@ def validate(document: dict[str, object]) -> dict[str, str | list[str]]:
         raise Refusal("source_epoch must be a positive integer string")
     if not str(values["maps_quota_bytes"]).isdigit() or int(str(values["maps_quota_bytes"])) <= 0:
         raise Refusal("maps_quota_bytes must be a positive integer string")
-    if values["android_capability"] != "deferred":
-        raise Refusal("Android capability is deferred for this release")
-    if values["cuttlefish_image_source_kind"] not in {"registry", "artifact"}:
-        raise Refusal("cuttlefish_image_source_kind is unsupported")
-    if values["cuttlefish_image_architecture"] not in {"amd64", "arm64"}:
-        raise Refusal("cuttlefish_image_architecture is unsupported")
-    if values["cuttlefish_image_artifact_format"] not in {
-        "android-cuttlefish-host-package",
-        "android-cuttlefish-image-archive",
-    }:
-        raise Refusal("cuttlefish_image_artifact_format is unsupported")
     for field in (
         "bootc_base_architecture",
         "app_vm_base_architecture",
         "bootc_release_role",
-        "cuttlefish_provider_identity",
-        "cuttlefish_android_release_id",
-        "cuttlefish_image_compatibility_id",
     ):
         if not TOKEN_RE.fullmatch(str(values[field])):
             raise Refusal(f"{field} is malformed")
@@ -224,26 +184,6 @@ def validate(document: dict[str, object]) -> dict[str, str | list[str]]:
         if not IMAGE_REFERENCE_RE.fullmatch(reference):
             raise Refusal(f"{field} must be one digest-pinned image reference")
 
-    original_source = str(values["cuttlefish_image_original_source"])
-    if values["cuttlefish_image_source_kind"] == "artifact":
-        values["cuttlefish_image_original_source"] = validate_path(
-            original_source, "cuttlefish_image_original_source"
-        )
-    elif not IMAGE_REFERENCE_RE.fullmatch(original_source):
-        raise Refusal("registry Cuttlefish image reference must be digest-pinned")
-
-    packages = document["cuttlefish_guest_packages"]
-    if not isinstance(packages, list) or len(packages) != 2:
-        raise Refusal("cuttlefish_guest_packages must contain exactly two paths")
-    package_paths = [validate_path(value, "cuttlefish_guest_packages entry") for value in packages]
-    if {Path(value).name for value in package_paths} != {
-        "mcnf-cuttlefish-readiness-relay.deb",
-        "mcnf-cuttlefish-vdi-agent.deb",
-    }:
-        raise Refusal("cuttlefish_guest_packages names are not the canonical two-package set")
-    if len({str(Path(value).parent) for value in package_paths}) != 1:
-        raise Refusal("cuttlefish_guest_packages must share one directory")
-    values["cuttlefish_guest_packages"] = package_paths
     return values
 
 
@@ -251,8 +191,6 @@ def canonical_argv(values: dict[str, str | list[str]]) -> list[str]:
     result = [str(PREFLIGHT)]
     for field, option in ARGUMENTS:
         result.extend((option, str(values[field])))
-    for package in values["cuttlefish_guest_packages"]:
-        result.extend(("--cuttlefish-guest-package", package))
     return result
 
 
