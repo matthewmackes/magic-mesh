@@ -538,8 +538,12 @@ behavioral evidence is not completion.
      is explicitly deferred to WL-TEST-002; that deferral does not create a
      release-input approval. Do not run a build with historical loose artifacts.
      - Inputs: Maps approval/source, App VM image/catalog receipt, Cuttlefish declarations/packages/image receipt, RPM signer receipt, bootc receipt.
-     - Action: create one private JSON argv file containing every mandatory release-input-preflight argument.
-     - Deliverable: immutable preflight argument file plus redacted input inventory; never commit credentials or private keys.
+     - Action: create one private strict-object JSON document containing every
+       mandatory release-input-preflight argument, then derive the separate
+       prepare-driver argv array with `release-input-argv.py
+       --emit-driver-arguments`; never hand-edit duplicate argument lists.
+     - Deliverable: immutable mode-0400 object and derived driver argument file
+       plus redacted input inventory; never commit credentials or private keys.
      - Validation: release-input-preflight.sh against the frozen revision and epoch; missing/substituted input fixture must refuse.
      - Done when: preflight succeeds before any build mutation and every accepted input identifies the frozen revision.
   4. S4 Freeze release notes and tag plan.
@@ -649,10 +653,11 @@ behavioral evidence is not completion.
   7. S7 Materialize private first-release preflight argv.
      - Inputs: all current-revision receipts from S2-S6, RPM signer receipt,
        private paths, target architecture, and release epoch.
-     - Action: write one mode-0400 private JSON argv file outside Git and run
-       release-input-preflight before any build mutation.
-     - Deliverable: private argv path, redacted input inventory, and preflight
-       transcript.
+     - Action: write one mode-0400 private JSON object outside Git, derive the
+       release-driver array from that object, and run release-input-preflight
+       before any build mutation.
+     - Deliverable: private object path, derived driver-array path, redacted
+       input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
        refuse; fixture substitutions require the governed evidence record; no
        credentials or private keys enter Git/logs.
