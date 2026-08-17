@@ -66,9 +66,20 @@ PY
 chmod 0755 "$WORK/plan" "$WORK/collector"
 printf '["--fixture","admitted"]\n' >"$WORK/preflight.json"
 chmod 0400 "$WORK/preflight.json"
+cat >"$WORK/argv-loader" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "$TEST_PRIVATE_OBJECT" && "$2" == --emit-driver-arguments ]]
+printf '["--fixture","admitted"]\n' >"$3"
+chmod 0400 "$3"
+SH
+chmod 0755 "$WORK/argv-loader"
+printf '{}\n' >"$WORK/private-object.json"
+chmod 0400 "$WORK/private-object.json"
 export TEST_LOG=$LOG TEST_REV=$REV TEST_EPOCH=$EPOCH
 export REPO_ROOT=$ROOT
 export MCNF_RELEASE_SOURCE_VERIFY=$WORK/source MCNF_RELEASE_PREFLIGHT=$WORK/preflight
+export MCNF_RELEASE_INPUT_ARGV_LOADER=$WORK/argv-loader TEST_PRIVATE_OBJECT=$WORK/private-object.json
 export MCNF_RELEASE_FARM=$WORK/farm MCNF_RELEASE_DERIVATIVES=$WORK/derivatives
 export MCNF_RELEASE_PLAN=$WORK/plan MCNF_RELEASE_COLLECTOR=$WORK/collector
 export MCNF_RELEASE_RPM_QUERY=$WORK/rpm-query
@@ -93,6 +104,9 @@ python3 - "$WORK/handoff/handoff.json" <<'PY'
 import json, sys
 v=json.load(open(sys.argv[1])); assert v["promotion"] == "forbidden" and v["target_fedora"] == 44 and len(v["outputs"]) == 3
 PY
+"$DRIVER" prepare --source-revision "$REV" --source-epoch "$EPOCH" \
+  --target-fedora 44 --preflight-object "$WORK/private-object.json" --output "$WORK/object-handoff"
+[[ -f "$WORK/object-handoff/handoff.json" ]] || { echo 'private preflight object did not produce a handoff' >&2; exit 1; }
 if "$DRIVER" prepare --source-revision "$REV" --source-epoch "$EPOCH" --target-fedora 44 --preflight-arguments "$WORK/preflight.json" --output "$WORK/handoff" >/dev/null 2>&1; then
   echo 'duplicate prepare output was accepted' >&2; exit 1
 fi

@@ -6,6 +6,7 @@ umask 077
 ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 SOURCE_VERIFY=${MCNF_RELEASE_SOURCE_VERIFY:-$ROOT/install-helpers/source-revision-receipt.sh}
 PREFLIGHT=${MCNF_RELEASE_PREFLIGHT:-$ROOT/install-helpers/release-input-preflight.sh}
+RELEASE_INPUT_ARGV_LOADER=${MCNF_RELEASE_INPUT_ARGV_LOADER:-$ROOT/install-helpers/release-input-argv.py}
 FARM=${MCNF_RELEASE_FARM:-$ROOT/install-helpers/xcp-build.sh}
 DERIVATIVES=${MCNF_RELEASE_DERIVATIVES:-$ROOT/install-helpers/build-release-derivative-images.sh}
 PLAN=${MCNF_RELEASE_PLAN:-$ROOT/install-helpers/produce-release-output-plan.py}
@@ -17,7 +18,7 @@ usage() {
   cat <<'EOF'
 Usage:
   run-first-full-release.sh prepare --source-revision REV --source-epoch EPOCH \
-    --target-fedora 44 --preflight-arguments JSON --output DIR
+    --target-fedora 44 (--preflight-object JSON | --preflight-arguments JSON) --output DIR
   run-first-full-release.sh resume --source-revision REV --target-fedora 44 --handoff DIR \
     --derivative-arguments JSON --plan-input JSON --output DIR
 
@@ -28,7 +29,7 @@ roles; it never signs, publishes, promotes, or runs live acceptance.
 EOF
 }
 
-revision='' epoch='' target_fedora='' preflight_file='' handoff='' derivative_file=''
+revision='' epoch='' target_fedora='' preflight_object='' preflight_file='' handoff='' derivative_file=''
 plan_input='' output=''
 declare -a preflight_args=() derivative_args=()
 mode=${1:-}
@@ -39,6 +40,7 @@ while (($#)); do
     --source-revision) revision=${2:-}; shift 2 ;;
     --source-epoch) epoch=${2:-}; shift 2 ;;
     --target-fedora) target_fedora=${2:-}; shift 2 ;;
+    --preflight-object) preflight_object=${2:-}; shift 2 ;;
     --preflight-arguments) preflight_file=${2:-}; shift 2 ;;
     --handoff) handoff=${2:-}; shift 2 ;;
     --derivative-arguments) derivative_file=${2:-}; shift 2 ;;
@@ -153,8 +155,18 @@ assert_source_identity() {
 
 if [[ "$mode" == prepare ]]; then
   [[ "$epoch" =~ ^[1-9][0-9]{0,11}$ ]] || refuse 'source epoch must be one bounded positive decimal'
-  [[ -n "$preflight_file" && -z "$handoff$derivative_file$plan_input" ]] \
-    || refuse 'prepare requires only --preflight-arguments'
+  [[ -z "$handoff$derivative_file$plan_input" ]] \
+    || refuse 'prepare does not accept resume inputs'
+  [[ -n "$preflight_object" || -n "$preflight_file" ]] \
+    || refuse 'prepare requires --preflight-object or --preflight-arguments'
+  [[ -z "$preflight_object" || -z "$preflight_file" ]] \
+    || refuse 'prepare accepts only one preflight input form'
+  if [[ -n "$preflight_object" ]]; then
+    regular 'private preflight object' "$preflight_object" 65536
+    preflight_file=$work/preflight-derived.json
+    "$RELEASE_INPUT_ARGV_LOADER" "$preflight_object" --emit-driver-arguments "$preflight_file" \
+      || refuse 'private preflight object could not derive driver arguments'
+  fi
   load_arguments "$preflight_file" preflight_args --source-revision --source-epoch
 
   # Resolve rather than syntax-check the receipt. Repeat immediately before
