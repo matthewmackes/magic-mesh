@@ -590,11 +590,11 @@ behavioral evidence is not completion.
   `evidence/WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Re-run S1-S4
   using the two-phase candidate/reconfirmation decision below.
 - Remaining work:
-  1. S1 Select the immutable source. BLOCKED: the recorded 1dfe6906 candidate
-     predates required WL-FUNC-023 implementation. After all source-changing
-     WL-FUNC-023 work lands, establish one clean pushed candidate revision and
-     epoch for WL-REL-006; final freeze waits for input admission against that
-     candidate, not for a second independently selected revision.
+  1. S1 Select the immutable source. BLOCKED: release branch
+     `agent/drain-worklist-20260725` is 1,420 commits ahead of protected
+     `master`; the recorded 1dfe6906 candidate predates WL-FUNC-023. Integrate
+     the release work, then establish one clean pushed candidate revision and
+     epoch for WL-REL-006; final freeze waits for input admission against it.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
