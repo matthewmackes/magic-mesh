@@ -297,9 +297,8 @@ behavioral evidence is not completion.
   Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
   `evidence/WL-FUNC-023-2026-08-16-bearer-handoff-farm-r1.md`,
   `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; focused authority
-  core passes; live bootstrap still passes a `{{JOIN_TOKEN}}` command
-  template where `RunEnroll` requires the minted bearer, so token minting and
-  bearer handoff precede SSH wiring.
+  core passes; bootstrap now refuses the `{{JOIN_TOKEN}}` template when no
+  minted bearer is present, so token minting and live SSH remain open.
 - Remaining work: GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
   deliverable, farm command, result, revision, and evidence; do not close a story
   from compilation alone.
