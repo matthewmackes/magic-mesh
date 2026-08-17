@@ -524,7 +524,18 @@ pub enum LifecycleIntentError {
 impl LifecycleIntentV1 {
     pub fn default_steps(&self) -> Vec<String> {
         let steps: &[LifecycleStepKind] = match self.intent {
-            LifecycleIntentKind::Onboard | LifecycleIntentKind::ResetAndOnboard => &[
+            LifecycleIntentKind::Onboard => &[
+                LifecycleStepKind::Identity,
+                LifecycleStepKind::Packages,
+                LifecycleStepKind::Configuration,
+                LifecycleStepKind::Mesh,
+                LifecycleStepKind::Compute,
+                LifecycleStepKind::Ui,
+                LifecycleStepKind::Hardware,
+                LifecycleStepKind::Verify,
+            ],
+            LifecycleIntentKind::ResetAndOnboard => &[
+                LifecycleStepKind::Offboard,
                 LifecycleStepKind::Identity,
                 LifecycleStepKind::Packages,
                 LifecycleStepKind::Configuration,
@@ -759,6 +770,16 @@ mod tests {
         let body = serde_json::to_string(&intent()).unwrap();
         assert_eq!(LifecycleIntentV1::from_json(&body).unwrap(), intent());
         assert_eq!(intent().default_steps(), vec!["identity", "packages", "configuration", "mesh", "compute", "ui", "hardware", "verify"]);
+    }
+
+    #[test]
+    fn reset_and_onboard_must_offboard_before_recommissioning() {
+        let mut reset = intent();
+        reset.intent = LifecycleIntentKind::ResetAndOnboard;
+        let steps = reset.default_steps();
+        assert_eq!(steps.first(), Some(&"offboard".to_string()));
+        assert_eq!(steps.last(), Some(&"verify".to_string()));
+        assert!(steps.contains(&"identity".to_string()));
     }
 
     #[test]
