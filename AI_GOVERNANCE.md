@@ -282,9 +282,12 @@ health check. Lighthouse replacement MUST be one node at a time, preserving
 the independently governed quorum and authenticated overlay before the next
 node is changed. The preview MUST remain out of public/package production
 channels, and no seat may be represented as having passed live acceptance
-merely because it received the bytes. The existing two-seat limit continues
-to govern live acceptance, chaos/recovery proof, and hardware signoff unless
-this policy is explicitly superseded by a later operator lock.
+merely because it received the bytes. **Operator lock (2026-08-16):** for the
+`13.0.0` release, the production qualification set is exactly Dell, Basement
+Seat 15, and Microsoft Surface. Those three seats are the sole approved live
+acceptance, chaos/recovery, and hardware-signoff seats for this release;
+Eagle and T480 remain non-gating inspection/deployment-wave seats. This
+three-seat lock supersedes the preceding two-seat limit for `13.0.0` only.
 
 **Engineering snapshot classification (2026-08-15).** A **DEV-SNAPSHOT** is a
 separate, non-production distribution type for exercising the available source

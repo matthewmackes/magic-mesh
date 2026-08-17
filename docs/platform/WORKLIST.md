@@ -35,11 +35,11 @@ tasks.
   Product epics must not duplicate those rollout tasks; they retain only
   product-specific implementation and integration gaps, and cite `WL-TEST-002`
   when its acceptance is a dependency.
-- **Production qualification topology (operator survey 2026-08-16):** deep
-  acceptance is capped at Seat 15 and Dell. Eagle is the third production
-  workstation for the six-node baseline and supplies package/runtime/topology
-  proof. Three lighthouses remain independently required. Surface is
-  experimental and non-blocking; ARM64 is outside the `13.0.0` support envelope.
+- **Production qualification topology (operator lock 2026-08-16):** deep
+  acceptance for `13.0.0` is exactly Seat 15, Dell, and Surface. Eagle and T480
+  are non-gating inspection/deployment-wave seats. Three lighthouses remain
+  independently required. Surface is promoted into the `13.0.0` production
+  support envelope; ARM64 remains outside that envelope.
   An unpublished signed candidate may be staged on this topology under the
   production-candidate qualification exception in `AI_GOVERNANCE.md`.
   Each target must receive the exact manifest-bound bytes, the red
@@ -58,8 +58,9 @@ tasks.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
   never run filler tests.
-- **Rollout lock:** prove each release activity on no more than two selected
-  physical seats and the independently required lighthouses. The approved
+- **Rollout lock:** for `13.0.0`, prove each release activity on exactly the
+  three selected physical seats (Dell, Seat 15, Surface) and the independently
+  required lighthouses. The approved
   promotion-forbidden preview may be distributed to all designated test seats
   and designated test lighthouses, but that wider distribution does not expand
   the test or acceptance requirement. Replace lighthouses one at a time while
@@ -282,7 +283,7 @@ behavioral evidence is not completion.
       - Validation: source scans and hostile package/first-boot fixtures.
       - Done when: no shipped path uses stale units or weak readiness proxies.
   18. S18 Prove and hand off the implementation.
-      - Inputs: S1-S17, farm inventory, two-seat acceptance cap,
+      - Inputs: S1-S17, farm inventory, the three-seat `13.0.0` acceptance lock,
         preview-distribution exception, retention lock, and the
         WL-TEST-002 ownership boundary.
       - Action: run focused unit/integration/hostile farm gates, put the longest
@@ -290,7 +291,7 @@ behavioral evidence is not completion.
       - Deliverable: evidence index, AI/operator runbook, migration notes, and
         exact deferred WL-TEST-002 obligations.
       - Validation: worklist lints pass; detailed history expires within six
-        hours; live proof uses no more than two seats; any broader preview
+        hours; live proof uses exactly Dell, Seat 15, and Surface; any broader preview
         distribution remains manifest-bound and is not counted as proof.
       - Done when: implementation gates pass and exact installed-release/live
         acceptance remains only under WL-TEST-002.
@@ -313,7 +314,7 @@ behavioral evidence is not completion.
   digest confirmation; core failures block; capability failures remain
   prominent `ReadyWithWarnings`.
 - Verification method: focused hostile/unit tests, farm integration and package
-  fixtures, GUI/TUI parity, interruption/resume proof, and at most two physical
+  fixtures, GUI/TUI parity, interruption/resume proof, and exactly three physical
   acceptance seats; defer exact release/rollout proof to WL-TEST-002.
 - Origin or merged source IDs: operator lifecycle consolidation, Seat 15 and
   Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
@@ -688,7 +689,7 @@ behavioral evidence is not completion.
      - Done when: package clients can resolve the complete release and no stale or unsigned higher candidate blocks upgrades.
   6. S6 Hand off to installed acceptance.
      - Inputs: publication receipt, download verifier results, package/image references, and corrected-forward recovery identity.
-     - Action: update WL-TEST-002 with exact release inputs and select no more than two physical proof seats.
+     - Action: update WL-TEST-002 with exact release inputs and select exactly Dell, Seat 15, and Surface as physical proof seats.
      - Deliverable: acceptance handoff naming immutable artifacts, seats, lighthouses, providers, and rollback-forbidden recovery plan.
      - Validation: all references resolve and every seat mutation requires the governed alert/wait sequence.
      - Done when: WL-TEST-002 can begin without guessing any release, package, image, seat, or recovery identity.
@@ -716,7 +717,7 @@ behavioral evidence is not completion.
        real production inputs, and selected seats.
      - Action: verify candidate bytes; record seat hardware, authorization, current package, target package, and recovery identity.
      - Deliverable: installed-acceptance plan and pre-mutation baseline.
-     - Validation: tested bytes equal the immutable candidate manifest; no more than two deep-acceptance seats are selected.
+     - Validation: tested bytes equal the immutable candidate manifest; exactly Dell, Seat 15, and Surface are selected for deep acceptance.
      - Done when: exact inputs and targets are unambiguous and recoverable by corrected-forward deployment.
   2. S2 Install and verify the baseline.
      - Inputs: admitted package/image references and governed mutation plan.
@@ -725,7 +726,7 @@ behavioral evidence is not completion.
      - Validation: package, mackesd, shell, About, watermark, welcome, and mesh-help versions agree.
      - Done when: each selected seat boots the exact release with honest degraded states and no stale build identity.
   3. S3 Prove collaboration and authorized providers.
-     - Inputs: governed SIP/provider credentials, collaboration identities, two-seat maximum, and signed release.
+     - Inputs: governed SIP/provider credentials, collaboration identities, the three-seat `13.0.0` maximum, and signed release.
      - Action: test Calls lifecycle, mute, consent, revocation, reconnect, chat/alerts, files/transfers, editor, and clipboard.
      - Deliverable: redacted provider/readiness, command, failure, and recovery evidence.
      - Validation: missing providers remain visible; no fake connected state; signed attribution and revocation remain auditable.
@@ -760,12 +761,12 @@ behavioral evidence is not completion.
      - Deliverable: signed acceptance index, blocker list, reopened work references, and WL-TEST-002 archive disposition.
      - Validation: every deferred obligation has evidence, a reopened implementation item, or one exact external-input blocker.
      - Done when: no obligation is silently dropped and the epic can be removed from the active worklist.
-- Scope: exact-release admission, up to two physical seats, providers, direct DRM, media/devices, guests, resilience, and reconciliation.
+- Scope: exact-release admission, exactly Dell, Seat 15, and Surface as physical proof seats, providers, direct DRM, media/devices, guests, resilience, and reconciliation.
 - Relevant files/components: docs/platform/release-evidence, install-helpers release/live/recovery verifiers,
   packaging installed-identity tools, direct-DRM capture helpers, and archived epic dispositions.
-- Dependencies: WL-REL-005, authorized provider inputs, selected hardware, and no more than two physical test seats.
+- Dependencies: WL-REL-005, authorized provider inputs, selected Dell/Seat 15/Surface hardware, and the three-seat `13.0.0` qualification lock.
 - Acceptance criteria: tested bytes match the signed release; states remain honest; recovery is corrected-forward; every deferred proof is reconciled.
-- Verification method: focused farm gates followed by exact installed one-seat/two-seat live checks with redacted evidence and independent readback.
+- Verification method: focused farm gates followed by exact installed three-seat live checks on Dell, Seat 15, and Surface with redacted evidence and independent readback.
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
 
 ## Core Architecture
