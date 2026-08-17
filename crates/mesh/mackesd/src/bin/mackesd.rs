@@ -1489,19 +1489,6 @@ enum OnboardCmd {
         /// JSON-encoded `mackes_mesh_types::lifecycle::LifecycleIntentV1`.
         #[arg(long, value_name = "JSON")]
         intent_json: String,
-        /// Ordered lifecycle step names selected by the operator.
-        #[arg(long = "step", value_name = "STEP")]
-        steps: Vec<String>,
-    },
-    /// WL-FUNC-023 — commit one already-successful lifecycle step through the
-    /// daemon authority and print the resulting checkpoint.
-    LifecycleComplete {
-        #[arg(long, value_name = "TARGET")]
-        target_id: String,
-        #[arg(long, value_name = "INDEX")]
-        step_index: u32,
-        #[arg(long, env = "QNM_SHARED_ROOT")]
-        root: Option<PathBuf>,
     },
     /// WL-FUNC-023 — verify and persist the signed operator confirmation
     /// required by destructive lifecycle intents.
@@ -1579,8 +1566,6 @@ enum OnboardCmd {
     LifecycleStart {
         #[arg(long, value_name = "JSON")]
         intent_json: String,
-        #[arg(long = "step", value_name = "STEP")]
-        steps: Vec<String>,
         #[arg(long, env = "QNM_SHARED_ROOT")]
         root: Option<PathBuf>,
     },
@@ -3539,6 +3524,42 @@ mod join_cli_role_tests {
             .as_deref(),
             Some("lighthouse")
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_cli_boundary_tests {
+    use super::parse_cli_on_large_test_stack;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn lifecycle_cli_refuses_caller_selected_steps() {
+        let error = match parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle".into(),
+            "--intent-json".into(),
+            "{}".into(),
+            "--step".into(),
+            "identity".into(),
+        ]) {
+            Ok(_) => panic!("the daemon must own lifecycle step selection"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn lifecycle_cli_refuses_manual_step_completion() {
+        let error = match parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-complete".into(),
+        ]) {
+            Ok(_) => panic!("only a real lifecycle executor may record success"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
     }
 }
 

@@ -8,11 +8,11 @@ use crate::*;
 #[allow(unreachable_code)]
 pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
     match verb {
-        OnboardCmd::Lifecycle { intent_json, steps } => {
+        OnboardCmd::Lifecycle { intent_json } => {
             use mackes_mesh_types::lifecycle::LifecyclePlanV1;
             let intent = mackes_mesh_types::lifecycle::LifecycleIntentV1::from_json(&intent_json)
                 .map_err(|error| anyhow::anyhow!("invalid lifecycle intent: {error:?}"))?;
-            let steps = if steps.is_empty() { intent.default_steps() } else { steps };
+            let steps = intent.default_steps();
             let plan = LifecyclePlanV1 {
                 schema_version: intent.schema_version,
                 request_id: intent.request_id,
@@ -24,16 +24,6 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             plan.validate()
                 .map_err(|error| anyhow::anyhow!("invalid lifecycle plan: {error:?}"))?;
             println!("{}", serde_json::to_string(&plan)?);
-        }
-        OnboardCmd::LifecycleComplete { target_id, step_index, root } => {
-            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
-            let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
-                .map_err(|error| anyhow::anyhow!("cannot resume lifecycle authority: {error:?}"))?;
-            authority.complete_step(step_index)
-                .map_err(|error| anyhow::anyhow!("cannot complete lifecycle step: {error:?}"))?;
-            println!("{}", serde_json::to_string(authority.checkpoint())?);
-            authority.finish()
-                .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
         OnboardCmd::LifecycleConfirm { target_id, confirmation_json, verifying_key_hex, root } => {
             use ed25519_dalek::VerifyingKey;
@@ -132,12 +122,12 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             authority.finish()
                 .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         }
-        OnboardCmd::LifecycleStart { intent_json, steps, root } => {
+        OnboardCmd::LifecycleStart { intent_json, root } => {
             use mackes_mesh_types::lifecycle::LifecyclePlanV1;
             let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
             let intent = mackes_mesh_types::lifecycle::LifecycleIntentV1::from_json(&intent_json)
                 .map_err(|error| anyhow::anyhow!("invalid lifecycle intent: {error:?}"))?;
-            let steps = if steps.is_empty() { intent.default_steps() } else { steps };
+            let steps = intent.default_steps();
             let plan = LifecyclePlanV1 {
                 schema_version: intent.schema_version,
                 request_id: intent.request_id,
