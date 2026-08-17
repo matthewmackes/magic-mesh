@@ -26,6 +26,15 @@ def invoke(loader: Path, document: Path, *identity: str) -> subprocess.Completed
     )
 
 
+def emit(loader: Path, document: Path, output: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(loader), str(document), "--emit-driver-arguments", str(output)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -112,6 +121,15 @@ def main() -> None:
         check(invoke(loader, good, *identity).returncode == 0, "matching checkout identity was refused")
         wrong_identity = (*identity[:1], "f" * 40, *identity[2:])
         check(invoke(loader, good, *wrong_identity).returncode == 2, "cross-revision document was accepted")
+
+        derived = root / "derived-arguments.json"
+        check(emit(loader, good, derived).returncode == 0, "derived driver arguments were refused")
+        derived_args = json.loads(derived.read_text(encoding="utf-8"))
+        check(derived.stat().st_mode & 0o777 == 0o400, "derived arguments were not mode 0400")
+        check("--source-revision" not in derived_args, "driver arguments duplicated source revision")
+        check("--source-epoch" not in derived_args, "driver arguments duplicated source epoch")
+        check(derived_args[0].endswith("/release-input-preflight.sh"), "derived preflight path is wrong")
+        check(emit(loader, good, derived).returncode == 2, "existing derived output was overwritten")
 
         permissive = publish("permissive.json", document, 0o600)
         check(invoke(loader, permissive).returncode == 2, "permissive private-file mode was accepted")

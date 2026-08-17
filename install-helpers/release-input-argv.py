@@ -249,8 +249,44 @@ def canonical_argv(values: dict[str, str | list[str]]) -> list[str]:
     return result
 
 
+def driver_argv(values: dict[str, str | list[str]]) -> list[str]:
+    """Return the prepare-driver argv derived from the validated object.
+
+    The driver owns source revision and epoch, so those three argv entries are
+    deliberately removed from the canonical preflight invocation.
+    """
+    result = canonical_argv(values)
+    del result[1:5]
+    return result
+
+
+def emit_driver_arguments(values: dict[str, str | list[str]], output: Path) -> None:
+    if not output.is_absolute() or os.path.normpath(output) != str(output):
+        raise Refusal("derived argument output must be one normalized absolute path")
+    if output.exists() or output.is_symlink():
+        raise Refusal("derived argument output must be absent")
+    parent = output.parent
+    if not parent.is_dir() or parent.is_symlink():
+        raise Refusal("derived argument output parent must be a real directory")
+    parent_info = parent.stat()
+    if stat.S_IMODE(parent_info.st_mode) & 0o022:
+        raise Refusal("derived argument output parent must not be group/other writable")
+    payload = json.dumps(driver_argv(values), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(output, flags, 0o400)
+    except OSError as exc:
+        raise Refusal("derived argument output could not be created exclusively") from exc
+    try:
+        os.write(descriptor, payload)
+        os.fchmod(descriptor, 0o400)
+    finally:
+        os.close(descriptor)
+
+
 def main() -> int:
-    if len(sys.argv) not in {2, 6}:
+    emit = len(sys.argv) == 4 and sys.argv[2] == "--emit-driver-arguments"
+    if len(sys.argv) not in {2, 4, 6} or (len(sys.argv) == 4 and not emit):
         print(
             f"usage: {Path(sys.argv[0]).name} PRIVATE_ARGV.json "
             "[--expected-source-revision REV --expected-source-epoch EPOCH]",
@@ -259,6 +295,9 @@ def main() -> int:
         return 2
     try:
         values = validate(read_private_document(Path(sys.argv[1])))
+        if emit:
+            emit_driver_arguments(values, Path(sys.argv[3]))
+            return 0
         if len(sys.argv) == 6:
             if sys.argv[2] != "--expected-source-revision" or sys.argv[4] != "--expected-source-epoch":
                 raise Refusal("expected source identity options are malformed")
