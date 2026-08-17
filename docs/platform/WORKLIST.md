@@ -686,7 +686,9 @@ behavioral evidence is not completion.
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
 - Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable private production-candidate handoff.
-- Current state: prepare-path hostile tests pass, but WL-REL-001 is blocked and no current-revision three-RPM handoff exists.
+- Current state: hostile prepare-path evidence is in
+  `evidence/WL-REL-002-2026-08-16-hostile-boundary-r1.md`; WL-REL-001 is
+  blocked and no current-revision three-RPM handoff exists.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
