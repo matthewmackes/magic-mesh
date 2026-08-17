@@ -146,3 +146,25 @@ MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=1 \
   erase while preserving a reusable identity or local resource. This contract
   proof does not replace the S14 real drain/revoke/erase executor or its
   installed-seat evidence.
+
+## Full local offboard execution and verification — 2026-08-17
+
+- Source revision: `a1378f7fa364fe0975b2938159e0b99bf1dae805`
+- Farm host/slot: `172.20.0.196` / `1`
+- Command:
+
+  ```text
+  MCNF_BUILD_HOST=172.20.0.196 MCNF_BUILD_SLOT=1 \
+    install-helpers/xcp-build.sh cargo test -p mackesd --bin mackesd \
+    cli::leave::tests --locked -- --nocapture
+  ```
+
+- Result: `5 passed, 0 failed, 69 filtered out`.
+- `mackesd leave` now uses the canonical two-step Offboard plan. Its real
+  destructive operation runs first; its second authority-owned step verifies
+  that the Nebula configuration is empty and that peer-roster, identity bundle,
+  SSH identity, media registry, role pin, and relay authority material are
+  absent. The verifier uses `symlink_metadata`, so a dangling symlink cannot
+  evade the erase boundary. A completed checkpoint can then project only the
+  empty-retention receipt. This does not claim the separate fleet drain and
+  remote target executor required by WL-FUNC-023 S14/S16.
