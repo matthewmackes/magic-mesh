@@ -156,18 +156,21 @@ behavioral evidence is not completion.
      - Inputs: final integration source candidate, open-source and license
        policies, Maps and image receipt contracts, Kiron assets, and the
        authorized release-key identity.
-     - Action: produce the operator-signed OpenStreetMap-derived Buffalo-Niagara
-       Maps bundle clipped to official Erie and Niagara county boundaries;
-       enforce the aggregate 1 GiB quota and deterministic PMTiles/tar.zst
-       transport; regenerate App VM, bootc, and Kiron receipts; build matching
-       Android 14 x86_64 Cuttlefish host/image bytes and current-source guest
-       DEBs; generate the signer receipt; and materialize canonical private
-       mode-0400 preflight inputs outside Git.
+     - Action: produce the OpenStreetMap-derived Buffalo-Niagara Maps bundle
+       clipped to official Erie and Niagara county boundaries using the existing
+       Maps approval, producer, materializer, and verifier contracts; enforce
+       the aggregate quota and deterministic transport; regenerate App VM,
+       bootc, and Kiron receipts; build matching Android 14 x86_64 Cuttlefish
+       host/image bytes and current-source guest DEBs; generate the existing
+       signer receipt; and materialize canonical private mode-0400 preflight
+       inputs outside Git. Do not add a platform-wide trust root, new security
+       subsystem, or unrelated runtime security surface.
      - Deliverable: immutable, licensed, current-revision receipts, declarations,
        approvals, signatures, manifests, private argv inputs, and redacted
        inventory required by canonical release preflight.
      - Validation: wrong bytes, provider, license, architecture, role, revision,
-       epoch, permissions, links, quota, signature, or path substitution refuse.
+       epoch, permissions, links, quota, or path substitution refuse through the
+       existing governed verifiers; no new security contract is required.
      - Done when: `release-input-preflight.sh` accepts every real production
        input and no preview fixture or historical receipt is admitted.
   4. S4 Build Android 14 on a one-use KVM-XCP1 host.
