@@ -116,3 +116,33 @@ MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=1 \
   claim a side effect completed without an authority-owned executor action.
   This is a safety boundary only; it does not claim the remaining turnkey
   provider, package, fleet, or live-seat execution work is complete.
+
+## Completed offboarding receipt erasure boundary — 2026-08-17
+
+- Source revision: `e2bb66b5e193469face9b340fe04a4b2b85a8663`
+- Contract gate:
+
+  ```text
+  MCNF_BUILD_HOST=172.20.0.90 MCNF_BUILD_SLOT=1 \
+    install-helpers/xcp-build.sh cargo test -p mackes-mesh-types lifecycle \
+    --locked -- --nocapture
+  ```
+
+  Result: `21 passed, 0 failed, 519 filtered out`.
+
+- Authority gate:
+
+  ```text
+  MCNF_BUILD_HOST=172.20.0.196 MCNF_BUILD_SLOT=1 \
+    install-helpers/xcp-build.sh cargo test -p mackesd --lib \
+    lifecycle_authority --locked -- --nocapture
+  ```
+
+  Result: `17 passed, 0 failed, 5006 filtered out` after a cold 3m35s build.
+
+- A valid completed `OffboardingReceiptV1` now requires an empty
+  `retained_resources` set, and the authority provides no caller-controlled
+  retention argument. A receipt can therefore no longer represent a completed
+  erase while preserving a reusable identity or local resource. This contract
+  proof does not replace the S14 real drain/revoke/erase executor or its
+  installed-seat evidence.
