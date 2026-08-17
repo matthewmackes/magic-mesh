@@ -294,11 +294,12 @@ behavioral evidence is not completion.
   first-desktop, spawn-lighthouse, mesh-dns/network/create, invite/join/found,
   and coordinated-upgrade mutations now acquire that authority. Upgrade
   execution requires a typed artifact selection or compatibility digest; downstream package, service, enrollment, renderer, fleet-offboarding, and full execution evidence remain.
-  Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-r1.md`,
-  `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r1.md`,
-  `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`, and
-  `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; the focused
-  authority core passes, while live transports remain open.
+  Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
+  `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; focused authority
+  core
+  passes; live bootstrap still passes a `{{JOIN_TOKEN}}` command
+  template where `RunEnroll` requires the minted bearer, so token minting and
+  bearer handoff precede SSH wiring.
 - Remaining work: GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
   deliverable, farm command, result, revision, and evidence; do not close a story
   from compilation alone.
@@ -494,8 +495,7 @@ behavioral evidence is not completion.
 - Verification method: focused hostile/unit tests, farm integration and package
   fixtures, GUI/TUI parity, interruption/resume proof, and exactly three physical
   acceptance seats; defer exact release/rollout proof to WL-TEST-002.
-- Origin or merged source IDs: operator lifecycle consolidation, Seat 15 and
-  Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
+- Origin or merged source IDs: operator lifecycle consolidation, Seat 15 and Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
 
