@@ -511,8 +511,9 @@ behavioral evidence is not completion.
   pre-WL-FUNC-023 candidate. It cannot be the final feature-complete release
   source because WL-FUNC-023 must land first. Browser helpers and the shipped
   role chooser resolve to 13.0.0, and the five internal non-release crates are
-  documented in docs/RELEASE-VERSIONING.md. Re-run S1-S4 after WL-FUNC-023 and
-  WL-REL-006 are complete.
+  documented in docs/RELEASE-VERSIONING.md. S2 farm metadata evidence is in
+  `evidence/WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Re-run S1-S4
+  after WL-FUNC-023 and WL-REL-006 are complete.
 - Remaining work:
   1. S1 Select the immutable source. BLOCKED: the recorded 1dfe6906 candidate
      predates required WL-FUNC-023 implementation and must be replaced after
