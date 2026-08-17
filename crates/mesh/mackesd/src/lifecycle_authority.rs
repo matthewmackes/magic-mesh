@@ -360,7 +360,7 @@ impl LifecycleAuthority {
                 if !correction_plan.corrections.iter().any(|candidate| candidate.check_id == *prerequisite) {
                     return Err(LifecycleAuthorityError::InvalidTransition("correction prerequisite missing"));
                 }
-            }
+        }
         }
         Ok(())
     }
@@ -466,10 +466,10 @@ impl LifecycleAuthority {
     /// Retry transient provider failures without losing the checkpoint. A
     /// reboot or process restart can call this again through `resume`; the
     /// bounded counter prevents an endless mutation loop.
-    pub fn run_next_with_retry<F>(&mut self, index: u32, step: String, mut action: F) -> Result<(), LifecycleAuthorityError>
-    where F: FnMut(&str) -> Result<(), String> {
-        for attempt in self.checkpoint.retry_count..=MAX_RETRIES {
-            match action(&step) {
+    pub fn run_next_with_retry<F>(&mut self, index: u32, step: String, action: F) -> Result<(), LifecycleAuthorityError>
+    where F: FnOnce(&str) -> Result<(), String> {
+        let attempt = self.checkpoint.retry_count;
+        match action(&step) {
                 Ok(()) => {
                     self.checkpoint.retry_count = 0;
                     self.checkpoint.last_error = None;
@@ -487,10 +487,9 @@ impl LifecycleAuthority {
                         self.update(failed)?;
                         return Err(LifecycleAuthorityError::StepFailed(error));
                     }
+                    Err(LifecycleAuthorityError::StepFailed(error))
                 }
             }
-        }
-        Err(LifecycleAuthorityError::InvalidTransition("retry state"))
     }
 
     /// Project the signed-boundary input for an offboarding receipt only after
