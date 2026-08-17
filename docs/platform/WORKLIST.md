@@ -529,8 +529,9 @@ behavioral evidence is not completion.
      - Deliverable: bounded version matrix naming each shipped surface, source, observed value, and exception.
      - Validation: farm metadata/package checks on .50; no runtime version authority other than workspace/package reflection.
      - Done when: every current release surface resolves to 13.0.0 or a documented packaging release suffix.
-  3. S3 Admit all governed release inputs. BLOCKED: no private preflight argv
-     file exists; the RPM signer receipt has been generated and inspected
+  3. S3 Admit all governed release inputs. BLOCKED: the release-input loader
+     and derived-driver converter exist, but no final private preflight object
+     exists; the RPM signer receipt has been generated and inspected
      privately for the superseded f095b8ce revision; it must be regenerated for
      the frozen 1dfe6906609d71da9ee2ce20c860912a09b32855 revision at epoch
      1786813297. Maps approval/source, App VM image/catalog receipt,
