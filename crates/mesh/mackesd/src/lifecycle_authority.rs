@@ -24,7 +24,6 @@ use serde::{Deserialize, Serialize};
 const CHECKPOINT: &str = "checkpoint.json";
 const JOURNAL: &str = "journal.jsonl";
 const LOCK: &str = "lifecycle.lock";
-const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleCheckpointV1 {
@@ -463,33 +462,30 @@ impl LifecycleAuthority {
         self.run_next_with_retry(index, step, action)
     }
 
-    /// Retry transient provider failures without losing the checkpoint. A
-    /// reboot or process restart can call this again through `resume`; the
-    /// bounded counter prevents an endless mutation loop.
+    /// Record a failed mutation durably and transition to terminal failure.
+    /// A caller must start an explicit corrected-forward generation before a
+    /// new provider action may run; this avoids silently replaying a partially
+    /// completed destructive mutation.
     pub fn run_next_with_retry<F>(&mut self, index: u32, step: String, action: F) -> Result<(), LifecycleAuthorityError>
     where F: FnOnce(&str) -> Result<(), String> {
-        let attempt = self.checkpoint.retry_count;
         match action(&step) {
-                Ok(()) => {
-                    self.checkpoint.retry_count = 0;
-                    self.checkpoint.last_error = None;
-                    self.persist()?;
-                    return self.complete_step(index);
-                }
-                Err(error) => {
-                    self.checkpoint.retry_count = attempt.saturating_add(1);
-                    self.checkpoint.last_error = Some(error.clone());
-                    self.append_journal("step_failed", &step, &error)?;
-                    self.persist()?;
-                    if attempt >= MAX_RETRIES {
-                        let mut failed = self.checkpoint.progress.clone();
-                        failed.phase = LifecyclePhase::Failed;
-                        self.update(failed)?;
-                        return Err(LifecycleAuthorityError::StepFailed(error));
-                    }
-                    Err(LifecycleAuthorityError::StepFailed(error))
-                }
+            Ok(()) => {
+                self.checkpoint.retry_count = 0;
+                self.checkpoint.last_error = None;
+                self.persist()?;
+                self.complete_step(index)
             }
+            Err(error) => {
+                self.checkpoint.retry_count = self.checkpoint.retry_count.saturating_add(1);
+                self.checkpoint.last_error = Some(error.clone());
+                self.append_journal("step_failed", &step, &error)?;
+                self.persist()?;
+                let mut failed = self.checkpoint.progress.clone();
+                failed.phase = LifecyclePhase::Failed;
+                self.update(failed)?;
+                Err(LifecycleAuthorityError::StepFailed(error))
+            }
+        }
     }
 
     /// Project the signed-boundary input for an offboarding receipt only after
