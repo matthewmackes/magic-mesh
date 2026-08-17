@@ -742,6 +742,7 @@ mod tests {
             Ok(Endpoint {
                 host: "203.0.113.7".to_string(),
                 overlay_ip: None,
+                join_bearer: None,
             })
         }
         fn push_enroll(

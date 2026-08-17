@@ -452,6 +452,9 @@ pub struct Endpoint {
     /// The overlay IP the box takes as a lighthouse once enrolled (`None` until
     /// the enroll signs it).
     pub overlay_ip: Option<String>,
+    /// The single-use lighthouse bearer minted for this endpoint. It remains
+    /// only in the in-memory side-effect handoff and is never serialized.
+    pub join_bearer: Option<String>,
 }
 
 /// A typed failure from the injectable [`Provisioner`] seam.
@@ -609,7 +612,7 @@ impl Provisioner for LiveProvisioner {
     fn push_enroll(
         &self,
         endpoint: &Endpoint,
-        enroll: &EnrollBootstrap,
+        _enroll: &EnrollBootstrap,
     ) -> Result<(), ProvisionError> {
         // OW-15 bootstrap remote push: reach the fresh box over bearer-scoped SSH
         // and run ONLY the enroll step (the single-use bearer, no ambient key). The
@@ -618,8 +621,14 @@ impl Provisioner for LiveProvisioner {
         let target = crate::onboard::remote_push::Target::Bootstrap {
             host: endpoint.host.clone(),
         };
+        let Some(bearer) = endpoint.join_bearer.as_deref() else {
+            return Err(ProvisionError::IntegrationGated {
+                step: "push-enroll",
+                reason: "provisioning did not return the minted lighthouse bearer; refusing to pass the command template as a bearer".to_string(),
+            });
+        };
         let actions = [crate::onboard::remote_push::Action::RunEnroll {
-            bearer: enroll.command.clone(),
+            bearer: bearer.to_string(),
         }];
         self.remote_push
             .apply(&target, &actions)
@@ -905,6 +914,7 @@ mod tests {
             Ok(Endpoint {
                 host: "203.0.113.7".to_string(),
                 overlay_ip: None,
+                join_bearer: None,
             })
         }
         fn push_enroll(
@@ -994,6 +1004,7 @@ mod tests {
         let ep = Endpoint {
             host: "203.0.113.7".to_string(),
             overlay_ip: None,
+            join_bearer: None,
         };
         assert!(matches!(
             prov.push_enroll(&ep, &enroll_bootstrap("home-deadbeef")),
@@ -1051,6 +1062,7 @@ mod tests {
         let ep = Endpoint {
             host: "203.0.113.7".to_string(),
             overlay_ip: None,
+            join_bearer: Some("minted-bearer".to_string()),
         };
         prov.push_enroll(&ep, &enroll_bootstrap("home-deadbeef"))
             .expect("fake transport ⇒ wiring proven");
