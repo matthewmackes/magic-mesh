@@ -686,7 +686,7 @@ mod tests {
             corrections: vec![mackes_mesh_types::lifecycle::LifecycleCorrectionV1 {
                 check_id: "mesh".into(), step: "mesh".into(), reason: "enroll target".into(),
                 prerequisites: Vec::new(),
-            }], rollback_forbidden: true,
+            }], edges: Vec::new(), rollback_forbidden: true,
         };
         authority.admit_correction_plan(correction).unwrap();
         authority.finish().unwrap();
