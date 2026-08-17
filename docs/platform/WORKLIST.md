@@ -680,8 +680,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
   The RPM lane still requires one mode-0400 private JSON input bound to the
   clean checkout and Maps contract gates are green. Android/Cuttlefish and its
-  former guest-DEB/image inputs are deferred and must be removed from the
-  production schema. Input selection is complete; materialize the choices named
+  former guest-DEB/image inputs are deferred and have been removed from the
+  strict production schema; the hostile loader test rejects stale fields.
+  Input selection is complete; materialize the choices named
   in S1-S6 without another survey or clarification cycle.
   Downstream release epics remain blocked until current receipts pass; the preview cannot be reused.
 - Remaining work:
@@ -729,7 +730,9 @@ behavioral evidence is not completion.
        registry or local bytes are bound to the frozen revision.
      - Done when: App VM inputs and real `curated` catalog pass preflight before
        image-context mutation; fixture IDs and mutable tags refuse.
-  4. S4 Remove Android/Cuttlefish from production input admission.
+  4. S4 Remove Android/Cuttlefish from production input admission. Complete:
+     `release-input-argv.py` admits only the six-role private object and its
+     hostile test rejects every Cuttlefish-bearing release input.
      - Inputs: Android deferral lock, private-object schema, release driver,
        output-plan producer, role collector, CI, and historical fixtures.
      - Action: remove Android/Cuttlefish fields from the `13.0.0` strict input
