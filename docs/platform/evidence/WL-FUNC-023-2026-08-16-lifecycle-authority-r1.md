@@ -1,5 +1,10 @@
 # WL-FUNC-023 lifecycle authority — focused contract and recovery gate
 
+> **HISTORICAL / SUPERSEDED:** This r1 record includes the former caller-selected
+> `--step` and `lifecycle-complete` CLI path. Commit
+> `afa79aade10b56cef0447e5652dd25c22950aa8a` removed both bypasses; current
+> evidence is recorded in `WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`.
+
 - Date: 2026-08-16 UTC
 - Base revision: `daf3c695928e96553fe839450bd86aa6f371e3aa`
 - Working tree: dirty; this evidence covers the lifecycle files listed below

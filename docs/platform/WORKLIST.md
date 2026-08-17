@@ -360,15 +360,15 @@ behavioral evidence is not completion.
 - Problem: setup, enrollment, upgrade, repair, reset, and offboarding are
   fragmented and can leave seats partially active. Seat 15 exposed missing
   identity, etcd, credential, compute, and grouped-service prerequisites.
-- Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed
-  by one resumable mackesd authority for local or fleet onboarding, upgrade,
+- Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: the resumable authority and typed contracts cover locking,
-  readiness, artifact/capsule admission, destructive confirmation, and terminal
+- Current state: the resumable authority and typed contracts cover locking, readiness, artifact/capsule admission, destructive confirmation, and terminal
   evidence. Live leave, decommission, role provisioning, service-add,
   first-desktop, spawn-lighthouse, mesh-dns/network/create, invite/join/found,
   and coordinated-upgrade mutations now acquire that authority. Upgrade
-  execution requires a typed artifact selection or compatibility digest; downstream package, service, enrollment, fleet-offboarding, and full execution evidence remain.
+  execution requires a typed artifact selection or compatibility digest; plans
+  are canonical and no CLI can select or complete steps. Downstream package,
+  service, enrollment, fleet-offboarding, and full execution evidence remain.
   Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
   `evidence/WL-FUNC-023-2026-08-16-bearer-handoff-farm-r1.md`,
   `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; focused authority

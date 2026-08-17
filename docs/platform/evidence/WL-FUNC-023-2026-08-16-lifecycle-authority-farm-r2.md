@@ -96,3 +96,23 @@ MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=1 \
   invalid `cordon`/`drain`/`erase` vocabulary and proves both the Offboard and
   ResetAndOnboard projections validate as `LifecyclePlanV1` values. This does
   not claim lifecycle executor, package, provider, or live-seat completion.
+
+## Unattended lifecycle CLI boundary — 2026-08-17
+
+- Source revision: `afa79aade10b56cef0447e5652dd25c22950aa8a`
+- Farm host/slot: `172.20.0.196` / `1`
+- Command:
+
+  ```text
+  MCNF_BUILD_HOST=172.20.0.196 MCNF_BUILD_SLOT=1 \
+    install-helpers/xcp-build.sh cargo test -p mackesd --bin mackesd \
+    lifecycle_cli_boundary --locked -- --nocapture
+  ```
+
+- Result: `2 passed, 0 failed, 71 filtered out`.
+- The public lifecycle commands now derive all steps from
+  `LifecycleIntentV1::default_steps()`. They reject caller-provided `--step`
+  values and no longer expose `lifecycle-complete`, so a user or renderer cannot
+  claim a side effect completed without an authority-owned executor action.
+  This is a safety boundary only; it does not claim the remaining turnkey
+  provider, package, fleet, or live-seat execution work is complete.
