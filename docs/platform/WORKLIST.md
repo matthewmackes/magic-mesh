@@ -731,9 +731,10 @@ behavioral evidence is not completion.
      - Done when: App VM inputs and real `curated` catalog pass preflight before
        image-context mutation; fixture IDs and mutable tags refuse.
   4. S4 Remove Android/Cuttlefish from production input admission. Complete:
-     `release-input-argv.py` and `release-input-preflight.sh` admit only the
-     six-role private object; hostile loader and preflight tests reject stale
-     Cuttlefish-bearing release inputs.
+     `release-input-argv.py`, `release-input-preflight.sh`, the output
+     producer/collector, and `run-first-full-release.sh` admit only the
+     six-role release set; hostile loader, preflight, plan/collector, and
+     release-resume tests reject stale Cuttlefish-bearing release inputs.
      - Inputs: Android deferral lock, private-object schema, release driver,
        output-plan producer, role collector, CI, and historical fixtures.
      - Action: remove Android/Cuttlefish fields from the `13.0.0` strict input
