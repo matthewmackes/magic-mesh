@@ -491,10 +491,7 @@ impl LifecycleAuthority {
     /// Project the signed-boundary input for an offboarding receipt only after
     /// every declared step has succeeded. Signing is performed by the caller's
     /// governed evidence boundary; this method never invents a signature.
-    pub fn offboarding_receipt(
-        &self,
-        retained_resources: Vec<String>,
-    ) -> Result<OffboardingReceiptV1, LifecycleAuthorityError> {
+    pub fn offboarding_receipt(&self) -> Result<OffboardingReceiptV1, LifecycleAuthorityError> {
         if self.checkpoint.plan.intent != LifecycleIntentKind::Offboard {
             return Err(LifecycleAuthorityError::InvalidTransition("not offboard"));
         }
@@ -510,7 +507,7 @@ impl LifecycleAuthority {
             target_id: self.checkpoint.plan.target_id.clone(),
             generation: self.checkpoint.plan.generation,
             completed: true,
-            retained_resources,
+            retained_resources: Vec::new(),
             signature_hex: String::new(),
         };
         receipt
@@ -782,7 +779,7 @@ mod tests {
         let mut offboard = plan();
         offboard.intent = LifecycleIntentKind::Offboard;
         let mut authority = LifecycleAuthority::begin(root.path(), offboard).unwrap();
-        assert!(matches!(authority.offboarding_receipt(vec![]), Err(LifecycleAuthorityError::InvalidTransition("offboard incomplete"))));
+        assert!(matches!(authority.offboarding_receipt(), Err(LifecycleAuthorityError::InvalidTransition("offboard incomplete"))));
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
         let confirmation = LifecycleConfirmationV1 {
             schema_version: 1,
@@ -798,9 +795,9 @@ mod tests {
         authority.accept_confirmation(confirmation, &signing_key.verifying_key()).unwrap();
         authority.run_next(|_| Ok(())).unwrap();
         authority.run_next(|_| Ok(())).unwrap();
-        let receipt = authority.offboarding_receipt(vec!["history".into()]).unwrap();
+        let receipt = authority.offboarding_receipt().unwrap();
         assert!(receipt.completed);
-        assert_eq!(receipt.retained_resources, vec!["history"]);
+        assert!(receipt.retained_resources.is_empty());
         authority.finish().unwrap();
     }
 

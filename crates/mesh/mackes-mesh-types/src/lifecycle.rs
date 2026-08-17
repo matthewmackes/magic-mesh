@@ -703,7 +703,9 @@ impl OffboardingReceiptV1 {
 
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
         validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id), ("target_id", &self.target_id)])?;
-        if self.retained_resources.len() > 256 || self.retained_resources.iter().any(|item| item.is_empty() || item.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES) {
+        // A completed offboard receipt is an erasure assertion, not a waiver:
+        // any retained reusable state makes the operation incomplete.
+        if !self.completed || !self.retained_resources.is_empty() {
             return Err(LifecycleIntentError::InvalidField("retained_resources"));
         }
         if !self.signature_hex.is_empty()
@@ -814,6 +816,10 @@ mod tests {
 
         let receipt = OffboardingReceiptV1 { schema_version: 1, request_id: "request-1".into(), target_id: "seat-15".into(), generation: 1, completed: true, retained_resources: vec![], signature_hex: String::new() };
         assert!(receipt.validate().is_ok());
+        let retained = OffboardingReceiptV1 { retained_resources: vec!["identity".into()], ..receipt.clone() };
+        assert!(matches!(retained.validate(), Err(LifecycleIntentError::InvalidField("retained_resources"))));
+        let incomplete = OffboardingReceiptV1 { completed: false, ..receipt.clone() };
+        assert!(matches!(incomplete.validate(), Err(LifecycleIntentError::InvalidField("retained_resources"))));
         let signing_key = SigningKey::from_bytes(&[14; 32]);
         assert!(receipt.sign(&signing_key).verify(&signing_key.verifying_key()).is_ok());
         let report = FleetLifecycleReportV1 { schema_version: 1, request_id: "request-1".into(), generation: 1, phase: LifecyclePhase::Succeeded, target_count: 2, succeeded: 2, failed: 1, signature_hex: String::new() };
