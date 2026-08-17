@@ -214,16 +214,10 @@ pub fn lighthouse_add(
         None,
     )?;
     let script = "/usr/libexec/mackesd/do-lighthouse-join";
-    if !std::path::Path::new(script).exists() {
-        println!("{token}");
-        eprintln!(
-            "lighthouse add: the join provisioner ({script}) isn't installed — run it by hand:\n  \
-             do-lighthouse-join.sh '{token}' --region {region}"
-        );
-        return Ok(());
-    }
+    require_lighthouse_provisioner(std::path::Path::new(script))?;
+    use std::io::Write as _;
     let mut cmd = std::process::Command::new(script);
-    cmd.arg(&token).args(["--region", region]);
+    cmd.arg("--token-stdin").args(["--region", region]);
     if let Some(s) = size {
         cmd.args(["--size", &s]);
     }
@@ -233,7 +227,20 @@ pub fn lighthouse_add(
     eprintln!(
         "lighthouse add: provisioning a droplet in {region} that joins this mesh as a lighthouse…"
     );
-    let status = cmd.status().context("running the join provisioner")?;
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("starting the join provisioner")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("join provisioner did not expose a private stdin"))?;
+    stdin
+        .write_all(token.as_bytes())
+        .and_then(|()| stdin.write_all(b"\n"))
+        .context("passing lighthouse enrollment bearer through provisioner stdin")?;
+    drop(stdin);
+    let status = child.wait().context("running the join provisioner")?;
     if !status.success() {
         anyhow::bail!("the join provisioner failed (see output above)");
     }
@@ -249,6 +256,7 @@ pub fn lighthouse_retire(
     droplet_id: Option<String>,
     force: bool,
 ) -> anyhow::Result<()> {
+    let droplet_id = require_lighthouse_droplet_id(droplet_id)?;
     // HA drain gate — use the authoritative etcd member list and a direct,
     // bounded probe of every survivor. Replicated directory rows can be stale
     // and must never authorize a destructive retirement.
@@ -266,31 +274,46 @@ pub fn lighthouse_retire(
     // Decommission + revoke + ban + etcd member-remove (all in remove_peer).
     remove_peer(db_path, node_id, force)?;
     // Delete the droplet LAST (the inverse of `add`'s provision step).
-    if let Some(id) = droplet_id {
-        let ctx = std::env::var("MCNF_DOCTL_CONTEXT").unwrap_or_else(|_| "mackes".to_string());
-        eprintln!("lighthouse retire: deleting droplet {id} via doctl (context {ctx})…");
-        let status = std::process::Command::new("doctl")
-            .args([
-                "compute",
-                "droplet",
-                "delete",
-                &id,
-                "--context",
-                &ctx,
-                "--force",
-            ])
-            .status()
-            .context("running doctl droplet delete")?;
-        if !status.success() {
-            eprintln!("lighthouse retire: doctl droplet delete {id} failed — delete it by hand");
-        }
-    } else {
-        eprintln!(
-            "lighthouse retire: no --droplet-id given; the node is drained + revoked, but the DO \
-             droplet (if any) was NOT deleted — remove it with `doctl compute droplet delete`"
-        );
+    let ctx = std::env::var("MCNF_DOCTL_CONTEXT").unwrap_or_else(|_| "mackes".to_string());
+    eprintln!("lighthouse retire: deleting droplet {droplet_id} via doctl (context {ctx})…");
+    let status = std::process::Command::new("doctl")
+        .args([
+            "compute",
+            "droplet",
+            "delete",
+            &droplet_id,
+            "--context",
+            &ctx,
+            "--force",
+        ])
+        .status()
+        .context("running doctl droplet delete")?;
+    if !status.success() {
+        anyhow::bail!("lighthouse retire: provider deletion failed for droplet {droplet_id}");
     }
     Ok(())
+}
+
+/// A missing packaged provisioner is an automation failure, never an excuse to
+/// print a secret-bearing command for a human to run later.
+fn require_lighthouse_provisioner(path: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        path.is_file(),
+        "lighthouse provisioning helper is unavailable at {}; automatic remediation must restore the packaged helper before retrying",
+        path.display()
+    );
+    Ok(())
+}
+
+/// All production lighthouses are provider-managed.  Require their immutable
+/// provider identity before destructive mutation so an unattended retry knows
+/// exactly what still needs deletion.
+fn require_lighthouse_droplet_id(droplet_id: Option<String>) -> anyhow::Result<String> {
+    let id = droplet_id.ok_or_else(|| anyhow::anyhow!(
+        "lighthouse retirement requires the provider droplet id before drain/revoke; refusing a partial retirement"
+    ))?;
+    anyhow::ensure!(!id.trim().is_empty(), "lighthouse retirement requires a non-empty provider droplet id");
+    Ok(id)
 }
 
 /// A lighthouse droplet must never be deleted after an unconfirmed etcd
@@ -308,7 +331,7 @@ fn ensure_member_removal_succeeded(result: Option<Result<bool, String>>) -> anyh
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_member_removal_succeeded;
+    use super::{ensure_member_removal_succeeded, require_lighthouse_droplet_id, require_lighthouse_provisioner};
 
     #[test]
     fn etcd_member_removal_failures_are_fail_closed() {
@@ -316,5 +339,17 @@ mod tests {
         assert!(ensure_member_removal_succeeded(Some(Ok(false))).is_ok());
         assert!(ensure_member_removal_succeeded(Some(Err("offline".into()))).is_err());
         assert!(ensure_member_removal_succeeded(None).is_err());
+    }
+
+    #[test]
+    fn provider_lighthouse_lifecycle_refuses_manual_handoffs() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(require_lighthouse_provisioner(&temporary.path().join("missing")).is_err());
+        let helper = temporary.path().join("do-lighthouse-join");
+        std::fs::write(&helper, "#!/bin/sh\n").unwrap();
+        assert!(require_lighthouse_provisioner(&helper).is_ok());
+        assert!(require_lighthouse_droplet_id(None).is_err());
+        assert!(require_lighthouse_droplet_id(Some("".into())).is_err());
+        assert_eq!(require_lighthouse_droplet_id(Some("1234".into())).unwrap(), "1234");
     }
 }

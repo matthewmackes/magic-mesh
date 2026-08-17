@@ -64,7 +64,7 @@ fi
 #    pins the role, network-enrolls, brings up nebula + mackesd, auto-joins the
 #    etcd quorum, and installs the CA key when the bearer is lighthouse-scoped.
 log "joining the existing mesh as a lighthouse"
-JOIN_OUT="$(mackesd join "$JOIN_TOKEN" --role lighthouse 2>&1)" \
+JOIN_OUT="$(printf '%s\n' "$JOIN_TOKEN" | mackesd join --role lighthouse 2>&1)" \
     || fail "mackesd join failed: $JOIN_OUT"
 echo "$JOIN_OUT"
 

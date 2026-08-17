@@ -10,7 +10,7 @@
 # (the recurring lighthouse-lockout — 3x observed).
 #
 # Usage:
-#   do-lighthouse-join.sh <join-token> [options]
+#   do-lighthouse-join.sh --token-stdin [options]
 # Options (defaults in []):
 #   --region <r>        DO region            [nyc3]
 #   --size <s>          droplet size slug    [s-1vcpu-1gb]
@@ -20,6 +20,7 @@
 #   --rpm-url <u>       direct thin lighthouse RPM URL (overrides the channel)
 #   --tag <t>           droplet+firewall tag [magic-lighthouse]
 #   --keep-on-fail      don't destroy the droplet if the join fails
+#   --token-stdin       read the one-time join token from standard input
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -32,10 +33,10 @@ REGION="nyc3"; SIZE="$THIN_SIZE"; IMAGE="fedora-43-x64"
 REPO_BASEURL="https://matthewmackes.github.io/magic-mesh"; RPM_URL=""
 TAG="magic-lighthouse"; SSH_KEYS=(); KEEP_ON_FAIL=0
 
-[ $# -ge 1 ] || { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
-JOIN_TOKEN="$1"; shift
+JOIN_TOKEN=""; TOKEN_STDIN=0
 while [ $# -gt 0 ]; do
     case "$1" in
+        --token-stdin) TOKEN_STDIN=1; shift;;
         --region) REGION="$2"; shift 2;;
         --size) SIZE="$2"; shift 2;;
         --image) IMAGE="$2"; shift 2;;
@@ -47,6 +48,10 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option: $1" >&2; exit 1;;
     esac
 done
+
+[ "$TOKEN_STDIN" -eq 1 ] || { echo "refusing join token on argv; use --token-stdin" >&2; exit 1; }
+IFS= read -r JOIN_TOKEN || { echo "missing join token on stdin" >&2; exit 1; }
+[ -n "$JOIN_TOKEN" ] || { echo "empty join token on stdin" >&2; exit 1; }
 
 if [ "$SIZE" != "$THIN_SIZE" ]; then
     echo "lighthouse provisioning only supports the thin $THIN_SIZE profile;" >&2
