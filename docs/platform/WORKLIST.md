@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-16 production 13.0.0 execution
 
-- **8 active epics:** 2 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
+- **9 active epics:** 3 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement the turnkey lifecycle under `WL-FUNC-023`;
   create real release inputs under `WL-REL-006`; re-freeze the exact
@@ -57,7 +57,11 @@ tasks.
   recorded in `docs/platform/evidence/WL-ARCH-008-WL-ARCH-009-WL-ARCH-010-WL-CRIT-007-2026-08-10-dell-churn-release33-r134.md`.
 - **Farm lock:** heavy verification is farm-only; route the longest job to
   BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
-  never run filler tests.
+  never run filler tests. The reproducible Android 14 AOSP/Cuttlefish source
+  build is the sole `13.0.0` exception: run it on one temporary, dedicated
+  KVM-XCP1 builder created only for that use case, export and independently
+  verify its governed artifacts, destroy the builder, then restore the normal
+  `.90` farm lane. BigBoy remains the long-pole host for every non-Android job.
 - **Rollout lock:** for `13.0.0`, prove each release activity on exactly the
   three selected physical seats (Dell, Seat 15, Surface) and the independently
   required lighthouses. The approved
@@ -77,7 +81,7 @@ Implement the unified turnkey seat lifecycle, then cut, self-sign, qualify,
 publish, install, and prove production `magic-mesh-v13.0.0` from one exact clean
 protected-default-branch revision. Produce all seven canonical roles, retain
 fail-closed provenance, require real production evidence, and keep deep live
-acceptance within Seat 15 and Dell.
+acceptance within Seat 15, Dell, and Surface.
 
 ## Service Release Queue
 
@@ -98,6 +102,177 @@ add the stated hostile or regression test; run the stated validation; record the
 revision, command, result, and evidence path; and mark the story complete only
 when the Done when condition is true. A passing compile without the named
 behavioral evidence is not completion.
+
+### WL-REL-007 - Execute the SOL Luna AI production 13.0.0 completion plan
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: the active lifecycle, release-input, source-freeze, build, signing,
+  qualification, evidence, and publication epics form one production release
+  dependency chain, but their cross-epic execution, farm ownership, temporary
+  Android build capacity, and final reconciliation need one explicit governing
+  plan so no blocker is skipped or satisfied with historical fixture evidence.
+- Required outcome: SOL Luna AI coordinates the owning epics to produce,
+  qualify, publish, read back, and archive production
+  `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
+  with exactly seven canonical roles and no fabricated or substituted evidence.
+- Current state: the eight owning epics below contain their product and release
+  acceptance criteria. A historical promotion-forbidden preview and several
+  source-bound receipts exist, but they predate the final lifecycle source and
+  cannot satisfy this plan. Surface is approved for `13.0.0` qualification.
+  Android 14 AOSP/Cuttlefish requires a one-use builder outside BigBoy's normal
+  farm lane; all other long-pole builds remain assigned to BigBoy.
+- Remaining work:
+  1. S1 Establish SOL Luna execution ownership and release ordering.
+     - Inputs: this worklist, governance locks, farm topology, the eight owning
+       epics, and the clean integration branch.
+     - Action: keep one Luna integration authority and use two to five workers
+       only for disjoint lifecycle, surfaces, inputs, Android, and release
+       scopes. Execute `WL-FUNC-023`, `WL-REL-006`, `WL-REL-001`,
+       `WL-REL-002`, `WL-REL-003`, pre-publication `WL-TEST-002`,
+       `WL-REL-004`, `WL-REL-005`, then final `WL-TEST-002` reconciliation.
+     - Deliverable: one dependency/ownership record citing each owning epic and
+       its current exact blocker; this epic must not duplicate their product
+       implementation or acceptance evidence.
+     - Validation: every worker has a disjoint write scope; every mutation and
+       gate maps to one owning story; no parallel tracker or filler farm job is
+       created.
+     - Done when: every ready story has one owner and no downstream story starts
+       before its dependencies are green.
+  2. S2 Complete the unified lifecycle under WL-FUNC-023.
+     - Inputs: `WL-FUNC-023` S1-S18 and its existing authority evidence.
+     - Action: complete the typed lifecycle model, mackesd-only resumable
+       authority, GUI/TUI parity, authorization, commissioning, artifact
+       selection, audit/correction, onboarding, upgrade, warning handling,
+       offboarding, reset, fleet execution, packaging, and first-boot behavior.
+     - Deliverable: all S1-S18 deliverables and focused farm/live evidence owned
+       by `WL-FUNC-023`.
+     - Validation: hostile decode, replay, scope change, interruption, reboot,
+       package, network, stale-generation, and renderer-parity checks pass.
+     - Done when: `WL-FUNC-023` is archived with behavioral evidence and no
+       lifecycle client retains an untyped or parallel mutation path.
+  3. S3 Produce and admit all governed release inputs under WL-REL-006.
+     - Inputs: final integration source candidate, open-source and license
+       policies, Maps and image receipt contracts, Kiron assets, and the
+       authorized release-key identity.
+     - Action: produce the operator-signed OpenStreetMap-derived Buffalo-Niagara
+       Maps bundle clipped to official Erie and Niagara county boundaries;
+       enforce the aggregate 1 GiB quota and deterministic PMTiles/tar.zst
+       transport; regenerate App VM, bootc, and Kiron receipts; build matching
+       Android 14 x86_64 Cuttlefish host/image bytes and current-source guest
+       DEBs; generate the signer receipt; and materialize canonical private
+       mode-0400 preflight inputs outside Git.
+     - Deliverable: immutable, licensed, current-revision receipts, declarations,
+       approvals, signatures, manifests, private argv inputs, and redacted
+       inventory required by canonical release preflight.
+     - Validation: wrong bytes, provider, license, architecture, role, revision,
+       epoch, permissions, links, quota, signature, or path substitution refuse.
+     - Done when: `release-input-preflight.sh` accepts every real production
+       input and no preview fixture or historical receipt is admitted.
+  4. S4 Build Android 14 on a one-use KVM-XCP1 host.
+     - Inputs: the locked Android 14 manifest, KVM-XCP1 capacity, OpenTofu/XAPI
+       authority, and immutable private artifact storage.
+     - Action: drain and stop the normal `.90` VM; create
+       `mcnf-build-android14` on KVM-XCP1 with 4 vCPU, 18 GiB RAM, a 32 GiB root,
+       a dedicated 400 GiB build volume, and bounded 32 GiB swap. Build only the
+       matching `aosp_cf_x86_64_phone-userdebug` image and host package in a
+       digest-pinned environment. If the local SR cannot admit the volume, add a
+       dedicated 400 GiB build SR before starting rather than consuming another
+       farm VM's disk.
+     - Deliverable: matching `cvd-host_package.tar.gz`, image archive, build
+       fingerprint, compatibility identity, image receipt, guest declaration,
+       license inventory, capacity record, and OpenTofu plan/apply record.
+     - Validation: boot the resulting Cuttlefish instance; prove `cvd`, Android
+       boot completion, `adb`, guest package installation, readiness/VDI,
+       input, reconnect, and clean shutdown. Export immutable outputs and verify
+       their hashes from a separate farm host.
+     - Done when: verified outputs are outside the temporary VM, the VM/build
+       volume/swap are destroyed, the destroy record is preserved, and the
+       restored `.90` lane passes normal farm admission. The temporary builder
+       never executes unrelated work or becomes a permanent farm lane.
+  5. S5 Freeze source and cut the seven-role candidate.
+     - Inputs: completed lifecycle and input epics, protected `master`, required
+       GitHub checks, authorized signing material, and Fedora 44 builders.
+     - Action: freeze one clean pushed revision and epoch; regenerate all
+       source-bound inputs for it; build exactly three unsigned RPMs; seal the
+       handoff; sign all three atomically without payload drift; build Browser
+       VM and App VM derivatives; and admit Cuttlefish and bootc.
+     - Deliverable: one immutable private candidate containing exactly
+       Workstation RPM, Server RPM, Lighthouse RPM, Browser VM, App VM,
+       Cuttlefish image, and bootc image.
+     - Validation: BigBoy runs the non-Android long poles; every permanent farm
+       host runs a unique meaningful build or gate; handoff, signature, NEVRA,
+       payload, receipt, manifest, collector, and seven-role hostile checks pass.
+     - Done when: `WL-REL-001`, `WL-REL-002`, and `WL-REL-003` are complete and
+       the unpublished signed candidate binds exactly to the frozen source.
+  6. S6 Qualify the unpublished candidate on production topology.
+     - Inputs: the signed seven-role candidate, Dell, Seat 15, Surface, three
+       lighthouses, provider authority, and corrected-forward recovery identity.
+     - Action: inspect all designated seats, then perform deep acceptance on
+       exactly Dell, Seat 15, and Surface. Publish the red
+       `AI-GENERATED-ALERT` and wait five seconds before every mutation. Upgrade
+       lighthouses one at a time while preserving quorum. Eagle and T480 remain
+       non-gating inspection/deployment-wave seats.
+     - Deliverable: exact installed identity, lifecycle, provider, direct-DRM,
+       Maps, collaboration, media/device, guest-role, Surface-hardware,
+       resilience, privacy-retention, lighthouse, and recovery evidence owned
+       by `WL-TEST-002`.
+     - Validation: tested bytes match the candidate; unavailable capabilities
+       remain honest; every failure recovers by corrected-forward action or
+       re-enrollment, never rollback.
+     - Done when: `WL-TEST-002` S1-S7 pass or reopen one exact owning
+       implementation blocker with no invented success.
+  7. S7 Assemble, sign, publish, and independently read back the release.
+     - Inputs: qualified seven-role candidate, gate matrix, SBOM producers,
+       release key, release notes, GitHub authority, and package repository.
+     - Action: collect exactly seven roles; run all mandatory farm and GitHub
+       gates; generate SBOM, compatibility, provenance, checksums, and evidence;
+       sign the complete envelope; create signed tag
+       `magic-mesh-v13.0.0`; publish the exact asset set; download it into a new
+       directory; and atomically promote signed repository metadata only after
+       clean-room verification.
+     - Deliverable: immutable tag and release, signed seven-role evidence
+       bundle, public asset/readback receipt, and signed package-channel receipt.
+     - Validation: omitted, extra, changed, stale, linked, unsigned, HOLD, or
+       cross-revision files refuse; downloaded bytes reproduce the qualified
+       artifact identities and all three RPM roles resolve from the channel.
+     - Done when: `WL-REL-004` and `WL-REL-005` are archived and public readback
+       agrees exactly with the frozen source and installed candidate.
+  8. S8 Reconcile and archive the complete plan.
+     - Inputs: every owning epic's evidence, public readback, installed
+       acceptance, worklist stewardship rules, and archive dispositions.
+     - Action: complete `WL-TEST-002` S8; map every obligation to evidence, a
+       reopened implementation story, or one exact external-authority blocker;
+       archive every completed owning epic and finally this coordination epic.
+     - Deliverable: final signed acceptance index, release disposition, blocker
+       inventory, and archive entries.
+     - Validation: worklist self-test and lint pass; snapshot counts match; no
+       deferred obligation, private secret, temporary Android resource,
+       abandoned worktree, or parallel tracker remains.
+     - Done when: production `13.0.0` is published and independently verified,
+       all completed epics are removed from the active worklist, and any genuine
+       external blocker names one concrete operator action.
+- Scope: coordination and dependency enforcement for the existing lifecycle and
+  release epics, plus the narrowly authorized temporary Android build capacity.
+  Existing epics remain the sole owners of implementation and acceptance work.
+- Relevant files/components: `docs/platform/WORKLIST.md`, release/farm helpers,
+  OpenTofu farm declarations, lifecycle components, release input producers,
+  packaging, evidence collectors, and publication verifiers.
+- Dependencies: the eight owning epics, authorized signing/publication/provider
+  access, KVM-XCP1 capacity, Dell/Seat 15/Surface access, and three lighthouse
+  targets. Story-level dependencies are enforced in S1-S8 order.
+- Acceptance criteria: one clean source produces exactly seven signed roles;
+  real governed inputs pass preflight; the one-use Android builder leaves no
+  residual resource; production topology passes; signed evidence and public
+  readback agree; no fixture, rollback, filler build, or fabricated proof
+  satisfies a gate.
+- Verification method: worklist lint, focused hostile tests, meaningful gates
+  across all permanent farm hosts, Android live boot proof, exact three-seat and
+  three-lighthouse acceptance, signed evidence verification, clean-room public
+  readback, and repository query.
+- Origin or merged source IDs: operator SOL Luna AI completion plan and
+  Android-only KVM-XCP1 build-host exception (2026-08-16).
 
 ### WL-FUNC-023 - Create the unified ONBOARD & OFFBOARDING lifecycle
 
@@ -707,9 +882,10 @@ behavioral evidence is not completion.
 - Priority: P1
 - Complexity: Epic
 - Problem: exact-release installation, providers, direct-DRM rendering, guest/device integrations, and corrected-forward recovery need live proof.
-- Required outcome: qualify the exact unpublished production candidate on Seat
-  15 and Dell, prove Eagle and three-lighthouse topology, then verify the same
-  bytes after WL-REL-005 publication.
+- Required outcome: qualify the exact unpublished production candidate on Dell,
+  Seat 15, and Surface, prove the three-lighthouse topology, then verify the
+  same bytes after WL-REL-005 publication. Eagle and T480 remain non-gating
+  inspection/deployment-wave seats.
 - Current state: pre-release harnesses pass; candidate qualification is blocked on the current-source seven-role candidate and real production inputs.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
@@ -764,7 +940,9 @@ behavioral evidence is not completion.
 - Scope: exact-release admission, exactly Dell, Seat 15, and Surface as physical proof seats, providers, direct DRM, media/devices, guests, resilience, and reconciliation.
 - Relevant files/components: docs/platform/release-evidence, install-helpers release/live/recovery verifiers,
   packaging installed-identity tools, direct-DRM capture helpers, and archived epic dispositions.
-- Dependencies: WL-REL-005, authorized provider inputs, selected Dell/Seat 15/Surface hardware, and the three-seat `13.0.0` qualification lock.
+- Dependencies: WL-REL-003 for unpublished-candidate S1-S7; WL-REL-005 for
+  post-publication S8; authorized provider inputs, selected Dell/Seat 15/Surface
+  hardware, and the three-seat `13.0.0` qualification lock.
 - Acceptance criteria: tested bytes match the signed release; states remain honest; recovery is corrected-forward; every deferred proof is reconciled.
 - Verification method: focused farm gates followed by exact installed three-seat live checks on Dell, Seat 15, and Surface with redacted evidence and independent readback.
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
