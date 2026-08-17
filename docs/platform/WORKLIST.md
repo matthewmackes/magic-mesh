@@ -368,7 +368,7 @@ behavioral evidence is not completion.
   evidence. Live leave, decommission, role provisioning, service-add,
   first-desktop, spawn-lighthouse, mesh-dns/network/create, invite/join/found,
   and coordinated-upgrade mutations now acquire that authority. Upgrade
-  execution requires a typed artifact selection or compatibility digest; downstream package, service, enrollment, renderer, fleet-offboarding, and full execution evidence remain.
+  execution requires a typed artifact selection or compatibility digest; downstream package, service, enrollment, fleet-offboarding, and full execution evidence remain.
   Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
   `evidence/WL-FUNC-023-2026-08-16-bearer-handoff-farm-r1.md`,
   `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; focused authority

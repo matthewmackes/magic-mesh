@@ -77,3 +77,22 @@ MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=1 \
   action argv contracts.
 - This closes local S4 contract coverage only; installed/live acceptance and
   physical-seat proof remain outside this evidence.
+
+## Canonical renderer plan follow-up — 2026-08-17
+
+- Source revision: `6b23a8488631329bfd355d5909a34fa07b3214b9`
+- Farm host/slot: `172.20.0.196` / `1`
+- Command:
+
+  ```text
+  MCNF_BUILD_HOST=172.20.0.196 MCNF_BUILD_SLOT=1 \
+    install-helpers/xcp-build.sh cargo test -p mde-enroll lifecycle_controller \
+    --locked -- --nocapture
+  ```
+
+- Result: `1 passed, 0 failed, 35 filtered out` after a cold 3m51s build.
+- `LifecycleController` now derives each GUI/TUI plan from the bounded
+  `LifecycleIntentV1::default_steps()` contract. This removes its untyped,
+  invalid `cordon`/`drain`/`erase` vocabulary and proves both the Offboard and
+  ResetAndOnboard projections validate as `LifecyclePlanV1` values. This does
+  not claim lifecycle executor, package, provider, or live-seat completion.
