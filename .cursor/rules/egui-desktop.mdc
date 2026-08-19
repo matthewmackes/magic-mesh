@@ -1,0 +1,54 @@
+---
+description: Construct/Car egui desktop locks — shared Style, no compositor, layered tiers, Browser-VM boundary. Apply when editing shell, panels, or mde-egui.
+globs: crates/desktop/**/*.rs,crates/shared/mde-egui/**/*.rs
+alwaysApply: false
+---
+
+# egui desktop (Construct / Car)
+
+Toolkit is **egui** via **eframe** on the shared `mde-egui` DRM/GBM + libinput
+harness. There is no Wayland compositor and no native host app. Surfaces are
+panels inside the one shell (`mde-shell-egui`), not separate clients.
+
+## Look source
+
+Use `mde-egui` `Style` / `Motion` / `Fonts` / `widgets`. Do not hand-roll
+colors, durations, or hover text.
+
+```rust
+// BAD — style leak (fails install-helpers/lint-style-leaks.sh)
+ui.colored_label(Color32::from_rgb(0x39, 0x39, 0x39), "Peers");
+ui.animate_bool_with_time(id, open, 0.12);
+
+// GOOD — shared tokens
+ui.colored_label(style.text_secondary, "Peers");
+let t = motion.animate_bool(ui, id, open);
+```
+
+Run `install-helpers/lint-style-leaks.sh` after UI edits. New glyphs go through
+the shared icon registry (`lint-carbon-icon-registry.py`).
+
+## Interface locks
+
+- Exactly two interfaces: **Construct** and **Car**
+  (`docs/design/platform-interfaces.md`).
+- Construct taskbar is full-width, 48px, icon-only Start/Search + Back + Home,
+  user-managed centered pins, placement control on the right. Start opens
+  Front Door search — not a Start menu. Do not add tray flyouts or a second
+  launcher.
+- Icon V2: app/service/role icons are simple linework, ≤3 product colors, no
+  plates. Toolbar/action/status icons stay monochrome and semantic-colored.
+- Motion lives in `mde-egui` (MOTION-DRM). No per-widget timing literals.
+- Accessibility is deferred for the 12.0 cutover — not a DoD gate.
+
+## Boundaries
+
+- Guest Chromium owns Browser chrome. Construct styles only
+  connection / unavailable / diagnostic frames around the typed `browser-vm`
+  session. Do not wrap or restyle guest pixels.
+- New UI is glue over existing crates. Shell must not depend outward
+  (`lint-layered-tiers.sh`).
+- Do not polish or revive iced / libcosmic / `mde-workbench` code.
+
+Visual `/preview` captures are optional and never a blocker. GUI/runtime claims
+need farm verification or an explicit note that live hardware was unavailable.

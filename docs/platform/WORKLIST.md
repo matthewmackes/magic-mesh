@@ -5,9 +5,9 @@ runbooks, and operator notes are inputs, not parallel trackers. Historical
 implementation diaries remain in docs/worklist-archive/ and are not executable
 tasks.
 
-## Current Snapshot - 2026-08-17 fully automated production 13.0.0 execution
+## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **9 active epics:** 3 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 12 `Remaining`, 7 `Blocked`, 0 `Needs clarification`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -19,8 +19,15 @@ tasks.
   `WL-TEST-002`; complete the final signed evidence envelope under
   `WL-REL-004`; then publish and read back under `WL-REL-005`. If source changes
   after input generation begins, invalidate the source-bound receipts and
-  repeat input admission; never solve the dependency by weakening source
+  repeat input   admission; never solve the dependency by weakening source
   binding.
+- **Feature-completion lane (2026-08-19):** `WL-FUNC-024` through `WL-FUNC-033`
+  close the remaining gap between implementation-complete and fit for purpose —
+  the Communications parity-ledger rulings that never landed, the Calls media
+  plane, and the operator-flagged legacy mesh-PBX retirement. They are
+  implementation-only, disjoint from the release chain, carry no new testing or
+  security-control scope, and are pre-freeze source work executable in parallel
+  by disjoint workers under the non-stall contract.
 - **Single-authority lock:** typed Workload operations are the only VM/container
   lifecycle API; mackesd is the only daemon authority; mde-bus is the only
   platform bus; the shell renders typed bounded projections and sends typed
@@ -1134,502 +1141,519 @@ behavioral evidence is not completion.
 - Verification method: focused farm gates followed by exact installed three-seat live checks on Dell, Seat 15, and Surface with redacted evidence and independent readback.
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
 
-## Core Architecture
+## Feature Completion
 
+These epics close the remaining gap between implementation-complete and fit
+for purpose: the Communications parity-ledger rulings that never landed, the
+Calls media plane, and the operator-flagged legacy mesh-PBX retirement. They
+are implementation-only and disjoint from the release chain; each rides the
+story execution contract above.
 
-## User Interface And Experience
+### WL-FUNC-024 - Carry live audio and video media in Communications Calls
 
-### WL-UX-009 evidence disposition — Editor large-text menubar correction (2026-08-02)
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: Communications Calls ships the complete call UI and convergent
+  command set, but every transport seam is a marked media-plane follow-up: no
+  audio or video ever flows, so the workgroup's calls product cannot make a
+  call.
+- Required outcome: a call started from the Calls UI carries live audio (and
+  offered video) between seats over WebRTC P2P, group calls ride an elected
+  LiveKit SFU with P2P failover, and PSTN legs terminate through the LiveKit
+  SIP gateway reusing the mde-voice-hud softphone, with all media state owned
+  by typed mackesd verbs and never by the renderer.
+- Current state: `crates/desktop/mde-collab-egui/src/calls.rs` records
+  mute/DTMF/camera/screen intent as honest local view state behind in-code
+  media-plane markers; call signaling already converges through the collab
+  command/store. The proven softphone account machinery (`VoiceAccounts`,
+  `run_agent_accounts`, `lift_if_legacy` in
+  `crates/services/mde-voice-hud/src/sip.rs`) is unused by the surface.
+- Remaining work: execute S1-S6 in order; change only owned components; record
+  deliverable, farm command, result, revision, and evidence per story.
+  1. S1 Add the typed media contracts.
+     - Inputs: mde-collab-types versioning conventions and the calls.rs command
+       set.
+     - Action: add `MediaSessionV1`, `MediaTrackKind`, and
+       `MediaSessionStateV1` (covering device-absent, permission-denied,
+       reconnecting, and failed) to `crates/shared/mde-collab-types/`.
+     - Deliverable: bounded versioned contracts consumed by worker and UI.
+     - Validation: hostile decode, version, and size coverage in the crate
+       suite.
+     - Done when: no media fact crosses the Bus as untyped JSON.
+  2. S2 Implement the mackesd media worker for WebRTC P2P.
+     - Inputs: the collab signaling topics and seat audio capture/playback.
+     - Action: one worker negotiates offer/answer over the existing signaling,
+       binds the seat audio device, and publishes
+       `state/calls/media/<session>` readiness.
+     - Deliverable: one-to-one audio calls between two seats.
+     - Validation: the loopback/chirp fixture proves frames flow; device
+       absence and permission denial publish typed unavailable states.
+     - Done when: mute and DTMF act on the live leg.
+  3. S3 Add the elected LiveKit SFU path for group calls.
+     - Inputs: the existing leader/lighthouse election machinery.
+     - Action: elect the SFU host, join group sessions through it, and fail
+       back to P2P when no SFU is healthy.
+     - Deliverable: group calls with an honest SFU-degraded fallback.
+     - Validation: SFU loss mid-call renegotiates without a fake connected
+       state.
+     - Done when: a three-seat group call carries audio with election
+       evidence.
+  4. S4 Terminate PSTN legs through the LiveKit SIP gateway.
+     - Inputs: `VoiceAccounts`, `run_agent_accounts`, `lift_if_legacy` (the
+       Q15 ruling), and the gateway configuration from WL-FUNC-030.
+     - Action: drive the split/shared-outbound-aware agent path, lift flat
+       legacy accounts once, and bridge gateway legs into calls.
+     - Deliverable: outbound and inbound PSTN calls from the Calls UI.
+     - Validation: a legacy flat account lifts once; split accounts never
+       double-register.
+     - Done when: a governed provider credential completes a PSTN leg, or the
+       absent provider stays visibly unavailable.
+  5. S5 Bind the Calls UI to the live plane.
+     - Inputs: the S1-S4 topics and states plus the calls.rs marked seams.
+     - Action: route `SendDtmf` and `SetCallMuted` to the live sender,
+       enumerate real devices, attach and detach camera and screen tracks,
+       and delete every media-plane follow-up marker.
+     - Deliverable: the existing call bar drives real media.
+     - Validation: no marker remains; every control has an observable media
+       effect or an honest unavailable state.
+     - Done when: calls.rs carries no recorded-intent-only path.
+  6. S6 Failure honesty and recovery.
+     - Inputs: the S2-S5 states.
+     - Action: peer drop, SFU unreachable, device unplug, and permission
+       revocation each walk the typed reconnecting/failed ladder with an
+       operator-visible reason.
+     - Deliverable: bounded auto-reconnect plus a manual re-dial affordance.
+     - Validation: forced-drop fixtures land on the typed states, never a
+       stuck connected state.
+     - Done when: every failure mode names its state and recovery in
+       evidence.
+- Scope: collab-types contracts, one mackesd media worker, mde-voice-hud
+  account driving, and the calls.rs bindings. No new security subsystem and
+  no new consent surface; existing mesh trust and call consent apply.
+- Relevant files/components: `crates/desktop/mde-collab-egui/src/calls.rs`,
+  `crates/shared/mde-collab-types/`,
+  `crates/services/mde-voice-hud/src/sip.rs`,
+  `crates/mesh/mackesd/src/workers/`.
+- Dependencies: WL-FUNC-030 for the operator-facing gateway configuration the
+  PSTN leg consumes.
+- Acceptance criteria: two seats complete an audio call with objective tone
+  correlation, mute and DTMF act on the live leg, a group call rides the SFU,
+  a PSTN leg lands through the gateway, and every failure renders a typed
+  honest state.
+- Verification method: focused per-crate farm gates plus the existing audio
+  chirp-correlation fixture on the qualification seats; evidence under
+  docs/platform/evidence/.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q11/Q15 and the
+  calls.rs media-plane follow-up markers.
 
-The shared `MenuBar` correction is accepted for the Editor Light/Largest
-direct-DRM slice. The constrained nested editor pane now uses an explicit
-two-row layout with a single-line horizontally scrollable menu strip, keeping
-`Help`, formatting controls, the document body, status row, details rail, and
-taskbar visible without accidental vertical expansion. Farm evidence is
-`mde-egui` 269/269 and `mde-editor-egui` 407/407; Dell `.138` ran payload
-`4808bd30bfa72ab386056cd1ecbc4d6aac0251a144609aedcee3e209b8dc888c` with an
-active zero-restart service. Accepted proof:
-`evidence/WL-UX-009-2026-08-02-138-editor-light-largest-4808bd30.png`,
-SHA-256 `b1e0bafea6d63cd88f0979d11024da56a05611115f1e8ee52bbc4c19035371cb`.
-This is a closed validation slice, not closure of WL-UX-009 or a production
-readiness claim; the full current-payload route/profile matrix and remaining
-hardware/boundary evidence are still required.
+### WL-FUNC-025 - Surface the full Files POSIX operation set
 
-- Proof-route follow-up (2026-08-02): the explicit Files direct-DRM proof route
-  is reasserted at shell construction and frame entry, but the live readback
-  still lands on the Auto/clock surface after later automatic navigation drains.
-  Add one final proof-only route assertion immediately before central workspace
-  rendering, preserve ordinary navigation behavior, farm-test the route seam,
-  and recapture the Files/Airsonic evidence before accepting the slice. This is
-  a route-harness correction only; no readiness claim follows from it.
-- Farm-integrity finding (2026-08-02): the current release source cannot compile
-  the existing This Node hostile-fixture test because a JSON `\\u0000` escape is
-  interpreted by Rust as an invalid source escape. Convert only that fixture to
-  Rust's braced Unicode escape form, rerun the release build and focused test,
-  and keep all visual/readiness claims open until the exact candidate is proven.
-- Farm-integrity resolution (2026-08-02): the synchronized farm source already
-  contains the braced `\\u{0000}` fixture form; the stale first release sync was
-  discarded. The rerun release build on BigBoy completed successfully and
-  produced exact payload `b888b0d163de8369b554569d5a75f3f17f257d8581f1e2558d14a3d479435f0c`.
-- Proof-route resolution (2026-08-02): after the approved temporary
-  `require_login_at_boot:false` proof fixture, exact candidate `b888b0d1…` on
-  `.138` rendered the explicit Files route rather than the boot curtain. Visual
-  inspection accepts the shared `FILES` frame, complete ten-action NODE ACTIONS
-  inventory, reachable mesh peer, and `Airsonic upload · Music-owned` action;
-  PNG SHA-256 is `64be0f4af1cdf26ecfc66e96172cf76a6234b64caed7b842fe2fec9c31e3b329`
-  in the DRM evidence ledger. The temporary unlock, candidate binary, and proof
-  drop-in were removed; `.138` is restored to payload `20955383…`,
-  `require_login_at_boot:true`, Dark/Construct/Default/Normal, active service,
-  and zero recorded restarts. This closes only the Files/Airsonic proof-route
-  slice; Dell adoption, the remaining matrix, strict linear scanout, and
-  WL-UX-009 readiness remain open.
-- Car Light palette implementation slice (2026-08-02): the Car profile currently
-  installs `AutoSync3` as the whole egui scheme, so the Auto Mode dashboard cannot
-  honor a persisted Light choice even though its cards use shared palette tokens.
-  Preserve AutoSync3's vehicle-specific accents/skin while pass-through rendering
-  the persisted Dark/Light surface palette to AutoHome. Add a focused Light-vs-Dark
-  render contract, farm-test it, then recapture exact current-payload Car Light /
-  Largest direct-DRM frames on both seats before accepting the open cell.
-- Car Light palette resolution (2026-08-02): candidate
-  `e30f36cd562f729f91620ef3842827190bbf3b055bcd8126072630d1dedcd0ee` passed
-  the focused Car suite 14/14. Visually accepted native Light/Largest Auto Mode
-  frames were captured on `.138` (1920x1080,
-  `79355ca02ed2a8086d0f9cd14dcfa411233e1aad46f8496ab0b885f9c781332b`) and
-  Dell `.225` (1366x768,
-  `39361bc641021fd0ed4e5ec7c4dd92b86343d944c5ce2bab3432c2feffa4dcbb`), with
-  Light surface ground/cards and AutoSync3 accents. Both seats were restored to
-  payload `20955383…`, secure Dark/Construct/Default/Normal, active service,
-  zero restarts, and no proof drop-in. The proof-only logical-width override
-  intentionally leaves each PNG at native physical dimensions while bounding
-  content to the requested 800 logical-pixel viewport. This closes the Car
-  Light/Largest narrow palette cell; strict linear scanout, the remaining
-  route/profile matrix, and WL-UX-009 readiness remain open.
-- Dell Terminal narrow recapture (2026-08-02): validate the current release
-  candidate `e30f36cd…` on Dell `.225` for Terminal Dark desktop, Dark narrow
-  (`800` logical width), Light desktop, and Light/Largest narrow. Inspect the
-  full `TERMINAL` identity, command/session controls, taskbar contrast, and
-  bounded body; accept only visually complete frames and restore secure seat
-  state afterward.
-- Dell Terminal recapture resolution (2026-08-02): candidate `e30f36cd…` on
-  Dell `.225` passed visual inspection for Dark desktop, Dark narrow (`800`
-  logical), Light desktop, and Light/Largest narrow. The full `TERMINAL`
-  identity, menu/session controls, taskbar contrast, and bounded body are
-  present; the earlier `TER…` interpretation is superseded. Evidence hashes
-  are recorded in the DRM ledger. Dell was restored to payload `20955383…`,
-  secure Dark/Construct/Default/Normal, active service, zero restarts, and no
-  proof drop-in. This closes the Dell Terminal visual slice only; the remaining
-  route/profile matrix, VDI guest readiness, strict linear scanout, and
-  WL-UX-009 readiness remain open.
-- Dell Editor current-candidate recapture (2026-08-02): validate candidate
-  `e30f36cd…` on Dell `.225` for Editor Dark desktop, Dark narrow (`800`
-  logical width), Light desktop, and Light/Largest narrow. Inspect direct-entry
-  sidebar collapse, the shared `EDITOR` identity, internal menu/toolbar
-  reachability, document/status/details geometry, and taskbar contrast; accept
-  only complete frames and restore secure seat state afterward.
-- Dell Editor recapture resolution (2026-08-02): candidate `e30f36cd…` on
-  Dell `.225` passed visual inspection for Dark desktop, Dark narrow (`800`
-  logical), Light desktop, and Light/Largest narrow. Direct-entry sidebars are
-  collapsed; the Mesh Teams editor host chrome, editor toolbar/menu, document,
-  status/details geometry, and taskbar remain bounded. Evidence hashes are in
-  the DRM ledger; no guest/VDI pixels are claimed. Dell was restored to payload
-  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
-  restarts, and no proof drop-in. This closes the Dell Editor visual slice only;
-  the remaining route/profile matrix, guest VDI readiness, strict linear
-  scanout, and WL-UX-009 readiness remain open.
-- Dell Files and Mesh Teams recapture (2026-08-02): validate candidate
-  `e30f36cd…` on Dell `.225` for Files and Mesh Teams across Dark desktop, Dark
-  narrow (`800` logical width), Light desktop, and Light/Largest narrow. Inspect
-  Files' complete ten-action node inventory and sync/status lanes, plus Mesh
-  Teams' shared identity strip, channel/app rails, and bounded body. Accept
-  only visually complete frames and restore secure seat state after the batch.
-- Mesh Teams Light contrast finding (2026-08-02): Dell `.225` current-candidate
-  Mesh Teams Dark desktop and Dark narrow are readable, but Light desktop and
-  Light/Largest narrow render Activity/body and rail copy with the Dark
-  `TEXT`/`TEXT_DIM` values under the Light surface, producing washed-out,
-  low-contrast content. Reject both Light cells; resolve Mesh Teams-owned text
-  tokens through the shared runtime palette, add a Light render assertion, farm
-  test, and recapture Dell before accepting the route.
-- Mesh Teams Light contrast resolution (2026-08-02): candidate
-  `ae51c12447c342aa9457e7db148cdb046595eeb533463a731b712cd1b1bb0236` maps the
-  Activity and frame-owned text tokens through the shared runtime palette;
-  BigBoy `mde-collab-egui --lib` passed 130/130, including an explicit
-  Light-mode render assertion for Activity and Mesh Teams rail text. Dell Light desktop and
-  Light/Largest narrow frames were recaptured after the normal page crossfade
-  settled and visually accepted; their hashes and links are in the DRM ledger.
-  The earlier transition frames remain rejected diagnostic evidence. Dell was
-  restored to payload `20955383…`, secure Dark/Construct/Default/Normal,
-  active service, zero restarts, and no proof drop-in. This closes only the
-  Dell Files/Mesh Teams visual slice and Mesh Teams Light contrast finding;
-  VDI guest readiness, strict linear scanout, the remaining matrix, and
-  WL-UX-009 readiness remain open.
-- VDI guest endpoint audit (2026-08-02): a fresh read-only probe of enrolled
-  validation seats `.15`, `.138`, `.145`, and Dell `.225` found no open RDP,
-  VNC, SPICE/VDI, or Sunshine endpoint on the approved validation ports.
-  The approved boundary remains documented, but no guest framebuffer, guest
-  input, or VDI readiness claim is made; retain this as an external-state
-  evidence gap rather than styling the guest surface or claiming readiness.
-- Current candidate Car matrix recapture (2026-08-02): validate exact release
-  `ae51c124…` on both direct-DRM seats for Car Light/Largest narrow after the
-  AutoHome palette resolution. Confirm the AutoSync3 vehicle skin remains
-  intact while the persisted Light surface palette is honored; accept only
-  complete, readable cockpit frames and restore secure seat state afterward.
-- Current candidate Car matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed Car Light/Largest narrow on `.138` and Dell `.225`.
-  Both direct-DRM frames show the complete Auto Mode cockpit, Light surface
-  palette, preserved AutoSync3 accents, and bounded large-text cards; hashes
-  and links are in the DRM ledger. Both seats were restored to payload
-  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
-  restarts, and no proof drop-in. This closes only the Car cell; strict linear
-  scanout, VDI guest readiness, the remaining matrix, and WL-UX-009 readiness
-  remain open.
-- Current candidate Files matrix recapture (2026-08-02): validate exact
-  release `ae51c124…` on `.138` and Dell `.225` for Files Dark desktop, Dark
-  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
-  Confirm the complete node-action inventory, peer/status lanes, file list,
-  preview boundary, and transfer status remain readable; restore secure seat
-  state after capture and accept only inspected frames.
-- Current candidate Files matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed Files Dark desktop, Dark narrow (`800`), Light desktop,
-  and Light/Largest narrow on both `.138` and Dell `.225`. All frames show the
-  complete ten-action node inventory, peer/status lanes, file list, preview
-  boundary, and transfer/status strip without clipping or overlap; hashes and
-  links are in the DRM ledger. Both seats were restored to payload `20955383…`,
-  secure Dark/Construct/Default/Normal, active service, zero restarts, and no
-  proof drop-in. This closes only the exact-candidate Files slice; strict
-  linear scanout, VDI guest readiness, the remaining matrix, and WL-UX-009
-  readiness remain open.
-- Current candidate Editor matrix recapture (2026-08-02): validate exact
-  release `ae51c124…` on `.138` and Dell `.225` for Editor Dark desktop, Dark
-  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
-  Confirm direct-entry sidebar collapse, shared Editor identity, internal
-  menu/toolbar reachability, document/status/details geometry, and taskbar
-  contrast; restore secure seat state and accept only inspected frames.
-- Current candidate Editor matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed Editor Dark desktop, Dark narrow (`800`), Light desktop,
-  and Light/Largest narrow on both `.138` and Dell `.225`. Direct-entry
-  sidebars are collapsed and the shared Editor identity, menu/toolbar,
-  document body, status row, details rail, and taskbar remain bounded; hashes
-  and links are in the DRM ledger. Both seats were restored to payload
-  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
-  restarts, and no proof drop-in. This closes only the exact-candidate Editor
-  slice; strict linear scanout, VDI guest readiness, the remaining matrix, and
-  WL-UX-009 readiness remain open.
-- Current candidate Terminal matrix recapture (2026-08-02): validate exact
-  release `ae51c124…` on `.138` and Dell `.225` for Terminal Dark desktop,
-  Dark narrow (`800` logical width), Light desktop, and Light/Largest narrow.
-  Confirm the complete TERMINAL identity, menu/session controls, shell body,
-  taskbar contrast, and bounded narrow layout; restore secure seat state and
-  accept only inspected frames.
-- Current candidate Terminal matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed Terminal Dark desktop, Dark narrow (`800`), Light desktop,
-  and Light/Largest narrow on both `.138` and Dell `.225`. The complete
-  `TERMINAL` identity, menu/session controls, shell body, taskbar, and bounded
-  narrow layout remain readable; hashes and links are in the DRM ledger. Both
-  seats were restored to payload `20955383…`, secure Dark/Construct/Default/
-  Normal, active service, zero restarts, and no proof drop-in. This closes only
-  the exact-candidate Terminal slice; strict linear scanout, VDI guest
-  readiness, the remaining matrix, and WL-UX-009 readiness remain open.
-- Current candidate This Node matrix recapture (2026-08-02): validate exact
-  release `ae51c124…` on `.138` and Dell `.225` for This Node Dark desktop,
-  Dark narrow (`800` logical width), Light desktop, and Light/Largest narrow.
-  Confirm the unified node navigation, health-score/status hierarchy, device
-  and local-operations body, large-text scroll boundary, and taskbar remain
-  readable and bounded; restore secure seat state and accept only inspected
-  frames.
-- Current candidate This Node matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed This Node Dark desktop, Dark narrow (`800`), Light desktop,
-  and Light/Largest narrow on both `.138` and Dell `.225`. Unified node
-  navigation, status/health hierarchy, device/local-operations body,
-  large-text continuation, and taskbar remain readable and bounded; hashes and
-  links are in the DRM ledger. Both seats were restored to payload
-  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
-  restarts, and no proof drop-in. This closes only the exact-candidate This
-  Node slice; strict linear scanout, VDI guest readiness, the remaining matrix,
-  and WL-UX-009 readiness remain open.
-- Current candidate Phones matrix recapture (2026-08-02): validate exact
-  release `ae51c124…` on `.138` and Dell `.225` for Phones Dark desktop, Dark
-  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
-  Confirm the shared title/header, pairing status, tabs, feature and
-  remote-input controls, and bounded large-text body; restore secure seat state
-  and accept only inspected frames.
-- Current candidate Phones matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed Phones Dark desktop, Dark narrow (`800`), Light desktop,
-  and Light/Largest narrow on both `.138` and Dell `.225`. The shared title,
-  pairing state, tabs, feature and remote-input controls, and large-text body
-  remain readable and bounded; hashes and links are in the DRM ledger. Both
-  seats were restored to payload `20955383…`, secure Dark/Construct/Default/
-  Normal, active service, zero restarts, and no proof drop-in. This closes only
-  the exact-candidate Phones slice; strict linear scanout, VDI guest readiness,
-  the remaining matrix, and WL-UX-009 readiness remain open.
-- Current candidate Media matrix recapture (2026-08-02): validate exact
-  release `ae51c124…` on `.138` and Dell `.225` for Media Dark desktop, Dark
-  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
-  Confirm the shared MEDIA identity/menu, source tabs, local/Jellyfin controls,
-  honest empty-source state, and taskbar remain readable and bounded; restore
-  secure seat state and accept only inspected frames.
-- Current candidate Media matrix resolution (2026-08-02): exact candidate
-  `ae51c124…` passed Media Dark desktop, Dark narrow (`800`), Light desktop,
-  and Light/Largest narrow on both `.138` and Dell `.225`. The shared MEDIA
-  identity/menu, source tabs, local/Jellyfin controls, honest empty-source
-  state, and taskbar remain readable and bounded; hashes and links are in the
-  DRM ledger. Both seats were restored to payload `20955383…`, secure
-  Dark/Construct/Default/Normal, active service, zero restarts, and no proof
-  drop-in. This closes only the exact-candidate Media slice; strict linear
-  scanout, VDI guest readiness, the remaining matrix, and WL-UX-009 readiness
-  remain open.
-- Current candidate Maps matrix recapture (2026-08-02): validate exact release
-  `ae51c124…` on `.138` and Dell `.225` for Maps Dark desktop, Dark narrow
-  (`800` logical width), Light desktop, and Light/Largest narrow. Confirm the
-  governed map-content palette, health/alert rail, FAB lane, empty-state panel,
-  and taskbar remain readable and separated; restore secure seat state and
-  accept only inspected frames.
-- Current candidate Maps matrix finding (2026-08-02): Dell `.225` Maps
-  Light/Largest narrow (`800` logical width) remains rejected because native
-  inspection shows the lower red alert pill clipped at the application
-  viewport boundary above the taskbar. Evidence is recorded in the DRM
-  ledger at `docs/platform/WL-UX-009-DRM-EVIDENCE-2026-07-31.md` with proof
-  SHA `cc3c01404c1d96ace43d2cc68cb2fa843339a58b31f8144b545750497f3ddd96`.
-  Keep this item open for a layout fix and a fresh direct-DRM recapture; do
-  not claim Maps matrix closure or WL-UX-009 readiness.
-- Maps alert-stack remediation (2026-08-02): update the Drive HUD's alert
-  placement to reserve a bottom-safe viewport margin before painting multiple
-  large-text status pills. Add geometry coverage for the Dell narrow profile,
-  then rebuild and recapture the rejected `.225` Light/Largest Maps cell on
-  direct DRM before changing its worklist disposition. Resolution evidence:
-  focused Maps tests pass 274/274; candidate `b75e395a…` was recaptured on
-  Dell direct DRM as `a52e044e00e6ba7cc4e305d7b97b8263e45f851b42817431a46288130c2f3b1a`.
-  The two large-text status pills are fully visible above the taskbar, and the
-  redundant no-data card is suppressed only in the combined no-fix/offline-
-  blocked state. The seat was restored to the secure baseline. This resolves
-  the recorded clipping finding; strict linear scanout, the remaining route /
-  profile matrix, VDI guest readiness, and overall WL-UX-009 readiness remain
-  open.
-- Build-integrity blocker resolved (2026-08-02): reconciled the This Node
-  `show_section_detail` call/definition after the application continuity slice;
-  the focused BigBoy suite now compiles and passes 44/44. Live Maps proof
-  remains blocked independently by the recorded narrow-layout finding below.
-- Local services continuity update (2026-08-02): This Node's Services detail
-  now folds a fixed, read-only local systemd failure provider alongside the
-  existing mesh-published daemon health. The provider runs off the render
-  thread, caps output at 32 unit names, treats systemd absence/refusal as an
-  explicit unavailable state, and keeps restart behind the typed Actions
-  confirmation/audit/recovery boundary. The focused BigBoy This Node suite
-  passes 40/40; physical GUI recapture remains open.
-- Printers/peripherals continuity update (2026-08-02): the durable Printers &
-  Peripherals route now consumes a fixed, read-only local CUPS `lpstat` probe,
-  bounded to 16 sanitized printer names plus local status/default evidence.
-  Missing or refused CUPS remains explicitly unavailable; printer jobs,
-  queues, USB authorization, and dock mutation remain outside the route until
-  typed confirmation/audit/recovery providers exist. The focused BigBoy This
-  Node suite passes 41/41; physical peripheral proof remains hardware-gated.
-- Firewall posture continuity update (2026-08-02): Security & Privacy now
-  consumes a fixed, off-render-thread firewalld `--state` observation and
-  distinguishes running, not-running, unavailable, and unknown-provider
-  states. Zone/rule detail, encryption, broader security policy, and firewall
-  mutation remain explicitly unavailable; the UI does not infer a general
-  security posture from one firewalld probe. The focused BigBoy This Node suite
-  passes 42/42; physical security-policy evidence remains open.
-- Remote-access continuity update (2026-08-02): Virtualization & Remote Access
-  now reuses the durable System Remote Proofing policy and derived
-  Sunshine/Moonlight/VNC service plan in the This Node detail route. It exposes
-  bounded enablement, bind scope, firewall policy, capture/encoder, frame
-  target, local approval, indicator, input, fallback, and provider warnings;
-  lifecycle and trusted-session mutations remain owned by the existing System/
-  VDI authorities. Catalog tests pass 9/9 and focused This Node tests pass
-  42/42 on BigBoy.
-- Backup posture continuity update (2026-08-02): Backup & Restore now reads
-  metadata for the existing encrypted `state-backup.enc` artifact at the
-  canonical workgroup/node/mackesd path. This Node reports bounded presence,
-  size, modification time, missing, and invalid/symlink states without opening
-  or exposing encrypted contents. Passphrase verification and restore remain
-  privileged mackesd operations outside the UI. Catalog tests pass 9/9 and
-  focused This Node tests pass 43/43 on BigBoy.
-- Applications continuity update (2026-08-02): Services & Applications now
-  reads the existing bounded `apps-installed.json` and `running-apps.json`
-  mirrors under the canonical workgroup/node directory and exposes aggregate
-  installed and running counts. Missing, malformed, symlinked, oversized, or
-  unavailable mirrors remain explicit unknown/unavailable states; app names,
-  launch, and mutation continue through the existing Front Door authority.
-  Focused This Node tests pass 44/44 on BigBoy; physical application proof
-  remains open.
-- Encryption posture continuity update (2026-08-02): Security & Privacy now
-  performs an off-render-thread, fixed-root observation of `/sys/class/block`
-  device-mapper entries and counts only mappings whose local `dm/uuid` begins
-  with `CRYPT-LUKS`. The route reports no mappings, observed encrypted versus
-  total mappings, or an explicit provider failure; it never exposes mapping
-  names, paths, keys, unlocked state, or a full-disk-encryption claim. Hostile
-  fixture coverage passes in the focused This Node suite, now 46/46 on BigBoy.
-  Encryption policy and mutation remain provider-gated; physical security
-  evidence remains open.
-- Security copy truthfulness update (2026-08-02): corrected the mesh-level
-  Security & Privacy summary so it no longer contradicts the trusted local
-  encryption/firewalld cards. It now distinguishes snapshot-wide policy, local
-  observations, camera-permission gaps, and partial-fact limitations. The
-  focused This Node suite remains green at 46/46 on BigBoy.
-- Physical-evidence audit update (2026-08-02): inspected the recorded direct-DRM
-  This Node Dark desktop and Light/Largest narrow frames for hierarchy, health
-  glyphs, Inventory/Actions navigation, contrast, taskbar touch targets, and
-  scroll continuation. They remain usable layout evidence, but their exact
-  candidate predates the later application, encryption, and Security copy
-  changes; do not treat those hashes as proof of the newest payload. A fresh
-  direct-DRM recapture is required after the next accepted release candidate.
-- Local security freshness update (2026-08-02): Security & Privacy now gives
-  firewalld and encryption observations independent `Fresh`, `Stale`, or
-  `Awaiting local provider` badges. A successful local observation ages out
-  after 45 seconds, so a hung or silent worker cannot leave old security facts
-  looking current. Focused BigBoy This Node tests pass 46/46; the existing
-  mesh-wide health authority remains unchanged.
-- Local-provider freshness continuity update (2026-08-02): the same bounded
-  freshness badge now appears on local Services, Printers & Peripherals, Backup
-  & Restore, and Services & Applications cards. Each successful off-render-
-  thread response records its own observation age; a silent worker becomes
-  `Stale` after 45 seconds and never masquerades as current. Provider errors
-  and not-yet-seen states remain distinct. Focused BigBoy This Node tests pass
-  46/46.
-- Diagnostics freshness continuity update (2026-08-02): the bounded redacted
-  journal provider now shows its own `Fresh`, `Stale`, or `Awaiting local
-  provider` badge. A stopped journal worker therefore cannot leave old warning
-  and error lines looking current, while the fixed query, redaction, size cap,
-  and no-user-query boundary remain unchanged. Focused BigBoy This Node tests
-  pass 46/46.
-- Hardware-provider freshness update (2026-08-02): the trusted `mde-seat`
-  HardwareStatus contract now carries a bounded observation timestamp. Hardware
-  detail renders `Fresh`, `Stale`, or `Awaiting provider timestamp` for local
-  thermal/fan, storage, firmware, dock, and platform-profile evidence instead
-  of relying solely on mesh snapshot age. No paths or mutation verbs cross the
-  seam. BigBoy `mde-seat` hardware tests pass 3/3 and focused This Node tests
-  pass 46/46.
-- Recovery & Reset route continuity update (2026-08-02): This Node now indexes
-  a distinct Recovery & Reset hierarchy/search route with a full-page boundary
-  that names the privileged provider required for recovery-environment, reset,
-  rollback, and destructive restoration controls. The page keeps encrypted
-  backup metadata and passphrase-gated `mackesd` verification/restore as the
-  existing safe continuity path, and presents no reset action as available.
-  Catalog tests pass 9/9 and focused This Node tests pass 46/46 on BigBoy.
-- Time/language/region provider update (2026-08-02): the durable Time, Language
-  & Region route now consumes a bounded local provider for host locale/language
-  values from fixed `/etc/locale.conf` or `/etc/default/locale` files and the
-  host time zone from fixed timezone evidence. Values are sanitized, kept
-  read-only, and show `Fresh`, `Stale`, or an explicit provider error; display
-  clock preference remains owned by the typed System provider, while locale
-  mutation, keyboard-region policy, and time synchronization remain gated.
-  Focused This Node tests pass 47/47 on BigBoy.
-- Full-page responsive evidence update (2026-08-02): the governed detail-route
-  render fixture now mounts the typed System provider instead of testing every
-  route only through a provider-less fallback, and renders every indexed page
-  again at 520px logical width with 1.4x text scale. This covers the real
-  locale, personalization, virtualization, and OS-management detail branches
-  alongside the device pages. Focused This Node tests pass 47/47 on BigBoy.
-- Physical-evidence audit update (2026-08-02): the available Dell proof target
-  `172.20.146.225` accepts SSH but currently reports an inactive
-  `mde-shell-egui.service` and no `/dev/dri/card0`; the `.138` proof target is
-  not reachable on SSH. The checked-in This Node PNGs remain useful visual
-  layout evidence, but are not current-payload or physical-control proof.
-  Fresh direct-DRM capture and reachable-device action evidence remain open
-  until a live DRM seat is available.
-- Time-sync and keyboard-region continuity update (2026-08-02): the local
-  Time, Language & Region provider now also reads bounded keyboard-region facts
-  from fixed host configuration and the fixed `timedatectl` synchronization
-  posture. The UI distinguishes synchronized, not synchronized, not reported,
-  and provider-error states; it exposes no host mutation or false sync claim.
-  Focused This Node tests pass 47/47 on BigBoy.
-- Current-payload route validation (2026-08-02): full production-feature
-  candidate `2f32f935c92a4cf84f926221a093a3666638fee9063ec4f9a8dc8ef1f686f628`
-  was built on BigBoy with `drm,live-vdi,media-mpv`. On `.138`, Music Dark
-  desktop, Music Dark narrow (`800` logical), and Music Light/Largest narrow
-  were visually inspected and accepted; Media Dark desktop was also captured
-  and accepted. Evidence and native readback hashes are recorded in the DRM
-  ledger. `.138` was restored to payload `20955383…`, secure login-at-boot,
-  active service, and zero restarts. This closes only the current-payload
-  Music slice plus one Media cell; the remaining Media profiles, Phones,
-  Terminal, Editor, Browser boundary, strict linear scanout, Dell adoption,
-  and WL-UX-009 readiness remain open.
-- Current-payload route validation continuation (2026-08-02): the same
-  production-feature candidate `2f32f935…` was explicitly routed on `.138` to
-  Phones, Terminal, and the unified Editor/Communications surface. Dark
-  desktop frames were visually inspected and accepted for all three. The
-  Editor frame records the approved boundary: Construct owns the Mesh Teams
-  host frame and embedded Editor surface; no guest application styling is
-  claimed. `.138` was restored to payload `20955383…`, secure login-at-boot,
-  active service, and zero restarts. Remaining Light/Largest and narrow cells,
-  Dell adoption, Browser/VDI boundaries, strict linear scanout, and overall
-  WL-UX-009 readiness remain open.
-- Dell adoption validation (2026-08-02): the production-feature candidate
-  `2f32f935…` was installed on Dell `.225` and the Phones, Terminal, and
-  unified Editor/Communications Dark desktop frames were visually inspected
-  and accepted. The Editor frame preserves the approved Construct-owned host
-  and embedded-editor boundary. Dell was restored to payload `20955383…`,
-  secure login-at-boot, active service, and zero restarts. This closes only
-  the Dell Dark desktop route slice; Light/Largest and narrow cells, remaining
-  Media coverage, Browser/VDI boundaries, strict linear scanout, and overall
-  WL-UX-009 readiness remain open.
-- Superseded inventory-health update (2026-08-02, retired 2026-08-03): the
-  inventory landing's global score, local freshness rollup, and provider badges
-  were removed by the System and Mesh Health cutover. Provider evidence still
-  carries freshness, but issue presentation and A–F grading exist only in the
-  centered modal.
-- Superseded critical-alert update (2026-08-02, retired 2026-08-03): the linked
-  This Node AlertInbox and inline health recovery card were removed. Typed
-  conditions, acknowledgement, snooze, and guided recovery now live only in
-  System and Mesh Health; signed mesh Chat remains notification transport and
-  is not a second health ledger.
-- NetworkManager SecretAgent boundary update (2026-08-02): `mde-seat` now
-  provides an in-process, non-persistent NetworkManager SecretAgent lifecycle
-  and a typed profile-activation method using only validated provider-issued
-  profile/device object paths. Secret values exist only in the callback and
-  D-Bus activation exchange; they are never serialized, logged, or exposed to
-  This Node snapshots. Save/delete persistence is refused, malformed metadata
-  is rejected, and mesh routes/DNS are not rewritten by activation. The This
-  Node profile action remains fail-closed until a trusted-session responder is
-  mounted by the shell. BigBoy `mde-seat` network tests pass 8/8 and focused
-  This Node tests pass 48/48.
-- Phones large-text remediation (2026-08-02): moved the always-available
-  `Disarm now` control into the wrapped arm-action lane, removing the needless
-  extra row at large text. Phones tests pass 26/26. Candidate
-  `cc56fdf0466a29506b8b7adcf27af8aa3f7a034d87bdebfe20143093289f2dbc` was
-  recaptured on Dell `.225` Light/Largest narrow; the complete Remote input
-  card now ends above the taskbar and is accepted. Dell was restored to
-  payload `20955383…`, secure login-at-boot, active service, and zero restarts.
-  Remaining route/profile cells, Browser/VDI boundaries, strict linear
-  scanout, and overall WL-UX-009 readiness remain open.
-- Dell Editor profile validation (2026-08-02): candidate `cc56fdf0…` was
-  explicitly routed to the unified Editor/Communications surface on Dell
-  `.225`. Dark narrow, Light desktop, and Light/Largest narrow frames were
-  visually inspected and accepted. The approved host-owned Mesh Teams and
-  embedded Editor boundary remains clear at each profile. Dell was restored to
-  payload `20955383…`, secure login-at-boot, active service, and zero restarts.
-  Remaining Media profiles, Browser/VDI boundaries, strict linear scanout, and
-  overall WL-UX-009 readiness remain open.
-- Live-render finding (2026-08-02): Dell `.225` Media Light/Largest narrow
-  current-payload proof clips the Jellyfin empty-state line at the taskbar
-  boundary. Reject the cell; keep the status copy truthful and make the Media
-  content lane taskbar-safe before recapturing the exact candidate.
-- Dell Terminal profile validation (2026-08-02): candidate `cc56fdf0…` was
-  explicitly routed on Dell `.225` and Dark narrow, Light desktop, and
-  Light/Largest narrow frames were visually inspected and accepted. Terminal
-  content remains bounded above the taskbar in all three profiles. Dell was
-  restored to payload `20955383…`, secure login-at-boot, active service, and
-  zero restarts. Remaining Editor/Media profiles, Browser/VDI boundaries,
-  strict linear scanout, and overall WL-UX-009 readiness remain open.
-- Network profile activation continuation (2026-08-02): This Node/System now
-  mounts the in-process NetworkManager SecretAgent only while the trusted
-  session is viewing the relevant action surface. Profile activation uses
-  typed, provider-issued profile/device object paths, requires a visible
-  second confirmation, and collects credentials through an ephemeral modal;
-  secrets are not persisted, placed in snapshots, or written to audit output.
-  APN/DNS/proxy edits and imported VPN mutation remain unavailable, and the
-  action warns that activation may interrupt underlay/mesh reachability.
-  BigBoy bridge tests pass 1/1; the existing BigBoy `mde-seat` network suite
-  passes 8/8 and focused This Node tests pass 48/48. Recovery/reset, typed
-  local service restart, remaining provider gaps, and physical DRM evidence
-  remain open.
-- Typed service-control continuation (2026-08-02): the existing bounded failed
-  systemd-service observation now has a matching `mde-seat` D-Bus provider.
-  This Node Actions offers only provider-reported, validated `.service` units;
-  the operator must arm and confirm the exact unit, and systemd resolves and
-  restarts it without a shell fallback. Provider refusal, absent system D-Bus,
-  malformed targets, and stale projections remain visible as unavailable or
-  refused; audit output contains only the fixed action label, outcome, and
-  timestamp. BigBoy service-provider tests pass 4/4 and focused This Node tests
-  pass 48/48. Recovery/reset, update application, remaining provider gaps, and
-  physical DRM evidence remain open.
+- Status: Remaining
+- Priority: P1
+- Complexity: Medium
+- Problem: file-manager design lock 1 requires the full POSIX plus archive
+  operation set, but the egui Files surface wires only New Folder and Rename;
+  new-file, duplicate, compress, extract, symlink, and hardlink have no
+  reachable command even though the backend engine is complete.
+- Required outcome: every lock-1 operation is reachable from the Files menubar
+  and context menu and executes through the existing FileOps/OpKind/archive
+  engine with the standard confirm, progress, and cancel treatment.
+- Current state: `OpKind::{Copy, Move, Delete, Compress, Extract}` and
+  `crates/services/mde-files/src/archive.rs` are complete and tested;
+  `FileOps` carries safe `symlink` and `hard_link` wrappers in
+  `crates/services/mde-files/src/fileops.rs`; the surface wires only
+  `NameOperation::{NewFolder, Rename}` across
+  `crates/desktop/mde-files-egui/src/dialogs.rs`, `model/mod.rs`, and
+  `view.rs`.
+- Remaining work:
+  1. S1 New File and Duplicate.
+     - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
+     - Action: add a `NewFile` name-dialog variant that creates an empty
+       regular file through `FileOps` with exists-refusal, and a Duplicate
+       command that copies each focused row into its own parent under a
+       `name (copy)` suffix with the standard conflict dialog.
+     - Deliverable: both commands on the menubar and context menu.
+     - Validation: existing-name, read-only-directory, and cross-backend rows
+       refuse honestly.
+     - Done when: both operations execute on local and mesh-mounted trees.
+  2. S2 Compress and Extract.
+     - Inputs: `OpKind::Compress`/`Extract`, `ArchiveFormat`, and the
+       op-queue progress UI.
+     - Action: context-menu entries enqueue the existing op kinds with a
+       format picker; extraction is the extract-here/extract-to pair.
+     - Deliverable: archive create and extract with progress and cancel.
+     - Validation: path-traversal members refuse; cancel leaves no
+       half-archive.
+     - Done when: a zip and a tar.gz round-trip through the queue on the
+       surface.
+  3. S3 Symlink and Hardlink.
+     - Inputs: `FileOps::symlink` and `FileOps::hard_link`.
+     - Action: an Advanced submenu creates links beside the focused row with
+       link-target validation.
+     - Deliverable: both link types with honest cross-device and
+       existing-path errors.
+     - Validation: hardlink across devices and symlink escaping a mesh mount
+       refuse.
+     - Done when: `symlink_metadata` reports the created link on reload.
+- Scope: mde-files-egui surface wiring plus at most additive helpers in
+  mde-files. No engine rewrite and no new store.
+- Relevant files/components:
+  `crates/desktop/mde-files-egui/src/{dialogs.rs,model/mod.rs,view.rs,menubar.rs}`,
+  `crates/services/mde-files/src/{opqueue.rs,fileops.rs,archive.rs}`.
+- Acceptance criteria: all six operations are reachable, execute through the
+  existing engine, report progress and cancel honestly, and hostile paths
+  refuse.
+- Verification method: focused mde-files and mde-files-egui farm gates; no
+  live hardware required.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q26
+  (build-new:file-manager-posix-ops), file-manager design lock 1.
+
+### WL-FUNC-026 - Persist per-folder Files view preferences
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Small
+- Problem: file-manager design lock 20 says view and sort persist per folder,
+  but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
+- Required outcome: per-folder view mode, sort order, and show-hidden survive
+  a shell restart.
+- Current state: `folder_prefs: HashMap<String, FolderPrefs>` lives at
+  `crates/desktop/mde-files-egui/src/model/mod.rs` (struct near line 306,
+  field near line 1058), populated by the set_view/sort setters and read on
+  navigation; nothing serializes it.
+- Remaining work:
+  1. S1 Serialize on mutation and hydrate at construction.
+     - Inputs: the editor-egui.json precedent (JSON under the mcnf config
+       directory) and `FolderPrefs`.
+     - Action: derive serde on `FolderPrefs`, write
+       `<config>/mcnf/files-folder-prefs.json` debounced on mutation, hydrate
+       at `FileBrowser` construction, cap the map with least-recently-used
+       eviction, and degrade corrupt, oversized, or symlinked files to
+       defaults with an honest note.
+     - Deliverable: durable per-folder preferences.
+     - Validation: corrupt JSON, oversize, and symlinked prefs files fall
+       back to defaults without panicking.
+     - Done when: a restart preserves a changed view, sort, and show-hidden
+       for a visited folder.
+- Scope: the mde-files-egui model only.
+- Relevant files/components:
+  `crates/desktop/mde-files-egui/src/model/mod.rs`.
+- Acceptance criteria: preferences survive restart, stay bounded on disk, and
+  hostile files degrade to defaults.
+- Verification method: focused mde-files-egui farm gate.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q28
+  (build-new:file-manager-folderprefs-persist), file-manager design lock 20.
+
+### WL-FUNC-027 - Add persisted user bookmarks to the Files Places sidebar
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Small
+- Problem: file-manager design lock 21 requires user-pinnable bookmarks, but
+  the Places sidebar is a fixed set plus live mesh peers; the capability was
+  never built.
+- Required outcome: operators pin, rename, reorder, and remove their own
+  Places entries, persisted across restarts.
+- Current state: the sidebar renders the fixed PLACES set and live mesh
+  peers; no bookmark store exists anywhere under
+  `crates/desktop/mde-files-egui/`.
+- Remaining work:
+  1. S1 Add the bookmark store and sidebar section.
+     - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
+       Places render path.
+     - Action: a bounded `<config>/mcnf/files-bookmarks.json` store with
+       path validation and a count cap; pin/unpin from the focused row;
+       rename, reorder, and remove in place; render a user section above the
+       fixed places while mesh peers stay a distinct live section.
+     - Deliverable: durable user bookmarks.
+     - Validation: hostile paths, duplicate pins, and corrupt stores refuse
+       or degrade honestly.
+     - Done when: a pinned folder survives restart and navigates on
+       activation.
+- Scope: mde-files-egui only.
+- Relevant files/components:
+  `crates/desktop/mde-files-egui/src/model/mod.rs`,
+  `crates/desktop/mde-files-egui/src/view.rs`.
+- Acceptance criteria: pin, rename, reorder, and remove persist and activate;
+  the store is bounded and hostile input refuses.
+- Verification method: focused mde-files-egui farm gate.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q27
+  (build-new:file-manager-bookmarks), file-manager design lock 21.
+
+### WL-FUNC-028 - Build the recurring-mirror (sync-pair) producer
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Medium
+- Problem: the design-locked recurring rsync mirror is code-complete but
+  unreachable: `TransferVerb::{SaveSyncPair, RemoveSyncPair}` are drained and
+  tested and `SyncPairStore` plus the worker scheduler are live, yet no CLI
+  or GUI producer exists, so the feature silently drops.
+- Required outcome: operators create, edit, list, and remove recurring sync
+  pairs from the CLI and from Communications Transfers; execution stays on
+  the existing worker.
+- Current state: verbs and store live at
+  `crates/mesh/mackesd/src/workers/transfers/{verb.rs,sync_pair.rs}` with
+  scheduling in `mod.rs` (`schedule_sync_pairs_at`); `TransferCmd`
+  (`crates/mesh/mackesd/src/bin/mackesd.rs`, `cli/transfer.rs`) has
+  Submit/List/Destinations/Cancel/Pause/Resume and no sync-pair arm;
+  Communications `transfers.rs` mirrors the ledger only.
+- Remaining work:
+  1. S1 Add the CLI producer.
+     - Inputs: TransferCmd conventions and the Save/Remove verbs.
+     - Action: add `mackesd transfer sync-pair add|remove|list` posting the
+       existing typed verbs with interval, source, destination, and bwlimit.
+     - Deliverable: the CLI manages pairs end to end.
+     - Validation: malformed intervals and unknown pair ids refuse.
+     - Done when: a CLI-added pair appears in the store and schedules.
+  2. S2 Add the Transfers-mode editor.
+     - Inputs: the Communications transfers.rs mirror and the same verbs.
+     - Action: a sync-pair editor (create/edit/remove, interval,
+       source/destination, bwlimit) that publishes the verbs and mirrors
+       `SyncPairStore` projections, never a second progress authority.
+     - Deliverable: GUI parity with the CLI.
+     - Validation: identical requests through CLI and GUI produce identical
+       store records.
+     - Done when: next-run and last-result come from the worker and
+       unreachable peers stay visibly degraded.
+- Scope: the mackesd CLI plus the collab-egui Transfers mode; the worker
+  engine is reused unchanged.
+- Relevant files/components: `crates/mesh/mackesd/src/bin/mackesd.rs`,
+  `crates/mesh/mackesd/src/cli/transfer.rs`,
+  `crates/mesh/mackesd/src/workers/transfers/`,
+  `crates/desktop/mde-collab-egui/src/transfers.rs`.
+- Acceptance criteria: CLI and GUI both manage pairs; the existing worker
+  executes them; no second store or scheduler appears.
+- Verification method: focused mackesd transfers and mde-collab-egui farm
+  gates.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q34
+  (build-new:recurring-mirror-producer), transfers design lock.
+
+### WL-FUNC-029 - Build the Fleet voice-admin panel in Communications Activity
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Medium
+- Problem: fleet voice provisioning (Vitelity DIDs, routing, failover,
+  shared-outbound, cutover) is a leader/operator function whose worker and
+  verbs are live, but no surface publishes them since the iced Workbench
+  retired.
+- Required outcome: Communications Activity carries the fleet voice-admin
+  panel publishing the existing action/voice verbs and rendering the
+  state/voice topics.
+- Current state: the `voice_provision` worker owns
+  `action/voice/{provision,did-route,failover,shared-config}` and the
+  `state/voice/*` topics
+  (`crates/mesh/mackesd/src/workers/voice_provision.rs`); Communications
+  Activity (`crates/desktop/mde-collab-egui/src/activity.rs`) has no voice
+  admin section.
+- Remaining work:
+  1. S1 Panel over the existing verbs.
+     - Inputs: the voice_provision verb bodies (provision, DID route,
+       failover, shared config) and the Activity mode layout.
+     - Action: add the Fleet/Voice admin section to Activity with an account
+       provisioning form, DID routing table, per-node failover policy,
+       shared-outbound toggle, and cutover control, publishing the typed
+       verbs and rendering retained state/voice projections with freshness.
+     - Deliverable: the leader/operator voice console inside Communications.
+     - Validation: invalid DIDs, unknown nodes, and conflicting routes refuse
+       at the verb boundary; the panel renders honestly empty without a
+       provisioned account.
+     - Done when: every published verb round-trips to a visible state/voice
+       projection.
+- Scope: collab-egui Activity plus at most additive projection reads; the
+  worker contract is unchanged.
+- Relevant files/components:
+  `crates/desktop/mde-collab-egui/src/activity.rs`,
+  `crates/mesh/mackesd/src/workers/voice_provision.rs`.
+- Acceptance criteria: provision, DID-route, failover, and shared-config all
+  publish from the panel and land in retained state; no mackesd contract
+  change.
+- Verification method: focused mde-collab-egui and mackesd voice_provision
+  farm gates.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q8
+  (build-new:fleet-voice-admin@Activity).
+
+### WL-FUNC-030 - Build the mesh SIP-gateway config control in Communications Activity
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Small
+- Problem: the mesh-wide SIP gateway responder
+  (`action/voip/{set,get,clear}-gateway`) still runs, but its only documented
+  publisher was the retired iced Workbench, so the workgroup gateway is
+  unconfigurable from any live surface.
+- Required outcome: Communications Activity owns gateway configuration; the
+  responder and gateway.toml contract stay unchanged; the existing workgroup
+  gateway.toml migrates in place.
+- Current state: the responder in `crates/mesh/mackesd/src/ipc/voip.rs`
+  serves set/get/clear with password redaction on get; no GUI publisher
+  exists.
+- Remaining work:
+  1. S1 Gateway section in Activity.
+     - Inputs: the three verb bodies and redaction contract in ipc/voip.rs.
+     - Action: a bounded gateway form (host, port, credentials) publishing
+       set-gateway, a present/absent readout from get-gateway, and a
+       confirmed clear-gateway; the write path never echoes the password
+       back, and the readout renders the redacted shape.
+     - Deliverable: gateway configuration from Communications.
+     - Validation: malformed hosts and replayed clears refuse; the password
+       never renders.
+     - Done when: set, get, and clear round-trip on a live Bus and the
+       migrated gateway.toml loads unchanged.
+- Scope: collab-egui Activity only; the responder is untouched.
+- Relevant files/components:
+  `crates/desktop/mde-collab-egui/src/activity.rs`,
+  `crates/mesh/mackesd/src/ipc/voip.rs`.
+- Acceptance criteria: the full set/get/clear cycle works from the panel with
+  the redaction contract intact.
+- Verification method: focused mde-collab-egui and mackesd voip farm gates.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q12
+  (build-new:sip-gateway-config@Activity).
+
+### WL-FUNC-031 - Build the per-document mesh co-edit share-session UI
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Medium
+- Problem: the Yrs CRDT co-editing library rides the embedded editor, but no
+  user-reachable action starts or joins a share session; only the Mesh Map
+  badge observes the wire, so mesh co-editing is a protocol without a
+  product.
+- Required outcome: from Documents mode an operator shares the focused
+  document to a space, participants join with view/edit permission and
+  follow-mode, and the session lifecycle is visible and closable by its
+  owner.
+- Current state: `crates/desktop/mde-collab-egui/src/documents.rs` marks the
+  seams with `WL-FUNC-011 Phase 3c` notes at the project-editor join,
+  snapshot load, and snapshot emit paths; the CRDT/collab_session/follow
+  library is carried by the embedded `mde-editor-egui` surface; fixture.rs
+  already projects live sessions.
+- Remaining work:
+  1. S1 Share-session lifecycle UI.
+     - Inputs: the documents.rs marked seams, the collab_session library, and
+       space membership from the collab store.
+     - Action: a Share control on the focused document that starts a session
+       into a chosen space, a participant list with a follow-mode toggle, and
+       owner close; joining from the space's live-session picker.
+     - Deliverable: start, join, follow, and close from the surface.
+     - Validation: non-members and closed sessions refuse honestly; owner
+       close detaches every follower.
+     - Done when: two seats co-edit one document with visible cursors.
+  2. S2 External-write three-way merge.
+     - Inputs: the documents.rs snapshot-emit marker (last-shared-base).
+     - Action: merge external file changes against the last shared base
+       instead of overwriting the live CRDT buffer.
+     - Deliverable: no silent clobber of in-flight co-edits.
+     - Validation: a concurrent external write merges or surfaces a typed
+       conflict, never a lost edit.
+     - Done when: the Phase-3c markers are gone from documents.rs.
+- Scope: collab-egui Documents mode and its use of the carried library; no
+  transport or CRDT changes.
+- Relevant files/components:
+  `crates/desktop/mde-collab-egui/src/documents.rs`,
+  `crates/desktop/mde-collab-egui/src/fixture.rs`,
+  `crates/desktop/mde-editor-egui/`.
+- Acceptance criteria: share, join, follow, and close work between two seats;
+  external writes merge safely; no Phase-3c marker remains.
+- Verification method: focused mde-collab-egui farm gates with the
+  two-instance session fixture.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q21
+  (defer-followup), documents.rs Phase-3c markers.
+
+### WL-FUNC-032 - Reserve the Transfers hotkeys
+
+- Status: Remaining
+- Priority: P3
+- Complexity: Small
+- Problem: no global accelerator opens Transfers, so the industry-standard
+  downloads chord (Ctrl+J) risks colliding with future bindings.
+- Required outcome: Ctrl+J opens Communications Transfers from any Construct
+  surface and one in-mode accelerator starts a new transfer; both are
+  registered in the shared keymap.
+- Current state: the shell keymap
+  (`crates/desktop/mde-shell-egui/src/hotkeys.rs`) has no Transfers binding;
+  Communications has no in-mode new-transfer accelerator.
+- Remaining work:
+  1. S1 Register both bindings.
+     - Inputs: the hotkeys.rs table and the Communications mode router.
+     - Action: bind Ctrl+J to Surface::Communications in Transfers mode and
+       an in-mode New Transfer accelerator; render both in the Hotkeys
+       settings section.
+     - Deliverable: two documented bindings.
+     - Validation: the bindings fire from every surface and never shadow text
+       editing inside Documents or Terminal.
+     - Done when: the hotkeys catalog lists both.
+- Scope: the shell keymap and Communications mode only.
+- Relevant files/components:
+  `crates/desktop/mde-shell-egui/src/hotkeys.rs`,
+  `crates/desktop/mde-collab-egui/src/transfers.rs`.
+- Acceptance criteria: both accelerators work and are catalogued with no
+  focus-context shadowing.
+- Verification method: focused mde-shell-egui and mde-collab-egui farm gates.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger
+  (build-new:reserve-transfer-hotkeys).
+
+### WL-FUNC-033 - Retire the legacy mesh-PBX stack and dead parity rows
+
+- Status: Blocked
+- Priority: P2
+- Complexity: Large
+- Problem: the operator-confirmed-dead Kamailio/RTPengine mesh-PBX stack and
+  several orphaned modules still ship and spawn, carrying config writers, a
+  worker, a CLI verb, and systemd units that the pure-Rust softphone and
+  Communications Calls never touch.
+- Required outcome: the retired stack and dead rows are deleted in one sweep;
+  the tree builds and runs without them; the parity ledger's retire rows cite
+  the deleting revision.
+- Current state: the live-spawned removal set per the ledger is
+  `crates/services/mde-voice-config/` (with snapshots),
+  `crates/mesh/mackesd/src/voice/` (mod and materialize),
+  `crates/mesh/mackesd/src/workers/voice_config.rs` (with
+  spawn/registration), `crates/mesh/mackesd/src/cli/voice.rs` plus
+  `VoiceCmd::RenderConfig`, and the kamailio-mde/rtpengine-mde units;
+  orphaned `crates/services/mde-voice-hud/src/{roster.rs,resolve.rs}`; the
+  never-wired voip_rtt worker, CLI, and `voip/link-rtt` topic; dead
+  Cosmic-era file-manager `View` arms with their outbox/downloads responders;
+  and unconstructed `SendToEntry` variants.
+- Remaining work:
+  1. S1 Confirm no live seat runs the stack.
+     - Inputs: fleet inventory and systemd unit states.
+     - Action: verify no enrolled seat runs kamailio-mde or rtpengine-mde for
+       real SIP before deletion (the ledger's pre-deploy check).
+     - Deliverable: a recorded fleet-wide negative.
+     - Validation: any positive finding parks this epic again.
+     - Done when: the check is evidence-cited.
+  2. S2 Delete the mesh-PBX stack.
+     - Inputs: the S1 evidence.
+     - Action: remove the crate, voice modules, worker, CLI verb, and units;
+       drop workspace membership and packaging references.
+     - Deliverable: a tree with no Kamailio/RTPengine path.
+     - Validation: build, clippy, and the full farm gate pass; no spawn site
+       or seed topic references the deleted pieces.
+     - Done when: greps for the deleted modules return only archive and
+       ledger references.
+  3. S3 Delete the orphaned and never-wired rows.
+     - Inputs: ledger Q10, Q13, Q29, and Q33 retire rulings.
+     - Action: remove roster.rs and resolve.rs, the voip_rtt worker, CLI, and
+       topic, the dead View arms with their list() branches and responders
+       (keeping fleet-files, files-inbox, and file-ops), and the
+       unconstructed SendToEntry variants (keeping Toolbar and ContextMenu).
+     - Deliverable: no orphan module remains.
+     - Validation: the full farm gate passes; the retained responders'
+       contract tests stay green.
+     - Done when: the parity ledger's retire rows are amended with the
+       deleting revision.
+- Scope: deletion only; no replacement security or policy surface.
+- Relevant files/components: the paths named in Current state plus packaging
+  and systemd references.
+- Dependencies: operator final signoff on the Q9 retirement (parity-ledger
+  Decisions note, 2026-07-21).
+- Acceptance criteria: the workspace builds and gates green without the
+  deleted stack; no live reference remains; the ledger cites the revision.
+- Verification method: full workspace farm gate on BigBoy plus the
+  module-reference greps recorded in evidence.
+- Origin or merged source IDs: WL-FUNC-011 parity ledger Q9, Q10, Q13, Q29,
+  and Q33 retire rulings.
+

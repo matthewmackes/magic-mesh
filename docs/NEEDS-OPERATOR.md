@@ -76,36 +76,19 @@ under the WL-\* epic named in the re-key map above, not as an independent ID.
   and node-to-node streaming gates; it is no longer a WON'T-DO requirement.
 
 - **mde-shell-egui pre-existing test reds** (recorded 2026-07-21, WL-FUNC-011
-  Phase-2) — 4 `cargo test -p mde-shell-egui` tests fail on the branch base
-  (`a698771d`, the 20-surface tree) *independent of* the Communications surface
-  cutover (verified by a base-tree run: 1615 passed / 4 failed). They are NOT
-  introduced by the cutover and are left untouched; triage separately:
-  1. `system::tests::every_section_is_reachable_exactly_once` — the SettingsSection
-     taxonomy has 14 sections but the test asserts 13 (a settings section was added
-     without updating the count/list). `system/tests.rs`.
-  2. ~~`tests::car_home_tiles_and_default_key_bindings_cover_the_vehicle_apps`~~ —
-     RESOLVED by WL-UX-007/U26 (Car Dashboard home): the roster rework now owns
-     the file and reconciled the expectation honestly — `A` IS bound to
-     `GoAirspace` in the factory layout (the Airspace letter-mnemonic row that
-     keeps the radar keyboard-reachable after its home tile was dropped, Q32).
-  3. `tests::shell_remote_sessions_fallback_mounts_for_bare_non_desktop_workspaces`
-     and 4. `tests::shell_remote_sessions_fallback_request_uses_shell_transition` —
-     both drive `Surface::Files`, but `surface_needs_remote_sessions_fallback` now
-     lists `Files` in the menubar-bearing (no-fallback) set (the crash-fix that
-     added Media/Files/Terminal/… to that set), so the fallback control never mounts
-     and the tests' expectation is stale. `main.rs`.
+  Phase-2) — RESOLVED 2026-08-19 against the current tree, verified by source
+  inspection: (1) `system::tests::every_section_is_reachable_exactly_once` now
+  enumerates all fifteen `SettingsSection` variants and asserts the taxonomy
+  length is 15 (`system/tests.rs`, `system/mod.rs`); (2)
+  `tests::shell_remote_sessions_fallback_mounts_for_bare_non_desktop_workspaces`
+  and (3) `tests::shell_remote_sessions_fallback_request_uses_shell_transition`
+  now drive `Surface::Browser` — a surface genuinely outside the menubar-bearing
+  set — instead of the stale `Surface::Files` expectation (`main.rs`). No
+  operator action remains.
 
 - **DESIGN RULING NEEDED — browser chrome light-vs-dark** (recorded 2026-07-21,
-  `/polish`) — `crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs` deliberately
-  mints 31 light-Material `CHROME_*` constants ("Chromium/Chrome Refresh light roles,
-  mirrored as local egui tokens so every Browser surface can stay on the stock Chrome
-  palette instead of inheriting the darker shell chrome"). This is a DELIBERATE
-  Chrome-fidelity choice for the CEF browser, but it conflicts with Construct design
-  **lock #1 (dark only)** and is the sole source of the 31 shell style-leak-grep hits.
-  Ruling needed — pick one, then `/polish` can act:
-  (a) KEEP stock-Chrome-light → add `web/chrome_ui/` to the style-leak grep's
-      exclusion list (same category as the VDI decoders / term palette = deliberate
-      data/fidelity, not look-to-drain); or
-  (b) CONFORM to dark → recolor the browser chrome to the `mde-egui` Construct-dark
-      tokens (a real visual change to the browser surface).
-  Until ruled, `/polish` holds the shell — it is NOT a blind drain.
+  `/polish`) — MOOT 2026-08-19: the VM-only Browser cutover (WL-ARCH-008)
+  extracted the CEF host browser; `web/chrome_ui/` and its 31 `CHROME_*`
+  constants no longer exist — the Browser surface is the thin typed `browser-vm`
+  controller in `crates/desktop/mde-shell-egui/src/web/mod.rs`, and guest
+  Chromium owns browser chrome per the platform boundary. No ruling is required.

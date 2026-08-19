@@ -1,0 +1,48 @@
+---
+description: Platform worklist stewardship — single tracker, required epic fields, archive-on-close, evidence citation. Apply when editing WORKLIST.md or worklist-archive.
+globs: docs/platform/WORKLIST.md,docs/platform/evidence/**/*.md,docs/worklist-archive/**/*.md,docs/NEEDS-OPERATOR.md
+alwaysApply: false
+---
+
+# Worklist stewardship
+
+`docs/platform/WORKLIST.md` is the **only** active platform worklist. Design
+notes, ops runbooks, review ledgers, and `docs/NEEDS-OPERATOR.md` are evidence
+sources — never present a second file as an active tracker.
+
+## Epic shape
+
+Heading: `### WL-<FAMILY>-<NNN> - <title>` (space-hyphen-space). Required
+fields, in this order:
+
+Status, Priority, Complexity, Problem, Required outcome, Current state,
+Remaining work, Scope, Relevant files/components, Acceptance criteria,
+Verification method, Origin or merged source IDs.
+
+Optional: `Dependencies`. No `Progress` field. No checkbox markers.
+
+Status is exactly `Remaining` / `Blocked` / `Needs clarification`. Do not
+leave a completed epic in the active file.
+
+## Close and evidence
+
+- Done or retired items move to `docs/worklist-archive/` with a disposition
+  (done + evidence path, or retired + reason + successor). Never reuse an ID.
+- A story is incomplete until deliverable, hostile/regression test, farm
+  command and result, and required live/package evidence are in
+  `docs/platform/evidence/`. A passing compile is not completion.
+- Missing hardware, provider access, credentials, or capacity fails the owning
+  automated gate. It is never a passing substitute or an operator handoff.
+- Fixtures must not satisfy production gates (`AI_GOVERNANCE.md` §7).
+
+## Hygiene
+
+Update the snapshot Remaining/Blocked/Needs-clarification counts so they match
+parsed epics. Keep lines and epic bodies inside `lint-worklist.sh` limits.
+
+Before landing worklist edits:
+
+```bash
+install-helpers/lint-worklist.sh --self-test
+install-helpers/lint-worklist.sh
+```
