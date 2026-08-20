@@ -26,8 +26,14 @@ REPO="$(cd "$HERE/../.." && pwd)"
 JOBS="${MCNF_FARM_JOBS:-$REPO/automation/lib/farm-jobs.sh}"
 WORKLIST="${MCNF_WORKLIST:-$REPO/docs/platform/WORKLIST.md}"
 STATE="${MCNF_AGENT_DISPATCH_STATE:-$REPO/automation/.state/agent-dispatch-plan.tsv}"
-ADAPTER="${MCNF_AGENT_DISPATCHER:-}"
 RUNTIME="${MCNF_AGENT_RUNTIME:-}"
+if [[ -z "$RUNTIME" ]]; then
+  if [[ "${CURSOR_AGENT:-}" == "1" ]]; then RUNTIME=cursor
+  elif [[ -n "${CODEX_HOME:-}" ]]; then RUNTIME=codex
+  elif [[ -n "${CLAUDE_CODE:-}" ]]; then RUNTIME=claude
+  fi
+fi
+ADAPTER="${MCNF_AGENT_DISPATCHER:-$HERE/native-agent-dispatch.sh}"
 
 die() { printf 'agent-dispatch: %s\n' "$*" >&2; exit 2; }
 
