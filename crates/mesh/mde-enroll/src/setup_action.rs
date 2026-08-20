@@ -221,8 +221,8 @@ mod tests {
     fn role_args_match_mackesd_vocabulary() {
         assert_eq!(SetupRole::Lighthouse.as_arg(), "lighthouse");
         assert_eq!(SetupRole::Workstation.as_arg(), "workstation");
-        assert_eq!(wizard_services(SetupRole::Lighthouse).len(), 6);
-        assert_eq!(wizard_services(SetupRole::Workstation).len(), 9);
+        assert_eq!(wizard_services(SetupRole::Lighthouse).len(), 7);
+        assert_eq!(wizard_services(SetupRole::Workstation).len(), 8);
         assert!(wizard_services(SetupRole::Workstation).contains(&"mde-shell-egui.service"));
     }
 
