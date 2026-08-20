@@ -1795,6 +1795,7 @@ fn drain_sync_pair_to_inbox(commands: &[SyncPairCommand]) -> bool {
 }
 
 fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<(), String> {
+    validate_sync_pair_command(command)?;
     let envelope = match command {
         SyncPairCommand::Save {
             id,
@@ -1808,7 +1809,7 @@ fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<
                 id: id.clone(),
                 source: source.clone(),
                 dest: dest.clone(),
-                every_secs: u64::max(*every_secs, 1),
+                every_secs: *every_secs,
                 policy: SyncPairPolicyWire {
                     bwlimit: bwlimit.clone(),
                     verify: false,
@@ -1834,6 +1835,56 @@ fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<
     std::fs::rename(&tmp, inbox.join(format!("{stem}.json")))
         .map_err(|error| format!("commit transfer verb: {error}"))?;
     Ok(())
+}
+
+fn validate_sync_pair_command(command: &SyncPairCommand) -> Result<(), String> {
+    let SyncPairCommand::Save {
+        id,
+        source,
+        dest,
+        every_secs,
+        bwlimit,
+    } = command
+    else {
+        return Ok(());
+    };
+    if !valid_sync_pair_id(id) {
+        return Err(format!("invalid sync pair id `{id}`"));
+    }
+    if source.trim().is_empty() || dest.trim().is_empty() {
+        return Err("sync pair requires non-empty source and destination".to_owned());
+    }
+    if source.as_bytes().contains(&0) || dest.as_bytes().contains(&0) {
+        return Err("sync pair source and destination must not contain NUL bytes".to_owned());
+    }
+    if *every_secs == 0 {
+        return Err("sync pair interval must be positive".to_owned());
+    }
+    if let Some(limit) = bwlimit {
+        if !valid_sync_pair_bwlimit(limit) {
+            return Err(format!("invalid sync pair bwlimit `{limit}`"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_sync_pair_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id.len() <= 120
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_sync_pair_bwlimit(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 32
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// The shell cannot depend on `mackesd` (the desktop tier points inward), but
@@ -3335,5 +3386,39 @@ mod tests {
             verb,
             SyncPairVerbWire::RemoveSyncPair(id) if id == "docs"
         )));
+    }
+
+    #[test]
+    fn sync_pair_writer_refuses_inputs_the_worker_would_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for command in [
+            SyncPairCommand::Save {
+                id: "../escape".to_owned(),
+                source: "/src".to_owned(),
+                dest: "/dst".to_owned(),
+                every_secs: 900,
+                bwlimit: None,
+            },
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src\0".to_owned(),
+                dest: "/dst".to_owned(),
+                every_secs: 900,
+                bwlimit: None,
+            },
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: "/dst".to_owned(),
+                every_secs: 900,
+                bwlimit: Some("1m;rm".to_owned()),
+            },
+        ] {
+            assert!(write_sync_pair_verb(dir.path(), &command).is_err());
+        }
+        assert!(
+            !dir.path().join("inbox").exists(),
+            "rejected GUI commands must not leave inbox records"
+        );
     }
 }

@@ -532,6 +532,11 @@ impl CommunicationsSurface {
             self.transfers_ui.notice = Some("sync pair requires source and destination".to_owned());
             return;
         }
+        if source.as_bytes().contains(&0) || dest.as_bytes().contains(&0) {
+            self.transfers_ui.notice =
+                Some("source and destination must not contain NUL bytes".to_owned());
+            return;
+        }
         let Some(every_secs) = parse_interval_secs(&self.transfers_ui.draft_interval) else {
             self.transfers_ui.notice =
                 Some("malformed interval (use 30s, 5m, 1h, or a positive second count)".to_owned());
@@ -541,6 +546,9 @@ impl CommunicationsSurface {
             let raw = self.transfers_ui.draft_bwlimit.trim();
             if raw.is_empty() {
                 None
+            } else if !valid_sync_pair_bwlimit(raw) {
+                self.transfers_ui.notice = Some("malformed bwlimit".to_owned());
+                return;
             } else {
                 Some(raw.to_owned())
             }
@@ -860,6 +868,14 @@ fn valid_pair_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_sync_pair_bwlimit(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 32
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn slug_pair_id(source: &str, dest: &str) -> String {

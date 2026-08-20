@@ -116,7 +116,7 @@ fn run_with_store(cmd: TransferCmd, store_root: &std::path::Path) -> anyhow::Res
                 bwlimit,
             } => {
                 let every_secs = parse_interval_secs(&interval)?;
-                validate_sync_pair_input(id.as_deref(), &source, &destination)?;
+                validate_sync_pair_input(id.as_deref(), &source, &destination, bwlimit.as_deref())?;
                 let id = match id {
                     Some(id) => id,
                     None => slug_pair_id(&source, &destination),
@@ -257,12 +257,18 @@ fn validate_sync_pair_input(
     id: Option<&str>,
     source: &str,
     destination: &str,
+    bwlimit: Option<&str>,
 ) -> anyhow::Result<()> {
     if source.trim().is_empty() || destination.trim().is_empty() {
         anyhow::bail!("sync pair requires non-empty source and destination");
     }
     if source.as_bytes().contains(&0) || destination.as_bytes().contains(&0) {
         anyhow::bail!("sync pair source and destination must not contain NUL bytes");
+    }
+    if let Some(limit) = bwlimit {
+        if !valid_sync_pair_bwlimit(limit) {
+            anyhow::bail!("invalid sync pair bwlimit `{limit}`");
+        }
     }
     if let Some(id) = id {
         let id = id.trim();
@@ -278,6 +284,14 @@ fn validate_sync_pair_input(
         }
     }
     Ok(())
+}
+
+fn valid_sync_pair_bwlimit(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 32
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn slug_pair_id(source: &str, dest: &str) -> String {
@@ -373,10 +387,17 @@ mod tests {
 
     #[test]
     fn sync_pair_add_refuses_invalid_store_inputs_without_writing() {
-        for (id, source, destination, expected) in [
-            (Some("../escape"), "/src", "/dst", "invalid sync pair id"),
-            (Some("docs"), "", "/dst", "non-empty source"),
-            (Some("docs"), "/src\0", "/dst", "NUL bytes"),
+        for (id, source, destination, expected, bwlimit) in [
+            (
+                Some("../escape"),
+                "/src",
+                "/dst",
+                "invalid sync pair id",
+                None,
+            ),
+            (Some("docs"), "", "/dst", "non-empty source", None),
+            (Some("docs"), "/src\0", "/dst", "NUL bytes", None),
+            (Some("docs"), "/src", "/dst", "bwlimit", Some("1m;rm")),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let err = run_with_store(
@@ -386,7 +407,7 @@ mod tests {
                         interval: "15m".into(),
                         source: source.into(),
                         destination: destination.into(),
-                        bwlimit: None,
+                        bwlimit: bwlimit.map(str::to_owned),
                     },
                 },
                 tmp.path(),
