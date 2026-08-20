@@ -507,6 +507,38 @@ pub fn redeem(
     Ok(to_join_token(&invite, endpoint))
 }
 
+/// Validate and atomically consume an invite for a real enrollment attempt.
+///
+/// [`redeem`] is intentionally a non-consuming projection: the endpoint-less
+/// wizard path uses it to prove that its code maps to the existing enroll
+/// contract before an operator supplies the missing lighthouse endpoint.
+/// A caller that is about to deliver an enrollment request must use this
+/// boundary instead. Validation alone is not authorization: two callers can
+/// both observe a pending ledger entry, but the ledger's unlink-based consume
+/// admits exactly one winner. Consumption happens before the returned token can
+/// be handed to a transport, so a replay or a concurrent loser receives the
+/// same typed [`RedeemError::NotIssued`] refusal.
+///
+/// # Errors
+/// Per [`RedeemError`]. A malformed, expired, foreign, or unissued code never
+/// mutates the ledger.
+pub fn redeem_once(
+    workgroup_root: &Path,
+    code: &str,
+    now_ms: u64,
+    mesh_id: &str,
+    endpoint: &EnrollEndpoint,
+) -> Result<JoinToken, RedeemError> {
+    let invite = validate_for_redeem(workgroup_root, code, now_ms, mesh_id)?;
+    // Consume the canonical payload, not the short-code wrapper. This is the
+    // same ledger key recorded by `issue`, and consume is the atomic
+    // test-and-act boundary that closes the validation/replay race.
+    if !crate::bearer_ledger::consume(workgroup_root, &invite.canonical()) {
+        return Err(RedeemError::NotIssued);
+    }
+    Ok(to_join_token(&invite, endpoint))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +845,55 @@ mod tests {
             )
             .is_err(),
             "the one-call entrypoint refuses the forgery too — no JoinToken minted"
+        );
+    }
+
+    #[test]
+    fn redeem_once_consumes_authorization_before_transport_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = issue(tmp.path(), "home-mesh", Duration::from_secs(600)).unwrap();
+        let token = redeem_once(
+            tmp.path(),
+            &issued.code,
+            issued.invite.exp_ms - 1,
+            "home-mesh",
+            &endpoint(),
+        )
+        .expect("the first authorized enrollment attempt wins");
+        assert_eq!(token.mesh_id, "home-mesh");
+        assert!(
+            !is_recorded(tmp.path(), &issued.code),
+            "the bearer is consumed before transport receives the token"
+        );
+        assert_eq!(
+            redeem_once(
+                tmp.path(),
+                &issued.qr,
+                issued.invite.exp_ms - 1,
+                "home-mesh",
+                &endpoint(),
+            ),
+            Err(RedeemError::NotIssued),
+            "a replay through the alternate encoding is refused"
+        );
+    }
+
+    #[test]
+    fn redeem_once_refusal_keeps_invalid_authorizations_unconsumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = issue(tmp.path(), "home-mesh", Duration::from_secs(600)).unwrap();
+        let err = redeem_once(
+            tmp.path(),
+            &issued.code,
+            issued.invite.exp_ms - 1,
+            "other-mesh",
+            &endpoint(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RedeemError::ForeignMesh { .. }));
+        assert!(
+            is_recorded(tmp.path(), &issued.code),
+            "scope refusal must not burn a valid commissioning bearer"
         );
     }
 
