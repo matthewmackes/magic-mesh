@@ -519,6 +519,67 @@ waive source identity, capacity, checkpoint, artifact-integrity, or
 virtualization/image-contract checks. `docs/BUILD-ENVIRONMENT.md` is the
 operator procedure; this subsection is the durable authority.
 
+**§10.0.4 — Parallel drain contract (newest lock 2026-08-20).** The §10.0
+"work the farm, scale out, never grind solo" mandate is now a hard, measurable
+scheduling contract, not aspirational prose. Prior sessions repeatedly left
+nine of ten heavy slots idle because the worklist carried no machine-readable
+farm units for the existing drain engine to dispatch. The DRAIN-ENGINE (built
+by earlier agents and preserved in-tree) is the canonical parallel-execution
+surface — do not invent a second one.
+
+1. **Machine-readable farm unit is required.** Every `Status: Remaining`
+   worklist epic MUST carry at least one `@farm:{cargo …}` payload in its
+   body. The canonical carrier is the `Verification method:` field. Multiple
+   `@farm:{…}` markers on the same epic authorise disjoint parallel workers;
+   each marker becomes one queue entry keyed by
+   `sha1(task_id \x1f command)` (`automation/lib/farm-jobs.sh jobid`). A
+   marker whose payload does not begin with `cargo ` is a documentation
+   template and contributes zero demand — do not stuff prose inside
+   `@farm:{}`.
+2. **Canonical entrypoints (do not duplicate).** The tick surface is
+   `install-helpers/drain-coordinator.sh plan` (per-node free-slot map +
+   next-N candidate list) and `automation/drain/ship-coordinator.sh --once`
+   (preflight + reconcile + queue surfaces). The queue producer is
+   `automation/lib/farm-jobs.sh active`; the etcd push is
+   `automation/queue/farm-enqueue.sh`; the consumer is
+   `automation/queue/farm-agent.sh`. The autoscaler tick is
+   `install-helpers/farm-reconciler.sh --once`. All read one roster:
+   `install-helpers/farm-topology.sh` (5 dom0s / 10 heavy slots). An
+   agent may not fork a competing scheduler, queue, or slot map.
+3. **Concurrency target.** During any session with Remaining epics, the
+   coordinator must keep `min(total_active_farm_jobs, total_free_slots)`
+   slots busy. If Remaining epics exist but `farm-jobs.sh active` returns
+   zero, the responsible agent's first act is to decompose the top-priority
+   Remaining epic into disjoint `@farm:{…}` units — not to start
+   single-threaded implementation. Idle nodes with Remaining stories is a
+   process failure, not a resource shortage.
+4. **Disjoint ownership.** Multiple `@farm:{…}` markers on the same epic
+   must cover disjoint file/write scopes so their workers cannot collide
+   at merge time. The epic's `Relevant files/components` field names the
+   union; each per-unit worker touches only the subset its command
+   exercises.
+5. **Local heavy `cargo` remains blocked.** `install-helpers/install-drain-guardrails.sh --install`
+   replaces `cargo` with `cargo-farm-guard.sh` on every AI-operated dev
+   host, so `cargo {build,test,check,clippy,bench,run,install,doc,rustc}`
+   fails locally with exit 97 and directs the caller to `xcp-build.sh`.
+   Removing or bypassing the guard is a governance violation; the honest
+   linker workaround is `RUSTFLAGS="-C link-arg=-fuse-ld=gold"` for the
+   remaining allowed local commands (`fmt`, `metadata`, `tree`, `--version`,
+   `locate-project`, `pkgid`, `read-manifest`).
+6. **Slot hygiene is automatic.** `install-helpers/farm-slot-gc.sh` runs
+   on a 20-minute timer on every build VM (`--deploy` from the control
+   host installs it fleet-wide). A worker that finds ENOSPC on a slot must
+   file a capacity incident (§10.0.3.5), not silently retry after `rm -rf`.
+7. **Lint enforcement.** `install-helpers/lint-worklist.sh` fails a
+   commit that leaves any `Status: Remaining` epic without a real
+   `@farm:{cargo …}` payload. Its `--self-test` covers both the required-
+   payload case and the "template payload does not count" case.
+
+Fanning out is the default and the measured behaviour; a serial pass is only
+acceptable for a single epic small enough to fit one `@farm:{…}` unit end to
+end (`Complexity: Small`) or for the tight cutover moments explicitly reserved
+by an operator lock.
+
 ---
 
 *Heritage: the pre-E12 Cosmic-era identity (libcosmic/iced, strictly-Carbon,

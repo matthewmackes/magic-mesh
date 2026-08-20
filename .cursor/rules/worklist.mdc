@@ -24,6 +24,29 @@ Optional: `Dependencies`. No `Progress` field. No checkbox markers.
 Status is exactly `Remaining` / `Blocked` / `Needs clarification`. Do not
 leave a completed epic in the active file.
 
+## Parallel drain unit (required for Remaining)
+
+`AI_GOVERNANCE.md` §10.0.4 makes the DRAIN-ENGINE the canonical parallel
+surface. Every `Status: Remaining` epic MUST carry at least one
+`@farm:{cargo …}` payload — the canonical carrier is the `Verification
+method:` field, appended inline:
+
+```
+- Verification method: focused mde-collab-egui farm gate. @farm:{cargo test -p mde-collab-egui}
+```
+
+Multiple markers on one epic authorise disjoint parallel workers. A
+non-`cargo …` payload (e.g. `@farm:{crate,verify}`) is a template and
+contributes zero demand — do not stuff prose inside the braces.
+
+The queue this feeds is `automation/lib/farm-jobs.sh active` →
+`automation/queue/farm-enqueue.sh` → the etcd `/farm/queue/*` consumed by
+`automation/queue/farm-agent.sh`. Tick with
+`install-helpers/drain-coordinator.sh plan`. Do not invent a second queue.
+
+`Status: Blocked` and `Status: Needs clarification` epics may omit the
+payload but should record what would unblock the payload landing.
+
 ## Close and evidence
 
 - Done or retired items move to `docs/worklist-archive/` with a disposition

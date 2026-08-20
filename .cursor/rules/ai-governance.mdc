@@ -107,9 +107,37 @@ Admit before sync (`AI_GOVERNANCE.md` §10.0.3). Reachability is not capacity.
 Heavy entry point: `install-helpers/xcp-build.sh`. Local Rocky cargo is
 guarded; if you need a linker locally, `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`.
 
+## Parallel drain (§10.0.4)
+
+Existing DRAIN-ENGINE is canonical — do not build a second scheduler:
+
+- **Machine-readable unit.** Every `Status: Remaining` epic MUST carry at
+  least one `@farm:{cargo …}` payload in its body (canonical carrier:
+  `Verification method:`). Multiple markers on one epic authorise disjoint
+  parallel workers.
+- **Entrypoints.** Tick with `install-helpers/drain-coordinator.sh plan`
+  or `automation/drain/ship-coordinator.sh --once`. Queue via
+  `automation/lib/farm-jobs.sh active` → `automation/queue/farm-enqueue.sh`
+  → `automation/queue/farm-agent.sh`. Autoscale via
+  `install-helpers/farm-reconciler.sh --once`. One roster:
+  `install-helpers/farm-topology.sh`.
+- **Concurrency target.** Keep `min(active_farm_jobs, free_slots)` busy.
+  If Remaining epics exist and `farm-jobs.sh active` returns zero, the
+  next act is decomposing the top-priority epic into disjoint
+  `@farm:{cargo …}` units, not starting a serial edit.
+- **Local heavy cargo stays disabled** by `install-drain-guardrails.sh`
+  (`cargo-farm-guard.sh` replaces `cargo`; blocked verbs exit 97). Do
+  not bypass. Allowed local: `fmt`, `metadata`, `tree`, `--version`,
+  `locate-project`, `pkgid`, `read-manifest`.
+- **Slot GC** is `install-helpers/farm-slot-gc.sh` on a 20-minute timer
+  (`--deploy` for fleet install). ENOSPC on a slot files a capacity
+  incident; do not silently retry.
+
 ## Worklist
 
 The only active tracker is `docs/platform/WORKLIST.md`. Design notes, evidence,
 and `docs/NEEDS-OPERATOR.md` are inputs, not parallel trackers. Closed items
 move to `docs/worklist-archive/`. Run
 `install-helpers/lint-worklist.sh --self-test` before landing worklist edits.
+The lint fails any `Status: Remaining` epic missing a real `@farm:{cargo …}`
+payload.

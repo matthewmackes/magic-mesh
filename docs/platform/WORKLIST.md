@@ -139,6 +139,38 @@ revision, command, result, and evidence path; and mark the story complete only
 when the Done when condition is true. A passing compile without the named
 behavioral evidence is not completion.
 
+Every `Status: Remaining` epic below carries at least one
+`@farm:{cargo …}` payload as part of `Verification method:`. That payload is
+what `automation/lib/farm-jobs.sh active` emits, what
+`automation/queue/farm-enqueue.sh` pushes to `/farm/queue/*`, and what a
+`automation/queue/farm-agent.sh` worker slot picks up. Multiple such markers
+on the same epic authorise disjoint parallel workers; each covers a
+non-overlapping slice of the epic's `Relevant files/components`. Adding or
+retiring an epic changes the queue; do not build a second queue or scheduler
+(`AI_GOVERNANCE.md` §10.0.4).
+
+## Parallel drain execution contract
+
+The canonical tick is `install-helpers/drain-coordinator.sh plan`
+(preflight + per-node free-slot map + next-N candidate units) or, from the
+control host, `automation/drain/ship-coordinator.sh --once` (adds farm
+reconcile + needs-review/triage surfaces). Both read one roster —
+`install-helpers/farm-topology.sh` (5 dom0s / 10 heavy slots) — and one
+queue producer: `automation/lib/farm-jobs.sh active` over this file.
+
+While Remaining epics exist, the coordinator must keep
+`min(active_farm_jobs, free_slots)` slots busy. When Remaining epics exist
+but `farm-jobs.sh active` returns zero, the responsible agent's next act is
+decomposing the top-priority epic into disjoint `@farm:{cargo …}` units,
+not starting single-threaded implementation. Idle nodes with Remaining
+stories is a process failure, not a resource shortage.
+
+Local heavy `cargo` remains blocked by
+`install-helpers/install-drain-guardrails.sh` (exit 97 with a farm redirect).
+Do not bypass. Slot GC (`install-helpers/farm-slot-gc.sh`) reclaims stale
+`~/magic-mesh-farm-*` dirs on a 20-minute timer; an ENOSPC after admission
+is a capacity incident (§10.0.3), not a silent retry.
+
 ## Non-stall execution contract
 
 - A blocked story parks only its dependent lane. While any implementation,
@@ -355,7 +387,7 @@ behavioral evidence is not completion.
 - Verification method: worklist lint, focused hostile tests, meaningful gates
   across all permanent farm hosts, exact three-seat and
   three-lighthouse acceptance, signed evidence verification, clean-room public
-  readback, and repository query.
+  readback, and repository query. @farm:{cargo test --workspace}
 - Origin or merged source IDs: SOL Luna AI completion plan and Android deferral
   direction (2026-08-17).
 
@@ -576,7 +608,7 @@ behavioral evidence is not completion.
   prominent `ReadyWithWarnings`.
 - Verification method: focused hostile/unit tests, farm integration and package
   fixtures, GUI/TUI parity, interruption/resume proof, and exactly three physical
-  acceptance seats; defer exact release/rollout proof to WL-TEST-002.
+  acceptance seats; defer exact release/rollout proof to WL-TEST-002. @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-enroll}
 - Origin or merged source IDs: lifecycle consolidation direction, Seat 15 and Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
@@ -802,6 +834,7 @@ behavioral evidence is not completion.
   fixture, unavailable input, or external handoff can satisfy the gate.
 - Verification method: farm-only source/image/package gates, receipt inspectors,
   hostile substitution tests, license review, and canonical preflight.
+  @farm:{cargo build --workspace}
 - Origin or merged source IDs: WL-CRIT-006, WL-FUNC-017, WL-FUNC-018,
   WL-FUNC-020, and the deferred WL-TEST-002 provider-proof queue.
 
@@ -1244,6 +1277,8 @@ story execution contract above.
 - Verification method: focused per-crate farm gates plus the existing audio
   chirp-correlation fixture on the qualification seats; evidence under
   docs/platform/evidence/.
+  @farm:{cargo test -p mde-collab-types} @farm:{cargo test -p mackesd}
+  @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mde-voice-hud}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q11/Q15 and the
   calls.rs media-plane follow-up markers.
 
@@ -1306,6 +1341,7 @@ story execution contract above.
   refuse.
 - Verification method: focused mde-files and mde-files-egui farm gates; no
   live hardware required.
+  @farm:{cargo test -p mde-files-egui} @farm:{cargo test -p mde-files}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q26
   (build-new:file-manager-posix-ops), file-manager design lock 1.
 
@@ -1342,6 +1378,7 @@ story execution contract above.
 - Acceptance criteria: preferences survive restart, stay bounded on disk, and
   hostile files degrade to defaults.
 - Verification method: focused mde-files-egui farm gate.
+  @farm:{cargo test -p mde-files-egui}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q28
   (build-new:file-manager-folderprefs-persist), file-manager design lock 20.
 
@@ -1378,6 +1415,7 @@ story execution contract above.
 - Acceptance criteria: pin, rename, reorder, and remove persist and activate;
   the store is bounded and hostile input refuses.
 - Verification method: focused mde-files-egui farm gate.
+  @farm:{cargo test -p mde-files-egui}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q27
   (build-new:file-manager-bookmarks), file-manager design lock 21.
 
@@ -1427,6 +1465,8 @@ story execution contract above.
   executes them; no second store or scheduler appears.
 - Verification method: focused mackesd transfers and mde-collab-egui farm
   gates.
+  @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-shell-egui}
+  @farm:{cargo test -p mde-collab-egui}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q34
   (build-new:recurring-mirror-producer), transfers design lock.
 
@@ -1472,6 +1512,7 @@ story execution contract above.
   change.
 - Verification method: focused mde-collab-egui and mackesd voice_provision
   farm gates.
+  @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mackesd}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q8
   (build-new:fleet-voice-admin@Activity).
 
@@ -1509,6 +1550,7 @@ story execution contract above.
 - Acceptance criteria: the full set/get/clear cycle works from the panel with
   the redaction contract intact.
 - Verification method: focused mde-collab-egui and mackesd voip farm gates.
+  @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mackesd}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q12
   (build-new:sip-gateway-config@Activity).
 
@@ -1559,6 +1601,7 @@ story execution contract above.
   external writes merge safely; no Phase-3c marker remains.
 - Verification method: focused mde-collab-egui farm gates with the
   two-instance session fixture.
+  @farm:{cargo test -p mde-collab-egui}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q21
   (defer-followup), documents.rs Phase-3c markers.
 
@@ -1592,6 +1635,7 @@ story execution contract above.
 - Acceptance criteria: both accelerators work and are catalogued with no
   focus-context shadowing.
 - Verification method: focused mde-shell-egui and mde-collab-egui farm gates.
+  @farm:{cargo test -p mde-shell-egui} @farm:{cargo test -p mde-collab-egui}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger
   (build-new:reserve-transfer-hotkeys).
 

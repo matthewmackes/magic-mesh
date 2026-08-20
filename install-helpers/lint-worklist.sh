@@ -314,6 +314,71 @@ farm_parser_check() {
   MCNF_WORKLIST="$wl" "$FARM_JOBS" list >/dev/null
 }
 
+# AI_GOVERNANCE.md §10.0.4: every `Status: Remaining` epic MUST carry at least
+# one real `@farm:{cargo …}` payload so the DRAIN-ENGINE
+# (drain-coordinator + farm-reconciler + farm-agent) has a machine-readable
+# unit to schedule. A missing payload silently idles free farm slots even
+# though 10 heavy build slots exist. Blocked / Needs clarification epics are
+# exempt (they park until an operator input lifts them).
+farm_remaining_unit_check() {
+  local wl="$1"
+  awk '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function fail(msg) {
+      print "lint-worklist.sh: " msg > "/dev/stderr"
+      failed = 1
+    }
+    function has_cargo_payload(line,   rest, pos, end, cmd) {
+      rest = line
+      while ((pos = index(rest, "@farm:{")) > 0) {
+        rest = substr(rest, pos + 7)
+        end = index(rest, "}")
+        if (end == 0) return 0
+        cmd = trim(substr(rest, 1, end - 1))
+        if (cmd ~ /^cargo[[:space:]]/) return 1
+        rest = substr(rest, end + 1)
+      }
+      return 0
+    }
+    function finish_item() {
+      if (item_id == "" || item_status != "Remaining") return
+      if (!item_has_payload) {
+        fail(item_line ": " item_id " is Status: Remaining but carries no @farm:{cargo …} payload (§10.0.4)")
+      }
+    }
+    /^### WL-[A-Z0-9-]+ - / {
+      finish_item()
+      item_id = $2
+      item_line = FNR
+      item_status = ""
+      item_has_payload = 0
+      next
+    }
+    /^## / {
+      finish_item()
+      item_id = ""
+      next
+    }
+    /^- Status:[[:space:]]*/ {
+      value = $0
+      sub(/^- Status:[[:space:]]*/, "", value)
+      item_status = trim(value)
+      next
+    }
+    {
+      if (item_id != "" && has_cargo_payload($0)) item_has_payload = 1
+    }
+    END {
+      finish_item()
+      exit failed ? 1 : 0
+    }
+  ' "$wl"
+}
+
 lint_one() {
   local wl="$1" rc=0
   if [ ! -f "$wl" ]; then
@@ -323,6 +388,7 @@ lint_one() {
   structure_check "$wl" || rc=1
   secret_check "$wl" || rc=1
   farm_payload_check "$wl" || rc=1
+  farm_remaining_unit_check "$wl" || rc=1
   if ! farm_parser_check "$wl"; then
     echo "lint-worklist.sh: farm job parser could not parse $wl" >&2
     rc=1
@@ -355,7 +421,10 @@ self_test() {
       if [ -n "$farm_line" ]; then
         printf '%s\n' "- Verification method: $farm_line"
       else
-        printf '%s\n' '- Verification method: Focused fixture tests.'
+        # §10.0.4: a Remaining epic must carry an @farm:{cargo …} payload.
+        # The default baseline uses `mde-bus` as a small stand-in so the good
+        # fixture is scheduler-ready without a real crate binding.
+        printf '%s\n' '- Verification method: Focused fixture tests. @farm:{cargo test -p mde-bus}'
       fi
       printf '%s\n' '- Origin or merged source IDs: self-test.'
       printf '%s\n' '### WL-TEST-002 - Good blocked item'
@@ -418,6 +487,18 @@ self_test() {
 
   write_good "$td/farm-placeholder.md" '@farm:{crate,verify}'
   expect_fail "placeholder farm job" "$td/farm-placeholder.md"
+
+  # §10.0.4: a Remaining epic without any @farm:{cargo …} payload silently
+  # idles the drain-coordinator. A prose-only Verification method must fail.
+  write_good "$td/remaining-no-unit.md" 'Focused fixture tests only.'
+  expect_fail "remaining epic missing @farm:{cargo …} unit" \
+    "$td/remaining-no-unit.md"
+
+  # Multiple @farm:{cargo …} markers on one epic authorise disjoint workers.
+  write_good "$td/remaining-multi-unit.md" \
+    'Two-lane gate. @farm:{cargo test -p mde-bus} @farm:{cargo build -p mde-egui}'
+  expect_pass "remaining epic with multiple @farm units" \
+    "$td/remaining-multi-unit.md"
 
   sed '0,/- Status: Remaining/d' "$td/good.md" >"$td/missing-status.md"
   expect_fail "missing status" "$td/missing-status.md"
