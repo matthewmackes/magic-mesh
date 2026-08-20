@@ -2334,3 +2334,39 @@ fn bookmarks_corrupt_store_is_preserved_until_the_operator_mutates() {
     assert_eq!(reloaded.bookmarks.len(), 1);
     assert_eq!(reloaded.bookmarks[0].path, target.to_string_lossy());
 }
+
+// WL-FUNC-027 — a failed bookmark write must be visible instead of making a
+// pin look durable when the configured store parent cannot be created.
+#[test]
+fn bookmarks_report_persistence_failure_and_keep_dirty_state() {
+    let dir = tempfile::tempdir().expect("config parent");
+    let blocked_parent = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, b"file blocker").expect("seed blocker");
+    let target = dir.path().join("Docs");
+    std::fs::create_dir(&target).expect("mkdir");
+    let rows = vec![FileRow::local("Docs", Mime::Folder, "\u{2014}", "\u{2014}")
+        .with_path(target.to_string_lossy())];
+    let mut b = live_posix_browser(rows).with_config_dir(&blocked_parent);
+    b.click(0, 0);
+    b.pin_focused(0);
+    b.flush_persisted();
+
+    assert_eq!(b.bookmarks().len(), 1, "the in-memory pin remains usable");
+    assert!(
+        b.last_note()
+            .is_some_and(|note| note.contains("Bookmarks could not be saved")),
+        "persistence failure must be visible: {:?}",
+        b.last_note()
+    );
+    assert!(
+        !blocked_parent.join(super::BOOKMARKS_FILE).exists(),
+        "a failed write must not claim to have created the store"
+    );
+
+    std::fs::remove_file(&blocked_parent).expect("remove blocker");
+    std::fs::create_dir(&blocked_parent).expect("repair config parent");
+    b.flush_persisted();
+    let saved = super::load_bookmarks_at(&blocked_parent.join(super::BOOKMARKS_FILE))
+        .expect("retry should persist after repair");
+    assert_eq!(saved.bookmarks, b.bookmarks());
+}

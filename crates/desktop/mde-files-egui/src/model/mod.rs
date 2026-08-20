@@ -3646,8 +3646,8 @@ impl FileBrowser {
         if self.folder_prefs_dirty.take().is_some() {
             self.write_folder_prefs();
         }
-        if self.bookmarks_dirty.take().is_some() {
-            self.write_bookmarks();
+        if self.bookmarks_dirty.is_some() && self.write_bookmarks() {
+            self.bookmarks_dirty = None;
         }
     }
 
@@ -3658,8 +3658,9 @@ impl FileBrowser {
             self.write_folder_prefs();
         }
         if self.bookmarks_dirty.is_some_and(due) {
-            self.bookmarks_dirty = None;
-            self.write_bookmarks();
+            if self.write_bookmarks() {
+                self.bookmarks_dirty = None;
+            }
         }
     }
 
@@ -3724,16 +3725,25 @@ impl FileBrowser {
         let _ = write_json_store(path, &FolderPrefsFile { entries });
     }
 
-    fn write_bookmarks(&self) {
-        let Some(path) = self.bookmarks_path.as_ref() else {
-            return;
+    fn write_bookmarks(&mut self) -> bool {
+        let Some(path) = self.bookmarks_path.clone() else {
+            return true;
         };
-        let _ = write_json_store(
-            path,
+        match write_json_store(
+            &path,
             &BookmarksFile {
                 bookmarks: self.bookmarks.clone(),
             },
-        );
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_note = Some(format!(
+                    "Bookmarks could not be saved to {}: {error}",
+                    path.display()
+                ));
+                false
+            }
+        }
     }
 
     fn cleanup_dup_staging(&mut self, finished: &[OpId]) {
