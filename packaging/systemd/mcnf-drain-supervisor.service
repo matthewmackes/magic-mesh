@@ -1,0 +1,25 @@
+# DRAIN-8 — persistent worklist supervisor.
+#
+# The coordinator remains the canonical DRAIN-ENGINE tick surface: it runs the
+# disk watchdog, farm reconciler, review/triage queues, and the tool-preserving
+# implementation dispatcher. The native adapter is supplied by the invoking
+# agent runtime through /etc/mcnf/drain-supervisor.env; absent adapters fail
+# closed instead of silently switching tools.
+[Unit]
+Description=MCNF worklist drain supervisor
+After=network-online.target mcnf-reconciler-bootstrap.service
+Wants=network-online.target mcnf-reconciler-bootstrap.service
+
+[Service]
+Type=simple
+Environment=HOME=/root
+EnvironmentFile=-/etc/mcnf/drain-supervisor.env
+WorkingDirectory=/opt/mcnf
+ExecStart=/bin/bash -lc 'exec automation/drain/ship-coordinator.sh --loop'
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
