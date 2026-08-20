@@ -114,6 +114,10 @@ Sibling agent surfaces load equivalent skills that trigger the same
 contract: `.claude/skills/drain-worklist/SKILL.md` (Claude Code) and
 `.codex/skills/drain-worklist/SKILL.md` (Codex IDE). All three sit atop
 `AI_GOVERNANCE.md §10.0.4` and `AGENTS.md → Parallel Drain Contract`.
+Cursor owns this invocation's implementation fan-out: set
+`MCNF_AGENT_RUNTIME=cursor` and use a Cursor-native
+`MCNF_AGENT_DISPATCHER`; never dispatch Codex or Claude workers from a Cursor
+drain. The bridge fails closed when the native adapter is absent.
 
 - **Machine-readable unit.** Every `Status: Remaining` epic MUST carry at
   least one `@farm:{cargo …}` payload in its body (canonical carrier:

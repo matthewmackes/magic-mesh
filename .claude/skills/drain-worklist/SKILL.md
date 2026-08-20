@@ -26,6 +26,11 @@ The DRAIN-ENGINE was built by earlier agents and is preserved in-tree. This
 skill wires Claude Code into that engine — **do not reinvent a scheduler,
 queue, or slot map.**
 
+Claude Code owns this invocation's implementation fan-out. Set
+`MCNF_AGENT_RUNTIME=claude` and use a Claude-native
+`MCNF_AGENT_DISPATCHER`; never dispatch Cursor or Codex workers from a Claude
+drain. The bridge fails closed when the native adapter is absent.
+
 ## What actually holds the farm parallel
 
 The scheduler chain reads `@farm:{cargo …}` payloads out of `Status:
