@@ -1413,6 +1413,18 @@ impl VehicleRosterSnapshot {
             snapshot.sequence = 0;
             snapshot.observed_at_ms = 0;
             snapshot.published_at_ms = 0;
+            // Freshness ages are derived from wall-clock time while folding a
+            // snapshot, not reported gateway content. Comparing them makes a
+            // metadata-only refresh look like a telemetry change.
+            for domain in [
+                &mut snapshot.freshness.identity,
+                &mut snapshot.freshness.radios,
+                &mut snapshot.freshness.gnss,
+                &mut snapshot.freshness.vehicle,
+                &mut snapshot.freshness.power,
+            ] {
+                domain.age_ms = None;
+            }
         }
         left == right
     }
