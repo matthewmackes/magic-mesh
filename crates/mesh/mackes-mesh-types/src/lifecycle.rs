@@ -154,12 +154,26 @@ pub struct LifecycleUpgradeBindingV1 {
 
 impl LifecycleUpgradeBindingV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("target_id", &self.target_id), ("current_version", &self.current_version), ("target_version", &self.target_version), ("source_revision", &self.source_revision)])?;
-        let current = parse_version(&self.current_version).ok_or(LifecycleIntentError::InvalidField("current_version"))?;
-        let target = parse_version(&self.target_version).ok_or(LifecycleIntentError::InvalidField("target_version"))?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[
+                ("target_id", &self.target_id),
+                ("current_version", &self.current_version),
+                ("target_version", &self.target_version),
+                ("source_revision", &self.source_revision),
+            ],
+        )?;
+        let current = parse_version(&self.current_version)
+            .ok_or(LifecycleIntentError::InvalidField("current_version"))?;
+        let target = parse_version(&self.target_version)
+            .ok_or(LifecycleIntentError::InvalidField("target_version"))?;
         if target <= current
             || self.target_artifact_digest_hex.len() != 64
-            || !self.target_artifact_digest_hex.chars().all(|c| c.is_ascii_hexdigit())
+            || !self
+                .target_artifact_digest_hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
         {
             return Err(LifecycleIntentError::InvalidField("upgrade_binding"));
         }
@@ -169,13 +183,24 @@ impl LifecycleUpgradeBindingV1 {
 
 fn parse_version(value: &str) -> Option<[u64; 3]> {
     let mut parts = value.split('.');
-    let parsed = [parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?];
+    let parsed = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
     (parts.next().is_none()).then_some(parsed)
 }
 
 impl LifecycleCorrectionPlanV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id), ("target_id", &self.target_id)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[
+                ("request_id", &self.request_id),
+                ("target_id", &self.target_id),
+            ],
+        )?;
         if self.corrections.is_empty()
             || self.corrections.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
             || !self.rollback_forbidden
@@ -190,39 +215,77 @@ impl LifecycleCorrectionPlanV1 {
         {
             return Err(LifecycleIntentError::InvalidField("correction_plan"));
         }
-        let ids = self.corrections.iter().map(|c| c.check_id.as_str()).collect::<std::collections::HashSet<_>>();
+        let ids = self
+            .corrections
+            .iter()
+            .map(|c| c.check_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
         if self.edges.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
-            || self.edges.iter().any(|(from, to)| from == to || !ids.contains(from.as_str()) || !ids.contains(to.as_str()))
+            || self.edges.iter().any(|(from, to)| {
+                from == to || !ids.contains(from.as_str()) || !ids.contains(to.as_str())
+            })
         {
             return Err(LifecycleIntentError::InvalidField("correction_edges"));
         }
         // Kahn's algorithm rejects cycles and makes execution order explicit.
-        let mut indegree = ids.iter().map(|id| (*id, 0usize)).collect::<std::collections::HashMap<_, _>>();
-        for (_, to) in &self.edges { *indegree.get_mut(to.as_str()).unwrap() += 1; }
-        let mut ready = indegree.iter().filter_map(|(id, count)| (*count == 0).then_some(*id)).collect::<Vec<_>>();
+        let mut indegree = ids
+            .iter()
+            .map(|id| (*id, 0usize))
+            .collect::<std::collections::HashMap<_, _>>();
+        for (_, to) in &self.edges {
+            *indegree.get_mut(to.as_str()).unwrap() += 1;
+        }
+        let mut ready = indegree
+            .iter()
+            .filter_map(|(id, count)| (*count == 0).then_some(*id))
+            .collect::<Vec<_>>();
         let mut visited = 0usize;
         while let Some(id) = ready.pop() {
             visited += 1;
-            for (from, to) in &self.edges { if from == id { let entry = indegree.get_mut(to.as_str()).unwrap(); *entry -= 1; if *entry == 0 { ready.push(to.as_str()); } } }
+            for (from, to) in &self.edges {
+                if from == id {
+                    let entry = indegree.get_mut(to.as_str()).unwrap();
+                    *entry -= 1;
+                    if *entry == 0 {
+                        ready.push(to.as_str());
+                    }
+                }
+            }
         }
-        if visited != ids.len() { return Err(LifecycleIntentError::InvalidField("correction_cycle")); }
+        if visited != ids.len() {
+            return Err(LifecycleIntentError::InvalidField("correction_cycle"));
+        }
         Ok(())
     }
 }
 
 impl LifecycleRequirementCheckV1 {
     pub fn blocks_progress(&self) -> bool {
-        self.required && matches!(self.status, LifecycleCheckStatus::Fail | LifecycleCheckStatus::Unknown)
+        self.required
+            && matches!(
+                self.status,
+                LifecycleCheckStatus::Fail | LifecycleCheckStatus::Unknown
+            )
     }
 
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("check_id", &self.check_id), ("target_id", &self.target_id)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[("check_id", &self.check_id), ("target_id", &self.target_id)],
+        )?;
         if self.expected.is_empty()
             || self.expected.len() > 1024
             || self.observed.len() > 1024
             || self.evidence_digest_hex.len() != 64
-            || !self.evidence_digest_hex.chars().all(|c| c.is_ascii_hexdigit())
-            || matches!(self.status, LifecycleCheckStatus::Warn | LifecycleCheckStatus::Unknown) && self.warning.as_deref().unwrap_or("").is_empty()
+            || !self
+                .evidence_digest_hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+            || matches!(
+                self.status,
+                LifecycleCheckStatus::Warn | LifecycleCheckStatus::Unknown
+            ) && self.warning.as_deref().unwrap_or("").is_empty()
         {
             return Err(LifecycleIntentError::InvalidField("requirement_check"));
         }
@@ -232,9 +295,20 @@ impl LifecycleRequirementCheckV1 {
 
 impl LifecycleArtifactSelectionV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("selection_id", &self.selection_id), ("target_id", &self.target_id), ("source_revision", &self.source_revision)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[
+                ("selection_id", &self.selection_id),
+                ("target_id", &self.target_id),
+                ("source_revision", &self.source_revision),
+            ],
+        )?;
         if self.artifact_digest_hex.len() != 64
-            || !self.artifact_digest_hex.chars().all(|c| c.is_ascii_hexdigit())
+            || !self
+                .artifact_digest_hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
             || (self.signed == self.unverified_build)
         {
             return Err(LifecycleIntentError::InvalidField("artifact_admission"));
@@ -269,10 +343,21 @@ impl CommissioningCapsuleV1 {
     }
 
     pub fn validate_at(&self, now_ms: i64) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.expires_at_ms.max(1) as u64, &[("capsule_id", &self.capsule_id), ("target_id", &self.target_id), ("key_id", &self.key_id)])?;
+        validate_common(
+            self.schema_version,
+            self.expires_at_ms.max(1) as u64,
+            &[
+                ("capsule_id", &self.capsule_id),
+                ("target_id", &self.target_id),
+                ("key_id", &self.key_id),
+            ],
+        )?;
         if self.expires_at_ms <= now_ms
             || self.bootstrap_digest_hex.len() != 64
-            || !self.bootstrap_digest_hex.chars().all(|c| c.is_ascii_hexdigit())
+            || !self
+                .bootstrap_digest_hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
             || self.signature_hex.len() != 128
             || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit())
             || !self.one_time
@@ -282,10 +367,17 @@ impl CommissioningCapsuleV1 {
         Ok(())
     }
 
-    pub fn verify_at(&self, now_ms: i64, verifying_key: &VerifyingKey) -> Result<(), LifecycleIntentError> {
+    pub fn verify_at(
+        &self,
+        now_ms: i64,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), LifecycleIntentError> {
         self.validate_at(now_ms)?;
-        let bytes = decode_hex_64(&self.signature_hex).ok_or(LifecycleIntentError::InvalidField("signature_hex"))?;
-        verifying_key.verify(&self.signing_bytes(), &Signature::from_bytes(&bytes)).map_err(|_| LifecycleIntentError::InvalidField("signature_hex"))
+        let bytes = decode_hex_64(&self.signature_hex)
+            .ok_or(LifecycleIntentError::InvalidField("signature_hex"))?;
+        verifying_key
+            .verify(&self.signing_bytes(), &Signature::from_bytes(&bytes))
+            .map_err(|_| LifecycleIntentError::InvalidField("signature_hex"))
     }
 }
 
@@ -325,14 +417,22 @@ impl LifecycleConfirmationV1 {
 
     pub fn expected_phrase(action: LifecycleConfirmationAction, target_count: u32) -> String {
         match action {
-            LifecycleConfirmationAction::Offboard => format!("FORCE OFFBOARD {target_count} SYSTEMS"),
+            LifecycleConfirmationAction::Offboard => {
+                format!("FORCE OFFBOARD {target_count} SYSTEMS")
+            }
             LifecycleConfirmationAction::Reset => format!("WIPE {target_count} SYSTEMS"),
-            LifecycleConfirmationAction::InstallUnsigned => format!("INSTALL UNSIGNED {target_count} SYSTEMS"),
+            LifecycleConfirmationAction::InstallUnsigned => {
+                format!("INSTALL UNSIGNED {target_count} SYSTEMS")
+            }
         }
     }
 
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("session_id", &self.session_id)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[("session_id", &self.session_id)],
+        )?;
         if self.target_count == 0
             || self.scope_digest_hex.len() != 64
             || !self.scope_digest_hex.chars().all(|c| c.is_ascii_hexdigit())
@@ -342,7 +442,9 @@ impl LifecycleConfirmationV1 {
         if self.key_id.is_empty() || self.key_id.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES {
             return Err(LifecycleIntentError::InvalidField("key_id"));
         }
-        if self.signature_hex.len() != 128 || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        if self.signature_hex.len() != 128
+            || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
             return Err(LifecycleIntentError::InvalidField("signature_hex"));
         }
         if self.phrase != Self::expected_phrase(self.action, self.target_count) {
@@ -453,16 +555,16 @@ pub fn canonical_lifecycle_baseline() -> Vec<LifecycleBaselineEntryV1> {
         ("verification", LifecycleStepKind::Verify),
     ]
     .into_iter()
-        .map(|(requirement_id, owner_step)| LifecycleBaselineEntryV1 {
-            schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
-            requirement_id: requirement_id.into(),
-            owner_step,
-            required: true,
-            provider: "mackesd".into(),
-            critical: true,
-            prerequisites: Vec::new(),
-            correction_step: owner_step,
-        })
+    .map(|(requirement_id, owner_step)| LifecycleBaselineEntryV1 {
+        schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
+        requirement_id: requirement_id.into(),
+        owner_step,
+        required: true,
+        provider: "mackesd".into(),
+        critical: true,
+        prerequisites: Vec::new(),
+        correction_step: owner_step,
+    })
     .collect()
 }
 
@@ -556,7 +658,9 @@ impl LifecycleIntentV1 {
                 LifecycleStepKind::Mesh,
                 LifecycleStepKind::Verify,
             ],
-            LifecycleIntentKind::Offboard => &[LifecycleStepKind::Offboard, LifecycleStepKind::Verify],
+            LifecycleIntentKind::Offboard => {
+                &[LifecycleStepKind::Offboard, LifecycleStepKind::Verify]
+            }
         };
         steps.iter().map(|step| step.as_str().to_string()).collect()
     }
@@ -565,7 +669,10 @@ impl LifecycleIntentV1 {
         if self.schema_version != LIFECYCLE_CONTRACT_SCHEMA_VERSION {
             return Err(LifecycleIntentError::UnsupportedSchema(self.schema_version));
         }
-        for (field, value) in [("request_id", &self.request_id), ("target_id", &self.target_id)] {
+        for (field, value) in [
+            ("request_id", &self.request_id),
+            ("target_id", &self.target_id),
+        ] {
             if value.is_empty() || value.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES {
                 return Err(LifecycleIntentError::InvalidField(field));
             }
@@ -597,16 +704,19 @@ impl OnboardOffboardSessionV1 {
         validate_common(
             self.schema_version,
             self.generation,
-            &[("session_id", &self.session_id), ("operator_id", &self.operator_id)],
+            &[
+                ("session_id", &self.session_id),
+                ("operator_id", &self.operator_id),
+            ],
         )?;
         if self.target_ids.is_empty()
             || self.target_ids.len() > 256
             || self.target_ids.iter().any(|target| {
                 target.is_empty()
                     || target.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES
-                    || !target.chars().all(|c| {
-                        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
-                    })
+                    || !target
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
             })
         {
             return Err(LifecycleIntentError::InvalidField("target_ids"));
@@ -615,12 +725,21 @@ impl OnboardOffboardSessionV1 {
     }
 }
 
-fn validate_common(schema_version: u16, generation: u64, fields: &[(&'static str, &str)]) -> Result<(), LifecycleIntentError> {
+fn validate_common(
+    schema_version: u16,
+    generation: u64,
+    fields: &[(&'static str, &str)],
+) -> Result<(), LifecycleIntentError> {
     if schema_version != LIFECYCLE_CONTRACT_SCHEMA_VERSION {
         return Err(LifecycleIntentError::UnsupportedSchema(schema_version));
     }
     for (field, value) in fields {
-        if value.is_empty() || value.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES || !value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')) {
+        if value.is_empty()
+            || value.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        {
             return Err(LifecycleIntentError::InvalidField(field));
         }
     }
@@ -632,8 +751,22 @@ fn validate_common(schema_version: u16, generation: u64, fields: &[(&'static str
 
 impl LifecyclePlanV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id), ("target_id", &self.target_id)])?;
-        if self.steps.is_empty() || self.steps.len() > 256 || self.steps.iter().any(|step| step.is_empty() || step.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES || LifecycleStepKind::parse(step).is_none()) {
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[
+                ("request_id", &self.request_id),
+                ("target_id", &self.target_id),
+            ],
+        )?;
+        if self.steps.is_empty()
+            || self.steps.len() > 256
+            || self.steps.iter().any(|step| {
+                step.is_empty()
+                    || step.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES
+                    || LifecycleStepKind::parse(step).is_none()
+            })
+        {
             return Err(LifecycleIntentError::InvalidField("steps"));
         }
         Ok(())
@@ -642,9 +775,19 @@ impl LifecyclePlanV1 {
 
 impl LifecycleBaselineEntryV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, 1, &[("requirement_id", &self.requirement_id), ("provider", &self.provider)])?;
+        validate_common(
+            self.schema_version,
+            1,
+            &[
+                ("requirement_id", &self.requirement_id),
+                ("provider", &self.provider),
+            ],
+        )?;
         if self.prerequisites.len() > MAX_LIFECYCLE_COLLECTION_ITEMS
-            || self.prerequisites.iter().any(|item| item.is_empty() || item.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES)
+            || self
+                .prerequisites
+                .iter()
+                .any(|item| item.is_empty() || item.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES)
         {
             return Err(LifecycleIntentError::InvalidField("baseline_prerequisites"));
         }
@@ -654,7 +797,14 @@ impl LifecycleBaselineEntryV1 {
 
 impl LifecycleProgressV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id), ("target_id", &self.target_id)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[
+                ("request_id", &self.request_id),
+                ("target_id", &self.target_id),
+            ],
+        )?;
         if self.total_steps == 0 || self.completed_steps > self.total_steps {
             return Err(LifecycleIntentError::InvalidNumber("steps"));
         }
@@ -664,14 +814,28 @@ impl LifecycleProgressV1 {
 
 impl SeatReadinessV1 {
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("target_id", &self.target_id)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[("target_id", &self.target_id)],
+        )?;
         if self.ready && !self.missing_requirements.is_empty() {
             return Err(LifecycleIntentError::InvalidField("missing_requirements"));
         }
-        if self.missing_requirements.len() > 256 || self.missing_requirements.iter().any(|item| item.is_empty() || item.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES) {
+        if self.missing_requirements.len() > 256
+            || self
+                .missing_requirements
+                .iter()
+                .any(|item| item.is_empty() || item.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES)
+        {
             return Err(LifecycleIntentError::InvalidField("missing_requirements"));
         }
-        if self.warnings.len() > 256 || self.warnings.iter().any(|item| item.is_empty() || item.len() > 1024) {
+        if self.warnings.len() > 256
+            || self
+                .warnings
+                .iter()
+                .any(|item| item.is_empty() || item.len() > 1024)
+        {
             return Err(LifecycleIntentError::InvalidField("warnings"));
         }
         Ok(())
@@ -682,10 +846,17 @@ impl OffboardingReceiptV1 {
     const SIGNING_DOMAIN: &'static str = "magic-mesh:offboarding-receipt:v1";
 
     fn signing_bytes(&self) -> Vec<u8> {
-        format!("{}|{}|{}|{}|{}|{}|{}", Self::SIGNING_DOMAIN, self.schema_version,
-            self.request_id, self.target_id, self.generation, self.completed,
-            serde_json::to_string(&self.retained_resources).expect("receipt fields serialize"))
-            .into_bytes()
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            Self::SIGNING_DOMAIN,
+            self.schema_version,
+            self.request_id,
+            self.target_id,
+            self.generation,
+            self.completed,
+            serde_json::to_string(&self.retained_resources).expect("receipt fields serialize")
+        )
+        .into_bytes()
     }
 
     pub fn sign(mut self, signing_key: &SigningKey) -> Self {
@@ -697,19 +868,28 @@ impl OffboardingReceiptV1 {
         self.validate()?;
         let signature = decode_hex_64(&self.signature_hex)
             .ok_or(LifecycleIntentError::InvalidField("signature_hex"))?;
-        verifying_key.verify(&self.signing_bytes(), &Signature::from_bytes(&signature))
+        verifying_key
+            .verify(&self.signing_bytes(), &Signature::from_bytes(&signature))
             .map_err(|_| LifecycleIntentError::InvalidField("signature_hex"))
     }
 
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id), ("target_id", &self.target_id)])?;
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[
+                ("request_id", &self.request_id),
+                ("target_id", &self.target_id),
+            ],
+        )?;
         // A completed offboard receipt is an erasure assertion, not a waiver:
         // any retained reusable state makes the operation incomplete.
         if !self.completed || !self.retained_resources.is_empty() {
             return Err(LifecycleIntentError::InvalidField("retained_resources"));
         }
         if !self.signature_hex.is_empty()
-            && (self.signature_hex.len() != 128 || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit()))
+            && (self.signature_hex.len() != 128
+                || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit()))
         {
             return Err(LifecycleIntentError::InvalidField("signature_hex"));
         }
@@ -721,9 +901,18 @@ impl FleetLifecycleReportV1 {
     const SIGNING_DOMAIN: &'static str = "magic-mesh:fleet-lifecycle-report:v1";
 
     fn signing_bytes(&self) -> Vec<u8> {
-        format!("{}|{}|{}|{}|{}|{}|{}|{}", Self::SIGNING_DOMAIN, self.schema_version,
-            self.request_id, self.generation, serde_json::to_string(&self.phase).expect("phase serializes"),
-            self.target_count, self.succeeded, self.failed).into_bytes()
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            Self::SIGNING_DOMAIN,
+            self.schema_version,
+            self.request_id,
+            self.generation,
+            serde_json::to_string(&self.phase).expect("phase serializes"),
+            self.target_count,
+            self.succeeded,
+            self.failed
+        )
+        .into_bytes()
     }
 
     pub fn sign(mut self, signing_key: &SigningKey) -> Self {
@@ -735,17 +924,27 @@ impl FleetLifecycleReportV1 {
         self.validate()?;
         let signature = decode_hex_64(&self.signature_hex)
             .ok_or(LifecycleIntentError::InvalidField("signature_hex"))?;
-        verifying_key.verify(&self.signing_bytes(), &Signature::from_bytes(&signature))
+        verifying_key
+            .verify(&self.signing_bytes(), &Signature::from_bytes(&signature))
             .map_err(|_| LifecycleIntentError::InvalidField("signature_hex"))
     }
 
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
-        validate_common(self.schema_version, self.generation, &[("request_id", &self.request_id)])?;
-        if self.target_count == 0 || self.succeeded > self.target_count || self.failed > self.target_count || self.succeeded.saturating_add(self.failed) > self.target_count {
+        validate_common(
+            self.schema_version,
+            self.generation,
+            &[("request_id", &self.request_id)],
+        )?;
+        if self.target_count == 0
+            || self.succeeded > self.target_count
+            || self.failed > self.target_count
+            || self.succeeded.saturating_add(self.failed) > self.target_count
+        {
             return Err(LifecycleIntentError::InvalidNumber("target_count"));
         }
         if !self.signature_hex.is_empty()
-            && (self.signature_hex.len() != 128 || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit()))
+            && (self.signature_hex.len() != 128
+                || !self.signature_hex.chars().all(|c| c.is_ascii_hexdigit()))
         {
             return Err(LifecycleIntentError::InvalidField("signature_hex"));
         }
@@ -771,7 +970,19 @@ mod tests {
     fn intent_round_trips_and_validates() {
         let body = serde_json::to_string(&intent()).unwrap();
         assert_eq!(LifecycleIntentV1::from_json(&body).unwrap(), intent());
-        assert_eq!(intent().default_steps(), vec!["identity", "packages", "configuration", "mesh", "compute", "ui", "hardware", "verify"]);
+        assert_eq!(
+            intent().default_steps(),
+            vec![
+                "identity",
+                "packages",
+                "configuration",
+                "mesh",
+                "compute",
+                "ui",
+                "hardware",
+                "verify"
+            ]
+        );
     }
 
     #[test]
@@ -788,54 +999,150 @@ mod tests {
     fn canonical_baseline_owns_every_readiness_surface() {
         let baseline = canonical_lifecycle_baseline();
         assert_eq!(baseline.len(), 8);
-        assert!(baseline.iter().all(|entry| entry.required && entry.validate().is_ok()));
-        assert!(baseline.iter().any(|entry| entry.requirement_id == "mesh_identity" && entry.owner_step == LifecycleStepKind::Mesh));
+        assert!(baseline
+            .iter()
+            .all(|entry| entry.required && entry.validate().is_ok()));
+        assert!(baseline
+            .iter()
+            .any(|entry| entry.requirement_id == "mesh_identity"
+                && entry.owner_step == LifecycleStepKind::Mesh));
     }
 
     #[test]
     fn intent_rejects_bad_schema_target_and_generation() {
         let mut value = intent();
         value.schema_version = 2;
-        assert!(matches!(value.validate(), Err(LifecycleIntentError::UnsupportedSchema(2))));
+        assert!(matches!(
+            value.validate(),
+            Err(LifecycleIntentError::UnsupportedSchema(2))
+        ));
         value = intent();
         value.target_id = "../seat".into();
-        assert!(matches!(value.validate(), Err(LifecycleIntentError::InvalidField("target_id"))));
+        assert!(matches!(
+            value.validate(),
+            Err(LifecycleIntentError::InvalidField("target_id"))
+        ));
         value = intent();
         value.generation = 0;
-        assert!(matches!(value.validate(), Err(LifecycleIntentError::InvalidNumber("generation"))));
+        assert!(matches!(
+            value.validate(),
+            Err(LifecycleIntentError::InvalidNumber("generation"))
+        ));
     }
 
     #[test]
     fn plan_progress_and_readiness_reject_inconsistent_states() {
-        let plan = LifecyclePlanV1 { schema_version: 1, request_id: "request-1".into(), target_id: "seat-15".into(), intent: LifecycleIntentKind::Upgrade, generation: 1, steps: vec!["packages".into(), "verify".into()] };
+        let plan = LifecyclePlanV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            target_id: "seat-15".into(),
+            intent: LifecycleIntentKind::Upgrade,
+            generation: 1,
+            steps: vec!["packages".into(), "verify".into()],
+        };
         assert!(plan.validate().is_ok());
-        let progress = LifecycleProgressV1 { schema_version: 1, request_id: "request-1".into(), target_id: "seat-15".into(), generation: 1, phase: LifecyclePhase::Running, completed_steps: 3, total_steps: 2 };
-        assert!(matches!(progress.validate(), Err(LifecycleIntentError::InvalidNumber("steps"))));
-        let readiness = SeatReadinessV1 { schema_version: 1, target_id: "seat-15".into(), generation: 1, ready: true, missing_requirements: vec!["mesh_identity".into()], warnings: vec![] };
-        assert!(matches!(readiness.validate(), Err(LifecycleIntentError::InvalidField("missing_requirements"))));
+        let progress = LifecycleProgressV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            target_id: "seat-15".into(),
+            generation: 1,
+            phase: LifecyclePhase::Running,
+            completed_steps: 3,
+            total_steps: 2,
+        };
+        assert!(matches!(
+            progress.validate(),
+            Err(LifecycleIntentError::InvalidNumber("steps"))
+        ));
+        let readiness = SeatReadinessV1 {
+            schema_version: 1,
+            target_id: "seat-15".into(),
+            generation: 1,
+            ready: true,
+            missing_requirements: vec!["mesh_identity".into()],
+            warnings: vec![],
+        };
+        assert!(matches!(
+            readiness.validate(),
+            Err(LifecycleIntentError::InvalidField("missing_requirements"))
+        ));
 
-        let receipt = OffboardingReceiptV1 { schema_version: 1, request_id: "request-1".into(), target_id: "seat-15".into(), generation: 1, completed: true, retained_resources: vec![], signature_hex: String::new() };
+        let receipt = OffboardingReceiptV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            target_id: "seat-15".into(),
+            generation: 1,
+            completed: true,
+            retained_resources: vec![],
+            signature_hex: String::new(),
+        };
         assert!(receipt.validate().is_ok());
-        let retained = OffboardingReceiptV1 { retained_resources: vec!["identity".into()], ..receipt.clone() };
-        assert!(matches!(retained.validate(), Err(LifecycleIntentError::InvalidField("retained_resources"))));
-        let incomplete = OffboardingReceiptV1 { completed: false, ..receipt.clone() };
-        assert!(matches!(incomplete.validate(), Err(LifecycleIntentError::InvalidField("retained_resources"))));
+        let retained = OffboardingReceiptV1 {
+            retained_resources: vec!["identity".into()],
+            ..receipt.clone()
+        };
+        assert!(matches!(
+            retained.validate(),
+            Err(LifecycleIntentError::InvalidField("retained_resources"))
+        ));
+        let incomplete = OffboardingReceiptV1 {
+            completed: false,
+            ..receipt.clone()
+        };
+        assert!(matches!(
+            incomplete.validate(),
+            Err(LifecycleIntentError::InvalidField("retained_resources"))
+        ));
         let signing_key = SigningKey::from_bytes(&[14; 32]);
-        assert!(receipt.sign(&signing_key).verify(&signing_key.verifying_key()).is_ok());
-        let report = FleetLifecycleReportV1 { schema_version: 1, request_id: "request-1".into(), generation: 1, phase: LifecyclePhase::Succeeded, target_count: 2, succeeded: 2, failed: 1, signature_hex: String::new() };
-        assert!(matches!(report.validate(), Err(LifecycleIntentError::InvalidNumber("target_count"))));
-        let report = FleetLifecycleReportV1 { schema_version: 1, request_id: "request-1".into(), generation: 1, phase: LifecyclePhase::Succeeded, target_count: 2, succeeded: 2, failed: 0, signature_hex: String::new() };
+        assert!(receipt
+            .sign(&signing_key)
+            .verify(&signing_key.verifying_key())
+            .is_ok());
+        let report = FleetLifecycleReportV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            generation: 1,
+            phase: LifecyclePhase::Succeeded,
+            target_count: 2,
+            succeeded: 2,
+            failed: 1,
+            signature_hex: String::new(),
+        };
+        assert!(matches!(
+            report.validate(),
+            Err(LifecycleIntentError::InvalidNumber("target_count"))
+        ));
+        let report = FleetLifecycleReportV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            generation: 1,
+            phase: LifecyclePhase::Succeeded,
+            target_count: 2,
+            succeeded: 2,
+            failed: 0,
+            signature_hex: String::new(),
+        };
         let key = SigningKey::from_bytes(&[15; 32]);
         assert!(report.sign(&key).verify(&key.verifying_key()).is_ok());
     }
 
     #[test]
     fn plan_rejects_unowned_step_names() {
-        let mut plan = LifecyclePlanV1 { schema_version: 1, request_id: "request-1".into(), target_id: "seat-15".into(), intent: LifecycleIntentKind::Onboard, generation: 1, steps: vec!["identity".into()] };
+        let mut plan = LifecyclePlanV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            target_id: "seat-15".into(),
+            intent: LifecycleIntentKind::Onboard,
+            generation: 1,
+            steps: vec!["identity".into()],
+        };
         assert_eq!(LifecycleStepKind::Identity.as_str(), "identity");
         assert!(plan.validate().is_ok());
         plan.steps = vec!["invented_mutation".into()];
-        assert!(matches!(plan.validate(), Err(LifecycleIntentError::InvalidField("steps"))));
+        assert!(matches!(
+            plan.validate(),
+            Err(LifecycleIntentError::InvalidField("steps"))
+        ));
     }
 
     #[test]
@@ -852,7 +1159,10 @@ mod tests {
         assert!(session.validate().is_ok());
         let mut invalid = session;
         invalid.target_ids = vec!["../seat".into()];
-        assert!(matches!(invalid.validate(), Err(LifecycleIntentError::InvalidField("target_ids"))));
+        assert!(matches!(
+            invalid.validate(),
+            Err(LifecycleIntentError::InvalidField("target_ids"))
+        ));
     }
 
     #[test]
@@ -870,11 +1180,19 @@ mod tests {
         };
         let signed = confirmation.sign("lifecycle-authority-v1", &SigningKey::from_bytes(&[3; 32]));
         assert!(signed.validate().is_ok());
-        assert!(signed.verify(&SigningKey::from_bytes(&[3; 32]).verifying_key()).is_ok());
-        assert_eq!(LifecycleConfirmationV1::expected_phrase(LifecycleConfirmationAction::Reset, 2), "WIPE 2 SYSTEMS");
+        assert!(signed
+            .verify(&SigningKey::from_bytes(&[3; 32]).verifying_key())
+            .is_ok());
+        assert_eq!(
+            LifecycleConfirmationV1::expected_phrase(LifecycleConfirmationAction::Reset, 2),
+            "WIPE 2 SYSTEMS"
+        );
         let mut invalid = signed;
         invalid.phrase = "FORCE OFFBOARD 1 SYSTEM".into();
-        assert!(matches!(invalid.validate(), Err(LifecycleIntentError::InvalidField("phrase"))));
+        assert!(matches!(
+            invalid.validate(),
+            Err(LifecycleIntentError::InvalidField("phrase"))
+        ));
     }
 
     #[test]
@@ -888,12 +1206,21 @@ mod tests {
             one_time: true,
             key_id: "commissioning-v1".into(),
             signature_hex: String::new(),
-        }.sign("commissioning-v1", &SigningKey::from_bytes(&[4; 32]));
-        assert!(capsule.verify_at(1_000, &SigningKey::from_bytes(&[4; 32]).verifying_key()).is_ok());
-        assert!(matches!(capsule.validate_at(2_000), Err(LifecycleIntentError::InvalidField("capsule_bounds"))));
+        }
+        .sign("commissioning-v1", &SigningKey::from_bytes(&[4; 32]));
+        assert!(capsule
+            .verify_at(1_000, &SigningKey::from_bytes(&[4; 32]).verifying_key())
+            .is_ok());
+        assert!(matches!(
+            capsule.validate_at(2_000),
+            Err(LifecycleIntentError::InvalidField("capsule_bounds"))
+        ));
         let mut replayable = capsule;
         replayable.one_time = false;
-        assert!(matches!(replayable.validate_at(1_000), Err(LifecycleIntentError::InvalidField("capsule_bounds"))));
+        assert!(matches!(
+            replayable.validate_at(1_000),
+            Err(LifecycleIntentError::InvalidField("capsule_bounds"))
+        ));
     }
 
     #[test]
@@ -912,7 +1239,10 @@ mod tests {
         assert!(selection.validate().is_ok());
         let mut invalid = selection;
         invalid.unverified_build = false;
-        assert!(matches!(invalid.validate(), Err(LifecycleIntentError::InvalidField("artifact_admission"))));
+        assert!(matches!(
+            invalid.validate(),
+            Err(LifecycleIntentError::InvalidField("artifact_admission"))
+        ));
     }
 
     #[test]
@@ -932,7 +1262,10 @@ mod tests {
         assert!(check.validate().is_ok());
         let mut invalid = check;
         invalid.warning = None;
-        assert!(matches!(invalid.validate(), Err(LifecycleIntentError::InvalidField("requirement_check"))));
+        assert!(matches!(
+            invalid.validate(),
+            Err(LifecycleIntentError::InvalidField("requirement_check"))
+        ));
     }
 
     #[test]
@@ -954,7 +1287,10 @@ mod tests {
         assert!(plan.validate().is_ok());
         let mut invalid = plan;
         invalid.rollback_forbidden = false;
-        assert!(matches!(invalid.validate(), Err(LifecycleIntentError::InvalidField("correction_plan"))));
+        assert!(matches!(
+            invalid.validate(),
+            Err(LifecycleIntentError::InvalidField("correction_plan"))
+        ));
     }
 
     #[test]
@@ -971,7 +1307,10 @@ mod tests {
         assert!(binding.validate().is_ok());
         let mut invalid = binding;
         invalid.target_version = "12.1.4".into();
-        assert!(matches!(invalid.validate(), Err(LifecycleIntentError::InvalidField("upgrade_binding"))));
+        assert!(matches!(
+            invalid.validate(),
+            Err(LifecycleIntentError::InvalidField("upgrade_binding"))
+        ));
     }
 }
 

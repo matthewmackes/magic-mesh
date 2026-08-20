@@ -487,19 +487,18 @@ impl Probe {
 /// timeout, or a missing `ssh` binary).
 fn probe_dom0(key: &str, dom0: &str) -> Probe {
     let mut command = std::process::Command::new("ssh");
-    command
-        .args([
-            "-i",
-            key,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            &format!("root@{dom0}"),
-            "true",
-        ]);
+    command.args([
+        "-i",
+        key,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        &format!("root@{dom0}"),
+        "true",
+    ]);
     let out = run_dom0_probe_command(command, crate::workers::proc::DEFAULT_CMD_TIMEOUT);
     match out {
         Ok(o) if o.status.success() => Probe::ok("ssh reachable"),

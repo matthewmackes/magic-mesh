@@ -167,8 +167,7 @@ fn validate_official_url(value: &str) -> io::Result<reqwest::Url> {
         .extension()
         .and_then(std::ffi::OsStr::to_str);
     if !(path.starts_with("/data/gis/images/4326/USCOMP/n0q_") && extension == Some("json")
-        || path.starts_with("/cache/tile.py/1.0.0/nexrad-n0q-900913")
-            && extension == Some("png"))
+        || path.starts_with("/cache/tile.py/1.0.0/nexrad-n0q-900913") && extension == Some("png"))
     {
         return Err(io::Error::other("IEM URL path is not canonical"));
     }

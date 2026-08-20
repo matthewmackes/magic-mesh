@@ -304,6 +304,30 @@ fn doctor() -> ExitCode {
         critical: true,
     });
 
+    // WL-FUNC-023 S17 — doctor consumes the canonical first-boot markers, not
+    // `mackesd status` as a readiness proxy.
+    let pending = PathBuf::from("/var/lib/mackesd/lifecycle/pending-convergence");
+    let converged = PathBuf::from("/var/lib/mackesd/lifecycle/firstboot-converged");
+    if pending.exists() {
+        checks.push(Check {
+            name: "lifecycle: first-boot",
+            ok: false,
+            detail: "pending-convergence queued; core baseline still blocked".into(),
+            critical: true,
+        });
+    } else {
+        checks.push(Check {
+            name: "lifecycle: first-boot",
+            ok: converged.is_file(),
+            detail: if converged.is_file() {
+                "canonical baseline converged".into()
+            } else {
+                "firstboot-converged marker missing".into()
+            },
+            critical: true,
+        });
+    }
+
     // Report.
     let mut failed_critical = false;
     println!("meshctl doctor — {} checks\n", checks.len());

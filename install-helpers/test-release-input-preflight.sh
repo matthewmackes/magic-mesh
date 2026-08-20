@@ -16,10 +16,10 @@ GIT_AUTHOR_NAME='release preflight self-test' GIT_AUTHOR_EMAIL='preflight@exampl
   git -C "$fixture/source-repo" commit -q -m 'fixture release identity'
 source_revision=$(git -C "$fixture/source-repo" rev-parse HEAD)
 source_epoch=$(git -C "$fixture/source-repo" show -s --format=%ct "$source_revision")
-bootc_reference='registry.invalid/mcnf/bootc:release'
+bootc_reference="registry.invalid/mcnf/bootc:release@sha256:$(printf 'b%.0s' {1..64})"
 bootc_architecture='amd64'
 bootc_role='all-roles'
-app_vm_reference='registry.invalid/fedora/app-vm-base:44'
+app_vm_reference=''
 app_vm_architecture='amd64'
 for verifier in source; do
   cat >"$fixture/$verifier" <<'EOF'
@@ -176,6 +176,7 @@ with open(path, "w", encoding="ascii") as stream:
     json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
     stream.write("\n")
 PY
+app_vm_reference="registry.invalid/fedora/app-vm-base:44@$(sha256sum "$fixture/app-vm-manifest.json" | awk '{print "sha256:" $1}')"
 APP_VM_TEST_REFERENCE="$app_vm_reference" APP_VM_TEST_MANIFEST="$fixture/app-vm-manifest.json" \
   python3 "$ROOT/packaging/app-vm/produce-base-image-receipt.py" \
   --repo "$fixture/source-repo" --skopeo "$fixture/app-vm-skopeo" produce \

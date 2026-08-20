@@ -475,7 +475,11 @@ mod tests {
         let retained = queue.get(&original).expect("original ledger row retained");
         assert_eq!(retained.source, "/authoritative");
         assert_eq!(retained.state, TransferState::Running);
-        assert_eq!(queue.running_count(), 1, "replay cannot free or replace the lane");
+        assert_eq!(
+            queue.running_count(),
+            1,
+            "replay cannot free or replace the lane"
+        );
     }
 
     #[test]

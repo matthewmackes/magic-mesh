@@ -2110,6 +2110,33 @@ impl Shell {
         ctx.request_repaint();
     }
 
+    /// Transfers chords must not steal keystrokes from Documents text editing,
+    /// the Terminal PTY, or a focused guest. Collapsed Construct chrome is safe.
+    fn transfer_hotkey_shadowed(&self, ctx: &egui::Context) -> bool {
+        if !self.nav.expanded {
+            return false;
+        }
+        match self.nav.surface {
+            Surface::Terminal => true,
+            Surface::Desktop | Surface::Browser => true,
+            Surface::Communications => ctx.wants_keyboard_input(),
+            _ => false,
+        }
+    }
+
+    /// Consume the Transfers chord so a focused Construct widget does not also
+    /// insert `j`/`n`.
+    fn consume_transfer_hotkey(ctx: &egui::Context, action: HotkeyAction) {
+        let key = match action {
+            HotkeyAction::OpenTransfers => egui::Key::J,
+            HotkeyAction::NewTransfer => egui::Key::N,
+            _ => return,
+        };
+        ctx.input_mut(|i| {
+            let _ = i.consume_key(egui::Modifiers::CTRL, key);
+        });
+    }
+
     /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE
     /// seat through the System state (volume/brightness flash the KIRON OSD tier);
     /// navigation actions move the shell itself — leaving a fullscreen guest is the
@@ -2150,6 +2177,16 @@ impl Shell {
             }
             HotkeyAction::OpenOmnibox => {
                 self.open_front_door_panel();
+            }
+            HotkeyAction::OpenTransfers => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Communications;
+                mde_collab_egui::request_open_transfers();
+            }
+            HotkeyAction::NewTransfer => {
+                if self.nav.surface == Surface::Communications {
+                    mde_collab_egui::request_new_transfer();
+                }
             }
             HotkeyAction::MediaPlayPause => {
                 self.web
@@ -3570,7 +3607,19 @@ impl Shell {
             if !self.curtain.engaged() {
                 if action == HotkeyAction::SessionSwitch {
                     super_tab = true;
+                } else if matches!(
+                    action,
+                    HotkeyAction::OpenTransfers | HotkeyAction::NewTransfer
+                ) && self.transfer_hotkey_shadowed(ctx)
+                {
+                    // Documents/Terminal keep the keystroke; do not consume it.
                 } else {
+                    if matches!(
+                        action,
+                        HotkeyAction::OpenTransfers | HotkeyAction::NewTransfer
+                    ) {
+                        Self::consume_transfer_hotkey(ctx, action);
+                    }
                     self.apply_hotkey(action);
                 }
             }
@@ -7527,6 +7576,19 @@ mod tests {
             shell.front_door.is_open(),
             "the full omnibox owns the focused front door while open"
         );
+    }
+
+    #[test]
+    fn open_transfers_hotkey_opens_communications() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        shell.apply_hotkey(HotkeyAction::OpenTransfers);
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Communications);
+        mde_collab_egui::clear_transfers_hotkey_intent();
     }
 
     #[test]

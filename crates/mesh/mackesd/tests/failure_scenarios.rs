@@ -99,7 +99,6 @@ fn node_failure_emits_auto_repair_drift_then_clears_on_recovery() {
         ],
         allow_east_west: vec![],
         settings_keys: vec![],
-        voice_policies: vec![],
     };
 
     // Observed: only peer:birch ↔ peer:cedar survived; peer:anvil
@@ -168,7 +167,6 @@ fn region_outage_excludes_dead_nodes_from_topology_and_flags_drift() {
         ],
         allow_east_west: vec![],
         settings_keys: vec![],
-        voice_policies: vec![],
     };
 
     let topo = calculate(&desired);
@@ -239,7 +237,6 @@ fn invalid_config_returns_specific_errors_then_accepts_fixed_payload() {
             ("us-east".into(), "typo-region".into()), // unknown region
         ],
         settings_keys: vec![],
-        voice_policies: vec![],
     };
     let errors = validate(&bad);
 
@@ -256,12 +253,10 @@ fn invalid_config_returns_specific_errors_then_accepts_fixed_payload() {
         "expected EmptyRequiredField for an id"
     );
     assert!(
-        any(
-            |e| matches!(e, ValidationError::EmptyRequiredField { path }
+        any(|e| matches!(e, ValidationError::EmptyRequiredField { path }
                 if std::path::Path::new(path)
                     .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("region")))
-        ),
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("region")))),
         "expected EmptyRequiredField for a region"
     );
     assert!(
@@ -277,7 +272,6 @@ fn invalid_config_returns_specific_errors_then_accepts_fixed_payload() {
         ],
         allow_east_west: vec![("us-east".into(), "us-east".into())],
         settings_keys: vec![],
-        voice_policies: vec![],
     };
     assert!(
         validate(&good).is_empty(),

@@ -14,11 +14,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use mackes_mesh_types::health::{
-    ExpectedReturn, MAX_NODE_AVAILABILITY_ID_BYTES, MAX_NODE_AVAILABILITY_INTENT_TTL_MS,
-    NODE_AVAILABILITY_INTENT_SCHEMA_VERSION, NODE_HEALTH_TOPIC_PREFIX, NodeAvailabilityAssessment,
-    NodeAvailabilityIntent, NodeAvailabilityPolicy, NodeAvailabilityState,
-    NodeAvailabilityValidationError, NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass,
-    node_health_topic,
+    node_health_topic, ExpectedReturn, NodeAvailabilityAssessment, NodeAvailabilityIntent,
+    NodeAvailabilityPolicy, NodeAvailabilityState, NodeAvailabilityValidationError,
+    NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass, MAX_NODE_AVAILABILITY_ID_BYTES,
+    MAX_NODE_AVAILABILITY_INTENT_TTL_MS, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+    NODE_HEALTH_TOPIC_PREFIX,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, PersistError};
@@ -1743,8 +1743,8 @@ impl From<AvailabilityAdmissionError> for AvailabilityFoldError {
 mod tests {
     use super::*;
     use mackes_mesh_types::health::{
-        ExpectedReturn, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION, NodeAddressFamily,
-        NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass,
+        ExpectedReturn, NodeAddressFamily, NodeConnectionType, NodeConnectivitySummary,
+        NodeDeviceClass, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
     };
 
     const NOW_MS: u64 = 10_000;
@@ -1938,18 +1938,16 @@ mod tests {
             rows[1].body.as_deref(),
             std::str::from_utf8(&returned_body).ok()
         );
-        assert!(
-            durable_path
-                .parent()
-                .expect("durable parent")
-                .read_dir()
-                .expect("read durable parent")
-                .all(|entry| entry
-                    .expect("directory entry")
-                    .file_name()
-                    .to_string_lossy()
-                    == "node-a-intent.json")
-        );
+        assert!(durable_path
+            .parent()
+            .expect("durable parent")
+            .read_dir()
+            .expect("read durable parent")
+            .all(|entry| entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                == "node-a-intent.json"));
     }
 
     #[test]
@@ -1983,12 +1981,10 @@ mod tests {
             ))
         ));
         assert_eq!(ledger.current("node-a"), Some(&awake));
-        assert!(
-            persist
-                .read_latest(&node_health_topic("node-a"))
-                .expect("read Bus")
-                .is_none()
-        );
+        assert!(persist
+            .read_latest(&node_health_topic("node-a"))
+            .expect("read Bus")
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -2050,19 +2046,15 @@ mod tests {
             ))
         ));
         assert_eq!(ledger.current("node-a"), Some(&awake));
-        assert!(
-            persist
-                .read_latest(&node_health_topic("node-a"))
-                .expect("read Bus")
-                .is_none()
-        );
-        assert!(
-            real_parent
-                .read_dir()
-                .expect("read real parent")
-                .next()
-                .is_none()
-        );
+        assert!(persist
+            .read_latest(&node_health_topic("node-a"))
+            .expect("read Bus")
+            .is_none());
+        assert!(real_parent
+            .read_dir()
+            .expect("read real parent")
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -2340,7 +2332,11 @@ mod tests {
         let rows = persist
             .list_since(&node_health_topic("node-a"), None)
             .expect("read unchanged Bus");
-        assert_eq!(rows.len(), 1, "correction must not join the false class chain");
+        assert_eq!(
+            rows.len(),
+            1,
+            "correction must not join the false class chain"
+        );
         assert_eq!(
             serde_json::from_str::<NodeAvailabilityIntent>(
                 rows[0].body.as_deref().expect("substituted body")
@@ -2486,7 +2482,9 @@ mod tests {
             Err(RuntimeAvailabilityError::BusProjection(_))
         ));
         assert_eq!(
-            publisher.current_intent().expect("read unchanged durable truth"),
+            publisher
+                .current_intent()
+                .expect("read unchanged durable truth"),
             Some(sleeping),
             "a restart must not overwrite its durable generation before reconciling the Bus floor"
         );
@@ -2510,11 +2508,9 @@ mod tests {
         let durable = state.path().join("availability/current.json");
         let publisher = runtime_publisher(&bus, &durable);
 
-        assert!(
-            publisher
-                .publish_at(runtime_sleep_request(), 40_000)
-                .is_err()
-        );
+        assert!(publisher
+            .publish_at(runtime_sleep_request(), 40_000)
+            .is_err());
         assert!(!durable.exists(), "failed input staging cannot mint truth");
 
         std::fs::remove_file(&blocked_parent).expect("remove blocker");
@@ -2684,12 +2680,10 @@ mod tests {
             serde_json::to_vec(&sleeping).expect("sleep bytes")
         );
         let current = Persist::open(bus.clone()).expect("current Bus");
-        assert!(
-            current
-                .read_latest(&node_health_topic("node-a"))
-                .expect("current projection")
-                .is_none()
-        );
+        assert!(current
+            .read_latest(&node_health_topic("node-a"))
+            .expect("current projection")
+            .is_none());
 
         let publisher = runtime_publisher(&bus, &durable);
         assert_eq!(

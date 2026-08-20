@@ -312,7 +312,10 @@ fn run_sweep(
     let writer = DoDnsWriter::resolve(workgroup_root, &cfg.token_ref, spawn);
     let change_count = sweep_once(&writer, &cfg, node, &vpn_cfg, wan.as_deref(), spawn, last);
     if change_count > 0 {
-        tracing::info!(writes = change_count, "ddns reconcile: published record changes");
+        tracing::info!(
+            writes = change_count,
+            "ddns reconcile: published record changes"
+        );
     }
 }
 

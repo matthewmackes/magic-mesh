@@ -49,9 +49,8 @@ fn read_bounded_playbook(path: impl AsRef<std::path::Path>) -> std::io::Result<S
             "playbook exceeds the maximum size",
         ));
     }
-    String::from_utf8(bytes).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-    })
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// The local job executor.

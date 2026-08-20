@@ -3242,8 +3242,6 @@ mod tests {
         // rank-0 successor to the removed openstack worker) => len 76.
         // Rolling Node +1 vehicle (the universal rank-0 MG90 vehicle-gateway mirror,
         // a no-op where no gateway is attached) => len 77.
-        // WL-FUNC-011 U2 -1 voice_config (the Kamailio/RTPengine VV render-config
-        // worker; Q9 retired the dead SIP-proxy stack) => len 76.
         // WL-FUNC-012 +2 workstation-tier keyless adapters: USGS earthquakes
         // (default-on, explicit false opt-out), NWS active alerts, and
         // adsb.lol aircraft (explicit opt-in; unconfigured is idle) => len 79.
@@ -3585,8 +3583,6 @@ mod tests {
         // ws = 48 + 28 = 76.
         // Rolling Node +1 rank-0 vehicle (the MG90 vehicle-gateway mirror) → lh 49,
         // ws = 49 + 28 = 77.
-        // WL-FUNC-011 U2 -1 workstation-tier voice_config (Q9 dead VV stack retired)
-        // → lh 49 (rank-0 unchanged), ws = 49 + 27 = 76.
         // WL-FUNC-012 +2 workstation-tier earthquake_overlay + nws_alert_overlay
         // WL-FUNC-012 OVERLAY-8 +1 rank-1 aircraft_overlay
         // → lh 49 (unchanged), ws = 49 + 30 = 79.

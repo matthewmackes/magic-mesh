@@ -1,8 +1,7 @@
 //! VOIP-4 (v5.0.0) — Vitelity-link RTT telemetry.
 //!
 //! Measures the network round-trip to the Vitelity SIP edge
-//! (`out.vitelity.net:5061`, per `mde-voice-config`'s `uacreg` row
-//! `sip:out.vitelity.net:5061;transport=tls`) and publishes it to
+//! (`out.vitelity.net:5061`, the per-node SIP service endpoint) and publishes it to
 //! `voip/link-rtt/<peer>` on the Mackes Bus, so the dialer (VOIP-4.b)
 //! can compare links across peers and offer an operator-explicit
 //! "place via `<peer>`" route override (auto-routing stays off).

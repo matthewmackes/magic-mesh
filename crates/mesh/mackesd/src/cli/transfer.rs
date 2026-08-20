@@ -5,17 +5,20 @@
 use crate::*;
 
 /// TRANSFERS-1 — `mackesd transfer <sub>`: the CLI half of the typed verb set (§9
-/// parity). Mutating verbs (submit/cancel/pause/resume) are handed to the running
-/// daemon through the node-local inbox (the daemon is the single ledger writer);
-/// `list` reads the persistent ledger directly. Both resolve the same node-local
-/// store the daemon uses, so the CLI and the daemon share one queue.
+/// parity). Mutating verbs (submit/cancel/pause/resume/sync-pair add|remove) are
+/// handed to the running daemon through the node-local inbox (the daemon is the
+/// single ledger/store writer); `list` reads the persistent ledger or sync-pair
+/// store directly. Both resolve the same node-local store the daemon uses, so the
+/// CLI and the daemon share one queue.
 pub fn run(cmd: TransferCmd) -> anyhow::Result<()> {
+    run_with_store(cmd, &mackesd_core::workers::transfers::default_store_root())
+}
+
+fn run_with_store(cmd: TransferCmd, store_root: &std::path::Path) -> anyhow::Result<()> {
     use mackesd_core::workers::transfers::{
-        default_store_root, discover_destinations, write_verb, Ledger, Method, TransferJob,
+        discover_destinations, write_verb, Ledger, Method, SyncPair, SyncPairStore, TransferJob,
         TransferPolicy, TransferVerb,
     };
-
-    let store_root = default_store_root();
 
     match cmd {
         TransferCmd::Submit {
@@ -29,7 +32,7 @@ pub fn run(cmd: TransferCmd) -> anyhow::Result<()> {
             let policy = TransferPolicy { bwlimit, verify };
             let job = TransferJob::new(source, dest, method, policy);
             let id = job.id.clone();
-            write_verb(&store_root, &TransferVerb::Submit(job))
+            write_verb(store_root, &TransferVerb::Submit(job))
                 .with_context(|| format!("writing submit verb under {}", store_root.display()))?;
             println!("transfer submit: queued {id} ({method})");
             println!(
@@ -39,7 +42,7 @@ pub fn run(cmd: TransferCmd) -> anyhow::Result<()> {
         TransferCmd::List { json } => {
             // A pure read: open the ledger directly (never `TransferQueue::open`,
             // which runs the daemon-only Running→Queued crash recovery).
-            let ledger = Ledger::open(&store_root).with_context(|| {
+            let ledger = Ledger::open(store_root).with_context(|| {
                 format!("opening the transfers ledger at {}", store_root.display())
             })?;
             let jobs = ledger.load_all();
@@ -87,28 +90,102 @@ pub fn run(cmd: TransferCmd) -> anyhow::Result<()> {
         }
         TransferCmd::Cancel { id } => {
             dispatch_transfer_lifecycle(
-                &store_root,
+                store_root,
                 &id,
                 TransferVerb::Cancel(id.clone()),
                 "cancel",
             )?;
         }
         TransferCmd::Pause { id } => {
-            dispatch_transfer_lifecycle(
-                &store_root,
-                &id,
-                TransferVerb::Pause(id.clone()),
-                "pause",
-            )?;
+            dispatch_transfer_lifecycle(store_root, &id, TransferVerb::Pause(id.clone()), "pause")?;
         }
         TransferCmd::Resume { id } => {
             dispatch_transfer_lifecycle(
-                &store_root,
+                store_root,
                 &id,
                 TransferVerb::Resume(id.clone()),
                 "resume",
             )?;
         }
+        TransferCmd::SyncPair { cmd } => match cmd {
+            SyncPairCmd::Add {
+                id,
+                interval,
+                source,
+                destination,
+                bwlimit,
+            } => {
+                let every_secs = parse_interval_secs(&interval)?;
+                let id = match id {
+                    Some(id) => id,
+                    None => slug_pair_id(&source, &destination),
+                };
+                let policy = TransferPolicy {
+                    bwlimit,
+                    verify: false,
+                };
+                let pair = SyncPair::new(id, source, destination, every_secs, policy);
+                let pair_id = pair.id.clone();
+                write_verb(store_root, &TransferVerb::SaveSyncPair(pair)).with_context(|| {
+                    format!("writing save-sync-pair verb under {}", store_root.display())
+                })?;
+                println!(
+                    "transfer sync-pair add: queued {pair_id} every {every_secs}s (the daemon saves it on its next tick)"
+                );
+            }
+            SyncPairCmd::Remove { id } => {
+                let store = SyncPairStore::open(store_root).with_context(|| {
+                    format!("opening the sync-pair store at {}", store_root.display())
+                })?;
+                if store.get(&id).is_none() {
+                    anyhow::bail!(
+                        "no sync pair `{id}` in the store (see `mackesd transfer sync-pair list`)"
+                    );
+                }
+                write_verb(store_root, &TransferVerb::RemoveSyncPair(id.clone())).with_context(
+                    || {
+                        format!(
+                            "writing remove-sync-pair verb under {}",
+                            store_root.display()
+                        )
+                    },
+                )?;
+                println!(
+                    "transfer sync-pair remove: requested for {id} (the daemon applies it on its next tick)"
+                );
+            }
+            SyncPairCmd::List { json } => {
+                let store = SyncPairStore::open(store_root).with_context(|| {
+                    format!("opening the sync-pair store at {}", store_root.display())
+                })?;
+                let pairs = store.load_all();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&pairs)?);
+                } else if pairs.is_empty() {
+                    println!("no sync pairs saved");
+                } else {
+                    println!("{:<24} {:<10} {:<12} SOURCE -> DEST", "ID", "EVERY", "LAST");
+                    for p in &pairs {
+                        let last = p
+                            .last_fired_ms
+                            .map_or_else(|| "never".to_owned(), |ms| ms.to_string());
+                        let bw = p
+                            .policy
+                            .bwlimit
+                            .as_deref()
+                            .map_or_else(String::new, |b| format!(" bwlimit={b}"));
+                        println!(
+                            "{:<24} {:<10} {:<12} {} -> {}{bw}",
+                            p.id,
+                            format!("{}s", p.every_secs),
+                            last,
+                            p.source,
+                            p.dest
+                        );
+                    }
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -132,4 +209,199 @@ fn dispatch_transfer_lifecycle(
         .with_context(|| format!("writing {name} verb under {}", store_root.display()))?;
     println!("transfer {name}: requested for {id} (the daemon applies it on its next tick)");
     Ok(())
+}
+
+/// Parse a sync-pair interval. Accepts a positive second count or a unit suffix
+/// (`s`/`m`/`h`/`d`). Zero, empty, negative, and unknown units refuse.
+fn parse_interval_secs(raw: &str) -> anyhow::Result<u64> {
+    parse_interval_secs_opt(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "malformed interval `{raw}` (expected a positive duration such as 30s, 5m, 1h, or seconds)"
+        )
+    })
+}
+
+fn parse_interval_secs_opt(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        let n: u64 = s.parse().ok()?;
+        return (n >= 1).then_some(n);
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    if split == 0 {
+        return None;
+    }
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let mult: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(mult).filter(|v| *v >= 1)
+}
+
+fn slug_pair_id(source: &str, dest: &str) -> String {
+    let raw = format!("{source}-{dest}");
+    let slug: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(80)
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "sync-pair".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mackesd_core::workers::transfers::{
+        take_verbs, SyncPair, SyncPairStore, TransferPolicy, TransferVerb,
+    };
+
+    #[test]
+    fn malformed_intervals_refuse() {
+        for raw in ["", "abc", "0", "0s", "-5m", "10y", "1.5h", "h"] {
+            assert!(
+                parse_interval_secs(raw).is_err(),
+                "interval `{raw}` must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_intervals_parse() {
+        assert_eq!(parse_interval_secs("30s").unwrap(), 30);
+        assert_eq!(parse_interval_secs("5m").unwrap(), 300);
+        assert_eq!(parse_interval_secs("1h").unwrap(), 3600);
+        assert_eq!(parse_interval_secs("2d").unwrap(), 172_800);
+        assert_eq!(parse_interval_secs("90").unwrap(), 90);
+    }
+
+    #[test]
+    fn sync_pair_add_posts_save_verb() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::Add {
+                    id: Some("docs".into()),
+                    interval: "15m".into(),
+                    source: "/src".into(),
+                    destination: "/dst".into(),
+                    bwlimit: Some("2m".into()),
+                },
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let verbs = take_verbs(tmp.path());
+        assert_eq!(verbs.len(), 1);
+        match &verbs[0] {
+            TransferVerb::SaveSyncPair(pair) => {
+                assert_eq!(pair.id, "docs");
+                assert_eq!(pair.source, "/src");
+                assert_eq!(pair.dest, "/dst");
+                assert_eq!(pair.every_secs, 900);
+                assert_eq!(pair.policy.bwlimit.as_deref(), Some("2m"));
+            }
+            other => panic!("expected SaveSyncPair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pair_add_refuses_malformed_interval_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::Add {
+                    id: Some("docs".into()),
+                    interval: "nope".into(),
+                    source: "/src".into(),
+                    destination: "/dst".into(),
+                    bwlimit: None,
+                },
+            },
+            tmp.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("malformed interval"), "got {err}");
+        assert!(take_verbs(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn sync_pair_remove_unknown_id_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::Remove {
+                    id: "missing".into(),
+                },
+            },
+            tmp.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no sync pair `missing`"),
+            "got {err}"
+        );
+        assert!(take_verbs(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn sync_pair_remove_known_id_posts_remove_verb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        store
+            .upsert(&SyncPair::new(
+                "docs",
+                "/src",
+                "/dst",
+                60,
+                TransferPolicy::default(),
+            ))
+            .unwrap();
+        run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::Remove { id: "docs".into() },
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let verbs = take_verbs(tmp.path());
+        assert_eq!(verbs, vec![TransferVerb::RemoveSyncPair("docs".into())]);
+    }
+
+    #[test]
+    fn sync_pair_list_reads_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        store
+            .upsert(&SyncPair::new(
+                "docs",
+                "/src",
+                "/dst",
+                60,
+                TransferPolicy::default(),
+            ))
+            .unwrap();
+        run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::List { json: true },
+            },
+            tmp.path(),
+        )
+        .unwrap();
+    }
 }

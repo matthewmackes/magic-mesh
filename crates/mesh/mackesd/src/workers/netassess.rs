@@ -1037,11 +1037,9 @@ mod tests {
     fn filename_is_colon_free_with_hash_suffix() {
         let name = snapshot_filename("20260531T143000", r#"{"ts_ms":1}"#);
         assert!(name.starts_with("20260531T143000-"));
-        assert!(
-            std::path::Path::new(&name)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        );
+        assert!(std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json")));
         assert!(!name.contains(':'));
         // deterministic hash for the same body
         assert_eq!(name, snapshot_filename("20260531T143000", r#"{"ts_ms":1}"#));

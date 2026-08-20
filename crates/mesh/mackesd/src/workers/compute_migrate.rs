@@ -634,10 +634,7 @@ fn run_rsync(args: &[String]) -> Result<(), String> {
 fn local_nebula_addr(interface: &str) -> String {
     let mut command = Command::new("ip");
     command.args(["-4", "addr", "show", interface]);
-    let Ok(output) = super::proc::output_with_timeout(
-        command,
-        super::proc::DEFAULT_CMD_TIMEOUT,
-    )
+    let Ok(output) = super::proc::output_with_timeout(command, super::proc::DEFAULT_CMD_TIMEOUT)
     else {
         return String::new();
     };

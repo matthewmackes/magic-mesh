@@ -1752,7 +1752,10 @@ mod tests {
                 if runtime.resolve_calls.load(Ordering::SeqCst) >= 2 {
                     break;
                 }
-                assert!(!task.is_finished(), "missing Bus root must remain retryable");
+                assert!(
+                    !task.is_finished(),
+                    "missing Bus root must remain retryable"
+                );
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })

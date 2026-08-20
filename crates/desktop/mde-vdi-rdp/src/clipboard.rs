@@ -11,8 +11,9 @@ use ironrdp_cliprdr::pdu::{
 };
 use ironrdp_core::impl_as_any;
 use mackes_mesh_types::vdi_clipboard::{
-    MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES, MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS,
-    MAX_VDI_CLIPBOARD_TEXT_BYTES, MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES, VdiClipboardFileDescriptorV1,
+    VdiClipboardFileDescriptorV1, MAX_CLIPBOARD_ENVELOPE_V2_CONTENT_BYTES,
+    MAX_VDI_CLIPBOARD_FILE_DESCRIPTORS, MAX_VDI_CLIPBOARD_TEXT_BYTES,
+    MAX_VDI_RDP_CLIPBOARD_IMAGE_BYTES,
 };
 
 /// The standard CLIPRDR text format supported by this backend.
@@ -1262,9 +1263,9 @@ fn guest_html_fragment_is_safe(fragment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardBridge, ClipboardBridgeError, DIB_FORMAT, DIBV5_FORMAT, HTML_FORMAT_ID,
-        MAX_LOCKED_LOCAL_FILES, RemoteClipboardImageFormat, UNICODE_TEXT_FORMAT, decode_cf_html,
-        decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe, html_format,
+        decode_cf_html, decode_unicode_text, encode_cf_html, guest_html_fragment_is_safe,
+        html_format, ClipboardBridge, ClipboardBridgeError, RemoteClipboardImageFormat,
+        DIBV5_FORMAT, DIB_FORMAT, HTML_FORMAT_ID, MAX_LOCKED_LOCAL_FILES, UNICODE_TEXT_FORMAT,
     };
     use ironrdp_cliprdr::pdu::{
         ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
@@ -1489,12 +1490,10 @@ mod tests {
         bridge
             .offer_host_html("new".into())
             .expect("replacement HTML");
-        assert!(
-            bridge
-                .take_local_data_response()
-                .expect("fail-closed response")
-                .is_error()
-        );
+        assert!(bridge
+            .take_local_data_response()
+            .expect("fail-closed response")
+            .is_error());
     }
 
     #[test]
@@ -1531,12 +1530,10 @@ mod tests {
         ));
 
         assert_eq!(bridge.advertised_formats(), Vec::<ClipboardFormat>::new());
-        assert!(
-            bridge
-                .take_local_data_response()
-                .expect("queued stale request must receive a response")
-                .is_error()
-        );
+        assert!(bridge
+            .take_local_data_response()
+            .expect("queued stale request must receive a response")
+            .is_error());
     }
 
     #[test]
@@ -1551,12 +1548,10 @@ mod tests {
         backend.on_format_data_request(FormatDataRequest {
             format: ClipboardFormatId::CF_UNICODETEXT,
         });
-        assert!(
-            bridge
-                .take_local_data_response()
-                .expect("stale request must receive a response")
-                .is_error()
-        );
+        assert!(bridge
+            .take_local_data_response()
+            .expect("stale request must receive a response")
+            .is_error());
 
         assert_eq!(bridge.advertised_formats(), vec![UNICODE_TEXT_FORMAT]);
         backend.on_format_data_request(FormatDataRequest {

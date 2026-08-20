@@ -1179,7 +1179,8 @@ impl MusicApp {
                             self.download_catalog_item(item);
                         }
                         if !enabled {
-                            let _ = mde_egui::disabled_hover_text(button,
+                            let _ = mde_egui::disabled_hover_text(
+                                button,
                                 "Download requires the authenticated Construct shell action path.",
                             );
                         }
@@ -1198,7 +1199,8 @@ impl MusicApp {
                 self.request_next_browse_page(&key, kind);
             }
             if !can_request && !loading {
-                let _ = mde_egui::disabled_hover_text(button,
+                let _ = mde_egui::disabled_hover_text(
+                    button,
                     "Load more requires the authenticated Construct shell browse path.",
                 );
             }
@@ -1504,7 +1506,8 @@ impl MusicApp {
                             self.download_catalog_item(item);
                         }
                         if !enabled {
-                            let _ = mde_egui::disabled_hover_text(button,
+                            let _ = mde_egui::disabled_hover_text(
+                                button,
                                 "Download requires the authenticated Construct shell action path.",
                             );
                         }
@@ -1555,7 +1558,8 @@ impl MusicApp {
                     self.play_radio_station(&detail);
                 }
                 if !enabled {
-                    let _ = mde_egui::disabled_hover_text(button,
+                    let _ = mde_egui::disabled_hover_text(
+                        button,
                         "Playback requires the authenticated Construct shell action path.",
                     );
                 }
@@ -2579,7 +2583,8 @@ fn render_bookmark_shelf(ui: &mut egui::Ui, bookmarks: &[BookmarkItem], app: &mu
                         app.play_bookmark(bookmark);
                     }
                     if !resume_enabled {
-                        let _ = mde_egui::disabled_hover_text(button,
+                        let _ = mde_egui::disabled_hover_text(
+                            button,
                             "Resume requires the authenticated Construct shell action path.",
                         );
                     }
@@ -3128,10 +3133,7 @@ fn render_bottom_player(ui: &mut egui::Ui, app: &mut MusicApp, narrow: bool) {
                                         "track" => "🔂",
                                         _ => "🔁",
                                     }),
-                                    format!(
-                                        "Repeat {} (choose {next_repeat})",
-                                        playback.repeat
-                                    ),
+                                    format!("Repeat {} (choose {next_repeat})", playback.repeat),
                                 )
                                 .clicked()
                                 {

@@ -39,8 +39,9 @@ pub fn run(yes: bool, confirmation_json: String, verifying_key_hex: String) -> a
         generation: intent.generation,
         steps: intent.default_steps(),
     };
-    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
-        .map_err(|error| anyhow::anyhow!("cannot acquire offboard authority: {error:?}"))?;
+    let mut authority =
+        mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+            .map_err(|error| anyhow::anyhow!("cannot acquire offboard authority: {error:?}"))?;
     let confirmation: mackes_mesh_types::lifecycle::LifecycleConfirmationV1 =
         serde_json::from_str(&confirmation_json)
             .map_err(|error| anyhow::anyhow!("invalid offboard confirmation: {error}"))?;
@@ -75,7 +76,9 @@ pub fn run(yes: bool, confirmation_json: String, verifying_key_hex: String) -> a
     });
     if let Err(error) = verify {
         let _ = authority.finish();
-        return Err(anyhow::anyhow!("offboard lifecycle verification failed: {error:?}"));
+        return Err(anyhow::anyhow!(
+            "offboard lifecycle verification failed: {error:?}"
+        ));
     }
     let receipt = authority
         .offboarding_receipt()
@@ -100,10 +103,23 @@ fn verify_offboard_state(
     relay_key_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let resources = vec![
-        ("peer roster", mackes_mesh_types::peers::peers_dir(root).join(format!("{hostname}.json"))),
-        ("identity bundle", mackesd_core::ca::bundle::bundle_path(root, node_id)),
-        ("SSH identity", root.join("ssh-keys").join(format!("{hostname}.pub"))),
-        ("media registry", root.join(hostname).join(mackesd_core::mesh_media::MEDIA_REGISTRY_FILE)),
+        (
+            "peer roster",
+            mackes_mesh_types::peers::peers_dir(root).join(format!("{hostname}.json")),
+        ),
+        (
+            "identity bundle",
+            mackesd_core::ca::bundle::bundle_path(root, node_id),
+        ),
+        (
+            "SSH identity",
+            root.join("ssh-keys").join(format!("{hostname}.pub")),
+        ),
+        (
+            "media registry",
+            root.join(hostname)
+                .join(mackesd_core::mesh_media::MEDIA_REGISTRY_FILE),
+        ),
         ("role pin", role_toml_path.to_owned()),
         ("relay authority pin", relay_pin_path.to_owned()),
         ("relay authority key", relay_key_path.to_owned()),
@@ -119,7 +135,10 @@ fn verify_offboard_state(
     match std::fs::read_dir(nebula_config_dir) {
         Ok(mut entries) => {
             if entries.next().transpose()?.is_some() {
-                retained.push(format!("Nebula configuration: {}", nebula_config_dir.display()));
+                retained.push(format!(
+                    "Nebula configuration: {}",
+                    nebula_config_dir.display()
+                ));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -148,42 +167,42 @@ fn parse_hex_32(value: &str) -> Result<Vec<u8>, &'static str> {
 
 fn run_inner(yes: bool, root: std::path::PathBuf, hostname: String) -> anyhow::Result<()> {
     debug_assert!(yes);
-        let node_id = format!("peer:{hostname}");
-        // HA — drop our own etcd cluster membership BEFORE stopping the overlay
-        // (the cluster is reached over nebula), so a retired node never leaves a
-        // ghost voter dragging quorum. A live etcd failure is fatal: wiping the
-        // local identity first would leave an unprunable ghost voter and make a
-        // retry impossible from this node.
-        {
-            use mackesd_core::substrate::{etcd, etcd_membership};
-            let eps = etcd::default_endpoints();
-            if !eps.is_empty() {
-                let sel = match mackesd_core::voip_rtt::own_nebula_ip() {
-                    Some(ip) => etcd_membership::MemberSel::Overlay(ip),
-                    None => etcd_membership::MemberSel::Hostname(hostname.clone()),
-                };
-                let result = etcd_membership::remove_member_blocking(&eps, &sel);
-                if matches!(&result, Some(Ok(true))) {
-                    println!("etcd: removed self from the cluster");
-                }
-                ensure_member_removal_succeeded(result)?;
+    let node_id = format!("peer:{hostname}");
+    // HA — drop our own etcd cluster membership BEFORE stopping the overlay
+    // (the cluster is reached over nebula), so a retired node never leaves a
+    // ghost voter dragging quorum. A live etcd failure is fatal: wiping the
+    // local identity first would leave an unprunable ghost voter and make a
+    // retry impossible from this node.
+    {
+        use mackesd_core::substrate::{etcd, etcd_membership};
+        let eps = etcd::default_endpoints();
+        if !eps.is_empty() {
+            let sel = match mackesd_core::voip_rtt::own_nebula_ip() {
+                Some(ip) => etcd_membership::MemberSel::Overlay(ip),
+                None => etcd_membership::MemberSel::Hostname(hostname.clone()),
+            };
+            let result = etcd_membership::remove_member_blocking(&eps, &sel);
+            if matches!(&result, Some(Ok(true))) {
+                println!("etcd: removed self from the cluster");
             }
+            ensure_member_removal_succeeded(result)?;
         }
-        let report = mackesd_core::leave::leave(
-            &root,
-            &hostname,
-            &node_id,
-            std::path::Path::new("/etc/nebula"),
-            std::path::Path::new("/var/lib/mde/role.toml"),
-        );
-        let trust_teardown = ensure_required_trust_teardown_succeeded(&report);
-        let _ = std::process::Command::new("systemctl")
-            .args(["stop", "nebula.service"])
-            .status();
-        trust_teardown?;
-        println!("left the mesh: {report:#?}");
-        println!("re-join later with: mackesd join '<fresh token from a lighthouse>'");
-        Ok(())
+    }
+    let report = mackesd_core::leave::leave(
+        &root,
+        &hostname,
+        &node_id,
+        std::path::Path::new("/etc/nebula"),
+        std::path::Path::new("/var/lib/mde/role.toml"),
+    );
+    let trust_teardown = ensure_required_trust_teardown_succeeded(&report);
+    let _ = std::process::Command::new("systemctl")
+        .args(["stop", "nebula.service"])
+        .status();
+    trust_teardown?;
+    println!("left the mesh: {report:#?}");
+    println!("re-join later with: mackesd join '<fresh token from a lighthouse>'");
+    Ok(())
 }
 
 /// An absent pin/key is an idempotent success (including a Workstation that
@@ -228,7 +247,10 @@ fn ensure_member_removal_succeeded(result: Option<Result<bool, String>>) -> anyh
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_member_removal_succeeded, ensure_required_trust_teardown_succeeded, verify_offboard_state};
+    use super::{
+        ensure_member_removal_succeeded, ensure_required_trust_teardown_succeeded,
+        verify_offboard_state,
+    };
     use mackesd_core::leave::LeaveReport;
 
     #[test]
@@ -282,12 +304,21 @@ mod tests {
         let pin = root.join("relay-pin");
         let key = root.join("relay-key");
         std::fs::create_dir_all(mackes_mesh_types::peers::peers_dir(root)).unwrap();
-        std::fs::write(mackes_mesh_types::peers::peers_dir(root).join("seat-15.json"), "{}").unwrap();
-        let error = verify_offboard_state(root, "seat-15", "peer:seat-15", &nebula, &role, &pin, &key)
-            .expect_err("retained peer identity must block completed offboarding")
-            .to_string();
+        std::fs::write(
+            mackes_mesh_types::peers::peers_dir(root).join("seat-15.json"),
+            "{}",
+        )
+        .unwrap();
+        let error =
+            verify_offboard_state(root, "seat-15", "peer:seat-15", &nebula, &role, &pin, &key)
+                .expect_err("retained peer identity must block completed offboarding")
+                .to_string();
         assert!(error.contains("peer roster"));
-        std::fs::remove_file(mackes_mesh_types::peers::peers_dir(root).join("seat-15.json")).unwrap();
-        assert!(verify_offboard_state(root, "seat-15", "peer:seat-15", &nebula, &role, &pin, &key).is_ok());
+        std::fs::remove_file(mackes_mesh_types::peers::peers_dir(root).join("seat-15.json"))
+            .unwrap();
+        assert!(
+            verify_offboard_state(root, "seat-15", "peer:seat-15", &nebula, &role, &pin, &key)
+                .is_ok()
+        );
     }
 }

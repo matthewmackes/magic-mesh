@@ -472,14 +472,13 @@ fn read_bounded_regular_file(path: &Path, expected: u64) -> Result<Vec<u8>, Read
     Ok(bytes)
 }
 
-fn load_index(
-    root: &Path,
-    policy: CachePolicy,
-) -> Result<(Vec<CacheEntry>, bool), CacheError> {
+fn load_index(root: &Path, policy: CachePolicy) -> Result<(Vec<CacheEntry>, bool), CacheError> {
     let path = root.join(INDEX_FILE);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), true))
+        }
         Err(error) => return Err(CacheError::Io(error.to_string())),
     };
     if !is_exclusive_regular_file(&metadata) || metadata.len() > MAX_INDEX_BYTES {

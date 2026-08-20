@@ -743,18 +743,14 @@ mod tests {
 
     #[test]
     fn action_parser_rejects_future_schema_and_unbounded_correlation_ids() {
-        assert!(parse_action(r#"{"schema_version":2,"id":"svc-1","kind":"files"}"#)
-            .is_err());
+        assert!(parse_action(r#"{"schema_version":2,"id":"svc-1","kind":"files"}"#).is_err());
         assert!(parse_action(r#"{"schema_version":1,"id":"","kind":"files"}"#).is_err());
-        assert!(parse_action(
-            &format!(
-                r#"{{"schema_version":1,"id":"{}","kind":"files"}}"#,
-                "x".repeat(MAX_SERVICE_ACTION_ID_BYTES + 1)
-            )
-        )
+        assert!(parse_action(&format!(
+            r#"{{"schema_version":1,"id":"{}","kind":"files"}}"#,
+            "x".repeat(MAX_SERVICE_ACTION_ID_BYTES + 1)
+        ))
         .is_err());
-        assert!(parse_action(r#"{"schema_version":1,"id":"svc/escape","kind":"files"}"#)
-            .is_err());
+        assert!(parse_action(r#"{"schema_version":1,"id":"svc/escape","kind":"files"}"#).is_err());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -83,7 +83,10 @@ pub struct WorkspaceIdentity {
 #[derive(Debug)]
 pub enum WorkspaceError {
     /// A required image-owned file or process operation failed.
-    Io { operation: &'static str, source: io::Error },
+    Io {
+        operation: &'static str,
+        source: io::Error,
+    },
     /// An identity did not match the bounded guest contract.
     InvalidIdentity(&'static str),
     /// The image-owned validator rejected runtime inputs.
@@ -134,7 +137,11 @@ pub fn load_identity(paths: &WorkspacePaths) -> Result<WorkspaceIdentity, Worksp
     if !valid_token(&vm_id, 63) {
         return Err(WorkspaceError::InvalidIdentity("VM identity"));
     }
-    Ok(WorkspaceIdentity { app_id, session_id, vm_id })
+    Ok(WorkspaceIdentity {
+        app_id,
+        session_id,
+        vm_id,
+    })
 }
 
 fn read_identity(path: &Path, operation: &'static str) -> Result<String, WorkspaceError> {
@@ -280,7 +287,10 @@ struct Sockets {
     sway_socket: PathBuf,
 }
 
-fn wait_for_sockets(paths: &WorkspacePaths, compositor: &mut Child) -> Result<Sockets, WorkspaceError> {
+fn wait_for_sockets(
+    paths: &WorkspacePaths,
+    compositor: &mut Child,
+) -> Result<Sockets, WorkspaceError> {
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if let Some(status) = compositor
@@ -307,7 +317,10 @@ fn wait_for_sockets(paths: &WorkspacePaths, compositor: &mut Child) -> Result<So
             }
         }
         if let (Some(wayland_display), Some(sway_socket)) = (wayland_display, sway_socket) {
-            return Ok(Sockets { wayland_display, sway_socket });
+            return Ok(Sockets {
+                wayland_display,
+                sway_socket,
+            });
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -357,11 +370,16 @@ fn publish(
 
 fn next_generation(path: &Path) -> Result<u64, WorkspaceError> {
     let current = match fs::read_to_string(path) {
-        Ok(raw) => raw.trim().parse::<u64>().map_err(|_| WorkspaceError::BadGeneration)?,
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| WorkspaceError::BadGeneration)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
         Err(error) => return Err(io_error("read runtime generation", error)),
     };
-    let next = current.checked_add(1).ok_or(WorkspaceError::BadGeneration)?;
+    let next = current
+        .checked_add(1)
+        .ok_or(WorkspaceError::BadGeneration)?;
     let parent = path.parent().ok_or(WorkspaceError::BadGeneration)?;
     fs::create_dir_all(parent).map_err(|e| io_error("create evidence directory", e))?;
     let temporary = path.with_extension("tmp");
@@ -384,12 +402,19 @@ mod tests {
         fs::write(input.join("session-id"), "session:app-1\n").expect("session");
         let hostname = temp.path().join("hostname");
         fs::write(&hostname, "app-vm-1\n").expect("host");
-        let paths = WorkspacePaths { input_root: input, hostname, ..WorkspacePaths::default() };
+        let paths = WorkspacePaths {
+            input_root: input,
+            hostname,
+            ..WorkspacePaths::default()
+        };
         let id = load_identity(&paths).expect("identity");
         assert_eq!(id.app_id, "org.example.Editor");
 
         fs::write(paths.input_root.join("app-id"), "org.example.App;reboot\n").expect("bad");
-        assert!(matches!(load_identity(&paths), Err(WorkspaceError::InvalidIdentity(_))));
+        assert!(matches!(
+            load_identity(&paths),
+            Err(WorkspaceError::InvalidIdentity(_))
+        ));
     }
 
     #[test]
@@ -410,7 +435,10 @@ mod tests {
         assert_eq!(next_generation(&path).expect("first"), 1);
         assert_eq!(next_generation(&path).expect("second"), 2);
         fs::write(&path, "not-a-number\n").expect("corrupt");
-        assert!(matches!(next_generation(&path), Err(WorkspaceError::BadGeneration)));
+        assert!(matches!(
+            next_generation(&path),
+            Err(WorkspaceError::BadGeneration)
+        ));
     }
 
     #[test]
@@ -420,6 +448,9 @@ mod tests {
         fs::create_dir(&target).expect("target");
         let link = temp.path().join("runtime");
         std::os::unix::fs::symlink(target, &link).expect("link");
-        assert!(matches!(prepare_private_dir(&link), Err(WorkspaceError::InvalidIdentity(_))));
+        assert!(matches!(
+            prepare_private_dir(&link),
+            Err(WorkspaceError::InvalidIdentity(_))
+        ));
     }
 }

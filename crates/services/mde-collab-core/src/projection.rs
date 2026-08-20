@@ -657,18 +657,22 @@ impl Projection {
     /// Returns an error if the stored rows cannot be read or decoded.
     pub fn call_state(&self, space: Option<SpaceId>) -> Result<CallState> {
         let (sql, want) = space.map_or_else(
-            || (
-                "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
+            || {
+                (
+                    "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
                  ORDER BY clock_wall, clock_counter, call_id"
-                    .to_string(),
-                None,
-            ),
-            |s| (
-                "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
+                        .to_string(),
+                    None,
+                )
+            },
+            |s| {
+                (
+                    "SELECT call_id, space_id, kind, initiator, started_ms, ended FROM calls \
                  WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, call_id"
-                    .to_string(),
-                Some(s.to_string()),
-            ),
+                        .to_string(),
+                    Some(s.to_string()),
+                )
+            },
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row<'_>| {

@@ -495,13 +495,15 @@ pub fn apply_request(
                     {
                         return Err(SessionError::ConflictingBrowserSession {
                             id,
-                            reason: "session id is already bound to a different VM route or transport",
+                            reason:
+                                "session id is already bound to a different VM route or transport",
                         });
                     }
                     if existing.state.is_terminal() {
                         return Err(SessionError::ConflictingBrowserSession {
                             id,
-                            reason: "the existing Browser VM session is closed; use a new session id",
+                            reason:
+                                "the existing Browser VM session is closed; use a new session id",
                         });
                     }
                     return Ok(());
@@ -2143,7 +2145,13 @@ mod tests {
             ("id", "session/one", "peer:a", "uuid-1", "peer:b"),
             ("serving_peer", "session-1", "peer/a", "uuid-1", "peer:b"),
             ("vm_id", "session-1", "peer:a", "../vm", "peer:b"),
-            ("client_peer", "session-1", "peer:a", "uuid-1", "peer\nclient"),
+            (
+                "client_peer",
+                "session-1",
+                "peer:a",
+                "uuid-1",
+                "peer\nclient",
+            ),
             ("id", " session-1", "peer:a", "uuid-1", "peer:b"),
         ];
         for (field, id, serving_peer, vm_id, client_peer) in cases {
@@ -2469,11 +2477,7 @@ mod tests {
 
         for conflicting in [
             open("catalog-2", vec!["audio".into()], false),
-            open(
-                "catalog-1",
-                vec!["audio".into(), "clipboard".into()],
-                false,
-            ),
+            open("catalog-1", vec!["audio".into(), "clipboard".into()], false),
             open("catalog-1", vec!["audio".into()], true),
         ] {
             assert!(matches!(
@@ -2967,10 +2971,7 @@ mod tests {
         );
         assert_eq!(invalidated.app_state_generation, 7);
         assert_eq!(
-            reconcile(
-                &recovered.values().cloned().collect::<Vec<_>>(),
-                &observed,
-            ),
+            reconcile(&recovered.values().cloned().collect::<Vec<_>>(), &observed,),
             vec![SessionAction::Publish(invalidated.clone())]
         );
         assert_eq!(

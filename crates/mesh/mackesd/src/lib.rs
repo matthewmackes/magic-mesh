@@ -49,11 +49,11 @@ pub mod leader;
 // SUBSTRATE-V2 (mackesd-01/-04) — the shared, substrate-aware leadership gate the
 // leader-gated ACTION workers consult (etcd election on a cut-over fleet, fs lock
 // pre-cutover). Gated with the worker pool since its etcd branch rides `substrate`.
-#[cfg(feature = "async-services")]
-pub mod leader_gate;
 /// WL-ARCH-010 — native QEMU Display1 DMA-BUF listener and KMS handoff seam.
 #[cfg(feature = "async-services")]
 pub mod display1_broker;
+#[cfg(feature = "async-services")]
+pub mod leader_gate;
 pub mod legacy_inventory;
 pub mod lighthouse_addr;
 pub mod lighthouse_lifecycle;
@@ -218,13 +218,13 @@ pub mod adopt_xcp;
 // the `mackesd recovery` CLI verb reaches it without the async-services worker pool.
 pub mod recovery;
 pub mod worker;
-/// WL-ARCH-010 — durable idempotent workload operation journal.
-pub mod workload_reconciler;
-/// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
-pub mod worker_role;
 /// WL-ARCH-009 — generation-bound Action Console change-set admission.
 #[cfg(feature = "async-services")]
 pub mod worker_change_set;
+/// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
+pub mod worker_role;
+/// WL-ARCH-010 — durable idempotent workload operation journal.
+pub mod workload_reconciler;
 
 /// OW-2 — the `mackesd onboard` engine core (the self-test + role-provision
 /// verbs both onboarding front-ends drive). Feature-agnostic (pure fold + thin

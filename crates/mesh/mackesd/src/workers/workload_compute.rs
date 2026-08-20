@@ -1400,8 +1400,7 @@ impl SystemWorkloadActuator {
             == Some(ContainerStartRecoveryStep::RematerializeAndStart)
         {
             self.ensure_container_unit(request)?;
-            Self::run_power_command(request, "start")
-                .map_err(WorkloadActuatorError::Retryable)?;
+            Self::run_power_command(request, "start").map_err(WorkloadActuatorError::Retryable)?;
             return Ok(Some(WorkloadActuatorOutcome {
                 phase: WorkloadOperationPhase::WaitingForGuest,
                 power: WorkloadPowerState::Starting,
@@ -1451,12 +1450,7 @@ impl SystemWorkloadActuator {
     fn domain_defined(request: &WorkloadOperationRequest) -> Result<bool, String> {
         let domain = Self::libvirt_domain(request);
         let mut command = Command::new("virsh");
-        command.args([
-            "--connect",
-            "qemu:///system",
-            "dominfo",
-            &domain,
-        ]);
+        command.args(["--connect", "qemu:///system", "dominfo", &domain]);
         let output = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             .map_err(|error| format!("domain existence probe failed: {error}"))?;
         if output.status.success() {
@@ -1638,11 +1632,12 @@ impl SystemWorkloadActuator {
             }),
             network: Some("default".to_string()),
         };
-        let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string)
-            .map_err(|error| {
+        let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string).map_err(
+            |error| {
                 let _ = fs::remove_file(&disk);
                 WorkloadActuatorError::Permanent(format!("invalid VM resources: {error}"))
-            })?;
+            },
+        )?;
         let xml_path = std::env::temp_dir().join(format!(
             "mde-workload-{domain}-{}-{}.xml",
             std::process::id(),
@@ -1940,12 +1935,7 @@ impl SystemWorkloadActuator {
                 }
                 let domain = Self::libvirt_domain(request);
                 let mut command = Command::new("virsh");
-                command.args([
-                    "--connect",
-                    "qemu:///system",
-                    verb,
-                    &domain,
-                ]);
+                command.args(["--connect", "qemu:///system", verb, &domain]);
                 run_libvirt_power_command(command, verb, DEFAULT_CMD_TIMEOUT)
             }
             WorkloadBackend::QuadletSystemd => {
@@ -1967,12 +1957,7 @@ impl SystemWorkloadActuator {
             WorkloadBackend::LibvirtVirtqemud => {
                 let domain = Self::libvirt_domain(request);
                 let mut command = Command::new("virsh");
-                command.args([
-                    "--connect",
-                    "qemu:///system",
-                    "domstate",
-                    &domain,
-                ]);
+                command.args(["--connect", "qemu:///system", "domstate", &domain]);
                 output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
             }
             WorkloadBackend::QuadletSystemd => {
@@ -3541,8 +3526,7 @@ impl WorkloadComputeWorker {
             );
             return;
         };
-        let target_generation_matches =
-            target_status.generation == request.expected_generation;
+        let target_generation_matches = target_status.generation == request.expected_generation;
         let target_matches = target_request.action != WorkloadOperationAction::Cancel
             && target_request.workload_id == request.workload_id
             && target_request.target_node == request.target_node
@@ -4074,11 +4058,9 @@ impl WorkloadComputeWorker {
                 // must still be inspected.  Otherwise a stale journal can
                 // publish Ready without an authenticated Display1 capability.
                 status.readiness == WorkloadReadiness::Ready
-                    && ledger
-                        .request(&status.request_id)
-                        .is_some_and(|request| {
-                            request.action == WorkloadOperationAction::StartAndAttach
-                        })
+                    && ledger.request(&status.request_id).is_some_and(|request| {
+                        request.action == WorkloadOperationAction::StartAndAttach
+                    })
             })
             .cloned()
             .collect();
@@ -4169,9 +4151,7 @@ impl WorkloadComputeWorker {
             // authority allowed to recreate the exact lease, so Ready without
             // that confirmation must revoke the stale descriptor and fail
             // closed instead of advertising a usable session.
-            if outcome.readiness == WorkloadReadiness::Ready
-                && outcome.attachment.is_none()
-            {
+            if outcome.readiness == WorkloadReadiness::Ready && outcome.attachment.is_none() {
                 tracing::error!(
                     request_id = %request.request_id,
                     "terminal attachment recovery reported Ready without a lease"
@@ -4776,8 +4756,7 @@ fn live_capacity<'a>(
         })
         .unwrap_or(0);
     let mut latest = BTreeMap::<&str, (u64, Vec<&WorkloadOperationStatus>)>::new();
-    let mut latest_consuming =
-        BTreeMap::<&str, (u64, Vec<&WorkloadOperationStatus>)>::new();
+    let mut latest_consuming = BTreeMap::<&str, (u64, Vec<&WorkloadOperationStatus>)>::new();
     for status in statuses {
         let key = status.workload_id.as_str();
         match latest.entry(key) {
@@ -4914,9 +4893,7 @@ fn status_reserves_capacity(status: &WorkloadOperationStatus) -> bool {
     !status.phase.is_terminal()
         || matches!(
             status.power,
-            WorkloadPowerState::Running
-                | WorkloadPowerState::Paused
-                | WorkloadPowerState::Stopping
+            WorkloadPowerState::Running | WorkloadPowerState::Paused | WorkloadPowerState::Stopping
         )
 }
 
@@ -4944,7 +4921,11 @@ fn probe_storage_gb_command(command: Command, timeout: Duration) -> u32 {
 fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
     let mut body = String::new();
     fs::File::open(path)?
-        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX).saturating_add(1))
+        .take(
+            u64::try_from(max_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
         .read_to_string(&mut body)?;
     if body.len() > max_bytes {
         return Err(io::Error::new(
@@ -5181,7 +5162,10 @@ mod tests {
         command.args(["-c", "sleep 1"]);
         let started = std::time::Instant::now();
 
-        assert_eq!(probe_storage_gb_command(command, Duration::from_millis(50)), 0);
+        assert_eq!(
+            probe_storage_gb_command(command, Duration::from_millis(50)),
+            0
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -5591,9 +5575,7 @@ mod tests {
                 state_root: temp.path().to_path_buf(),
                 lease: lease.clone(),
                 revoked: Arc::clone(&revoked),
-                saw_durable_detach_before_revoke: Arc::clone(
-                    &saw_durable_detach_before_revoke,
-                ),
+                saw_durable_detach_before_revoke: Arc::clone(&saw_durable_detach_before_revoke),
                 cancel_calls: Arc::clone(&cancel_calls),
             }));
         let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
@@ -5626,7 +5608,10 @@ mod tests {
         assert_eq!(target_status.readiness, WorkloadReadiness::Unavailable);
         assert!(target_status.attachment.is_none());
         assert_eq!(
-            ledger.status(&cancel.request_id).expect("cancel status").phase,
+            ledger
+                .status(&cancel.request_id)
+                .expect("cancel status")
+                .phase,
             WorkloadOperationPhase::Stopping
         );
 
@@ -5637,8 +5622,7 @@ mod tests {
         let mut failed_target = request();
         failed_target.request_id = "target-detach-flush-fails".into();
         failed_target.deadline_at_ms = started_at.saturating_add(20_000);
-        let failed_lease =
-            SystemWorkloadActuator::attachment_lease(&failed_target, 1, started_at);
+        let failed_lease = SystemWorkloadActuator::attachment_lease(&failed_target, 1, started_at);
         let failed_revoked = Arc::new(Mutex::new(Vec::new()));
         let failed_saw_detach = Arc::new(AtomicBool::new(false));
         let failed_cancel_calls = Arc::new(AtomicU64::new(0));
@@ -5655,8 +5639,7 @@ mod tests {
             }));
         let mut failed_ledger =
             WorkloadOperationLedger::open(failed.path()).expect("failed-path ledger");
-        let failed_target_raw =
-            serde_json::to_string(&failed_target).expect("failed target wire");
+        let failed_target_raw = serde_json::to_string(&failed_target).expect("failed target wire");
         failed_worker.handle_request(
             &mut failed_ledger,
             &failed_target_raw,
@@ -5686,14 +5669,14 @@ mod tests {
             failed_cancel_status,
             started_at,
         );
-        fs::set_permissions(
-            failed.path(),
-            fs::Permissions::from_mode(writable_mode),
-        )
-        .expect("restore cancellation journal permissions");
+        fs::set_permissions(failed.path(), fs::Permissions::from_mode(writable_mode))
+            .expect("restore cancellation journal permissions");
 
         assert!(!failed_saw_detach.load(Ordering::Acquire));
-        assert!(failed_revoked.lock().expect("failed revocations").is_empty());
+        assert!(failed_revoked
+            .lock()
+            .expect("failed revocations")
+            .is_empty());
         assert_eq!(failed_cancel_calls.load(Ordering::Acquire), 0);
         assert_eq!(
             failed_ledger
@@ -6079,8 +6062,7 @@ mod tests {
                 .expect("reopen failure journal at revocation boundary");
             self.saw_durable_detach_before_revoke.store(
                 reopened.status(&status.request_id).is_some_and(|durable| {
-                    durable.phase == WorkloadOperationPhase::Failed
-                        && durable.attachment.is_none()
+                    durable.phase == WorkloadOperationPhase::Failed && durable.attachment.is_none()
                 }),
                 Ordering::Release,
             );
@@ -6379,8 +6361,7 @@ mod tests {
                 status.power = WorkloadPowerState::Running;
                 status.readiness = WorkloadReadiness::PreparingDisplay;
                 status.attachment = Some(lease.clone());
-                status.signals =
-                    WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
+                status.signals = WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
             }
             status = ledger
                 .advance(&request.request_id, status, now)
@@ -6515,8 +6496,8 @@ mod tests {
     #[test]
     fn hostile_workload_id_suffixes_cannot_alias_a_vm_domain_or_overlay() {
         let mut first = request();
-        first.workload_id = WorkloadId::new("app-vm:seat15:writer:org.example.Writer:catalog-7")
-            .expect("first id");
+        first.workload_id =
+            WorkloadId::new("app-vm:seat15:writer:org.example.Writer:catalog-7").expect("first id");
         let mut second = first.clone();
         second.workload_id = WorkloadId::new("app-vm:seat15:reader:org.example.Reader:catalog-7")
             .expect("second id");
@@ -6620,11 +6601,8 @@ mod tests {
             .expect("closed fixture listener");
         let closed_address = closed.local_addr().expect("closed fixture address");
         drop(closed);
-        let error = require_workload_audio_endpoint_at(
-            closed_address,
-            Duration::from_millis(100),
-        )
-        .expect_err("closed endpoint must prevent a silent VM start");
+        let error = require_workload_audio_endpoint_at(closed_address, Duration::from_millis(100))
+            .expect_err("closed endpoint must prevent a silent VM start");
         assert!(error.contains("restore mcnf-qemu-pulse-endpoint.service"));
     }
 
@@ -6702,22 +6680,17 @@ mod tests {
             .expect("closed Browser endpoint");
         let closed_port = closed.local_addr().expect("closed endpoint address").port();
         drop(closed);
-        assert!(browser_rdp_endpoint_ready_at(
-            &browser,
-            closed_port,
-            Duration::from_millis(100)
-        )
-        .is_err());
+        assert!(
+            browser_rdp_endpoint_ready_at(&browser, closed_port, Duration::from_millis(100))
+                .is_err()
+        );
 
         let ready = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("ready Browser endpoint");
         let ready_port = ready.local_addr().expect("ready endpoint address").port();
-        assert!(browser_rdp_endpoint_ready_at(
-            &browser,
-            ready_port,
-            Duration::from_millis(100)
-        )
-        .is_ok());
+        assert!(
+            browser_rdp_endpoint_ready_at(&browser, ready_port, Duration::from_millis(100)).is_ok()
+        );
     }
 
     #[test]
@@ -6743,7 +6716,10 @@ mod tests {
         let error = ensure_new_overlay_path(&path)
             .expect_err("an orphan overlay must require explicit recovery");
         assert!(matches!(error, WorkloadActuatorError::Permanent(_)));
-        assert_eq!(fs::read(&path).expect("retained overlay"), b"retained overlay");
+        assert_eq!(
+            fs::read(&path).expect("retained overlay"),
+            b"retained overlay"
+        );
     }
 
     #[test]
@@ -6833,11 +6809,8 @@ mod tests {
         let old_socket = old_runtime.server.socket_path().to_path_buf();
         let mut replacement_request = request.clone();
         replacement_request.request_id = "op-2".into();
-        let replacement_lease = SystemWorkloadActuator::attachment_lease(
-            &replacement_request,
-            1,
-            now,
-        );
+        let replacement_lease =
+            SystemWorkloadActuator::attachment_lease(&replacement_request, 1, now);
         let mut status = queued_status(&request);
         status.attachment = Some(replacement_lease.clone());
         drop(old_runtime);
@@ -6849,14 +6822,7 @@ mod tests {
         assert!(!old_socket.exists());
         assert_eq!(replacement.server.lease(), &replacement_lease);
         assert!(replacement.server.socket_path().exists());
-        assert_eq!(
-            actuator
-                .attachments
-                .lock()
-                .expect("attachments")
-                .len(),
-            1
-        );
+        assert_eq!(actuator.attachments.lock().expect("attachments").len(), 1);
     }
 
     #[test]
@@ -7154,9 +7120,10 @@ mod tests {
         let refused = ledger.status(&request.request_id).expect("refused status");
         assert!(refused.attachment.is_none());
         assert_eq!(refused.readiness, WorkloadReadiness::Unavailable);
-        assert!(refused.reason.as_deref().is_some_and(|reason| {
-            reason.contains("without a journaled Display1 lease")
-        }));
+        assert!(refused
+            .reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("without a journaled Display1 lease") }));
     }
 
     #[test]
@@ -7418,12 +7385,8 @@ mod tests {
         let (initial, initial_raw) =
             arm_request(&base, &mint_signer, "initial-capability", started_at);
 
-        let accepted = worker.handle_request(
-            &mut ledger,
-            &initial_raw,
-            initial.clone(),
-            started_at,
-        );
+        let accepted =
+            worker.handle_request(&mut ledger, &initial_raw, initial.clone(), started_at);
         assert!(matches!(accepted, HandleResult::Accepted(_)));
         assert_eq!(*calls.lock().expect("calls"), 1);
         assert!(!claim_nonce(
@@ -8335,7 +8298,9 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
         let request = request();
-        ledger.accept(request.clone(), now_ms()).expect("queue request");
+        ledger
+            .accept(request.clone(), now_ms())
+            .expect("queue request");
 
         let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
             .with_state_root(temp.path().to_path_buf())
@@ -8373,10 +8338,7 @@ mod tests {
 
         assert_eq!(host.allocated_vcpu, running.resources.vcpu);
         assert_eq!(host.allocated_memory_mb, running.resources.memory_mb);
-        assert_eq!(
-            storage.allocated_vm_storage_gb,
-            running.resources.disk_gb
-        );
+        assert_eq!(storage.allocated_vm_storage_gb, running.resources.disk_gb);
         assert!(
             !admit_workload_for_backend(
                 WorkloadProfile::Small.resources(),
@@ -8414,10 +8376,7 @@ mod tests {
 
         assert_eq!(host.allocated_vcpu, running.resources.vcpu);
         assert_eq!(host.allocated_memory_mb, running.resources.memory_mb);
-        assert_eq!(
-            storage.allocated_vm_storage_gb,
-            running.resources.disk_gb
-        );
+        assert_eq!(storage.allocated_vm_storage_gb, running.resources.disk_gb);
         assert!(
             !admit_workload_for_backend(
                 WorkloadProfile::Small.resources(),
@@ -8453,10 +8412,7 @@ mod tests {
 
         assert_eq!(host.allocated_vcpu, running.resources.vcpu);
         assert_eq!(host.allocated_memory_mb, running.resources.memory_mb);
-        assert_eq!(
-            storage.allocated_vm_storage_gb,
-            running.resources.disk_gb
-        );
+        assert_eq!(storage.allocated_vm_storage_gb, running.resources.disk_gb);
         assert!(
             !admit_workload_for_backend(
                 WorkloadProfile::Small.resources(),
@@ -8658,8 +8614,7 @@ mod tests {
         let mut failed_request = request();
         failed_request.request_id = "terminal-detach-flush-fails".into();
         failed_request.deadline_at_ms = started_at.saturating_add(20_000);
-        let failed_lease =
-            SystemWorkloadActuator::attachment_lease(&failed_request, 1, started_at);
+        let failed_lease = SystemWorkloadActuator::attachment_lease(&failed_request, 1, started_at);
         let mut failed_ledger =
             WorkloadOperationLedger::open(failed.path()).expect("failed-path ledger");
         let failed_status = seed_inflight_attachment(
@@ -8670,13 +8625,13 @@ mod tests {
         );
         let failed_revoked = Arc::new(Mutex::new(Vec::new()));
         let failed_saw_detach = Arc::new(AtomicBool::new(false));
-        let failed_worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(
-            Box::new(OrderedFailureRevocationActuator {
+        let failed_worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            OrderedFailureRevocationActuator {
                 state_root: failed.path().to_path_buf(),
                 revoked: Arc::clone(&failed_revoked),
                 saw_durable_detach_before_revoke: Arc::clone(&failed_saw_detach),
-            }),
-        );
+            },
+        ));
 
         use std::os::unix::fs::PermissionsExt as _;
         let writable_mode = fs::metadata(failed.path())
@@ -8698,7 +8653,10 @@ mod tests {
             .expect("restore failure journal permissions");
 
         assert!(!failed_saw_detach.load(Ordering::Acquire));
-        assert!(failed_revoked.lock().expect("failed revocations").is_empty());
+        assert!(failed_revoked
+            .lock()
+            .expect("failed revocations")
+            .is_empty());
         let retained = failed_ledger
             .status(&failed_request.request_id)
             .expect("retained durable operation");

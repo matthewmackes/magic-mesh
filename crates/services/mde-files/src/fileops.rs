@@ -166,6 +166,41 @@ pub trait FileOps {
     }
 }
 
+/// Sibling destination for the Files Duplicate command: `stem (copy).ext`
+/// beside `path`. The first collision is left for the op-queue conflict dialog
+/// (Overwrite / Skip / Keep both); this helper does not auto-increment.
+#[must_use]
+pub fn duplicate_copy_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(duplicate_copy_name(path))
+}
+
+/// The `stem (copy).ext` basename Duplicate places beside the source.
+#[must_use]
+pub fn duplicate_copy_name(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_name.clone());
+    match path.extension().map(|e| e.to_string_lossy().into_owned()) {
+        Some(ext) if file_name != stem => format!("{stem} (copy).{ext}"),
+        _ => format!("{stem} (copy)"),
+    }
+}
+
+/// `true` when `err` is a cross-device `hard_link(2)` (`EXDEV`).
+#[must_use]
+pub fn is_cross_device_error(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    err.raw_os_error() == Some(18)
+}
+
 /// Pick the first "`<stem> copy<n>.<ext>`" sibling of `path` for which
 /// `exists(candidate)` is `false`. `n` is empty for the first copy, then ` 2`,
 /// ` 3`, … The extension and parent directory are preserved.
@@ -1220,5 +1255,18 @@ mod tests {
             Some("photo copy.png")
         );
         assert_eq!(std::fs::read(&dup).expect("read"), b"PNG");
+    }
+
+    #[test]
+    fn duplicate_copy_path_uses_the_parenthesized_copy_suffix() {
+        assert_eq!(
+            duplicate_copy_path(Path::new("/work/report.txt")),
+            PathBuf::from("/work/report (copy).txt")
+        );
+        assert_eq!(
+            duplicate_copy_name(Path::new("/work/Projects")),
+            "Projects (copy)"
+        );
+        assert!(is_cross_device_error(&io::Error::from_raw_os_error(18)));
     }
 }

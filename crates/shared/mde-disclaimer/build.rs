@@ -10,7 +10,10 @@ use std::path::Path;
 fn main() {
     let path = Path::new("../../../DISCLAIMER.md");
     println!("cargo:rerun-if-changed={}", path.display());
-    #[allow(clippy::panic, reason = "the build gate must refuse an empty or unreadable disclaimer")]
+    #[allow(
+        clippy::panic,
+        reason = "the build gate must refuse an empty or unreadable disclaimer"
+    )]
     match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => {
             // Non-empty disclaimer present — the gate passes.

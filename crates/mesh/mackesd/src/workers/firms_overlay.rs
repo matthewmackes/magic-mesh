@@ -1647,7 +1647,10 @@ mod tests {
             .ensure_no_context_published(&mut last_good, &mut no_fix_published)
             .expect("publish retraction");
 
-        assert!(no_fix_published, "no-fix status must be recorded as published");
+        assert!(
+            no_fix_published,
+            "no-fix status must be recorded as published"
+        );
         assert!(
             last_good.is_none(),
             "old vehicle-scoped FIRMS hotspot cache must not survive fix loss"

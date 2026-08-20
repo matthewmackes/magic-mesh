@@ -210,18 +210,16 @@ impl MirrorSyncd {
                     tracing::warn!(mirror = %m.name, error = %e, "mirror-syncd: .repo write failed");
                 } else {
                     if let Some(generation) = admitted_generation.or(current_generation) {
-                        *retained_generation = Some(retained_generation.map_or(
-                            generation,
-                            |previous| previous.max(generation),
-                        ));
+                        *retained_generation = Some(
+                            retained_generation
+                                .map_or(generation, |previous| previous.max(generation)),
+                        );
                     }
                     self.ready_mirrors.insert(m.name.clone());
                 }
             } else if was_ready {
                 self.ready_mirrors.remove(&m.name);
-                let repo_path = self
-                    .repo_dir
-                    .join(format!("mackes-mirror-{}.repo", m.name));
+                let repo_path = self.repo_dir.join(format!("mackes-mirror-{}.repo", m.name));
                 if let Err(error) = std::fs::remove_file(&repo_path) {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(
@@ -407,9 +405,7 @@ mod tests {
         w.tick().await;
         std::fs::write(mirror.local_dir(tmp.path()).join(".last-sync"), "2").unwrap();
         w.tick().await;
-        let repo = tmp
-            .path()
-            .join("yum.repos.d/mackes-mirror-magic-mesh.repo");
+        let repo = tmp.path().join("yum.repos.d/mackes-mirror-magic-mesh.repo");
         assert!(repo.exists(), "forward peer generation must be admitted");
 
         std::fs::write(mirror.local_dir(tmp.path()).join(".last-sync"), "1").unwrap();

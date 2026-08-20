@@ -63,6 +63,7 @@ use mde_egui::{ChipTone, Style};
 use crate::model::{mount_host_of, FileBrowser, SortKey, SurfaceTab, ViewMode, LOCAL_SPOTS};
 use crate::transfers::{LedgerCounts, Method, StateFilter};
 use crate::view::Action;
+use mde_files::ArchiveFormat;
 
 /// The bar's menu titles, left to right — the shared File/Edit/View/Help spine
 /// with the two Files-specific menus (Go = places + mesh navigation, Share = the
@@ -91,6 +92,22 @@ const DESTINATIONS_OPEN: &str = "files-menubar-destinations-open";
 pub(crate) enum Picked {
     /// Open the New Folder dialog in the active directory.
     NewFolder,
+    /// Open the New File dialog in the active directory.
+    NewFile,
+    /// Duplicate the local selection beside itself as `name (copy)`.
+    Duplicate,
+    /// Compress the local selection (`OpKind::Compress`).
+    Compress(ArchiveFormat),
+    /// Extract the focused archive into its parent.
+    ExtractHere,
+    /// Open Extract To for the focused archive.
+    ExtractTo,
+    /// Create a symbolic link beside the focused row.
+    Symlink,
+    /// Create a hard link beside the focused row.
+    HardLink,
+    /// Pin the focused row into Places.
+    PinBookmark,
     /// Open a fresh tab in the active pane ([`FileBrowser::new_tab`]).
     NewTab,
     /// Close the active pane's active tab ([`FileBrowser::close_tab`]).
@@ -183,6 +200,14 @@ pub(crate) fn to_action(picked: Picked, cx: &FilesCtx) -> Option<Action> {
     let p = cx.active;
     Some(match picked {
         Picked::NewFolder => Action::OpenNewFolder(p),
+        Picked::NewFile => Action::OpenNewFile(p),
+        Picked::Duplicate => Action::Duplicate(p),
+        Picked::Compress(format) => Action::Compress(p, format),
+        Picked::ExtractHere => Action::ExtractHere(p),
+        Picked::ExtractTo => Action::OpenExtractTo(p),
+        Picked::Symlink => Action::OpenSymlink(p),
+        Picked::HardLink => Action::OpenHardLink(p),
+        Picked::PinBookmark => Action::PinFocused(p),
         Picked::NewTab => Action::NewTab(p),
         Picked::CloseTab => Action::CloseTab(p, cx.tab_ix),
         Picked::Refresh => Action::Refresh,
@@ -276,6 +301,8 @@ pub(crate) struct FilesCtx {
     pub has_directory: bool,
     /// Exactly one local row is focused (Rename's gate).
     pub can_rename: bool,
+    /// The focused row is a supported archive (Extract's gate).
+    pub can_extract: bool,
     /// History back is available.
     pub can_back: bool,
     /// History forward is available.
@@ -353,6 +380,10 @@ pub(crate) fn snapshot(b: &FileBrowser) -> FilesCtx {
         has_directory: tab.current_dir().is_some(),
         can_rename: tab.selection().len() == 1
             && tab.focused_row().and_then(|r| r.path.as_ref()).is_some(),
+        can_extract: tab
+            .focused_row()
+            .and_then(|r| r.path.as_ref())
+            .is_some_and(|p| ArchiveFormat::from_path(std::path::Path::new(p)).is_some()),
         can_back: tab.can_back(),
         can_forward: tab.can_forward(),
         can_paste: b.can_paste(),
@@ -386,11 +417,58 @@ fn item(id: Picked, label: &str) -> Entry<Picked> {
 
 /// The File drop-down.
 fn file_menu(cx: &FilesCtx) -> Menu<Picked> {
+    let compress = Entry::Submenu {
+        label: "Compress".to_owned(),
+        mnemonic: None,
+        entries: ArchiveFormat::supported()
+            .iter()
+            .map(|&format| {
+                Entry::Item(
+                    BarItem::new(
+                        Picked::Compress(format),
+                        format!(".{ext}", ext = format.extension()),
+                    )
+                    .enabled(cx.has_local_selection),
+                )
+            })
+            .collect(),
+    };
+    let advanced = Entry::Submenu {
+        label: "Advanced".to_owned(),
+        mnemonic: None,
+        entries: vec![
+            Entry::Item(
+                BarItem::new(Picked::Symlink, "Create Symbolic Link\u{2026}")
+                    .enabled(cx.has_focused_local),
+            ),
+            Entry::Item(
+                BarItem::new(Picked::HardLink, "Create Hard Link\u{2026}")
+                    .enabled(cx.has_focused_local),
+            ),
+        ],
+    };
     Menu::new(
         "File",
         vec![
             Entry::Item(
                 BarItem::new(Picked::NewFolder, "New Folder\u{2026}").enabled(cx.has_directory),
+            ),
+            Entry::Item(
+                BarItem::new(Picked::NewFile, "New File\u{2026}").enabled(cx.has_directory),
+            ),
+            Entry::Item(
+                BarItem::new(Picked::Duplicate, "Duplicate").enabled(cx.has_local_selection),
+            ),
+            Entry::Separator,
+            compress,
+            Entry::Item(BarItem::new(Picked::ExtractHere, "Extract Here").enabled(cx.can_extract)),
+            Entry::Item(
+                BarItem::new(Picked::ExtractTo, "Extract To\u{2026}").enabled(cx.can_extract),
+            ),
+            advanced,
+            Entry::Separator,
+            Entry::Item(
+                BarItem::new(Picked::PinBookmark, "Pin to Places").enabled(cx.has_focused_local),
             ),
             Entry::Separator,
             item(Picked::NewTab, "New Tab"),
@@ -858,6 +936,7 @@ mod tests {
             has_focused_local: true,
             has_directory: true,
             can_rename: true,
+            can_extract: false,
             can_back: true,
             can_forward: false,
             can_paste: true,
@@ -942,6 +1021,8 @@ mod tests {
     fn new_folder_and_rename_ship_while_quit_remains_honestly_omitted() {
         let items = all_items(&build_menus(&fixture()));
         assert!(items.iter().any(|(_, id, _)| id == &Picked::NewFolder));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::NewFile));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::Duplicate));
         assert!(items.iter().any(|(_, id, _)| id == &Picked::Rename));
         assert!(!items.iter().any(|(label, _, _)| label == "Quit"));
     }
@@ -960,6 +1041,14 @@ mod tests {
         assert!(matches!(
             to_action(Picked::NewFolder, &cx),
             Some(Action::OpenNewFolder(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::NewFile, &cx),
+            Some(Action::OpenNewFile(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::Duplicate, &cx),
+            Some(Action::Duplicate(0))
         ));
         assert!(matches!(
             to_action(Picked::Rename, &cx),
@@ -1022,6 +1111,7 @@ mod tests {
             has_focused_local: false,
             has_directory: false,
             can_rename: false,
+            can_extract: false,
             can_back: false,
             can_forward: false,
             can_paste: false,
@@ -1067,6 +1157,16 @@ mod tests {
             enabled(&menus, &Picked::NewFolder),
             Some(false),
             "New Folder needs a resolved directory"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::NewFile),
+            Some(false),
+            "New File needs a resolved directory"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::Duplicate),
+            Some(false),
+            "Duplicate needs a local selection"
         );
         assert_eq!(
             enabled(&menus, &Picked::Rename),

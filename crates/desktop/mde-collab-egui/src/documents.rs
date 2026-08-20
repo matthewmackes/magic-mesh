@@ -1,6 +1,5 @@
-//! Documents mode (WL-FUNC-011 Phase 3c foundation) — the biggest parity mode,
-//! built by **reusing** the whole `mde-editor-egui` "Construct" editor rather than
-//! re-implementing one.
+//! Documents mode — the biggest parity mode, built by **reusing** the whole
+//! `mde-editor-egui` "Construct" editor rather than re-implementing one.
 //!
 //! A document lives in a space by [`DocumentId`]. The mode has two sub-modes:
 //!
@@ -15,7 +14,8 @@
 //! * [`DocSubMode::Project`] — the **full IDE**: the same embedded editor with its
 //!   whole capability set (rope, undo/redo, multicursor, tree-sitter, LSP,
 //!   tabs/splits, folding, palette, integrated terminal). Nothing re-implemented;
-//!   the real widget is mounted.
+//!   the real widget is mounted. Live mesh share-sessions attach to the Document
+//!   sub-mode's one-pane buffer.
 //!
 //! # The collab document round-trip (wired now)
 //!
@@ -29,29 +29,34 @@
 //! [`DocumentId`] linked into multiple spaces shares content; per-space discussion
 //! anchors stay separate (they live in Messages/Threads, not here).
 //!
-//! # Explicit Phase-3c follow-ups (marked in-code, never stubbed/faked)
+//! # Mesh share-session (WL-FUNC-031)
 //!
-//! The foundation is real (a real embedded editor + real Markdown editing + the
-//! real `UpdateDocument` round-trip). These advanced paths are the next slice and
-//! are each marked with a `// WL-FUNC-011 Phase 3c:` note at their seam:
+//! A **Share** control on the focused document starts a [`CollabSession`] into a
+//! chosen member space. Peers join from the space's live-session picker, the
+//! participant roster offers a follow-mode toggle (wired through the editor's
+//! existing `follow` / [`follow_banner`] APIs), and the owner can close the
+//! session — which detaches every follower. Non-members and closed sessions
+//! refuse honestly. CollabCommand has no share/join/follow/close variants, so
+//! this UI crate emits a local [`DocumentShareCommand`] through
+//! [`DocumentShareSink`].
 //!
-//! 1. **Yrs CRDT live co-editing** + shared cursor/presence + follow-mode (the
-//!    editor already carries `CollabSession`/`follow`; wiring the mesh session over
-//!    the Bus per document is the next unit).
-//! 2. the **external-write three-way merge** (last-shared-base vs. collab vs. disk).
-//! 3. the **portable review sidecar** (comments/suggestions as anchored threads);
-//!    the Documents strip now emits the existing `RequestReview`/`SubmitReview`
-//!    commands, while anchored comments remain a follow-up.
-//! 4. **autosave versioned snapshots** + a rendered word-diff timeline + git
-//!    integration.
+//! External file changes merge against the **last shared base** instead of
+//! overwriting the live CRDT buffer; a concurrent write that cannot merge
+//! surfaces a typed [`ExternalWriteConflict`] and never drops the in-flight edit.
+//!
+//! Remaining follow-ups (not faked): the portable review sidecar (anchored
+//! comments) and autosave versioned snapshots + a rendered word-diff timeline.
 
 use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
-    CollabCommand, DocumentChange, DocumentId, PayloadRef, ReviewVerdict, SpaceId,
+    CollabCommand, DocumentChange, DocumentId, DocumentSession, PayloadRef, ReviewVerdict, SpaceId,
 };
-use mde_editor_egui::{editor_panel, markdown, real_editor, EditorSurface};
+use mde_editor_egui::{
+    editor_panel, follow_banner, markdown, real_editor, BusTransport, CollabSession,
+    CollabTransport, EditorSurface, FakeBus, FollowUpdate, Role, SessionId,
+};
 
 use crate::{frame, icons, CollabData, CommandSink, CommunicationsSurface};
 
@@ -67,6 +72,182 @@ const MAX_DOCUMENT_TITLE_CHARS: usize = 96;
 const MAX_DOCUMENT_SUMMARY_CHARS: usize = 160;
 const MAX_DOCUMENT_PREVIEW_CHARS: usize = 64 * 1024;
 const MAX_REVIEW_COMMENT_CHARS: usize = 4096;
+
+/// Local share-session intent. [`CollabCommand`] has no share / join / follow /
+/// close variants, so Documents mode records these here for the mount to drain
+/// the same way it drains [`CommandSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentShareCommand {
+    /// Start hosting a share session for `document` in `space`.
+    Start {
+        /// Space the session is shared into.
+        space: SpaceId,
+        /// Document being shared.
+        document: DocumentId,
+        /// Mesh collab session id (the Bus topic segment).
+        session: String,
+    },
+    /// Join an existing live share session as a guest.
+    Join {
+        /// Space whose live-session picker listed the session.
+        space: SpaceId,
+        /// Document to join.
+        document: DocumentId,
+        /// Mesh collab session id.
+        session: String,
+    },
+    /// Follow `peer` in the live session (view tracks their caret/viewport).
+    Follow {
+        /// Document whose share session is being followed.
+        document: DocumentId,
+        /// Peer identity to follow.
+        peer: String,
+    },
+    /// Stop following in the live session.
+    Unfollow {
+        /// Document whose follow is being cleared.
+        document: DocumentId,
+    },
+    /// Owner closes the session; every follower must detach.
+    Close {
+        /// Space the session was shared into.
+        space: SpaceId,
+        /// Document whose session is closing.
+        document: DocumentId,
+        /// Mesh collab session id.
+        session: String,
+    },
+}
+
+/// Sink Documents mode pushes [`DocumentShareCommand`]s into.
+#[derive(Debug, Default, Clone)]
+pub struct DocumentShareSink {
+    queued: Vec<DocumentShareCommand>,
+}
+
+impl DocumentShareSink {
+    /// A fresh, empty sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `command` as intent.
+    pub fn emit(&mut self, command: DocumentShareCommand) {
+        self.queued.push(command);
+    }
+
+    /// Take every queued command, leaving the sink empty.
+    #[must_use = "the drained share commands must be routed by the caller"]
+    pub fn drain(&mut self) -> Vec<DocumentShareCommand> {
+        std::mem::take(&mut self.queued)
+    }
+
+    /// The queued commands without draining.
+    #[must_use]
+    pub fn queued(&self) -> &[DocumentShareCommand] {
+        &self.queued
+    }
+}
+
+/// An external write that could not be merged into the live buffer without
+/// dropping an in-flight edit. The live rope is left untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalWriteConflict {
+    /// Last shared / loaded snapshot the merge used as the ancestor.
+    pub base: String,
+    /// The live editor (or CRDT) text that would have been lost by a clobber.
+    pub local: String,
+    /// The incoming external snapshot.
+    pub remote: String,
+}
+
+/// How an external write was reconciled against the last shared base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalWriteMerge {
+    /// The three sides agreed on `0` — use this text.
+    Clean(String),
+    /// Concurrent edits overlap; keep the live buffer and surface this.
+    Conflict(ExternalWriteConflict),
+}
+
+/// Transport a Documents-mode share session rides. Production uses the editor's
+/// Bus-backed transport; tests inject a shared [`FakeBus`].
+enum DocumentShareTransport {
+    /// Live Mackes Bus (`collab/session/<id>`).
+    Bus(BusTransport),
+    /// In-process bus so two [`CommunicationsSurface`]s can co-edit in tests.
+    Fake(FakeBus),
+}
+
+impl Default for DocumentShareTransport {
+    fn default() -> Self {
+        Self::Bus(BusTransport::from_env())
+    }
+}
+
+impl CollabTransport for DocumentShareTransport {
+    fn publish(&self, topic: &str, body: &str) {
+        match self {
+            Self::Bus(transport) => transport.publish(topic, body),
+            Self::Fake(transport) => transport.publish(topic, body),
+        }
+    }
+
+    fn poll(&self, topic: &str, cursor: &mut Option<String>) -> Vec<String> {
+        match self {
+            Self::Bus(transport) => transport.poll(topic, cursor),
+            Self::Fake(transport) => transport.poll(topic, cursor),
+        }
+    }
+
+    fn tail(&self, topic: &str) -> Option<String> {
+        match self {
+            Self::Bus(transport) => transport.tail(topic),
+            Self::Fake(transport) => transport.tail(topic),
+        }
+    }
+}
+
+/// One locally attached mesh share-session (host or guest).
+struct LiveShare {
+    /// Space the session was started or joined in.
+    space: SpaceId,
+    /// Document being co-edited.
+    document: DocumentId,
+    /// The editor crate's live CRDT session.
+    session: CollabSession,
+    /// Whether this seat hosted the session (owner-close authority).
+    owner: bool,
+    /// Host peer identity — guests use this to detach when the owner leaves.
+    host_peer: String,
+}
+
+/// Derive the mesh [`SessionId`] for a document (UUID hyphens are legal).
+fn session_id_for(document: DocumentId) -> Option<SessionId> {
+    SessionId::new(document.to_string()).ok()
+}
+
+/// Whether `space` is in the seat's directory (membership).
+fn is_space_member(data: &dyn CollabData, space: SpaceId) -> bool {
+    data.space_directory()
+        .spaces
+        .iter()
+        .any(|summary| summary.id == space)
+}
+
+/// The live document session row for `document` in `space`, if the projection
+/// still lists it (a missing row is a closed session).
+fn live_document_session<'a>(
+    data: &'a dyn CollabData,
+    space: SpaceId,
+    document: DocumentId,
+) -> Option<&'a DocumentSession> {
+    data.document_sessions(space)?
+        .sessions
+        .iter()
+        .find(|session| session.document == document)
+}
 
 /// Characters that can change the visual direction or structure of a Documents
 /// label. They are replaced before text reaches egui's shaper; ordinary
@@ -297,11 +478,28 @@ pub(crate) struct DocumentsState {
     /// Optional review comment, kept local until the seat explicitly submits a
     /// verdict. The durable review event carries the bounded snapshot.
     pub(crate) review_comment: String,
+    /// Whether the Share space-picker row is open.
+    share_picker_open: bool,
+    /// Last snapshot this seat loaded or saved — the ancestor for external-write
+    /// three-way merge.
+    last_shared_base: Option<String>,
+    /// Last `document_body` this seat already merged or loaded, so a quiet frame
+    /// does not re-merge the same external snapshot.
+    last_seen_external: Option<String>,
+    /// A typed external-write conflict, if a concurrent disk/collab write could
+    /// not merge. The live rope is left as-is.
+    external_conflict: Option<ExternalWriteConflict>,
+    /// Local share-session commands (CollabCommand has no share/join/follow/close).
+    share_commands: DocumentShareSink,
+    /// In-process or Bus transport the live [`CollabSession`] rides.
+    share_transport: DocumentShareTransport,
+    /// Attached mesh share-session, if this seat is hosting or has joined.
+    share: Option<LiveShare>,
 }
 
 impl std::fmt::Debug for DocumentsState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The embedded `EditorSurface`s are not `Debug`; report the view state.
+        // The embedded `EditorSurface`s and `CollabSession` are not `Debug`.
         f.debug_struct("DocumentsState")
             .field("sub", &self.sub)
             .field("view", &self.view)
@@ -309,8 +507,11 @@ impl std::fmt::Debug for DocumentsState {
             .field("loaded_document", &self.loaded_document)
             .field("active_title", &self.active_title)
             .field("template_open", &self.template_open)
+            .field("share_picker_open", &self.share_picker_open)
             .field("review_comment_len", &self.review_comment.len())
             .field("editor_open", &self.editor.is_open())
+            .field("share_attached", &self.share.is_some())
+            .field("external_conflict", &self.external_conflict.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -335,12 +536,92 @@ impl DocumentsState {
         self.template_open = false;
         self.notice = None;
         self.review_comment.clear();
+        self.share_picker_open = false;
+        self.last_shared_base = None;
+        self.last_seen_external = None;
+        self.external_conflict = None;
+        self.detach_share("Left the previous space's share session.");
         // The previous space's editor is a loaded view, not durable state. Drop
         // it with the per-space selection so the no-selection path cannot keep
         // rendering the old space's Markdown while the new session projection
         // is still arriving (or has disappeared after membership loss).
         self.editor = real_editor();
     }
+
+    /// Drop the live share-session, announcing Leave so followers detach.
+    fn detach_share(&mut self, notice: &str) {
+        if let Some(live) = self.share.take() {
+            live.session.leave(&self.share_transport);
+            if !notice.is_empty() {
+                self.notice = Some(notice.to_owned());
+            }
+        }
+    }
+
+    /// Record the snapshot that future external writes merge against.
+    fn remember_shared_base(&mut self, body: &str) {
+        self.last_shared_base = Some(body.to_owned());
+        self.last_seen_external = Some(body.to_owned());
+        self.external_conflict = None;
+    }
+
+    /// Pump the attached share-session against the Document editor.
+    fn pump_share(&mut self) -> SharePumpOutcome {
+        let DocumentsState {
+            share,
+            share_transport,
+            editor,
+            ..
+        } = self;
+        let Some(live) = share.as_mut() else {
+            return SharePumpOutcome::default();
+        };
+        if let Some(text) = editor.current_text() {
+            mirror_local_text_into_session(&mut live.session, &text);
+        }
+        live.session.flush(share_transport);
+        live.session.publish_presence(share_transport);
+        let outcome = live.session.poll(share_transport);
+        if live.host_peer.is_empty() {
+            if let Some(peer) = live.session.peers().keys().next() {
+                live.host_peer = peer.clone();
+            }
+        }
+        let host_left = !live.owner
+            && !live.host_peer.is_empty()
+            && !live.session.peers().contains_key(&live.host_peer);
+        SharePumpOutcome {
+            crdt_text: Some(live.session.doc().to_text()),
+            follow: outcome.follow,
+            host_left,
+            follow_ended: outcome.follow_ended,
+        }
+    }
+
+    /// Apply merged text to the live CRDT without clobbering a different document.
+    fn mirror_merged_into_share(&mut self, document: DocumentId, text: &str) {
+        let DocumentsState {
+            share,
+            share_transport,
+            ..
+        } = self;
+        if let Some(live) = share.as_mut() {
+            if live.document == document {
+                mirror_local_text_into_session(&mut live.session, text);
+                live.session.flush(share_transport);
+            }
+        }
+    }
+}
+
+/// Result of one share-session pump, applied to the editor after the session
+/// borrow ends.
+#[derive(Default)]
+struct SharePumpOutcome {
+    crdt_text: Option<String>,
+    follow: Option<FollowUpdate>,
+    host_left: bool,
+    follow_ended: bool,
 }
 
 impl CommunicationsSurface {
@@ -360,14 +641,11 @@ impl CommunicationsSurface {
             return;
         };
 
+        self.pump_document_share();
         frame::bar_frame().show(ui, |ui| self.documents_strip(ui, data, sink, space));
 
         egui::Frame::NONE.show(ui, |ui| match self.doc_submode() {
             DocSubMode::Document => self.documents_pane(ui, data),
-            // WL-FUNC-011 Phase 3c: the Project editor is a distinct embedded
-            // `EditorSurface`; a follow-up may join a mesh co-edit session on
-            // the focused project buffer (the editor already carries
-            // `CollabSession`/`follow`). Today it is the full local IDE.
             DocSubMode::Project => {
                 editor_panel(ui, &mut self.documents.project_editor);
             }
@@ -476,6 +754,18 @@ impl CommunicationsSurface {
                 let bytes = self.export_markdown().map_or(0, |md| md.len());
                 self.documents.notice = Some(format!("Exported {bytes} bytes of Markdown."));
             }
+
+            if icons::icon_button(
+                ui,
+                icons::CLIP_ATTACH,
+                Style::SP_M,
+                Style::ACCENT,
+                "Share this document into a space",
+            )
+            .clicked()
+            {
+                self.documents.share_picker_open = !self.documents.share_picker_open;
+            }
         });
 
         // The ops-oriented template picker row (opened by New).
@@ -494,8 +784,37 @@ impl CommunicationsSurface {
             });
         }
 
+        if self.documents.share_picker_open {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Share into space:")
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
+                let mut chosen: Option<SpaceId> = None;
+                for summary in &data.space_directory().spaces {
+                    let label = bounded_document_display(&summary.name, MAX_DOCUMENT_TITLE_CHARS);
+                    if ui.selectable_label(summary.id == space, &label).clicked() {
+                        chosen = Some(summary.id);
+                    }
+                }
+                if data.space_directory().spaces.is_empty() {
+                    ui.label(
+                        egui::RichText::new("no member spaces to share into")
+                            .small()
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+                if let Some(target) = chosen {
+                    let _ = self.share_document(data, target);
+                    self.documents.share_picker_open = false;
+                }
+            });
+        }
+
         // The session picker: the space's live documents (read model), plus the
-        // honest empty state when the space has none yet.
+        // honest empty state when the space has none yet. Clicking a live session
+        // opens it and joins the mesh share-session when this seat is a member.
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Open:").small().color(Style::TEXT_DIM));
             let mut pick: Option<(DocumentId, String)> = None;
@@ -523,8 +842,11 @@ impl CommunicationsSurface {
             }
             if let Some((document, title)) = pick {
                 self.open_document(data, document, title);
+                let _ = self.join_document_share(data, space, document);
             }
         });
+
+        self.share_session_strip(ui, data, space);
 
         // Review actions are explicit commands over the selected document. The
         // current session participants are the honest reviewer candidates; the
@@ -562,6 +884,103 @@ impl CommunicationsSurface {
 
         if let Some(notice) = self.documents.notice.clone() {
             ui.label(egui::RichText::new(notice).small().color(Style::TEXT_DIM));
+        }
+        if self.documents.external_conflict.is_some() {
+            ui.label(
+                egui::RichText::new(
+                    "External write conflict — live edits kept; incoming file was not applied.",
+                )
+                .small()
+                .color(Style::WARN),
+            );
+        }
+    }
+
+    /// Participant roster + follow-mode toggle + owner close for the live share.
+    fn share_session_strip(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, _space: SpaceId) {
+        self.pump_document_share();
+        let Some(live) = self.documents.share.as_ref() else {
+            return;
+        };
+        let me = data.me().as_str().to_owned();
+        let owner = live.session.role() == Role::Host;
+        let following = live.session.following().map(str::to_owned);
+        let follow_name = following.as_ref().and_then(|peer| {
+            live.session
+                .peers()
+                .get(peer)
+                .map(|remote| remote.presence.name.clone())
+                .or_else(|| Some(peer.clone()))
+        });
+        let mut peers: Vec<(String, String)> = live
+            .session
+            .peers()
+            .iter()
+            .map(|(id, remote)| (id.clone(), remote.presence.name.clone()))
+            .collect();
+        peers.sort_by(|a, b| a.0.cmp(&b.0));
+        drop(live);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Sharing:")
+                    .small()
+                    .strong()
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.label(
+                egui::RichText::new(format!("{me} (you)"))
+                    .small()
+                    .color(Style::TEXT),
+            );
+            let mut follow_peer: Option<String> = None;
+            let mut unfollow = false;
+            for (id, name) in &peers {
+                let label = bounded_document_display(name, MAX_DOCUMENT_TITLE_CHARS);
+                ui.label(egui::RichText::new(&label).small().color(Style::TEXT));
+                let is_following = following.as_deref() == Some(id.as_str());
+                let hint = if is_following {
+                    "Stop following this participant"
+                } else {
+                    "Follow this participant"
+                };
+                let tint = if is_following {
+                    Style::ACCENT
+                } else {
+                    Style::TEXT_DIM
+                };
+                if icons::icon_button(ui, icons::THREAD, Style::SP_M, tint, hint).clicked() {
+                    if is_following {
+                        unfollow = true;
+                    } else {
+                        follow_peer = Some(id.clone());
+                    }
+                }
+            }
+            if owner
+                && icons::icon_button(
+                    ui,
+                    icons::CALL_DECLINE,
+                    Style::SP_M,
+                    Style::DANGER,
+                    "Close share session (detaches every follower)",
+                )
+                .clicked()
+            {
+                let _ = self.close_document_share();
+            }
+            if let Some(peer) = follow_peer {
+                let _ = self.follow_share_peer(&peer);
+            }
+            if unfollow {
+                let _ = self.unfollow_share_peer();
+            }
+        });
+
+        if let Some(name) = follow_name {
+            if follow_banner(ui, &name) {
+                let _ = self.unfollow_share_peer();
+            }
         }
     }
 
@@ -602,24 +1021,24 @@ impl CommunicationsSurface {
     fn ensure_document_loaded(&mut self, data: &dyn CollabData) {
         if let Some(document) = self.documents.active_document {
             if self.documents.loaded_document != Some(document) {
-                self.load_editor_body(data.document_body(document).unwrap_or_default());
+                let body = data.document_body(document).unwrap_or_default();
+                self.load_editor_body(body);
+                self.documents.remember_shared_base(body);
                 self.documents.loaded_document = Some(document);
+            } else {
+                self.merge_external_document(data, document);
             }
         } else if !self.documents.editor.is_open() {
             // No document picked yet — a real, empty, editable Markdown buffer
             // (§7), never a faked placeholder.
             self.documents.editor.open_text("");
         }
+        self.pump_document_share();
     }
 
     /// Replace the Document editor with a fresh one-pane [`EditorSurface`] seeded
     /// with `body` — the load path that keeps the Document editor single-pane
     /// (a fresh surface, one buffer). The seeded buffer is a real editable rope.
-    ///
-    /// WL-FUNC-011 Phase 3c: this loads a resolved *snapshot* of the canonical
-    /// Markdown; the live Yrs CRDT co-edit stream (shared cursors/presence,
-    /// follow-mode) that keeps the buffer converging across seats in real time is
-    /// the next slice, wired through `mde_editor_egui::CollabSession`.
     fn load_editor_body(&mut self, body: &str) {
         self.documents.editor = real_editor();
         self.documents.editor.open_text(body);
@@ -674,6 +1093,15 @@ impl CommunicationsSurface {
         document: DocumentId,
         title: impl Into<String>,
     ) {
+        if self
+            .documents
+            .share
+            .as_ref()
+            .is_some_and(|live| live.document != document)
+        {
+            self.documents
+                .detach_share("Left the previous document's share session.");
+        }
         self.load_editor_body(data.document_body(document).unwrap_or_default());
         self.documents.active_document = Some(document);
         self.documents.loaded_document = Some(document);
@@ -684,6 +1112,8 @@ impl CommunicationsSurface {
         self.documents.sub = DocSubMode::Document;
         self.documents.review_comment.clear();
         self.documents.notice = None;
+        let body = self.documents.editor.current_text().unwrap_or_default();
+        self.documents.remember_shared_base(&body);
     }
 
     /// Create a new document in `space` from `template`: emit
@@ -709,6 +1139,7 @@ impl CommunicationsSurface {
         self.documents.template_open = false;
         self.documents.review_comment.clear();
         self.documents.notice = Some("Created — Save to share it.".to_owned());
+        self.documents.remember_shared_base(template.markdown());
         document
     }
 
@@ -716,12 +1147,8 @@ impl CommunicationsSurface {
     /// editor's rope and emit [`UpdateDocument`](CollabCommand::UpdateDocument)
     /// whose [`DocumentChange`] payload is the **content address of that Markdown**
     /// (`text/markdown`) — the Markdown path is the source of truth. Returns
-    /// whether an update was emitted.
-    ///
-    /// WL-FUNC-011 Phase 3c: this emits a whole-document snapshot update. The
-    /// follow-ups are the external-write three-way merge (last-shared-base vs.
-    /// collab vs. disk) before publishing, and autosave versioned snapshots + a
-    /// rendered word-diff timeline + git integration around each save.
+    /// whether an update was emitted. External writes merge against this saved
+    /// snapshot as the last shared base instead of clobbering the live buffer.
     pub(crate) fn save_document(&mut self, sink: &mut CommandSink, space: SpaceId) -> bool {
         let Some(document) = self.documents.active_document else {
             self.documents.notice = Some("Open or create a document first.".to_owned());
@@ -737,6 +1164,7 @@ impl CommunicationsSurface {
             document,
             change: DocumentChange { payload, summary },
         });
+        self.documents.remember_shared_base(&markdown);
         self.documents.notice = Some("Saved — update shared.".to_owned());
         true
     }
@@ -817,6 +1245,475 @@ impl CommunicationsSurface {
     pub(crate) fn export_markdown(&self) -> Option<String> {
         self.documents.editor.current_text()
     }
+
+    /// Inject an in-process [`FakeBus`] so two surfaces can co-edit in tests.
+    #[cfg(test)]
+    pub(crate) fn bind_document_share_bus(&mut self, bus: FakeBus) {
+        self.documents.share_transport = DocumentShareTransport::Fake(bus);
+    }
+
+    /// Queued local share-session commands (test/inspection accessor).
+    #[must_use]
+    pub(crate) fn document_share_commands(&self) -> &[DocumentShareCommand] {
+        self.documents.share_commands.queued()
+    }
+
+    /// Whether this seat currently has a live share-session attached.
+    #[must_use]
+    pub(crate) fn has_live_document_share(&self) -> bool {
+        self.documents.share.is_some()
+    }
+
+    /// Whether this seat hosted the attached share-session.
+    #[must_use]
+    pub(crate) fn is_document_share_owner(&self) -> bool {
+        self.documents.share.as_ref().is_some_and(|live| live.owner)
+    }
+
+    /// Peer currently being followed in the live share-session, if any.
+    #[must_use]
+    pub(crate) fn following_share_peer(&self) -> Option<&str> {
+        self.documents
+            .share
+            .as_ref()
+            .and_then(|live| live.session.following())
+    }
+
+    /// Remote peer identities currently in the live share roster.
+    #[must_use]
+    pub(crate) fn document_share_peers(&self) -> Vec<String> {
+        self.documents
+            .share
+            .as_ref()
+            .map(|live| live.session.peers().keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Typed external-write conflict, if a concurrent write could not merge.
+    #[must_use]
+    pub(crate) fn external_write_conflict(&self) -> Option<&ExternalWriteConflict> {
+        self.documents.external_conflict.as_ref()
+    }
+
+    /// Last shared / loaded snapshot used as the three-way merge ancestor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn last_shared_base(&self) -> Option<&str> {
+        self.documents.last_shared_base.as_deref()
+    }
+
+    /// Test seam: replace the Document editor rope without opening a new tab.
+    #[cfg(test)]
+    pub(crate) fn set_document_editor_text(&mut self, text: &str) {
+        self.documents.editor.replace_text(text);
+    }
+
+    /// Test seam: run the external-write merge against the current `document_body`.
+    #[cfg(test)]
+    pub(crate) fn apply_external_document_body(&mut self, data: &dyn CollabData) {
+        if let Some(document) = self.documents.active_document {
+            self.merge_external_document(data, document);
+        }
+    }
+
+    /// Start hosting a share session for the focused document into `space`.
+    /// Non-members are refused honestly.
+    pub(crate) fn share_document(&mut self, data: &dyn CollabData, space: SpaceId) -> bool {
+        let Some(document) = self.documents.active_document else {
+            self.documents.notice = Some("Open or create a document first.".to_owned());
+            return false;
+        };
+        if !is_space_member(data, space) {
+            self.documents.notice =
+                Some("Cannot share: this seat is not a member of that space.".to_owned());
+            return false;
+        }
+        let Some(session_id) = session_id_for(document) else {
+            self.documents.notice =
+                Some("Cannot share: document id is not a valid session.".to_owned());
+            return false;
+        };
+        if let Some(live) = &self.documents.share {
+            if live.document == document && live.owner {
+                self.documents.notice = Some("Already sharing this document.".to_owned());
+                return true;
+            }
+            self.documents.detach_share("");
+        }
+        let text = self.documents.editor.current_text().unwrap_or_default();
+        let mut session = CollabSession::host(session_id.clone(), data.me().as_str(), &text);
+        session.join(&self.documents.share_transport);
+        self.documents.share = Some(LiveShare {
+            space,
+            document,
+            session,
+            owner: true,
+            host_peer: data.me().as_str().to_owned(),
+        });
+        self.documents
+            .share_commands
+            .emit(DocumentShareCommand::Start {
+                space,
+                document,
+                session: session_id.to_string(),
+            });
+        self.documents.notice =
+            Some("Sharing — peers can join from this space's session picker.".to_owned());
+        true
+    }
+
+    /// Join the live share-session for `document` in `space` as a guest. Closed
+    /// sessions and non-members refuse honestly.
+    pub(crate) fn join_document_share(
+        &mut self,
+        data: &dyn CollabData,
+        space: SpaceId,
+        document: DocumentId,
+    ) -> bool {
+        if !is_space_member(data, space) {
+            self.documents.notice =
+                Some("Cannot join: this seat is not a member of that space.".to_owned());
+            return false;
+        }
+        if live_document_session(data, space, document).is_none() {
+            self.documents.notice = Some("Cannot join: that share session is closed.".to_owned());
+            return false;
+        }
+        if let Some(live) = &self.documents.share {
+            if live.document == document {
+                return true;
+            }
+            self.documents.detach_share("");
+        }
+        let Some(session_id) = session_id_for(document) else {
+            self.documents.notice =
+                Some("Cannot join: document id is not a valid session.".to_owned());
+            return false;
+        };
+        let mut session = CollabSession::guest(session_id.clone(), data.me().as_str());
+        session.join(&self.documents.share_transport);
+        self.documents.share = Some(LiveShare {
+            space,
+            document,
+            session,
+            owner: false,
+            host_peer: String::new(),
+        });
+        self.documents
+            .share_commands
+            .emit(DocumentShareCommand::Join {
+                space,
+                document,
+                session: session_id.to_string(),
+            });
+        self.pump_document_share();
+        if self.documents.share.is_none() {
+            return false;
+        }
+        self.documents.notice = Some("Joined share session.".to_owned());
+        true
+    }
+
+    /// Follow `peer` in the live share-session. Returns false when the peer is
+    /// not in the roster (you can only follow a collaborator you can see).
+    pub(crate) fn follow_share_peer(&mut self, peer: &str) -> bool {
+        let Some(live) = self.documents.share.as_mut() else {
+            self.documents.notice = Some("Join a share session before following.".to_owned());
+            return false;
+        };
+        if !live.session.follow(peer) {
+            self.documents.notice =
+                Some("Cannot follow: that participant is not in the share roster.".to_owned());
+            return false;
+        }
+        let document = live.document;
+        self.documents
+            .share_commands
+            .emit(DocumentShareCommand::Follow {
+                document,
+                peer: peer.to_owned(),
+            });
+        self.documents.notice = Some(format!("Following {peer}."));
+        true
+    }
+
+    /// Stop following in the live share-session.
+    pub(crate) fn unfollow_share_peer(&mut self) -> bool {
+        let Some(live) = self.documents.share.as_mut() else {
+            return false;
+        };
+        let document = live.document;
+        live.session.unfollow();
+        self.documents
+            .share_commands
+            .emit(DocumentShareCommand::Unfollow { document });
+        self.documents.notice = Some("Stopped following.".to_owned());
+        true
+    }
+
+    /// Owner closes the live share-session. Every follower detaches on the next
+    /// pump (the host Leave frame). Non-owners are refused.
+    pub(crate) fn close_document_share(&mut self) -> bool {
+        let (space, document, session, owner) = match self.documents.share.as_ref() {
+            None => {
+                self.documents.notice = Some("No share session to close.".to_owned());
+                return false;
+            }
+            Some(live) => (
+                live.space,
+                live.document,
+                live.session.session_id().to_string(),
+                live.owner,
+            ),
+        };
+        if !owner {
+            self.documents.notice = Some("Only the share owner can close this session.".to_owned());
+            return false;
+        }
+        if let Some(live) = self.documents.share.take() {
+            live.session.leave(&self.documents.share_transport);
+        }
+        self.documents
+            .share_commands
+            .emit(DocumentShareCommand::Close {
+                space,
+                document,
+                session,
+            });
+        self.documents.notice = Some("Share session closed — followers detached.".to_owned());
+        true
+    }
+
+    /// Pump the live share-session: mirror local edits into the CRDT, apply
+    /// remote updates onto the editor, replay follow, and detach if the owner
+    /// closed.
+    pub(crate) fn pump_document_share(&mut self) {
+        let outcome = self.documents.pump_share();
+        if let Some(crdt_text) = outcome.crdt_text.as_ref() {
+            if self.documents.editor.current_text().as_deref() != Some(crdt_text.as_str()) {
+                self.documents.editor.replace_text(crdt_text);
+            }
+        }
+        if let Some(update) = outcome.follow.as_ref() {
+            let _ = self.documents.editor.apply_follow_update(update);
+        }
+        if outcome.host_left {
+            self.documents
+                .detach_share("Share session closed by its owner — followers detached.");
+            return;
+        }
+        if outcome.follow_ended {
+            self.documents.notice = Some("Stopped following — that participant left.".to_owned());
+        }
+    }
+
+    /// Merge an external `document_body` against the last shared base instead of
+    /// overwriting the live CRDT / editor buffer.
+    fn merge_external_document(&mut self, data: &dyn CollabData, document: DocumentId) {
+        let Some(external) = data.document_body(document) else {
+            return;
+        };
+        if self.documents.last_seen_external.as_deref() == Some(external) {
+            return;
+        }
+        let live = if let Some(share) = &self.documents.share {
+            if share.document == document {
+                share.session.doc().to_text()
+            } else {
+                self.documents.editor.current_text().unwrap_or_default()
+            }
+        } else {
+            self.documents.editor.current_text().unwrap_or_default()
+        };
+        let base = self.documents.last_shared_base.clone().unwrap_or_default();
+        match merge_external_write(&base, &live, external) {
+            ExternalWriteMerge::Clean(merged) => {
+                if merged != live {
+                    self.documents.editor.replace_text(&merged);
+                    self.documents.mirror_merged_into_share(document, &merged);
+                }
+                self.documents.remember_shared_base(&merged);
+                self.documents.notice = Some("Merged external file changes.".to_owned());
+            }
+            ExternalWriteMerge::Conflict(conflict) => {
+                self.documents.last_seen_external = Some(external.to_owned());
+                self.documents.external_conflict = Some(conflict);
+                self.documents.notice = Some(
+                    "External write conflict — live edits kept; incoming file was not applied."
+                        .to_owned(),
+                );
+            }
+        }
+    }
+}
+
+/// Mirror local editor text into the CRDT as a prefix/suffix splice so concurrent
+/// remote edits still merge instead of a whole-document replace.
+fn mirror_local_text_into_session(session: &mut CollabSession, text: &str) {
+    let current = session.doc().to_text();
+    if current == text {
+        return;
+    }
+    let prefix = char_prefix_len(&current, text);
+    let suffix = char_suffix_len(&current, text, prefix);
+    let current_len = current.chars().count();
+    let text_len = text.chars().count();
+    let remove_end = current_len.saturating_sub(suffix);
+    if prefix < remove_end {
+        let _ = session.local_remove(prefix..remove_end);
+    }
+    let insert: String = text
+        .chars()
+        .skip(prefix)
+        .take(text_len.saturating_sub(prefix + suffix))
+        .collect();
+    if !insert.is_empty() {
+        let _ = session.local_insert(prefix, &insert);
+    }
+}
+
+fn char_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+fn char_suffix_len(a: &str, b: &str, prefix: usize) -> usize {
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
+    let max = a_len.min(b_len).saturating_sub(prefix);
+    a.chars()
+        .rev()
+        .zip(b.chars().rev())
+        .take(max)
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// Three-way merge of an external snapshot against the last shared base and the
+/// live buffer. Overlapping concurrent edits surface a typed conflict; the live
+/// side is never silently overwritten.
+fn merge_external_write(base: &str, local: &str, remote: &str) -> ExternalWriteMerge {
+    if local == remote {
+        return ExternalWriteMerge::Clean(local.to_owned());
+    }
+    if local == base {
+        return ExternalWriteMerge::Clean(remote.to_owned());
+    }
+    if remote == base {
+        return ExternalWriteMerge::Clean(local.to_owned());
+    }
+    let base_lines = split_lines_keep_nl(base);
+    let local_lines = split_lines_keep_nl(local);
+    let remote_lines = split_lines_keep_nl(remote);
+    match merge_line_lists(&base_lines, &local_lines, &remote_lines) {
+        Some(merged) => ExternalWriteMerge::Clean(merged.concat()),
+        None => ExternalWriteMerge::Conflict(ExternalWriteConflict {
+            base: base.to_owned(),
+            local: local.to_owned(),
+            remote: remote.to_owned(),
+        }),
+    }
+}
+
+fn split_lines_keep_nl(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('\n') {
+        lines.push(&rest[..=at]);
+        rest = &rest[at + 1..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
+fn lcs_pairs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
+fn merge_line_lists(base: &[&str], local: &[&str], remote: &[&str]) -> Option<Vec<String>> {
+    let local_matches = lcs_pairs(base, local);
+    let remote_matches = lcs_pairs(base, remote);
+    let remote_by_base: std::collections::BTreeMap<usize, usize> =
+        remote_matches.into_iter().collect();
+    let mut anchors: Vec<(usize, usize, usize)> = Vec::new();
+    for (base_i, local_i) in local_matches {
+        if let Some(&remote_i) = remote_by_base.get(&base_i) {
+            anchors.push((base_i, local_i, remote_i));
+        }
+    }
+
+    let mut merged = Vec::new();
+    let mut prev_base = 0usize;
+    let mut prev_local = 0usize;
+    let mut prev_remote = 0usize;
+    for (base_i, local_i, remote_i) in anchors {
+        merge_gap(
+            &mut merged,
+            &base[prev_base..base_i],
+            &local[prev_local..local_i],
+            &remote[prev_remote..remote_i],
+        )?;
+        merged.push(local[local_i].to_owned());
+        prev_base = base_i + 1;
+        prev_local = local_i + 1;
+        prev_remote = remote_i + 1;
+    }
+    merge_gap(
+        &mut merged,
+        &base[prev_base..],
+        &local[prev_local..],
+        &remote[prev_remote..],
+    )?;
+    Some(merged)
+}
+
+fn merge_gap(
+    merged: &mut Vec<String>,
+    base: &[&str],
+    local: &[&str],
+    remote: &[&str],
+) -> Option<()> {
+    if local == remote {
+        merged.extend(local.iter().map(|line| (*line).to_owned()));
+        return Some(());
+    }
+    if local == base {
+        merged.extend(remote.iter().map(|line| (*line).to_owned()));
+        return Some(());
+    }
+    if remote == base {
+        merged.extend(local.iter().map(|line| (*line).to_owned()));
+        return Some(());
+    }
+    None
 }
 
 /// The first non-blank line of `text`, trimmed and bounded — a short human
@@ -896,5 +1793,28 @@ mod tests {
         let (preview, truncated) = markdown_preview("# Runbook\n");
         assert_eq!(preview, "# Runbook\n");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn external_write_merges_non_overlapping_line_edits() {
+        let merged = match super::merge_external_write("base\n", "base\nlocal\n", "remote\nbase\n")
+        {
+            super::ExternalWriteMerge::Clean(text) => text,
+            super::ExternalWriteMerge::Conflict(_) => panic!("expected a clean merge"),
+        };
+        assert_eq!(merged, "remote\nbase\nlocal\n");
+    }
+
+    #[test]
+    fn overlapping_external_write_is_a_typed_conflict_not_a_clobber() {
+        match super::merge_external_write("hello\n", "hello world\n", "hello mesh\n") {
+            super::ExternalWriteMerge::Conflict(conflict) => {
+                assert_eq!(conflict.local, "hello world\n");
+                assert_eq!(conflict.remote, "hello mesh\n");
+            }
+            super::ExternalWriteMerge::Clean(text) => {
+                panic!("overlapping edits must not silently merge, got {text:?}")
+            }
+        }
     }
 }

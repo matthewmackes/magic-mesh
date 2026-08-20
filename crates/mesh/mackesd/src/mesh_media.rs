@@ -1325,10 +1325,7 @@ pub fn read_shared_account_from_plane(workgroup_root: &Path) -> Option<SharedAcc
                 return None;
             }
             healthy.get_or_insert(acct);
-        } else if fallback
-            .as_ref()
-            .is_some_and(|admitted| admitted != &acct)
-        {
+        } else if fallback.as_ref().is_some_and(|admitted| admitted != &acct) {
             fallback_equivocated = true;
         } else {
             fallback.get_or_insert(acct);

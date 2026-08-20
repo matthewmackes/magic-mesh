@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use mde_wayland_workspace::{WorkspacePaths, run, run_session};
+use mde_wayland_workspace::{run, run_session, WorkspacePaths};
 
 fn main() {
     let paths = WorkspacePaths::default();

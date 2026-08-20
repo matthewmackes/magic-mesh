@@ -43,6 +43,7 @@ use mde_theme::brand::icons::{icon_image, IconId};
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::{Progress, Resolution};
 use mde_files::search::TypeFilter;
+use mde_files::ArchiveFormat;
 
 use crate::dialogs::{Perm, PermClass};
 use crate::mesh_mount::{MountPhase, MountView};
@@ -463,6 +464,34 @@ pub(crate) enum Action {
     CloseQuickLook,
     /// WL-FUNC-011 — open New Folder in the active pane's current directory.
     OpenNewFolder(usize),
+    /// WL-FUNC-025 — open New File in the active pane's current directory.
+    OpenNewFile(usize),
+    /// WL-FUNC-025 — duplicate the local selection as `name (copy)`.
+    Duplicate(usize),
+    /// WL-FUNC-025 — compress the selection in `format`.
+    Compress(usize, ArchiveFormat),
+    /// WL-FUNC-025 — extract the focused archive into its parent.
+    ExtractHere(usize),
+    /// WL-FUNC-025 — open Extract To for the focused archive.
+    OpenExtractTo(usize),
+    /// WL-FUNC-025 — edit the extract-to destination field.
+    SetExtractToDest(String),
+    /// WL-FUNC-025 — submit extract-to through the op queue.
+    SubmitExtractTo,
+    /// WL-FUNC-025 — dismiss extract-to.
+    CancelExtractTo,
+    /// WL-FUNC-025 — open Create Symbolic Link for the focused row.
+    OpenSymlink(usize),
+    /// WL-FUNC-025 — open Create Hard Link for the focused row.
+    OpenHardLink(usize),
+    /// WL-FUNC-027 — pin the focused row into Places.
+    PinFocused(usize),
+    /// WL-FUNC-027 — remove a user bookmark.
+    UnpinBookmark(usize),
+    /// WL-FUNC-027 — move a user bookmark by `delta`.
+    ReorderBookmark(usize, i32),
+    /// WL-FUNC-027 — rename a user bookmark.
+    RenameBookmark(usize),
     /// WL-FUNC-011 — open Rename for exactly one focused local entry.
     OpenRename(usize),
     /// WL-FUNC-011 — edit the shared New Folder / Rename name field.
@@ -709,6 +738,8 @@ fn operation_dialogs(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) 
         conflict_dialog(ui, b, actions);
     } else if b.name_dialog().is_some() {
         name_dialog(ui, b, actions);
+    } else if b.extract_to_dialog().is_some() {
+        extract_to_dialog(ui, b, actions);
     } else if b.pending_delete().is_some() {
         delete_dialog(ui, b, actions);
     } else if b.properties().is_some() {
@@ -783,6 +814,20 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         Action::ToggleQuickLook => browser.toggle_quick_look(),
         Action::CloseQuickLook => browser.close_quick_look(),
         Action::OpenNewFolder(p) => browser.open_new_folder(p),
+        Action::OpenNewFile(p) => browser.open_new_file(p),
+        Action::Duplicate(p) => browser.duplicate_selection(p),
+        Action::Compress(p, format) => browser.compress_selection(p, format),
+        Action::ExtractHere(p) => browser.extract_here(p),
+        Action::OpenExtractTo(p) => browser.open_extract_to(p),
+        Action::SetExtractToDest(dest) => browser.set_extract_to_dest(dest),
+        Action::SubmitExtractTo => browser.submit_extract_to(),
+        Action::CancelExtractTo => browser.cancel_extract_to(),
+        Action::OpenSymlink(p) => browser.open_symlink(p),
+        Action::OpenHardLink(p) => browser.open_hard_link(p),
+        Action::PinFocused(p) => browser.pin_focused(p),
+        Action::UnpinBookmark(i) => browser.unpin_bookmark(i),
+        Action::ReorderBookmark(i, delta) => browser.reorder_bookmark(i, delta),
+        Action::RenameBookmark(i) => browser.open_rename_bookmark(i),
         Action::OpenRename(p) => browser.open_rename(p),
         Action::SetNameDialogInput(name) => browser.set_name_dialog_input(name),
         Action::SubmitNameDialog(p) => browser.submit_name_dialog(p),
@@ -1585,6 +1630,48 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                     ui.add_space(section_gap);
 
                     section_header(ui, "PLACES");
+                    for (idx, bookmark) in b.bookmarks().iter().enumerate() {
+                        let here = matches!(
+                            b.active_tab().location(),
+                            Location::Local(p) if p.as_str() == bookmark.path
+                        );
+                        let resp = local_place_row(
+                            ui,
+                            IconId::FileFolder,
+                            bookmark.label.as_str(),
+                            here,
+                        );
+                        if resp.clicked() {
+                            actions.push(Action::Navigate(
+                                active,
+                                Location::Local(bookmark.path.clone()),
+                            ));
+                        }
+                        files_context_menu(&resp, |ui| {
+                            if ui.button("Rename\u{2026}").clicked() {
+                                actions.push(Action::RenameBookmark(idx));
+                                ui.close_menu();
+                            }
+                            if ui.add_enabled(idx > 0, egui::Button::new("Move Up")).clicked() {
+                                actions.push(Action::ReorderBookmark(idx, -1));
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    idx + 1 < b.bookmarks().len(),
+                                    egui::Button::new("Move Down"),
+                                )
+                                .clicked()
+                            {
+                                actions.push(Action::ReorderBookmark(idx, 1));
+                                ui.close_menu();
+                            }
+                            if ui.button("Remove").clicked() {
+                                actions.push(Action::UnpinBookmark(idx));
+                                ui.close_menu();
+                            }
+                        });
+                    }
                     for spot in LOCAL_SPOTS {
                         let here = matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
                         if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
@@ -2134,11 +2221,28 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
     let bg = ui.interact(
         region,
         ui.make_persistent_id(("listing-bg", pane_ix)),
-        Sense::drag(),
+        Sense::click_and_drag(),
     );
     if bg.dragged() {
         actions.push(Action::Focus(pane_ix));
     }
+    files_context_menu(&bg, |ui| {
+        if ui.button("New Folder\u{2026}").clicked() {
+            actions.push(Action::OpenNewFolder(pane_ix));
+            ui.close_menu();
+        }
+        if ui.button("New File\u{2026}").clicked() {
+            actions.push(Action::OpenNewFile(pane_ix));
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(b.can_paste(), egui::Button::new("Paste"))
+            .clicked()
+        {
+            actions.push(Action::ClipPaste(pane_ix));
+            ui.close_menu();
+        }
+    });
 
     let mut rects: Vec<(usize, Rect)> = Vec::new();
     egui::ScrollArea::vertical()
@@ -2496,6 +2600,66 @@ fn entry_interactions(
             .clicked()
         {
             actions.push(Action::ClipPaste(pane_ix));
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("New Folder\u{2026}").clicked() {
+            actions.push(Action::OpenNewFolder(pane_ix));
+            ui.close_menu();
+        }
+        if ui.button("New File\u{2026}").clicked() {
+            actions.push(Action::OpenNewFile(pane_ix));
+            ui.close_menu();
+        }
+        if ui.button("Duplicate").clicked() {
+            actions.push(Action::Duplicate(pane_ix));
+            ui.close_menu();
+        }
+        if ui.button("Rename\u{2026}").clicked() {
+            actions.push(Action::OpenRename(pane_ix));
+            ui.close_menu();
+        }
+        files_submenu_button(ui, "Compress", |ui| {
+            for format in ArchiveFormat::supported() {
+                if ui
+                    .button(format!(".{ext}", ext = format.extension()))
+                    .clicked()
+                {
+                    actions.push(Action::Compress(pane_ix, *format));
+                    ui.close_menu();
+                }
+            }
+        });
+        let is_archive = e
+            .path
+            .as_deref()
+            .is_some_and(|p| ArchiveFormat::from_path(std::path::Path::new(p)).is_some());
+        if ui
+            .add_enabled(is_archive, egui::Button::new("Extract Here"))
+            .clicked()
+        {
+            actions.push(Action::ExtractHere(pane_ix));
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(is_archive, egui::Button::new("Extract To\u{2026}"))
+            .clicked()
+        {
+            actions.push(Action::OpenExtractTo(pane_ix));
+            ui.close_menu();
+        }
+        files_submenu_button(ui, "Advanced", |ui| {
+            if ui.button("Create Symbolic Link\u{2026}").clicked() {
+                actions.push(Action::OpenSymlink(pane_ix));
+                ui.close_menu();
+            }
+            if ui.button("Create Hard Link\u{2026}").clicked() {
+                actions.push(Action::OpenHardLink(pane_ix));
+                ui.close_menu();
+            }
+        });
+        if ui.button("Pin to Places").clicked() {
+            actions.push(Action::PinFocused(pane_ix));
             ui.close_menu();
         }
         ui.separator();
@@ -3217,6 +3381,50 @@ fn name_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                 }
                 if ui.button("Cancel").clicked() {
                     actions.push(Action::CancelNameDialog);
+                }
+            });
+        });
+}
+
+/// Extract To: an absolute destination path, executed through [`OpKind::Extract`].
+fn extract_to_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let Some(dialog) = b.extract_to_dialog() else {
+        return;
+    };
+    if modal_backdrop(ui.ctx(), "files-extract-to-dim") {
+        actions.push(Action::CancelExtractTo);
+    }
+    egui::Window::new("Extract To")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            muted_note(ui, dialog.archive.display().to_string());
+            let mut dest = dialog.dest.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut dest)
+                    .hint_text("Destination folder")
+                    .desired_width(Style::SP_XL * 10.0),
+            );
+            if response.changed() {
+                actions.push(Action::SetExtractToDest(dest));
+            }
+            let validation = dialog.validation_error();
+            if let Some(error) = validation.as_deref() {
+                ui.colored_label(Style::WARN, error);
+            } else if let Some(error) = dialog.error.as_deref() {
+                ui.colored_label(Style::DANGER, error);
+            }
+            ui.add_space(Style::SP_S);
+            ui.horizontal(|ui| {
+                let submit = egui::Button::new(RichText::new("Extract").color(Style::BG).strong())
+                    .fill(Style::ACCENT);
+                if ui.add_enabled(validation.is_none(), submit).clicked() {
+                    actions.push(Action::SubmitExtractTo);
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CancelExtractTo);
                 }
             });
         });

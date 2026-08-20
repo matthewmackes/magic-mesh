@@ -149,9 +149,7 @@ impl ReqwestTransport {
     ///
     /// # Errors
     /// Returns [`TransportError`] if the underlying HTTP client cannot be built.
-    pub fn with_builder(
-        builder: reqwest::blocking::ClientBuilder,
-    ) -> Result<Self, TransportError> {
+    pub fn with_builder(builder: reqwest::blocking::ClientBuilder) -> Result<Self, TransportError> {
         let http = builder
             // Apply this last: even a caller requesting redirect handling must
             // not move a server-bound request or its query credentials to a

@@ -248,9 +248,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut shutdown = ShutdownToken::from_receiver(shutdown_rx);
 
-        let retry = tokio::spawn(async move {
-            wait_for_retry(&mut shutdown, Duration::from_secs(30)).await
-        });
+        let retry =
+            tokio::spawn(
+                async move { wait_for_retry(&mut shutdown, Duration::from_secs(30)).await },
+            );
         tokio::task::yield_now().await;
         shutdown_tx.send(true).expect("publish group shutdown");
 

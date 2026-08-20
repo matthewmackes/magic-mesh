@@ -1111,11 +1111,8 @@ impl BookmarksWorker {
         // lag a successfully-pruned snapshot or belong to a replaced Browser
         // VM. Bind it to this node and then advance beyond every durable local
         // register/tail stamp before accepting a new mutation.
-        let mut clock = load_clock(
-            &clock_path(&self.local_root, &self.node),
-            &self.node,
-        )
-        .unwrap_or_else(|| HlcClock::new(self.node.clone()));
+        let mut clock = load_clock(&clock_path(&self.local_root, &self.node), &self.node)
+            .unwrap_or_else(|| HlcClock::new(self.node.clone()));
         let history_floor = collection_generation_floor(&self.own_snapshot)
             .into_iter()
             .chain(self.own_tail.iter().map(|op| op.hlc.clone()))
@@ -2618,8 +2615,14 @@ mod tests {
         let local = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         let gate = Arc::new(AtomicBool::new(false));
-        let mut original = worker("browser-vm", "alice", local.path(), share.path(), now.clone())
-            .with_share_gate(gate.clone());
+        let mut original = worker(
+            "browser-vm",
+            "alice",
+            local.path(),
+            share.path(),
+            now.clone(),
+        )
+        .with_share_gate(gate.clone());
         let add = original.apply_action(add("https://authority.test", "Before restart"));
         let id = find_by_title(original.collection(), "Before restart").unwrap();
         original.snapshot_prune();
@@ -2633,8 +2636,8 @@ mod tests {
         .unwrap();
         wall.store(100, Ordering::SeqCst);
 
-        let mut restarted = worker("browser-vm", "alice", local.path(), share.path(), now)
-            .with_share_gate(gate);
+        let mut restarted =
+            worker("browser-vm", "alice", local.path(), share.path(), now).with_share_gate(gate);
         restarted.load();
         let edit = restarted.apply_action(BookmarkAction::Edit {
             id,
@@ -2645,7 +2648,10 @@ mod tests {
         });
 
         assert_eq!(edit.hlc.node, "browser-vm");
-        assert!(edit.hlc > add.hlc, "restored generation must dominate its snapshot");
+        assert!(
+            edit.hlc > add.hlc,
+            "restored generation must dominate its snapshot"
+        );
         assert_eq!(
             title_of(restarted.collection(), id).as_deref(),
             Some("After restart"),

@@ -461,7 +461,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let overlay = tmp.path().join("overlay-ip");
         let dropin = tmp.path().join("mackes-mesh.conf");
-        std::fs::write(&overlay, vec![b'9'; MAX_OVERLAY_IP_BYTES + 1]).expect("seed oversized overlay");
+        std::fs::write(&overlay, vec![b'9'; MAX_OVERLAY_IP_BYTES + 1])
+            .expect("seed oversized overlay");
         let mut w = SshdOverlayBindWorker::new()
             .with_overlay_ip_path(overlay)
             .with_dropin_path(dropin.clone())

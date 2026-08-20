@@ -12,18 +12,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use mackes_mesh_types::worker_runtime::{
-    worker_change_set_action_topic, worker_change_set_result_topic,
-    WorkerChangeSetItemOutcome,
+    worker_change_set_action_topic, worker_change_set_result_topic, WorkerChangeSetItemOutcome,
     WorkerChangeSetItemResult, WorkerChangeSetOperation, WorkerChangeSetOutcome,
-    WorkerChangeSetRequest, WorkerChangeSetResult, WorkerContract,
-    WORKER_CHANGE_SET_AUTH_VERB, WORKER_RUNTIME_SCHEMA_VERSION,
+    WorkerChangeSetRequest, WorkerChangeSetResult, WorkerContract, WORKER_CHANGE_SET_AUTH_VERB,
+    WORKER_RUNTIME_SCHEMA_VERSION,
 };
 use mde_bus::persist::Persist;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
-use crate::workers::worker_runtime_status::{
-    read_runtime_status_file, WorkerRuntimeNodeStatus,
-};
+use crate::workers::worker_runtime_status::{read_runtime_status_file, WorkerRuntimeNodeStatus};
 
 const MAX_STAGED: usize = 64;
 const MAX_REPLAYS: usize = 256;
@@ -67,11 +64,7 @@ impl WorkerChangeSetConsumer {
     }
 
     #[cfg(test)]
-    fn for_test(
-        node_id: String,
-        status_path: PathBuf,
-        authorizer: Arc<ActionAuthorizer>,
-    ) -> Self {
+    fn for_test(node_id: String, status_path: PathBuf, authorizer: Arc<ActionAuthorizer>) -> Self {
         Self {
             node_id,
             status_path,
@@ -396,17 +389,17 @@ mod tests {
         project_status, write_runtime_status_file, WorkerRuntimeNodeStatus,
     };
     use mackes_mesh_types::worker_runtime::{
-        worker_change_set_digest, WorkerAction, WorkerActionDescriptor,
-        WorkerArmingRequirement, WorkerChangeSetItem, WorkerChangeSetTarget, WorkerGroup,
-        WorkerRuntimeSnapshot, WorkerRuntimeState,
+        worker_change_set_digest, WorkerAction, WorkerActionDescriptor, WorkerArmingRequirement,
+        WorkerChangeSetItem, WorkerChangeSetTarget, WorkerGroup, WorkerRuntimeSnapshot,
+        WorkerRuntimeState,
     };
 
     const KEY: &[u8] = b"worker-change-set-action-authority-test-key";
     const NOW: u64 = 1_700_000_000_000;
 
     fn contract() -> WorkerContract {
-        let mut contract = WorkerContract::new("safe-worker", WorkerGroup::Actions, "safe")
-            .expect("contract");
+        let mut contract =
+            WorkerContract::new("safe-worker", WorkerGroup::Actions, "safe").expect("contract");
         contract.actions.push(WorkerActionDescriptor {
             action: WorkerAction::Refresh,
             label: "Refresh".into(),
@@ -415,11 +408,43 @@ mod tests {
         contract.admitted().expect("admitted contract")
     }
 
-    fn request(id: &str, operation: WorkerChangeSetOperation, generation: u64) -> WorkerChangeSetRequest {
-        let target = WorkerChangeSetTarget { node_id: "node-1".into(), worker_id: Some("safe-worker".into()) };
-        let items = vec![WorkerChangeSetItem { item_id: "item-1".into(), worker_id: "safe-worker".into(), action: WorkerAction::Refresh }];
-        let digest = worker_change_set_digest(&target, generation, &items, "refresh", "retry", WorkerArmingRequirement::Confirmation).expect("digest");
-        let mut request = WorkerChangeSetRequest::new(id, operation, target, generation, items, "refresh", "retry", WorkerArmingRequirement::Confirmation, digest, 1000, 2000).expect("request");
+    fn request(
+        id: &str,
+        operation: WorkerChangeSetOperation,
+        generation: u64,
+    ) -> WorkerChangeSetRequest {
+        let target = WorkerChangeSetTarget {
+            node_id: "node-1".into(),
+            worker_id: Some("safe-worker".into()),
+        };
+        let items = vec![WorkerChangeSetItem {
+            item_id: "item-1".into(),
+            worker_id: "safe-worker".into(),
+            action: WorkerAction::Refresh,
+        }];
+        let digest = worker_change_set_digest(
+            &target,
+            generation,
+            &items,
+            "refresh",
+            "retry",
+            WorkerArmingRequirement::Confirmation,
+        )
+        .expect("digest");
+        let mut request = WorkerChangeSetRequest::new(
+            id,
+            operation,
+            target,
+            generation,
+            items,
+            "refresh",
+            "retry",
+            WorkerArmingRequirement::Confirmation,
+            digest,
+            1000,
+            2000,
+        )
+        .expect("request");
         request.armed_token = Some(format!("token-{id}"));
         request
     }
@@ -484,23 +509,58 @@ mod tests {
         let mut executor = WorkerChangeSetExecutor::default();
         let contracts = vec![contract()];
         let preview = request("preview-1", WorkerChangeSetOperation::Preview, 7);
-        assert_eq!(executor.consume(preview.clone(), 1100, 7, &contracts).outcome, WorkerChangeSetOutcome::Previewed);
-        assert_eq!(executor.consume(preview, 1101, 7, &contracts).outcome, WorkerChangeSetOutcome::Refused);
-        assert_eq!(executor.consume(request("stale", WorkerChangeSetOperation::Commit, 7), 1200, 8, &contracts).outcome, WorkerChangeSetOutcome::StaleGeneration);
+        assert_eq!(
+            executor
+                .consume(preview.clone(), 1100, 7, &contracts)
+                .outcome,
+            WorkerChangeSetOutcome::Previewed
+        );
+        assert_eq!(
+            executor.consume(preview, 1101, 7, &contracts).outcome,
+            WorkerChangeSetOutcome::Refused
+        );
+        assert_eq!(
+            executor
+                .consume(
+                    request("stale", WorkerChangeSetOperation::Commit, 7),
+                    1200,
+                    8,
+                    &contracts
+                )
+                .outcome,
+            WorkerChangeSetOutcome::StaleGeneration
+        );
         let substituted = request("substitute", WorkerChangeSetOperation::Commit, 8);
-        assert_eq!(executor.consume(substituted, 1200, 8, &contracts).outcome, WorkerChangeSetOutcome::Refused);
+        assert_eq!(
+            executor.consume(substituted, 1200, 8, &contracts).outcome,
+            WorkerChangeSetOutcome::Refused
+        );
         let commit = request("commit-1", WorkerChangeSetOperation::Commit, 7);
-        assert_eq!(executor.consume(commit, 1200, 7, &contracts).outcome, WorkerChangeSetOutcome::Refused);
+        assert_eq!(
+            executor.consume(commit, 1200, 7, &contracts).outcome,
+            WorkerChangeSetOutcome::Refused
+        );
         let cancel = request("cancel-1", WorkerChangeSetOperation::Cancel, 7);
-        assert_eq!(executor.consume(cancel, 1300, 7, &contracts).outcome, WorkerChangeSetOutcome::Cancelled);
+        assert_eq!(
+            executor.consume(cancel, 1300, 7, &contracts).outcome,
+            WorkerChangeSetOutcome::Cancelled
+        );
         let second_cancel = request("cancel-2", WorkerChangeSetOperation::Cancel, 7);
-        assert_eq!(executor.consume(second_cancel, 1301, 7, &contracts).outcome, WorkerChangeSetOutcome::Refused);
+        assert_eq!(
+            executor.consume(second_cancel, 1301, 7, &contracts).outcome,
+            WorkerChangeSetOutcome::Refused
+        );
     }
 
     #[test]
     fn undeclared_action_never_stages() {
         let mut executor = WorkerChangeSetExecutor::default();
-        let result = executor.consume(request("preview-2", WorkerChangeSetOperation::Preview, 3), 1100, 3, &[]);
+        let result = executor.consume(
+            request("preview-2", WorkerChangeSetOperation::Preview, 3),
+            1100,
+            3,
+            &[],
+        );
         assert_eq!(result.outcome, WorkerChangeSetOutcome::Refused);
     }
 
@@ -513,11 +573,7 @@ mod tests {
             temp.path().join("auth"),
             i64::try_from(NOW).unwrap(),
         ));
-        let consumer = WorkerChangeSetConsumer::for_test(
-            "node-1".into(),
-            status_path,
-            authorizer,
-        );
+        let consumer = WorkerChangeSetConsumer::for_test("node-1".into(), status_path, authorizer);
 
         let request = unsigned_request("preview-auth", WorkerChangeSetOperation::Preview, 7);
         let body = signed_body(&request, "node-1", "nonce-body");
@@ -531,14 +587,11 @@ mod tests {
             WorkerChangeSetOutcome::Refused
         );
 
-        let wrong_identity = unsigned_request(
-            "preview-identity",
-            WorkerChangeSetOperation::Preview,
-            7,
-        );
+        let wrong_identity =
+            unsigned_request("preview-identity", WorkerChangeSetOperation::Preview, 7);
         let wrong_identity_body = signed_body(&wrong_identity, "other-node", "nonce-identity");
-        let wrong_identity = WorkerChangeSetRequest::from_json(&wrong_identity_body)
-            .expect("signed request");
+        let wrong_identity =
+            WorkerChangeSetRequest::from_json(&wrong_identity_body).expect("signed request");
         assert_eq!(
             consumer
                 .admit_and_consume(&wrong_identity_body, wrong_identity, NOW)

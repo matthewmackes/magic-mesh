@@ -370,9 +370,7 @@ mod tests {
         symlink(&outside, dir.join("symlink.toml")).unwrap();
 
         let oversized = std::fs::File::create(dir.join("oversized.toml")).unwrap();
-        oversized
-            .set_len(MAX_REMEDIATION_PLAN_BYTES + 1)
-            .unwrap();
+        oversized.set_len(MAX_REMEDIATION_PLAN_BYTES + 1).unwrap();
         std::fs::write(
             dir.join("reserved-binding.toml"),
             "name = \"reserved\"\npolicy = \"*\"\ntemplate = \"safe\"\nauto = true\n\

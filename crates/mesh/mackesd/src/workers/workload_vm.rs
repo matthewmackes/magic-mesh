@@ -52,7 +52,9 @@ impl std::fmt::Display for VmDomainSpecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyResources => formatter.write_str("VM resources must be non-zero"),
-            Self::NoDom0Reserve => formatter.write_str("VM requires one host CPU reserved for Dom0"),
+            Self::NoDom0Reserve => {
+                formatter.write_str("VM requires one host CPU reserved for Dom0")
+            }
             Self::UnsafeDiskPath => {
                 formatter.write_str("VM disk attachment is outside the managed VM pool")
             }
@@ -90,8 +92,7 @@ impl VmDomainSpec {
                 && identity.trim() == identity
                 && !identity.chars().any(char::is_control)
         };
-        if !valid(&self.name) || !valid(self.network_or_default())
-        {
+        if !valid(&self.name) || !valid(self.network_or_default()) {
             return Err(VmDomainSpecError::InvalidIdentity);
         }
         Ok(())
@@ -131,10 +132,7 @@ fn xml_escape(value: &str) -> String {
 /// PipeWire-Pulse loopback endpoint instead of guessing at a system QEMU
 /// user's nonexistent PipeWire runtime directory.
 #[must_use]
-pub fn build_domain_xml(
-    spec: &VmDomainSpec,
-    disk_path: &str,
-) -> Result<String, VmDomainSpecError> {
+pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> Result<String, VmDomainSpecError> {
     spec.validate()?;
     spec.validate_identity()?;
     let disk = std::path::Path::new(disk_path);
@@ -397,10 +395,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_domain_xml(
-                &spec,
-                "/var/lib/mde-vms/mde-vm-foreign-generation.qcow2"
-            ),
+            build_domain_xml(&spec, "/var/lib/mde-vms/mde-vm-foreign-generation.qcow2"),
             Err(VmDomainSpecError::MismatchedDiskIdentity),
             "a managed-pool path must not transfer disk authority between Workloads"
         );

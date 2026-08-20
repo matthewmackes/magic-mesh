@@ -647,7 +647,7 @@ impl CollabFilesResolver {
         body: &str,
     ) -> Result<(), FilesCommitFailure> {
         let transaction = TransferBusTransaction::open(&self.bus_root, None)
-        .map_err(|_| FilesCommitFailure::Publication)?;
+            .map_err(|_| FilesCommitFailure::Publication)?;
         transaction
             .persist
             .write(topic, Priority::Default, None, Some(body))

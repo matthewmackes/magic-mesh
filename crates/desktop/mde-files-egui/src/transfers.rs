@@ -442,10 +442,7 @@ fn load_ledger_record(path: &Path) -> Option<TransferJob> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if opened.nlink() != 1
-            || opened.dev() != before.dev()
-            || opened.ino() != before.ino()
-        {
+        if opened.nlink() != 1 || opened.dev() != before.dev() || opened.ino() != before.ino() {
             return None;
         }
     }

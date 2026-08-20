@@ -461,8 +461,14 @@ impl IconId {
     /// 0 64 64` for the mark); the wordmark alone is a `0 0 320 184` text
     /// lockup.
     #[must_use]
-    #[expect(clippy::too_many_lines, reason = "the exhaustive icon-to-asset mapping is intentionally grouped here")]
-    #[expect(clippy::match_same_arms, reason = "asset macros intentionally retain distinct enum identities")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive icon-to-asset mapping is intentionally grouped here"
+    )]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "asset macros intentionally retain distinct enum identities"
+    )]
     pub const fn svg(self) -> &'static str {
         match self {
             Self::Mark => construct_svg!("mark.svg"),
@@ -493,7 +499,9 @@ impl IconId {
             Self::Keyboard => yamis_svg!("apps/16/preferences-desktop-keyboard.svg"),
             Self::Wallpaper => yamis_svg!("apps/16/preferences-desktop-wallpaper.svg"),
             Self::Appearance => yamis_svg!("apps/16/preferences-appearance.svg"),
-            Self::Bluetooth | Self::BluetoothSmall => yamis_svg!("status/scalable/bluetooth-active.svg"),
+            Self::Bluetooth | Self::BluetoothSmall => {
+                yamis_svg!("status/scalable/bluetooth-active.svg")
+            }
             Self::PowerBattery => yamis_svg!("apps/16/preferences-power-and-battery.svg"),
             Self::NetworkSettings => yamis_svg!("apps/16/preferences-system-network.svg"),
             Self::HealthStatus => yamis_svg!("preferences/scalable/preferences-smart-status.svg"),
@@ -585,7 +593,10 @@ impl IconId {
     /// `"surface-terminal"`) — handy as an egui texture debug-name and for
     /// packaging scripts that resolve the on-disk asset.
     #[must_use]
-    #[expect(clippy::too_many_lines, reason = "the exhaustive icon-to-name mapping is intentionally grouped here")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive icon-to-name mapping is intentionally grouped here"
+    )]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Mark => "mark",

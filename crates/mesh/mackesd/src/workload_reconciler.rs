@@ -96,7 +96,10 @@ impl WorkloadOperationLedger {
         fs::create_dir_all(state_root.as_ref())?;
         let path = state_root.as_ref().join(WORKLOAD_LEDGER_FILENAME);
         let Some(mut file) = open_restart_ledger(&path)? else {
-            return Ok(Self { path, operations: BTreeMap::new() });
+            return Ok(Self {
+                path,
+                operations: BTreeMap::new(),
+            });
         };
         let mut bytes = Vec::new();
         std::io::Read::by_ref(&mut file)

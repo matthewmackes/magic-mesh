@@ -1463,19 +1463,12 @@ fn merge_lifecycle(
     });
     // Own the provenance tuples so the lifecycle pass can mutate `current`
     // while it compares the previous active set.
-    let current_identities: Vec<_> = current
-        .iter()
-        .map(condition_lifecycle_identity)
-        .collect();
+    let current_identities: Vec<_> = current.iter().map(condition_lifecycle_identity).collect();
     if let Some(previous) = previous {
         for condition in current.iter_mut() {
-            if let Some(old) = previous
-                .active_conditions
-                .iter()
-                .find(|old| {
-                    condition_lifecycle_identity(old) == condition_lifecycle_identity(condition)
-                })
-            {
+            if let Some(old) = previous.active_conditions.iter().find(|old| {
+                condition_lifecycle_identity(old) == condition_lifecycle_identity(condition)
+            }) {
                 condition.active_since_ms = old.active_since_ms;
                 condition.acknowledged_at_ms = old.acknowledged_at_ms;
                 condition.snoozed_until_ms = old.snoozed_until_ms;
@@ -2958,11 +2951,8 @@ mod tests {
             Vec::new(),
         );
 
-        let resolved = merge_lifecycle(
-            Some(&previous),
-            std::slice::from_mut(&mut replacement),
-            200,
-        );
+        let resolved =
+            merge_lifecycle(Some(&previous), std::slice::from_mut(&mut replacement), 200);
 
         assert_eq!(replacement.active_since_ms, 200);
         assert_eq!(replacement.acknowledged_at_ms, None);

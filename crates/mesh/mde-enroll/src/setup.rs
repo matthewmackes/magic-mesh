@@ -149,7 +149,12 @@ impl Wizard {
     #[must_use]
     pub fn menu_for(configured: bool) -> Vec<MenuItem> {
         if configured {
-            vec![MenuItem::ManagePeers, MenuItem::Status, MenuItem::Lifecycle, MenuItem::Quit]
+            vec![
+                MenuItem::ManagePeers,
+                MenuItem::Status,
+                MenuItem::Lifecycle,
+                MenuItem::Quit,
+            ]
         } else {
             vec![MenuItem::CreateMesh, MenuItem::JoinMesh, MenuItem::Quit]
         }
@@ -281,7 +286,12 @@ mod tests {
         let w = Wizard::new(true);
         assert_eq!(
             w.menu_items,
-            vec![MenuItem::ManagePeers, MenuItem::Status, MenuItem::Lifecycle, MenuItem::Quit]
+            vec![
+                MenuItem::ManagePeers,
+                MenuItem::Status,
+                MenuItem::Lifecycle,
+                MenuItem::Quit
+            ]
         );
     }
 

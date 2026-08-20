@@ -66,6 +66,7 @@
 //! this engine carries no stub / `todo!()` variant for any: `enroll` (its own OW unit).
 
 pub mod first_desktop;
+pub mod firstboot;
 pub mod invite;
 pub mod mesh_create;
 pub mod mesh_dns;

@@ -1987,13 +1987,11 @@ mod tests {
         })
         .await
         .expect("the same worker must publish after Bus recovery");
-        assert!(
-            mount
-                .path()
-                .join("recovery")
-                .join(MESH_LIBRARY_MANIFEST_FILE)
-                .exists()
-        );
+        assert!(mount
+            .path()
+            .join("recovery")
+            .join(MESH_LIBRARY_MANIFEST_FILE)
+            .exists());
         assert!(!task.is_finished(), "recovered worker must remain active");
 
         shutdown_tx.send(true).expect("request shutdown");
@@ -2050,7 +2048,7 @@ mod tests {
         assert_eq!(state.node, "peer:elm");
         assert_eq!(state.server.shared_item_count, 1);
         assert_eq!(state.server.http, "idle"); // live server disabled in the test
-        // The aggregated library carries BOTH oak's peer film + elm's local file.
+                                               // The aggregated library carries BOTH oak's peer film + elm's local file.
         assert_eq!(state.library.node_count, 2);
         let titles: Vec<&str> = state
             .library
@@ -2167,13 +2165,11 @@ mod tests {
             "sentinel",
             "retired publication must not commit serving state"
         );
-        assert!(
-            Persist::open(bus.path().to_path_buf())
-                .unwrap()
-                .read_latest(MESH_LIBRARY_TOPIC)
-                .unwrap()
-                .is_none()
-        );
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .read_latest(MESH_LIBRARY_TOPIC)
+            .unwrap()
+            .is_none());
 
         let current = MediaServerBusTransaction::open(bus.path().to_path_buf(), None).unwrap();
         assert!(worker.tick_once(&current, Some(&serve), true).unwrap());
@@ -2206,13 +2202,11 @@ mod tests {
         assert!(worker.tick_once(&transaction, Some(&serve), true).is_err());
         assert!(worker.last_fingerprint.is_none());
         assert_eq!(serve.lock().unwrap().manifest.host, "sentinel");
-        assert!(
-            transaction
-                .persist
-                .read_latest(MESH_LIBRARY_TOPIC)
-                .unwrap()
-                .is_none()
-        );
+        assert!(transaction
+            .persist
+            .read_latest(MESH_LIBRARY_TOPIC)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

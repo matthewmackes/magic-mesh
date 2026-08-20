@@ -413,7 +413,10 @@ mod tests {
             error,
             CollabError::ConflictingEventId(id) if id == original.event_id
         ));
-        assert_eq!(reopened.read_all().expect("read durable log"), vec![original]);
+        assert_eq!(
+            reopened.read_all().expect("read durable log"),
+            vec![original]
+        );
     }
 
     #[test]
@@ -438,7 +441,10 @@ mod tests {
             log.append(&wrong_actor),
             Err(CollabError::InvalidEvent(id)) if id == wrong_actor.event_id
         ));
-        assert!(!path.exists(), "rejected live events must not create the log");
+        assert!(
+            !path.exists(),
+            "rejected live events must not create the log"
+        );
 
         std::fs::write(
             &path,

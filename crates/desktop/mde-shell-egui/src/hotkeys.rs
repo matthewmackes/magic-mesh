@@ -143,6 +143,20 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
     })
 }
 
+/// Map a Ctrl-held named key to the catalog chord string. These fire on Construct
+/// chrome without Super; Documents/Terminal skip them at the shell apply site so
+/// they never shadow text editing.
+const fn ctrl_chord(press: KeyPress) -> Option<&'static str> {
+    if !press.ctrl || press.shift {
+        return None;
+    }
+    Some(match press.key {
+        egui::Key::J => "Ctrl+J",
+        egui::Key::N => "Ctrl+N",
+        _ => return None,
+    })
+}
+
 /// The stateful hotkey dispatcher: it carries only the leader latch (armed while a
 /// Super key is held) and turns each frame's raw input into the matched typed
 /// actions, applying lock 8. Pure + headless-testable — the shell owns the actual
@@ -287,6 +301,10 @@ impl HotkeyRouter {
         for press in egui_presses {
             if let Some(a) = self.on_egui_key(*press) {
                 actions.push(a);
+            } else if !self.leader && !self.leader_release_pending {
+                if let Some(action) = ctrl_chord(*press).and_then(action_for) {
+                    actions.push(action);
+                }
             }
         }
 
@@ -343,6 +361,8 @@ pub(crate) struct KeyPress {
     pub(crate) key: egui::Key,
     /// Whether Shift was held for this press.
     pub(crate) shift: bool,
+    /// Whether Ctrl was held for this press (Transfers chords, WL-FUNC-032).
+    pub(crate) ctrl: bool,
 }
 
 /// The egui key **presses** in this frame's input (a press, not a release), the
@@ -361,6 +381,7 @@ pub(crate) fn egui_key_presses(events: &[egui::Event]) -> Vec<KeyPress> {
             } => Some(KeyPress {
                 key: *key,
                 shift: modifiers.shift,
+                ctrl: modifiers.ctrl,
             }),
             _ => None,
         })
@@ -378,12 +399,29 @@ mod tests {
 
     /// A plain (unshifted) egui key press.
     fn press(key: egui::Key) -> KeyPress {
-        KeyPress { key, shift: false }
+        KeyPress {
+            key,
+            shift: false,
+            ctrl: false,
+        }
     }
 
     /// A Shift-held egui key press — the second Super-number nav tier (REACH-2).
     fn shift_press(key: egui::Key) -> KeyPress {
-        KeyPress { key, shift: true }
+        KeyPress {
+            key,
+            shift: true,
+            ctrl: false,
+        }
+    }
+
+    /// A Ctrl-held egui key press — Transfers chords (WL-FUNC-032).
+    fn ctrl_press(key: egui::Key) -> KeyPress {
+        KeyPress {
+            key,
+            shift: false,
+            ctrl: true,
+        }
     }
 
     #[test]
@@ -754,6 +792,35 @@ mod tests {
         assert!(
             crate::surfaces::springboard_surface(past_end.index()).is_none(),
             "a slot past the last surface resolves to no surface",
+        );
+    }
+
+    #[test]
+    fn ctrl_j_opens_transfers_without_a_leader() {
+        let mut r = HotkeyRouter::default();
+        let acts = r.dispatch(&[], &[ctrl_press(egui::Key::J)]);
+        assert_eq!(acts, vec![HotkeyAction::OpenTransfers]);
+        let acts = r.dispatch(&[], &[press(egui::Key::J)]);
+        assert!(acts.is_empty(), "bare J is not a Transfers chord");
+    }
+
+    #[test]
+    fn ctrl_n_is_the_in_mode_new_transfer_accelerator() {
+        let mut r = HotkeyRouter::default();
+        let acts = r.dispatch(&[], &[ctrl_press(egui::Key::N)]);
+        assert_eq!(acts, vec![HotkeyAction::NewTransfer]);
+    }
+
+    #[test]
+    fn transfer_ctrl_chords_are_listed_and_unique_in_the_catalog() {
+        use std::collections::BTreeSet;
+        let chords: BTreeSet<_> = mde_seat::hotkeys::HOTKEYS.iter().map(|h| h.chord).collect();
+        assert!(chords.contains("Ctrl+J"), "Ctrl+J must be catalogued");
+        assert!(chords.contains("Ctrl+N"), "Ctrl+N must be catalogued");
+        assert_eq!(
+            chords.len(),
+            mde_seat::hotkeys::HOTKEYS.len(),
+            "catalog chords must stay unique"
         );
     }
 }

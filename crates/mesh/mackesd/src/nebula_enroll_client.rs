@@ -1317,10 +1317,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
     #[test]
     fn hostile_response_with_oversized_header_block_is_rejected() {
         let mut raw = b"HTTP/1.1 200 OK\r\nX-Filler: ".to_vec();
-        raw.extend(std::iter::repeat_n(
-            b'x',
-            MAX_ENROLL_RESPONSE_HEADER_BYTES,
-        ));
+        raw.extend(std::iter::repeat_n(b'x', MAX_ENROLL_RESPONSE_HEADER_BYTES));
         raw.extend_from_slice(b"\r\n\r\n{}");
         let error = parse_http_response(&raw).expect_err("oversized headers must fail closed");
         assert!(error.contains("response headers exceed"));

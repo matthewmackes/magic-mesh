@@ -507,10 +507,14 @@ pub fn run(
     workgroup_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
-    let root = workgroup_root.clone().unwrap_or_else(mackesd_core::default_qnm_shared_root);
+    let root = workgroup_root
+        .clone()
+        .unwrap_or_else(mackesd_core::default_qnm_shared_root);
     let node_id = default_node_id();
-    let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
     let lifecycle_plan = LifecyclePlanV1 {
         schema_version: 1,
         request_id: format!("join-{node_id}-{generation}"),
@@ -521,17 +525,22 @@ pub fn run(
         // are one atomic enrollment boundary from this CLI's perspective.
         steps: vec!["mesh".into()],
     };
-    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
-        .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for join: {error:?}"))?;
+    let mut authority =
+        mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+            .map_err(|error| {
+                anyhow::anyhow!("cannot acquire lifecycle authority for join: {error:?}")
+            })?;
     let result = authority.run_next(|_| {
-        run_inner(token, role, name, workgroup_root.clone())
-            .map_err(|error| error.to_string())
+        run_inner(token, role, name, workgroup_root.clone()).map_err(|error| error.to_string())
     });
     if let Err(error) = result {
         let _ = authority.finish();
-        return Err(anyhow::anyhow!("join lifecycle authority recorded failure: {error:?}"));
+        return Err(anyhow::anyhow!(
+            "join lifecycle authority recorded failure: {error:?}"
+        ));
     }
-    authority.finish()
+    authority
+        .finish()
         .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))
 }
 

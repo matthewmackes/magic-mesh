@@ -115,8 +115,9 @@ pub fn remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
         generation,
         steps: vec!["offboard".into()],
     };
-    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
-        .map_err(|error| anyhow::anyhow!("cannot acquire remove-peer authority: {error:?}"))?;
+    let mut authority =
+        mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, plan)
+            .map_err(|error| anyhow::anyhow!("cannot acquire remove-peer authority: {error:?}"))?;
     let result = authority.run_next(|_| {
         remove_peer_inner(db_path, node_id, force).map_err(|error| error.to_string())
     });
@@ -312,7 +313,10 @@ fn require_lighthouse_droplet_id(droplet_id: Option<String>) -> anyhow::Result<S
     let id = droplet_id.ok_or_else(|| anyhow::anyhow!(
         "lighthouse retirement requires the provider droplet id before drain/revoke; refusing a partial retirement"
     ))?;
-    anyhow::ensure!(!id.trim().is_empty(), "lighthouse retirement requires a non-empty provider droplet id");
+    anyhow::ensure!(
+        !id.trim().is_empty(),
+        "lighthouse retirement requires a non-empty provider droplet id"
+    );
     Ok(id)
 }
 
@@ -331,7 +335,10 @@ fn ensure_member_removal_succeeded(result: Option<Result<bool, String>>) -> anyh
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_member_removal_succeeded, require_lighthouse_droplet_id, require_lighthouse_provisioner};
+    use super::{
+        ensure_member_removal_succeeded, require_lighthouse_droplet_id,
+        require_lighthouse_provisioner,
+    };
 
     #[test]
     fn etcd_member_removal_failures_are_fail_closed() {
@@ -350,6 +357,9 @@ mod tests {
         assert!(require_lighthouse_provisioner(&helper).is_ok());
         assert!(require_lighthouse_droplet_id(None).is_err());
         assert!(require_lighthouse_droplet_id(Some("".into())).is_err());
-        assert_eq!(require_lighthouse_droplet_id(Some("1234".into())).unwrap(), "1234");
+        assert_eq!(
+            require_lighthouse_droplet_id(Some("1234".into())).unwrap(),
+            "1234"
+        );
     }
 }

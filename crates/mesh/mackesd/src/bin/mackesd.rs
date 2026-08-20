@@ -1317,6 +1317,48 @@ enum TransferCmd {
         #[arg(value_name = "ID")]
         id: String,
     },
+    /// Recurring rsync mirrors (`transfer.save-sync-pair` / `.remove-sync-pair`).
+    SyncPair {
+        #[command(subcommand)]
+        cmd: SyncPairCmd,
+    },
+}
+
+/// `mackesd transfer sync-pair <add|remove|list>` — CLI producer for the existing
+/// daemon sync-pair store/scheduler (WL-FUNC-028). Mutating verbs go through the
+/// inbox; `list` reads the store.
+#[derive(Subcommand)]
+enum SyncPairCmd {
+    /// Save or replace a recurring rsync pair (`transfer.save-sync-pair`).
+    Add {
+        /// Stable pair id. When omitted, a slug is minted from source + destination.
+        #[arg(long)]
+        id: Option<String>,
+        /// Recurrence interval (`30s`, `5m`, `1h`, `2d`, or a positive second count).
+        #[arg(long)]
+        interval: String,
+        /// rsync source path/spec.
+        #[arg(long)]
+        source: String,
+        /// rsync destination path/spec.
+        #[arg(long)]
+        destination: String,
+        /// Optional rsync `--bwlimit` token (e.g. `2m`).
+        #[arg(long, value_name = "RATE")]
+        bwlimit: Option<String>,
+    },
+    /// Remove a saved pair (`transfer.remove-sync-pair`). Unknown ids refuse.
+    Remove {
+        /// The pair id (from `sync-pair list`).
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// List saved pairs from the daemon store.
+    List {
+        /// Emit the store records as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// FILEMGR-6 — `mackesd mesh-ssh-key <sub>`: the shared-key lifecycle
@@ -1568,6 +1610,20 @@ enum OnboardCmd {
         intent_json: String,
         #[arg(long, env = "QNM_SHARED_ROOT")]
         root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 S17 — audit the canonical lifecycle baseline and stamp
+    /// first-boot convergence only when no required check blocks.
+    LifecycleFirstBoot {
+        #[arg(long, value_name = "TARGET")]
+        target_id: Option<String>,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+        /// Directory for firstboot-converged / pending-convergence markers.
+        #[arg(long, value_name = "DIR")]
+        marker_dir: Option<PathBuf>,
+        /// Print the readiness JSON without writing markers.
+        #[arg(long)]
+        report_only: bool,
     },
     /// OW-2 — node self-diagnostic: KVM stack readiness (the KVM_SERVICES
     /// catalog), the mesh peer directory, and identity + CA presence. Prints a
@@ -2302,9 +2358,11 @@ fn main() -> anyhow::Result<()> {
             dry_run,
         } => cli::fleet_push_setting::run(key, value, peers, author, dry_run, db_path)?,
         Cmd::Revisions { cmd } => cli::revisions::run(cmd, db_path)?,
-        Cmd::Leave { yes, confirmation_json, verifying_key_hex } => {
-            cli::leave::run(yes, confirmation_json, verifying_key_hex)?
-        }
+        Cmd::Leave {
+            yes,
+            confirmation_json,
+            verifying_key_hex,
+        } => cli::leave::run(yes, confirmation_json, verifying_key_hex)?,
         Cmd::MeshInit {
             mesh_id,
             external_addr,
@@ -2417,7 +2475,12 @@ fn main() -> anyhow::Result<()> {
             version,
             artifact_digest,
             artifact_selection_json,
-        } => cli::upgrade::run(coordinate, version, artifact_digest, artifact_selection_json)?,
+        } => cli::upgrade::run(
+            coordinate,
+            version,
+            artifact_digest,
+            artifact_selection_json,
+        )?,
         Cmd::Nodes { cmd } => cli::nodes::run(cmd, db_path)?,
         Cmd::AnsibleHistory { cmd } => cli::ansible_history::run(cmd)?,
         Cmd::Events { cmd } => cli::events::run(cmd, db_path)?,
@@ -3560,6 +3623,21 @@ mod lifecycle_cli_boundary_tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn lifecycle_firstboot_is_a_real_verb_without_caller_steps() {
+        let parsed = parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-firstboot".into(),
+            "--report-only".into(),
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "first-boot verb must parse without a caller-selected step: {:?}",
+            parsed.err().map(|error| error.kind())
+        );
     }
 }
 

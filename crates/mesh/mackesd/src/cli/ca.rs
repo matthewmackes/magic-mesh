@@ -439,12 +439,7 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 let workgroup_root =
                     workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
                 let self_id = self_node_id.unwrap_or_else(default_node_id);
-                let rows = revoke_with_authority(
-                    &conn,
-                    &workgroup_root,
-                    &self_id,
-                    &node_id,
-                )?;
+                let rows = revoke_with_authority(&conn, &workgroup_root, &self_id, &node_id)?;
                 println!(
                     "revoked '{node_id}': {rows} cert row(s) marked revoked; \
                          added to ban list at {self_id}'s QNM-Shared entry."
@@ -479,12 +474,8 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 let mut added = None;
                 let result = authority.run_next(|_| {
                     added = Some(
-                        mackesd_core::ca::ban_list::add_banned(
-                            &workgroup_root,
-                            &self_id,
-                            &node_id,
-                        )
-                        .map_err(|error| error.to_string())?,
+                        mackesd_core::ca::ban_list::add_banned(&workgroup_root, &self_id, &node_id)
+                            .map_err(|error| error.to_string())?,
                     );
                     Ok(())
                 });
@@ -604,8 +595,9 @@ fn revoke_with_authority(
         generation,
         steps: vec!["offboard".into()],
     };
-    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(workgroup_root, plan)
-        .map_err(|error| anyhow::anyhow!("cannot acquire CA revoke authority: {error:?}"))?;
+    let mut authority =
+        mackesd_core::lifecycle_authority::LifecycleAuthority::begin(workgroup_root, plan)
+            .map_err(|error| anyhow::anyhow!("cannot acquire CA revoke authority: {error:?}"))?;
     let mut rows = None;
     let result = authority.run_next(|_| {
         rows = Some(

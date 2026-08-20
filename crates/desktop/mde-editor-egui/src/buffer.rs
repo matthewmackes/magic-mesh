@@ -748,9 +748,7 @@ fn open_editor_destination(path: &Path) -> io::Result<File> {
     const O_CLOEXEC: i32 = 0o2000000;
 
     let mut existing = OpenOptions::new();
-    existing
-        .write(true)
-        .custom_flags(O_NOFOLLOW | O_CLOEXEC);
+    existing.write(true).custom_flags(O_NOFOLLOW | O_CLOEXEC);
     match existing.open(path) {
         Ok(file) => Ok(file),
         Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
@@ -819,10 +817,7 @@ fn validate_editor_destination(file: &File, path: &Path) -> io::Result<()> {
         if descriptor.dev() != current.dev() || descriptor.ino() != current.ino() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Editor destination changed during save: {}",
-                    path.display()
-                ),
+                format!("Editor destination changed during save: {}", path.display()),
             ));
         }
     }
@@ -1040,7 +1035,10 @@ mod tests {
             b"operator-owned bytes",
             "the replacement target must never receive Editor bytes"
         );
-        assert!(buf.path().is_none(), "failed save-as must not adopt the path");
+        assert!(
+            buf.path().is_none(),
+            "failed save-as must not adopt the path"
+        );
         assert!(buf.is_dirty(), "failed save-as must retain unsaved state");
     }
 

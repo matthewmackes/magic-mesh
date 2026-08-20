@@ -712,50 +712,44 @@ fn materialize_identity_key(path: &Path, material: &[u8]) -> Result<(), MountErr
         }
     }
     let file_name = components.pop().ok_or_else(|| {
-        MountError::Backend(format!("mesh SSH key path has no filename: {}", path.display()))
+        MountError::Backend(format!(
+            "mesh SSH key path has no filename: {}",
+            path.display()
+        ))
     })?;
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut directory = rustix::fs::open("/", directory_flags, Mode::empty())
         .map_err(|error| MountError::Backend(format!("open key-path root: {error}")))?;
     for component in components {
-        directory = match rustix::fs::openat(
-            &directory,
-            &component,
-            directory_flags,
-            Mode::empty(),
-        ) {
-            Ok(next) => next,
-            Err(rustix::io::Errno::NOENT) => {
-                match rustix::fs::mkdirat(
-                    &directory,
-                    &component,
-                    Mode::RUSR | Mode::WUSR | Mode::XUSR,
-                ) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(error) => {
-                        return Err(MountError::Backend(format!(
-                            "create secure key directory {component:?}: {error}"
-                        )));
+        directory =
+            match rustix::fs::openat(&directory, &component, directory_flags, Mode::empty()) {
+                Ok(next) => next,
+                Err(rustix::io::Errno::NOENT) => {
+                    match rustix::fs::mkdirat(
+                        &directory,
+                        &component,
+                        Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                    ) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => {
+                            return Err(MountError::Backend(format!(
+                                "create secure key directory {component:?}: {error}"
+                            )));
+                        }
                     }
+                    rustix::fs::openat(&directory, &component, directory_flags, Mode::empty())
+                        .map_err(|error| {
+                            MountError::Backend(format!(
+                                "open secure key directory {component:?}: {error}"
+                            ))
+                        })?
                 }
-                rustix::fs::openat(
-                    &directory,
-                    &component,
-                    directory_flags,
-                    Mode::empty(),
-                )
-                .map_err(|error| {
-                    MountError::Backend(format!(
-                        "open secure key directory {component:?}: {error}"
-                    ))
-                })?
-            }
-            Err(error) => {
-                return Err(MountError::Backend(format!(
-                    "key path component {component:?} is not a safe directory: {error}"
-                )));
-            }
-        };
+                Err(error) => {
+                    return Err(MountError::Backend(format!(
+                        "key path component {component:?} is not a safe directory: {error}"
+                    )));
+                }
+            };
     }
 
     let mut random = [0_u8; 16];
@@ -770,11 +764,7 @@ fn materialize_identity_key(path: &Path, material: &[u8]) -> Result<(), MountErr
     let temp = rustix::fs::openat(
         &directory,
         temp_name.as_str(),
-        OFlags::WRONLY
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::NOFOLLOW
-            | OFlags::CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(|error| MountError::Backend(format!("create secure key staging file: {error}")))?;
@@ -1710,7 +1700,10 @@ mod tests {
             b"foreign-generation",
             "restart must never write key material through a retained symlink"
         );
-        assert_eq!(std::fs::read(&key).unwrap(), b"corrected-forward-generation");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            b"corrected-forward-generation"
+        );
 
         std::fs::remove_file(&key).expect("remove first materialization");
         std::fs::hard_link(&victim, &key).expect("retained hard-link alias");
@@ -1721,7 +1714,10 @@ mod tests {
             b"foreign-generation",
             "restart must never mutate an aliased identity inode"
         );
-        assert_eq!(std::fs::read(&key).unwrap(), b"next-authenticated-generation");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            b"next-authenticated-generation"
+        );
         let metadata = std::fs::symlink_metadata(&key).expect("installed identity metadata");
         assert!(metadata.file_type().is_file());
         assert_eq!(metadata.nlink(), 1);

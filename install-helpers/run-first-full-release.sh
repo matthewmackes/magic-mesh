@@ -24,7 +24,7 @@ Usage:
 
 Argument files contain one JSON array of argv strings. Prepare creates only an
 immutable, unsigned, promotion-forbidden operator handoff. Resume accepts only
-operator-signed candidates, verified derivatives, and all seven canonical
+operator-signed candidates, verified derivatives, and all six canonical
 roles; it never signs, publishes, promotes, or runs live acceptance.
 EOF
 }

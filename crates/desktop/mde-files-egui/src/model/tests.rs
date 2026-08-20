@@ -1,10 +1,14 @@
 use super::*;
+use crate::dialogs::NameOperation;
 use mde_egui::search_omnibox::{ranked_hits, SearchDomain};
 use mde_files::backend::{AuditEntry, ConflictPolicy, LocalFsBackend, SendMode};
-use mde_files::fileops::{FakeFileOps, FileOps};
+use mde_files::fileops::{FakeFileOps, FileOps, LiveFileOps};
 use mde_files::model::{PeerKind, PeerStatus};
+use mde_files::opqueue::Resolution;
 use mde_files::{ArchiveFormat, OpKind};
 use std::collections::HashMap as Map;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ── In-test backend double (from E12-11, unchanged shape) ────────────────
 
@@ -1639,4 +1643,481 @@ fn operation_progress_summary_bounds_labels_with_ascii_ellipsis_for_shell_chrome
         "Files progress summary labels must stay bounded: {label}"
     );
     assert!(!label.contains('…'), "label must not use Unicode ellipsis");
+}
+
+// ── WL-FUNC-025 POSIX ops + WL-FUNC-026 prefs + WL-FUNC-027 bookmarks ─────
+
+fn live_posix_browser(rows: Vec<FileRow>) -> FileBrowser {
+    FileBrowser::with_file_ops(
+        Box::new(FixtureBackend::new(Vec::new(), rows)),
+        LiveFileOps::new(),
+    )
+    .with_meta_ops(LiveFileOps::new(), false)
+}
+
+fn pump_until_idle(b: &mut FileBrowser) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        b.pump_ops();
+        let busy = b.ops().any_running() || b.any_pending_conflict();
+        if !busy {
+            b.pump_ops();
+            return;
+        }
+        assert!(Instant::now() < deadline, "op queue never went idle");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn raw_tar_bytes(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    h[..name.len()].copy_from_slice(name.as_bytes());
+    h[100..108].copy_from_slice(b"0000644\0");
+    h[108..116].copy_from_slice(b"0000000\0");
+    h[116..124].copy_from_slice(b"0000000\0");
+    h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    h[136..148].copy_from_slice(b"00000000000\0");
+    h[156] = b'0';
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    for b in &mut h[148..156] {
+        *b = b' ';
+    }
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = h.to_vec();
+    out.extend_from_slice(data);
+    out.resize(out.len() + (512 - data.len() % 512) % 512, 0);
+    out.resize(out.len() + 1024, 0);
+    out
+}
+
+#[test]
+fn new_file_refuses_an_existing_name_without_mutation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let occupied = temp.path().join("taken.txt");
+    std::fs::write(&occupied, b"keep").expect("seed");
+    let rows =
+        vec![FileRow::local("taken.txt", Mime::Doc, "4 B", "now")
+            .with_path(occupied.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.open_new_file(0);
+    b.set_name_dialog_input("taken.txt".to_string());
+    b.submit_name_dialog(0);
+    let error = b
+        .name_dialog()
+        .and_then(|d| d.error.as_deref())
+        .expect("collision is visible");
+    assert!(
+        error.contains("already exists"),
+        "honest collision: {error}"
+    );
+    assert_eq!(std::fs::read(&occupied).expect("intact"), b"keep");
+}
+
+#[test]
+fn new_file_and_duplicate_refuse_a_read_only_directory() {
+    // /proc is not a writable parent even for root (procfs), so this is an
+    // honest read-only/unwritable-directory refusal without chmod races.
+    let rows = vec![FileRow::local("stat", Mime::Doc, "0 B", "now").with_path("/proc/stat")];
+    let mut b = live_posix_browser(rows);
+    b.open_new_file(0);
+    b.set_name_dialog_input("mcnf-ro-test".to_string());
+    b.submit_name_dialog(0);
+    let error = b
+        .name_dialog()
+        .and_then(|d| d.error.as_deref())
+        .expect("unwritable create is visible");
+    assert!(
+        error.contains("Couldn't create file") || error.to_ascii_lowercase().contains("permission"),
+        "honest read-only: {error}"
+    );
+    b.cancel_name_dialog();
+    b.click(0, 0);
+    b.duplicate_selection(0);
+    let note = b.last_note().unwrap_or("");
+    assert!(
+        note.contains("Couldn't duplicate") || note.to_ascii_lowercase().contains("permission"),
+        "honest duplicate: {note}"
+    );
+}
+
+#[test]
+fn new_file_duplicate_and_symlink_execute_on_a_local_tree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("report.txt");
+    std::fs::write(&source, b"report").expect("seed");
+    let rows =
+        vec![FileRow::local("report.txt", Mime::Doc, "6 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+
+    b.open_new_file(0);
+    b.set_name_dialog_input("notes.txt".to_string());
+    b.submit_name_dialog(0);
+    assert!(b.name_dialog().is_none());
+    assert_eq!(
+        std::fs::read(temp.path().join("notes.txt")).expect("new file"),
+        b""
+    );
+
+    b.click(0, 0);
+    b.duplicate_selection(0);
+    pump_until_idle(&mut b);
+    let dup = temp.path().join("report (copy).txt");
+    assert_eq!(std::fs::read(&dup).expect("duplicate payload"), b"report");
+
+    b.click(0, 0);
+    b.open_symlink(0);
+    b.set_name_dialog_input("report.link".to_string());
+    b.submit_name_dialog(0);
+    assert!(b.name_dialog().is_none(), "symlink created");
+    let link = temp.path().join("report.link");
+    let meta = std::fs::symlink_metadata(&link).expect("lstat");
+    assert!(meta.file_type().is_symlink());
+}
+
+#[test]
+fn duplicate_of_an_existing_copy_name_raises_the_conflict_dialog() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("report.txt");
+    let occupied = temp.path().join("report (copy).txt");
+    std::fs::write(&source, b"new").expect("seed");
+    std::fs::write(&occupied, b"old").expect("seed dest");
+    let rows =
+        vec![FileRow::local("report.txt", Mime::Doc, "3 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.duplicate_selection(0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.pending_conflict().is_none() {
+        b.pump_ops();
+        assert!(Instant::now() < deadline, "collision never surfaced");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (id, conflict) = b.pending_conflict().expect("conflict");
+    assert!(
+        conflict.dst.ends_with("report (copy).txt"),
+        "conflict dest = {}",
+        conflict.dst.display()
+    );
+    b.resolve_conflict(id, Resolution::Skip, true);
+    pump_until_idle(&mut b);
+    assert_eq!(std::fs::read(&occupied).expect("kept"), b"old");
+}
+
+#[test]
+fn posix_ops_refuse_pathless_peer_rows() {
+    let mut b = browser_over(roster_backend());
+    b.navigate(0, Location::Peer("pine".into()));
+    b.click(0, 0);
+    b.open_new_file(0);
+    assert!(b.name_dialog().is_none());
+    assert!(b.last_note().is_some());
+    b.duplicate_selection(0);
+    assert!(b.last_note().unwrap_or("").contains("Select a local item"));
+    b.compress_selection(0, ArchiveFormat::Zip);
+    assert!(b.last_note().unwrap_or("").contains("Select a local item"));
+}
+
+#[test]
+fn extract_here_refuses_path_traversal_members() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = temp.path().join("evil.tar");
+    std::fs::write(&archive, raw_tar_bytes("../escaped.txt", b"pwned")).expect("seed tar");
+    let dest = temp.path().join("dest");
+    std::fs::create_dir(&dest).expect("dest");
+    let rows = vec![FileRow::local("evil.tar", Mime::Archive, "1 KB", "now")
+        .with_path(archive.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.extract_here(0);
+    pump_until_idle(&mut b);
+    assert!(
+        !temp.path().join("escaped.txt").exists(),
+        "traversal member was not written beside the archive"
+    );
+    assert!(!dest.join("escaped.txt").exists());
+}
+
+#[test]
+fn cancel_compress_leaves_no_half_archive() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("blob.bin");
+    std::fs::write(&source, vec![b'A'; 64 * 1024]).expect("seed");
+    let rows =
+        vec![FileRow::local("blob.bin", Mime::Doc, "64 KB", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.compress_selection(0, ArchiveFormat::Zip);
+    let ids: Vec<_> = b.ops().active().iter().map(|op| op.op_id).collect();
+    for id in ids {
+        b.cancel_op(id);
+    }
+    pump_until_idle(&mut b);
+    let archive = temp.path().join("blob.zip");
+    if archive.exists() {
+        let bytes = std::fs::read(&archive).expect("read");
+        assert!(
+            bytes.starts_with(b"PK"),
+            "a finished archive is complete, never a half-write"
+        );
+    }
+}
+
+#[test]
+fn zip_and_tar_gz_round_trip_through_the_queue() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("payload.txt");
+    std::fs::write(&source, b"round-trip").expect("seed");
+    let rows =
+        vec![FileRow::local("payload.txt", Mime::Doc, "10 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.compress_selection(0, ArchiveFormat::Zip);
+    pump_until_idle(&mut b);
+    let zip = temp.path().join("payload.zip");
+    assert!(zip.is_file(), "zip archive written");
+
+    b.click(0, 0);
+    b.compress_selection(0, ArchiveFormat::TarGz);
+    pump_until_idle(&mut b);
+    let tgz = temp.path().join("payload.tar.gz");
+    assert!(tgz.is_file(), "tar.gz archive written");
+
+    let out = temp.path().join("out");
+    std::fs::create_dir(&out).expect("out");
+    let rows = vec![FileRow::local("payload.zip", Mime::Archive, "1 KB", "now")
+        .with_path(zip.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.open_extract_to(0);
+    b.set_extract_to_dest(out.to_string_lossy().into_owned());
+    b.submit_extract_to();
+    pump_until_idle(&mut b);
+    assert_eq!(
+        std::fs::read(out.join("payload.txt")).expect("extracted zip"),
+        b"round-trip"
+    );
+}
+
+#[test]
+fn symlink_escaping_a_mesh_mount_is_refused() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mount = temp.path().join("run/user/1000/mde-mesh/oak/docs");
+    std::fs::create_dir_all(&mount).expect("mount");
+    let source = mount.join("notes.txt");
+    std::fs::write(&source, b"notes").expect("seed");
+    let rows =
+        vec![FileRow::local("notes.txt", Mime::Doc, "5 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.open_symlink(0);
+    b.set_name_dialog_input("escape.link".to_string());
+    b.set_name_operation_for_test(NameOperation::Symlink {
+        target: PathBuf::from("/etc/passwd"),
+        parent: mount.clone(),
+    });
+    b.submit_name_dialog(0);
+    let error = b
+        .name_dialog()
+        .and_then(|d| d.error.as_deref())
+        .unwrap_or_else(|| b.last_note().unwrap_or(""));
+    assert!(
+        error.contains("escapes this mesh mount"),
+        "mesh-escape refused: {error}"
+    );
+}
+
+#[test]
+fn symlink_escape_helper_detects_a_target_outside_the_mount() {
+    let parent = Path::new("/run/user/1000/mde-mesh/oak/docs");
+    let link = parent.join("escape.link");
+    assert!(super::symlink_escapes_mesh(
+        parent,
+        &link,
+        Path::new("/etc/passwd")
+    ));
+    assert!(!super::symlink_escapes_mesh(
+        parent,
+        &link,
+        Path::new("/run/user/1000/mde-mesh/oak/docs/notes.txt")
+    ));
+}
+
+#[test]
+fn hardlink_across_devices_is_an_honest_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("report.txt");
+    std::fs::write(&source, b"report").expect("seed");
+    let rows =
+        vec![FileRow::local("report.txt", Mime::Doc, "6 B", "now")
+            .with_path(source.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.open_hard_link(0);
+    b.set_name_operation_for_test(NameOperation::HardLink {
+        target: source,
+        parent: PathBuf::from("/proc"),
+    });
+    b.set_name_dialog_input("mcnf-hl-test".to_string());
+    b.submit_name_dialog(0);
+    let error = b
+        .name_dialog()
+        .and_then(|d| d.error.as_deref())
+        .unwrap_or("");
+    assert!(
+        error.contains("across devices")
+            || error.contains("Couldn't create hard link")
+            || error.contains("Couldn't check the destination"),
+        "honest hardlink error: {error}"
+    );
+}
+
+#[test]
+fn folder_prefs_survive_restart_and_hostile_files_degrade() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let rows = vec![FileRow::local("a.txt", Mime::Doc, "1 B", "now").with_path("/work/a.txt")];
+    let mut b = live_posix_browser(rows.clone()).with_config_dir(temp.path());
+    b.navigate(0, Location::Local("/work".into()));
+    b.set_view(0, ViewMode::Grid);
+    b.toggle_hidden(0);
+    b.flush_persisted();
+    let stored = temp.path().join("files-folder-prefs.json");
+    assert!(stored.is_file());
+
+    let b2 = live_posix_browser(rows).with_config_dir(temp.path());
+    let prefs = b2.folder_prefs().get("/work").copied().expect("hydrated");
+    assert_eq!(prefs.view, ViewMode::Grid);
+    assert!(prefs.show_hidden);
+
+    let hostile = tempfile::tempdir().expect("hostile");
+    std::os::unix::fs::symlink("/tmp", hostile.path().join("files-folder-prefs.json"))
+        .expect("symlink");
+    let b3 = live_posix_browser(Vec::new()).with_config_dir(hostile.path());
+    assert!(b3.folder_prefs().is_empty());
+    assert!(
+        b3.last_note()
+            .is_some_and(|n| n.contains("symlink") || n.contains("defaults")),
+        "symlink prefs: {:?}",
+        b3.last_note()
+    );
+
+    let corrupt = tempfile::tempdir().expect("corrupt");
+    std::fs::write(corrupt.path().join("files-folder-prefs.json"), b"{nope").expect("write");
+    let err = load_folder_prefs_at(&corrupt.path().join("files-folder-prefs.json"))
+        .expect_err("corrupt JSON");
+    assert!(err.contains("not valid JSON") || err.contains("defaults"));
+
+    let oversize = tempfile::tempdir().expect("oversize");
+    std::fs::write(
+        oversize.path().join("files-folder-prefs.json"),
+        vec![b'x'; 256 * 1024 + 8],
+    )
+    .expect("write");
+    let err = load_folder_prefs_at(&oversize.path().join("files-folder-prefs.json"))
+        .expect_err("oversize");
+    assert!(err.contains("larger than"));
+}
+
+#[test]
+fn persistence_replaces_a_store_symlink_without_following_it() {
+    let dir = tempfile::tempdir().expect("store dir");
+    let target = dir.path().join("outside.json");
+    std::fs::write(&target, b"must stay untouched").expect("seed target");
+    let store = dir.path().join("files-folder-prefs.json");
+    std::os::unix::fs::symlink(&target, &store).expect("symlink store");
+
+    super::write_json_store(&store, &super::FolderPrefsFile::default()).expect("safe write");
+
+    assert_eq!(
+        std::fs::read(&target).expect("target"),
+        b"must stay untouched"
+    );
+    assert!(!std::fs::symlink_metadata(&store)
+        .expect("store")
+        .file_type()
+        .is_symlink());
+    assert!(load_folder_prefs_at(&store)
+        .expect("new store")
+        .entries
+        .is_empty());
+}
+
+#[test]
+fn bookmarks_pin_rename_reorder_and_refuse_hostile_input() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let folder = temp.path().join("Projects");
+    std::fs::create_dir(&folder).expect("mkdir");
+    let rows = vec![
+        FileRow::local("Projects", Mime::Folder, "\u{2014}", "\u{2014}")
+            .with_path(folder.to_string_lossy()),
+    ];
+    let mut b = live_posix_browser(rows).with_config_dir(temp.path());
+    b.click(0, 0);
+    b.pin_focused(0);
+    assert_eq!(b.bookmarks().len(), 1);
+    b.pin_focused(0);
+    assert!(
+        b.last_note().is_some_and(|n| n.contains("already pinned")),
+        "duplicate pin: {:?}",
+        b.last_note()
+    );
+    b.flush_persisted();
+    drop(b);
+
+    let other = temp.path().join("Docs");
+    std::fs::create_dir(&other).expect("mkdir");
+    let store = tempfile::tempdir().expect("bookmark store");
+    let rows = vec![
+        FileRow::local("Projects", Mime::Folder, "\u{2014}", "\u{2014}")
+            .with_path(folder.to_string_lossy()),
+        FileRow::local("Docs", Mime::Folder, "\u{2014}", "\u{2014}")
+            .with_path(other.to_string_lossy()),
+    ];
+    let mut b = live_posix_browser(rows).with_config_dir(store.path());
+    b.click(0, 0);
+    b.pin_focused(0);
+    b.click(0, 1);
+    b.pin_focused(0);
+    assert_eq!(b.bookmarks().len(), 2);
+    b.reorder_bookmark(1, -1);
+    assert_eq!(b.bookmarks()[0].path, folder.to_string_lossy());
+    b.open_rename_bookmark(0);
+    b.set_name_dialog_input("Documents".to_string());
+    b.submit_name_dialog(0);
+    assert_eq!(b.bookmarks()[0].label, "Documents");
+    b.unpin_bookmark(1);
+    assert_eq!(b.bookmarks().len(), 1);
+    b.flush_persisted();
+    drop(b);
+
+    let b2 = live_posix_browser(Vec::new()).with_config_dir(store.path());
+    assert_eq!(b2.bookmarks().len(), 1);
+    assert_eq!(b2.bookmarks()[0].label, "Documents");
+
+    let missing = load_bookmarks_at(Path::new("/no/such/files-bookmarks.json"));
+    assert!(missing
+        .expect("missing store is empty defaults")
+        .bookmarks
+        .is_empty());
+
+    let hostile = tempfile::tempdir().expect("hostile");
+    std::fs::write(hostile.path().join("files-bookmarks.json"), b"{").expect("write");
+    let note =
+        load_bookmarks_at(&hostile.path().join("files-bookmarks.json")).expect_err("corrupt");
+    assert!(note.contains("not valid JSON") || note.contains("defaults"));
+}
+
+#[test]
+fn bookmark_validate_refuses_peer_and_escaping_paths() {
+    assert!(super::validate_bookmark_path("peer:oak").is_err());
+    assert!(super::validate_bookmark_path("/tmp/../etc/passwd").is_err());
+    assert!(super::validate_bookmark_path("relative").is_err());
+    assert!(super::validate_bookmark_path("/home/me/docs").is_ok());
+    assert!(super::validate_bookmark_path("local:home").is_ok());
 }

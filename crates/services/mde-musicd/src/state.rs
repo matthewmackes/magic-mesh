@@ -523,7 +523,9 @@ pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
     // rejected roster replay cannot leave a half-admitted ownership update.
     admit_state_revision(&bp, state)?;
     let publish_authority = match read_state(dir) {
-        Some(current) if current.peer != state.peer && state.updated_ms < current.updated_ms => false,
+        Some(current) if current.peer != state.peer && state.updated_ms < current.updated_ms => {
+            false
+        }
         _ => {
             admit_state_revision(&state_path(dir), state)?;
             true
@@ -653,14 +655,7 @@ pub fn post_takeover(
     to_peer: Option<String>,
     now_ms: u64,
 ) -> std::io::Result<HandoffIntent> {
-    post_takeover_target(
-        dir,
-        from_peer,
-        to_peer,
-        "mesh_seat",
-        "",
-        now_ms,
-    )
+    post_takeover_target(dir, from_peer, to_peer, "mesh_seat", "", now_ms)
 }
 
 /// Persist a takeover intent for a concrete playback target. Legacy callers

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use super::{ShutdownToken, Worker};
 use super::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
+use super::{ShutdownToken, Worker};
 
 /// The rclone-backed music-library mount unit.
 pub const STORE_UNIT: &str = "mcnf-music-store.service";

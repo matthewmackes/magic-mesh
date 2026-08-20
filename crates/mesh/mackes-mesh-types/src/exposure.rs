@@ -265,10 +265,7 @@ pub fn render_caddyfile(cfg: &ExposureConfig, lighthouse: &str) -> String {
     out.push('\n');
     for (hostname, node, port) in sites {
         use std::fmt::Write as _;
-        let _ = writeln!(
-            out,
-            "{hostname} {{\n\treverse_proxy {node}.mesh:{port}\n}}"
-        );
+        let _ = writeln!(out, "{hostname} {{\n\treverse_proxy {node}.mesh:{port}\n}}");
     }
     out
 }

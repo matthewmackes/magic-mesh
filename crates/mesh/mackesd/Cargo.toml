@@ -539,6 +539,7 @@ assets = [
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
     { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },
     { source = "packaging/systemd/mcnf-boot-status.service", dest = "/usr/lib/systemd/system/mcnf-boot-status.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-lifecycle-firstboot.service", dest = "/usr/lib/systemd/system/mcnf-lifecycle-firstboot.service", mode = "644" },
     { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
     { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
     { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
@@ -671,11 +672,6 @@ assets = [
     # MDE_WORKGROUP_ROOT the unit sets, so GUI panels read the daemon's mount.
     { source = "packaging/environment.d/90-mde-workgroup.conf", dest = "/usr/lib/environment.d/90-mde-workgroup.conf", mode = "644" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
-    # EFF-43 / VV-1 — the voice-stack units, shipped DISABLED (the
-    # operator/fleet policy enables them; ExecStartPre regenerates the
-    # config set via `mackesd voice render-config`).
-    { source = "packaging/systemd/kamailio-mde.service",  dest = "/usr/lib/systemd/system/kamailio-mde.service",  mode = "644" },
-    { source = "packaging/systemd/rtpengine-mde.service", dest = "/usr/lib/systemd/system/rtpengine-mde.service", mode = "644" },
     # App launchers + the SVC-4 voice-agent autostart.
     { source = "packaging/applications/*.desktop", dest = "/usr/share/applications/",      mode = "644" },
     { source = "packaging/autostart/*.desktop",    dest = "/etc/xdg/autostart/",           mode = "644" },
@@ -901,7 +897,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
 # the grouped mackesd supervisor. Each process self-gates on the pinned role,
 # so enabling the target pre-enrollment is safe.
-systemctl enable mcnf-boot-status.service mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mcnf-boot-status.service mcnf-lifecycle-firstboot.service mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
 fi
@@ -1333,12 +1329,6 @@ libcanberra-gtk3 = "*"
 # control by default, while a minimal install degrades honestly and the headless
 # server variant stays free of desktop-seat helpers.
 playerctl = "*"
-# AUD6-6 — the shipped (disabled, operator-enabled per EFF-43)
-# kamailio-mde/rtpengine-mde units ExecStart these external binaries;
-# without them `systemctl start kamailio-mde` fails silently. Weak deps
-# so a default install carries them, opt-out-able like ansible-core.
-kamailio = "*"
-rtpengine = "*"
 # RCLICK-4 — the power menu's "Disk Management (Admin)" launches cosmic-disks;
 # weak (may be absent from some repos) so a default install pulls it but its
 # absence never blocks the install (the entry just no-ops if missing).
@@ -1416,6 +1406,7 @@ assets = [
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
     { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },
     { source = "packaging/systemd/mcnf-boot-status.service", dest = "/usr/lib/systemd/system/mcnf-boot-status.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-lifecycle-firstboot.service", dest = "/usr/lib/systemd/system/mcnf-lifecycle-firstboot.service", mode = "644" },
     { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
     { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
     { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
@@ -1502,7 +1493,7 @@ rm -f /etc/systemd/system/mackesd.service \
       /usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf || :
 rmdir /etc/systemd/system/mackesd.service.d /usr/lib/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
-systemctl enable mcnf-boot-status.service mackesd.target mcnf-cloud-arm-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mcnf-boot-status.service mcnf-lifecycle-firstboot.service mackesd.target mcnf-cloud-arm-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
 fi
@@ -1576,6 +1567,7 @@ assets = [
     { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
     { source = "install-helpers/mcnf-boot-status.sh", dest = "/usr/libexec/mackesd/mcnf-boot-status", mode = "755" },
     { source = "packaging/systemd/mcnf-boot-status.service", dest = "/usr/lib/systemd/system/mcnf-boot-status.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-lifecycle-firstboot.service", dest = "/usr/lib/systemd/system/mcnf-lifecycle-firstboot.service", mode = "644" },
     { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
     { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
     { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
@@ -1647,10 +1639,6 @@ assets = [
     { source = "packaging/systemd/mcnf-private-application-history.timer", dest = "/usr/lib/systemd/system/mcnf-private-application-history.timer", mode = "644" },
     { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
     { source = "packaging/environment.d/90-mde-workgroup.conf", dest = "/usr/lib/environment.d/90-mde-workgroup.conf", mode = "644" },
-    # EFF-43 / VV-1 — the voice-stack units (disabled; server-side render via
-    # `mackesd voice render-config`).
-    { source = "packaging/systemd/kamailio-mde.service",  dest = "/usr/lib/systemd/system/kamailio-mde.service",  mode = "644" },
-    { source = "packaging/systemd/rtpengine-mde.service", dest = "/usr/lib/systemd/system/rtpengine-mde.service", mode = "644" },
     # DISCLAIMER + license + notices.
     { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
     { source = "LICENSE",                          dest = "/usr/share/licenses/magic-mesh-server/LICENSE", mode = "644" },
@@ -1769,9 +1757,8 @@ qemu-img = "*"
 podman = "*"
 
 # XPA-6 — the headless variant's weak deps: the Server-tier shell-outs only.
-# Dropped vs the base: the desktop-only cosmic-disks, the voice binaries
-# (kamailio/rtpengine stay operator-enabled and aren't on a default Server), and
-# the libvirt GUI stack stays since a Server hosts compute.
+# Dropped vs the base: the desktop-only cosmic-disks and the libvirt GUI stack
+# stays since a Server hosts compute.
 [package.metadata.generate-rpm.variants.server.recommends]
 ansible-core = "*"
 libvirt-daemon-driver-qemu = "*"

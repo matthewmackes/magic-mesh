@@ -570,7 +570,11 @@ mod tests {
             ledger.submit(replay),
             Err(V2LedgerError::Duplicate(duplicate)) if duplicate == id
         ));
-        assert_eq!(ledger.get(id).unwrap(), job, "replay cannot replace the admitted row");
+        assert_eq!(
+            ledger.get(id).unwrap(),
+            job,
+            "replay cannot replace the admitted row"
+        );
 
         let paused = ledger
             .apply_control(id, TransferControlV2::Pause, 101)

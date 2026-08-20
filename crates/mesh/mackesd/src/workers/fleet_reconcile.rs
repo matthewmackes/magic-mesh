@@ -287,13 +287,13 @@ exec /usr/bin/sleep 600
             .await;
 
         assert!(root.path().join("wedged-started").is_file());
-        assert!(!reconciled, "a timed-out generation must never count as converged");
+        assert!(
+            !reconciled,
+            "a timed-out generation must never count as converged"
+        );
         assert!(
             worker
-                .run_reconcile_with_timeout(
-                    Path::new("/usr/bin/true"),
-                    Duration::from_secs(1),
-                )
+                .run_reconcile_with_timeout(Path::new("/usr/bin/true"), Duration::from_secs(1),)
                 .await,
             "the corrected-forward generation must run after the wedged child is killed"
         );

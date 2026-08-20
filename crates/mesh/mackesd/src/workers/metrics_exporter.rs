@@ -194,10 +194,7 @@ fn export_interval(tick: Duration) -> tokio::time::Interval {
     // Do not perform an immediate startup export: a daemon restart after a
     // slow scrape should wait for the next normal cadence, not join a burst
     // with the collector's just-written snapshot.
-    let mut interval = tokio::time::interval_at(
-        tokio::time::Instant::now() + tick,
-        tick,
-    );
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval
 }
@@ -612,9 +609,11 @@ mod tests {
         // A slow export must not cause the four missed periods to fire as a
         // burst; the next pass is scheduled one full cadence later.
         tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(tokio::time::timeout(Duration::from_nanos(1), interval.tick())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_nanos(1), interval.tick())
+                .await
+                .is_err()
+        );
         tokio::time::advance(Duration::from_millis(500)).await;
         interval.tick().await;
     }

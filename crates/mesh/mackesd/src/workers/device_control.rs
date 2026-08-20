@@ -317,9 +317,13 @@ fn validate_service_unit(unit: &str) -> Result<(), String> {
     if bytes.len() > 255
         || !unit.ends_with(".service")
         || !bytes.first().is_some_and(|b| b.is_ascii_alphanumeric())
-        || !bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'@' | b'.' | b'-'))
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'@' | b'.' | b'-'))
     {
-        return Err(format!("service unit `{unit}` is not a bounded service identifier"));
+        return Err(format!(
+            "service unit `{unit}` is not a bounded service identifier"
+        ));
     }
     Ok(())
 }
@@ -1038,7 +1042,10 @@ mod tests {
         let mut target = DeviceTarget::new("mde-shell-egui.service", category::NETWORK_ADAPTERS);
         let wrong_category = command_plan(DeviceControlOp::RestartService, &target)
             .expect_err("service action must stay in the service provider");
-        assert!(wrong_category.contains("not a published service"), "{wrong_category}");
+        assert!(
+            wrong_category.contains("not a published service"),
+            "{wrong_category}"
+        );
 
         target.category = category::SERVICES.into();
         target.name = "mde-shell-egui.service; reboot".into();

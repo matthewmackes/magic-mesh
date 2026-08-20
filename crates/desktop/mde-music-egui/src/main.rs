@@ -32,11 +32,7 @@ fn admitted_unprivileged_identity(status: &str) -> bool {
     let Some(Ok(filesystem)) = ids.next() else {
         return false;
     };
-    ids.next().is_none()
-        && real != 0
-        && real == effective
-        && real == saved
-        && real == filesystem
+    ids.next().is_none() && real != 0 && real == effective && real == saved && real == filesystem
 }
 
 fn validate_launch_authority() -> io::Result<()> {
@@ -76,7 +72,10 @@ mod tests {
             "Name:\tmde-music-egui\nUid:\t1000\t1000\t1000\n",
             "Name:\tmde-music-egui\n",
         ] {
-            assert!(!admitted_unprivileged_identity(status), "admitted {status:?}");
+            assert!(
+                !admitted_unprivileged_identity(status),
+                "admitted {status:?}"
+            );
         }
     }
 }

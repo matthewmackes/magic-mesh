@@ -989,9 +989,7 @@ fn load_cache(path: &Path) -> io::Result<Option<WeatherCache>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
-        || metadata.nlink() != 1
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() || metadata.nlink() != 1
     {
         return Err(io::Error::other(
             "weather cache must be a single-link regular non-symlink file",

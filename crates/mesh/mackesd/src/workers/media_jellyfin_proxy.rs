@@ -549,8 +549,7 @@ fn route_matches_current_authority(
     resolved: &GatewayRoute,
     current_sources: &[JellyfinGatewaySource],
 ) -> bool {
-    resolve_gateway_route(target, current_sources)
-        .is_ok_and(|current| current == *resolved)
+    resolve_gateway_route(target, current_sources).is_ok_and(|current| current == *resolved)
 }
 
 fn join_upstream_url(base: &str, suffix: &str) -> Option<String> {

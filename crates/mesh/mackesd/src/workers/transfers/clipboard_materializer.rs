@@ -224,13 +224,12 @@ impl ClipboardFilesMaterializer {
                 .lease_expires_at_ms
                 .min(request.envelope_expires_at_ms),
         );
-        self.commands
-            .insert(
-                command_key,
-                request
-                    .lease_expires_at_ms
-                    .min(request.envelope_expires_at_ms),
-            );
+        self.commands.insert(
+            command_key,
+            request
+                .lease_expires_at_ms
+                .min(request.envelope_expires_at_ms),
+        );
 
         let object = request
             .files_reference

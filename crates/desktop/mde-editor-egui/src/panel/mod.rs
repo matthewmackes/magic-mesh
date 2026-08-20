@@ -759,6 +759,34 @@ impl EditorSurface {
         self.doc().map(|doc| doc.buffer.rope().to_string())
     }
 
+    /// Replace the focused buffer's entire text in place, without opening a new
+    /// tab. Documents-mode share-session catch-up and the external-write
+    /// three-way merge use this so a live [`crate::CollabSession`] can stay
+    /// attached on the collab side.
+    pub fn replace_text(&mut self, text: &str) {
+        if let Some(doc) = self.doc_mut() {
+            let len = doc.buffer.len_chars();
+            if len > 0 {
+                doc.buffer.remove(0..len);
+            }
+            if !text.is_empty() {
+                doc.buffer.insert(0, text);
+            }
+            let caret = doc.buffer.len_chars();
+            doc.view.place_cursor(&doc.buffer, caret);
+        } else {
+            self.open_text(text);
+        }
+    }
+
+    /// Replay a collab follow-mode presence update onto the focused editor view.
+    pub fn apply_follow_update(&mut self, update: &crate::FollowUpdate) -> bool {
+        let Some(doc) = self.doc_mut() else {
+            return false;
+        };
+        crate::apply_follow(update, &mut doc.view, &doc.buffer)
+    }
+
     // ── EDITOR-6: the focused pane's active tab is the "current document" ─────
 
     /// The focused pane's active document — the "current document" every seam

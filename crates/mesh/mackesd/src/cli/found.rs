@@ -22,8 +22,10 @@ pub fn run(
     use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
     let root = mackesd_core::default_qnm_shared_root();
     let node_id = default_node_id();
-    let generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().max(1)).unwrap_or(1);
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .unwrap_or(1);
     let lifecycle_plan = LifecyclePlanV1 {
         schema_version: 1,
         request_id: format!("found-{node_id}-{generation}"),
@@ -32,17 +34,30 @@ pub fn run(
         generation,
         steps: vec!["mesh".into()],
     };
-    let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
-        .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for found: {error:?}"))?;
+    let mut authority =
+        mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+            .map_err(|error| {
+                anyhow::anyhow!("cannot acquire lifecycle authority for found: {error:?}")
+            })?;
     let result = authority.run_next(|_| {
-        run_inner(db_path, mesh_id, external_addr, role, enroll_port, with_backoffice)
-            .map_err(|error| error.to_string())
+        run_inner(
+            db_path,
+            mesh_id,
+            external_addr,
+            role,
+            enroll_port,
+            with_backoffice,
+        )
+        .map_err(|error| error.to_string())
     });
     if let Err(error) = result {
         let _ = authority.finish();
-        return Err(anyhow::anyhow!("found lifecycle authority recorded failure: {error:?}"));
+        return Err(anyhow::anyhow!(
+            "found lifecycle authority recorded failure: {error:?}"
+        ));
     }
-    authority.finish()
+    authority
+        .finish()
         .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))
 }
 
@@ -335,9 +350,7 @@ mod found_backoffice_tests {
         std::thread::Builder::new()
             .name("found-cli-parse".into())
             .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                Cli::try_parse_from(args).expect("found args should parse")
-            })
+            .spawn(move || Cli::try_parse_from(args).expect("found args should parse"))
             .expect("spawn parser helper")
             .join()
             .expect("parser helper should not panic")
@@ -428,7 +441,10 @@ mod found_backoffice_tests {
                 assert_eq!(mesh_id, "home-mesh");
                 assert_eq!(external_addr, "203.0.113.7");
                 assert_eq!(role, "lighthouse");
-                assert_eq!(with_backoffice.as_ref().and_then(|value| value.as_deref()), Some("full"));
+                assert_eq!(
+                    with_backoffice.as_ref().and_then(|value| value.as_deref()),
+                    Some("full")
+                );
             }
             _ => panic!("expected Found"),
         }

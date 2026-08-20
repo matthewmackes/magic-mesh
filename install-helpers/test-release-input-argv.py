@@ -79,7 +79,7 @@ def main() -> None:
             "bootc_base_digest_receipt": str(inputs / "bootc-receipt.json"),
             "bootc_base_image_reference": "registry.invalid/mcnf/bootc@sha256:" + "2" * 64,
             "bootc_base_architecture": "amd64",
-            "bootc_release_role": "unified-seat-server",
+            "bootc_release_role": "all-roles",
             "app_vm_base_image_receipt": str(inputs / "app-base-receipt.json"),
             "app_vm_catalog_receipt": str(inputs / "app-catalog.json"),
             "app_vm_base_image_reference": "registry.invalid/mcnf/app@sha256:" + "3" * 64,

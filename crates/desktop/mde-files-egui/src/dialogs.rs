@@ -13,9 +13,9 @@
 //!   offered **only when permitted** (`chown_permitted`), honestly disabled
 //!   otherwise (§7 — never a faked success).
 //! * [`NameDialog`] — the bounded single-component name entry shared by New
-//!   Folder and Rename. The model executes the accepted path through the same
-//!   injected [`FileOps`] authority as Properties; syscall failures remain
-//!   visible in the open dialog.
+//!   Folder, New File, Rename, and the Advanced link verbs. The model executes
+//!   the accepted path through the same injected [`FileOps`] authority as
+//!   Properties; syscall failures remain visible in the open dialog.
 //! * [`ConfirmDelete`] + [`Arming`] — the permanent-delete confirm (lock 3/6 —
 //!   no trash, no undo), with **typed-arming** (lock 19) layered on when the
 //!   deletion targets a remote / escalated mesh mount: the user must type the
@@ -47,6 +47,11 @@ pub enum NameOperation {
         /// Directory that receives the new child.
         parent: PathBuf,
     },
+    /// Create one empty regular file under `parent` (`O_CREAT|O_EXCL`).
+    NewFile {
+        /// Directory that receives the new child.
+        parent: PathBuf,
+    },
     /// Rename `source` to a sibling under `parent`.
     Rename {
         /// Existing path captured when the dialog opened.
@@ -56,9 +61,30 @@ pub enum NameOperation {
         /// Existing basename, used to reject an unchanged submission.
         original: String,
     },
+    /// Create a symlink `parent/name` pointing at `target`.
+    Symlink {
+        /// Existing path the new link points at.
+        target: PathBuf,
+        /// Directory that receives the new link.
+        parent: PathBuf,
+    },
+    /// Create a hard link `parent/name` to the existing file `target`.
+    HardLink {
+        /// Existing file the new name aliases.
+        target: PathBuf,
+        /// Directory that receives the new name.
+        parent: PathBuf,
+    },
+    /// Rename a persisted Places bookmark in place.
+    BookmarkRename {
+        /// Index into the user bookmark list.
+        index: usize,
+        /// Current label, used to reject an unchanged submission.
+        original: String,
+    },
 }
 
-/// Render-agnostic input and error state for New Folder / Rename.
+/// Render-agnostic input and error state for New Folder / New File / Rename / links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameDialog {
     /// The filesystem operation and its authoritative paths.
@@ -81,6 +107,16 @@ impl NameDialog {
         }
     }
 
+    /// Open a blank New File dialog for an already-resolved directory.
+    #[must_use]
+    pub fn new_file(parent: PathBuf) -> Self {
+        Self {
+            operation: NameOperation::NewFile { parent },
+            name: String::new(),
+            error: None,
+        }
+    }
+
     /// Open Rename prefilled with the entry's current name.
     #[must_use]
     pub fn rename(source: PathBuf, parent: PathBuf, original: String) -> Self {
@@ -95,12 +131,49 @@ impl NameDialog {
         }
     }
 
+    /// Open Create Symbolic Link prefilled with a sibling link name.
+    #[must_use]
+    pub fn symlink(target: PathBuf, parent: PathBuf, original: &str) -> Self {
+        Self {
+            operation: NameOperation::Symlink { target, parent },
+            name: format!("{original} link"),
+            error: None,
+        }
+    }
+
+    /// Open Create Hard Link prefilled with a sibling link name.
+    #[must_use]
+    pub fn hard_link(target: PathBuf, parent: PathBuf, original: &str) -> Self {
+        Self {
+            operation: NameOperation::HardLink { target, parent },
+            name: format!("{original} hardlink"),
+            error: None,
+        }
+    }
+
+    /// Open Rename Bookmark prefilled with the current label.
+    #[must_use]
+    pub fn bookmark_rename(index: usize, original: String) -> Self {
+        Self {
+            operation: NameOperation::BookmarkRename {
+                index,
+                original: original.clone(),
+            },
+            name: original,
+            error: None,
+        }
+    }
+
     /// Dialog title and affirmative button label.
     #[must_use]
     pub const fn labels(&self) -> (&'static str, &'static str) {
         match &self.operation {
             NameOperation::NewFolder { .. } => ("New Folder", "Create"),
+            NameOperation::NewFile { .. } => ("New File", "Create"),
             NameOperation::Rename { .. } => ("Rename", "Rename"),
+            NameOperation::Symlink { .. } => ("Create Symbolic Link", "Create"),
+            NameOperation::HardLink { .. } => ("Create Hard Link", "Create"),
+            NameOperation::BookmarkRename { .. } => ("Rename Bookmark", "Rename"),
         }
     }
 
@@ -129,7 +202,9 @@ impl NameDialog {
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
             return Some("Enter one name, without a path or slash.".to_string());
         }
-        if let NameOperation::Rename { original, .. } = &self.operation {
+        if let NameOperation::Rename { original, .. }
+        | NameOperation::BookmarkRename { original, .. } = &self.operation
+        {
             if &self.name == original {
                 return Some("Enter a different name.".to_string());
             }
@@ -144,9 +219,67 @@ impl NameDialog {
             return None;
         }
         let parent = match &self.operation {
-            NameOperation::NewFolder { parent } | NameOperation::Rename { parent, .. } => parent,
+            NameOperation::NewFolder { parent }
+            | NameOperation::NewFile { parent }
+            | NameOperation::Rename { parent, .. }
+            | NameOperation::Symlink { parent, .. }
+            | NameOperation::HardLink { parent, .. } => parent,
+            NameOperation::BookmarkRename { .. } => return None,
         };
         Some(parent.join(&self.name))
+    }
+}
+
+/// Extract-to destination: a writable directory path the archive unpacks into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractToDialog {
+    /// Archive being unpacked.
+    pub archive: PathBuf,
+    /// Destination directory the operator is editing.
+    pub dest: String,
+    /// The most recent preflight failure. Validation errors are derived live.
+    pub error: Option<String>,
+}
+
+impl ExtractToDialog {
+    /// Prefill extract-to with `dest` (typically `<archive-stem>` beside the archive).
+    #[must_use]
+    pub fn new(archive: PathBuf, dest: PathBuf) -> Self {
+        Self {
+            archive,
+            dest: dest.to_string_lossy().into_owned(),
+            error: None,
+        }
+    }
+
+    /// Refuse empty, NUL, and relative-escape destinations before FileOps.
+    #[must_use]
+    pub fn validation_error(&self) -> Option<String> {
+        let dest = self.dest.trim();
+        if dest.is_empty() {
+            return Some("Enter a destination folder.".to_string());
+        }
+        if dest.as_bytes().contains(&0) {
+            return Some("A path can't contain a NUL character.".to_string());
+        }
+        let path = Path::new(dest);
+        if !path.is_absolute() {
+            return Some("Enter an absolute destination path.".to_string());
+        }
+        for c in path.components() {
+            if matches!(c, Component::ParentDir) {
+                return Some("The destination can't walk above its root.".to_string());
+            }
+        }
+        None
+    }
+
+    /// The destination directory after successful validation.
+    #[must_use]
+    pub fn target(&self) -> Option<PathBuf> {
+        self.validation_error()
+            .is_none()
+            .then(|| PathBuf::from(self.dest.trim()))
     }
 }
 
@@ -783,6 +916,35 @@ mod tests {
             dialog.target(),
             Some(PathBuf::from("/work/report-final.txt"))
         );
+    }
+
+    #[test]
+    fn new_file_and_link_dialogs_share_the_bounded_name_rules() {
+        let mut dialog = NameDialog::new_file(PathBuf::from("/work"));
+        assert_eq!(dialog.labels(), ("New File", "Create"));
+        dialog.name = "notes.txt".to_string();
+        assert_eq!(dialog.target(), Some(PathBuf::from("/work/notes.txt")));
+
+        let link = NameDialog::symlink(
+            PathBuf::from("/work/notes.txt"),
+            PathBuf::from("/work"),
+            "notes.txt",
+        );
+        assert_eq!(link.labels().0, "Create Symbolic Link");
+        assert!(link.name.contains("link"));
+    }
+
+    #[test]
+    fn extract_to_refuses_relative_and_escaping_destinations() {
+        let mut dialog =
+            ExtractToDialog::new(PathBuf::from("/work/a.zip"), PathBuf::from("/work/a"));
+        assert_eq!(dialog.validation_error(), None);
+        dialog.dest = "relative".to_string();
+        assert!(dialog.validation_error().is_some());
+        dialog.dest = "/work/../escaped".to_string();
+        assert!(dialog.validation_error().is_some());
+        dialog.dest = "/work/out".to_string();
+        assert_eq!(dialog.target(), Some(PathBuf::from("/work/out")));
     }
 
     // ── ConfirmDelete + typed-arming ─────────────────────────────────────────

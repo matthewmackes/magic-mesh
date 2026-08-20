@@ -229,9 +229,7 @@ fn validate_active_condition_continuity(
             .active_conditions
             .iter()
             .chain(candidate.resolved_conditions.iter())
-            .find(|condition| {
-                condition.id == retained.id && condition.scope == retained.scope
-            });
+            .find(|condition| condition.id == retained.id && condition.scope == retained.scope);
         let continuous = successor.is_some_and(|condition| {
             same_condition_provenance(retained, condition)
                 && condition.last_observed_ms >= retained.last_observed_ms
@@ -1330,12 +1328,7 @@ pub fn reconcile_with_conn(
         if node.node_id == local_node_id {
             continue;
         }
-        let next = health_for_peer(
-            &health_authority,
-            workgroup_root,
-            &node.node_id,
-            now_ms,
-        );
+        let next = health_for_peer(&health_authority, workgroup_root, &node.node_id, now_ms);
         let next_str = match next {
             HealthState::Healthy => "healthy",
             HealthState::Degraded => "degraded",
@@ -1587,9 +1580,9 @@ mod tests {
     use crate::store::{open_in_memory, upsert_node};
     use crate::telemetry::{write_heartbeat, HEARTBEAT_INTERVAL_S};
     use mackes_mesh_types::health::{
-        ExpectedReturn, GradeFactors, HealthComponent, HealthEvidence, HealthScope,
-        HealthSeverity, NodeAvailabilityIntent, NodeAvailabilityState, NodeConnectionType,
-        NodeDeviceClass, NodeGrade, RequirementClass, HEALTH_SCHEMA_VERSION,
+        ExpectedReturn, GradeFactors, HealthComponent, HealthEvidence, HealthScope, HealthSeverity,
+        NodeAvailabilityIntent, NodeAvailabilityState, NodeConnectionType, NodeDeviceClass,
+        NodeGrade, RequirementClass, HEALTH_SCHEMA_VERSION,
         NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
     };
     use mde_bus::hooks::config::Priority;
@@ -1804,8 +1797,7 @@ mod tests {
         let workgroup = tempfile::tempdir().expect("workgroup");
         let health_root = workgroup.path().join("system-mesh-health");
         std::fs::create_dir_all(&health_root).expect("health root");
-        std::fs::write(health_root.join("nodes"), b"not a directory")
-            .expect("regular file parent");
+        std::fs::write(health_root.join("nodes"), b"not a directory").expect("regular file parent");
 
         let state = health_publication("node-a", 1, 100);
         let error = project_health_state(workgroup.path(), &state)

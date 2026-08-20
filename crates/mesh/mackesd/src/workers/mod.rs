@@ -129,9 +129,9 @@ pub use mde_worker_core::{ShutdownToken, Worker};
 // bodies as Phase B fills in.
 /// WL-FUNC-020 S1 — signed Android catalog import and admitted-state authority.
 pub mod android_catalog;
+pub mod ansible_pull;
 /// WL-FUNC-018 S2 — signed Flatpak catalog admission and installed-app projection.
 pub mod app_catalog;
-pub mod ansible_pull;
 // EPIC-SYNC-APP-CONFIG (Q26) — native-Rust app-config sync
 // (Sublime Music / Delfin). Replaces the retired `media_sync`
 // subprocess worker + the Python `media_sync_daemon.py` it drove.
@@ -172,9 +172,9 @@ pub mod reconcile;
 // re-probe without polling). Quietly skips peers without a
 // heartbeat file (peer hasn't enrolled yet) and the local peer
 // (heartbeat-self is unreachable by definition).
-pub mod health_reconciler;
 /// WL-FUNC-022 S2 — daemon-owned local Clock persistence and deadline authority.
 pub mod clock;
+pub mod health_reconciler;
 /// WL-FUNC-017 S6 — bounded daemon-owned route/navigation authority.
 pub mod navigation;
 /// WL-UX-013 — bounded daemon-side admission for node availability intent.
@@ -452,9 +452,9 @@ pub mod probe;
 // SUBAUDIT-D2 — the missing PeerProbe producer: gathers this node's
 // hardware probe + writes it to the replicated directory so the
 // Workbench Hardware panel renders the fleet. Spawned in run_serve.
-pub mod hardware_probe;
 /// WL-UX-011 — read-only, fail-closed PipeWire/WirePlumber audio provider.
 pub mod audio_provider;
+pub mod hardware_probe;
 /// WL-UX-011 — read-only, fail-closed portal/polkit/kernel privacy provider.
 pub mod privacy_provider;
 /// WL-UX-011 — read-only, fail-closed NetworkManager Wi-Fi provider.
@@ -803,6 +803,10 @@ pub mod chat;
 // will EVENTUALLY replace (Phase 4; it runs ALONGSIDE chat for now). Bus + actor
 // -log roots are injectable seams so the whole flow is headless-testable.
 pub mod collab;
+// WL-FUNC-024 S2 — one-to-one P2P offer/answer media plane. The collab media
+// verifier remains a sidecar; this worker binds seat audio and publishes
+// `state/calls/media/<session>`.
+pub(crate) mod call_media;
 pub(crate) mod collab_media;
 // CHAT-FIX-2 — the local-notification producer worker (design
 // docs/design/console-frontdoor.md Q34/46/47). The real empty-Chat fix: with the
@@ -1154,8 +1158,7 @@ impl Drop for WorkerOwnerLease {
 }
 
 fn canonical_worker_identity(name: &'static str) -> &'static str {
-    crate::worker_role::runtime_spec(name)
-        .map_or(name, |spec| spec.name)
+    crate::worker_role::runtime_spec(name).map_or(name, |spec| spec.name)
 }
 
 fn acquire_group_owner_lease(
@@ -1977,11 +1980,9 @@ mod tests {
         std::fs::File::create(&target).expect("target file");
         symlink(&target, owner_root.path().join("control.lock")).expect("symlink lock leaf");
 
-        let error = acquire_group_owner_lease(
-            owner_root.path(),
-            crate::worker_role::WorkerGroup::Control,
-        )
-        .expect_err("a process-group lease must not follow a symlink");
+        let error =
+            acquire_group_owner_lease(owner_root.path(), crate::worker_role::WorkerGroup::Control)
+                .expect_err("a process-group lease must not follow a symlink");
         assert!(error.to_string().contains("not a regular file"));
     }
 

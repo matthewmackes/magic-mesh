@@ -507,11 +507,7 @@ impl Shared {
     /// renderer, while preserving any still-queued tail of the preceding
     /// logical track. Returns `false` once even one frame from this source has
     /// become audible, because a byte-zero fallback would then replay audio.
-    fn discard_inaudible_candidate(
-        &self,
-        candidate_start: u64,
-        rendered_before: u64,
-    ) -> bool {
+    fn discard_inaudible_candidate(&self, candidate_start: u64, rendered_before: u64) -> bool {
         let mut ring = self
             .ring
             .lock()
@@ -2101,9 +2097,7 @@ mod tests {
         // candidate reached the renderer, so its samples must be withdrawn
         // without discarding the preceding track or suppressing fallback.
         let shared = Shared {
-            ring: Mutex::new(VecDeque::from([
-                0.1, -0.1, 0.2, -0.2, 0.8, -0.8, 0.9, -0.9,
-            ])),
+            ring: Mutex::new(VecDeque::from([0.1, -0.1, 0.2, -0.2, 0.8, -0.8, 0.9, -0.9])),
             volume: AtomicU32::new(1.0_f32.to_bits()),
             playing: AtomicBool::new(true),
             stop: AtomicBool::new(false),

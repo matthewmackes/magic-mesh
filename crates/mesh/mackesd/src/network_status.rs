@@ -491,11 +491,7 @@ mod tests {
     #[test]
     fn hostile_network_provider_cannot_pin_the_observation_worker() {
         let started = Instant::now();
-        let output = run_status_command(
-            "sh",
-            &["-c", "exec sleep 60"],
-            Duration::from_millis(100),
-        );
+        let output = run_status_command("sh", &["-c", "exec sleep 60"], Duration::from_millis(100));
 
         assert!(output.is_none(), "timed-out provider must be unavailable");
         assert!(

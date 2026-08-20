@@ -3836,7 +3836,10 @@ mod tests {
             ),
             0
         );
-        assert!(cursor.is_none(), "failed checkpoint must not advance the cursor");
+        assert!(
+            cursor.is_none(),
+            "failed checkpoint must not advance the cursor"
+        );
         assert!(
             persist
                 .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)

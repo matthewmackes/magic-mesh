@@ -178,7 +178,10 @@ fn unambiguous_server_records(records: &[MediaServerRecord]) -> Vec<MediaServerR
     let mut conflicted = Vec::<String>::new();
 
     for record in records.iter().filter_map(MediaServerRecord::validated) {
-        if conflicted.iter().any(|endpoint| endpoint == &record.endpoint) {
+        if conflicted
+            .iter()
+            .any(|endpoint| endpoint == &record.endpoint)
+        {
             continue;
         }
         if let Some(existing) = accepted

@@ -94,12 +94,23 @@ mod transfers;
 #[cfg(test)]
 mod tests;
 
+pub use activity::{
+    ActivityAdminData, ActivityAdminSnapshot, GatewayCommand, GatewayReadout, GatewaySink,
+    VoiceAdminCommand, VoiceAdminSink, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid,
+    VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState, VoiceSharedOutbound,
+    VOICE_DID_ROUTE_TOPIC, VOICE_FAILOVER_TOPIC, VOICE_PROVISION_TOPIC, VOICE_SHARED_CONFIG_TOPIC,
+    VOIP_CLEAR_GATEWAY_TOPIC, VOIP_GET_GATEWAY_TOPIC, VOIP_SET_GATEWAY_TOPIC,
+};
 pub use data::{
     amend_affordance, relative_age, AmendAffordance, CollabData, CommandSink, EDIT_WINDOW_MS,
 };
 pub use documents::{DocSubMode, DocTemplate, DocView};
 pub use fixture::FixtureData;
 pub use icons::ALL_COLLAB_ICONS;
+pub use transfers::{
+    clear_transfers_hotkey_intent, request_new_transfer, request_open_transfers, SyncPairCommand,
+    SyncPairView,
+};
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -503,6 +514,24 @@ pub struct CommunicationsSurface {
     /// Session-scoped local clipboard publication preference. The shell owns
     /// the provider; this mirrors the setting into the Mesh Teams Settings UI.
     clipboard_publishing_enabled: bool,
+    /// Transfers-mode editor drafts (create/edit). Not a pair store.
+    transfers_ui: transfers::TransfersUi,
+    /// Optional worker projection of saved sync pairs. Empty by default; the
+    /// shell later binds the daemon store. Never a second scheduler.
+    sync_pair_views: Vec<transfers::SyncPairView>,
+    /// Local sync-pair write sink (Save/Remove). Tests assert; the shell drains
+    /// onto `TransferVerb::{SaveSyncPair, RemoveSyncPair}`.
+    sync_pair_sink: transfers::SyncPairSink,
+    /// Local fleet-voice admin sink. Tests assert; the shell drains onto
+    /// `action/voice/*`.
+    pub(crate) voice_admin_sink: VoiceAdminSink,
+    /// Local SIP-gateway sink. Tests assert; the shell drains onto
+    /// `action/voip/*`.
+    pub(crate) gateway_sink: GatewaySink,
+    /// Retained `state/voice/*` / redacted gateway snapshot the shell binds.
+    /// Empty by default so the panels stay honestly empty without a provisioned
+    /// account.
+    activity_admin: ActivityAdminSnapshot,
 }
 
 impl CommunicationsSurface {
@@ -599,6 +628,45 @@ impl CommunicationsSurface {
     pub fn open_editor(&mut self) {
         self.documents.prepare_direct_entry();
         self.set_mode(Mode::Documents);
+    }
+
+    /// Open Communications in Transfers mode (Ctrl+J).
+    pub fn open_transfers(&mut self) {
+        self.set_mode(Mode::Transfers);
+    }
+
+    /// Open Transfers mode and start a new sync-pair / transfer draft (Ctrl+N).
+    pub fn begin_new_transfer(&mut self) {
+        self.set_mode(Mode::Transfers);
+        self.transfers_ui.begin_new();
+    }
+
+    /// Bind the worker's sync-pair projection for this frame. Empty by default.
+    pub fn set_sync_pair_views(&mut self, views: Vec<transfers::SyncPairView>) {
+        self.sync_pair_views = views;
+    }
+
+    /// Drain editor-emitted sync-pair commands (tests + future shell Bus drain).
+    #[must_use]
+    pub fn drain_sync_pair_commands(&mut self) -> Vec<transfers::SyncPairCommand> {
+        self.sync_pair_sink.drain()
+    }
+
+    /// Drain Activity fleet-voice verbs for the shell to publish.
+    #[must_use]
+    pub fn drain_voice_admin_commands(&mut self) -> Vec<VoiceAdminCommand> {
+        self.voice_admin_sink.drain()
+    }
+
+    /// Drain Activity SIP-gateway verbs for the shell to publish.
+    #[must_use]
+    pub fn drain_gateway_commands(&mut self) -> Vec<GatewayCommand> {
+        self.gateway_sink.drain()
+    }
+
+    /// Bind the retained fleet-voice / SIP-gateway snapshot for this frame.
+    pub fn set_activity_admin(&mut self, admin: ActivityAdminSnapshot) {
+        self.activity_admin = admin;
     }
 
     /// Switch the Teams-style app route.
@@ -780,6 +848,21 @@ impl CommunicationsSurface {
             self.car_bias_applied = false;
         }
 
+        match transfers::take_transfers_hotkey_intent() {
+            Some(transfers::TransfersHotkey::Open) => self.open_transfers(),
+            Some(transfers::TransfersHotkey::New) if self.mode == Mode::Transfers => {
+                self.transfers_ui.begin_new();
+            }
+            Some(transfers::TransfersHotkey::New) | None => {}
+        }
+        if !ui.ctx().wants_keyboard_input()
+            && ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::J))
+        {
+            self.open_transfers();
+        }
+
         // Construct owns one shared workspace identity strip. The channel/app
         // header below remains Mesh Teams domain chrome; it must not also carry
         // the host workspace title or shell session control.
@@ -866,7 +949,10 @@ impl CommunicationsSurface {
             return;
         }
         match self.mode {
-            Mode::Activity => self.activity_body(ui, data),
+            Mode::Activity => {
+                let admin = self.activity_admin.clone();
+                crate::activity::activity_body_with_admin(self, ui, data, &admin);
+            }
             Mode::Messages => self.messages_body(ui, data, sink),
             Mode::Calls => self.calls_body(ui, data, sink),
             Mode::Tasks => self.tasks_body(ui, data, sink),

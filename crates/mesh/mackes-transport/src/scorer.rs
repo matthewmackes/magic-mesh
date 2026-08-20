@@ -230,9 +230,8 @@ pub fn score(
     let scored: Vec<(f32, TransportKind)> = candidates
         .iter()
         .map(|s| {
-            let base = f32::from(
-                u16::try_from(*rank_of.get(&s.kind).unwrap_or(&99)).unwrap_or(u16::MAX),
-            );
+            let base =
+                f32::from(u16::try_from(*rank_of.get(&s.kind).unwrap_or(&99)).unwrap_or(u16::MAX));
             let weighted = base * class_weight;
             // Degraded penalty must dominate any base*weight
             // outcome so a Degraded transport always loses to a

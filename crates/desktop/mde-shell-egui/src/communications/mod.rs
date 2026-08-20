@@ -19,7 +19,9 @@
 //!   * [`CommunicationsState`] owns the surface + the data source, refreshes the
 //!     fold on a poll cadence while in view, and drains the surface's emitted
 //!     commands onto `action/collab/<verb>` ([`topics::command_topic_for`]) so the
-//!     collab worker applies them.
+//!     collab worker applies them. Activity fleet-voice and SIP-gateway verbs
+//!     drain onto `action/voice/*` and `action/voip/*` with the same privileged
+//!     action envelope the workers already authorize.
 //!
 //! Activity + Messages are live (the surface implements them in full); the
 //! labeled-for-later modes stay labeled — no faked data (§7). Live multi-node
@@ -28,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "drm")]
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,8 +47,14 @@ use mde_egui::{egui, TextClipboard};
 #[cfg(feature = "drm")]
 use mde_egui::{ClipboardClientPoll, LocalClipboardOffer, RichClipboardClient};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
-use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface, Mode};
+use mde_collab_egui::{
+    ActivityAdminSnapshot, CollabData, CommandSink, CommunicationsSurface, GatewayCommand,
+    GatewayReadout, Mode, SyncPairCommand, SyncPairView, VoiceAdminCommand, VoiceCutoverPhase,
+    VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState,
+    VoiceSharedOutbound, VOIP_GET_GATEWAY_TOPIC,
+};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
     clipboard_clip_id, ActivityFeed, ActorId, AlertInbox, CallState, ChannelTasks,
@@ -67,6 +76,30 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// hand-authored Bus mirror; the UI boundary still must not paint or scan an
 /// unbounded feed on low-end hardware.
 const MAX_ACTIVITY_FEED_ENTRIES: usize = 1024;
+
+/// Per-node fleet-board prefix published by `voice_provision`.
+const VOICE_STATE_PREFIX: &str = "state/voice/";
+/// Master-account DID inventory (fleet-wide, not under the per-node prefix).
+const VOICE_DIDS_TOPIC: &str = "state/voice-dids";
+/// Leader-held shared-outbound mirror.
+const VOICE_SHARED_TOPIC: &str = "state/voice-shared";
+/// Fleet cutover status.
+const VOICE_CUTOVER_TOPIC: &str = "state/voice-cutover";
+/// Closed capability node scope for Voice mutations (`voice_provision`).
+const VOICE_AUTH_NODE: &str = "voice";
+const VOICE_PROVISION_AUTH_VERB: &str = "voice-provision";
+const VOICE_DID_ROUTE_AUTH_VERB: &str = "voice-did-route";
+const VOICE_FAILOVER_AUTH_VERB: &str = "voice-failover";
+const VOICE_SHARED_CONFIG_AUTH_VERB: &str = "voice-shared-config";
+/// Closed capability node scope for VoIP gateway mutations (`ipc/voip`).
+const VOIP_ACTION_NODE_SCOPE: &str = "voip";
+const VOIP_GATEWAY_TARGET: &str = "gateway";
+/// Observational HUD snapshot — not a fleet-board [`VoiceNodeProjection`].
+const VOICE_HUD_STATUS_SUFFIX: &str = "status";
+/// Bound the fleet board so a hostile retained prefix cannot stall paint.
+const MAX_VOICE_NODE_ROWS: usize = 512;
+/// Hard ceiling for one transfer inbox verb (matches the daemon parser).
+const MAX_TRANSFER_VERB_BYTES: usize = 1024 * 1024;
 
 /// Seat-local read cursors. This topic deliberately lives outside the
 /// replicated `state/collab/*` namespace: read position is a UI preference for
@@ -107,6 +140,224 @@ fn now_unix_ms() -> i64 {
 fn read_state<T: DeserializeOwned>(persist: &Persist, topic: &str) -> Option<T> {
     let msg = persist.read_latest(topic).ok().flatten()?;
     serde_json::from_str(&msg.body?).ok()
+}
+
+fn read_latest_json(persist: &Persist, topic: &str) -> Option<serde_json::Value> {
+    let msg = persist.read_latest(topic).ok().flatten()?;
+    serde_json::from_str(&msg.body?).ok()
+}
+
+/// Fold retained Voice fleet-board + DID/shared/cutover mirrors. Gateway
+/// readout is RPC (`get-gateway`) and is bound separately.
+fn fold_voice_admin(persist: &Persist) -> ActivityAdminSnapshot {
+    let mut voice_nodes = Vec::new();
+    if let Ok(topics) = persist.list_topics_with_prefix(VOICE_STATE_PREFIX) {
+        for topic in topics {
+            let Some(suffix) = topic.strip_prefix(VOICE_STATE_PREFIX) else {
+                continue;
+            };
+            if suffix.is_empty() || suffix == VOICE_HUD_STATUS_SUFFIX {
+                continue;
+            }
+            if let Some(node) = read_latest_json(persist, &topic).and_then(parse_voice_node) {
+                voice_nodes.push(node);
+            }
+            if voice_nodes.len() >= MAX_VOICE_NODE_ROWS {
+                break;
+            }
+        }
+    }
+    voice_nodes.sort_by(|a, b| {
+        a.hostname
+            .cmp(&b.hostname)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    ActivityAdminSnapshot {
+        voice_nodes,
+        voice_dids: read_latest_json(persist, VOICE_DIDS_TOPIC)
+            .and_then(parse_voice_dids)
+            .unwrap_or_default(),
+        voice_shared: read_latest_json(persist, VOICE_SHARED_TOPIC).and_then(parse_voice_shared),
+        voice_cutover: read_latest_json(persist, VOICE_CUTOVER_TOPIC).and_then(parse_voice_cutover),
+        gateway: None,
+    }
+}
+
+fn parse_voice_node(value: serde_json::Value) -> Option<VoiceNodeProjection> {
+    let obj = value.as_object()?;
+    let node_id = obj.get("node_id")?.as_str()?.to_owned();
+    if node_id.trim().is_empty() {
+        return None;
+    }
+    Some(VoiceNodeProjection {
+        node_id,
+        hostname: json_string(obj, "hostname"),
+        username: json_string(obj, "username"),
+        sip_uri: json_string(obj, "sip_uri"),
+        reg_state: parse_reg_state(obj)?,
+        routed_dids: obj
+            .get("routed_dids")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        failover: obj.get("failover").and_then(parse_failover),
+        updated_at_s: obj
+            .get("updated_at_s")
+            .and_then(serde_json::Value::as_u64)?,
+    })
+}
+
+fn parse_reg_state(obj: &serde_json::Map<String, serde_json::Value>) -> Option<VoiceRegState> {
+    match obj.get("state")?.as_str()? {
+        "registered" => Some(VoiceRegState::Registered),
+        "unregistered" => Some(VoiceRegState::Unregistered),
+        "provisioning" => Some(VoiceRegState::Provisioning),
+        "error" => Some(VoiceRegState::Error {
+            reason: json_string(obj, "reason"),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_failover(value: &serde_json::Value) -> Option<VoiceFailoverPolicy> {
+    if let Some(tag) = value.as_str() {
+        return match tag {
+            "Voicemail" => Some(VoiceFailoverPolicy::Voicemail),
+            "None" => Some(VoiceFailoverPolicy::None),
+            _ => None,
+        };
+    }
+    let obj = value.as_object()?;
+    let forward = obj.get("Forward")?.as_object()?;
+    Some(VoiceFailoverPolicy::Forward {
+        number: json_string(forward, "number"),
+    })
+}
+
+fn parse_voice_dids(value: serde_json::Value) -> Option<Vec<VoiceDid>> {
+    let rows = value.as_array()?;
+    let mut dids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let obj = row.as_object()?;
+        let number = obj.get("number")?.as_str()?.to_owned();
+        if number.trim().is_empty() {
+            continue;
+        }
+        dids.push(VoiceDid {
+            number,
+            routed_to: obj
+                .get("routed_to")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    Some(dids)
+}
+
+fn parse_voice_shared(value: serde_json::Value) -> Option<VoiceSharedOutbound> {
+    let obj = value.as_object()?;
+    Some(VoiceSharedOutbound {
+        caller_id: json_string(obj, "caller_id"),
+        outbound_trunk: json_string(obj, "outbound_trunk"),
+    })
+}
+
+fn parse_voice_cutover(value: serde_json::Value) -> Option<VoiceCutoverStatus> {
+    let obj = value.as_object()?;
+    Some(VoiceCutoverStatus {
+        phase: parse_cutover_phase(obj.get("phase")?.as_str()?)?,
+        total_nodes: obj.get("total_nodes").and_then(json_usize)?,
+        reprovisioned: obj.get("reprovisioned").and_then(json_usize)?,
+        pending_nodes: obj
+            .get("pending_nodes")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        shared_outbound_lifted: obj.get("shared_outbound_lifted")?.as_bool()?,
+        updated_at_s: obj.get("updated_at_s")?.as_u64()?,
+    })
+}
+
+fn parse_cutover_phase(wire: &str) -> Option<VoiceCutoverPhase> {
+    match wire {
+        "legacy" => Some(VoiceCutoverPhase::Legacy),
+        "lifted-shared-outbound" => Some(VoiceCutoverPhase::LiftedSharedOutbound),
+        "nodes-reprovisioning" => Some(VoiceCutoverPhase::NodesReprovisioning),
+        "cutover-complete" => Some(VoiceCutoverPhase::CutoverComplete),
+        _ => None,
+    }
+}
+
+fn json_usize(value: &serde_json::Value) -> Option<usize> {
+    value.as_u64().and_then(|n| usize::try_from(n).ok())
+}
+
+fn json_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn parse_gateway_readout(body: &str) -> Option<GatewayReadout> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = value.as_object()?;
+    if obj.contains_key("error") {
+        return None;
+    }
+    if obj.get("present").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Some(GatewayReadout::absent());
+    }
+    Some(GatewayReadout::present(
+        json_string(obj, "host"),
+        obj.get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+            .unwrap_or(5060),
+        json_string(obj, "username"),
+        obj.get("password_set")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        json_string(obj, "display_name"),
+        obj.get("expires")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(3600),
+    ))
+}
+
+fn with_action_schema(body: &str) -> Result<String, String> {
+    let mut document: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("Invalid mutation request body: {e}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "Mutation request body is not a JSON object.".to_string())?;
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+    );
+    serde_json::to_string(&document).map_err(|e| format!("serialize mutation request: {e}"))
+}
+
+fn voice_auth(command: &VoiceAdminCommand) -> (&'static str, String) {
+    match command {
+        VoiceAdminCommand::Provision | VoiceAdminCommand::Cutover => {
+            (VOICE_PROVISION_AUTH_VERB, "fleet".to_owned())
+        }
+        VoiceAdminCommand::DidRoute { did, .. } => (VOICE_DID_ROUTE_AUTH_VERB, did.clone()),
+        VoiceAdminCommand::Failover { node_id, .. } => (VOICE_FAILOVER_AUTH_VERB, node_id.clone()),
+        VoiceAdminCommand::SharedConfig { .. } => {
+            (VOICE_SHARED_CONFIG_AUTH_VERB, "fleet".to_owned())
+        }
+    }
 }
 
 /// Remove Clock mutation capabilities from the retained collaboration mirror.
@@ -725,6 +976,9 @@ pub(crate) struct LiveCollabData {
     read_cursors: HashMap<SpaceId, mde_collab_types::ActorClock>,
     /// The last fold time; the poll self-throttles to [`REFRESH`].
     last_poll: Option<Instant>,
+    /// Retained Voice fleet-board + DID/shared/cutover snapshot. Gateway
+    /// readout is RPC and lives on [`CommunicationsState`].
+    activity_admin: ActivityAdminSnapshot,
 }
 
 impl LiveCollabData {
@@ -751,6 +1005,7 @@ impl LiveCollabData {
             document_sessions: HashMap::new(),
             read_cursors: HashMap::new(),
             last_poll: None,
+            activity_admin: ActivityAdminSnapshot::default(),
         }
     }
 
@@ -797,6 +1052,7 @@ impl LiveCollabData {
             self.clipboard_lanes.clear();
             self.document_sessions.clear();
             self.read_cursors.clear();
+            self.activity_admin = ActivityAdminSnapshot::default();
             return;
         };
 
@@ -926,6 +1182,7 @@ impl LiveCollabData {
         self.alert_inbox = alert_inbox;
         self.clipboard_lanes = clipboard_lanes;
         self.document_sessions = document_sessions;
+        self.activity_admin = fold_voice_admin(&persist);
     }
 
     /// Advance a seat-local cursor to the newest activity currently visible in
@@ -1071,6 +1328,20 @@ pub(crate) struct CommunicationsState {
     /// reader's copy because publishing needs the open/write error text; the
     /// fail-soft `BusReader` swallows it).
     bus_root: Option<PathBuf>,
+    /// Latest redacted `get-gateway` readout, when a reply has arrived.
+    gateway_readout: Option<GatewayReadout>,
+    /// Correlation ULID of an in-flight `get-gateway` request.
+    pending_gateway_get: Option<String>,
+    /// Last time a `get-gateway` request was published.
+    last_gateway_get: Option<Instant>,
+    /// Force a `get-gateway` after a set/clear so the readout catches the write.
+    gateway_get_dirty: bool,
+    /// Worker-projected sync-pair rows read from the node-local store.
+    sync_pair_views: Vec<SyncPairView>,
+    /// Last time the sync-pair store was folded into [`sync_pair_views`].
+    last_sync_pair_poll: Option<Instant>,
+    /// Re-fold sync pairs on the next Transfers paint after a Save/Remove verb.
+    sync_pair_views_dirty: bool,
 }
 
 impl Default for CommunicationsState {
@@ -1089,6 +1360,13 @@ impl CommunicationsState {
             data: LiveCollabData::new(bus_root.clone()),
             clipboard: BusTextClipboard::for_shell(bus_root.clone()),
             bus_root,
+            gateway_readout: None,
+            pending_gateway_get: None,
+            last_gateway_get: None,
+            gateway_get_dirty: true,
+            sync_pair_views: Vec::new(),
+            last_sync_pair_poll: None,
+            sync_pair_views_dirty: true,
         }
     }
 
@@ -1130,6 +1408,7 @@ impl CommunicationsState {
         // respect to the Bus; local publication occurs only on a DRM CopyText
         // write through `drm_clipboard`.
         let _ = self.clipboard.read_text();
+        self.refresh_sync_pair_views_if_due();
         self.data.poll(ctx, self.surface.selected_space());
     }
 
@@ -1162,7 +1441,9 @@ impl CommunicationsState {
     /// Render the surface and route the frame's emitted commands. The widget reads
     /// [`self.data`](LiveCollabData) and pushes intent into a per-frame
     /// [`CommandSink`]; this drains the sink and publishes each command onto
-    /// `action/collab/<verb>` so the collab worker applies it.
+    /// `action/collab/<verb>` so the collab worker applies it. Activity
+    /// fleet-voice / SIP-gateway sinks drain onto `action/voice/*` and
+    /// `action/voip/*`.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut sink = CommandSink::new();
         let selected_before = self.surface.selected_space();
@@ -1176,6 +1457,18 @@ impl CommunicationsState {
                 ui.add_space(mde_egui::Style::SP_S);
             }
         }
+        self.poll_gateway_readout();
+        if self.surface.mode() == Mode::Activity {
+            self.maybe_request_gateway_get();
+        }
+        let mut admin = self.data.activity_admin.clone();
+        admin.gateway = self.gateway_readout.clone();
+        self.surface.set_activity_admin(admin);
+        if self.surface.mode() == Mode::Transfers {
+            self.refresh_sync_pair_views_if_due();
+        }
+        self.surface
+            .set_sync_pair_views(self.sync_pair_views.clone());
         self.surface.ui(ui, &self.data, &mut sink);
         let surface_clipboard_preference = self.surface.clipboard_publishing_enabled();
         if surface_clipboard_preference != self.clipboard_publishing_enabled() {
@@ -1190,6 +1483,89 @@ impl CommunicationsState {
             self.data.mark_space_read(space);
         }
         drain_to_bus(&mut sink, self.bus_root.as_deref(), &self.data);
+        drain_voice_admin_to_bus(
+            &self.surface.drain_voice_admin_commands(),
+            self.bus_root.as_deref(),
+        );
+        let gateway_cmds = self.surface.drain_gateway_commands();
+        if gateway_cmds
+            .iter()
+            .any(|command| matches!(command, GatewayCommand::Set { .. } | GatewayCommand::Clear))
+        {
+            self.gateway_get_dirty = true;
+        }
+        if let Some(ulid) = drain_gateway_to_bus(&gateway_cmds, self.bus_root.as_deref()) {
+            self.pending_gateway_get = Some(ulid);
+        }
+        if drain_sync_pair_to_inbox(&self.surface.drain_sync_pair_commands()) {
+            self.sync_pair_views_dirty = true;
+        }
+        if self.gateway_get_dirty && self.surface.mode() == Mode::Activity {
+            self.maybe_request_gateway_get();
+        }
+    }
+
+    fn poll_gateway_readout(&mut self) {
+        let Some(ulid) = self.pending_gateway_get.as_deref() else {
+            return;
+        };
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let Ok(Some(msg)) = persist.read_latest(&mde_bus::rpc::reply_topic(ulid)) else {
+            return;
+        };
+        let Some(body) = msg.body.as_deref() else {
+            return;
+        };
+        if let Some(readout) = parse_gateway_readout(body) {
+            self.gateway_readout = Some(readout);
+            self.pending_gateway_get = None;
+        }
+    }
+
+    fn maybe_request_gateway_get(&mut self) {
+        if self.pending_gateway_get.is_some() {
+            return;
+        }
+        let due = self.gateway_get_dirty
+            || self
+                .last_gateway_get
+                .is_none_or(|last| last.elapsed() >= REFRESH);
+        if !due {
+            return;
+        }
+        match publish_gateway_get(self.bus_root.as_deref()) {
+            Ok(ulid) => {
+                self.pending_gateway_get = Some(ulid);
+                self.last_gateway_get = Some(Instant::now());
+                self.gateway_get_dirty = false;
+            }
+            Err(e) => {
+                self.last_gateway_get = Some(Instant::now());
+                tracing::debug!(
+                    target: "shell::communications",
+                    error = %e,
+                    "voip get-gateway publish failed",
+                );
+            }
+        }
+    }
+
+    fn refresh_sync_pair_views_if_due(&mut self) {
+        let due = self.sync_pair_views_dirty
+            || self
+                .last_sync_pair_poll
+                .is_none_or(|last| last.elapsed() >= REFRESH);
+        if !due {
+            return;
+        }
+        self.last_sync_pair_poll = Some(Instant::now());
+        self.sync_pair_views_dirty = false;
+        self.sync_pair_views = fold_sync_pair_views(&transfers_store_root());
     }
 }
 
@@ -1216,6 +1592,271 @@ fn drain_to_bus(sink: &mut CommandSink, bus_root: Option<&Path>, data: &dyn Coll
             );
         }
     }
+}
+
+fn drain_voice_admin_to_bus(commands: &[VoiceAdminCommand], bus_root: Option<&Path>) {
+    for command in commands {
+        if let Err(e) = publish_voice_admin(bus_root, command) {
+            tracing::debug!(
+                target: "shell::communications",
+                topic = command.topic(),
+                error = %e,
+                "voice admin command publish failed",
+            );
+        }
+    }
+}
+
+fn drain_gateway_to_bus(commands: &[GatewayCommand], bus_root: Option<&Path>) -> Option<String> {
+    let mut last_get = None;
+    for command in commands {
+        match publish_gateway_command(bus_root, command) {
+            Ok(ulid) => {
+                if matches!(command, GatewayCommand::Get) {
+                    last_get = Some(ulid);
+                }
+            }
+            Err(e) => tracing::debug!(
+                target: "shell::communications",
+                topic = command.topic(),
+                error = %e,
+                "voip gateway command publish failed",
+            ),
+        }
+    }
+    last_get
+}
+
+fn publish_voice_admin(bus_root: Option<&Path>, command: &VoiceAdminCommand) -> Result<(), String> {
+    let (verb, target) = voice_auth(command);
+    let unsigned = with_action_schema(&command.json_body())?;
+    let authorized =
+        crate::iac::authorize_root_mutation_body(&unsigned, verb, VOICE_AUTH_NODE, &target)?;
+    publish_action_body(bus_root, command.topic(), Some(&authorized)).map(|_| ())
+}
+
+fn publish_gateway_command(
+    bus_root: Option<&Path>,
+    command: &GatewayCommand,
+) -> Result<String, String> {
+    match command {
+        GatewayCommand::Get => publish_gateway_get(bus_root),
+        GatewayCommand::Set { .. } | GatewayCommand::Clear => {
+            let Some(body) = command.json_body() else {
+                return Err("gateway mutation is missing a JSON body".to_string());
+            };
+            let unsigned = with_action_schema(&body)?;
+            let verb = match command {
+                GatewayCommand::Set { .. } => "voip-set-gateway",
+                GatewayCommand::Clear => "voip-clear-gateway",
+                GatewayCommand::Get => unreachable!("Get is handled above"),
+            };
+            let authorized = crate::iac::authorize_root_mutation_body(
+                &unsigned,
+                verb,
+                VOIP_ACTION_NODE_SCOPE,
+                VOIP_GATEWAY_TARGET,
+            )?;
+            publish_action_body(bus_root, command.topic(), Some(&authorized))
+        }
+    }
+}
+
+fn publish_gateway_get(bus_root: Option<&Path>) -> Result<String, String> {
+    publish_action_body(bus_root, VOIP_GET_GATEWAY_TOPIC, None)
+}
+
+fn publish_action_body(
+    bus_root: Option<&Path>,
+    topic: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let Some(root) = bus_root else {
+        return Err("No local Bus — the mesh daemon may be down.".to_string());
+    };
+    let persist = Persist::open(root.to_path_buf())
+        .map_err(|e| format!("Couldn't open the local Bus: {e}"))?;
+    let msg = persist
+        .write(topic, Priority::Default, None, body)
+        .map_err(|e| format!("Bus write failed: {e}"))?;
+    Ok(msg.ulid)
+}
+
+/// Node-local transfers store (`<MDE_HOME>/transfers` or `/var/lib/mde/transfers`).
+fn transfers_store_root() -> PathBuf {
+    if let Ok(home) = std::env::var("MDE_HOME").or_else(|_| std::env::var("MACKESD_HOME")) {
+        let home = home.trim();
+        if !home.is_empty() {
+            return PathBuf::from(home).join("transfers");
+        }
+    }
+    PathBuf::from("/var/lib/mde/transfers")
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredSyncPair {
+    id: String,
+    source: String,
+    dest: String,
+    every_secs: u64,
+    #[serde(default)]
+    policy: StoredSyncPairPolicy,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    last_fired_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StoredSyncPairPolicy {
+    #[serde(default)]
+    bwlimit: Option<String>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Fold the daemon's durable sync-pair store into UI rows. Scheduler facts the
+/// worker does not yet mirror (`last_result`, reachability) stay honestly empty /
+/// optimistic until the worker publishes them.
+fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
+    let dir = store_root.join("sync-pairs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let now_ms = now_unix_ms().max(0) as u64;
+    let mut views = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.len() > 256 * 1024 {
+            continue;
+        }
+        let Ok(pair) = serde_json::from_str::<StoredSyncPair>(&text) else {
+            continue;
+        };
+        if pair.id.trim().is_empty() || !pair.enabled {
+            continue;
+        }
+        let every_ms = pair.every_secs.max(1).saturating_mul(1000);
+        let next_run_unix_ms = pair
+            .last_fired_ms
+            .map_or(now_ms, |last| last.saturating_add(every_ms));
+        views.push(SyncPairView {
+            id: pair.id,
+            source: pair.source,
+            dest: pair.dest,
+            every_secs: pair.every_secs.max(1),
+            bwlimit: pair.policy.bwlimit,
+            next_run_unix_ms: Some(i64::try_from(next_run_unix_ms).unwrap_or(i64::MAX)),
+            last_result: None,
+            peer_reachable: true,
+        });
+    }
+    views.sort_by(|a, b| a.id.cmp(&b.id));
+    views
+}
+
+fn drain_sync_pair_to_inbox(commands: &[SyncPairCommand]) -> bool {
+    if commands.is_empty() {
+        return false;
+    }
+    let store_root = transfers_store_root();
+    let mut wrote = false;
+    for command in commands {
+        match write_sync_pair_verb(&store_root, command) {
+            Ok(()) => wrote = true,
+            Err(error) => tracing::debug!(
+                target: "shell::communications",
+                error = %error,
+                "sync-pair verb publish failed",
+            ),
+        }
+    }
+    wrote
+}
+
+fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<(), String> {
+    let envelope = match command {
+        SyncPairCommand::Save {
+            id,
+            source,
+            dest,
+            every_secs,
+            bwlimit,
+        } => {
+            let now = transfer_now_ms();
+            serde_json::json!({
+                "verb": "save_sync_pair",
+                "arg": {
+                    "id": id,
+                    "source": source,
+                    "dest": dest,
+                    "every_secs": u64::max(*every_secs, 1),
+                    "policy": {
+                        "bwlimit": bwlimit,
+                        "verify": false
+                    },
+                    "enabled": true,
+                    "created_ms": now,
+                    "updated_ms": now
+                }
+            })
+        }
+        SyncPairCommand::Remove { id } => {
+            serde_json::json!({
+                "verb": "remove_sync_pair",
+                "arg": id
+            })
+        }
+    };
+    let body = serde_json::to_string(&envelope)
+        .map_err(|error| format!("serialize transfer verb: {error}"))?;
+    if body.len() > MAX_TRANSFER_VERB_BYTES {
+        return Err("transfer verb exceeds the byte limit".to_string());
+    }
+    let inbox = store_root.join("inbox");
+    std::fs::create_dir_all(&inbox).map_err(|error| format!("create transfer inbox: {error}"))?;
+    let stem = format!("{:020}-{}", next_transfer_seq(), verb_stem(command));
+    let tmp = inbox.join(format!(".{stem}.json.tmp"));
+    std::fs::write(&tmp, body.as_bytes())
+        .map_err(|error| format!("write transfer verb: {error}"))?;
+    std::fs::rename(&tmp, inbox.join(format!("{stem}.json")))
+        .map_err(|error| format!("commit transfer verb: {error}"))?;
+    Ok(())
+}
+
+fn verb_stem(command: &SyncPairCommand) -> &'static str {
+    match command {
+        SyncPairCommand::Save { .. } => "save-sync-pair",
+        SyncPairCommand::Remove { .. } => "remove-sync-pair",
+    }
+}
+
+fn transfer_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn next_transfer_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = transfer_now_ms();
+    (ms << 16) | (SEQ.fetch_add(1, Ordering::Relaxed) & 0xFFFF)
 }
 
 /// Mirror Communications clipboard row mutations to the canonical
@@ -2394,6 +3035,245 @@ mod tests {
                 reason: "no fresh target-seat clipboard materialization is available".to_string(),
             }),
             Some("Clipboard delivery unavailable — retry: no fresh target-seat clipboard materialization is available".to_string())
+        );
+    }
+
+    #[test]
+    fn fold_voice_admin_reads_retained_fleet_board_and_skips_hud_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        persist
+            .write(
+                "state/voice/peer:eagle",
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"node_id":"peer:eagle","hostname":"eagle","username":"eagle","sip_uri":"eagle@sip.vitelity.net","state":"unregistered","routed_dids":["15551234567"],"failover":"Voicemail","updated_at_s":1700000000}"#,
+                ),
+            )
+            .expect("write node");
+        persist
+            .write(
+                "state/voice/status",
+                Priority::Default,
+                None,
+                Some(r#"{"registered":true,"not":"a-fleet-row"}"#),
+            )
+            .expect("write hud");
+        persist
+            .write(
+                VOICE_DIDS_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"[{"number":"15551234567","routed_to":"eagle"}]"#),
+            )
+            .expect("write dids");
+        persist
+            .write(
+                VOICE_SHARED_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"caller_id":"15551234567","outbound_trunk":"main"}"#),
+            )
+            .expect("write shared");
+        persist
+            .write(
+                VOICE_CUTOVER_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"phase":"nodes-reprovisioning","total_nodes":2,"reprovisioned":1,"pending_nodes":["otter"],"shared_outbound_lifted":true,"updated_at_s":1700000000}"#,
+                ),
+            )
+            .expect("write cutover");
+
+        let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        data.refresh();
+        assert_eq!(data.activity_admin.voice_nodes.len(), 1);
+        assert_eq!(
+            data.activity_admin.voice_nodes[0].sip_uri,
+            "eagle@sip.vitelity.net"
+        );
+        assert_eq!(
+            data.activity_admin.voice_nodes[0].failover,
+            Some(VoiceFailoverPolicy::Voicemail)
+        );
+        assert_eq!(data.activity_admin.voice_dids.len(), 1);
+        assert_eq!(
+            data.activity_admin
+                .voice_shared
+                .as_ref()
+                .map(|s| s.caller_id.as_str()),
+            Some("15551234567")
+        );
+        assert_eq!(
+            data.activity_admin.voice_cutover.as_ref().map(|c| c.phase),
+            Some(VoiceCutoverPhase::NodesReprovisioning)
+        );
+        assert!(data.activity_admin.gateway.is_none());
+    }
+
+    #[test]
+    fn voice_admin_publish_arms_the_exact_worker_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        publish_voice_admin(Some(dir.path()), &VoiceAdminCommand::Provision)
+            .expect("publish provision");
+        publish_voice_admin(
+            Some(dir.path()),
+            &VoiceAdminCommand::DidRoute {
+                did: "15551234567".to_owned(),
+                node_id: Some("peer:eagle".to_owned()),
+            },
+        )
+        .expect("publish did-route");
+        let persist = persist_at(dir.path());
+        let provision = persist
+            .read_latest("action/voice/provision")
+            .expect("read provision")
+            .expect("provision message");
+        let body = provision.body.expect("provision body");
+        assert!(body.contains("\"schema_version\":1"), "{body}");
+        assert!(body.contains("armed_token"), "{body}");
+        let route = persist
+            .read_latest("action/voice/did-route")
+            .expect("read did-route")
+            .expect("did-route message");
+        let route_body = route.body.expect("did-route body");
+        assert!(
+            route_body.contains("\"did\":\"15551234567\""),
+            "{route_body}"
+        );
+        assert!(
+            route_body.contains("\"node_id\":\"peer:eagle\""),
+            "{route_body}"
+        );
+        assert!(route_body.contains("armed_token"), "{route_body}");
+    }
+
+    #[test]
+    fn gateway_readout_never_keeps_a_password_and_get_is_unsigned() {
+        let leaked = parse_gateway_readout(
+            r#"{"present":true,"host":"pbx.example.com","port":5062,"username":"alice","password":"s3cret","password_set":true,"display_name":"Alice","expires":3600}"#,
+        )
+        .expect("present readout");
+        assert_eq!(leaked.password, "");
+        assert!(leaked.password_set);
+        assert_eq!(leaked.host, "pbx.example.com");
+        assert_eq!(
+            parse_gateway_readout(r#"{"present":false}"#),
+            Some(GatewayReadout::absent())
+        );
+        assert!(parse_gateway_readout(r#"{"error":"nope"}"#).is_none());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ulid = publish_gateway_get(Some(dir.path())).expect("get-gateway");
+        let persist = persist_at(dir.path());
+        let msg = persist
+            .read_latest(VOIP_GET_GATEWAY_TOPIC)
+            .expect("read get")
+            .expect("get message");
+        assert_eq!(msg.ulid, ulid);
+        assert!(msg.body.is_none(), "get-gateway must not carry a body");
+    }
+
+    #[test]
+    fn gateway_set_is_armed_and_keeps_the_write_password_on_the_bus() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        publish_gateway_command(
+            Some(dir.path()),
+            &GatewayCommand::Set {
+                host: "pbx.example.com".to_owned(),
+                port: Some(5062),
+                username: "alice".to_owned(),
+                password: "s3cret".to_owned(),
+                display_name: "Alice".to_owned(),
+                expires: Some(3600),
+            },
+        )
+        .expect("set-gateway");
+        let persist = persist_at(dir.path());
+        let body = persist
+            .read_latest("action/voip/set-gateway")
+            .expect("read set")
+            .expect("set message")
+            .body
+            .expect("set body");
+        assert!(body.contains("\"host\":\"pbx.example.com\""), "{body}");
+        assert!(body.contains("\"password\":\"s3cret\""), "{body}");
+        assert!(body.contains("armed_token"), "{body}");
+        assert!(body.contains("\"schema_version\":1"), "{body}");
+    }
+
+    #[test]
+    fn fold_sync_pair_views_reads_the_daemon_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("sync-pairs");
+        std::fs::create_dir_all(&store).expect("sync-pairs dir");
+        std::fs::write(
+            store.join("docs.json"),
+            r#"{
+                "id": "docs",
+                "source": "/src",
+                "dest": "node:oak",
+                "every_secs": 900,
+                "policy": { "bwlimit": "2m" },
+                "enabled": true,
+                "last_fired_ms": 1000000,
+                "created_ms": 1,
+                "updated_ms": 1
+            }"#,
+        )
+        .expect("write pair");
+        let views = fold_sync_pair_views(dir.path());
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "docs");
+        assert_eq!(views[0].source, "/src");
+        assert_eq!(views[0].dest, "node:oak");
+        assert_eq!(views[0].every_secs, 900);
+        assert_eq!(views[0].bwlimit.as_deref(), Some("2m"));
+        assert_eq!(views[0].next_run_unix_ms, Some(1_000_000 + 900_000));
+    }
+
+    #[test]
+    fn sync_pair_save_and_remove_verbs_land_in_the_transfer_inbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_sync_pair_verb(
+            dir.path(),
+            &SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: "node:oak".to_owned(),
+                every_secs: 900,
+                bwlimit: Some("2m".to_owned()),
+            },
+        )
+        .expect("save");
+        write_sync_pair_verb(
+            dir.path(),
+            &SyncPairCommand::Remove {
+                id: "docs".to_owned(),
+            },
+        )
+        .expect("remove");
+        let inbox = dir.path().join("inbox");
+        let bodies: Vec<String> = std::fs::read_dir(&inbox)
+            .expect("inbox")
+            .flatten()
+            .map(|entry| std::fs::read_to_string(entry.path()).expect("read verb"))
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies.iter().any(|body| {
+                body.contains("\"verb\":\"save_sync_pair\"")
+                    && body.contains("\"dest\":\"node:oak\"")
+            }),
+            "missing save-sync-pair verb: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| {
+                body.contains("\"verb\":\"remove_sync_pair\"") && body.contains("\"arg\":\"docs\"")
+            }),
+            "missing remove-sync-pair verb: {bodies:?}"
         );
     }
 }

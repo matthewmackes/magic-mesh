@@ -4,9 +4,9 @@
 //! in `main.rs` (mde-enroll) and `bin/magic-setup.rs` (magic-setup).
 
 pub mod app;
+pub mod lifecycle_controller;
 /// WL-FUNC-023 S4 — the renderer-neutral lifecycle session projection.
 pub mod lifecycle_view;
-pub mod lifecycle_controller;
 pub mod public_roster;
 pub mod setup;
 pub mod setup_action;

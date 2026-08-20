@@ -17,13 +17,16 @@
 //! queue runs over `LiveFileOps`; tests drive both with in-memory fakes.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use mde_egui::search_omnibox::{SearchDomain, SearchItem};
 use mde_files::backend::{Backend, BackendError, Destination, MeshOverlayBadge, OpId};
-use mde_files::fileops::{FileOps, LiveFileOps};
+use mde_files::fileops::{duplicate_copy_path, is_cross_device_error, FileOps, LiveFileOps};
 use mde_files::model::{FileRow, Mime, Peer, SelfNode};
 use mde_files::opqueue::OpKind;
 use mde_files::search::{
@@ -31,10 +34,13 @@ use mde_files::search::{
     TypeFilter,
 };
 use mde_files::send_to::{SendToEntry, SendToRequest};
+use mde_files::ArchiveFormat;
+use serde::{Deserialize, Serialize};
 
 use crate::chat_bridge::{BusChatBridge, ChatBridge};
 use crate::dialogs::{
-    Arming, ConfirmDelete, NameDialog, NameOperation, Perm, PermClass, PropertiesDialog,
+    Arming, ConfirmDelete, ExtractToDialog, NameDialog, NameOperation, Perm, PermClass,
+    PropertiesDialog,
 };
 use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
@@ -50,6 +56,15 @@ use mde_files::opqueue::{ConflictChoice, Resolution};
 /// Matches the other Bus surfaces' cadence.
 const MOUNT_POLL: Duration = Duration::from_secs(2); // logic-timing, not motion (poll interval)
 const HOME_SEARCH_LIMIT: usize = 32;
+/// Debounce window for folder-prefs / bookmark writes (logic-timing, not motion).
+const PREFS_DEBOUNCE: Duration = Duration::from_millis(400);
+const FOLDER_PREFS_CAP: usize = 256;
+const FOLDER_PREFS_MAX_BYTES: u64 = 256 * 1024;
+const BOOKMARKS_CAP: usize = 48;
+const BOOKMARKS_MAX_BYTES: u64 = 64 * 1024;
+const BOOKMARK_LABEL_MAX: usize = 128;
+const FOLDER_PREFS_FILE: &str = "files-folder-prefs.json";
+const BOOKMARKS_FILE: &str = "files-bookmarks.json";
 
 /// The short mount hostname for a peer — the `<host>` verb slot.
 ///
@@ -193,7 +208,7 @@ pub struct Crumb {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// How a listing is laid out (lock 20).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     /// One row per entry, type tag + name (the compact default).
     #[default]
@@ -220,7 +235,7 @@ impl ViewMode {
 }
 
 /// The column a listing is sorted on (lock 20).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SortKey {
     /// Alphabetical by name.
     #[default]
@@ -250,7 +265,7 @@ impl SortKey {
 }
 
 /// Sort direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SortDir {
     /// Ascending (A→Z, small→large, newest→oldest by age).
     #[default]
@@ -280,7 +295,7 @@ impl SortDir {
 }
 
 /// A folder's sort key + direction + dirs-first grouping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SortSpec {
     /// The column sorted on.
     pub key: SortKey,
@@ -302,7 +317,7 @@ impl Default for SortSpec {
 
 /// The remembered per-folder presentation (lock 20 — "view+sort persist
 /// per-folder"): view mode, sort order, and the show-hidden toggle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FolderPrefs {
     /// The last view mode used in this folder.
     pub view: ViewMode,
@@ -345,6 +360,34 @@ pub const LOCAL_SPOTS: &[LocalSpot] = &[
         path: "local:root",
     },
 ];
+
+/// A user-pinnable Places bookmark (lock 21). Path is a local backend route
+/// (absolute `/…` or a `local:` slug); mesh peers stay a live roster section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserBookmark {
+    /// Sidebar label.
+    pub label: String,
+    /// Backend `list()` path the bookmark navigates to.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct FolderPrefsFile {
+    #[serde(default)]
+    pub(crate) entries: Vec<FolderPrefsStored>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FolderPrefsStored {
+    path: String,
+    prefs: FolderPrefs,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct BookmarksFile {
+    #[serde(default)]
+    pub(crate) bookmarks: Vec<UserBookmark>,
+}
 
 /// Outcome of the most recent Send-To, surfaced in the status line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1023,6 +1066,12 @@ pub struct FileBrowser {
     /// WL-FUNC-011 — the open New Folder / Rename dialog, if any. Both execute
     /// through `meta_ops`, the existing immediate FileOps authority.
     name_dialog: Option<NameDialog>,
+    /// WL-FUNC-025 — extract-to destination dialog, if any.
+    extract_to: Option<ExtractToDialog>,
+    /// Staging directories for Duplicate (hidden `.mcnf-dup-*` siblings) keyed by
+    /// the op that still needs them. Removed when that op finishes.
+    dup_staging: Vec<(OpId, PathBuf)>,
+    dup_seq: u64,
     /// FILEMGR-11 — the pending permanent-delete confirm, if any.
     confirm_delete: Option<ConfirmDelete>,
     /// FILEMGR-9 — the mesh-mount client (reads `state/mesh-mount/*`, writes
@@ -1056,6 +1105,13 @@ pub struct FileBrowser {
     active_pane: usize,
     dual: bool,
     folder_prefs: HashMap<String, FolderPrefs>,
+    /// LRU order for `folder_prefs` (oldest at the front).
+    folder_prefs_lru: VecDeque<String>,
+    folder_prefs_path: Option<PathBuf>,
+    folder_prefs_dirty: Option<Instant>,
+    bookmarks: Vec<UserBookmark>,
+    bookmarks_path: Option<PathBuf>,
+    bookmarks_dirty: Option<Instant>,
     destination: Option<String>,
     last_send: SendOutcome,
     last_note: Option<String>,
@@ -1122,6 +1178,9 @@ impl FileBrowser {
             chown_permitted: false,
             properties: None,
             name_dialog: None,
+            extract_to: None,
+            dup_staging: Vec::new(),
+            dup_seq: 1,
             confirm_delete: None,
             chat: Box::new(BusChatBridge::from_env()),
             clipboard: None,
@@ -1136,6 +1195,12 @@ impl FileBrowser {
             active_pane: 0,
             dual: false,
             folder_prefs: HashMap::new(),
+            folder_prefs_lru: VecDeque::new(),
+            folder_prefs_path: default_config_file(FOLDER_PREFS_FILE),
+            folder_prefs_dirty: None,
+            bookmarks: Vec::new(),
+            bookmarks_path: default_config_file(BOOKMARKS_FILE),
+            bookmarks_dirty: None,
             destination: None,
             last_send: SendOutcome::Idle,
             last_note: None,
@@ -1149,6 +1214,8 @@ impl FileBrowser {
             transfers_filter: TransferFilter::default(),
             new_transfer: None,
         };
+        me.hydrate_folder_prefs();
+        me.hydrate_bookmarks();
         me.refresh_roster();
         me.reload(0);
         me.reload(1);
@@ -1199,6 +1266,21 @@ impl FileBrowser {
     ) -> Self {
         self.meta_ops = Box::new(meta_ops);
         self.chown_permitted = chown_permitted;
+        self
+    }
+
+    /// Point folder-prefs and bookmarks at `dir` (tests inject a tempdir so the
+    /// suite never touches the real user config). Hydrates both stores and
+    /// re-applies remembered presentation to the open tabs.
+    #[must_use]
+    pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        self.folder_prefs_path = Some(dir.join(FOLDER_PREFS_FILE));
+        self.bookmarks_path = Some(dir.join(BOOKMARKS_FILE));
+        self.hydrate_folder_prefs();
+        self.hydrate_bookmarks();
+        self.reload(0);
+        self.reload(1);
         self
     }
 
@@ -2232,7 +2314,17 @@ impl FileBrowser {
                 },
             )
         };
-        self.folder_prefs.insert(key, prefs);
+        self.folder_prefs.insert(key.clone(), prefs);
+        if let Some(idx) = self.folder_prefs_lru.iter().position(|k| k == &key) {
+            self.folder_prefs_lru.remove(idx);
+        }
+        self.folder_prefs_lru.push_back(key);
+        while self.folder_prefs_lru.len() > FOLDER_PREFS_CAP {
+            if let Some(old) = self.folder_prefs_lru.pop_front() {
+                self.folder_prefs.remove(&old);
+            }
+        }
+        self.folder_prefs_dirty = Some(Instant::now());
     }
 
     // ── selection ───────────────────────────────────────────────────────────
@@ -2439,6 +2531,8 @@ impl FileBrowser {
         if !finished.is_empty() {
             self.reload_all();
         }
+        self.cleanup_dup_staging(&finished);
+        self.flush_persisted_if_due();
     }
 
     /// The op queue (its live [`crate::ops::ActiveOp`] list for the strip).
@@ -2492,6 +2586,16 @@ impl FileBrowser {
         self.last_note = None;
     }
 
+    /// Open New File against `pane`'s resolved current directory.
+    pub fn open_new_file(&mut self, pane: usize) {
+        let Some(parent) = self.pane(pane).active_tab().current_dir() else {
+            self.last_note = Some("This location has no writable filesystem path.".to_string());
+            return;
+        };
+        self.name_dialog = Some(NameDialog::new_file(parent));
+        self.last_note = None;
+    }
+
     /// Open Rename for exactly one focused local row. The source and parent are
     /// captured now, so later selection changes cannot redirect the operation.
     pub fn open_rename(&mut self, pane: usize) {
@@ -2516,6 +2620,231 @@ impl FileBrowser {
         self.last_note = None;
     }
 
+    /// Duplicate each selected local row into its parent as `name (copy)` via
+    /// [`OpKind::Copy`] so an existing destination raises the standard conflict
+    /// dialog.
+    pub fn duplicate_selection(&mut self, pane: usize) {
+        let sources = self.pane(pane).active_tab().selected_paths();
+        if sources.is_empty() {
+            self.last_note = Some("Select a local item to duplicate.".to_string());
+            return;
+        }
+        let mut queued = 0usize;
+        for src in sources {
+            if self.enqueue_duplicate(src) {
+                queued += 1;
+            }
+        }
+        if queued > 0 {
+            self.last_note = None;
+        }
+    }
+
+    fn enqueue_duplicate(&mut self, src: PathBuf) -> bool {
+        let dest = duplicate_copy_path(&src);
+        let Some(parent) = dest.parent().map(Path::to_path_buf) else {
+            self.last_note = Some("This entry has no parent directory.".to_string());
+            return false;
+        };
+        let Some(dest_name) = dest.file_name().map(std::ffi::OsStr::to_os_string) else {
+            self.last_note = Some("This entry has no name.".to_string());
+            return false;
+        };
+        self.dup_seq = self.dup_seq.saturating_add(1);
+        let staging = parent.join(format!(".mcnf-dup-{}", self.dup_seq));
+        if let Err(e) = self.meta_ops.create_dir(&staging) {
+            self.last_note = Some(format!("Couldn't duplicate item: {e}"));
+            return false;
+        }
+        let staged = staging.join(&dest_name);
+        let staged_ok = match self.meta_ops.hard_link(&src, &staged) {
+            Ok(()) => Ok(()),
+            Err(_) => self.meta_ops.copy(&src, &staged).map(|_| ()),
+        };
+        if let Err(e) = staged_ok {
+            let _ = self.meta_ops.remove(&staging);
+            self.last_note = Some(format!("Couldn't duplicate item: {e}"));
+            return false;
+        }
+        let name = dest_name.to_string_lossy();
+        let id = self.ops.submit(
+            OpKind::Copy {
+                items: vec![staged],
+                dest_dir: parent,
+            },
+            format!("Duplicating {name}"),
+        );
+        self.dup_staging.push((id, staging));
+        true
+    }
+
+    /// Compress the selection into `parent/<stem>.<ext>` through [`OpKind::Compress`].
+    pub fn compress_selection(&mut self, pane: usize, format: ArchiveFormat) {
+        if !format.is_supported() {
+            self.last_note = Some(format!(
+                "{} archives are not available in this build.",
+                format.extension()
+            ));
+            return;
+        }
+        let items = self.pane(pane).active_tab().selected_paths();
+        if items.is_empty() {
+            self.last_note = Some("Select a local item to compress.".to_string());
+            return;
+        }
+        let Some(parent) = items[0].parent().map(Path::to_path_buf) else {
+            self.last_note = Some("This entry has no parent directory.".to_string());
+            return;
+        };
+        if items
+            .iter()
+            .any(|p| p.parent().map(Path::to_path_buf).as_ref() != Some(&parent))
+        {
+            self.last_note = Some("Compress only a selection that shares one folder.".to_string());
+            return;
+        }
+        let stem = archive_stem_for(&items);
+        let archive = parent.join(format!("{stem}.{}", format.extension()));
+        if self.meta_ops.symlink_metadata(&archive).is_ok() {
+            self.last_note = Some(format!(
+                "An item named \u{201c}{}\u{201d} already exists.",
+                archive
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| archive.display().to_string())
+            ));
+            return;
+        }
+        let label = format!("Compress {}", archive.display());
+        self.ops.submit(
+            OpKind::Compress {
+                items,
+                base_dir: parent,
+                archive,
+                format,
+            },
+            label,
+        );
+        self.last_note = None;
+    }
+
+    /// Extract the focused archive into its parent directory.
+    pub fn extract_here(&mut self, pane: usize) {
+        let Some(archive) = self.focused_archive(pane) else {
+            self.last_note = Some("Select an archive to extract.".to_string());
+            return;
+        };
+        let Some(dest_dir) = archive.parent().map(Path::to_path_buf) else {
+            self.last_note = Some("This archive has no parent directory.".to_string());
+            return;
+        };
+        self.enqueue_extract(archive, dest_dir);
+    }
+
+    /// Open Extract To, prefilled with `<parent>/<archive-stem>`.
+    pub fn open_extract_to(&mut self, pane: usize) {
+        let Some(archive) = self.focused_archive(pane) else {
+            self.last_note = Some("Select an archive to extract.".to_string());
+            return;
+        };
+        let parent = archive.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dest = parent.join(archive_file_stem(&archive));
+        self.extract_to = Some(ExtractToDialog::new(archive, dest));
+        self.last_note = None;
+    }
+
+    /// The open Extract To dialog, if any.
+    #[must_use]
+    pub fn extract_to_dialog(&self) -> Option<&ExtractToDialog> {
+        self.extract_to.as_ref()
+    }
+
+    /// Replace the extract-to destination buffer.
+    pub fn set_extract_to_dest(&mut self, dest: String) {
+        if let Some(dialog) = self.extract_to.as_mut() {
+            dialog.dest = dest;
+            dialog.error = None;
+        }
+    }
+
+    /// Enqueue extract-to through [`OpKind::Extract`].
+    pub fn submit_extract_to(&mut self) {
+        let Some(dialog) = self.extract_to.as_ref() else {
+            return;
+        };
+        let Some(dest_dir) = dialog.target() else {
+            return;
+        };
+        let archive = dialog.archive.clone();
+        self.extract_to = None;
+        self.enqueue_extract(archive, dest_dir);
+    }
+
+    /// Dismiss Extract To without unpacking.
+    pub fn cancel_extract_to(&mut self) {
+        self.extract_to = None;
+    }
+
+    fn enqueue_extract(&mut self, archive: PathBuf, dest_dir: PathBuf) {
+        let name = archive
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive.display().to_string());
+        self.ops.submit(
+            OpKind::Extract { archive, dest_dir },
+            format!("Extract {name}"),
+        );
+        self.last_note = None;
+    }
+
+    fn focused_archive(&self, pane: usize) -> Option<PathBuf> {
+        let row = self.pane(pane).active_tab().focused_row()?;
+        let path = PathBuf::from(row.path.as_ref()?);
+        ArchiveFormat::from_path(&path).map(|_| path)
+    }
+
+    /// Open Create Symbolic Link for the focused local row.
+    pub fn open_symlink(&mut self, pane: usize) {
+        match self.focused_local_parent(pane) {
+            Ok((target, parent, original)) => {
+                self.name_dialog = Some(NameDialog::symlink(target, parent, &original));
+                self.last_note = None;
+            }
+            Err(note) => self.last_note = Some(note),
+        }
+    }
+
+    /// Open Create Hard Link for the focused local row.
+    pub fn open_hard_link(&mut self, pane: usize) {
+        match self.focused_local_parent(pane) {
+            Ok((target, parent, original)) => {
+                self.name_dialog = Some(NameDialog::hard_link(target, parent, &original));
+                self.last_note = None;
+            }
+            Err(note) => self.last_note = Some(note),
+        }
+    }
+
+    fn focused_local_parent(&self, pane: usize) -> Result<(PathBuf, PathBuf, String), String> {
+        let tab = self.pane(pane).active_tab();
+        if tab.selection().len() != 1 {
+            return Err("Select exactly one item.".to_string());
+        }
+        let row = tab
+            .focused_row()
+            .ok_or_else(|| "Select exactly one item.".to_string())?;
+        let source = row
+            .path
+            .as_ref()
+            .map(PathBuf::from)
+            .ok_or_else(|| "This entry has no writable filesystem path.".to_string())?;
+        let parent = source
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "This entry has no parent directory.".to_string())?;
+        Ok((source, parent, row.name.clone()))
+    }
+
     /// The open New Folder / Rename dialog, if any.
     #[must_use]
     pub fn name_dialog(&self) -> Option<&NameDialog> {
@@ -2531,32 +2860,30 @@ impl FileBrowser {
         }
     }
 
-    /// Execute New Folder / Rename through the existing immediate [`FileOps`]
-    /// authority. A destination preflight prevents ordinary replacement; any
-    /// validation, preflight, or syscall failure remains visible in the dialog.
+    /// Execute New Folder / New File / Rename / links through the existing
+    /// immediate [`FileOps`] authority. A destination preflight prevents ordinary
+    /// replacement; any validation, preflight, or syscall failure remains visible
+    /// in the dialog.
     pub fn submit_name_dialog(&mut self, pane: usize) {
         let Some(dialog) = self.name_dialog.as_ref() else {
             return;
         };
+        if matches!(dialog.operation, NameOperation::BookmarkRename { .. }) {
+            self.submit_bookmark_rename();
+            return;
+        }
         let Some(target) = dialog.target() else {
             return;
         };
         let operation = dialog.operation.clone();
+        let name = dialog.name.clone();
         let result = match self.meta_ops.symlink_metadata(&target) {
             Ok(_) => Err(format!(
-                "An item named \u{201c}{}\u{201d} already exists.",
-                dialog.name
+                "An item named \u{201c}{name}\u{201d} already exists."
             )),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match operation {
-                NameOperation::NewFolder { .. } => self
-                    .meta_ops
-                    .create_dir(&target)
-                    .map_err(|e| format!("Couldn't create folder: {e}")),
-                NameOperation::Rename { source, .. } => self
-                    .meta_ops
-                    .rename_noreplace(&source, &target)
-                    .map_err(|e| format!("Couldn't rename item: {e}")),
-            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.execute_name_operation(&operation, &target)
+            }
             Err(e) => Err(format!("Couldn't check the destination: {e}")),
         };
         match result {
@@ -2570,6 +2897,50 @@ impl FileBrowser {
                     dialog.error = Some(error);
                 }
             }
+        }
+    }
+
+    fn execute_name_operation(
+        &self,
+        operation: &NameOperation,
+        target: &Path,
+    ) -> Result<(), String> {
+        match operation {
+            NameOperation::NewFolder { .. } => self
+                .meta_ops
+                .create_dir(target)
+                .map_err(|e| format!("Couldn't create folder: {e}")),
+            NameOperation::NewFile { .. } => self
+                .meta_ops
+                .create_file(target)
+                .map_err(|e| format!("Couldn't create file: {e}")),
+            NameOperation::Rename { source, .. } => self
+                .meta_ops
+                .rename_noreplace(source, target)
+                .map_err(|e| format!("Couldn't rename item: {e}")),
+            NameOperation::Symlink {
+                target: link_to,
+                parent,
+            } => {
+                if symlink_escapes_mesh(parent, target, link_to) {
+                    return Err(
+                        "Can't create a symbolic link that escapes this mesh mount.".to_string()
+                    );
+                }
+                self.meta_ops
+                    .symlink(link_to, target)
+                    .map_err(|e| format!("Couldn't create symbolic link: {e}"))
+            }
+            NameOperation::HardLink {
+                target: link_to, ..
+            } => self.meta_ops.hard_link(link_to, target).map_err(|e| {
+                if is_cross_device_error(&e) {
+                    "Can't create a hard link across devices.".to_string()
+                } else {
+                    format!("Couldn't create hard link: {e}")
+                }
+            }),
+            NameOperation::BookmarkRename { .. } => Ok(()),
         }
     }
 
@@ -3112,6 +3483,238 @@ impl FileBrowser {
         mde_files::editor_open::BusEditorLaunch::from_env().send(&path);
         self.last_note = Some(format!("Sent {name} to the Editor."));
     }
+
+    /// The remembered per-folder prefs map (tests assert hydrate / LRU).
+    #[must_use]
+    pub fn folder_prefs(&self) -> &HashMap<String, FolderPrefs> {
+        &self.folder_prefs
+    }
+
+    /// User Places bookmarks, in display order (above the fixed Places set).
+    #[must_use]
+    pub fn bookmarks(&self) -> &[UserBookmark] {
+        &self.bookmarks
+    }
+
+    /// Pin the focused row (a directory, or a file's parent) into Places.
+    pub fn pin_focused(&mut self, pane: usize) {
+        let tab = self.pane(pane).active_tab();
+        let path = if let Some(row) = tab.focused_row() {
+            match row.path.as_ref() {
+                Some(p) if row.is_dir() => PathBuf::from(p),
+                Some(p) => PathBuf::from(p)
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from(p)),
+                None => {
+                    self.last_note =
+                        Some("This entry has no writable filesystem path.".to_string());
+                    return;
+                }
+            }
+        } else if let Some(dir) = tab.current_dir() {
+            dir
+        } else {
+            self.last_note = Some("Select a folder to pin.".to_string());
+            return;
+        };
+        let route = bookmark_route(&path);
+        if let Err(note) = validate_bookmark_path(&route) {
+            self.last_note = Some(note);
+            return;
+        }
+        if self.bookmarks.iter().any(|b| b.path == route) {
+            self.last_note = Some("That location is already pinned.".to_string());
+            return;
+        }
+        if self.bookmarks.len() >= BOOKMARKS_CAP {
+            self.last_note = Some(format!("At most {BOOKMARKS_CAP} bookmarks can be pinned."));
+            return;
+        }
+        let label = bookmark_label(&route);
+        self.bookmarks.push(UserBookmark { label, path: route });
+        self.bookmarks_dirty = Some(Instant::now());
+        self.last_note = None;
+    }
+
+    /// Remove the bookmark at `index`.
+    pub fn unpin_bookmark(&mut self, index: usize) {
+        if index < self.bookmarks.len() {
+            self.bookmarks.remove(index);
+            self.bookmarks_dirty = Some(Instant::now());
+            self.last_note = None;
+        }
+    }
+
+    /// Move bookmark `index` by `delta` (-1 up, +1 down).
+    pub fn reorder_bookmark(&mut self, index: usize, delta: i32) {
+        let dest = index as i32 + delta;
+        if dest < 0 || dest as usize >= self.bookmarks.len() || index >= self.bookmarks.len() {
+            return;
+        }
+        self.bookmarks.swap(index, dest as usize);
+        self.bookmarks_dirty = Some(Instant::now());
+    }
+
+    /// Open Rename Bookmark for `index`.
+    pub fn open_rename_bookmark(&mut self, index: usize) {
+        let Some(bookmark) = self.bookmarks.get(index) else {
+            self.last_note = Some("No such bookmark.".to_string());
+            return;
+        };
+        self.name_dialog = Some(NameDialog::bookmark_rename(index, bookmark.label.clone()));
+        self.last_note = None;
+    }
+
+    fn submit_bookmark_rename(&mut self) {
+        let Some(dialog) = self.name_dialog.as_ref() else {
+            return;
+        };
+        let NameOperation::BookmarkRename { index, .. } = dialog.operation else {
+            return;
+        };
+        if dialog.validation_error().is_some() {
+            return;
+        }
+        let name = dialog.name.trim().to_string();
+        if name.len() > BOOKMARK_LABEL_MAX {
+            if let Some(dialog) = self.name_dialog.as_mut() {
+                dialog.error = Some(format!(
+                    "Name is longer than {BOOKMARK_LABEL_MAX} characters."
+                ));
+            }
+            return;
+        }
+        if let Some(bookmark) = self.bookmarks.get_mut(index) {
+            bookmark.label = name;
+            self.bookmarks_dirty = Some(Instant::now());
+            self.name_dialog = None;
+            self.last_note = None;
+        }
+    }
+
+    /// Write dirty prefs/bookmarks immediately (tests skip the debounce window).
+    pub fn flush_persisted(&mut self) {
+        if self.folder_prefs_dirty.take().is_some() {
+            self.write_folder_prefs();
+        }
+        if self.bookmarks_dirty.take().is_some() {
+            self.write_bookmarks();
+        }
+    }
+
+    fn flush_persisted_if_due(&mut self) {
+        let due = |t: Instant| t.elapsed() >= PREFS_DEBOUNCE;
+        if self.folder_prefs_dirty.is_some_and(due) {
+            self.folder_prefs_dirty = None;
+            self.write_folder_prefs();
+        }
+        if self.bookmarks_dirty.is_some_and(due) {
+            self.bookmarks_dirty = None;
+            self.write_bookmarks();
+        }
+    }
+
+    fn hydrate_folder_prefs(&mut self) {
+        let Some(path) = self.folder_prefs_path.clone() else {
+            return;
+        };
+        match load_folder_prefs_at(&path) {
+            Ok(file) => {
+                self.folder_prefs.clear();
+                self.folder_prefs_lru.clear();
+                for entry in file.entries.into_iter().rev().take(FOLDER_PREFS_CAP).rev() {
+                    if self.folder_prefs.contains_key(&entry.path) {
+                        continue;
+                    }
+                    self.folder_prefs_lru.push_back(entry.path.clone());
+                    self.folder_prefs.insert(entry.path, entry.prefs);
+                }
+            }
+            Err(note) => {
+                self.folder_prefs.clear();
+                self.folder_prefs_lru.clear();
+                self.last_note = Some(note);
+            }
+        }
+    }
+
+    fn hydrate_bookmarks(&mut self) {
+        let Some(path) = self.bookmarks_path.clone() else {
+            return;
+        };
+        match load_bookmarks_at(&path) {
+            Ok(file) => {
+                self.bookmarks = file
+                    .bookmarks
+                    .into_iter()
+                    .filter(|b| validate_bookmark_path(&b.path).is_ok())
+                    .take(BOOKMARKS_CAP)
+                    .collect();
+            }
+            Err(note) => {
+                self.bookmarks.clear();
+                self.last_note = Some(note);
+            }
+        }
+    }
+
+    fn write_folder_prefs(&self) {
+        let Some(path) = self.folder_prefs_path.as_ref() else {
+            return;
+        };
+        let entries = self
+            .folder_prefs_lru
+            .iter()
+            .filter_map(|k| {
+                self.folder_prefs.get(k).map(|prefs| FolderPrefsStored {
+                    path: k.clone(),
+                    prefs: *prefs,
+                })
+            })
+            .collect();
+        let _ = write_json_store(path, &FolderPrefsFile { entries });
+    }
+
+    fn write_bookmarks(&self) {
+        let Some(path) = self.bookmarks_path.as_ref() else {
+            return;
+        };
+        let _ = write_json_store(
+            path,
+            &BookmarksFile {
+                bookmarks: self.bookmarks.clone(),
+            },
+        );
+    }
+
+    fn cleanup_dup_staging(&mut self, finished: &[OpId]) {
+        if finished.is_empty() || self.dup_staging.is_empty() {
+            return;
+        }
+        let mut keep = Vec::new();
+        for (id, dir) in self.dup_staging.drain(..) {
+            if finished.contains(&id) {
+                let _ = self.meta_ops.remove(&dir);
+            } else {
+                keep.push((id, dir));
+            }
+        }
+        self.dup_staging = keep;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_name_operation_for_test(&mut self, operation: NameOperation) {
+        if let Some(dialog) = self.name_dialog.as_mut() {
+            dialog.operation = operation;
+        }
+    }
+}
+
+impl Drop for FileBrowser {
+    fn drop(&mut self) {
+        self.flush_persisted();
+    }
 }
 
 /// A short label for a Send-To/Send-in-Chat status line: the single file's name,
@@ -3124,6 +3727,264 @@ fn describe_sources(sources: &[PathBuf]) -> String {
         ),
         many => format!("{} items", many.len()),
     }
+}
+
+#[cfg(not(test))]
+fn default_config_file(name: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("mcnf").join(name))
+}
+
+#[cfg(test)]
+fn default_config_file(_name: &str) -> Option<PathBuf> {
+    None
+}
+
+fn archive_file_stem(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    for ext in [
+        ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tzst", ".tar", ".zip",
+    ] {
+        if let Some(stem) = lower.strip_suffix(ext) {
+            return name[..stem.len()].to_string();
+        }
+    }
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or(name)
+}
+
+fn archive_stem_for(items: &[PathBuf]) -> String {
+    match items {
+        [one] => archive_file_stem(one),
+        _ => items
+            .first()
+            .and_then(|p| p.parent())
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Archive".to_string()),
+    }
+}
+
+fn mesh_mount_root(path: &Path) -> Option<PathBuf> {
+    let s = path.to_string_lossy();
+    let rest = s.split("/mde-mesh/").nth(1)?;
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    let prefix = s.split("/mde-mesh/").next()?;
+    Some(PathBuf::from(format!("{prefix}/mde-mesh/{host}")))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut acc = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::RootDir => acc = PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                acc.pop();
+            }
+            Component::Normal(s) => acc.push(s),
+            Component::Prefix(_) => {}
+        }
+    }
+    acc
+}
+
+fn symlink_escapes_mesh(parent: &Path, link: &Path, target: &Path) -> bool {
+    let Some(root) = mesh_mount_root(link).or_else(|| mesh_mount_root(parent)) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        parent.join(target)
+    };
+    !normalize_path(&resolved).starts_with(&root)
+}
+
+fn bookmark_route(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn bookmark_label(route: &str) -> String {
+    if let Some(slug) = route.strip_prefix("local:") {
+        return slug.to_string();
+    }
+    Path::new(route)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(route)
+        .to_string()
+}
+
+fn validate_bookmark_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("A bookmark needs a path.".to_string());
+    }
+    if path.as_bytes().contains(&0) {
+        return Err("A bookmark path can't contain a NUL character.".to_string());
+    }
+    if path.starts_with("peer:") {
+        return Err(
+            "Mesh peers stay in the Mesh section — pin a local folder instead.".to_string(),
+        );
+    }
+    if let Some(slug) = path.strip_prefix("local:") {
+        if slug.is_empty() || slug.contains('/') || slug.contains('\0') {
+            return Err("That local place isn't a valid bookmark.".to_string());
+        }
+        return Ok(());
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err("Pin an absolute folder path.".to_string());
+    }
+    for c in p.components() {
+        if matches!(c, Component::ParentDir) {
+            return Err("A bookmark path can't walk above its root.".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Load folder prefs from `path`, degrading hostile files to an error string.
+pub(crate) fn load_folder_prefs_at(path: &Path) -> Result<FolderPrefsFile, String> {
+    match read_json_store::<FolderPrefsFile>(path, FOLDER_PREFS_MAX_BYTES) {
+        Ok(None) => Ok(FolderPrefsFile::default()),
+        Ok(Some(file)) => Ok(file),
+        Err(note) => Err(note),
+    }
+}
+
+/// Load bookmarks from `path`, degrading hostile files to an error string.
+pub(crate) fn load_bookmarks_at(path: &Path) -> Result<BookmarksFile, String> {
+    match read_json_store::<BookmarksFile>(path, BOOKMARKS_MAX_BYTES) {
+        Ok(None) => Ok(BookmarksFile::default()),
+        Ok(Some(file)) => Ok(file),
+        Err(note) => Err(note),
+    }
+}
+
+fn read_json_store<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<T>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Couldn't read {}: {e}", path.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink — folder preferences were not loaded.",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "{} is not a regular file — using defaults.",
+            path.display()
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(format!(
+            "{} is larger than {max_bytes} bytes — using defaults.",
+            path.display()
+        ));
+    }
+    let mut options = File::options();
+    options.read(true);
+    options.custom_flags(0o400_000 | 0o2_000_000); // O_NOFOLLOW | O_CLOEXEC
+    let file = options
+        .open(path)
+        .map_err(|e| format!("Couldn't open {}: {e}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("Couldn't stat {}: {e}", path.display()))?;
+    if opened.nlink() != 1 {
+        return Err(format!(
+            "{} is multiply linked — using defaults.",
+            path.display()
+        ));
+    }
+    let mut data = String::new();
+    file.take(max_bytes + 1)
+        .read_to_string(&mut data)
+        .map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    if data.len() as u64 > max_bytes {
+        return Err(format!(
+            "{} is larger than {max_bytes} bytes — using defaults.",
+            path.display()
+        ));
+    }
+    serde_json::from_str(&data).map(Some).map_err(|e| {
+        format!(
+            "{} is not valid JSON ({e}) — using defaults.",
+            path.display()
+        )
+    })
+}
+
+fn write_json_store<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // Never follow an attacker-controlled replacement of the store path.
+    // Writing a sibling and renaming it also makes a preference update
+    // all-or-nothing instead of exposing a truncated JSON file to the next
+    // startup.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("store"));
+    let pid = std::process::id();
+    let mut temp = None;
+    for attempt in 0..32u32 {
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            stem.to_string_lossy(),
+            pid,
+            attempt
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(0o400_000 | 0o2_000_000); // O_NOFOLLOW | O_CLOEXEC
+        match options.open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                temp = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let temp = temp.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a temporary preferences file",
+        )
+    })?;
+    let result = std::fs::rename(&temp, path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 mod sort;

@@ -6,10 +6,10 @@ ConditionPathExists=/var/lib/mde/role.toml
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/mackesd status
-ExecStartPost=/usr/bin/install -d -m 0750 /var/lib/mackesd/lifecycle
-ExecStartPost=/usr/bin/touch /var/lib/mackesd/lifecycle/firstboot-converged
-RemainAfterExit=yes
+ExecStart=/usr/bin/mackesd onboard lifecycle-firstboot
+# Do not stamp readiness here. The verb writes firstboot-converged only after
+# the canonical baseline has no blocking checks, and writes pending-convergence
+# (keeping enrollment tokens) on core failure.
 
 [Install]
 WantedBy=multi-user.target

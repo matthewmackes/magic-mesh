@@ -117,8 +117,10 @@ fn parse_cups_service(raw: &str) -> Option<CupsServiceFact> {
     let mut fields = HashMap::new();
     for line in raw.lines() {
         let (key, value) = line.split_once('=')?;
-        if !matches!(key, "LoadState" | "UnitFileState" | "ActiveState" | "SubState")
-            || value.is_empty()
+        if !matches!(
+            key,
+            "LoadState" | "UnitFileState" | "ActiveState" | "SubState"
+        ) || value.is_empty()
             || fields.insert(key, value).is_some()
         {
             return None;
@@ -188,7 +190,12 @@ fn classify_printer_provider(
     let (Some(service), Some(scheduler), Some(queue_count), Some(mut kernel)) =
         (service, scheduler, queues, kernel_printers)
     else {
-        return (PrinterReadiness::Unknown, 0, 0, "printer facts unavailable or malformed");
+        return (
+            PrinterReadiness::Unknown,
+            0,
+            0,
+            "printer facts unavailable or malformed",
+        );
     };
     if kernel.len() > MAX_PRINTER_FACTS
         || kernel.iter().any(|name| {
@@ -197,17 +204,32 @@ fn classify_printer_provider(
             })
         })
     {
-        return (PrinterReadiness::Unknown, 0, 0, "kernel printer inventory malformed");
+        return (
+            PrinterReadiness::Unknown,
+            0,
+            0,
+            "kernel printer inventory malformed",
+        );
     }
     kernel.sort_unstable();
     if kernel.windows(2).any(|pair| pair[0] == pair[1]) {
-        return (PrinterReadiness::Unknown, 0, 0, "kernel printer identities are duplicated");
+        return (
+            PrinterReadiness::Unknown,
+            0,
+            0,
+            "kernel printer identities are duplicated",
+        );
     }
     if service.active != scheduler
         || (!service.loaded && (service.enabled || service.active))
         || (!service.active && queue_count > 0)
     {
-        return (PrinterReadiness::Unknown, 0, 0, "CUPS and system facts contradict");
+        return (
+            PrinterReadiness::Unknown,
+            0,
+            0,
+            "CUPS and system facts contradict",
+        );
     }
     if !service.loaded || (!service.enabled && !service.active) {
         return (
@@ -1293,12 +1315,7 @@ mod tests {
                 Some(1),
                 Some(vec!["lp0".into(), "lp0".into()]),
             ),
-            classify_printer_provider(
-                service,
-                Some(true),
-                Some(1),
-                Some(vec!["lp-secret".into()]),
-            ),
+            classify_printer_provider(service, Some(true), Some(1), Some(vec!["lp-secret".into()])),
         ];
         for (readiness, queues, kernel, reason) in cases {
             assert_eq!(readiness, PrinterReadiness::Unknown);

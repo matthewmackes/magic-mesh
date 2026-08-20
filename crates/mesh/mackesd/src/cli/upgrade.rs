@@ -34,8 +34,13 @@ pub fn run(
             generation,
             steps: vec!["configuration".into()],
         };
-        let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
-            .map_err(|error| anyhow::anyhow!("cannot acquire lifecycle authority for upgrade coordination: {error:?}"))?;
+        let mut authority =
+            mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot acquire lifecycle authority for upgrade coordination: {error:?}"
+                    )
+                })?;
         let result = authority.run_next(|_| {
             match artifact_selection_json {
                 Some(selection) => mackesd_core::workers::upgrade_intent_watcher::write_intent_with_selection_json(
@@ -50,9 +55,12 @@ pub fn run(
         });
         if let Err(error) = result {
             let _ = authority.finish();
-            return Err(anyhow::anyhow!("mackesd upgrade --coordinate lifecycle failure: {error:?}"));
+            return Err(anyhow::anyhow!(
+                "mackesd upgrade --coordinate lifecycle failure: {error:?}"
+            ));
         }
-        authority.finish()
+        authority
+            .finish()
             .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
         return Ok(());
     }

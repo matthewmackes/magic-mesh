@@ -1804,12 +1804,9 @@ impl VehicleRoster {
         // an accepted snapshot. Preserve the source publication clock so an
         // unhealthy non-selected manager cannot manufacture a false Changed
         // publication on the next fold.
-        let has_live_manager = self
-            .assignments
-            .iter()
-            .any(|((candidate, _), assignment)| {
-                candidate == source_id && assignment.latest.is_some()
-            });
+        let has_live_manager = self.assignments.iter().any(|((candidate, _), assignment)| {
+            candidate == source_id && assignment.latest.is_some()
+        });
         if !has_live_manager {
             self.published.remove(source_id);
         }
@@ -1845,12 +1842,9 @@ impl VehicleRoster {
             // another manager still has an accepted snapshot; doing so emits
             // a false Changed publication and makes a healthy MG90 look like
             // it churned during manager failover.
-            let has_live_manager = self
-                .assignments
-                .iter()
-                .any(|((candidate, _), assignment)| {
-                    candidate == &source_id && assignment.latest.is_some()
-                });
+            let has_live_manager = self.assignments.iter().any(|((candidate, _), assignment)| {
+                candidate == &source_id && assignment.latest.is_some()
+            });
             if !has_live_manager {
                 self.published.remove(&source_id);
             }
@@ -2137,9 +2131,7 @@ fn mark_retained_radio_state_stale(state: &VehicleState, snapshot: &mut VehicleS
         ) {
             continue;
         }
-        if radio.age_ms.is_some()
-            || radio.operation != RadioOperation::Unknown
-            || radio.active_path
+        if radio.age_ms.is_some() || radio.operation != RadioOperation::Unknown || radio.active_path
         {
             radio.operation = RadioOperation::Stale;
             radio.active_path = false;
@@ -5663,9 +5655,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         replacement.nmea = replacement
             .nmea
             .map(|nmea| nmea.replace("3210.07993", "4010.07993"));
-        replacement.wan = replacement
-            .wan
-            .map(|wan| wan.replace("CellularA", "WiFi"));
+        replacement.wan = replacement.wan.map(|wan| wan.replace("CellularA", "WiFi"));
 
         runtime.apply_enrichment(VehicleWorker::probe_enrichment(&replacement));
         let refused = runtime.render();
@@ -6859,16 +6849,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         }
 
         roster
-            .ingest_at(
-                roster_snapshot(&source, "manager-a", 100, 100, 1),
-                t0,
-            )
+            .ingest_at(roster_snapshot(&source, "manager-a", 100, 100, 1), t0)
             .unwrap();
         roster
-            .ingest_at(
-                roster_snapshot(&source, "manager-b", 100, 100, 1),
-                t0,
-            )
+            .ingest_at(roster_snapshot(&source, "manager-b", 100, 100, 1), t0)
             .unwrap();
         assert_eq!(roster.take_publications(t0).len(), 1);
 
@@ -6910,16 +6894,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         }
 
         roster
-            .ingest_at(
-                roster_snapshot(&source, "manager-a", 200, 200, 2),
-                t0,
-            )
+            .ingest_at(roster_snapshot(&source, "manager-a", 200, 200, 2), t0)
             .unwrap();
         roster
-            .ingest_at(
-                roster_snapshot(&source, "manager-b", 100, 100, 1),
-                t0,
-            )
+            .ingest_at(roster_snapshot(&source, "manager-b", 100, 100, 1), t0)
             .unwrap();
         let initial = roster.take_publications(t0);
         assert_eq!(initial.len(), 1);
@@ -6929,7 +6907,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             .mark_unavailable(&source, "manager-b")
             .expect("registered manager can be marked unavailable");
         assert!(
-            roster.take_publications(t0 + Duration::from_secs(1)).is_empty(),
+            roster
+                .take_publications(t0 + Duration::from_secs(1))
+                .is_empty(),
             "losing a non-selected manager must not manufacture a source change"
         );
     }

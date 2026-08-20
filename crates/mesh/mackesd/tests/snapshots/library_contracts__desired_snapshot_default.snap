@@ -6,6 +6,5 @@ expression: snap
 {
   "nodes": [],
   "allow_east_west": [],
-  "settings_keys": [],
-  "voice_policies": []
+  "settings_keys": []
 }

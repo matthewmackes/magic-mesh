@@ -2559,6 +2559,8 @@ impl SystemState {
             | HotkeyAction::ReturnToChrome
             | HotkeyAction::OpenSystem
             | HotkeyAction::OpenOmnibox
+            | HotkeyAction::OpenTransfers
+            | HotkeyAction::NewTransfer
             | HotkeyAction::MediaPlayPause
             | HotkeyAction::MediaPause
             | HotkeyAction::MediaStop

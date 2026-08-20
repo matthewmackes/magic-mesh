@@ -744,17 +744,17 @@ fn run_pass_at_inner(
     {
         if let Some(cutoff) = ttl_cutoff_unix_ms(policy, "unknown", now_unix_ms) {
             let mut stmt = conn
-            .prepare(
-                "SELECT ulid, file_path FROM messages \
+                .prepare(
+                    "SELECT ulid, file_path FROM messages \
                  WHERE priority NOT IN ('min', 'default', 'high', 'urgent') \
                    AND ts_unix_ms < ?1",
-            )
-            .map_err(|e| RetentionError::Sql(format!("prepare unknown priority: {e}")))?;
+                )
+                .map_err(|e| RetentionError::Sql(format!("prepare unknown priority: {e}")))?;
             let rows = stmt
-            .query_map(params![cutoff], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| RetentionError::Sql(format!("query unknown priority: {e}")))?;
+                .query_map(params![cutoff], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| RetentionError::Sql(format!("query unknown priority: {e}")))?;
             for row in rows {
                 victims.push(
                     row.map_err(|e| RetentionError::Sql(format!("decode unknown priority: {e}")))?,

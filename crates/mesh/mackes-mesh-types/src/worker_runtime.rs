@@ -444,7 +444,6 @@ pub struct WorkerApplicability {
     pub requires_configuration: bool,
 }
 
-
 impl WorkerApplicability {
     fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
         if self.roles.len() > MAX_WORKER_APPLICABILITY_ENTRIES
@@ -1870,7 +1869,10 @@ where
     serde_json::from_str(body).map_err(|_| WorkerRuntimeContractError::MalformedWire)
 }
 
-const fn validate_schema(field: &'static str, found: u16) -> Result<(), WorkerRuntimeContractError> {
+const fn validate_schema(
+    field: &'static str,
+    found: u16,
+) -> Result<(), WorkerRuntimeContractError> {
     if found != WORKER_RUNTIME_SCHEMA_VERSION {
         return Err(WorkerRuntimeContractError::UnsupportedSchema { field, found });
     }
@@ -1999,7 +2001,10 @@ fn validate_unique_topics(
     Ok(())
 }
 
-const fn validate_timestamp(field: &'static str, value: u64) -> Result<(), WorkerRuntimeContractError> {
+const fn validate_timestamp(
+    field: &'static str,
+    value: u64,
+) -> Result<(), WorkerRuntimeContractError> {
     if value == 0 {
         return Err(WorkerRuntimeContractError::InvalidTimestamp(field));
     }
@@ -2034,43 +2039,48 @@ const fn validate_state_reason(
     }
     let valid = matches!(
         (state, reason),
-        (WorkerRuntimeState::NotApplicable, Some(WorkerRuntimeReason::NotApplicable))
-            | (WorkerRuntimeState::Unconfigured, Some(WorkerRuntimeReason::NotConfigured))
-            | (
-                WorkerRuntimeState::Backoff,
-                Some(
-                    WorkerRuntimeReason::CrashLoop
-                        | WorkerRuntimeReason::ResourceLimit
-                        | WorkerRuntimeReason::DependencyUnavailable,
-                ),
-            )
-            | (WorkerRuntimeState::Paused, Some(WorkerRuntimeReason::OperatorPaused))
-            | (
-                WorkerRuntimeState::Failed,
-                Some(
-                    WorkerRuntimeReason::CrashLoop
-                        | WorkerRuntimeReason::DependencyUnavailable
-                        | WorkerRuntimeReason::ProviderUnavailable
-                        | WorkerRuntimeReason::Unknown,
-                ),
-            )
-            | (WorkerRuntimeState::Stale, Some(WorkerRuntimeReason::ObservationStale))
-            | (
-                WorkerRuntimeState::Unavailable,
-                Some(
-                    WorkerRuntimeReason::CapabilityMissing
-                        | WorkerRuntimeReason::DependencyUnavailable
-                        | WorkerRuntimeReason::ProviderUnavailable
-                        | WorkerRuntimeReason::ResourceLimit
-                        | WorkerRuntimeReason::Unknown,
-                ),
-            )
-            | (
-                WorkerRuntimeState::Starting
-                    | WorkerRuntimeState::Running
-                    | WorkerRuntimeState::Stopped,
-                None,
-            )
+        (
+            WorkerRuntimeState::NotApplicable,
+            Some(WorkerRuntimeReason::NotApplicable)
+        ) | (
+            WorkerRuntimeState::Unconfigured,
+            Some(WorkerRuntimeReason::NotConfigured)
+        ) | (
+            WorkerRuntimeState::Backoff,
+            Some(
+                WorkerRuntimeReason::CrashLoop
+                    | WorkerRuntimeReason::ResourceLimit
+                    | WorkerRuntimeReason::DependencyUnavailable,
+            ),
+        ) | (
+            WorkerRuntimeState::Paused,
+            Some(WorkerRuntimeReason::OperatorPaused)
+        ) | (
+            WorkerRuntimeState::Failed,
+            Some(
+                WorkerRuntimeReason::CrashLoop
+                    | WorkerRuntimeReason::DependencyUnavailable
+                    | WorkerRuntimeReason::ProviderUnavailable
+                    | WorkerRuntimeReason::Unknown,
+            ),
+        ) | (
+            WorkerRuntimeState::Stale,
+            Some(WorkerRuntimeReason::ObservationStale)
+        ) | (
+            WorkerRuntimeState::Unavailable,
+            Some(
+                WorkerRuntimeReason::CapabilityMissing
+                    | WorkerRuntimeReason::DependencyUnavailable
+                    | WorkerRuntimeReason::ProviderUnavailable
+                    | WorkerRuntimeReason::ResourceLimit
+                    | WorkerRuntimeReason::Unknown,
+            ),
+        ) | (
+            WorkerRuntimeState::Starting
+                | WorkerRuntimeState::Running
+                | WorkerRuntimeState::Stopped,
+            None,
+        )
     );
     if valid {
         Ok(())

@@ -145,7 +145,10 @@ const fn legacy_direction(
     }
 }
 
-const fn file_on_direction_side(job: &TransferJobV2, direction: TransferDirection) -> Option<FileRefId> {
+const fn file_on_direction_side(
+    job: &TransferJobV2,
+    direction: TransferDirection,
+) -> Option<FileRefId> {
     let location = match direction {
         TransferDirection::Inbound => &job.endpoint.destination,
         TransferDirection::Outbound => &job.endpoint.source,

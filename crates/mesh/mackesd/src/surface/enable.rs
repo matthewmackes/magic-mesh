@@ -782,7 +782,7 @@ screen (MOK Manager). It will NOT continue to the desktop on its own:\n\
 mokutil asked for when staging the key).\n\
   4. Select \"Reboot\".\n\
 If you miss the screen (it times out to the OS), re-run enable — the key is \
-still staged until enrolled. Reboot only through System → Power & Battery."
+still staged until enrolled. Reboot only through System → Power & Battery.",
     )
 }
 

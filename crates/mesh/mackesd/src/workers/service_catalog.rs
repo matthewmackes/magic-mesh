@@ -434,11 +434,16 @@ fn registered_card(
     let auth_credential_ref = SecretReference::new(credential_ref.clone())?;
     let is_configured = configured.is_some();
     let is_enabled = configured.is_some_and(|config| config.enabled);
-    let is_launchable = configured
-        .is_some_and(|config| config.enabled && config.last_test_ok == Some(true));
+    let is_launchable =
+        configured.is_some_and(|config| config.enabled && config.last_test_ok == Some(true));
     let health_failure = configured
         .is_some_and(|config| config.last_test_ok == Some(false))
-        .then(|| failure(FailureCode::Unreachable, "latest service endpoint test failed"));
+        .then(|| {
+            failure(
+                FailureCode::Unreachable,
+                "latest service endpoint test failed",
+            )
+        });
     let actions = [
         ("inspect", ResourceActionVerb::Inspect, true),
         ("configure", ResourceActionVerb::Configure, true),
@@ -572,11 +577,13 @@ fn observed_card(
         format!("service/{host}/{kind}"),
         vec![],
     )?;
-    let record_is_fresh = u64::try_from(record.last_seen_ms).ok().is_some_and(|observed| {
-        observed > 0
-            && observed <= now
-            && now.saturating_sub(observed) <= SERVICE_RECORD_MAX_AGE_MS
-    });
+    let record_is_fresh = u64::try_from(record.last_seen_ms)
+        .ok()
+        .is_some_and(|observed| {
+            observed > 0
+                && observed <= now
+                && now.saturating_sub(observed) <= SERVICE_RECORD_MAX_AGE_MS
+        });
     let effective_health = if record_is_fresh {
         record.health
     } else {
@@ -755,11 +762,9 @@ fn probed_rdp_card(
     // for the same bounded five-minute window as the probe-only service row.
     // Leaving the generic one-minute provenance TTL here made the UI present a
     // still-connectable RDP card whose only provenance had already expired.
-    rdp_provenance.expires_at_ms = observed_at_ms
-        .checked_add(PROBED_RDP_MAX_AGE_MS)
-        .ok_or(ResourceValidationError::InvalidTimestamp(
-            "probed_rdp.provenance_freshness",
-        ))?;
+    rdp_provenance.expires_at_ms = observed_at_ms.checked_add(PROBED_RDP_MAX_AGE_MS).ok_or(
+        ResourceValidationError::InvalidTimestamp("probed_rdp.provenance_freshness"),
+    )?;
     card.provenance = vec![rdp_provenance];
     card.validate()?;
     Ok(Some(card))
@@ -1674,9 +1679,9 @@ mod tests {
                 .cards
                 .iter()
                 .find(|card| {
-                    card.service.as_ref().is_some_and(|service| {
-                        service.stack.hosting_nodes == [host.to_owned()]
-                    })
+                    card.service
+                        .as_ref()
+                        .is_some_and(|service| service.stack.hosting_nodes == [host.to_owned()])
                 })
                 .expect("retained service remains inspectable");
             assert_eq!(card.health.status, HealthStatus::Stale);
@@ -1971,18 +1976,18 @@ SERVER: MCNF/1.0\r\n\r\n";
     fn failed_latest_test_revokes_launch_admission_even_when_enabled() {
         let root = tempfile::tempdir().unwrap();
         let config = StoredServiceConfiguration {
-                schema_version: SERVICE_CONFIG_VERSION,
-                service_kind: "jellyfin".into(),
-                non_secret_values: BTreeMap::from([(
-                    "endpoint".into(),
-                    "https://media.example.test".into(),
-                )]),
-                secret_fields: vec!["api-key".into()],
-                credential_ref: "service/jellyfin/jellyfin".into(),
-                enabled: true,
-                last_test_ok: Some(false),
-                updated_at_ms: 1_700_000_000_000,
-            };
+            schema_version: SERVICE_CONFIG_VERSION,
+            service_kind: "jellyfin".into(),
+            non_secret_values: BTreeMap::from([(
+                "endpoint".into(),
+                "https://media.example.test".into(),
+            )]),
+            secret_fields: vec!["api-key".into()],
+            credential_ref: "service/jellyfin/jellyfin".into(),
+            enabled: true,
+            last_test_ok: Some(false),
+            updated_at_ms: 1_700_000_000_000,
+        };
         persist_configuration(root.path(), &config).expect("persist service state");
         let spec = registered_service("jellyfin").expect("registered Jellyfin adapter");
         let card = registered_card(spec, "seat-15", 1_700_000_000_000, Some(&config))

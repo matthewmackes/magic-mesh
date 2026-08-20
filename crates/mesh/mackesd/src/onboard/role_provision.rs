@@ -46,10 +46,9 @@ pub struct PlannedUnit {
 ///   `mackesd` daemon, the etcd + Syncthing substrate, and the health + status
 ///   timers. This is [`crate::site_yml::CONVERGE_SERVICES`] plus the status
 ///   timer (a unit test pins that superset relationship).
-/// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell and
-///   the voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
-///   worker's tier). The base role owns the supported provisioning units; retired
-///   Browser runtime setup is not part of the package or role contract.
+/// * **Rank 1 (Workstation only)** — the desktop adds the DRM-seat shell.
+///   The base role owns the supported provisioning units; retired Browser
+///   runtime setup is not part of the package or role contract.
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
@@ -58,10 +57,9 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("syncthing.service", 0),
     ("mesh-health.timer", 0),
     ("mesh-status.timer", 0),
-    // ── Rank 1 — Workstation-only: the DRM-seat shell + voice stack.
+    ("mcnf-lifecycle-firstboot.service", 0),
+    // ── Rank 1 — Workstation-only: the DRM-seat shell.
     ("mde-shell-egui.service", 1),
-    ("kamailio-mde.service", 1),
-    ("rtpengine-mde.service", 1),
 ];
 
 /// The pure role→unit-actions mapping.
@@ -246,6 +244,7 @@ mod tests {
             "syncthing.service",
             "mesh-health.timer",
             "mesh-status.timer",
+            "mcnf-lifecycle-firstboot.service",
         ] {
             assert_eq!(
                 action_for(&p, u).action,
@@ -254,11 +253,7 @@ mod tests {
             );
         }
         // Rank-1 Workstation units → masked (a lighthouse never runs them).
-        for u in [
-            "mde-shell-egui.service",
-            "kamailio-mde.service",
-            "rtpengine-mde.service",
-        ] {
+        for u in ["mde-shell-egui.service"] {
             assert_eq!(
                 action_for(&p, u).action,
                 UnitAction::Mask,
@@ -356,6 +351,19 @@ mod tests {
         assert!(
             post_install.contains("systemctl enable mde-shell-egui.service"),
             "base RPM post-install must enable the self-gated seat unit"
+        );
+        assert!(
+            asset_exists(
+                base_assets,
+                "packaging/systemd/mcnf-lifecycle-firstboot.service",
+                "/usr/lib/systemd/system/mcnf-lifecycle-firstboot.service",
+                "644",
+            ),
+            "base RPM must ship the first-boot baseline unit"
+        );
+        assert!(
+            post_install.contains("mcnf-lifecycle-firstboot.service"),
+            "base RPM post-install must enable first-boot baseline convergence"
         );
         assert!(
             post_install.contains("usermod -aG audio \"$user\""),

@@ -669,26 +669,34 @@ fn availability_transition_allowed(
         return previous != NodeAvailabilityState::Returned;
     }
     match (previous, current) {
-        (NodeAvailabilityState::Awake,
+        (
+            NodeAvailabilityState::Awake,
             NodeAvailabilityState::Sleeping
-                | NodeAvailabilityState::ShuttingDown
-                | NodeAvailabilityState::ScheduledReboot
-                | NodeAvailabilityState::Maintenance
-                | NodeAvailabilityState::AdapterMigration)
-        | (NodeAvailabilityState::ShuttingDown | NodeAvailabilityState::ScheduledReboot,
-            NodeAvailabilityState::ShutDown)
-        | (NodeAvailabilityState::ShuttingDown
+            | NodeAvailabilityState::ShuttingDown
+            | NodeAvailabilityState::ScheduledReboot
+            | NodeAvailabilityState::Maintenance
+            | NodeAvailabilityState::AdapterMigration,
+        )
+        | (
+            NodeAvailabilityState::ShuttingDown | NodeAvailabilityState::ScheduledReboot,
+            NodeAvailabilityState::ShutDown,
+        )
+        | (
+            NodeAvailabilityState::ShuttingDown
             | NodeAvailabilityState::ShutDown
             | NodeAvailabilityState::ScheduledReboot,
-            NodeAvailabilityState::Rebooting)
-        | (NodeAvailabilityState::ShuttingDown
+            NodeAvailabilityState::Rebooting,
+        )
+        | (
+            NodeAvailabilityState::ShuttingDown
             | NodeAvailabilityState::Sleeping
             | NodeAvailabilityState::ShutDown
             | NodeAvailabilityState::ScheduledReboot
             | NodeAvailabilityState::Rebooting
             | NodeAvailabilityState::Maintenance
             | NodeAvailabilityState::AdapterMigration,
-            NodeAvailabilityState::Returned)
+            NodeAvailabilityState::Returned,
+        )
         | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::ScheduledReboot)
         | (NodeAvailabilityState::Returned, NodeAvailabilityState::Awake) => true,
         _ => false,
@@ -1597,9 +1605,7 @@ impl SystemMeshHealthSnapshot {
         // nonzero check also keeps the wire-level zero timestamp sentinel
         // from becoming fresh when a test or hostile caller supplies
         // `now_ms == 0`.
-        self.generated_at_ms != 0
-            && self.generated_at_ms <= now_ms
-            && now_ms <= self.fresh_until_ms
+        self.generated_at_ms != 0 && self.generated_at_ms <= now_ms && now_ms <= self.fresh_until_ms
     }
 }
 
@@ -2391,12 +2397,18 @@ mod tests {
         );
         future.generated_at_ms = 101;
         future.fresh_until_ms = 200;
-        assert!(!future.is_fresh(100), "future evidence must not appear current");
+        assert!(
+            !future.is_fresh(100),
+            "future evidence must not appear current"
+        );
 
         let mut zero = future;
         zero.generated_at_ms = 0;
         zero.fresh_until_ms = 0;
-        assert!(!zero.is_fresh(0), "zero timestamp is an invalid freshness sentinel");
+        assert!(
+            !zero.is_fresh(0),
+            "zero timestamp is an invalid freshness sentinel"
+        );
     }
 
     #[test]

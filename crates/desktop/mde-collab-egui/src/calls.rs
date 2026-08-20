@@ -16,26 +16,27 @@
 //!   [`AnswerCall`](CollabCommand::AnswerCall) /
 //!   [`DeclineCall`](CollabCommand::DeclineCall).
 //! * **Mute** the local microphone → [`SetCallMuted`](CollabCommand::SetCallMuted)
-//!   (a real convergent command; the projection carries each participant's muted
-//!   bit).
+//!   (a real convergent command applied to the live P2P audio leg by the
+//!   mackesd media worker when a seat device is bound; the projection carries
+//!   each participant's muted bit).
 //! * **DTMF** — an in-call keypad whose every press emits
-//!   [`SendDtmf`](CollabCommand::SendDtmf).
+//!   [`SendDtmf`](CollabCommand::SendDtmf), which the same worker injects into
+//!   the bound live leg.
 //! * **Hang up** → [`HangUpCall`](CollabCommand::HangUpCall).
 //! * Device selection (mic / camera / screen), reusing the egui combo shape the
 //!   `mde-voice-egui` dialer controls take.
 //!
-//! # Media transport is an explicit, marked follow-up — never faked (spec §7)
+//! # Media plane: mute/DTMF are live; camera/screen remain marked follow-ups
 //!
-//! Every control above emits a **real** typed command and the call **state** flows
-//! through the worker's event log into the projection today. What lands later is
-//! the media plane that actually carries the audio/video frames, marked in-code
-//! with `// WL-FUNC-011 media:`:
+//! Mute and DTMF are the live-leg verbs. The renderer still only emits typed
+//! [`CollabCommand`]s; the mackesd P2P worker (`call_media`) applies them to the
+//! bound seat audio (or publishes a typed unavailable media session when no
+//! device or permission exists). What remains marked in-code with
+//! `// WL-FUNC-011 media:` is capture that this surface does not yet bind:
 //!
-//! * **WebRTC P2P** for direct (two-party) calls;
-//! * an **elected LiveKit SFU** for group calls + P2P failover;
-//! * the existing **SIP** account / DID / G.711 path (from `mde-voice-config` /
-//!   `mde-voice-hud`, reused unchanged) behind a **LiveKit SIP gateway** so a mesh
-//!   call can bridge to the PSTN.
+//! * **camera / screen-share** track attach (S5);
+//! * **elected LiveKit SFU** for group calls (S3);
+//! * **LiveKit SIP gateway** PSTN legs (S4).
 //!
 //! The camera / screen-source toggles record the seat's outgoing-media intent as
 //! local view state; binding a real device to a live sender is part of that same
@@ -135,11 +136,10 @@ const DTMF_ROWS: [[char; 3]; 4] = [
 /// screen device and the seat's outgoing camera / screen-share intents.
 ///
 /// **Seat-level view state only.** This pure UI crate never touches a real capture
-/// device: the actual device enumeration and the act of binding a device to the
-/// live media sender (WebRTC / LiveKit) are the marked media-plane follow-up. The
-/// *audio* mute is not here — that is a real convergent
-/// [`SetCallMuted`](CollabCommand::SetCallMuted) command reflected in the
-/// projection, not a local preference.
+/// device: live microphone bind and mute/DTMF injection are owned by the mackesd
+/// P2P media worker, driven by [`SetCallMuted`](CollabCommand::SetCallMuted) and
+/// [`SendDtmf`](CollabCommand::SendDtmf). Camera and screen enumeration plus
+/// attaching those tracks remain marked media-plane follow-ups.
 #[derive(Debug, Clone)]
 pub(crate) struct CallMediaPrefs {
     /// The chosen microphone device (default: the system default).
@@ -448,8 +448,9 @@ impl CommunicationsSurface {
     }
 
     /// The connected-seat control cluster: mute, camera, screen-share, the DTMF
-    /// keypad toggle, and hang up. Mute + DTMF emit real commands; the camera /
-    /// screen toggles record the seat's outgoing-media intent (a marked media-plane
+    /// keypad toggle, and hang up. Mute + DTMF emit the live-leg commands the
+    /// P2P media worker applies to a bound audio sender; the camera / screen
+    /// toggles record the seat's outgoing-media intent (a marked media-plane
     /// follow-up).
     fn connected_controls(
         &mut self,
@@ -459,7 +460,9 @@ impl CommunicationsSurface {
         muted: bool,
     ) {
         ui.horizontal(|ui| {
-            // Microphone mute — a real convergent command.
+            // Microphone mute — live-leg command. The mackesd P2P worker applies
+            // this to the bound seat audio sender (or refuses with a typed
+            // unavailable media session when no device is bound).
             let (mic_glyph, mic_hint) = if muted {
                 (icons::CALL_UNMUTE, "Unmute microphone")
             } else {
@@ -572,12 +575,14 @@ impl CommunicationsSurface {
         sink.emit(CollabCommand::HangUpCall { call });
     }
 
-    /// Emit [`SetCallMuted`](CollabCommand::SetCallMuted) — toggle the local mic.
+    /// Emit [`SetCallMuted`](CollabCommand::SetCallMuted) for the live audio
+    /// sender owned by the mackesd P2P media worker.
     pub(crate) fn set_call_muted(&self, sink: &mut CommandSink, call: CallId, muted: bool) {
         sink.emit(CollabCommand::SetCallMuted { call, muted });
     }
 
-    /// Emit [`SendDtmf`](CollabCommand::SendDtmf) — one in-call keypad tone.
+    /// Emit [`SendDtmf`](CollabCommand::SendDtmf) for the live audio sender
+    /// owned by the mackesd P2P media worker.
     pub(crate) fn send_dtmf(&self, sink: &mut CommandSink, call: CallId, digit: char) {
         sink.emit(CollabCommand::SendDtmf { call, digit });
     }

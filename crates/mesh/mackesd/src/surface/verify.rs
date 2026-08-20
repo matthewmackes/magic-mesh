@@ -1255,10 +1255,9 @@ mod worker {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use mackes_mesh_types::surface_hardware::{
-        SurfaceCameraProofOutcome, SurfaceCameraProofRefusal,
-        SurfaceCameraProofRequest, SurfaceCameraProofResult, SurfaceCameraProofUnavailable,
-        SurfaceModelIdentity, SurfaceProGeneration, SURFACE_CAMERA_PROOF_ARM_TOKEN,
-        SURFACE_HARDWARE_SCHEMA_VERSION,
+        SurfaceCameraProofOutcome, SurfaceCameraProofRefusal, SurfaceCameraProofRequest,
+        SurfaceCameraProofResult, SurfaceCameraProofUnavailable, SurfaceModelIdentity,
+        SurfaceProGeneration, SURFACE_CAMERA_PROOF_ARM_TOKEN, SURFACE_HARDWARE_SCHEMA_VERSION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -1613,9 +1612,9 @@ mod worker {
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
         use mackes_mesh_types::surface_hardware::{
             SurfaceActionHeader, SurfaceCameraProofFailure, SurfaceCameraProofOutcome,
-            SurfaceCameraProofRequest,
-            SurfaceCameraProofResult, SurfaceCameraProofUnavailable, SurfaceFleetSummary,
-            SurfaceProGeneration, SurfaceVerifyBoard, SURFACE_CAMERA_PROOF_ARM_TOKEN,
+            SurfaceCameraProofRequest, SurfaceCameraProofResult, SurfaceCameraProofUnavailable,
+            SurfaceFleetSummary, SurfaceProGeneration, SurfaceVerifyBoard,
+            SURFACE_CAMERA_PROOF_ARM_TOKEN,
         };
 
         const AUTH_KEY: &[u8] = b"surface-camera-functional-proof-test-key";

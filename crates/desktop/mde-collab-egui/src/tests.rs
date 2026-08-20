@@ -26,9 +26,11 @@ use mde_collab_types::{
 use crate::activity::{activity_rows, filtered_activity_entries};
 use crate::fixture::{activity, message, space_summary, FixtureData};
 use crate::{
-    amend_affordance, file_ref_of_path, ActivityFilter, AmendAffordance, ChannelTab, CollabData,
-    CommandSink, CommunicationsSurface, DocSubMode, DocTemplate, DocView, MeshTeamsApp, Mode,
-    ALL_COLLAB_ICONS, EDIT_WINDOW_MS,
+    amend_affordance, file_ref_of_path, ActivityAdminSnapshot, ActivityFilter, AmendAffordance,
+    ChannelTab, CollabData, CommandSink, CommunicationsSurface, DocSubMode, DocTemplate, DocView,
+    GatewayCommand, GatewayReadout, GatewaySink, MeshTeamsApp, Mode, VoiceAdminCommand,
+    VoiceAdminSink, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy,
+    VoiceNodeProjection, VoiceRegState, VoiceSharedOutbound, ALL_COLLAB_ICONS, EDIT_WINDOW_MS,
 };
 
 /// A `1000 x 700` headless input with the given events.
@@ -2855,7 +2857,7 @@ fn clip_actions_emit_attach_pin_and_delete() {
     );
 }
 
-// ── Documents mode (WL-FUNC-011 Phase 3c foundation) ─────────────────────────
+// ── Documents mode (WL-FUNC-031 share-session + external-write merge) ─────────
 
 /// A one-space fixture with a single document session + its resolved body, so the
 /// Documents-mode tests exercise the real read models (never faked data).
@@ -3094,6 +3096,226 @@ fn switching_space_resets_the_picked_document() {
         None,
         "a space switch must close the previous space's editor so its Markdown cannot remain visible"
     );
+}
+
+fn documents_fixture_as(
+    me: &str,
+    space: SpaceId,
+    document: DocumentId,
+    body: &str,
+    role: SpaceRole,
+) -> FixtureData {
+    FixtureData::new(me, 1_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Project,
+            "Docs",
+            role,
+            0,
+            2,
+            1_000,
+        ))
+        .with_document_sessions(
+            space,
+            DocumentSessions {
+                sessions: vec![DocumentSession {
+                    document,
+                    space,
+                    title: "Runbook".to_owned(),
+                    participants: vec![ActorId::new("eagle"), ActorId::new("falcon")],
+                    call: None,
+                }],
+            },
+        )
+        .with_document_body(document, body)
+}
+
+#[test]
+fn share_join_follow_and_owner_close_work_between_two_seats() {
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Runbook\n\nshared\n";
+    let host_data = documents_fixture_as("eagle", space, document, body, SpaceRole::Owner);
+    let guest_data = documents_fixture_as("falcon", space, document, body, SpaceRole::Member);
+    let bus = mde_editor_egui::FakeBus::new();
+
+    let mut host = CommunicationsSurface::new();
+    host.bind_document_share_bus(bus.clone());
+    host.select_space(space);
+    host.open_document(&host_data, document, "Runbook");
+
+    let mut guest = CommunicationsSurface::new();
+    guest.bind_document_share_bus(bus);
+    guest.select_space(space);
+    guest.open_document(&guest_data, document, "Runbook");
+
+    assert!(
+        host.share_document(&host_data, space),
+        "owner share must start a session"
+    );
+    assert!(
+        host.is_document_share_owner(),
+        "the sharing seat is the session owner"
+    );
+    assert!(
+        matches!(
+            host.document_share_commands().last(),
+            Some(crate::documents::DocumentShareCommand::Start { .. })
+        ),
+        "share emits a local Start command"
+    );
+
+    assert!(
+        guest.join_document_share(&guest_data, space, document),
+        "a member must join from the live-session picker"
+    );
+    for _ in 0..4 {
+        host.pump_document_share();
+        guest.pump_document_share();
+    }
+
+    assert_eq!(
+        guest.document_editor_text().as_deref(),
+        host.document_editor_text().as_deref(),
+        "two seats must converge on the shared document"
+    );
+    assert!(
+        guest
+            .document_share_peers()
+            .iter()
+            .any(|peer| peer == "eagle")
+            || host
+                .document_share_peers()
+                .iter()
+                .any(|peer| peer == "falcon"),
+        "the share roster must show the other seat (visible cursors/presence)"
+    );
+
+    assert!(
+        guest.follow_share_peer("eagle"),
+        "guest follow-mode toggle must pin the owner once they are in the roster"
+    );
+    assert_eq!(guest.following_share_peer(), Some("eagle"));
+    assert!(
+        matches!(
+            guest.document_share_commands().last(),
+            Some(crate::documents::DocumentShareCommand::Follow { .. })
+        ),
+        "follow emits a local Follow command"
+    );
+
+    assert!(host.close_document_share(), "owner close must succeed");
+    guest.pump_document_share();
+    assert!(
+        !guest.has_live_document_share(),
+        "owner close must detach every follower"
+    );
+    assert_eq!(
+        guest.following_share_peer(),
+        None,
+        "owner close must end follow mode"
+    );
+}
+
+#[test]
+fn non_members_and_closed_sessions_refuse_share_join_honestly() {
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Runbook\n";
+    let member = documents_fixture_as("eagle", space, document, body, SpaceRole::Owner);
+    let outsider = FixtureData::new("osprey", 1_000).with_document_sessions(
+        space,
+        DocumentSessions {
+            sessions: vec![DocumentSession {
+                document,
+                space,
+                title: "Runbook".to_owned(),
+                participants: vec![ActorId::new("eagle")],
+                call: None,
+            }],
+        },
+    );
+    let closed = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        space,
+        SpaceKind::Project,
+        "Docs",
+        SpaceRole::Owner,
+        0,
+        1,
+        1_000,
+    ));
+
+    let mut host = CommunicationsSurface::new();
+    host.select_space(space);
+    host.open_document(&member, document, "Runbook");
+    assert!(host.share_document(&member, space));
+
+    let mut stranger = CommunicationsSurface::new();
+    stranger.select_space(space);
+    stranger.open_document(&outsider, document, "Runbook");
+    assert!(
+        !stranger.join_document_share(&outsider, space, document),
+        "a non-member must be refused"
+    );
+    assert!(
+        !stranger.has_live_document_share(),
+        "a refused join must not attach a session"
+    );
+
+    let mut late = CommunicationsSurface::new();
+    late.select_space(space);
+    late.open_document(&closed, document, "Runbook");
+    assert!(
+        !late.join_document_share(&closed, space, document),
+        "a closed session must be refused"
+    );
+}
+
+#[test]
+fn concurrent_external_write_merges_or_surfaces_a_typed_conflict() {
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.open_document(
+        &documents_fixture(space, document, "base\n"),
+        document,
+        "Runbook",
+    );
+    surface.set_document_editor_text("base\nlocal\n");
+    surface.apply_external_document_body(&documents_fixture(space, document, "remote\nbase\n"));
+    assert_eq!(
+        surface.document_editor_text().as_deref(),
+        Some("remote\nbase\nlocal\n"),
+        "non-overlapping external writes must merge into the live buffer"
+    );
+    assert_eq!(
+        surface.last_shared_base(),
+        Some("remote\nbase\nlocal\n"),
+        "a clean merge becomes the next shared base"
+    );
+    assert!(surface.external_write_conflict().is_none());
+
+    let mut conflicted = CommunicationsSurface::new();
+    conflicted.select_space(space);
+    conflicted.open_document(
+        &documents_fixture(space, document, "hello\n"),
+        document,
+        "Runbook",
+    );
+    conflicted.set_document_editor_text("hello world\n");
+    conflicted.apply_external_document_body(&documents_fixture(space, document, "hello mesh\n"));
+    assert_eq!(
+        conflicted.document_editor_text().as_deref(),
+        Some("hello world\n"),
+        "a typed conflict must keep the live edit"
+    );
+    let conflict = conflicted
+        .external_write_conflict()
+        .expect("overlapping external write must surface a typed conflict");
+    assert_eq!(conflict.local, "hello world\n");
+    assert_eq!(conflict.remote, "hello mesh\n");
 }
 
 // ── Calls mode (WL-FUNC-011) ─────────────────────────────────────────────────
@@ -3512,4 +3734,414 @@ fn no_recording_or_transcription_control_exists_anywhere() {
             "no call command may be a recording/transcription verb (found {verb:?})"
         );
     }
+}
+
+fn render_activity_admin(
+    surface: &mut CommunicationsSurface,
+    data: &dyn CollabData,
+    admin: &dyn crate::ActivityAdminData,
+) -> Vec<egui::epaint::ClippedShape> {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let out = ctx.run(sized_input(Vec::new()), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            crate::activity::activity_body_with_admin(surface, ui, data, admin);
+        });
+    });
+    out.shapes
+}
+
+fn provisioned_admin() -> ActivityAdminSnapshot {
+    ActivityAdminSnapshot {
+        voice_nodes: vec![VoiceNodeProjection {
+            node_id: "peer:eagle".to_owned(),
+            hostname: "eagle".to_owned(),
+            username: "eagle".to_owned(),
+            sip_uri: "eagle@sip.vitelity.net".to_owned(),
+            reg_state: VoiceRegState::Unregistered,
+            routed_dids: vec!["15551234567".to_owned()],
+            failover: Some(VoiceFailoverPolicy::Voicemail),
+            updated_at_s: 1_700_000_000,
+        }],
+        voice_dids: vec![VoiceDid {
+            number: "15551234567".to_owned(),
+            routed_to: Some("eagle".to_owned()),
+        }],
+        voice_shared: Some(VoiceSharedOutbound {
+            caller_id: "15551234567".to_owned(),
+            outbound_trunk: "main".to_owned(),
+        }),
+        voice_cutover: Some(VoiceCutoverStatus {
+            phase: VoiceCutoverPhase::NodesReprovisioning,
+            total_nodes: 2,
+            reprovisioned: 1,
+            pending_nodes: vec!["otter".to_owned()],
+            shared_outbound_lifted: true,
+            updated_at_s: 1_700_000_000,
+        }),
+        gateway: Some(GatewayReadout::present(
+            "pbx.example.com",
+            5062,
+            "alice",
+            true,
+            "Alice",
+            3600,
+        )),
+    }
+}
+
+#[test]
+fn activity_voice_admin_is_honestly_empty_without_a_provisioned_account() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    let shapes = render_activity_admin(&mut surface, &data, &ActivityAdminSnapshot::default());
+    let texts = painted_text(&shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("No provisioned voice account")),
+        "the fleet panel must render honestly empty without a sub-account: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, _)| text == "DID routing" || text == "Failover policy"),
+        "DID/failover controls must not appear without a provisioned account: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("No SIP gateway configured")),
+        "the gateway panel must render honestly empty without a readout: {texts:?}"
+    );
+}
+
+#[test]
+fn activity_voice_admin_renders_retained_projections_and_round_trips_verbs() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    let admin = provisioned_admin();
+    let shapes = render_activity_admin(&mut surface, &data, &admin);
+    let texts = painted_text(&shapes);
+
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("eagle@sip.vitelity.net")),
+        "fleet board must paint the retained SIP URI: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, _)| text.contains("15551234567")),
+        "DID inventory must paint the retained number: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("Cutover in progress")),
+        "cutover status must paint the retained phase headline: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, _)| text == "pbx.example.com"),
+        "gateway readout must paint the retained host: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|(text, _)| text.contains("s3cret")),
+        "gateway readout must never paint a password: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, _)| text == "true"),
+        "gateway readout must render the redacted password_set shape: {texts:?}"
+    );
+
+    let mut voice = VoiceAdminSink::new();
+    let mut gateway = GatewaySink::new();
+    voice.emit(VoiceAdminCommand::Provision);
+    voice.emit(
+        crate::activity::validate_did_route(
+            "15551234567",
+            Some("peer:eagle"),
+            &admin.voice_dids,
+            &admin.voice_nodes,
+            &[],
+        )
+        .expect("valid route"),
+    );
+    voice.emit(
+        crate::activity::validate_failover(
+            "peer:eagle",
+            VoiceFailoverPolicy::None,
+            &admin.voice_nodes,
+        )
+        .expect("valid failover"),
+    );
+    voice.emit(
+        crate::activity::validate_shared_config("15551234567", "main").expect("valid shared"),
+    );
+    voice.emit(
+        crate::activity::validate_cutover(admin.voice_cutover.as_ref(), &admin.voice_nodes)
+            .expect("valid cutover"),
+    );
+    gateway.emit(
+        crate::activity::validate_gateway_set(
+            "pbx.example.com",
+            Some(5062),
+            "alice",
+            "s3cret",
+            "Alice",
+            None,
+        )
+        .expect("valid set"),
+    );
+    gateway.emit(GatewayCommand::Get);
+    gateway.emit(
+        crate::activity::validate_gateway_clear(admin.gateway.as_ref(), &gateway)
+            .expect("valid clear"),
+    );
+
+    let voice_cmds = voice.drain();
+    assert_eq!(voice_cmds.len(), 5);
+    assert!(matches!(voice_cmds[0], VoiceAdminCommand::Provision));
+    assert!(matches!(voice_cmds[1], VoiceAdminCommand::DidRoute { .. }));
+    assert!(matches!(voice_cmds[2], VoiceAdminCommand::Failover { .. }));
+    assert!(matches!(
+        voice_cmds[3],
+        VoiceAdminCommand::SharedConfig { .. }
+    ));
+    assert!(matches!(voice_cmds[4], VoiceAdminCommand::Cutover));
+    let gw = gateway.drain();
+    assert!(matches!(gw[0], GatewayCommand::Set { .. }));
+    assert!(matches!(gw[1], GatewayCommand::Get));
+    assert!(matches!(gw[2], GatewayCommand::Clear));
+    if let GatewayCommand::Set { password, .. } = &gw[0] {
+        assert_eq!(password, "s3cret");
+        let debug = format!("{:?}", gw[0]);
+        assert!(!debug.contains("s3cret"));
+    }
+}
+
+#[test]
+fn activity_mode_still_paints_the_empty_admin_panels_from_ui() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+    assert!(
+        texts.iter().any(|(text, _)| text.contains("Fleet voice")),
+        "Communications Activity must carry the fleet voice-admin section: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, _)| text.contains("SIP gateway")),
+        "Communications Activity must carry the SIP-gateway section: {texts:?}"
+    );
+    assert!(
+        surface.drain_voice_admin_commands().is_empty(),
+        "painting Activity without a click must not emit voice verbs"
+    );
+    assert!(
+        surface.drain_gateway_commands().is_empty(),
+        "painting Activity without a click must not emit gateway verbs"
+    );
+}
+
+#[test]
+fn activity_ui_renders_bound_admin_snapshot() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    surface.set_activity_admin(provisioned_admin());
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("eagle@sip.vitelity.net")),
+        "default Activity ui must paint the bound SIP URI: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("pbx.example.com")),
+        "default Activity ui must paint the bound gateway host: {texts:?}"
+    );
+}
+
+// ── Transfers sync-pairs + hotkeys (WL-FUNC-028 / WL-FUNC-032) ───────────────
+
+fn sample_sync_pair(reachable: bool) -> crate::transfers::SyncPairView {
+    crate::transfers::SyncPairView {
+        id: "docs".into(),
+        source: "/src".into(),
+        dest: "node:oak".into(),
+        every_secs: 900,
+        bwlimit: Some("2m".into()),
+        next_run_unix_ms: Some(1_000_000 + 60_000),
+        last_result: Some("ok".into()),
+        peer_reachable: reachable,
+    }
+}
+
+#[test]
+fn sync_pair_source_defaults_empty() {
+    fn empty<T: crate::transfers::SyncPairSource>(src: &T) -> usize {
+        src.sync_pairs().len()
+    }
+    assert_eq!(empty(&()), 0);
+    assert_eq!(empty(&Vec::<crate::transfers::SyncPairView>::new()), 0);
+}
+
+#[test]
+fn transfers_mode_renders_sync_pair_projection() {
+    let _ = crate::transfers::take_transfers_hotkey_intent();
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        2,
+        1_000_000,
+    ));
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Transfers);
+    surface.set_sync_pair_views(vec![sample_sync_pair(true)]);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+    assert!(
+        texts.iter().any(|(t, _)| t.contains("docs")),
+        "pair id must paint: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(t, _)| t.contains("next in")),
+        "next-run must paint from the worker projection: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(t, _)| t.contains("last: ok")),
+        "last-result must paint from the worker projection: {texts:?}"
+    );
+}
+
+#[test]
+fn unreachable_sync_pair_peer_stays_visibly_degraded() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        2,
+        1_000_000,
+    ));
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Transfers);
+    surface.set_sync_pair_views(vec![sample_sync_pair(false)]);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+    assert!(
+        texts
+            .iter()
+            .any(|(t, color)| t.contains("unreachable") && *color == Style::WARN),
+        "unreachable peers stay visible and degraded: {texts:?}"
+    );
+}
+
+#[test]
+fn sync_pair_editor_emits_save_and_refuses_malformed_interval() {
+    let mut surface = CommunicationsSurface::new();
+    surface.begin_new_transfer();
+    surface.save_sync_pair_draft_for_test("docs", "nope", "/src", "/dst", None);
+    assert!(
+        surface.drain_sync_pair_commands().is_empty(),
+        "malformed interval must not publish a verb"
+    );
+    assert!(
+        surface
+            .sync_pair_notice_for_test()
+            .is_some_and(|n| n.contains("malformed interval")),
+        "malformed interval must refuse visibly"
+    );
+
+    surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "/dst", Some("2m"));
+    assert_eq!(
+        surface.drain_sync_pair_commands(),
+        vec![crate::transfers::SyncPairCommand::Save {
+            id: "docs".into(),
+            source: "/src".into(),
+            dest: "/dst".into(),
+            every_secs: 900,
+            bwlimit: Some("2m".into()),
+        }]
+    );
+}
+
+#[test]
+fn ctrl_j_opens_transfers_mode_from_any_communications_surface() {
+    let _ = crate::transfers::take_transfers_hotkey_intent();
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    let _ = ctx.run(
+        sized_input_with_modifiers(vec![modified_key(egui::Key::J, modifiers)], modifiers),
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut sink = CommandSink::new();
+                surface.ui(ui, &data, &mut sink);
+            });
+        },
+    );
+    assert_eq!(surface.mode(), Mode::Transfers);
+}
+
+#[test]
+fn ctrl_n_in_transfers_opens_the_new_transfer_editor() {
+    let _ = crate::transfers::take_transfers_hotkey_intent();
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Transfers);
+    assert!(!surface.editor_open_for_test());
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    let out = ctx.run(
+        sized_input_with_modifiers(vec![modified_key(egui::Key::N, modifiers)], modifiers),
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut sink = CommandSink::new();
+                surface.ui(ui, &data, &mut sink);
+            });
+        },
+    );
+    assert!(
+        surface.editor_open_for_test(),
+        "Ctrl+N is the in-mode New Transfer accelerator"
+    );
+    let texts = painted_text(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(t, _)| t.contains("New transfer") || t.contains("Interval")),
+        "the editor must paint: {texts:?}"
+    );
+}
+
+#[test]
+fn request_open_transfers_latch_lands_on_transfers_mode() {
+    let _ = crate::transfers::take_transfers_hotkey_intent();
+    crate::request_open_transfers();
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Messages);
+    let _ = render_shapes(&mut surface, &data);
+    assert_eq!(surface.mode(), Mode::Transfers);
 }

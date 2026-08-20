@@ -69,18 +69,14 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
         Some(stdout) => stdout,
         None => {
             reap_child(&mut child);
-            return Err(io::Error::other(
-                "subprocess stdout pipe was not available",
-            ));
+            return Err(io::Error::other("subprocess stdout pipe was not available"));
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
             reap_child(&mut child);
-            return Err(io::Error::other(
-                "subprocess stderr pipe was not available",
-            ));
+            return Err(io::Error::other("subprocess stderr pipe was not available"));
         }
     };
 

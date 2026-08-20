@@ -30,6 +30,8 @@
 //!   contract and its bounded executor/lifecycle types.
 //! * [`read_model`] — [`CollabReadModel`] and its projection structs, the
 //!   read-side shapes the surface renders.
+//! * [`media`] — WL-FUNC-024 bounded [`MediaSessionV1`] / [`MediaTrackKind`] /
+//!   [`MediaSessionStateV1`] contracts for the live media plane.
 //! * [`topics`] — the `action/collab/*`, `state/collab/*`, and
 //!   `collab/event/<space>/<actor>` topic helpers.
 //!
@@ -52,6 +54,8 @@ pub mod command;
 pub mod envelope;
 pub mod event;
 pub mod ids;
+/// WL-FUNC-024 — bounded live-media session contracts (offer/answer, tracks, state).
+pub mod media;
 pub mod read_model;
 pub mod space;
 pub mod topics;
@@ -85,6 +89,15 @@ pub use command::{
 pub use envelope::{last_writer_wins, CollabEventEnvelope, EventSignature, SCHEMA_VERSION};
 pub use event::CollabEventKind;
 pub use ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
+pub use media::{
+    media_answer_topic, media_offer_topic, media_session_topic, media_sfu_election_topic,
+    MediaDescriptionV1, MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1,
+    MediaSessionV1DecodeError, MediaSessionV1ValidationError, MediaSignalingRoleV1, MediaTrackKind,
+    SfuElectionV1, MAX_MEDIA_ACTOR_BYTES, MAX_MEDIA_DESCRIPTION_V1_JSON_BYTES,
+    MAX_MEDIA_RECONNECT_ATTEMPTS, MAX_MEDIA_SESSION_V1_JSON_BYTES, MAX_MEDIA_TRACKS,
+    MAX_SFU_ELECTION_PARTICIPANTS, MAX_SFU_ELECTION_V1_JSON_BYTES, MEDIA_SESSION_V1_SCHEMA_VERSION,
+    MEDIA_STATE_PREFIX,
+};
 pub use read_model::{
     ActivityEntry, ActivityFeed, AiSuggestionRequestStatus, AiSuggestionRequestView,
     AiSuggestionRequests, AlertInbox, AlertView, CallMediaAdapter, CallMediaAdmission,

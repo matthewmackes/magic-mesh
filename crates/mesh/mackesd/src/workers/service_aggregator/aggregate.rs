@@ -259,12 +259,7 @@ mod tests {
         let now = 1_000_000;
         let published = vec![
             published("advertised", Some("10.42.0.10"), &["ssh"], now - 1_000),
-            published(
-                "stale",
-                Some("10.42.0.11"),
-                &["ssh"],
-                now - (TTL + 1),
-            ),
+            published("stale", Some("10.42.0.11"), &["ssh"], now - (TTL + 1)),
         ];
         let probes = vec![probe("confirmed", "10.42.0.12", 22, "ssh", now - 1_000)];
 

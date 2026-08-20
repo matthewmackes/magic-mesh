@@ -146,7 +146,8 @@ mod tests {
             "schema_version": 1, "target_id": "seat-15", "generation": 1,
             "ready": true, "missing_requirements": [], "warnings": ["capability unavailable: kvm"]
         });
-        let view = LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
+        let view =
+            LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
         assert_eq!(view.readiness, ReadinessState::ReadyWithWarnings);
         assert!(view.capability_summary().contains("kvm"));
     }

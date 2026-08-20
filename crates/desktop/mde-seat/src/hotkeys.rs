@@ -49,6 +49,10 @@ pub enum HotkeyAction {
     OpenSystem,
     /// Open the shell-owned unified search/omnibox front door.
     OpenOmnibox,
+    /// Open Communications in Transfers mode from any Construct surface.
+    OpenTransfers,
+    /// In-mode accelerator: start a new transfer / sync-pair draft.
+    NewTransfer,
 }
 
 impl HotkeyAction {
@@ -74,6 +78,8 @@ impl HotkeyAction {
             Self::Lock => "Lock seat",
             Self::OpenSystem => "Open System panel",
             Self::OpenOmnibox => "Open omnibox",
+            Self::OpenTransfers => "Open Transfers",
+            Self::NewTransfer => "New transfer",
         }
     }
 
@@ -186,6 +192,14 @@ pub static HOTKEYS: &[Hotkey] = &[
         chord: "Super+Space",
         action: HotkeyAction::OpenOmnibox,
     },
+    Hotkey {
+        chord: "Ctrl+J",
+        action: HotkeyAction::OpenTransfers,
+    },
+    Hotkey {
+        chord: "Ctrl+N",
+        action: HotkeyAction::NewTransfer,
+    },
 ];
 
 /// Look up the action bound to a chord label, if any.
@@ -232,5 +246,15 @@ mod tests {
         for h in HOTKEYS {
             assert!(!h.action.label().is_empty());
         }
+    }
+
+    #[test]
+    fn transfers_hotkeys_are_catalogued() {
+        assert_eq!(action_for("Ctrl+J"), Some(HotkeyAction::OpenTransfers));
+        assert_eq!(action_for("Ctrl+N"), Some(HotkeyAction::NewTransfer));
+        assert_eq!(HotkeyAction::OpenTransfers.label(), "Open Transfers");
+        assert_eq!(HotkeyAction::NewTransfer.label(), "New transfer");
+        assert!(!HotkeyAction::OpenTransfers.host_first());
+        assert!(!HotkeyAction::NewTransfer.host_first());
     }
 }

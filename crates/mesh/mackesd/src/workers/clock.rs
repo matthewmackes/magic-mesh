@@ -6107,16 +6107,16 @@ mod tests {
         receiver.worker.snapshot = Some(peer);
         assert!(receiver
             .worker
-                .apply_command(
-                    ClockCommandKindV1::UpsertStopwatch {
-                        stopwatch: desired.clone(),
-                    },
-                    "seat-1",
-                    true,
-                    &peer_request_id("stopwatch", "seat-2", "mesh-stopwatch", 4, ""),
-                    1,
-                    NOW,
-                    NOW,
+            .apply_command(
+                ClockCommandKindV1::UpsertStopwatch {
+                    stopwatch: desired.clone(),
+                },
+                "seat-1",
+                true,
+                &peer_request_id("stopwatch", "seat-2", "mesh-stopwatch", 4, ""),
+                1,
+                NOW,
+                NOW,
             )
             .expect("origin repair bound to the observed peer generation"));
         assert_eq!(

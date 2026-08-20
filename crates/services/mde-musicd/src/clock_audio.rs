@@ -1469,7 +1469,10 @@ mod tests {
             Some("provider_failed_after_renderer_start")
         );
         assert_eq!(effects.starts, ["music:track-1", "tone:bell"]);
-        assert_eq!(effects.stops, 1, "partial provider renderer must be revoked");
+        assert_eq!(
+            effects.stops, 1,
+            "partial provider renderer must be revoked"
+        );
         assert_eq!(effects.music_volume, Some(0.17));
         assert_eq!(effects.seat_levels, [0.2, 0.11]);
         assert_eq!(effects.queue_generation, 41);
@@ -1496,10 +1499,7 @@ mod tests {
         assert_eq!(effects.music_volume, Some(0.68));
         assert_eq!(effects.seat_levels, [0.8, 0.44]);
         assert_eq!(effects.volume_writes, [0.17, 0.68]);
-        assert_eq!(
-            effects.seat_writes,
-            [vec![0.2, 0.11], vec![0.8, 0.44]]
-        );
+        assert_eq!(effects.seat_writes, [vec![0.2, 0.11], vec![0.8, 0.44]]);
     }
 
     #[test]

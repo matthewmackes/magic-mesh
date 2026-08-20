@@ -341,9 +341,9 @@ impl FederationGrants {
         };
         if is_intrinsically_excluded_topic(topic)
             || pair
-            .excluded_topics
-            .iter()
-            .any(|pat| topic_pattern_matches(pat, topic))
+                .excluded_topics
+                .iter()
+                .any(|pat| topic_pattern_matches(pat, topic))
         {
             return Decision::Deny(DenyReason::ExcludedTopic);
         }

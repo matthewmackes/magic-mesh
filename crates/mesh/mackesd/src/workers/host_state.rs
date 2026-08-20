@@ -814,8 +814,7 @@ impl HostStateWorker {
                 let current = publisher
                     .current_intent()
                     .map_err(|error| error.to_string())?;
-                if current.is_none_or(|intent| intent.state != NodeAvailabilityState::Maintenance)
-                {
+                if current.is_none_or(|intent| intent.state != NodeAvailabilityState::Maintenance) {
                     return Err("maintenance end has no active maintenance intent".to_string());
                 }
                 publisher
@@ -1094,12 +1093,9 @@ async fn lifecycle_monitor_session(
         .await
         .map_err(|error| format!("subscribe PrepareForShutdown: {error}"))?;
 
-    reconcile_startup_return(
-        publisher,
-        shutdown,
-        LIFECYCLE_MONITOR_RETRY,
-        || wait_for_network_manager_stability(&connection),
-    )
+    reconcile_startup_return(publisher, shutdown, LIFECYCLE_MONITOR_RETRY, || {
+        wait_for_network_manager_stability(&connection)
+    })
     .await?;
 
     loop {
@@ -2577,15 +2573,10 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut shutdown = ShutdownToken::from_receiver(shutdown_rx);
 
-        reconcile_startup_return(
-            &publisher,
-            &mut shutdown,
-            Duration::ZERO,
-            || {
-                attempts.set(attempts.get().saturating_add(1));
-                std::future::ready(Ok(attempts.get() > 1))
-            },
-        )
+        reconcile_startup_return(&publisher, &mut shutdown, Duration::ZERO, || {
+            attempts.set(attempts.get().saturating_add(1));
+            std::future::ready(Ok(attempts.get() > 1))
+        })
         .await
         .expect("transient instability remains retryable");
 

@@ -678,7 +678,10 @@ fn open_preview_source(path: &Path, max_bytes: u64) -> Result<File, String> {
         return Err("untrusted preview source: not a regular file".to_string());
     }
     if before.len() > max_bytes {
-        return Err(format!("too large to preview ({} MB cap)", max_bytes / (1024 * 1024)));
+        return Err(format!(
+            "too large to preview ({} MB cap)",
+            max_bytes / (1024 * 1024)
+        ));
     }
 
     let mut options = File::options();
@@ -804,9 +807,7 @@ pub(crate) fn probe_media_file(path: &Path) -> Result<MediaMeta, String> {
     use symphonia::core::probe::Hint;
 
     let file = open_preview_source(path, MAX_DECODE_BYTES)?;
-    let verifier = file
-        .try_clone()
-        .map_err(|e| format!("unreadable: {e}"))?;
+    let verifier = file.try_clone().map_err(|e| format!("unreadable: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -1134,7 +1135,10 @@ mod tests {
         std::fs::hard_link(&source, &alias).expect("create hostile alias");
 
         let error = read_text_file(&alias).expect_err("multiply-linked resource must fail closed");
-        assert!(error.contains("external aliases"), "unexpected refusal: {error}");
+        assert!(
+            error.contains("external aliases"),
+            "unexpected refusal: {error}"
+        );
     }
 
     // ── tokenizer folds ──────────────────────────────────────────────────────

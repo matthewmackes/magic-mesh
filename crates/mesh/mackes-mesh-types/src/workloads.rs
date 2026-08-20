@@ -993,9 +993,7 @@ impl WorkloadOperationStatus {
                 self.phase,
                 WorkloadOperationPhase::Failed | WorkloadOperationPhase::Cancelled
             ) {
-                return Err(WorkloadContractError::InvalidField(
-                    "terminal_attachment",
-                ));
+                return Err(WorkloadContractError::InvalidField("terminal_attachment"));
             }
             attachment.validate(now_ms)?;
             if attachment.workload_id != self.workload_id {

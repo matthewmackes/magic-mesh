@@ -18,9 +18,9 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
-    CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaReadiness,
-    CallMediaRequirement, CallMediaSession, CallMediaVerification, CallMediaVerificationRow,
-    CallMediaVerificationStatus, CollabCommand,
+    CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
+    CallMediaReadiness, CallMediaRequirement, CallMediaSession, CallMediaVerification,
+    CallMediaVerificationRow, CallMediaVerificationStatus, CollabCommand,
 };
 use mde_voice_hud::sip::{AgentCommand, AgentEvent, RegistrationState, SipAccount};
 
@@ -238,9 +238,7 @@ fn validate_sip_dial_target(target: &str) -> Result<(), CallMediaProviderError> 
     }
     if trimmed.len() > MAX_SIP_DIAL_TARGET_BYTES {
         return Err(CallMediaProviderError::ExecutionRefused {
-            detail: format!(
-                "SIP outbound target exceeds {MAX_SIP_DIAL_TARGET_BYTES}-byte limit"
-            ),
+            detail: format!("SIP outbound target exceeds {MAX_SIP_DIAL_TARGET_BYTES}-byte limit"),
         });
     }
     if trimmed.chars().any(char::is_control) {
@@ -312,10 +310,7 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             CollabCommand::StartOutboundCall { call, target, .. } => {
                 validate_sip_dial_target(target)?;
                 let target = target.trim().to_owned();
-                self.send_acknowledged(|completion| AgentCommand::Dial {
-                    target,
-                    completion,
-                })?;
+                self.send_acknowledged(|completion| AgentCommand::Dial { target, completion })?;
                 if let Ok(mut active) = self.active_call.lock() {
                     *active = Some(*call);
                 }
@@ -406,6 +401,7 @@ pub(super) fn publish_retained_call_media_verification(
     last_published: &mut BTreeMap<String, String>,
     providers: &CallMediaProviderRegistry,
 ) {
+    providers.publish_p2p_media_sessions(persist, last_published);
     let topic = topics::state_topic(proj::CALL_MEDIA_VERIFICATION);
     match verify_retained_call_media(persist, providers) {
         Ok(board) => match serde_json::to_string(&board) {
@@ -790,6 +786,22 @@ pub(crate) trait CallMediaFrameVerifier: Send + Sync {
     ) -> bool {
         false
     }
+
+    /// Whether this provider currently owns a live media leg for `call`.
+    fn owns_call(&self, _call: mde_collab_types::CallId) -> bool {
+        false
+    }
+
+    /// Drive the P2P offer/answer plane and publish
+    /// `state/calls/media/<session>` readiness. The SIP verifier leaves this
+    /// as a no-op; the WebRTC P2P worker overrides it.
+    fn publish_p2p_media_sessions(
+        &self,
+        persist: &Persist,
+        last_published: &mut BTreeMap<String, String>,
+    ) {
+        let _ = (persist, last_published);
+    }
 }
 
 /// One bounded in-process registration table for concrete call-media proof
@@ -831,6 +843,8 @@ impl CallMediaProviderRegistry {
                 tracing::info!(target: "mackesd::collab", detail, "SIP Calls provider not activated")
             }
         }
+        registry.webrtc_p2p = Some(Box::new(super::call_media::WebrtcP2pPlane::production()));
+        registry.livekit_sfu = Some(Box::new(super::call_media::LiveKitSfuPlane::production()));
         registry
     }
 
@@ -875,6 +889,13 @@ impl CallMediaProviderRegistry {
             // effect targets no active call.
             return Ok(());
         };
+        if matches!(command, CollabCommand::StartOutboundCall { .. }) {
+            return if self.sip_gateway.is_some() {
+                Ok(())
+            } else {
+                Err(CallMediaCommandAdmissionError::NoProvider { kind })
+            };
+        }
         if self.supports(kind) {
             Ok(())
         } else {
@@ -917,7 +938,7 @@ impl CallMediaProviderRegistry {
             // result; do not send an unattributed command to any provider.
             return Ok(());
         };
-        let Some((adapter, provider)) = self.provider_for_kind(kind) else {
+        let Some((adapter, provider)) = self.provider_for_command(command, kind) else {
             return if cleanup {
                 Ok(())
             } else {
@@ -966,6 +987,76 @@ impl CallMediaProviderRegistry {
         self.sip_gateway
             .as_deref()
             .is_some_and(|provider| provider.bind_inbound_call(offer, call))
+    }
+
+    pub(crate) fn publish_p2p_media_sessions(
+        &self,
+        persist: &Persist,
+        last_published: &mut BTreeMap<String, String>,
+    ) {
+        if let Some(plane) = self.webrtc_p2p.as_deref() {
+            plane.publish_p2p_media_sessions(persist, last_published);
+        }
+        if let Some(plane) = self.livekit_sfu.as_deref() {
+            plane.publish_p2p_media_sessions(persist, last_published);
+        }
+    }
+
+    pub(crate) fn provider_for_command(
+        &self,
+        command: &CollabCommand,
+        kind: CallKind,
+    ) -> Option<(CallMediaAdapter, &dyn CallMediaFrameVerifier)> {
+        if matches!(command, CollabCommand::StartOutboundCall { .. }) {
+            return self
+                .slot(CallMediaAdapter::SipGateway)
+                .as_deref()
+                .map(|provider| (CallMediaAdapter::SipGateway, provider));
+        }
+        if let Some(call) = Self::command_call_id(command) {
+            if matches!(
+                command,
+                CollabCommand::SendDtmf { .. }
+                    | CollabCommand::SetCallMuted { .. }
+                    | CollabCommand::HangUpCall { .. }
+                    | CollabCommand::DeclineCall { .. }
+            ) {
+                if self
+                    .livekit_sfu
+                    .as_deref()
+                    .is_some_and(|provider| provider.owns_call(call))
+                {
+                    return self
+                        .slot(CallMediaAdapter::LiveKitSfu)
+                        .as_deref()
+                        .map(|provider| (CallMediaAdapter::LiveKitSfu, provider));
+                }
+                if self
+                    .webrtc_p2p
+                    .as_deref()
+                    .is_some_and(|provider| provider.owns_call(call))
+                {
+                    return self
+                        .slot(CallMediaAdapter::WebRtcP2p)
+                        .as_deref()
+                        .map(|provider| (CallMediaAdapter::WebRtcP2p, provider));
+                }
+            }
+        }
+        self.provider_for_kind(kind)
+    }
+
+    fn command_call_id(command: &CollabCommand) -> Option<CallId> {
+        match command {
+            CollabCommand::StartCall { call, .. }
+            | CollabCommand::StartOutboundCall { call, .. }
+            | CollabCommand::AnswerCall { call }
+            | CollabCommand::DeclineCall { call }
+            | CollabCommand::HangUpCall { call }
+            | CollabCommand::SendDtmf { call, .. }
+            | CollabCommand::SetCallMuted { call, .. } => Some(*call),
+            _ => None,
+        }
     }
 
     fn provider_for_kind(
@@ -1140,6 +1231,16 @@ pub(crate) enum CallMediaProviderError {
     TransportUnavailable { detail: String },
     ProviderUnavailable { detail: String },
     ExecutionRefused { detail: String },
+}
+
+impl std::fmt::Display for CallMediaProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransportUnavailable { detail }
+            | Self::ProviderUnavailable { detail }
+            | Self::ExecutionRefused { detail } => f.write_str(detail),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

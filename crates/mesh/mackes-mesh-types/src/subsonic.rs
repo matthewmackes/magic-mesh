@@ -230,7 +230,7 @@ impl SubsonicAuthState {
     }
 }
 
-    /// Features the typed `OpenSubsonic` adapter may expose.
+/// Features the typed `OpenSubsonic` adapter may expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubsonicCapability {

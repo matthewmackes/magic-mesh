@@ -207,7 +207,10 @@ pub fn is_suppressed(
 /// Read one stable DND authority inode without following a replacement link.
 fn read_dnd_file(path: &Path) -> io::Result<Vec<u8>> {
     let byte_cap = u64::try_from(MAX_DND_FILE_BYTES).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "DND state size cap overflows u64")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DND state size cap overflows u64",
+        )
     })?;
     let validate = |metadata: &std::fs::Metadata| -> io::Result<()> {
         if !metadata.file_type().is_file() {
@@ -536,11 +539,7 @@ mod tests {
         let admitted = restarted.current();
         assert!(!admitted.active, "replacement DND toggle must fail open");
         assert!(
-            !is_snoozed(
-                &admitted.snoozes,
-                "event/notify/clock/seat-1",
-                2_000
-            ),
+            !is_snoozed(&admitted.snoozes, "event/notify/clock/seat-1", 2_000),
             "replacement state must not gain Clock suppression authority"
         );
     }

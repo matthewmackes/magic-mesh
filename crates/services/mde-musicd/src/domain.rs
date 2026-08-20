@@ -604,8 +604,8 @@ impl MusicWorkspaceSnapshotV1 {
         }
         if self
             .downloads
-                .iter()
-                .any(|entry| !valid_content_ref(&entry.content))
+            .iter()
+            .any(|entry| !valid_content_ref(&entry.content))
             || self
                 .shelves
                 .iter()

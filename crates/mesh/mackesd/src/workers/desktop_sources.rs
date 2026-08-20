@@ -4568,10 +4568,9 @@ mod tests {
             r#"{"host":"https://evil.example/$(id)","port":3389,"protocol":"rdp"}"#
         )
         .is_err());
-        assert!(parse_add_source(
-            r#"{"name":" bad","host":"h","port":3389,"protocol":"rdp"}"#
-        )
-        .is_err());
+        assert!(
+            parse_add_source(r#"{"name":" bad","host":"h","port":3389,"protocol":"rdp"}"#).is_err()
+        );
     }
 
     #[test]
@@ -5616,7 +5615,10 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let mut worker = worker_at(wg.path(), store.path());
 
-        for (name, nonce) in [("Old label", "replace-old"), ("Current label", "replace-new")] {
+        for (name, nonce) in [
+            ("Old label", "replace-old"),
+            ("Current label", "replace-new"),
+        ] {
             let request = format!(
                 r#"{{"name":"{name}","host":"192.168.1.50","port":3389,"protocol":"rdp","schema_version":1}}"#
             );
@@ -5633,7 +5635,11 @@ mod tests {
             assert!(!refresh);
         }
 
-        assert_eq!(worker.manual.len(), 1, "replacement must not duplicate identity");
+        assert_eq!(
+            worker.manual.len(),
+            1,
+            "replacement must not duplicate identity"
+        );
         assert_eq!(worker.manual[0].name.as_deref(), Some("Current label"));
         assert_eq!(load_manual_sources(store.path()), worker.manual);
 

@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{ShutdownToken, Worker};
 use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
+use super::{ShutdownToken, Worker};
 
 /// Sweep cadence — 10 s (farm jobs are coarse vs the 5 s firewall sweeps).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);

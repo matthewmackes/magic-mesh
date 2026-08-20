@@ -492,38 +492,108 @@ struct BusWorkloadPlace {
 #[cfg(feature = "async-services")]
 impl BusWorkloadPlace {
     fn bus_root(&self) -> Result<PathBuf, FirstDesktopError> {
-        self.bus_root.clone().or_else(crate::bus_publish::default_bus_root).ok_or_else(|| FirstDesktopError::IntegrationGated {
-            step: "place-desktop",
-            reason: "no Mackes Bus root is configured for the Workload operation API".into(),
-        })
+        self.bus_root
+            .clone()
+            .or_else(crate::bus_publish::default_bus_root)
+            .ok_or_else(|| FirstDesktopError::IntegrationGated {
+                step: "place-desktop",
+                reason: "no Mackes Bus root is configured for the Workload operation API".into(),
+            })
     }
     fn signer(&self) -> Result<Arc<WorkloadTokenSigner>, FirstDesktopError> {
-        if let Some(signer) = &self.signer { return Ok(Arc::clone(signer)); }
+        if let Some(signer) = &self.signer {
+            return Ok(Arc::clone(signer));
+        }
         crate::workers::cloud::HmacTokenSigner::from_systemd_credential()
             .map(|signer| Arc::new(signer) as Arc<WorkloadTokenSigner>)
-            .map_err(|reason| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot arm Workload request from the Bus: {reason}") })
+            .map_err(|reason| FirstDesktopError::IntegrationGated {
+                step: "place-desktop",
+                reason: format!("cannot arm Workload request from the Bus: {reason}"),
+            })
     }
-    fn request_body(desktop: &CloudDesktopSpec, signer: &WorkloadTokenSigner) -> Result<(String, String), FirstDesktopError> {
-        use mackes_mesh_types::workloads::{WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId, WorkloadOperationAction, WorkloadOperationRequest, WorkloadResources, WORKLOAD_CONTRACT_SCHEMA_VERSION};
-        let workload_id = WorkloadId::new(format!("vm:{}:{}", desktop.placement_peer, desktop.vm_name)).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("invalid Workload id: {error}") })?;
+    fn request_body(
+        desktop: &CloudDesktopSpec,
+        signer: &WorkloadTokenSigner,
+    ) -> Result<(String, String), FirstDesktopError> {
+        use mackes_mesh_types::workloads::{
+            WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId, WorkloadOperationAction,
+            WorkloadOperationRequest, WorkloadResources, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        };
+        let workload_id =
+            WorkloadId::new(format!("vm:{}:{}", desktop.placement_peer, desktop.vm_name)).map_err(
+                |error| FirstDesktopError::Failed {
+                    step: "place-desktop",
+                    reason: format!("invalid Workload id: {error}"),
+                },
+            )?;
         let now = now_ms();
         let request = WorkloadOperationRequest {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
-            request_id: format!("first-desktop-workload-{}-{}", desktop.vm_name, uuid::Uuid::new_v4().simple()),
+            request_id: format!(
+                "first-desktop-workload-{}-{}",
+                desktop.vm_name,
+                uuid::Uuid::new_v4().simple()
+            ),
             workload_id,
             backend: WorkloadBackend::LibvirtVirtqemud,
-            resources: WorkloadResources { vcpu: u16::try_from(desktop.vcpus).map_err(|_| FirstDesktopError::Failed { step: "place-desktop", reason: "desktop vCPU count exceeds Workload contract".into() })?, memory_mb: u32::try_from(desktop.ram_mb).map_err(|_| FirstDesktopError::Failed { step: "place-desktop", reason: "desktop memory exceeds Workload contract".into() })?, disk_gb: u32::try_from(desktop.disk_gb).map_err(|_| FirstDesktopError::Failed { step: "place-desktop", reason: "desktop disk exceeds Workload contract".into() })? },
+            resources: WorkloadResources {
+                vcpu: u16::try_from(desktop.vcpus).map_err(|_| FirstDesktopError::Failed {
+                    step: "place-desktop",
+                    reason: "desktop vCPU count exceeds Workload contract".into(),
+                })?,
+                memory_mb: u32::try_from(desktop.ram_mb).map_err(|_| {
+                    FirstDesktopError::Failed {
+                        step: "place-desktop",
+                        reason: "desktop memory exceeds Workload contract".into(),
+                    }
+                })?,
+                disk_gb: u32::try_from(desktop.disk_gb).map_err(|_| FirstDesktopError::Failed {
+                    step: "place-desktop",
+                    reason: "desktop disk exceeds Workload contract".into(),
+                })?,
+            },
             image_ref: Some(format!("{}:{}", desktop.image, desktop.image_version)),
-            target_node: desktop.placement_peer.clone(), expected_generation: 0, action: WorkloadOperationAction::StartAndAttach,
-            target_request_id: None, deadline_at_ms: u64::try_from(now).unwrap_or(0).saturating_add(20_000), preferred_attachment: Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf), armed_token: None,
+            target_node: desktop.placement_peer.clone(),
+            expected_generation: 0,
+            action: WorkloadOperationAction::StartAndAttach,
+            target_request_id: None,
+            deadline_at_ms: u64::try_from(now).unwrap_or(0).saturating_add(20_000),
+            preferred_attachment: Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+            armed_token: None,
         };
-        let unsigned = serde_json::to_string(&request).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("encode Workload request: {error}") })?;
-        let digest = mackes_mesh_types::cloud::cloud_request_digest(&unsigned).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("digest Workload request: {error}") })?;
+        let unsigned =
+            serde_json::to_string(&request).map_err(|error| FirstDesktopError::Failed {
+                step: "place-desktop",
+                reason: format!("encode Workload request: {error}"),
+            })?;
+        let digest =
+            mackes_mesh_types::cloud::cloud_request_digest(&unsigned).map_err(|error| {
+                FirstDesktopError::Failed {
+                    step: "place-desktop",
+                    reason: format!("digest Workload request: {error}"),
+                }
+            })?;
         let target = format!("workload:{}", request.workload_id.as_str());
-        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(signer, &format!("first-desktop-{}", request.request_id), now.saturating_add(WORKLOAD_AUTH_TTL_MS), "workload-operation", &request.target_node, &target, &digest).encode();
-        let mut value: serde_json::Value = serde_json::from_str(&unsigned).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("encode Workload object: {error}") })?;
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer,
+            &format!("first-desktop-{}", request.request_id),
+            now.saturating_add(WORKLOAD_AUTH_TTL_MS),
+            "workload-operation",
+            &request.target_node,
+            &target,
+            &digest,
+        )
+        .encode();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&unsigned).map_err(|error| FirstDesktopError::Failed {
+                step: "place-desktop",
+                reason: format!("encode Workload object: {error}"),
+            })?;
         value["armed_token"] = serde_json::Value::String(token);
-        let body = serde_json::to_string(&value).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("serialize armed Workload request: {error}") })?;
+        let body = serde_json::to_string(&value).map_err(|error| FirstDesktopError::Failed {
+            step: "place-desktop",
+            reason: format!("serialize armed Workload request: {error}"),
+        })?;
         Ok((request.request_id, body))
     }
 }
@@ -531,26 +601,87 @@ impl BusWorkloadPlace {
 #[cfg(feature = "async-services")]
 impl WorkloadPlace for BusWorkloadPlace {
     fn place(&self, desktop: &CloudDesktopSpec) -> Result<BootedDesktop, FirstDesktopError> {
-        let root = self.bus_root().map_err(|error| workload_integration_gate(desktop, &error.to_string()))?;
-        let signer = self.signer().map_err(|error| workload_integration_gate(desktop, &error.to_string()))?;
+        let root = self
+            .bus_root()
+            .map_err(|error| workload_integration_gate(desktop, &error.to_string()))?;
+        let signer = self
+            .signer()
+            .map_err(|error| workload_integration_gate(desktop, &error.to_string()))?;
         let (request_id, body) = Self::request_body(desktop, signer.as_ref())?;
-        let persist = mde_bus::persist::Persist::open(root.clone()).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot open Workload Bus {}: {error}", root.display()) })?;
-        let state_topic = mackes_mesh_types::workloads::workload_state_topic(&desktop.placement_peer);
-        let mut cursor = persist.latest_ulid(&state_topic).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot read Workload state cursor: {error}") })?;
-        persist.write(WORKLOAD_OPERATION_TOPIC, mde_bus::hooks::config::Priority::Default, Some("Workload StartAndAttach"), Some(&body)).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot publish Workload operation: {error}") })?;
+        let persist = mde_bus::persist::Persist::open(root.clone()).map_err(|error| {
+            FirstDesktopError::IntegrationGated {
+                step: "place-desktop",
+                reason: format!("cannot open Workload Bus {}: {error}", root.display()),
+            }
+        })?;
+        let state_topic =
+            mackes_mesh_types::workloads::workload_state_topic(&desktop.placement_peer);
+        let mut cursor = persist.latest_ulid(&state_topic).map_err(|error| {
+            FirstDesktopError::IntegrationGated {
+                step: "place-desktop",
+                reason: format!("cannot read Workload state cursor: {error}"),
+            }
+        })?;
+        persist
+            .write(
+                WORKLOAD_OPERATION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                Some("Workload StartAndAttach"),
+                Some(&body),
+            )
+            .map_err(|error| FirstDesktopError::IntegrationGated {
+                step: "place-desktop",
+                reason: format!("cannot publish Workload operation: {error}"),
+            })?;
         let deadline = Instant::now() + self.timeout;
         loop {
-            let messages = persist.list_since(&state_topic, cursor.as_deref()).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot read Workload projection: {error}") })?;
+            let messages = persist
+                .list_since(&state_topic, cursor.as_deref())
+                .map_err(|error| FirstDesktopError::IntegrationGated {
+                    step: "place-desktop",
+                    reason: format!("cannot read Workload projection: {error}"),
+                })?;
             for message in messages {
                 cursor = Some(message.ulid.clone());
-                let Some(body) = message.body.as_deref() else { continue; };
-                let Ok(snapshot) = serde_json::from_str::<mackes_mesh_types::workloads::WorkloadStateSnapshot>(body) else { continue; };
-                if let Some(status) = snapshot.workloads.iter().find(|status| status.request_id == request_id) {
-                    if status.phase == mackes_mesh_types::workloads::WorkloadOperationPhase::Completed { return Ok(BootedDesktop { vm_id: desktop.vm_name.clone(), serving_peer: desktop.placement_peer.clone() }); }
-                    if status.phase == mackes_mesh_types::workloads::WorkloadOperationPhase::Failed { return Err(workload_integration_gate(desktop, status.reason.as_deref().unwrap_or("Workload operation failed"))); }
+                let Some(body) = message.body.as_deref() else {
+                    continue;
+                };
+                let Ok(snapshot) = serde_json::from_str::<
+                    mackes_mesh_types::workloads::WorkloadStateSnapshot,
+                >(body) else {
+                    continue;
+                };
+                if let Some(status) = snapshot
+                    .workloads
+                    .iter()
+                    .find(|status| status.request_id == request_id)
+                {
+                    if status.phase
+                        == mackes_mesh_types::workloads::WorkloadOperationPhase::Completed
+                    {
+                        return Ok(BootedDesktop {
+                            vm_id: desktop.vm_name.clone(),
+                            serving_peer: desktop.placement_peer.clone(),
+                        });
+                    }
+                    if status.phase == mackes_mesh_types::workloads::WorkloadOperationPhase::Failed
+                    {
+                        return Err(workload_integration_gate(
+                            desktop,
+                            status
+                                .reason
+                                .as_deref()
+                                .unwrap_or("Workload operation failed"),
+                        ));
+                    }
                 }
             }
-            if Instant::now() >= deadline { return Err(workload_integration_gate(desktop, "timed out waiting for state/workloads projection")); }
+            if Instant::now() >= deadline {
+                return Err(workload_integration_gate(
+                    desktop,
+                    "timed out waiting for state/workloads projection",
+                ));
+            }
             std::thread::sleep(self.poll);
         }
     }
@@ -1226,7 +1357,10 @@ mod tests {
         match err {
             FirstDesktopError::IntegrationGated { step, reason } => {
                 assert_eq!(step, "place-desktop");
-                assert!(reason.contains("Workload") || reason.contains("Bus"), "names the Workload prerequisite: {reason}");
+                assert!(
+                    reason.contains("Workload") || reason.contains("Bus"),
+                    "names the Workload prerequisite: {reason}"
+                );
                 assert!(reason.contains("desktop-eagle"), "names the VM: {reason}");
             }
             FirstDesktopError::Failed { .. } => panic!("expected an integration-gated error"),
@@ -1439,8 +1573,8 @@ mod tests {
         use crate::workers::cloud::{verify_token, HmacTokenSigner, TokenVerdict};
         use mackes_mesh_types::workloads::{
             WorkloadOperationAction, WorkloadOperationPhase, WorkloadOperationStatus,
-            WorkloadPowerState, WorkloadReadiness, WorkloadRuntimeSignals,
-            WorkloadStateSnapshot, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            WorkloadPowerState, WorkloadReadiness, WorkloadRuntimeSignals, WorkloadStateSnapshot,
+            WORKLOAD_CONTRACT_SCHEMA_VERSION,
         };
         use mde_bus::hooks::config::Priority;
         use std::sync::Arc;
@@ -1471,17 +1605,17 @@ mod tests {
                     .expect("list Workload operations");
                 if let Some(message) = messages.into_iter().next() {
                     let body = message.body.expect("Workload request body");
-                    let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
-                        &body,
-                        u64::try_from(now_ms()).unwrap_or(0),
-                    )
-                    .expect("valid Workload request");
+                    let request =
+                        mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
+                            &body,
+                            u64::try_from(now_ms()).unwrap_or(0),
+                        )
+                        .expect("valid Workload request");
                     assert_eq!(request.action, WorkloadOperationAction::StartAndAttach);
                     assert_eq!(request.target_node, report_node);
                     let token = request.armed_token.as_deref().expect("armed token");
-                    let verifier = HmacTokenSigner::new(
-                        b"first-desktop-workload-bus-test-key".to_vec(),
-                    );
+                    let verifier =
+                        HmacTokenSigner::new(b"first-desktop-workload-bus-test-key".to_vec());
                     assert_eq!(
                         verify_token(
                             Some(token),

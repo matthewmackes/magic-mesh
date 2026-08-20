@@ -1004,9 +1004,7 @@ pub enum OpInvalid {
         free_mib: u64,
     },
     /// A create-partition request has no usable size or overflows its end offset.
-    #[error(
-        "device {device}: invalid partition geometry start={start_mib} size={size_mib}"
-    )]
+    #[error("device {device}: invalid partition geometry start={start_mib} size={size_mib}")]
     InvalidPartitionGeometry {
         /// The disk.
         device: String,
@@ -1289,9 +1287,11 @@ fn safe_mountpoint(mountpoint: &str) -> bool {
 fn safe_mapper_name(mapper_name: &str) -> bool {
     !mapper_name.is_empty()
         && !mapper_name.contains('\0')
-        && Path::new(mapper_name).components().eq([
-            std::path::Component::Normal(std::ffi::OsStr::new(mapper_name)),
-        ])
+        && Path::new(mapper_name)
+            .components()
+            .eq([std::path::Component::Normal(std::ffi::OsStr::new(
+                mapper_name,
+            ))])
 }
 
 /// Accept normal relative components for btrfs names, including nested names,
@@ -2328,21 +2328,23 @@ pub fn configure_workload_pool_layout(
             let pattern = format!("{}(/.*)?", path.display());
             let mut modify = Command::new("semanage");
             modify.args(["fcontext", "-m", "-t", context, &pattern]);
-            let modify_status = status_with_timeout(modify, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-                StorageError::OpFailed {
-                    op: "label_workload_pool",
-                    reason: format!("SELinux fcontext update failed to start: {error}"),
-                }
-            })?;
+            let modify_status =
+                status_with_timeout(modify, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                    StorageError::OpFailed {
+                        op: "label_workload_pool",
+                        reason: format!("SELinux fcontext update failed to start: {error}"),
+                    }
+                })?;
             if !modify_status.success() {
                 let mut add = Command::new("semanage");
                 add.args(["fcontext", "-a", "-t", context, &pattern]);
-                let add_status = status_with_timeout(add, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-                    StorageError::OpFailed {
-                        op: "label_workload_pool",
-                        reason: format!("SELinux fcontext add failed to start: {error}"),
-                    }
-                })?;
+                let add_status =
+                    status_with_timeout(add, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                        StorageError::OpFailed {
+                            op: "label_workload_pool",
+                            reason: format!("SELinux fcontext add failed to start: {error}"),
+                        }
+                    })?;
                 if !add_status.success() {
                     return Err(StorageError::OpFailed {
                         op: "label_workload_pool",
@@ -2353,12 +2355,13 @@ pub fn configure_workload_pool_layout(
         }
         let mut restore = Command::new("restorecon");
         restore.args(["-RF", mountpoint_string.as_str()]);
-        let restore_status = status_with_timeout(restore, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-            StorageError::OpFailed {
-                op: "restore_workload_pool",
-                reason: format!("restorecon failed to start: {error}"),
-            }
-        })?;
+        let restore_status =
+            status_with_timeout(restore, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                StorageError::OpFailed {
+                    op: "restore_workload_pool",
+                    reason: format!("restorecon failed to start: {error}"),
+                }
+            })?;
         if !restore_status.success() {
             return Err(StorageError::OpFailed {
                 op: "restore_workload_pool",
@@ -2370,9 +2373,8 @@ pub fn configure_workload_pool_layout(
     if let Err(error) = layout_result {
         let mut unmount = Command::new("umount");
         unmount.arg(mountpoint_string.as_str());
-        let cleanup = status_with_timeout(unmount, DEFAULT_CMD_TIMEOUT).map_err(|cleanup| {
-            format!("unmount failed to start: {cleanup}")
-        });
+        let cleanup = status_with_timeout(unmount, DEFAULT_CMD_TIMEOUT)
+            .map_err(|cleanup| format!("unmount failed to start: {cleanup}"));
         return Err(match cleanup {
             Ok(status) if status.success() => error,
             Ok(status) => StorageError::OpFailed {

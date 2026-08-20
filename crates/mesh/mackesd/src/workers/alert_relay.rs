@@ -748,11 +748,7 @@ mod tests {
 
         let outside = tmp.path().join("outside");
         write_event(tmp.path(), "01H8XYZABC0000000000000004", "CRITICAL");
-        std::fs::rename(
-            tmp.path().join("01H8XYZABC0000000000000004.json"),
-            &outside,
-        )
-        .unwrap();
+        std::fs::rename(tmp.path().join("01H8XYZABC0000000000000004.json"), &outside).unwrap();
         std::os::unix::fs::symlink(&outside, tmp.path().join("linked.json"))
             .expect("symlink fixture");
 

@@ -929,8 +929,8 @@ fn confirm_destination_generation(
     )
     .map_err(|_| FilesCommitFailure::ConcurrentDestination)?;
 
-    let desired_bytes = bound.size_bytes == outcome.bytes_copied
-        && bound.sha256_hex == outcome.sha256_hex;
+    let desired_bytes =
+        bound.size_bytes == outcome.bytes_copied && bound.sha256_hex == outcome.sha256_hex;
     if observed.generation < predecessor.generation {
         return Err(FilesCommitFailure::ConcurrentDestination);
     }

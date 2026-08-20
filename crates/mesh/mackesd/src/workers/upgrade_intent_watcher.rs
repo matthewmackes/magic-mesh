@@ -46,11 +46,11 @@ use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedT
 use serde_json::{json, Value};
 
 use super::{ShutdownToken, Worker};
-use crate::workers::proc::{output_with_timeout, status_with_timeout};
 use crate::ipc::action_auth::{
     production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
     MAX_AUTH_TTL_MS,
 };
+use crate::workers::proc::{output_with_timeout, status_with_timeout};
 
 /// Tick cadence — five seconds, matching `gluster_worker` /
 /// `nebula_supervisor`.
@@ -188,11 +188,13 @@ pub fn write_intent_with_selection_json(
     selection_json: &str,
 ) -> std::io::Result<PathBuf> {
     let selection: mackes_mesh_types::lifecycle::LifecycleArtifactSelectionV1 =
-        serde_json::from_str(selection_json).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
-        })?;
+        serde_json::from_str(selection_json)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     selection.validate().map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid artifact selection: {error:?}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid artifact selection: {error:?}"),
+        )
     })?;
     let selection_value = serde_json::to_value(selection).map_err(std::io::Error::other)?;
     write_intent_signed(
@@ -240,8 +242,8 @@ fn write_intent_with_signer(
     signer: &CloudArmSigner,
     auth_now_ms: i64,
     nonce: &str,
-        selection: Option<Value>,
-        artifact_digest: Option<&str>,
+    selection: Option<Value>,
+    artifact_digest: Option<&str>,
 ) -> std::io::Result<PathBuf> {
     let dir = mesh_home.join("upgrade-intent");
     std::fs::create_dir_all(&dir)?;
@@ -874,9 +876,7 @@ impl UpgradeIntentWatcher {
     fn run_mde_install(&self) -> Result<(), String> {
         let profile = installed_profile().unwrap_or_else(|| "full".to_string());
         let mut command = Command::new(&self.install_binary);
-        command
-            .arg("--yes")
-            .arg(format!("--profile={profile}"));
+        command.arg("--yes").arg(format!("--profile={profile}"));
         let status = status_with_timeout(command, self.command_timeout)
             .map_err(|e| format!("mde-install failed: {e}"))?;
         if status.success() {
@@ -1126,7 +1126,10 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         let digest = "a".repeat(64);
-        assert_eq!(admitted_artifact_digest(&value).as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            admitted_artifact_digest(&value).as_deref(),
+            Some(digest.as_str())
+        );
 
         let mut invalid = value;
         invalid["artifact_selection"]["signed"] = Value::Bool(false);

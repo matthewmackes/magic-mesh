@@ -809,8 +809,7 @@ impl WorkspaceActionLedger {
         admitted_at_ms: u64,
     ) -> WorkspaceReservation {
         self.records.retain(|record| {
-            admitted_at_ms.saturating_sub(record.admitted_at_ms)
-                <= WORKSPACE_LEDGER_RETENTION_MS
+            admitted_at_ms.saturating_sub(record.admitted_at_ms) <= WORKSPACE_LEDGER_RETENTION_MS
         });
         if self.contains(request_id) {
             return WorkspaceReservation::Duplicate;
@@ -2851,11 +2850,7 @@ fn local_artwork_dir() -> PathBuf {
 /// preserves the runtime path while preventing tests from mutating process
 /// `HOME` and racing provider/cache tests in the same binary.
 #[must_use]
-fn materialize_local_artwork_in(
-    dir: &Path,
-    cover_id: &str,
-    bytes: &[u8],
-) -> Option<PathBuf> {
+fn materialize_local_artwork_in(dir: &Path, cover_id: &str, bytes: &[u8]) -> Option<PathBuf> {
     if bytes.is_empty() {
         return None;
     }
@@ -2888,11 +2883,7 @@ fn cover_art_path_reply(cover_id: &str, bytes: &[u8]) -> serde_json::Value {
 }
 
 #[must_use]
-fn cover_art_path_reply_in(
-    dir: &Path,
-    cover_id: &str,
-    bytes: &[u8],
-) -> serde_json::Value {
+fn cover_art_path_reply_in(dir: &Path, cover_id: &str, bytes: &[u8]) -> serde_json::Value {
     if let Some(path) = materialize_local_artwork_in(dir, cover_id, bytes) {
         json!({ "path": path.to_string_lossy(), "bytes": bytes.len() })
     } else {
@@ -3754,7 +3745,8 @@ fn apply_workspace_action_with_clients_and_coordination(
                 .ok_or("missing_target_peer")?;
             let local_peer = state::local_host();
             if let Some(target_id) = target_peer.strip_prefix("cast:") {
-                let configured = std::env::var("MDE_MUSIC_CAST_ADDRESS").map_err(|_| "cast_not_configured")?;
+                let configured =
+                    std::env::var("MDE_MUSIC_CAST_ADDRESS").map_err(|_| "cast_not_configured")?;
                 if configured != target_id {
                     return Err("cast_target_not_admitted");
                 }
@@ -3772,43 +3764,44 @@ fn apply_workspace_action_with_clients_and_coordination(
                 .map(|_| false)
                 .map_err(|_| "handoff_persist_failed")
             } else {
-            if target_peer == local_peer {
-                return Err("target_is_local_peer");
-            }
-            let target_state = state::read_all_peer_states(coordination_dir)
-                .into_iter()
-                .find(|peer| peer.peer == target_peer)
-                .ok_or("target_not_admitted")?;
-            if state::now_ms().saturating_sub(target_state.updated_ms) > state::STATE_STALE_MS {
-                return Err("target_stale");
-            }
-            if target_state.playing {
-                return Err("target_busy");
-            }
-            let Some(engine) = engine else {
-                return Err("audio_unavailable");
-            };
-            if !engine.is_active() {
-                return Err("playback_not_active");
-            }
-            if state::read_all_peer_states(coordination_dir)
-                .into_iter()
-                .any(|peer| {
-                    peer.peer != local_peer
-                        && peer.playing
-                        && state::now_ms().saturating_sub(peer.updated_ms) <= state::STATE_STALE_MS
-                })
-            {
-                return Err("playback_owned_elsewhere");
-            }
-            state::post_takeover(
-                coordination_dir,
-                target_peer,
-                Some(local_peer),
-                state::now_ms(),
-            )
-            .map(|_| false)
-            .map_err(|_| "handoff_persist_failed")
+                if target_peer == local_peer {
+                    return Err("target_is_local_peer");
+                }
+                let target_state = state::read_all_peer_states(coordination_dir)
+                    .into_iter()
+                    .find(|peer| peer.peer == target_peer)
+                    .ok_or("target_not_admitted")?;
+                if state::now_ms().saturating_sub(target_state.updated_ms) > state::STATE_STALE_MS {
+                    return Err("target_stale");
+                }
+                if target_state.playing {
+                    return Err("target_busy");
+                }
+                let Some(engine) = engine else {
+                    return Err("audio_unavailable");
+                };
+                if !engine.is_active() {
+                    return Err("playback_not_active");
+                }
+                if state::read_all_peer_states(coordination_dir)
+                    .into_iter()
+                    .any(|peer| {
+                        peer.peer != local_peer
+                            && peer.playing
+                            && state::now_ms().saturating_sub(peer.updated_ms)
+                                <= state::STATE_STALE_MS
+                    })
+                {
+                    return Err("playback_owned_elsewhere");
+                }
+                state::post_takeover(
+                    coordination_dir,
+                    target_peer,
+                    Some(local_peer),
+                    state::now_ms(),
+                )
+                .map(|_| false)
+                .map_err(|_| "handoff_persist_failed")
             }
         }
         _ => Err("unknown_action"),
@@ -4006,12 +3999,9 @@ fn poll_workspace_with_authorizer(
                             revision,
                             Some("replayed_request"),
                         ),
-                        WorkspaceReservation::Full => typed_result(
-                            &request.request_id,
-                            false,
-                            revision,
-                            Some("ledger_full"),
-                        ),
+                        WorkspaceReservation::Full => {
+                            typed_result(&request.request_id, false, revision, Some("ledger_full"))
+                        }
                         WorkspaceReservation::Reserved => {
                             if persist_workspace_ledger(&data_dir, action_ledger).is_err() {
                                 action_ledger.release(&request.request_id);
@@ -4037,40 +4027,43 @@ fn poll_workspace_with_authorizer(
                             } else {
                                 let previous_queue = queue.clone();
                                 let coordination_dir = state::coordination_dir();
-                                let result = match apply_workspace_action_with_clients_and_coordination(
-                                    &request,
-                                    &mut queue,
-                                    engine,
-                                    clients,
-                                    rt,
-                                    &data_dir,
-                                    &coordination_dir,
-                                ) {
-                                    Ok(mutated) => {
-                                        if mutated && queue::write_to(queue_path, &queue).is_err() {
-                                            queue = previous_queue;
-                                            typed_result(
-                                                &request.request_id,
-                                                false,
-                                                revision,
-                                                Some("state_persist_failed"),
-                                            )
-                                        } else {
-                                            typed_result(
-                                                &request.request_id,
-                                                true,
-                                                queue::revision(&queue),
-                                                None,
-                                            )
+                                let result =
+                                    match apply_workspace_action_with_clients_and_coordination(
+                                        &request,
+                                        &mut queue,
+                                        engine,
+                                        clients,
+                                        rt,
+                                        &data_dir,
+                                        &coordination_dir,
+                                    ) {
+                                        Ok(mutated) => {
+                                            if mutated
+                                                && queue::write_to(queue_path, &queue).is_err()
+                                            {
+                                                queue = previous_queue;
+                                                typed_result(
+                                                    &request.request_id,
+                                                    false,
+                                                    revision,
+                                                    Some("state_persist_failed"),
+                                                )
+                                            } else {
+                                                typed_result(
+                                                    &request.request_id,
+                                                    true,
+                                                    queue::revision(&queue),
+                                                    None,
+                                                )
+                                            }
                                         }
-                                    }
-                                    Err(error_code) => typed_result(
-                                        &request.request_id,
-                                        false,
-                                        revision,
-                                        Some(error_code),
-                                    ),
-                                };
+                                        Err(error_code) => typed_result(
+                                            &request.request_id,
+                                            false,
+                                            revision,
+                                            Some(error_code),
+                                        ),
+                                    };
                                 action_ledger.finish(&request.request_id, result.clone());
                                 if let Err(error) =
                                     persist_workspace_ledger(&data_dir, action_ledger)
@@ -4494,8 +4487,12 @@ fn target_handoff_action(
     if completion.from_peer != target_peer {
         return TargetHandoffAction::IgnoreForeign;
     }
-    if let Some(intent) = intents.iter().find(|intent| intent.intent_id == completion.intent_id) {
-        if intent.target_kind != completion.target_kind || intent.target_id != completion.target_id {
+    if let Some(intent) = intents
+        .iter()
+        .find(|intent| intent.intent_id == completion.intent_id)
+    {
+        if intent.target_kind != completion.target_kind || intent.target_id != completion.target_id
+        {
             return TargetHandoffAction::DropInvalid;
         }
     }
@@ -4525,24 +4522,35 @@ fn apply_cast_handoff_completion(queue_path: &Path, clients: &[&Client]) -> bool
                 continue;
             }
         };
-        let Some(address) = completion.target_id.strip_prefix("cast:") else { continue };
-        let Ok(configured) = std::env::var("MDE_MUSIC_CAST_ADDRESS") else { continue };
+        let Some(address) = completion.target_id.strip_prefix("cast:") else {
+            continue;
+        };
+        let Ok(configured) = std::env::var("MDE_MUSIC_CAST_ADDRESS") else {
+            continue;
+        };
         if configured != address {
             continue;
         }
-        let name = std::env::var("MDE_MUSIC_CAST_NAME").unwrap_or_else(|_| "Cast receiver".to_owned());
-        let Ok(target) = crate::cast::CastTarget::new(address, name) else { continue };
+        let name =
+            std::env::var("MDE_MUSIC_CAST_NAME").unwrap_or_else(|_| "Cast receiver".to_owned());
+        let Ok(target) = crate::cast::CastTarget::new(address, name) else {
+            continue;
+        };
         let candidates = if clients.is_empty() {
-            cached_upcoming_tracks(&queue, &crate::cache::cache_dir()).map(|tracks| {
-                tracks.into_iter().map(|(url, _)| url).collect::<Vec<_>>()
-            })
+            cached_upcoming_tracks(&queue, &crate::cache::cache_dir())
+                .map(|tracks| tracks.into_iter().map(|(url, _)| url).collect::<Vec<_>>())
         } else {
             let catalog = load_catalog(&state::data_dir()).unwrap_or_default();
             source_aware_upcoming_candidates(&queue, clients, &catalog).map(|tracks| {
-                tracks.into_iter().filter_map(|track| track.candidates.into_iter().next().map(|(url, _)| url)).collect()
+                tracks
+                    .into_iter()
+                    .filter_map(|track| track.candidates.into_iter().next().map(|(url, _)| url))
+                    .collect()
             })
         };
-        let Some(media_url) = candidates.and_then(|urls| urls.into_iter().next()) else { continue };
+        let Some(media_url) = candidates.and_then(|urls| urls.into_iter().next()) else {
+            continue;
+        };
         let handoff = match crate::cast::CastHandoff::new(
             &media_url,
             "audio/mpeg",
@@ -4552,7 +4560,9 @@ fn apply_cast_handoff_completion(queue_path: &Path, clients: &[&Client]) -> bool
             Ok(handoff) => handoff,
             Err(_) => continue,
         };
-        if crate::cast::execute_cast_handoff(&target, &handoff, &dir.join("music-cast-owner.json")).is_err() {
+        if crate::cast::execute_cast_handoff(&target, &handoff, &dir.join("music-cast-owner.json"))
+            .is_err()
+        {
             continue;
         }
         let target_state = MusicState {
@@ -6414,9 +6424,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         // Suppress both the mesh heartbeat and workspace projection while that
         // proof is pending; either surface claiming `playing` would bypass the
         // one-use transfer's two-phase commit.
-        if pending_target_handoff.is_none()
-            && last_state_write.elapsed() >= STATE_WRITE_INTERVAL
-        {
+        if pending_target_handoff.is_none() && last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
             write_periodic_state(engine.as_ref(), queue_path, &mut last_idle_state);
             if let Some(current_revision) = workspace_revision {
                 if let Some(next_revision) = current_revision.checked_add(1) {
@@ -7616,7 +7624,10 @@ mod tests {
             )
             .unwrap();
         poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
-        assert_eq!(queue::read_from(&queue_path).songs, vec!["corrected-forward"]);
+        assert_eq!(
+            queue::read_from(&queue_path).songs,
+            vec!["corrected-forward"]
+        );
         assert!(persist
             .list_since(&reply_topic(&corrected.ulid), None)
             .unwrap()[0]

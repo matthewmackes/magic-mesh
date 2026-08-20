@@ -77,14 +77,11 @@ pub fn run(
             generation,
             steps: vec!["identity".into()],
         };
-        let mut authority = mackesd_core::lifecycle_authority::LifecycleAuthority::begin(
-            &root,
-            lifecycle_plan,
-        )
-        .map_err(|error| anyhow::anyhow!("cannot acquire recovery authority: {error:?}"))?;
+        let mut authority =
+            mackesd_core::lifecycle_authority::LifecycleAuthority::begin(&root, lifecycle_plan)
+                .map_err(|error| anyhow::anyhow!("cannot acquire recovery authority: {error:?}"))?;
         let result = authority.run_next(|_| {
-            run_live_recovery(node_id, roster, root, plan, evict)
-                .map_err(|error| error.to_string())
+            run_live_recovery(node_id, roster, root, plan, evict).map_err(|error| error.to_string())
         });
         if let Err(error) = result {
             let _ = authority.finish();
@@ -107,8 +104,9 @@ fn run_live_recovery(
     use mackesd_core::recovery::{self as rec, RecoveryApply as _};
     if evict {
         if let Some(row) = roster.iter().find(|r| r.node_id == node_id) {
-            let fingerprints = rec::fingerprint_old_cert(&row.cert_pem)
-                .ok_or_else(|| anyhow::anyhow!("--evict needs nebula-cert to fingerprint the old cert"))?;
+            let fingerprints = rec::fingerprint_old_cert(&row.cert_pem).ok_or_else(|| {
+                anyhow::anyhow!("--evict needs nebula-cert to fingerprint the old cert")
+            })?;
             let req = rec::EvictRequest {
                 workgroup_root: root,
                 node_id: node_id.clone(),
@@ -120,7 +118,8 @@ fn run_live_recovery(
                 .map_err(|error| anyhow::anyhow!("immediate eviction failed: {error}"))?;
             println!(
                 "  evicted old identity into the blocklist at {} (signed={})",
-                receipt.blocklist_path.display(), receipt.signed
+                receipt.blocklist_path.display(),
+                receipt.signed
             );
         } else {
             println!("  --evict: no old roster row for {node_id} — nothing to blocklist");

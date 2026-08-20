@@ -599,7 +599,9 @@ impl RemotePush for SshBootstrap {
             };
             if bearer.is_empty()
                 || bearer.len() > crate::nebula_enroll::JOIN_TOKEN_MAX_LEN
-                || bearer.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+                || bearer
+                    .chars()
+                    .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
             {
                 return Err(RemotePushError::BundleRejected {
                     why: "enrollment bearer is not a valid bounded token".to_string(),
@@ -627,24 +629,36 @@ impl RemotePush for SshBootstrap {
                     why: format!("spawn ssh: {error}"),
                 })?;
             use std::io::Write;
-            child.stdin.take().ok_or_else(|| RemotePushError::Unreachable {
-                target: host.clone(),
-                why: "ssh stdin unavailable".to_string(),
-            })?.write_all(format!("{bearer}\n").as_bytes()).map_err(|error| RemotePushError::Unreachable {
-                target: host.clone(),
-                why: format!("send enrollment credential: {error}"),
-            })?;
-            let output = child.wait_with_output().map_err(|error| RemotePushError::Unreachable {
-                target: host.clone(),
-                why: format!("wait for ssh enroll: {error}"),
-            })?;
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| RemotePushError::Unreachable {
+                    target: host.clone(),
+                    why: "ssh stdin unavailable".to_string(),
+                })?
+                .write_all(format!("{bearer}\n").as_bytes())
+                .map_err(|error| RemotePushError::Unreachable {
+                    target: host.clone(),
+                    why: format!("send enrollment credential: {error}"),
+                })?;
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|error| RemotePushError::Unreachable {
+                        target: host.clone(),
+                        why: format!("wait for ssh enroll: {error}"),
+                    })?;
             if output.status.success() {
                 Ok(())
             } else {
                 let detail = String::from_utf8_lossy(&output.stderr);
                 Err(RemotePushError::Unreachable {
                     target: host.clone(),
-                    why: format!("ssh enroll exited {:?}: {}", output.status.code(), redact_ssh_detail(&detail)),
+                    why: format!(
+                        "ssh enroll exited {:?}: {}",
+                        output.status.code(),
+                        redact_ssh_detail(&detail)
+                    ),
                 })
             }
         }
@@ -669,7 +683,9 @@ fn bootstrap_ssh_argv(
     if host.is_empty()
         || host.len() > 253
         || host.starts_with('-')
-        || host.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+        || host
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
     {
         return Err(RemotePushError::BundleRejected {
             why: "bootstrap host is not a safe SSH host value".to_string(),
@@ -1473,7 +1489,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "mackesd" && pair[1] == "join"));
-        assert!(args.iter().any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7"));
         assert!(!args.iter().any(|arg| arg.contains("sh -c")));
         assert!(!args.iter().any(|arg| arg.contains("bearer")));
         assert!(args.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));

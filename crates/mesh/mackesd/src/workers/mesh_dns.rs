@@ -480,10 +480,12 @@ mod tests {
     #[test]
     fn oversized_directory_fails_closed_without_mesh_records() {
         let peers: Vec<serde_json::Value> = (0..=MAX_DIRECTORY_PEERS)
-            .map(|i| serde_json::json!({
-                "hostname": format!("peer-{i}"),
-                "overlay_ip": format!("10.42.0.{}", i + 1),
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "hostname": format!("peer-{i}"),
+                    "overlay_ip": format!("10.42.0.{}", i + 1),
+                })
+            })
             .collect();
         let dir = serde_json::json!({ "peers": peers });
 

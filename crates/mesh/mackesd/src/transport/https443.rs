@@ -252,13 +252,19 @@ fn reject_symlinked_policy_parents(path: &Path) -> std::io::Result<()> {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("refusing symlinked HTTPS fallback policy parent {}", current.display()),
+                    format!(
+                        "refusing symlinked HTTPS fallback policy parent {}",
+                        current.display()
+                    ),
                 ));
             }
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotADirectory,
-                    format!("HTTPS fallback policy parent is not a directory: {}", current.display()),
+                    format!(
+                        "HTTPS fallback policy parent is not a directory: {}",
+                        current.display()
+                    ),
                 ));
             }
             Ok(_) => {}
@@ -685,7 +691,10 @@ mod tests {
             FallbackHostConfig::from_policy_file(&escaped_policy).is_none(),
             "a symlinked policy parent must not activate an outside endpoint"
         );
-        assert!(outside_policy.exists(), "the outside policy must remain untouched");
+        assert!(
+            outside_policy.exists(),
+            "the outside policy must remain untouched"
+        );
     }
 
     #[test]
