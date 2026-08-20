@@ -2775,6 +2775,12 @@ impl FileBrowser {
         let Some(dest_dir) = dialog.target() else {
             return;
         };
+        if let Some(error) = self.extract_destination_error(&dest_dir) {
+            if let Some(dialog) = self.extract_to.as_mut() {
+                dialog.error = Some(error);
+            }
+            return;
+        }
         let archive = dialog.archive.clone();
         self.extract_to = None;
         self.enqueue_extract(archive, dest_dir);
@@ -2783,6 +2789,33 @@ impl FileBrowser {
     /// Dismiss Extract To without unpacking.
     pub fn cancel_extract_to(&mut self) {
         self.extract_to = None;
+    }
+
+    /// Refuse extraction through an existing symlink anywhere in the
+    /// destination path. The archive worker creates missing directories and
+    /// writes members beneath this path; allowing a symlink here would turn a
+    /// user-selected destination into an implicit escape hatch.
+    fn extract_destination_error(&self, dest: &Path) -> Option<String> {
+        let mut current = PathBuf::new();
+        for component in dest.components() {
+            current.push(component.as_os_str());
+            let Ok(stat) = self.meta_ops.symlink_metadata(&current) else {
+                break;
+            };
+            if stat.is_symlink {
+                return Some(format!(
+                    "The extraction destination cannot contain a symbolic link: {}",
+                    current.display()
+                ));
+            }
+            if !stat.is_dir {
+                return Some(format!(
+                    "The extraction destination is not a directory: {}",
+                    current.display()
+                ));
+            }
+        }
+        None
     }
 
     fn enqueue_extract(&mut self, archive: PathBuf, dest_dir: PathBuf) {

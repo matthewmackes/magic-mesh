@@ -1490,13 +1490,17 @@ fn voice_admin_panel(
             }
 
             ui.add_space(Style::SP_S);
+            // Keep the retained migration projection above the longer action
+            // forms. The Activity body is hosted in a bounded shell viewport,
+            // so status must be visible before the controls can extend below
+            // the first frame; the controls and their verb paths stay intact.
+            voice_cutover(ui, &mut form, admin.voice_cutover(), nodes, data, sink);
+            ui.add_space(Style::SP_S);
             voice_did_routing(ui, &mut form, dids, nodes, sink);
             ui.add_space(Style::SP_S);
             voice_failover(ui, &mut form, nodes, sink);
             ui.add_space(Style::SP_S);
             voice_shared_outbound(ui, &mut form, admin.voice_shared(), sink);
-            ui.add_space(Style::SP_S);
-            voice_cutover(ui, &mut form, admin.voice_cutover(), nodes, data, sink);
 
             if let Some(notice) = form.notice.as_deref() {
                 ui.add_space(Style::SP_XS);

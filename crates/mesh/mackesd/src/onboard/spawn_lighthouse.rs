@@ -545,12 +545,19 @@ pub struct LiveProvisioner {
     ///
     /// [`SshBootstrap`]: crate::onboard::remote_push::SshBootstrap
     remote_push: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+    /// Lifecycle state root used to mint target-bound lighthouse bearers.
+    ///
+    /// Kept explicit so a daemon cannot accidentally mint into an unrelated
+    /// directory. A missing root is an honest integration gate, while a failed
+    /// SSH handoff leaves the issued bearer pending for a corrected-forward retry.
+    workgroup_root: Option<std::path::PathBuf>,
 }
 
 impl Default for LiveProvisioner {
     fn default() -> Self {
         Self {
             remote_push: std::sync::Arc::new(crate::onboard::remote_push::SshBootstrap),
+            workgroup_root: None,
         }
     }
 }
@@ -563,6 +570,18 @@ impl LiveProvisioner {
         transport: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
     ) -> Self {
         self.remote_push = transport;
+        self
+    }
+
+    /// Configure the authoritative lifecycle root used for bearer issuance.
+    ///
+    /// The bearer is generated only when the endpoint did not already carry
+    /// one from the provider. This makes retries idempotent for a provider that
+    /// persisted its handoff, while still allowing the normal provision →
+    /// push-enroll path to mint through the existing ledger.
+    #[must_use]
+    pub fn with_workgroup_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workgroup_root = Some(root);
         self
     }
 }
@@ -621,11 +640,26 @@ impl Provisioner for LiveProvisioner {
         let target = crate::onboard::remote_push::Target::Bootstrap {
             host: endpoint.host.clone(),
         };
-        let Some(bearer) = endpoint.join_bearer.as_deref() else {
-            return Err(ProvisionError::IntegrationGated {
-                step: "push-enroll",
-                reason: "provisioning did not return the minted lighthouse bearer; refusing to pass the command template as a bearer".to_string(),
-            });
+        let issued_bearer;
+        let bearer = if let Some(bearer) = endpoint.join_bearer.as_deref() {
+            bearer
+        } else {
+            let Some(root) = self.workgroup_root.as_deref() else {
+                return Err(ProvisionError::IntegrationGated {
+                    step: "push-enroll",
+                    reason: "no lifecycle workgroup root is configured to mint the \
+                             lighthouse-scoped bearer; refusing to pass the command template \
+                             as a bearer"
+                        .to_string(),
+                });
+            };
+            issued_bearer =
+                crate::bearer_ledger::issue(root, crate::bearer_ledger::LIGHTHOUSE_ROLE_NOTE)
+                    .map_err(|error| ProvisionError::Failed {
+                        step: "push-enroll",
+                        reason: format!("mint lighthouse-scoped bearer: {error}"),
+                    })?;
+            issued_bearer.as_str()
         };
         let actions = [crate::onboard::remote_push::Action::RunEnroll {
             bearer: bearer.to_string(),
@@ -1079,6 +1113,60 @@ mod tests {
         assert!(
             matches!(&seen[0].1[0], Action::RunEnroll { .. }),
             "the bootstrap instant runs only enroll"
+        );
+    }
+
+    #[test]
+    fn push_enroll_mints_a_scoped_bearer_when_provider_did_not_return_one() {
+        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPush {
+            seen: Mutex<Vec<Action>>,
+        }
+        impl RemotePush for RecordingPush {
+            fn apply(&self, _target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+                self.seen
+                    .lock()
+                    .expect("seen mutex")
+                    .extend_from_slice(actions);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let push = Arc::new(RecordingPush::default());
+        let prov = LiveProvisioner::default()
+            .with_remote_push(push.clone())
+            .with_workgroup_root(root.path().to_path_buf());
+        let endpoint = Endpoint {
+            host: "203.0.113.8".into(),
+            overlay_ip: None,
+            join_bearer: None,
+        };
+
+        prov.push_enroll(&endpoint, &enroll_bootstrap("home-deadbeef"))
+            .expect("configured lifecycle root mints the handoff bearer");
+
+        let seen = push.seen.lock().expect("seen mutex");
+        let Action::RunEnroll { bearer } = &seen[0] else {
+            panic!("bootstrap must receive only RunEnroll");
+        };
+        assert_ne!(bearer, JOIN_TOKEN_PLACEHOLDER);
+        assert!(!bearer.is_empty());
+        assert!(crate::bearer_ledger::is_pending(root.path(), bearer));
+        assert!(
+            crate::bearer_ledger::is_lighthouse_bearer(root.path(), bearer),
+            "minted handoff must carry the lighthouse scope"
+        );
+        assert!(
+            !Action::RunEnroll {
+                bearer: bearer.clone()
+            }
+            .redacted()
+            .contains(bearer),
+            "bearer never enters the log-safe action description"
         );
     }
 }

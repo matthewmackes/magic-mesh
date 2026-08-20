@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_collab_types::{
-    ActorId, CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
-    CallMediaReadiness, CallMediaSession, CollabCommand, MEDIA_SESSION_V1_SCHEMA_VERSION,
-    MediaDescriptionV1, MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1,
-    MediaSignalingRoleV1, MediaTrackKind, SfuElectionV1, SpaceId, media_answer_topic,
-    media_offer_topic, media_session_topic, media_sfu_election_topic,
+    media_answer_topic, media_offer_topic, media_session_topic, media_sfu_election_topic, ActorId,
+    CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
+    CallMediaReadiness, CallMediaSession, CollabCommand, MediaDescriptionV1, MediaFailureReasonV1,
+    MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1, MediaTrackKind, SfuElectionV1,
+    SpaceId, MEDIA_SESSION_V1_SCHEMA_VERSION,
 };
 
 use super::collab_media::{CallMediaFrameVerifier, CallMediaProviderError};
@@ -1591,8 +1591,8 @@ fn publish_media_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mde_collab_types::CallMediaRequirement;
     use mde_collab_types::topics::{self, projection as proj};
+    use mde_collab_types::CallMediaRequirement;
 
     fn write_readiness(persist: &Persist, readiness: &CallMediaReadiness) {
         let body = serde_json::to_string(readiness).expect("serialize readiness");

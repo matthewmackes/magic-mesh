@@ -46,6 +46,47 @@ recovery/package checks. Those results are useful regression evidence, but they
 do not independently close a story whose required package, provider, fleet, or
 live evidence is absent.
 
+## S18 implementation follow-up — 2026-08-20
+
+The lifecycle-specific implementation changed the production
+`LiveProvisioner::push_enroll` path. When a cloud/provider endpoint does not
+return a bearer, the configured lifecycle workgroup root now mints one through
+the existing bearer ledger with `role:lighthouse` scope and hands it to the
+typed `SshBootstrap` action. The command-template placeholder is never used as
+a credential; a missing root remains a typed integration gate. Provider-issued
+bearers remain supported, and a failed handoff leaves a newly issued ledger
+entry pending for corrected-forward retry.
+
+Farm admission and results:
+
+```text
+MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=3 \
+  install-helpers/xcp-build.sh cargo test -p mackesd --lib \
+  onboard::spawn_lighthouse -- --nocapture
+```
+
+- BigBoy `.130`, slot `3`; admission reported 38,881,316 KiB free.
+- Source synced to the admitted farm checkout; `15 passed, 0 failed, 5011
+  filtered out` (5m37s total command time).
+- The new `push_enroll_mints_a_scoped_bearer_when_provider_did_not_return_one`
+  test proves ledger pending state, lighthouse scope, placeholder refusal, and
+  redacted action output.
+
+```text
+MCNF_BUILD_HOST=172.20.0.196 MCNF_BUILD_SLOT=1 \
+  install-helpers/xcp-build.sh cargo test -p mackesd --lib \
+  onboard::remote_push -- --nocapture
+```
+
+- `.196`, slot `1`; admission reported 30,102,288 KiB free.
+- `26 passed, 0 failed, 5000 filtered out` (4m01s total command time).
+- Existing typed SSH/Bus refusal, redaction, nonce, signature, and
+  acknowledgement coverage remains green.
+
+These are farm implementation/contract results only. They do not claim that a
+real cloud provider returned an endpoint, that live SSH enrollment succeeded,
+or that the exact candidate was installed on Dell, Seat 15, or Surface.
+
 ## Story disposition at S18
 
 | Story | Disposition | Exact boundary |
@@ -55,7 +96,7 @@ live evidence is absent.
 | S3 | Farm authority/recovery evidence present. | No proof of every real provider-side executor effect. |
 | S4 | Partial farm evidence. | Projection, TUI state machine, and route reachability are tested; full Construct GUI/TUI parity on an installed seat remains open. |
 | S5 | Farm hostile authorization evidence present. | No physical seat mutation or live trust/provider proof. |
-| S6 | Farm capsule, redaction, refusal, and handoff evidence present. | Actual bearer minting through the live authority and live SSH enrollment remain open. |
+| S6 | Farm capsule, scoped-bearer minting, redaction, refusal, and handoff evidence present. | Live SSH enrollment and provider-side execution remain open. |
 | S7 | Farm exact artifact-selection contract evidence present. | Candidate-bound release inputs and installed artifact identity belong to the release chain/WL-TEST-002. |
 | S8 | Farm unsigned-artifact confirmation evidence present. | No installed-release qualification claim. |
 | S9 | Focused missing-input/readiness evidence present. | Full provider, hardware, compute, storage, and installed-seat discovery remains open. |

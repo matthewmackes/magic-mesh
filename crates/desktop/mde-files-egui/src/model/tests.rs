@@ -1842,6 +1842,42 @@ fn extract_here_refuses_path_traversal_members() {
 }
 
 #[test]
+fn extract_to_refuses_a_symlinked_destination_without_queueing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = temp.path().join("payload.zip");
+    std::fs::write(&archive, b"not an archive").expect("seed archive path");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).expect("outside");
+    let destination = temp.path().join("chosen");
+    std::os::unix::fs::symlink(&outside, &destination).expect("destination symlink");
+    let rows = vec![FileRow::local("payload.zip", Mime::Archive, "14 B", "now")
+        .with_path(archive.to_string_lossy())];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.open_extract_to(0);
+    b.set_extract_to_dest(destination.to_string_lossy().into_owned());
+    b.submit_extract_to();
+
+    let dialog = b
+        .extract_to_dialog()
+        .expect("hostile destination stays open");
+    let error = dialog.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("cannot contain a symbolic link"),
+        "honest symlink refusal: {error}"
+    );
+    assert!(
+        b.ops().active().is_empty(),
+        "invalid destination never reaches the queue"
+    );
+    assert!(outside
+        .read_dir()
+        .expect("outside remains readable")
+        .next()
+        .is_none());
+}
+
+#[test]
 fn cancel_compress_leaves_no_half_archive() {
     let temp = tempfile::tempdir().expect("tempdir");
     let source = temp.path().join("blob.bin");
