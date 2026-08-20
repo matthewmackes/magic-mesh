@@ -98,6 +98,7 @@ pub fn request_open_transfers() {
 
 /// Ask Transfers mode to open the New Transfer / sync-pair editor (Ctrl+N).
 pub fn request_new_transfer() {
+    remember_hotkey_owner();
     TRANSFERS_HOTKEY_INTENT.store(INTENT_NEW, Ordering::SeqCst);
 }
 
@@ -109,7 +110,7 @@ pub fn clear_transfers_hotkey_intent() {
 
 /// Drain one pending Transfers hotkey intent, if any.
 pub(crate) fn take_transfers_hotkey_intent() -> Option<TransfersHotkey> {
-    if TRANSFERS_HOTKEY_INTENT.load(Ordering::SeqCst) == INTENT_OPEN
+    if TRANSFERS_HOTKEY_INTENT.load(Ordering::SeqCst) != INTENT_NONE
         && !hotkey_belongs_to_current_thread()
     {
         return None;
