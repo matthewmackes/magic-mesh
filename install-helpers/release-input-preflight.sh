@@ -15,6 +15,16 @@ APP_CATALOG_RECEIPT="${MCNF_APP_CATALOG_RECEIPT:-$ROOT/packaging/app-vm/produce-
 
 die() { printf 'release-input-preflight: REFUSED: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${2:-}" ]] || die "missing mandatory input: $1"; }
+regular_file() {
+  local label=$1 path=$2
+  [[ -n "$path" && -f "$path" && ! -L "$path" ]] ||
+    die "$label must be a regular non-symlink file"
+}
+directory() {
+  local label=$1 path=$2
+  [[ -n "$path" && -d "$path" && ! -L "$path" ]] ||
+    die "$label must be a real non-symlink directory"
+}
 source_revision='' source_epoch=''
 maps_approval='' maps_source_root='' maps_quota='' maps_verifier='' maps_mbtiles=''
 rpm_signing_receipt='' bootc_receipt='' bootc_reference='' bootc_architecture='' bootc_role=''
@@ -54,6 +64,15 @@ for pair in \
   'App VM base architecture' "$app_vm_base_architecture"; do
   if [[ -z ${label+x} ]]; then label=$pair; else need "$label" "$pair"; unset label; fi
 done
+
+regular_file 'Maps approval' "$maps_approval"
+directory 'Maps tile source root' "$maps_source_root"
+regular_file 'Maps production verifier' "$maps_verifier"
+regular_file 'Maps MBTiles' "$maps_mbtiles"
+regular_file 'RPM signing identity receipt' "$rpm_signing_receipt"
+regular_file 'bootc base digest receipt' "$bootc_receipt"
+regular_file 'App VM base image receipt' "$app_vm_base_receipt"
+regular_file 'App VM curated catalog receipt' "$app_vm_catalog_receipt"
 
 "$SOURCE_VERIFY" --verify "$source_revision" "$source_epoch" >/dev/null \
   || die 'source revision receipt is invalid'

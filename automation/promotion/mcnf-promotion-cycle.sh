@@ -26,6 +26,12 @@ SSH_KEY="${MCNF_SSH_KEY:-/root/.ssh/id_ed25519}"
 DECLARATION_FILE="${MCNF_RELEASE_DECLARATION:-$ROOT/docs/ops/production-release-declaration.md}"
 WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
 
+# Candidate-bound execution receipts let an interrupted cycle resume at the
+# first incomplete stage without treating an old evidence line as proof.
+# shellcheck source=/dev/null
+source "$ROOT/automation/promotion/release-stage-journal.sh"
+release_journal_source_revision="${MCNF_RELEASE_SOURCE_REVISION:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)}"
+
 if [ "$DO_SIZE" != "$DO_THIN_SIZE" ]; then
   printf 'ERROR: lighthouses only support the thin %s profile; refusing %s\n' \
     "$DO_THIN_SIZE" "$DO_SIZE" >&2
@@ -367,6 +373,35 @@ build_rpm() {
   record_gate build pass "farm-rpm"
 }
 
+run_build_checkpoint() {
+  local sha
+  RPM="$(latest_rpm || true)"
+  if [ -n "$RPM" ] && [ -f "$RPM" ]; then
+    sha="$(rpm_sha256 "$RPM")"
+    if release_journal_complete build "$sha"; then
+      log "Resume: build receipt already passed for candidate sha256=$sha"
+      return 0
+    fi
+  fi
+  build_rpm
+  sha="$(rpm_sha256 "$RPM")"
+  release_journal_record_pass build "$sha" "" farm-rpm
+}
+
+run_stage_checkpoint() {
+  local stage="$1" previous="$2" fn="$3" sha
+  RPM="$(latest_rpm || true)"
+  [ -n "$RPM" ] && [ -f "$RPM" ] || die "no RPM candidate for stage $stage"
+  sha="$(rpm_sha256 "$RPM")"
+  if release_journal_complete "$stage" "$sha"; then
+    log "Resume: $stage receipt already passed for candidate sha256=$sha"
+    return 0
+  fi
+  release_journal_require_previous "$stage" "$sha" "$previous"
+  "$fn"
+  release_journal_record_pass "$stage" "$sha" "$previous" "promotion-cycle"
+}
+
 adopt_existing_candidate() {
   RPM="$(latest_rpm)"
   [ -n "$RPM" ] && [ -f "$RPM" ] || die "no RPM candidate to adopt"
@@ -675,17 +710,17 @@ promote_do() {
 
 cycle() {
   inventory
-  build_rpm
-  run_l1
-  run_l2
-  run_l3
-  run_l4
-  promote_eagle
-  live_smoke
-  promote_do
-  live_smoke
-  live_audit
-  live_fd_soak
+  run_build_checkpoint
+  run_stage_checkpoint l1 build run_l1
+  run_stage_checkpoint l2 l1 run_l2
+  run_stage_checkpoint l3 l2 run_l3
+  run_stage_checkpoint l4 l3 run_l4
+  run_stage_checkpoint eagle l4 promote_eagle
+  run_stage_checkpoint live-smoke eagle live_smoke
+  run_stage_checkpoint do live-smoke promote_do
+  run_stage_checkpoint live-smoke-post do live_smoke
+  run_stage_checkpoint live-audit live-smoke-post live_audit
+  run_stage_checkpoint fd-soak live-audit live_fd_soak
 }
 
 case "${1:-cycle}" in
