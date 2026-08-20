@@ -104,7 +104,7 @@ pub use activity::{
 pub use data::{
     amend_affordance, relative_age, AmendAffordance, CollabData, CommandSink, EDIT_WINDOW_MS,
 };
-pub use documents::{DocSubMode, DocTemplate, DocView};
+pub use documents::{DocSubMode, DocTemplate, DocView, DocumentShareCommand};
 pub use fixture::FixtureData;
 pub use icons::ALL_COLLAB_ICONS;
 pub use transfers::{

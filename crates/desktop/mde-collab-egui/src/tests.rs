@@ -28,9 +28,10 @@ use crate::fixture::{activity, message, space_summary, FixtureData};
 use crate::{
     amend_affordance, file_ref_of_path, ActivityAdminSnapshot, ActivityFilter, AmendAffordance,
     ChannelTab, CollabData, CommandSink, CommunicationsSurface, DocSubMode, DocTemplate, DocView,
-    GatewayCommand, GatewayReadout, GatewaySink, MeshTeamsApp, Mode, VoiceAdminCommand,
-    VoiceAdminSink, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy,
-    VoiceNodeProjection, VoiceRegState, VoiceSharedOutbound, ALL_COLLAB_ICONS, EDIT_WINDOW_MS,
+    DocumentShareCommand, GatewayCommand, GatewayReadout, GatewaySink, MeshTeamsApp, Mode,
+    VoiceAdminCommand, VoiceAdminSink, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid,
+    VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState, VoiceSharedOutbound, ALL_COLLAB_ICONS,
+    EDIT_WINDOW_MS,
 };
 
 /// A `1000 x 700` headless input with the given events.
@@ -3267,6 +3268,119 @@ fn share_join_follow_and_owner_close_work_between_two_seats() {
         guest.following_share_peer(),
         None,
         "owner close must end follow mode"
+    );
+}
+
+#[test]
+fn share_command_projection_survives_full_lifecycle_through_public_drain() {
+    // The mount-facing seam: `CommunicationsSurface::drain_document_share_commands`
+    // (a `pub fn`, paralleling `drain_sync_pair_commands` / `drain_voice_admin_commands`
+    // / `drain_gateway_commands`) is the only way the shell can route Documents-mode
+    // share-session intents through its Bus lane, so the projection must be
+    // observable *and ordered* across the full Start → Join → Follow → Unfollow →
+    // Close lifecycle. The existing `share_join_follow_and_owner_close_...` test
+    // exercises the runtime CRDT convergence and per-phase drains; this fixture
+    // is disjoint — it holds every emission for a whole lifecycle, walks the
+    // observable projection through the *public* accessor, and asserts the
+    // `DocumentShareCommand::Unfollow` variant (silent in the earlier test) rides
+    // the same drain in the correct position.
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Runbook\n\nshared\n";
+    let host_data = documents_fixture_as("eagle", space, document, body, SpaceRole::Owner);
+    let guest_data = documents_fixture_as("falcon", space, document, body, SpaceRole::Member);
+    let bus = mde_editor_egui::FakeBus::new();
+
+    let mut host = CommunicationsSurface::new();
+    host.bind_document_share_bus(bus.clone());
+    host.select_space(space);
+    host.open_document(&host_data, document, "Runbook");
+
+    let mut guest = CommunicationsSurface::new();
+    guest.bind_document_share_bus(bus);
+    guest.select_space(space);
+    guest.open_document(&guest_data, document, "Runbook");
+
+    assert!(host.share_document(&host_data, space));
+    assert!(guest.join_document_share(&guest_data, space, document));
+    for _ in 0..4 {
+        host.pump_document_share();
+        guest.pump_document_share();
+    }
+    assert!(
+        guest.follow_share_peer("eagle"),
+        "guest must be able to follow the host once the roster is populated"
+    );
+    assert!(
+        guest.unfollow_share_peer(),
+        "guest must be able to stop following on demand"
+    );
+    assert!(host.close_document_share());
+
+    let host_drain = host.drain_document_share_commands();
+    let guest_drain = guest.drain_document_share_commands();
+
+    // Host observes exactly Start → Close through the public accessor.
+    assert!(
+        matches!(
+            host_drain.as_slice(),
+            [
+                DocumentShareCommand::Start {
+                    space: host_space,
+                    document: host_document,
+                    session: host_session,
+                },
+                DocumentShareCommand::Close {
+                    space: close_space,
+                    document: close_document,
+                    session: close_session,
+                },
+            ] if *host_space == space
+                && *host_document == document
+                && *close_space == space
+                && *close_document == document
+                && host_session == close_session
+                && !host_session.is_empty()
+        ),
+        "host public drain must yield Start then Close over the same session id, got {host_drain:?}",
+    );
+
+    // Guest observes exactly Join → Follow → Unfollow through the public accessor
+    // — the Unfollow variant is the previously-unasserted lifecycle rung.
+    assert!(
+        matches!(
+            guest_drain.as_slice(),
+            [
+                DocumentShareCommand::Join {
+                    space: join_space,
+                    document: join_document,
+                    ..
+                },
+                DocumentShareCommand::Follow {
+                    document: follow_document,
+                    peer,
+                },
+                DocumentShareCommand::Unfollow {
+                    document: unfollow_document,
+                },
+            ] if *join_space == space
+                && *join_document == document
+                && *follow_document == document
+                && peer == "eagle"
+                && *unfollow_document == document
+        ),
+        "guest public drain must yield Join → Follow → Unfollow in order, got {guest_drain:?}",
+    );
+
+    // The public drain must be idempotent — a second drain in the same frame is
+    // empty on both seats so the shell mount cannot double-publish an intent.
+    assert!(
+        host.drain_document_share_commands().is_empty(),
+        "host public drain must clear after one call",
+    );
+    assert!(
+        guest.drain_document_share_commands().is_empty(),
+        "guest public drain must clear after one call",
     );
 }
 

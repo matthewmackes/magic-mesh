@@ -634,9 +634,15 @@ impl CommunicationsSurface {
     ///
     /// These lifecycle intents are distinct from [`CommandSink`], because
     /// `CollabCommand` has no share-session variants. The mount drains this
-    /// seam once per frame and routes the typed intents through its Bus lane.
+    /// seam once per frame and routes the typed intents through its Bus lane,
+    /// paralleling the shape of [`drain_sync_pair_commands`],
+    /// [`drain_voice_admin_commands`], and [`drain_gateway_commands`].
+    ///
+    /// [`drain_sync_pair_commands`]: Self::drain_sync_pair_commands
+    /// [`drain_voice_admin_commands`]: Self::drain_voice_admin_commands
+    /// [`drain_gateway_commands`]: Self::drain_gateway_commands
     #[must_use]
-    pub(crate) fn drain_document_share_commands(&mut self) -> Vec<DocumentShareCommand> {
+    pub fn drain_document_share_commands(&mut self) -> Vec<DocumentShareCommand> {
         self.documents.drain_share_commands()
     }
 

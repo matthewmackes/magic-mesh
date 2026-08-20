@@ -233,7 +233,9 @@ impl LifecycleCorrectionPlanV1 {
             .map(|id| (*id, 0usize))
             .collect::<std::collections::HashMap<_, _>>();
         for (_, to) in &self.edges {
-            *indegree.get_mut(to.as_str()).unwrap() += 1;
+            *indegree
+                .get_mut(to.as_str())
+                .expect("edge endpoints validated against correction id set above") += 1;
         }
         let mut ready = indegree
             .iter()
@@ -244,7 +246,9 @@ impl LifecycleCorrectionPlanV1 {
             visited += 1;
             for (from, to) in &self.edges {
                 if from == id {
-                    let entry = indegree.get_mut(to.as_str()).unwrap();
+                    let entry = indegree
+                        .get_mut(to.as_str())
+                        .expect("edge endpoints validated against correction id set above");
                     *entry -= 1;
                     if *entry == 0 {
                         ready.push(to.as_str());
@@ -260,6 +264,7 @@ impl LifecycleCorrectionPlanV1 {
 }
 
 impl LifecycleRequirementCheckV1 {
+    #[must_use]
     pub fn blocks_progress(&self) -> bool {
         self.required
             && matches!(
@@ -335,6 +340,7 @@ impl CommissioningCapsuleV1 {
         .into_bytes()
     }
 
+    #[must_use]
     pub fn sign(mut self, key_id: impl Into<String>, signing_key: &SigningKey) -> Self {
         self.key_id = key_id.into();
         self.signature_hex.clear();
@@ -400,6 +406,7 @@ impl LifecycleConfirmationV1 {
         .into_bytes()
     }
 
+    #[must_use]
     pub fn sign(mut self, key_id: impl Into<String>, signing_key: &SigningKey) -> Self {
         self.key_id = key_id.into();
         self.signature_hex = encode_hex(&signing_key.sign(&self.signing_bytes()).to_bytes());
@@ -415,6 +422,7 @@ impl LifecycleConfirmationV1 {
             .map_err(|_| LifecycleIntentError::InvalidField("signature_hex"))
     }
 
+    #[must_use]
     pub fn expected_phrase(action: LifecycleConfirmationAction, target_count: u32) -> String {
         match action {
             LifecycleConfirmationAction::Offboard => {
@@ -455,6 +463,7 @@ impl LifecycleConfirmationV1 {
 }
 
 impl LifecycleStepKind {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Identity => "identity",
@@ -469,6 +478,7 @@ impl LifecycleStepKind {
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "identity" => Self::Identity,
@@ -543,6 +553,7 @@ pub struct LifecycleBaselineEntryV1 {
     pub correction_step: LifecycleStepKind,
 }
 
+#[must_use]
 pub fn canonical_lifecycle_baseline() -> Vec<LifecycleBaselineEntryV1> {
     [
         ("packages", LifecycleStepKind::Packages),
@@ -624,6 +635,7 @@ pub enum LifecycleIntentError {
 }
 
 impl LifecycleIntentV1 {
+    #[must_use]
     pub fn default_steps(&self) -> Vec<String> {
         let steps: &[LifecycleStepKind] = match self.intent {
             LifecycleIntentKind::Onboard => &[
@@ -859,6 +871,7 @@ impl OffboardingReceiptV1 {
         .into_bytes()
     }
 
+    #[must_use]
     pub fn sign(mut self, signing_key: &SigningKey) -> Self {
         self.signature_hex = encode_hex(&signing_key.sign(&self.signing_bytes()).to_bytes());
         self
@@ -915,6 +928,7 @@ impl FleetLifecycleReportV1 {
         .into_bytes()
     }
 
+    #[must_use]
     pub fn sign(mut self, signing_key: &SigningKey) -> Self {
         self.signature_hex = encode_hex(&signing_key.sign(&self.signing_bytes()).to_bytes());
         self
@@ -950,6 +964,21 @@ impl FleetLifecycleReportV1 {
         }
         Ok(())
     }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
+    if value.len() != 128 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0_u8; 64];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -1312,19 +1341,4 @@ mod tests {
             Err(LifecycleIntentError::InvalidField("upgrade_binding"))
         ));
     }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
-    if value.len() != 128 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut bytes = [0_u8; 64];
-    for (index, slot) in bytes.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
-    }
-    Some(bytes)
 }
