@@ -197,6 +197,7 @@ impl CommunicationsSurface {
         let me = data.me().clone();
         let now = data.now_unix_ms();
         let calls = data.call_state().active.clone();
+        self.reconcile_media_intent(&calls, &me);
         let (space_name, direct) = space_context(&directory, space);
         let can_start = call_start_enabled(&directory, space);
 
@@ -585,6 +586,23 @@ impl CommunicationsSurface {
     /// owned by the mackesd P2P media worker.
     pub(crate) fn send_dtmf(&self, sink: &mut CommandSink, call: CallId, digit: char) {
         sink.emit(CollabCommand::SendDtmf { call, digit });
+    }
+
+    /// Reconcile recorded camera/screen intent with the converged call
+    /// projection. Device preferences remain seat-level state, but outgoing
+    /// track intent is meaningful only while this seat has a connected leg.
+    /// This keeps the marked capture follow-up honest after a call ends or the
+    /// local participant leaves, without inventing a media-plane event.
+    pub(crate) fn reconcile_media_intent(&mut self, calls: &[CallView], me: &ActorId) {
+        let connected = calls.iter().any(|call| {
+            call.participants.iter().any(|participant| {
+                &participant.actor == me && participant.state == CallParticipantState::Connected
+            })
+        });
+        if !connected {
+            self.call_media.camera_on = false;
+            self.call_media.screen_sharing = false;
+        }
     }
 
     /// Open the in-call DTMF keypad for `call` (test seam for the keypad gate).

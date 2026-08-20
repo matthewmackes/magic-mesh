@@ -3868,6 +3868,28 @@ fn dtmf_keypad_emits_send_dtmf() {
 }
 
 #[test]
+fn calls_media_intent_tracks_a_connected_local_leg() {
+    let space = SpaceId::new();
+    let call = CallId::new();
+    let me = ActorId::new("eagle");
+    let mut surface = CommunicationsSurface::new();
+    surface.call_media.camera_on = true;
+    surface.call_media.screen_sharing = true;
+
+    surface.reconcile_media_intent(&calls_fixture(space, call).call_state().active, &me);
+    assert!(
+        surface.call_media.camera_on && surface.call_media.screen_sharing,
+        "recorded outgoing-media intent must survive while the local leg is connected"
+    );
+
+    surface.reconcile_media_intent(&[], &me);
+    assert!(
+        !surface.call_media.camera_on && !surface.call_media.screen_sharing,
+        "recorded outgoing-media intent must clear after the local leg disappears"
+    );
+}
+
+#[test]
 fn no_recording_or_transcription_control_exists_anywhere() {
     // Spec §7: recording + transcription are deliberately absent from the UI, the
     // icon standard, and the call commands. No glyph names them...
