@@ -665,6 +665,8 @@ pub enum GatewayRefuse {
     InvalidPort,
     /// `set-gateway` requires a username.
     UsernameRequired,
+    /// REGISTER expiry is outside the responder's u32 contract.
+    InvalidExpiry,
     /// Clear when the gateway is already absent, or a second clear in this sink.
     ReplayClear,
 }
@@ -677,6 +679,7 @@ impl GatewayRefuse {
             Self::MalformedHost => "Malformed gateway host",
             Self::InvalidPort => "Gateway port must be 1–65535",
             Self::UsernameRequired => "Gateway username is required",
+            Self::InvalidExpiry => "Gateway expiry must be between 1 and 4294967295 seconds",
             Self::ReplayClear => "Gateway is already cleared",
         }
     }
@@ -1221,6 +1224,11 @@ pub fn validate_gateway_set(
     if let Some(port) = port {
         if port == 0 || port > u64::from(u16::MAX) {
             return Err(GatewayRefuse::InvalidPort);
+        }
+    }
+    if let Some(expires) = expires {
+        if expires == 0 || expires > u64::from(u32::MAX) {
+            return Err(GatewayRefuse::InvalidExpiry);
         }
     }
     let username = username.trim();
@@ -1937,6 +1945,7 @@ fn gateway_admin_panel(ui: &mut egui::Ui, admin: &dyn ActivityAdminData, sink: &
                         .hint_text("unchanged if blank"),
                 );
                 labeled_field(ui, "Display name", &mut form.display_name, "optional");
+                labeled_field(ui, "Expires", &mut form.expires, "3600");
             });
 
             ui.horizontal_wrapped(|ui| {
@@ -1944,8 +1953,11 @@ fn gateway_admin_panel(ui: &mut egui::Ui, admin: &dyn ActivityAdminData, sink: &
                     let port = parse_optional_u64(&form.port);
                     let expires = parse_optional_u64(&form.expires);
                     match (port, expires) {
-                        (Err(()), _) | (_, Err(())) => {
+                        (Err(()), _) => {
                             form.notice = Some(GatewayRefuse::InvalidPort.label().to_owned());
+                        }
+                        (_, Err(())) => {
+                            form.notice = Some(GatewayRefuse::InvalidExpiry.label().to_owned());
                         }
                         (Ok(port), Ok(expires)) => {
                             match validate_gateway_set(
@@ -1983,6 +1995,12 @@ fn gateway_admin_panel(ui: &mut egui::Ui, admin: &dyn ActivityAdminData, sink: &
                         match validate_gateway_clear(readout, sink) {
                             Ok(command) => {
                                 sink.emit(command);
+                                form.host.clear();
+                                form.port.clear();
+                                form.username.clear();
+                                form.display_name.clear();
+                                form.expires.clear();
+                                form.password.clear();
                                 form.notice = Some("Gateway clear published".to_owned());
                             }
                             Err(refuse) => form.notice = Some(refuse.label().to_owned()),
@@ -2492,6 +2510,22 @@ mod tests {
         assert_eq!(
             validate_gateway_set("pbx.example.com", Some(0), "alice", "", "", None).unwrap_err(),
             GatewayRefuse::InvalidPort
+        );
+        assert_eq!(
+            validate_gateway_set(
+                "pbx.example.com",
+                None,
+                "alice",
+                "",
+                "",
+                Some(u64::from(u32::MAX) + 1)
+            )
+            .unwrap_err(),
+            GatewayRefuse::InvalidExpiry
+        );
+        assert_eq!(
+            validate_gateway_set("pbx.example.com", None, "alice", "", "", Some(0)).unwrap_err(),
+            GatewayRefuse::InvalidExpiry
         );
         assert_eq!(
             validate_gateway_set("pbx.example.com", None, "  ", "", "", None).unwrap_err(),
