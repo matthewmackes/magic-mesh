@@ -393,11 +393,12 @@ impl PowerCycleState {
             );
             if remote_destructive {
                 ui.add_space(Style::SP_S);
-                ui.checkbox(
+                let override_response = ui.checkbox(
                     &mut self.explicit_override,
                     "Explicit override for remote restart or shutdown",
-                )
-                .on_hover_text(
+                );
+                let _ = mde_egui::hover_text(
+                    override_response,
                     "Confirms the operator accepts service interruption and permits the mesh leader interlock. It cannot bypass missing authority or an offline target.",
                 );
             }
@@ -426,7 +427,7 @@ impl PowerCycleState {
                         );
                         let clicked = response.clicked();
                         if !available {
-                            response.on_hover_text(reason);
+                            let _ = mde_egui::disabled_hover_text(response, reason);
                         }
                         if clicked {
                             self.pending = Some(PendingAction {
@@ -614,7 +615,10 @@ impl PowerCycleState {
                 }
             }
         } else if !available {
-            response.on_hover_text("Onboarding & Offboarding is not installed on this node.");
+            let _ = mde_egui::disabled_hover_text(
+                response,
+                "Onboarding & Offboarding is not installed on this node.",
+            );
             ui.colored_label(
                 Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
                 "Onboarding & Offboarding is not installed on this node.",
