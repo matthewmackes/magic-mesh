@@ -136,6 +136,17 @@ struct CatalogWatermark {
     content_digest: String,
 }
 
+/// Durable last-good state carries an independent digest.  Re-validating the
+/// catalog against its own payload digest is insufficient: an attacker who can
+/// replace the cache can modify both the payload and any digest derived from
+/// it.  The envelope makes cache corruption/tampering detectable on restart.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCatalog {
+    catalog: FlatpakRuntimeCatalog,
+    content_digest: String,
+}
+
 impl CatalogWatermark {
     fn from_catalog(catalog: &FlatpakRuntimeCatalog) -> io::Result<Self> {
         Ok(Self {
@@ -681,14 +692,22 @@ fn recover_last_good(config: &CatalogConfig, now_ms: u64) -> io::Result<Option<R
     ) {
         Ok(mut file) => {
             let body = read_bounded(&mut file, MAX_CATALOG_WIRE_BYTES)?;
-            let parsed: FlatpakRuntimeCatalog = serde_json::from_slice(&body).map_err(io_other)?;
+            let persisted: PersistedCatalog = serde_json::from_slice(&body).map_err(io_other)?;
+            let parsed = persisted.catalog;
+            let catalog_body = serde_json::to_vec(&parsed).map_err(io_other)?;
             let verified = FlatpakRuntimeCatalog::decode_and_admit_json(
-                &body,
+                &catalog_body,
                 parsed.payload.issued_at_unix_ms,
             )
             .map_err(io_other)?;
             let watermark = CatalogWatermark::from_catalog(&verified)?;
-            let is_fresh = FlatpakRuntimeCatalog::decode_and_admit_json(&body, now_ms).is_ok();
+            if persisted.content_digest != watermark.content_digest {
+                return Err(io::Error::other(
+                    "Flatpak catalog last-good content digest mismatch",
+                ));
+            }
+            let is_fresh =
+                FlatpakRuntimeCatalog::decode_and_admit_json(&catalog_body, now_ms).is_ok();
             Ok(Some(RecoveredCatalog {
                 watermark,
                 catalog: verified,
@@ -711,7 +730,12 @@ fn store_last_good(config: &CatalogConfig, catalog: &FlatpakRuntimeCatalog) -> i
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(io::Error::other("Flatpak catalog state path is a symlink"));
     }
-    let body = serde_json::to_vec(catalog).map_err(io_other)?;
+    let content_digest = catalog.payload.content_digest().map_err(io_other)?;
+    let body = serde_json::to_vec(&PersistedCatalog {
+        catalog: catalog.clone(),
+        content_digest,
+    })
+    .map_err(io_other)?;
     if body.len() > usize::try_from(MAX_CATALOG_WIRE_BYTES).unwrap_or(usize::MAX) {
         return Err(io::Error::other(
             "admitted Flatpak catalog exceeds persistence bound",
@@ -1569,7 +1593,9 @@ mod tests {
         let good = runtime_catalog("flatpak-production", 7);
         store_last_good(worker.config.as_ref().unwrap(), &good).unwrap();
         let mut persist = Persist::open(temp.path().join("bus")).unwrap();
-        import(&persist, &runtime_catalog("flatpak-production", 8));
+        let mut conflicting = runtime_catalog("flatpak-production", 7);
+        conflicting.payload.entries[1].search.weight = 600;
+        import(&persist, &conflicting);
         persist
             .write(
                 &app_catalog_import_topic("node-01").unwrap(),

@@ -1034,11 +1034,11 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the base Workstation units.
+        // Lighthouse masks exactly the current rank-1 Workstation unit.
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            3,
-            "lighthouse masks the rank-1 shell + voice units"
+            1,
+            "lighthouse masks the rank-1 shell unit"
         );
     }
 

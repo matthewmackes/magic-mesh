@@ -1532,7 +1532,7 @@ mod tests {
                 "declared_capabilities": ["audio"],
                 "guest_profile": "wayland-standard",
                 "supported_actions": ["launch"],
-                "provenance": {"source": "curated", "signature": "sig-42"},
+                "provenance": {"source": "curated"},
                 "state": "installed"
             }]
         });
@@ -1599,7 +1599,7 @@ mod tests {
                     "declared_capabilities": ["audio"],
                     "guest_profile": "wayland-standard",
                     "supported_actions": actions,
-                    "provenance": {"source": "curated", "signature": "sig-42"},
+                    "provenance": {"source": "curated"},
                     "state": "installed"
                 }]
             })

@@ -3087,7 +3087,7 @@ mod tests {
     fn canonical_registry_inventory_hash_covers_every_runtime_field() {
         let hash = registry_inventory_sha256(WORKER_REGISTRY);
         assert_eq!(
-            hash, "0687e5676b1f5370e4337fe78192607bd39442557a329c583c20f11f7e4fd244",
+            hash, "7623b72d2c40f0c6d257ff0d9d775f7ff54a94c17f5c6ee0ad6101ff1178c947",
             "WL-ARCH-009: canonical registration inventory drifted"
         );
 

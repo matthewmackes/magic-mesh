@@ -1613,6 +1613,7 @@ enum OnboardCmd {
     },
     /// WL-FUNC-023 S17 — audit the canonical lifecycle baseline and stamp
     /// first-boot convergence only when no required check blocks.
+    #[command(name = "lifecycle-firstboot")]
     LifecycleFirstBoot {
         #[arg(long, value_name = "TARGET")]
         target_id: Option<String>,
