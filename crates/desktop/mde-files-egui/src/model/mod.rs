@@ -1870,6 +1870,13 @@ impl FileBrowser {
         let loc = self.panes[pane].tabs[ti].location.clone();
         let key = loc.backend_path();
         let prefs = self.folder_prefs.get(&key).copied().unwrap_or_default();
+        // A folder visit is a use of its remembered presentation. Keep the
+        // persisted order honest so the bounded store evicts the least
+        // recently visited folder, rather than the folder whose preference
+        // was most recently mutated.
+        if self.folder_prefs.contains_key(&key) {
+            self.touch_folder_pref(&key);
+        }
         let listing = self.backend.list(&key);
         let tab = &mut self.panes[pane].tabs[ti];
         match listing {
@@ -2324,6 +2331,14 @@ impl FileBrowser {
                 self.folder_prefs.remove(&old);
             }
         }
+        self.folder_prefs_dirty = Some(Instant::now());
+    }
+
+    fn touch_folder_pref(&mut self, key: &str) {
+        if let Some(idx) = self.folder_prefs_lru.iter().position(|k| k == key) {
+            self.folder_prefs_lru.remove(idx);
+        }
+        self.folder_prefs_lru.push_back(key.to_string());
         self.folder_prefs_dirty = Some(Instant::now());
     }
 

@@ -352,6 +352,23 @@ fn view_and_sort_and_hidden_persist_per_folder() {
 }
 
 #[test]
+fn revisiting_a_folder_refreshes_preference_lru_recency() {
+    let mut b = browser_over(roster_backend());
+    b.navigate(0, Location::Local("/one".into()));
+    b.set_view(0, ViewMode::Grid);
+    b.navigate(0, Location::Local("/two".into()));
+    b.set_view(0, ViewMode::Details);
+
+    b.navigate(0, Location::Local("/one".into()));
+
+    assert_eq!(
+        b.folder_prefs_lru.back().map(String::as_str),
+        Some("/one"),
+        "a visit must make the folder most recently used"
+    );
+}
+
+#[test]
 fn show_hidden_filters_dotfiles() {
     let rows = vec![
         FileRow::local(".secret", Mime::Doc, "1 KB", "now").with_path("/d/.secret"),
