@@ -1356,6 +1356,7 @@ struct VoiceAdminFormState {
     failover_number: String,
     caller_id: String,
     outbound_trunk: String,
+    shared_seeded: bool,
     confirm_cutover: bool,
     notice: Option<String>,
 }
@@ -1402,6 +1403,24 @@ fn store_voice_admin_form_state(ui: &egui::Ui, state: VoiceAdminFormState) {
     ui.ctx().data_mut(|data| data.insert_temp(id, state));
 }
 
+fn seed_voice_shared_form_state(
+    mut form: VoiceAdminFormState,
+    shared: Option<&VoiceSharedOutbound>,
+) -> VoiceAdminFormState {
+    if !form.shared_seeded {
+        if let Some(config) = shared {
+            if form.caller_id.trim().is_empty() {
+                form.caller_id.clone_from(&config.caller_id);
+            }
+            if form.outbound_trunk.trim().is_empty() {
+                form.outbound_trunk.clone_from(&config.outbound_trunk);
+            }
+            form.shared_seeded = true;
+        }
+    }
+    form
+}
+
 fn gateway_admin_form_state(ui: &egui::Ui, readout: Option<&GatewayReadout>) -> GatewayFormState {
     let id = ui.id().with("gateway-admin-form");
     let mut state = ui
@@ -1439,7 +1458,8 @@ fn voice_admin_panel(
     let nodes = admin.voice_nodes();
     let dids = admin.voice_dids();
     let provisioned = has_provisioned_voice_account(nodes);
-    let mut form = voice_admin_form_state(ui);
+    let form = voice_admin_form_state(ui);
+    let mut form = seed_voice_shared_form_state(form, admin.voice_shared());
 
     widgets::section().show(ui, |ui| {
         widgets::card().show(ui, |ui| {
@@ -2064,14 +2084,15 @@ mod tests {
     use mde_collab_types::{ActorClock, ActorId, AlertPayload, AlertView, EventId};
 
     use super::{
-        coalesced_activity_rows, has_provisioned_voice_account, validate_cutover,
-        validate_did_route, validate_failover, validate_gateway_clear, validate_gateway_set,
-        validate_shared_config, ActivityEntry, ActivityFilter, AlertInbox, GatewayCommand,
-        GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId, VoiceAdminCommand,
-        VoiceAdminRefuse, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy,
-        VoiceNodeProjection, VoiceRegState, VOICE_DID_ROUTE_TOPIC, VOICE_FAILOVER_TOPIC,
-        VOICE_PROVISION_TOPIC, VOICE_SHARED_CONFIG_TOPIC, VOIP_CLEAR_GATEWAY_TOPIC,
-        VOIP_GET_GATEWAY_TOPIC, VOIP_SET_GATEWAY_TOPIC,
+        coalesced_activity_rows, has_provisioned_voice_account, seed_voice_shared_form_state,
+        validate_cutover, validate_did_route, validate_failover, validate_gateway_clear,
+        validate_gateway_set, validate_shared_config, ActivityEntry, ActivityFilter, AlertInbox,
+        GatewayCommand, GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId,
+        VoiceAdminCommand, VoiceAdminFormState, VoiceAdminRefuse, VoiceCutoverPhase,
+        VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState,
+        VoiceSharedOutbound, VOICE_DID_ROUTE_TOPIC, VOICE_FAILOVER_TOPIC, VOICE_PROVISION_TOPIC,
+        VOICE_SHARED_CONFIG_TOPIC, VOIP_CLEAR_GATEWAY_TOPIC, VOIP_GET_GATEWAY_TOPIC,
+        VOIP_SET_GATEWAY_TOPIC,
     };
 
     fn entry(
@@ -2381,6 +2402,29 @@ mod tests {
                 .unwrap_err(),
             VoiceAdminRefuse::NoProvisionedAccount
         );
+    }
+
+    #[test]
+    fn retained_shared_config_seeds_the_apply_form_for_a_round_trip() {
+        let shared = VoiceSharedOutbound {
+            caller_id: "15551234567".to_owned(),
+            outbound_trunk: "main".to_owned(),
+        };
+        let form = seed_voice_shared_form_state(VoiceAdminFormState::default(), Some(&shared));
+
+        assert_eq!(form.caller_id, shared.caller_id);
+        assert_eq!(form.outbound_trunk, shared.outbound_trunk);
+        assert!(form.shared_seeded);
+
+        let edited = VoiceAdminFormState {
+            caller_id: "15557654321".to_owned(),
+            outbound_trunk: "backup".to_owned(),
+            shared_seeded: true,
+            ..form
+        };
+        let unchanged = seed_voice_shared_form_state(edited, Some(&shared));
+        assert_eq!(unchanged.caller_id, "15557654321");
+        assert_eq!(unchanged.outbound_trunk, "backup");
     }
 
     #[test]
