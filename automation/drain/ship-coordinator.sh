@@ -17,6 +17,7 @@ STATE="${MCNF_FARM_STATE:-$REPO/automation/.state}"
 WATCHDOG="${MCNF_DISK_WATCHDOG:-$REPO/install-helpers/disk-watchdog.sh}"
 RECONCILE="${MCNF_FARM_RECONCILE:-$REPO/automation/reconciler/farm-reconcile.sh}"
 GUARD="$REPO/automation/drain/worktree-guard.sh"
+DISPATCH="${MCNF_AGENT_DISPATCH:-$REPO/automation/drain/agent-dispatch.sh}"
 DRY=0
 ONCE=1
 
@@ -62,19 +63,33 @@ tick() {
   print_queue "$STATE/needs-review.txt" "needs-review queue"
   print_queue "$STATE/triage.txt" "triage queue"
   log "agent STEP-0: run '$GUARD' from each isolated worktree before editing"
+  if [ -x "$DISPATCH" ]; then
+    if ! "$DISPATCH" plan; then
+      log "IMPLEMENTATION DISPATCH BLOCKED — no plan was produced"
+    elif [ -z "${MCNF_AGENT_DISPATCHER:-}" ]; then
+      log "IMPLEMENTATION DISPATCH PAUSED — set MCNF_AGENT_RUNTIME (cursor|codex|claude) and its native MCNF_AGENT_DISPATCHER"
+      log "  plan: ${MCNF_AGENT_DISPATCH_STATE:-$REPO/automation/.state/agent-dispatch-plan.tsv}"
+    elif ! "$DISPATCH" dispatch; then
+      log "IMPLEMENTATION DISPATCH FAILED — adapter returned non-zero"
+    fi
+  else
+    log "implementation dispatcher missing at $DISPATCH"
+  fi
 }
 
 self_test() {
-  local td fake_watch fake_rec
+  local td fake_watch fake_rec fake_dispatch
   td="$(mktemp -d)"
   trap 'rm -rf "$td"' RETURN
-  fake_watch="$td/watchdog"; fake_rec="$td/reconcile"
+  fake_watch="$td/watchdog"; fake_rec="$td/reconcile"; fake_dispatch="$td/dispatch"
   printf '#!/usr/bin/env bash\necho watchdog >>"%s/log"\n' "$td" > "$fake_watch"
   printf '#!/usr/bin/env bash\necho reconcile "$@" >>"%s/log"\n' "$td" > "$fake_rec"
-  chmod +x "$fake_watch" "$fake_rec"
-  MCNF_REPO="$REPO" MCNF_FARM_STATE="$td/state" MCNF_DISK_WATCHDOG="$fake_watch" MCNF_FARM_RECONCILE="$fake_rec" "$0" --dry-run >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\necho dispatch "$@" >>"%s/log"\n' "$td" > "$fake_dispatch"
+  chmod +x "$fake_watch" "$fake_rec" "$fake_dispatch"
+  MCNF_REPO="$REPO" MCNF_FARM_STATE="$td/state" MCNF_DISK_WATCHDOG="$fake_watch" MCNF_FARM_RECONCILE="$fake_rec" MCNF_AGENT_DISPATCH="$fake_dispatch" "$0" --dry-run >/dev/null 2>&1
   grep -q '^watchdog$' "$td/log"
   grep -q '^reconcile --dry-run$' "$td/log"
+  grep -q '^dispatch plan' "$td/log"
   echo "ship-coordinator: self-test passed"
 }
 

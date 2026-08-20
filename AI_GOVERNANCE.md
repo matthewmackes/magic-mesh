@@ -580,6 +580,16 @@ acceptable for a single epic small enough to fit one `@farm:{…}` unit end to
 end (`Complexity: Small`) or for the tight cutover moments explicitly reserved
 by an operator lock.
 
+8. **Tool-preserving implementation dispatch.** The farm queue is not an
+ implementation-agent runtime. The coordinator MUST bridge Remaining units
+ through `automation/drain/agent-dispatch.sh` (or an approved replacement)
+ and MUST fail closed when no adapter is configured. The runtime that invoked
+ the drain owns the fan-out: Cursor invokes Cursor agents, Codex IDE invokes
+ Codex agents, and Claude Code invokes Claude agents. Every adapter declares
+ `MCNF_AGENT_RUNTIME=cursor|codex|claude` and receives the same runtime; it
+ MUST NOT silently fall back to another tool. A plan-only tick without a
+ native adapter is a dispatch failure, not healthy utilization.
+
 ---
 
 *Heritage: the pre-E12 Cosmic-era identity (libcosmic/iced, strictly-Carbon,

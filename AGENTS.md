@@ -97,6 +97,13 @@ authority — this section is the shared operational glue.
  the same phrasing.
  - Cursor: `.cursor/rules/ai-governance.mdc` (Parallel drain section)
  + `.cursor/rules/worklist.mdc` (required-unit section).
+- **Tool-preserving dispatch.** The agent runtime that invoked the drain owns
+ the implementation-agent fan-out. Cursor dispatches Cursor agents; Codex IDE
+ dispatches Codex agents; Claude Code dispatches Claude agents. A dispatcher
+ MUST set `MCNF_AGENT_RUNTIME=cursor|codex|claude` and provide a native
+ `MCNF_AGENT_DISPATCHER`; cross-tool fallback is forbidden. The durable bridge
+ is `automation/drain/agent-dispatch.sh`, which fails closed when either value
+ is absent or mismatched rather than silently invoking another agent product.
 - **Reconcile at tick start.** Before delegating or acting, re-read
  `AI_GOVERNANCE.md` §10.0.4 and `docs/platform/WORKLIST.md`. The newest
  lock wins.
