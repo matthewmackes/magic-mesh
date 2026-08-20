@@ -273,6 +273,19 @@ if run_release "${bad[@]}" >/dev/null 2>&1; then
 fi
 [[ ! -e "$marker" ]] || { echo 'preflight self-test: symlinked Maps approval mutated build state' >&2; exit 1; }
 
+ln -s "$fixture/maps-tiles" "$fixture/maps-tiles-link"
+bad=("${args[@]}")
+for ((index = 0; index < ${#bad[@]}; index++)); do
+  if [[ ${bad[index]} == --maps-tile-source-root ]]; then
+    bad[index + 1]="$fixture/maps-tiles-link"
+    break
+  fi
+done
+if run_release "${bad[@]}" >/dev/null 2>&1; then
+  echo 'preflight self-test: symlinked Maps source root reached build command' >&2; exit 1
+fi
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: symlinked Maps source root mutated build state' >&2; exit 1; }
+
 if run_release "${args[@]:0:${#args[@]}-2}" >/dev/null 2>&1; then
   echo 'preflight self-test: incomplete App catalog interface reached build command' >&2; exit 1
 fi
