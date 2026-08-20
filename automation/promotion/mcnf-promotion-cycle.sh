@@ -375,6 +375,8 @@ build_rpm() {
 
 run_build_checkpoint() {
   local sha
+  release_journal_assert_current_source "$ROOT"
+  release_journal_claim_stage build
   RPM="$(latest_rpm || true)"
   if [ -n "$RPM" ] && [ -f "$RPM" ]; then
     sha="$(rpm_sha256 "$RPM")"
@@ -390,6 +392,8 @@ run_build_checkpoint() {
 
 run_stage_checkpoint() {
   local stage="$1" previous="$2" fn="$3" sha
+  release_journal_assert_current_source "$ROOT"
+  release_journal_claim_stage "$stage"
   RPM="$(latest_rpm || true)"
   [ -n "$RPM" ] && [ -f "$RPM" ] || die "no RPM candidate for stage $stage"
   sha="$(rpm_sha256 "$RPM")"
