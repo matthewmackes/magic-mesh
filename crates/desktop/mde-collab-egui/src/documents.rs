@@ -517,6 +517,11 @@ impl std::fmt::Debug for DocumentsState {
 }
 
 impl DocumentsState {
+    /// Drain share-session intents for the shell mount.
+    pub(crate) fn drain_share_commands(&mut self) -> Vec<DocumentShareCommand> {
+        self.share_commands.drain()
+    }
+
     /// Prepare both embedded editor routes for a direct Editor launch. The
     /// Project editor and the one-pane document editor retain their documents,
     /// but optional sidebars never steal the initial canvas width.
@@ -625,6 +630,16 @@ struct SharePumpOutcome {
 }
 
 impl CommunicationsSurface {
+    /// Drain Documents share-session intents for the owning shell mount.
+    ///
+    /// These lifecycle intents are distinct from [`CommandSink`], because
+    /// `CollabCommand` has no share-session variants. The mount drains this
+    /// seam once per frame and routes the typed intents through its Bus lane.
+    #[must_use]
+    pub(crate) fn drain_document_share_commands(&mut self) -> Vec<DocumentShareCommand> {
+        self.documents.drain_share_commands()
+    }
+
     /// Render Documents mode for the selected space: the sub-mode + document
     /// toolbar strip, then the active sub-mode's body (the one-pane Markdown editor
     /// or the full embedded IDE).

@@ -19,6 +19,10 @@
 //! is an honest empty projection.
 
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::thread::ThreadId;
 
 use mde_egui::egui;
 use mde_egui::Style;
@@ -40,8 +44,55 @@ const INTENT_NEW: u8 = 2;
 /// client. Consumed once on the next [`CommunicationsSurface::ui`] frame.
 static TRANSFERS_HOTKEY_INTENT: AtomicU8 = AtomicU8::new(0);
 
+#[cfg(test)]
+static TRANSFERS_HOTKEY_OWNER: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
+
+#[cfg(test)]
+fn hotkey_owner() -> &'static Mutex<Option<ThreadId>> {
+    TRANSFERS_HOTKEY_OWNER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn remember_hotkey_owner() {
+    *hotkey_owner()
+        .lock()
+        .expect("Transfers hotkey owner lock must not be poisoned") =
+        Some(std::thread::current().id());
+}
+
+#[cfg(not(test))]
+fn remember_hotkey_owner() {}
+
+#[cfg(test)]
+fn clear_hotkey_owner() {
+    *hotkey_owner()
+        .lock()
+        .expect("Transfers hotkey owner lock must not be poisoned") = None;
+}
+
+#[cfg(not(test))]
+fn clear_hotkey_owner() {}
+
+#[cfg(test)]
+fn hotkey_belongs_to_current_thread() -> bool {
+    *hotkey_owner()
+        .lock()
+        .expect("Transfers hotkey owner lock must not be poisoned")
+        == Some(std::thread::current().id())
+}
+
+#[cfg(not(test))]
+fn hotkey_belongs_to_current_thread() -> bool {
+    true
+}
+
+fn theme_color(ui: &egui::Ui, color: egui::Color32) -> egui::Color32 {
+    Style::resolve_color(ui.ctx(), color)
+}
+
 /// Ask Communications to land on Transfers mode (Ctrl+J).
 pub fn request_open_transfers() {
+    remember_hotkey_owner();
     TRANSFERS_HOTKEY_INTENT.store(INTENT_OPEN, Ordering::SeqCst);
 }
 
@@ -53,12 +104,21 @@ pub fn request_new_transfer() {
 /// Drop a pending Transfers hotkey intent (tests that must not leak the latch).
 pub fn clear_transfers_hotkey_intent() {
     TRANSFERS_HOTKEY_INTENT.store(INTENT_NONE, Ordering::SeqCst);
+    clear_hotkey_owner();
 }
 
 /// Drain one pending Transfers hotkey intent, if any.
 pub(crate) fn take_transfers_hotkey_intent() -> Option<TransfersHotkey> {
+    if TRANSFERS_HOTKEY_INTENT.load(Ordering::SeqCst) == INTENT_OPEN
+        && !hotkey_belongs_to_current_thread()
+    {
+        return None;
+    }
     match TRANSFERS_HOTKEY_INTENT.swap(INTENT_NONE, Ordering::SeqCst) {
-        INTENT_OPEN => Some(TransfersHotkey::Open),
+        INTENT_OPEN => {
+            clear_hotkey_owner();
+            Some(TransfersHotkey::Open)
+        }
         INTENT_NEW => Some(TransfersHotkey::New),
         _ => None,
     }
@@ -156,9 +216,10 @@ pub struct SyncPairView {
     /// Worker-projected last outcome (`ok`, a failure reason, …). `None` if
     /// the pair has never fired.
     pub last_result: Option<String>,
-    /// `false` when the destination peer is unreachable — the row stays visible
-    /// and is painted degraded. Never hidden.
-    pub peer_reachable: bool,
+    /// Worker-projected destination reachability. `Some(false)` means the row
+    /// is unreachable and is painted degraded; `None` means no probe result has
+    /// been published yet. Never infer reachability from a missing result.
+    pub peer_reachable: Option<bool>,
 }
 
 /// Read-side access to saved sync pairs. Defaults to empty so a source that has
@@ -239,19 +300,19 @@ impl CommunicationsSurface {
             ui.label(
                 egui::RichText::new("Transfers")
                     .strong()
-                    .color(Style::TEXT_STRONG),
+                    .color(theme_color(ui, Style::TEXT_STRONG)),
             );
             ui.label(
                 egui::RichText::new("shared ledger mirror · recurring sync pairs")
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icons::icon_button(
                     ui,
                     icons::FILE_LINK,
                     Style::SP_M,
-                    Style::ACCENT,
+                    theme_color(ui, Style::ACCENT),
                     "New transfer (Ctrl+N)",
                 )
                 .clicked()
@@ -285,12 +346,12 @@ impl CommunicationsSurface {
         ui.label(
             egui::RichText::new("Sync pairs")
                 .strong()
-                .color(Style::TEXT_STRONG),
+                .color(theme_color(ui, Style::TEXT_STRONG)),
         );
         ui.label(
             egui::RichText::new("next-run and last-result come from the transfers worker")
                 .small()
-                .color(Style::TEXT_DIM),
+                .color(theme_color(ui, Style::TEXT_DIM)),
         );
 
         if self.transfers_ui.editor_open {
@@ -302,12 +363,12 @@ impl CommunicationsSurface {
             ui.label(
                 egui::RichText::new("No sync pairs saved.")
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
             ui.label(
                 egui::RichText::new("Create one here or with `mackesd transfer sync-pair add`.")
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
         } else {
             for pair in &pairs {
@@ -327,7 +388,7 @@ impl CommunicationsSurface {
             ui.label(
                 egui::RichText::new(title)
                     .strong()
-                    .color(Style::TEXT_STRONG),
+                    .color(theme_color(ui, Style::TEXT_STRONG)),
             );
             ui.add_space(Style::SP_XS);
             labeled_edit(ui, "Id", &mut self.transfers_ui.draft_id);
@@ -336,7 +397,11 @@ impl CommunicationsSurface {
             labeled_edit(ui, "Destination", &mut self.transfers_ui.draft_dest);
             labeled_edit(ui, "Bwlimit", &mut self.transfers_ui.draft_bwlimit);
             if let Some(notice) = &self.transfers_ui.notice {
-                ui.label(egui::RichText::new(notice).small().color(Style::DANGER));
+                ui.label(
+                    egui::RichText::new(notice)
+                        .small()
+                        .color(theme_color(ui, Style::DANGER)),
+                );
             }
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -355,7 +420,7 @@ impl CommunicationsSurface {
         data: &dyn crate::CollabData,
         pair: &SyncPairView,
     ) {
-        let degraded = !pair.peer_reachable;
+        let degraded = pair.peer_reachable == Some(false);
         let title_tone = if degraded {
             Style::WARN
         } else {
@@ -368,14 +433,23 @@ impl CommunicationsSurface {
         };
         mde_egui::card().show(ui, |ui| {
             ui.horizontal(|ui| {
-                icons::icon(ui, icons::XFER_ROW, Style::SP_M, title_tone);
-                ui.label(egui::RichText::new(&pair.id).strong().color(title_tone));
+                icons::icon(
+                    ui,
+                    icons::XFER_ROW,
+                    Style::SP_M,
+                    theme_color(ui, title_tone),
+                );
+                ui.label(
+                    egui::RichText::new(&pair.id)
+                        .strong()
+                        .color(theme_color(ui, title_tone)),
+                );
                 if degraded {
                     ui.label(
                         egui::RichText::new("unreachable")
                             .small()
                             .strong()
-                            .color(Style::WARN),
+                            .color(theme_color(ui, Style::WARN)),
                     );
                 }
                 ui.label(
@@ -384,30 +458,30 @@ impl CommunicationsSurface {
                         format_interval_draft(pair.every_secs)
                     ))
                     .small()
-                    .color(meta_tone),
+                    .color(theme_color(ui, meta_tone)),
                 );
             });
             ui.label(
                 egui::RichText::new(format!("{} → {}", pair.source, pair.dest))
                     .small()
-                    .color(meta_tone),
+                    .color(theme_color(ui, meta_tone)),
             );
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format_next_run(data.now_unix_ms(), pair.next_run_unix_ms))
                         .small()
-                        .color(meta_tone),
+                        .color(theme_color(ui, meta_tone)),
                 );
                 ui.label(
                     egui::RichText::new(format_last_result(pair.last_result.as_deref()))
                         .small()
-                        .color(meta_tone),
+                        .color(theme_color(ui, meta_tone)),
                 );
                 if let Some(limit) = &pair.bwlimit {
                     ui.label(
                         egui::RichText::new(format!("bwlimit {limit}"))
                             .small()
-                            .color(meta_tone),
+                            .color(theme_color(ui, meta_tone)),
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -415,7 +489,7 @@ impl CommunicationsSurface {
                         ui,
                         icons::FILE_UNLINK,
                         Style::SP_M,
-                        Style::DANGER,
+                        theme_color(ui, Style::DANGER),
                         "Remove sync pair",
                     )
                     .clicked()
@@ -428,7 +502,7 @@ impl CommunicationsSurface {
                         ui,
                         icons::DOC_ROW,
                         Style::SP_M,
-                        Style::TEXT_DIM,
+                        theme_color(ui, Style::TEXT_DIM),
                         "Edit sync pair",
                     )
                     .clicked()
@@ -517,7 +591,7 @@ impl CommunicationsSurface {
         ui.label(
             egui::RichText::new("Jobs")
                 .strong()
-                .color(Style::TEXT_STRONG),
+                .color(theme_color(ui, Style::TEXT_STRONG)),
         );
         let jobs = data.transfer_jobs();
         match jobs {
@@ -533,13 +607,16 @@ impl CommunicationsSurface {
                     });
             }
             _ => {
-                ui.label(egui::RichText::new("No transfers in flight.").color(Style::TEXT_DIM));
+                ui.label(
+                    egui::RichText::new("No transfers in flight.")
+                        .color(theme_color(ui, Style::TEXT_DIM)),
+                );
                 ui.label(
                     egui::RichText::new(
                         "Share a file from the Files mode to start one — its progress mirrors here.",
                     )
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
                 );
             }
         }
@@ -559,17 +636,23 @@ impl CommunicationsSurface {
                     TransferDirection::Inbound => (icons::XFER_INBOUND, "Inbound"),
                     TransferDirection::Outbound => (icons::XFER_OUTBOUND, "Outbound"),
                 };
-                icons::icon(ui, icons::XFER_ROW, Style::SP_M, Style::ACCENT);
-                icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).comms_hover_text(dir_hint);
+                icons::icon(
+                    ui,
+                    icons::XFER_ROW,
+                    Style::SP_M,
+                    theme_color(ui, Style::ACCENT),
+                );
+                icons::icon(ui, glyph, Style::SP_M, theme_color(ui, Style::TEXT_DIM))
+                    .comms_hover_text(dir_hint);
                 ui.label(
                     egui::RichText::new(short_file(job))
                         .strong()
-                        .color(Style::TEXT_STRONG),
+                        .color(theme_color(ui, Style::TEXT_STRONG)),
                 );
                 ui.label(
                     egui::RichText::new(format!("· {}", method_label(job.method)))
                         .small()
-                        .color(Style::TEXT_DIM),
+                        .color(theme_color(ui, Style::TEXT_DIM)),
                 );
             });
 
@@ -578,7 +661,7 @@ impl CommunicationsSurface {
                     egui::RichText::new(transfer_state_label(job.state))
                         .small()
                         .strong()
-                        .color(transfer_state_color(job.state)),
+                        .color(theme_color(ui, transfer_state_color(job.state))),
                 );
                 // Mirrored byte progress (WL-FUNC-006). `total == 0` means the
                 // ledger has not reported a size yet — shown honestly, never
@@ -591,19 +674,19 @@ impl CommunicationsSurface {
                             fmt_bytes(job.total)
                         ))
                         .small()
-                        .color(Style::TEXT_DIM),
+                        .color(theme_color(ui, Style::TEXT_DIM)),
                     );
                 } else if job.moved > 0 {
                     ui.label(
                         egui::RichText::new(fmt_bytes(job.moved))
                             .small()
-                            .color(Style::TEXT_DIM),
+                            .color(theme_color(ui, Style::TEXT_DIM)),
                     );
                 } else {
                     ui.label(
                         egui::RichText::new("progress pending")
                             .small()
-                            .color(Style::TEXT_DIM),
+                            .color(theme_color(ui, Style::TEXT_DIM)),
                     );
                 }
 
@@ -629,7 +712,7 @@ impl CommunicationsSurface {
                     ui,
                     icons::TRANSFER_CANCEL,
                     Style::SP_M,
-                    Style::DANGER,
+                    theme_color(ui, Style::DANGER),
                     "Cancel",
                 )
                 .clicked()
@@ -640,7 +723,7 @@ impl CommunicationsSurface {
                     ui,
                     icons::TRANSFER_PAUSE,
                     Style::SP_M,
-                    Style::TEXT_DIM,
+                    theme_color(ui, Style::TEXT_DIM),
                     "Pause",
                 )
                 .clicked()
@@ -653,15 +736,21 @@ impl CommunicationsSurface {
                     ui,
                     icons::TRANSFER_CANCEL,
                     Style::SP_M,
-                    Style::DANGER,
+                    theme_color(ui, Style::DANGER),
                     "Cancel",
                 )
                 .clicked()
                 {
                     self.control_transfer(sink, job.transfer, TransferControl::Cancel);
                 }
-                if icons::icon_button(ui, icons::TRANSFER_RESUME, Style::SP_M, Style::OK, "Resume")
-                    .clicked()
+                if icons::icon_button(
+                    ui,
+                    icons::TRANSFER_RESUME,
+                    Style::SP_M,
+                    theme_color(ui, Style::OK),
+                    "Resume",
+                )
+                .clicked()
                 {
                     self.control_transfer(sink, job.transfer, TransferControl::Resume);
                 }
@@ -671,7 +760,7 @@ impl CommunicationsSurface {
                     ui,
                     icons::TRANSFER_CANCEL,
                     Style::SP_M,
-                    Style::DANGER,
+                    theme_color(ui, Style::DANGER),
                     "Cancel",
                 )
                 .clicked()
@@ -687,7 +776,11 @@ impl CommunicationsSurface {
 
 fn labeled_edit(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small().color(Style::TEXT_DIM));
+        ui.label(
+            egui::RichText::new(label)
+                .small()
+                .color(theme_color(ui, Style::TEXT_DIM)),
+        );
         ui.text_edit_singleline(value);
     });
 }

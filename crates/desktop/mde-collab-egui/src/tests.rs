@@ -3164,10 +3164,42 @@ fn share_join_follow_and_owner_close_work_between_two_seats() {
         ),
         "share emits a local Start command"
     );
+    let start = host.drain_document_share_commands();
+    assert_eq!(
+        start.len(),
+        1,
+        "the shell drain must receive the Start intent"
+    );
+    assert!(
+        matches!(
+            start.first(),
+            Some(crate::documents::DocumentShareCommand::Start {
+                space: command_space,
+                document: command_document,
+                ..
+            }) if *command_space == space && *command_document == document
+        ),
+        "the drained Start intent must identify the shared space and document"
+    );
+    assert!(
+        host.drain_document_share_commands().is_empty(),
+        "draining share intents must clear the per-frame queue"
+    );
 
     assert!(
         guest.join_document_share(&guest_data, space, document),
         "a member must join from the live-session picker"
+    );
+    assert!(
+        matches!(
+            guest.drain_document_share_commands().first(),
+            Some(crate::documents::DocumentShareCommand::Join {
+                space: command_space,
+                document: command_document,
+                ..
+            }) if *command_space == space && *command_document == document
+        ),
+        "the shell drain must receive the Join intent"
     );
     for _ in 0..4 {
         host.pump_document_share();
@@ -3203,8 +3235,29 @@ fn share_join_follow_and_owner_close_work_between_two_seats() {
         ),
         "follow emits a local Follow command"
     );
+    assert!(
+        matches!(
+            guest.drain_document_share_commands().first(),
+            Some(crate::documents::DocumentShareCommand::Follow {
+                document: command_document,
+                peer,
+            }) if *command_document == document && peer == "eagle"
+        ),
+        "the shell drain must receive the Follow intent"
+    );
 
     assert!(host.close_document_share(), "owner close must succeed");
+    assert!(
+        matches!(
+            host.drain_document_share_commands().first(),
+            Some(crate::documents::DocumentShareCommand::Close {
+                space: command_space,
+                document: command_document,
+                ..
+            }) if *command_space == space && *command_document == document
+        ),
+        "the shell drain must receive the owner Close intent"
+    );
     guest.pump_document_share();
     assert!(
         !guest.has_live_document_share(),
@@ -3977,7 +4030,7 @@ fn sample_sync_pair(reachable: bool) -> crate::transfers::SyncPairView {
         bwlimit: Some("2m".into()),
         next_run_unix_ms: Some(1_000_000 + 60_000),
         last_result: Some("ok".into()),
-        peer_reachable: reachable,
+        peer_reachable: Some(reachable),
     }
 }
 

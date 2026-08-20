@@ -65,7 +65,7 @@ self_test() {
   first_revision="$(printf '1%.0s' {1..40})"
   second_revision="$(printf '2%.0s' {1..40})"
   marker="$root/revision-read"
-  hostile="$({
+  if hostile="$({
     git() {
       case "$*" in
         *"rev-parse --verify HEAD^{commit}"*)
@@ -82,7 +82,9 @@ self_test() {
       esac
     }
     resolve_receipt "$root"
-  } 2>&1 || true)"
+  } 2>&1)"; then
+    die "self-test accepted a revision that changed during receipt resolution"
+  fi
   [[ "$hostile" == *"HEAD changed while the source receipt was being resolved"* ]] \
     || die "self-test accepted a revision that changed during receipt resolution"
   rm -rf -- "$root"

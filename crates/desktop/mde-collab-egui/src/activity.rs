@@ -792,13 +792,6 @@ pub fn activity_body_with_admin(
     ui.separator();
     ui.add_space(Style::SP_S);
 
-    voice_admin_panel(ui, data, admin, &mut surface.voice_admin_sink);
-    ui.add_space(Style::SP_S);
-    gateway_admin_panel(ui, admin, &mut surface.gateway_sink);
-    ui.add_space(Style::SP_S);
-    ui.separator();
-    ui.add_space(Style::SP_S);
-
     let feed = if surface.app() == MeshTeamsApp::Activity {
         data.activity(None)
             .or_else(|| data.activity(surface.selected_space()))
@@ -825,16 +818,24 @@ pub fn activity_body_with_admin(
             egui::RichText::new("No activity for this filter yet")
                 .color(theme_color(ui, Style::TEXT_DIM)),
         );
-        return;
+    } else {
+        egui::ScrollArea::vertical()
+            .max_height(Style::SP_XL * 8.0)
+            .auto_shrink([false, false])
+            .show_rows(ui, ACTIVITY_ROW_HEIGHT, admitted.len(), |ui, row_range| {
+                for row in admitted.range(row_range) {
+                    activity_row(ui, row, now);
+                }
+            });
     }
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show_rows(ui, ACTIVITY_ROW_HEIGHT, admitted.len(), |ui, row_range| {
-            for row in admitted.range(row_range) {
-                activity_row(ui, row, now);
-            }
-        });
+    ui.add_space(Style::SP_S);
+    ui.separator();
+    ui.add_space(Style::SP_S);
+    ui.columns(2, |columns| {
+        voice_admin_panel(&mut columns[0], data, admin, &mut surface.voice_admin_sink);
+        gateway_admin_panel(&mut columns[1], admin, &mut surface.gateway_sink);
+    });
 }
 
 impl CommunicationsSurface {
@@ -1368,6 +1369,7 @@ struct GatewayFormState {
     display_name: String,
     expires: String,
     seeded: bool,
+    seeded_present: bool,
     confirm_clear: bool,
     notice: Option<String>,
 }
@@ -1406,7 +1408,8 @@ fn gateway_admin_form_state(ui: &egui::Ui, readout: Option<&GatewayReadout>) -> 
         .ctx()
         .data_mut(|data| data.get_temp::<GatewayFormState>(id))
         .unwrap_or_default();
-    if !state.seeded {
+    let present = readout.is_some_and(|row| row.present);
+    if !state.seeded || (present && !state.seeded_present) {
         if let Some(row) = readout.filter(|row| row.present) {
             state.host = row.host.clone();
             state.port = row.port.to_string();
@@ -1418,6 +1421,7 @@ fn gateway_admin_form_state(ui: &egui::Ui, readout: Option<&GatewayReadout>) -> 
         }
         state.seeded = true;
     }
+    state.seeded_present = present;
     state
 }
 
@@ -1456,6 +1460,11 @@ fn voice_admin_panel(
                 "Leader/operator console. Verbs publish locally; the shell drains them onto action/voice/*.",
             );
 
+            if provisioned {
+                voice_fleet_board(ui, data, nodes);
+                ui.add_space(Style::SP_S);
+            }
+
             ui.add_space(Style::SP_S);
             if ui
                 .button("Provision / Re-provision")
@@ -1480,8 +1489,6 @@ fn voice_admin_panel(
                 return;
             }
 
-            ui.add_space(Style::SP_S);
-            voice_fleet_board(ui, data, nodes);
             ui.add_space(Style::SP_S);
             voice_did_routing(ui, &mut form, dids, nodes, sink);
             ui.add_space(Style::SP_S);
@@ -1510,6 +1517,16 @@ fn voice_fleet_board(
         Style::typography_text("Fleet board", TypographyRole::Title)
             .color(theme_color(ui, Style::TEXT_STRONG)),
     );
+    for node in nodes {
+        if !node.sip_uri.is_empty() {
+            widgets::field(
+                ui,
+                &node.hostname,
+                &node.sip_uri,
+                theme_color(ui, Style::TEXT),
+            );
+        }
+    }
     let mut list = widgets::DenseList::new();
     list.header(ui, |ui| {
         ui.label(
@@ -2481,5 +2498,25 @@ mod tests {
             "Debug echoed the gateway password: {debug}"
         );
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn cutover_headlines_match_the_operator_phase() {
+        assert_eq!(
+            VoiceCutoverPhase::Legacy.headline(),
+            "Legacy single-account model — apply the fleet shared-outbound to begin"
+        );
+        assert_eq!(
+            VoiceCutoverPhase::LiftedSharedOutbound.headline(),
+            "Shared-outbound lifted — outbound alive; reprovisioning nodes onto the split model"
+        );
+        assert_eq!(
+            VoiceCutoverPhase::NodesReprovisioning.headline(),
+            "Cutover in progress — some nodes still on the legacy model"
+        );
+        assert_eq!(
+            VoiceCutoverPhase::CutoverComplete.headline(),
+            "Cutover complete — every node on the split model"
+        );
     }
 }

@@ -1705,6 +1705,12 @@ struct StoredSyncPair {
     enabled: bool,
     #[serde(default)]
     last_fired_ms: Option<u64>,
+    /// Last scheduler/worker outcome, when the worker has published one.
+    #[serde(default)]
+    last_result: Option<String>,
+    /// Destination reachability from the worker's latest probe, when present.
+    #[serde(default)]
+    peer_reachable: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1717,9 +1723,8 @@ fn default_enabled() -> bool {
     true
 }
 
-/// Fold the daemon's durable sync-pair store into UI rows. Scheduler facts the
-/// worker does not yet mirror (`last_result`, reachability) stay honestly empty /
-/// optimistic until the worker publishes them.
+/// Fold the daemon's durable sync-pair store into UI rows. Scheduler facts are
+/// copied only when the worker has published them; absent facts remain unknown.
 fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
     let dir = store_root.join("sync-pairs");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1762,8 +1767,8 @@ fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
             every_secs: pair.every_secs.max(1),
             bwlimit: pair.policy.bwlimit,
             next_run_unix_ms: Some(i64::try_from(next_run_unix_ms).unwrap_or(i64::MAX)),
-            last_result: None,
-            peer_reachable: true,
+            last_result: pair.last_result,
+            peer_reachable: pair.peer_reachable,
         });
     }
     views.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3219,6 +3224,8 @@ mod tests {
                 "policy": { "bwlimit": "2m" },
                 "enabled": true,
                 "last_fired_ms": 1000000,
+                "last_result": "ok",
+                "peer_reachable": false,
                 "created_ms": 1,
                 "updated_ms": 1
             }"#,
@@ -3232,6 +3239,34 @@ mod tests {
         assert_eq!(views[0].every_secs, 900);
         assert_eq!(views[0].bwlimit.as_deref(), Some("2m"));
         assert_eq!(views[0].next_run_unix_ms, Some(1_000_000 + 900_000));
+        assert_eq!(views[0].last_result.as_deref(), Some("ok"));
+        assert_eq!(views[0].peer_reachable, Some(false));
+    }
+
+    #[test]
+    fn fold_sync_pair_views_preserves_unknown_worker_facts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("sync-pairs");
+        std::fs::create_dir_all(&store).expect("sync-pairs dir");
+        std::fs::write(
+            store.join("pending.json"),
+            r#"{
+                "id": "pending",
+                "source": "/src",
+                "dest": "node:oak",
+                "every_secs": 900,
+                "enabled": true,
+                "created_ms": 1,
+                "updated_ms": 1
+            }"#,
+        )
+        .expect("write pair");
+
+        let views = fold_sync_pair_views(dir.path());
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].last_result, None);
+        assert_eq!(views[0].peer_reachable, None);
     }
 
     #[test]
