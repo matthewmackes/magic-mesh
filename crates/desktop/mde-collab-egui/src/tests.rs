@@ -3439,6 +3439,38 @@ fn non_members_and_closed_sessions_refuse_share_join_honestly() {
 }
 
 #[test]
+fn same_document_gets_independent_session_topics_per_space() {
+    let first_space = SpaceId::new();
+    let second_space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Shared reference\n";
+    let first = documents_fixture_as("eagle", first_space, document, body, SpaceRole::Owner);
+    let second = documents_fixture_as("eagle", second_space, document, body, SpaceRole::Owner);
+    let mut surface = CommunicationsSurface::new();
+
+    surface.select_space(first_space);
+    surface.open_document(&first, document, "Shared reference");
+    assert!(surface.share_document(&first, first_space));
+    let first_session = match surface.drain_document_share_commands().as_slice() {
+        [DocumentShareCommand::Start { session, .. }] => session.clone(),
+        commands => panic!("expected one start command, got {commands:?}"),
+    };
+
+    surface.select_space(second_space);
+    surface.open_document(&second, document, "Shared reference");
+    assert!(surface.share_document(&second, second_space));
+    let second_session = match surface.drain_document_share_commands().as_slice() {
+        [DocumentShareCommand::Start { session, .. }] => session.clone(),
+        commands => panic!("expected one start command, got {commands:?}"),
+    };
+
+    assert_ne!(
+        first_session, second_session,
+        "a document linked into two spaces must not share one Bus topic"
+    );
+}
+
+#[test]
 fn concurrent_external_write_merges_or_surfaces_a_typed_conflict() {
     let space = SpaceId::new();
     let document = DocumentId::new();

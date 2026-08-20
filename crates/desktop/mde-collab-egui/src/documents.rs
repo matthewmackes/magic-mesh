@@ -223,9 +223,13 @@ struct LiveShare {
     host_peer: String,
 }
 
-/// Derive the mesh [`SessionId`] for a document (UUID hyphens are legal).
-fn session_id_for(document: DocumentId) -> Option<SessionId> {
-    SessionId::new(document.to_string()).ok()
+/// Derive the mesh [`SessionId`] for one document *in one space*.
+///
+/// A document can be linked into multiple spaces. Scoping the Bus topic with
+/// both ids prevents edits in one space from leaking into another share
+/// session while keeping the id deterministic for a picker join.
+fn session_id_for(space: SpaceId, document: DocumentId) -> Option<SessionId> {
+    SessionId::new(format!("{}-{}", space.as_uuid(), document.as_uuid())).ok()
 }
 
 /// Whether `space` is in the seat's directory (membership).
@@ -1349,7 +1353,7 @@ impl CommunicationsSurface {
                 Some("Cannot share: this seat is not a member of that space.".to_owned());
             return false;
         }
-        let Some(session_id) = session_id_for(document) else {
+        let Some(session_id) = session_id_for(space, document) else {
             self.documents.notice =
                 Some("Cannot share: document id is not a valid session.".to_owned());
             return false;
@@ -1406,7 +1410,7 @@ impl CommunicationsSurface {
             }
             self.documents.detach_share("");
         }
-        let Some(session_id) = session_id_for(document) else {
+        let Some(session_id) = session_id_for(space, document) else {
             self.documents.notice =
                 Some("Cannot join: document id is not a valid session.".to_owned());
             return false;
