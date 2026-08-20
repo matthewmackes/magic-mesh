@@ -2157,3 +2157,163 @@ fn bookmark_validate_refuses_peer_and_escaping_paths() {
     assert!(super::validate_bookmark_path("/home/me/docs").is_ok());
     assert!(super::validate_bookmark_path("local:home").is_ok());
 }
+
+// WL-FUNC-027 — add/remove/reorder round-trip: every mutation on the user
+// bookmark list survives a fresh browser restart with the same on-disk store.
+// The prior test only verified rename survived; this one exercises reorder
+// and remove explicitly across process boundaries so the persisted display
+// order can never drift from what the operator last saw.
+#[test]
+fn bookmarks_add_remove_and_reorder_all_survive_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let alpha = temp.path().join("Alpha");
+    let bravo = temp.path().join("Bravo");
+    let charlie = temp.path().join("Charlie");
+    for dir in [&alpha, &bravo, &charlie] {
+        std::fs::create_dir(dir).expect("mkdir");
+    }
+    let rows_for = || {
+        vec![
+            FileRow::local("Alpha", Mime::Folder, "\u{2014}", "\u{2014}")
+                .with_path(alpha.to_string_lossy()),
+            FileRow::local("Bravo", Mime::Folder, "\u{2014}", "\u{2014}")
+                .with_path(bravo.to_string_lossy()),
+            FileRow::local("Charlie", Mime::Folder, "\u{2014}", "\u{2014}")
+                .with_path(charlie.to_string_lossy()),
+        ]
+    };
+    let store = tempfile::tempdir().expect("store");
+
+    let mut b = live_posix_browser(rows_for()).with_config_dir(store.path());
+    b.click(0, 0);
+    b.pin_focused(0);
+    b.click(0, 1);
+    b.pin_focused(0);
+    b.click(0, 2);
+    b.pin_focused(0);
+    assert_eq!(b.bookmarks().len(), 3);
+    let display_before = b
+        .bookmarks()
+        .iter()
+        .map(|bm| bm.path.clone())
+        .collect::<Vec<_>>();
+    // Move the bottom bookmark to the top so the persisted order is neither
+    // the pinning order nor the sort-collated ordering the sidebar reads.
+    b.reorder_bookmark(2, -1);
+    b.reorder_bookmark(1, -1);
+    let mut expected_after_reorder = display_before.clone();
+    expected_after_reorder.swap(2, 1);
+    expected_after_reorder.swap(1, 0);
+    assert_eq!(
+        b.bookmarks()
+            .iter()
+            .map(|bm| bm.path.clone())
+            .collect::<Vec<_>>(),
+        expected_after_reorder
+    );
+    b.unpin_bookmark(1);
+    let expected_after_remove: Vec<String> = expected_after_reorder
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .map(|(_, p)| p.clone())
+        .collect();
+    b.flush_persisted();
+    drop(b);
+
+    let b2 = live_posix_browser(rows_for()).with_config_dir(store.path());
+    let paths_after: Vec<String> = b2.bookmarks().iter().map(|bm| bm.path.clone()).collect();
+    assert_eq!(paths_after, expected_after_remove);
+    assert_eq!(b2.bookmarks().len(), 2);
+}
+
+// WL-FUNC-027 — a symlink at the bookmarks store path is a classic
+// preferences-hijack attack: the attacker leaves a symlink pointing at a
+// sensitive file so the surface either reads it as JSON or overwrites it on
+// the next flush. `load_bookmarks_at` must refuse the symlink outright, the
+// hydrating browser must degrade to empty defaults with an operator-visible
+// note, and the target file bytes must survive untouched.
+#[test]
+fn bookmarks_reject_a_symlinked_store_and_leave_target_intact() {
+    let dir = tempfile::tempdir().expect("store dir");
+    let target = dir.path().join("outside.json");
+    std::fs::write(&target, b"secret sibling bytes").expect("seed target");
+    let store = dir.path().join(super::BOOKMARKS_FILE);
+    std::os::unix::fs::symlink(&target, &store).expect("symlink store");
+
+    let note = super::load_bookmarks_at(&store).expect_err("symlinked store refuses");
+    assert!(
+        note.contains("symlink") || note.contains("defaults"),
+        "honest refusal: {note}"
+    );
+
+    let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
+    assert!(b.bookmarks().is_empty());
+    assert!(
+        b.last_note()
+            .is_some_and(|n| n.contains("symlink") || n.contains("defaults")),
+        "operator-visible note: {:?}",
+        b.last_note()
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("target"),
+        b"secret sibling bytes",
+        "hostile symlink target was never rewritten"
+    );
+    assert!(
+        std::fs::symlink_metadata(&store)
+            .expect("store still exists")
+            .file_type()
+            .is_symlink(),
+        "hydrate must not replace the hostile symlink"
+    );
+}
+
+// WL-FUNC-027 — a tampered on-disk representation (invalid JSON, wrong shape,
+// oversize) must be rejected without silently overwriting the operator's file.
+// The failure has to stay honestly visible in `last_note` and the raw bytes
+// must remain on disk so an operator can copy them out and repair them by
+// hand; only a subsequent, deliberate mutation is allowed to replace the
+// store contents.
+#[test]
+fn bookmarks_corrupt_store_is_preserved_until_the_operator_mutates() {
+    let dir = tempfile::tempdir().expect("store dir");
+    let store = dir.path().join(super::BOOKMARKS_FILE);
+    let corrupt = br#"{"bookmarks": [not valid json"#;
+    std::fs::write(&store, corrupt).expect("seed corrupt");
+
+    let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
+    assert!(
+        b.bookmarks().is_empty(),
+        "in-memory refuses the tampered file"
+    );
+    assert!(
+        b.last_note()
+            .is_some_and(|n| n.contains("not valid JSON") || n.contains("defaults")),
+        "honest refusal in the note: {:?}",
+        b.last_note()
+    );
+    drop(b);
+    assert_eq!(
+        std::fs::read(&store).expect("store"),
+        corrupt,
+        "no silent overwrite of the tampered on-disk representation"
+    );
+
+    // A deliberate mutation replaces the store all-or-nothing through the
+    // hardened write path — the operator's next pin is what displaces the
+    // corrupted bytes, not the hydrate.
+    let target = dir.path().join("Docs");
+    std::fs::create_dir(&target).expect("mkdir");
+    let rows = vec![FileRow::local("Docs", Mime::Folder, "\u{2014}", "\u{2014}")
+        .with_path(target.to_string_lossy())];
+    let mut b2 = live_posix_browser(rows).with_config_dir(dir.path());
+    b2.click(0, 0);
+    b2.pin_focused(0);
+    b2.flush_persisted();
+    drop(b2);
+
+    let reloaded = super::load_bookmarks_at(&store).expect("valid after mutation");
+    assert_eq!(reloaded.bookmarks.len(), 1);
+    assert_eq!(reloaded.bookmarks[0].path, target.to_string_lossy());
+}

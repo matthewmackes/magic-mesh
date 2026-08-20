@@ -812,6 +812,39 @@ mod tests {
     }
 
     #[test]
+    fn transfer_chords_require_the_exact_ctrl_modifier() {
+        let mut r = HotkeyRouter::default();
+        assert!(
+            r.dispatch(
+                &[],
+                &[KeyPress {
+                    key: egui::Key::J,
+                    shift: true,
+                    ctrl: true,
+                }],
+            )
+            .is_empty(),
+            "Ctrl+Shift+J must remain available to the focused text context"
+        );
+        assert!(
+            r.dispatch(
+                &[],
+                &[KeyPress {
+                    key: egui::Key::N,
+                    shift: true,
+                    ctrl: true,
+                }],
+            )
+            .is_empty(),
+            "Ctrl+Shift+N must remain available to the focused text context"
+        );
+        assert!(
+            r.dispatch(&[], &[press(egui::Key::N)]).is_empty(),
+            "bare N must never start a transfer"
+        );
+    }
+
+    #[test]
     fn transfer_ctrl_chords_are_listed_and_unique_in_the_catalog() {
         use std::collections::BTreeSet;
         let chords: BTreeSet<_> = mde_seat::hotkeys::HOTKEYS.iter().map(|h| h.chord).collect();

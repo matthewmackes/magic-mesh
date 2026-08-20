@@ -47,7 +47,7 @@ use mde_egui::{egui, TextClipboard};
 #[cfg(feature = "drm")]
 use mde_egui::{ClipboardClientPoll, LocalClipboardOffer, RichClipboardClient};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use mde_collab_egui::{
     ActivityAdminSnapshot, CollabData, CommandSink, CommunicationsSurface, GatewayCommand,
@@ -1804,29 +1804,21 @@ fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<
             bwlimit,
         } => {
             let now = transfer_now_ms();
-            serde_json::json!({
-                "verb": "save_sync_pair",
-                "arg": {
-                    "id": id,
-                    "source": source,
-                    "dest": dest,
-                    "every_secs": u64::max(*every_secs, 1),
-                    "policy": {
-                        "bwlimit": bwlimit,
-                        "verify": false
-                    },
-                    "enabled": true,
-                    "created_ms": now,
-                    "updated_ms": now
-                }
+            SyncPairVerbWire::SaveSyncPair(SyncPairWire {
+                id: id.clone(),
+                source: source.clone(),
+                dest: dest.clone(),
+                every_secs: u64::max(*every_secs, 1),
+                policy: SyncPairPolicyWire {
+                    bwlimit: bwlimit.clone(),
+                    verify: false,
+                },
+                enabled: true,
+                created_ms: now,
+                updated_ms: now,
             })
         }
-        SyncPairCommand::Remove { id } => {
-            serde_json::json!({
-                "verb": "remove_sync_pair",
-                "arg": id
-            })
-        }
+        SyncPairCommand::Remove { id } => SyncPairVerbWire::RemoveSyncPair(id.clone()),
     };
     let body = serde_json::to_string(&envelope)
         .map_err(|error| format!("serialize transfer verb: {error}"))?;
@@ -1842,6 +1834,35 @@ fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<
     std::fs::rename(&tmp, inbox.join(format!("{stem}.json")))
         .map_err(|error| format!("commit transfer verb: {error}"))?;
     Ok(())
+}
+
+/// The shell cannot depend on `mackesd` (the desktop tier points inward), but
+/// this wire shape is the daemon's public tagged `TransferVerb` contract.
+/// Keeping it typed here prevents the GUI producer from drifting into an
+/// envelope the transfer worker silently drops.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "verb", content = "arg")]
+enum SyncPairVerbWire {
+    SaveSyncPair(SyncPairWire),
+    RemoveSyncPair(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncPairWire {
+    id: String,
+    source: String,
+    dest: String,
+    every_secs: u64,
+    policy: SyncPairPolicyWire,
+    enabled: bool,
+    created_ms: u64,
+    updated_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncPairPolicyWire {
+    bwlimit: Option<String>,
+    verify: bool,
 }
 
 fn verb_stem(command: &SyncPairCommand) -> &'static str {
@@ -3297,18 +3318,22 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.path()).expect("read verb"))
             .collect();
         assert_eq!(bodies.len(), 2);
-        assert!(
-            bodies.iter().any(|body| {
-                body.contains("\"verb\":\"save_sync_pair\"")
-                    && body.contains("\"dest\":\"node:oak\"")
-            }),
-            "missing save-sync-pair verb: {bodies:?}"
-        );
-        assert!(
-            bodies.iter().any(|body| {
-                body.contains("\"verb\":\"remove_sync_pair\"") && body.contains("\"arg\":\"docs\"")
-            }),
-            "missing remove-sync-pair verb: {bodies:?}"
-        );
+        let verbs: Vec<SyncPairVerbWire> = bodies
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("daemon transfer verb shape"))
+            .collect();
+        assert!(verbs.iter().any(|verb| matches!(
+            verb,
+            SyncPairVerbWire::SaveSyncPair(pair)
+                if pair.id == "docs"
+                    && pair.dest == "node:oak"
+                    && pair.every_secs == 900
+                    && pair.policy.bwlimit.as_deref() == Some("2m")
+                    && !pair.policy.verify
+        )));
+        assert!(verbs.iter().any(|verb| matches!(
+            verb,
+            SyncPairVerbWire::RemoveSyncPair(id) if id == "docs"
+        )));
     }
 }
