@@ -563,6 +563,26 @@ pub fn process_apply(
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SshBootstrap;
 
+/// Validate the raw bearer before it is written to the bootstrap SSH stdin.
+///
+/// `bearer_ledger::issue` emits 32 random bytes as URL-safe, unpadded base64:
+/// exactly 43 characters.  Enforcing that shape at the transport boundary
+/// prevents a caller from turning the private stdin handoff into an arbitrary
+/// credential channel, while still keeping the bearer out of argv and logs.
+#[cfg(feature = "async-services")]
+fn validate_bootstrap_bearer(bearer: &str) -> Result<(), RemotePushError> {
+    if bearer.len() != 43
+        || bearer
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-' && byte != b'_')
+    {
+        return Err(RemotePushError::BundleRejected {
+            why: "enrollment bearer must be 43 URL-safe characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl RemotePush for SshBootstrap {
     fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
         match target {
@@ -597,16 +617,7 @@ impl RemotePush for SshBootstrap {
             let [Action::RunEnroll { bearer }] = actions else {
                 unreachable!("the action allow-list above admits only one action")
             };
-            if bearer.is_empty()
-                || bearer.len() > crate::nebula_enroll::JOIN_TOKEN_MAX_LEN
-                || bearer
-                    .chars()
-                    .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
-            {
-                return Err(RemotePushError::BundleRejected {
-                    why: "enrollment bearer is not a valid bounded token".to_string(),
-                });
-            }
+            validate_bootstrap_bearer(bearer)?;
             let key = std::env::var_os("MACKESD_BOOTSTRAP_SSH_KEY")
                 .map(std::path::PathBuf::from)
                 .ok_or_else(|| RemotePushError::NotWired {
@@ -1470,10 +1481,29 @@ mod tests {
                 &Target::Bootstrap {
                     host: "203.0.113.7".into(),
                 },
-                &[Action::RunEnroll { bearer: "b".into() }],
+                &[Action::RunEnroll {
+                    bearer: "a".repeat(43),
+                }],
             )
             .unwrap_err();
         assert!(matches!(err, RemotePushError::NotWired { .. }));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn ssh_bootstrap_rejects_a_malformed_bearer_before_secret_handoff() {
+        let err = SshBootstrap
+            .apply(
+                &Target::Bootstrap {
+                    host: "203.0.113.7".into(),
+                },
+                &[Action::RunEnroll {
+                    bearer: "short".into(),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+        assert!(err.to_string().contains("43 URL-safe"));
     }
 
     #[cfg(feature = "async-services")]
