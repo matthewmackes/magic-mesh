@@ -116,6 +116,7 @@ fn run_with_store(cmd: TransferCmd, store_root: &std::path::Path) -> anyhow::Res
                 bwlimit,
             } => {
                 let every_secs = parse_interval_secs(&interval)?;
+                validate_sync_pair_input(id.as_deref(), &source, &destination)?;
                 let id = match id {
                     Some(id) => id,
                     None => slug_pair_id(&source, &destination),
@@ -249,6 +250,36 @@ fn parse_interval_secs_opt(raw: &str) -> Option<u64> {
     n.checked_mul(mult).filter(|v| *v >= 1)
 }
 
+/// Refuse malformed producer input before it becomes an inbox record. The
+/// daemon store repeats these checks, but rejecting here prevents a CLI request
+/// from looking queued while the worker later drops it.
+fn validate_sync_pair_input(
+    id: Option<&str>,
+    source: &str,
+    destination: &str,
+) -> anyhow::Result<()> {
+    if source.trim().is_empty() || destination.trim().is_empty() {
+        anyhow::bail!("sync pair requires non-empty source and destination");
+    }
+    if source.as_bytes().contains(&0) || destination.as_bytes().contains(&0) {
+        anyhow::bail!("sync pair source and destination must not contain NUL bytes");
+    }
+    if let Some(id) = id {
+        let id = id.trim();
+        let valid = !id.is_empty()
+            && id != "."
+            && id != ".."
+            && id.len() <= 120
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        if !valid {
+            anyhow::bail!("invalid sync pair id `{id}`");
+        }
+    }
+    Ok(())
+}
+
 fn slug_pair_id(source: &str, dest: &str) -> String {
     let raw = format!("{source}-{dest}");
     let slug: String = raw
@@ -338,6 +369,32 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("malformed interval"), "got {err}");
         assert!(take_verbs(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn sync_pair_add_refuses_invalid_store_inputs_without_writing() {
+        for (id, source, destination, expected) in [
+            (Some("../escape"), "/src", "/dst", "invalid sync pair id"),
+            (Some("docs"), "", "/dst", "non-empty source"),
+            (Some("docs"), "/src\0", "/dst", "NUL bytes"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let err = run_with_store(
+                TransferCmd::SyncPair {
+                    cmd: SyncPairCmd::Add {
+                        id: id.map(str::to_owned),
+                        interval: "15m".into(),
+                        source: source.into(),
+                        destination: destination.into(),
+                        bwlimit: None,
+                    },
+                },
+                tmp.path(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains(expected), "got {err}");
+            assert!(take_verbs(tmp.path()).is_empty());
+        }
     }
 
     #[test]
