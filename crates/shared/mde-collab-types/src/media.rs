@@ -565,6 +565,7 @@ impl MediaSessionV1 {
             if description.session != self.session
                 || description.from != self.local_actor
                 || description.to != self.remote_actor
+                || description.tracks != self.offered_tracks
             {
                 return Err(MediaSessionV1ValidationError::InvalidField {
                     field: "local_description",
@@ -576,6 +577,7 @@ impl MediaSessionV1 {
             if description.session != self.session
                 || description.from != self.remote_actor
                 || description.to != self.local_actor
+                || description.tracks != self.offered_tracks
             {
                 return Err(MediaSessionV1ValidationError::InvalidField {
                     field: "remote_description",
@@ -986,6 +988,27 @@ mod tests {
             serde_json::to_value(sample_description(MediaSignalingRoleV1::Offer)).expect("value");
         value["role"] = json!("pranswer");
         assert!(MediaDescriptionV1::from_json(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn session_rejects_description_with_different_track_set() {
+        let mut session = sample_session();
+        session.remote_description = Some(
+            MediaDescriptionV1::new(
+                session.session,
+                session.remote_actor.clone(),
+                session.local_actor.clone(),
+                MediaSignalingRoleV1::Answer,
+                vec![MediaTrackKind::Audio, MediaTrackKind::Video],
+            )
+            .expect("valid mismatched description"),
+        );
+        assert!(matches!(
+            session.validate(),
+            Err(MediaSessionV1ValidationError::InvalidField {
+                field: "remote_description"
+            })
+        ));
     }
 
     #[test]

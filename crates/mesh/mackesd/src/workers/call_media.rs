@@ -493,8 +493,10 @@ impl WebrtcP2pPlane {
                 if session.remote_description.is_none() {
                     if let Some(answer) = read_description(persist, &media_answer_topic(call))? {
                         if answer.role != MediaSignalingRoleV1::Answer
+                            || answer.session != call
                             || answer.from != session.remote_actor
                             || answer.to != session.local_actor
+                            || answer.tracks != session.offered_tracks
                         {
                             session.state = MediaSessionStateV1::Failed {
                                 reason: MediaFailureReasonV1::InvalidSignaling,
@@ -509,8 +511,10 @@ impl WebrtcP2pPlane {
                 if session.remote_description.is_none() {
                     if let Some(offer) = read_description(persist, &media_offer_topic(call))? {
                         if offer.role != MediaSignalingRoleV1::Offer
+                            || offer.session != call
                             || offer.from != session.remote_actor
                             || offer.to != session.local_actor
+                            || offer.tracks != session.offered_tracks
                         {
                             session.state = MediaSessionStateV1::Failed {
                                 reason: MediaFailureReasonV1::InvalidSignaling,
@@ -1025,8 +1029,10 @@ impl LiveKitSfuPlane {
                 if session.remote_description.is_none() {
                     if let Some(answer) = read_description(persist, &media_answer_topic(call))? {
                         if answer.role != MediaSignalingRoleV1::Answer
+                            || answer.session != call
                             || answer.from != session.remote_actor
                             || answer.to != session.local_actor
+                            || answer.tracks != session.offered_tracks
                         {
                             session.state = MediaSessionStateV1::Failed {
                                 reason: MediaFailureReasonV1::InvalidSignaling,
@@ -1041,8 +1047,10 @@ impl LiveKitSfuPlane {
                 if session.remote_description.is_none() {
                     if let Some(offer) = read_description(persist, &media_offer_topic(call))? {
                         if offer.role != MediaSignalingRoleV1::Offer
+                            || offer.session != call
                             || offer.from != session.remote_actor
                             || offer.to != session.local_actor
+                            || offer.tracks != session.offered_tracks
                         {
                             session.state = MediaSessionStateV1::Failed {
                                 reason: MediaFailureReasonV1::InvalidSignaling,
