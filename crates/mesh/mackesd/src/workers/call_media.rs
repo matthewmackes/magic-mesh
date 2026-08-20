@@ -321,6 +321,7 @@ struct LiveSession {
     local_actor: ActorId,
     remote_actor: ActorId,
     role: SignalingRole,
+    offered_tracks: Vec<MediaTrackKind>,
     state: MediaSessionStateV1,
     local_muted: bool,
     audio: Option<SeatAudioBinding>,
@@ -346,7 +347,7 @@ impl LiveSession {
             self.remote_actor.clone(),
             CallMediaAdapter::WebRtcP2p,
             self.state.clone(),
-            vec![MediaTrackKind::Audio],
+            self.offered_tracks.clone(),
             self.local_muted,
             self.dtmf_bound(),
             self.audio_bound(),
@@ -423,6 +424,7 @@ impl WebrtcP2pPlane {
                 .unwrap_or_else(|| ActorId::new("local")),
             remote_actor: ActorId::new("peer"),
             role,
+            offered_tracks: vec![MediaTrackKind::Audio],
             state: MediaSessionStateV1::Negotiating,
             local_muted: false,
             audio: None,
@@ -478,7 +480,7 @@ impl WebrtcP2pPlane {
                         session.local_actor.clone(),
                         session.remote_actor.clone(),
                         MediaSignalingRoleV1::Offer,
-                        vec![MediaTrackKind::Audio],
+                        session.offered_tracks.clone(),
                     )
                     .map_err(|error| {
                         CallMediaProviderError::ExecutionRefused {
@@ -524,7 +526,7 @@ impl WebrtcP2pPlane {
                         session.local_actor.clone(),
                         session.remote_actor.clone(),
                         MediaSignalingRoleV1::Answer,
-                        vec![MediaTrackKind::Audio],
+                        session.offered_tracks.clone(),
                     )
                     .map_err(|error| {
                         CallMediaProviderError::ExecutionRefused {
@@ -594,7 +596,7 @@ impl WebrtcP2pPlane {
             .sessions
             .iter()
             .filter(|session| {
-                session.kind == CallKind::Audio
+                is_media_call_kind(session.kind)
                     && session.admission == CallMediaAdmission::AdapterReady
                     && session
                         .connected_participants
@@ -637,6 +639,7 @@ impl WebrtcP2pPlane {
                     local_actor: readiness.local_actor.clone(),
                     remote_actor: remote.clone(),
                     role,
+                    offered_tracks: tracks_for_call_kind(ready.kind),
                     state: MediaSessionStateV1::Negotiating,
                     local_muted: ready.local_muted,
                     audio: None,
@@ -647,6 +650,7 @@ impl WebrtcP2pPlane {
             session.space = ready.space;
             session.local_actor = readiness.local_actor.clone();
             session.remote_actor = remote;
+            session.offered_tracks = tracks_for_call_kind(ready.kind);
             if session.audio.is_none() {
                 session.local_muted = ready.local_muted;
             }
@@ -693,13 +697,10 @@ impl CallMediaFrameVerifier for WebrtcP2pPlane {
         }
         let mut inner = self.lock_inner()?;
         match command {
-            CollabCommand::StartCall {
-                call,
-                kind: CallKind::Audio,
-                ..
-            } => {
+            CollabCommand::StartCall { call, kind, .. } => {
                 let session =
                     WebrtcP2pPlane::ensure_session(&mut inner, *call, SignalingRole::Offer);
+                session.offered_tracks = tracks_for_call_kind(*kind);
                 session.state = MediaSessionStateV1::Negotiating;
                 Ok(())
             }
@@ -752,7 +753,6 @@ impl CallMediaFrameVerifier for WebrtcP2pPlane {
                 inner.sessions.remove(call);
                 Ok(())
             }
-            CollabCommand::StartCall { .. } => Ok(()),
             CollabCommand::StartOutboundCall { .. } => {
                 Err(CallMediaProviderError::ExecutionRefused {
                     detail: "outbound PSTN dials are owned by the SIP gateway adapter".to_string(),
@@ -838,6 +838,7 @@ struct SfuSession {
     host: ActorId,
     role: SignalingRole,
     participants: Vec<ActorId>,
+    offered_tracks: Vec<MediaTrackKind>,
     state: MediaSessionStateV1,
     local_muted: bool,
     audio: Option<SeatAudioBinding>,
@@ -864,7 +865,7 @@ impl SfuSession {
             self.remote_actor.clone(),
             CallMediaAdapter::LiveKitSfu,
             self.state.clone(),
-            vec![MediaTrackKind::Audio],
+            self.offered_tracks.clone(),
             self.local_muted,
             self.dtmf_bound(),
             self.audio_bound(),
@@ -953,6 +954,7 @@ impl LiveKitSfuPlane {
             host: ActorId::new("host"),
             role,
             participants: Vec::new(),
+            offered_tracks: vec![MediaTrackKind::Audio],
             state: MediaSessionStateV1::Negotiating,
             local_muted: false,
             audio: None,
@@ -1082,7 +1084,7 @@ impl LiveKitSfuPlane {
                     session.local_actor.clone(),
                     session.remote_actor.clone(),
                     MediaSignalingRoleV1::Offer,
-                    vec![MediaTrackKind::Audio],
+                    session.offered_tracks.clone(),
                 )
                 .map_err(|error| CallMediaProviderError::ExecutionRefused {
                     detail: error.to_string(),
@@ -1096,7 +1098,7 @@ impl LiveKitSfuPlane {
                     session.remote_actor.clone(),
                     session.local_actor.clone(),
                     MediaSignalingRoleV1::Answer,
-                    vec![MediaTrackKind::Audio],
+                    session.offered_tracks.clone(),
                 )
                 .map_err(|error| CallMediaProviderError::ExecutionRefused {
                     detail: error.to_string(),
@@ -1169,7 +1171,7 @@ impl LiveKitSfuPlane {
             .iter()
             .filter(|session| {
                 is_group_call(&session.connected_participants)
-                    && session.kind == CallKind::Audio
+                    && is_media_call_kind(session.kind)
                     && session.admission == CallMediaAdmission::AdapterReady
                     && session
                         .connected_participants
@@ -1237,6 +1239,7 @@ impl LiveKitSfuPlane {
                     host: host.clone(),
                     role,
                     participants: participants.clone(),
+                    offered_tracks: tracks_for_call_kind(ready.kind),
                     state: MediaSessionStateV1::Negotiating,
                     local_muted: ready.local_muted,
                     audio: None,
@@ -1251,6 +1254,7 @@ impl LiveKitSfuPlane {
             session.host = host;
             session.role = role;
             session.participants = participants;
+            session.offered_tracks = tracks_for_call_kind(ready.kind);
             if session.audio.is_none() {
                 session.local_muted = ready.local_muted;
             }
@@ -1306,13 +1310,10 @@ impl CallMediaFrameVerifier for LiveKitSfuPlane {
         }
         let mut inner = self.lock_inner()?;
         match command {
-            CollabCommand::StartCall {
-                call,
-                kind: CallKind::Audio,
-                ..
-            } => {
+            CollabCommand::StartCall { call, kind, .. } => {
                 let session =
                     LiveKitSfuPlane::ensure_session(&mut inner, *call, SignalingRole::Offer);
+                session.offered_tracks = tracks_for_call_kind(*kind);
                 session.state = MediaSessionStateV1::Negotiating;
                 Ok(())
             }
@@ -1365,7 +1366,6 @@ impl CallMediaFrameVerifier for LiveKitSfuPlane {
                 inner.sessions.remove(call);
                 Ok(())
             }
-            CollabCommand::StartCall { .. } => Ok(()),
             CollabCommand::StartOutboundCall { .. } => {
                 Err(CallMediaProviderError::ExecutionRefused {
                     detail: "outbound PSTN dials are owned by the SIP gateway adapter".to_string(),
@@ -1446,6 +1446,19 @@ impl CallMediaFrameVerifier for LiveKitSfuPlane {
 
 fn is_group_call(participants: &[ActorId]) -> bool {
     participants.len() >= 3
+}
+
+fn is_media_call_kind(kind: CallKind) -> bool {
+    matches!(kind, CallKind::Audio | CallKind::Video)
+}
+
+fn tracks_for_call_kind(kind: CallKind) -> Vec<MediaTrackKind> {
+    match kind {
+        CallKind::Video => vec![MediaTrackKind::Audio, MediaTrackKind::Video],
+        CallKind::Audio | CallKind::Screen | CallKind::CoEdit | CallKind::RemoteDesktop => {
+            vec![MediaTrackKind::Audio]
+        }
+    }
 }
 
 fn normalized_participants(participants: &[ActorId]) -> Vec<ActorId> {
@@ -1625,6 +1638,12 @@ mod tests {
                 local_muted: false,
             }],
         }
+    }
+
+    fn two_party_video_readiness(call: CallId, space: SpaceId, local: &str) -> CallMediaReadiness {
+        let mut readiness = two_party_readiness(call, space, local);
+        readiness.sessions[0].kind = CallKind::Video;
+        readiness
     }
 
     fn three_party_readiness(call: CallId, space: SpaceId, local: &str) -> CallMediaReadiness {
@@ -1847,6 +1866,66 @@ mod tests {
         assert!(!session.state.claims_live_media());
         assert!(session.local_description.is_some());
         assert!(session.remote_description.is_some());
+    }
+
+    #[test]
+    fn video_call_carries_audio_and_camera_tracks_through_p2p_signaling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let loopback = SharedLoopback::new();
+        let alice = WebrtcP2pPlane::new(FixedSeatAudio::present(), Some(loopback.clone()))
+            .with_local_actor(ActorId::new("alice"));
+        let bob = WebrtcP2pPlane::new(FixedSeatAudio::present(), Some(loopback))
+            .with_local_actor(ActorId::new("bob"));
+
+        alice
+            .execute_command(
+                &CollabCommand::StartCall {
+                    space,
+                    call,
+                    kind: CallKind::Video,
+                },
+                CallMediaAdapter::WebRtcP2p,
+            )
+            .expect("video start");
+        bob.execute_command(
+            &CollabCommand::AnswerCall { call },
+            CallMediaAdapter::WebRtcP2p,
+        )
+        .expect("video answer");
+
+        let mut alice_pub = BTreeMap::new();
+        let mut bob_pub = BTreeMap::new();
+        write_readiness(&persist, &two_party_video_readiness(call, space, "alice"));
+        alice.tick(&persist, &mut alice_pub);
+        write_readiness(&persist, &two_party_video_readiness(call, space, "bob"));
+        bob.tick(&persist, &mut bob_pub);
+        write_readiness(&persist, &two_party_video_readiness(call, space, "alice"));
+        alice.tick(&persist, &mut alice_pub);
+
+        let session = read_session(&persist, call);
+        assert_eq!(
+            session.offered_tracks,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video]
+        );
+        assert_eq!(
+            session
+                .local_description
+                .as_ref()
+                .expect("video offer")
+                .tracks,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video]
+        );
+        assert_eq!(
+            session
+                .remote_description
+                .as_ref()
+                .expect("video answer")
+                .tracks,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video]
+        );
     }
 
     #[test]
