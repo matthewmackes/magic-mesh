@@ -109,7 +109,11 @@ guarded; if you need a linker locally, `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`.
 
 ## Parallel drain (§10.0.4)
 
-Existing DRAIN-ENGINE is canonical — do not build a second scheduler:
+Existing DRAIN-ENGINE is canonical — do not build a second scheduler.
+Sibling agent surfaces load equivalent skills that trigger the same
+contract: `.claude/skills/drain-worklist/SKILL.md` (Claude Code) and
+`.codex/skills/drain-worklist/SKILL.md` (Codex IDE). All three sit atop
+`AI_GOVERNANCE.md §10.0.4` and `AGENTS.md → Parallel Drain Contract`.
 
 - **Machine-readable unit.** Every `Status: Remaining` epic MUST carry at
   least one `@farm:{cargo …}` payload in its body (canonical carrier:
