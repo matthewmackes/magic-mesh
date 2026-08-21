@@ -371,12 +371,26 @@ mod tests {
             .trim()
             .parse::<u32>()
             .expect("helper reports a descendant pid");
+        // The worker group-kills the descendant, but the kernel reaps it
+        // asynchronously — on a loaded host /proc can still show the pre-kill
+        // state for a brief window. Poll within a bounded budget instead of
+        // sampling once (a single sample raced under parallel test load). The
+        // assertion is unchanged in spirit: the descendant must not outlive the
+        // bounded invocation.
         let proc_entry = std::path::PathBuf::from(format!("/proc/{descendant_pid}"));
-        let still_executing = std::fs::read_to_string(proc_entry.join("stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
-            .and_then(|fields| fields.chars().next())
-            .is_some_and(|state| state != 'Z');
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut still_executing = true;
+        while Instant::now() < deadline {
+            still_executing = std::fs::read_to_string(proc_entry.join("stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
+                .and_then(|fields| fields.chars().next())
+                .is_some_and(|state| state != 'Z');
+            if !still_executing {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             !still_executing,
             "the descendant process must not remain executable"
