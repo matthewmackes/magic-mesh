@@ -70,9 +70,6 @@ tick() {
   if [ -x "$DISPATCH" ]; then
     if ! "$DISPATCH" plan; then
       log "IMPLEMENTATION DISPATCH BLOCKED — no plan was produced"
-    elif [ -z "${MCNF_AGENT_DISPATCHER:-}" ]; then
-      log "IMPLEMENTATION DISPATCH PAUSED — set MCNF_AGENT_RUNTIME (cursor|codex|claude) and its native MCNF_AGENT_DISPATCHER"
-      log "  plan: ${MCNF_AGENT_DISPATCH_STATE:-$REPO/automation/.state/agent-dispatch-plan.tsv}"
     elif ! "$DISPATCH" dispatch; then
       log "IMPLEMENTATION DISPATCH FAILED — adapter returned non-zero"
     fi
