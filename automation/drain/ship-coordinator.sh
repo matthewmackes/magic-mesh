@@ -55,9 +55,13 @@ tick() {
 
   log "farm reconcile"
   if [ "$DRY" -eq 1 ]; then
-    "$RECONCILE" --dry-run
+    if ! "$RECONCILE" --dry-run; then
+      log "farm reconcile reported failures during dry-run; continuing"
+    fi
   else
-    "$RECONCILE"
+    if ! "$RECONCILE"; then
+      log "farm reconcile reported failed jobs; continuing supervision"
+    fi
   fi
 
   print_queue "$STATE/needs-review.txt" "needs-review queue"
