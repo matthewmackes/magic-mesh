@@ -83,6 +83,10 @@ DIR_BASE="${MCNF_DISPATCH_DIR_BASE:-magic-mesh-farm}"
 # How long a duplicate request waits for the in-flight owner of the same jobid
 # before giving the caller an EX_TEMPFAIL. Sized for a cold workspace gate.
 JOB_WAIT_SECS="${MCNF_DISPATCH_JOB_WAIT_SECS:-5400}"
+# Hard caps so a wedged node cannot hold a slot forever. Generous enough for a
+# cold whole-workspace build; anything past them is a stuck job, not a slow one.
+SYNC_TIMEOUT="${MCNF_DISPATCH_SYNC_TIMEOUT:-1200}"
+JOB_TIMEOUT="${MCNF_DISPATCH_JOB_TIMEOUT:-7200}"
 
 # ============================================================================
 # PURE helpers — no I/O, no globals; exercised by --self-test.
@@ -163,13 +167,21 @@ required_kib() {
 # ============================================================================
 
 reachable()   { timeout 4 bash -c "cat </dev/null >/dev/tcp/$1/22" 2>/dev/null; }
-toolchained() { "${SSH[@]}" -n "mm@$1" '. "$HOME/.cargo/env" 2>/dev/null; command -v cargo >/dev/null && command -v g++ >/dev/null' 2>/dev/null; }
+
+# Every probe is wrapped in `timeout`, not merely ssh's ConnectTimeout. A node can
+# be sick in a way that accepts the TCP connection and then never completes the
+# SSH banner — a full or thrashing guest does exactly that, as .196 did on
+# 2026-08-21. ConnectTimeout covers only the connect, so such a node would hang a
+# probe while holding a slot reservation, costing capacity for as long as it
+# stayed half-dead. A probe that cannot answer in time is simply not eligible.
+PROBE_TIMEOUT="${MCNF_DISPATCH_PROBE_TIMEOUT:-20}"
+toolchained() { timeout "$PROBE_TIMEOUT" "${SSH[@]}" -n "mm@$1" '. "$HOME/.cargo/env" 2>/dev/null; command -v cargo >/dev/null && command -v g++ >/dev/null' 2>/dev/null; }
 
 # free_kib <node> — /home free space in KiB, or empty when unreachable/garbled.
 # `-n` keeps ssh off our stdin so this is safe inside a read loop.
 free_kib() {
   local v
-  v="$("${SSH[@]}" -n "mm@$1" 'df -Pk "$HOME" | awk "NR == 2 { print \$4 }"' 2>/dev/null)" || return 1
+  v="$(timeout "$PROBE_TIMEOUT" "${SSH[@]}" -n "mm@$1" 'df -Pk "$HOME" | awk "NR == 2 { print \$4 }"' 2>/dev/null)" || return 1
   case "$v" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s\n' "$v"
 }
@@ -439,14 +451,19 @@ EOF
   # mid-build. Build identity still stamps honestly (mde-theme's build.rs
   # degrades to a non-promotable marker without Git); promotable RPM cuts use
   # xcp-build.sh's immutable git-archive path, not this dispatcher.
-  rsync -az --delete -e "${SSH[*]}" \
+  timeout "$SYNC_TIMEOUT" rsync -az --delete -e "${SSH[*]}" \
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
     --exclude '/.git' --exclude '/automation/.state' \
     "$REPO/" "mm@$node:$remote_dir/" >>"$log_file" 2>&1
-  "${SSH[@]}" "mm@$node" \
+  # Cap the build itself. A node that dies mid-job leaves an ssh that never
+  # returns, and the slot stays reserved while nothing progresses — orphans of
+  # 16h and 24h were found holding nodes this way on 2026-08-21. `timeout`
+  # reports 124, which records as a normal fail and frees the slot.
+  timeout "$JOB_TIMEOUT" "${SSH[@]}" "mm@$node" \
     ". \"\$HOME/.cargo/env\"; . \"\$HOME/.sccache.env\" 2>/dev/null || true; cd $remote_dir && $command" \
     >>"$log_file" 2>&1
   exit_code=$?
+  [ "$exit_code" -eq 124 ] && log "job $jobid exceeded ${JOB_TIMEOUT}s on $node slot$slot — timed out, slot released"
   ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   flock -u "$lockfd"; exec {lockfd}>&-
 

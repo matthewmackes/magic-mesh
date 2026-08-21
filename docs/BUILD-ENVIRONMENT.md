@@ -401,19 +401,33 @@ zero gtk deps in `Cargo.lock`.)*
 
 ## 3. The hardware / fleet
 
-Full operator authorization on all three (root, incl. destructive ops). Private
-LAN `172.20.0.0/16`. Management is the **mesh SSH key**
-`~/.ssh/mackes_mesh_ed25519` (authorized on both dom0s + the build VMs' `mm`
+Full operator authorization on all five dom0s (root, incl. destructive ops).
+Private LAN `172.20.0.0/16`. Management is the **mesh SSH key**
+`~/.ssh/mackes_mesh_ed25519` (authorized on every dom0 + the build VMs' `mm`
 user). Secrets are **off-repo** — see "Credentials" below.
 
-| Host | IP | OS | Cores / RAM | Role |
-|---|---|---|---|---|
-| `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | Orchestration only; farm dispatch via `xcp-build.sh`; builds and Podman workloads run on farm VMs; this is where Claude Code + `/root/magic-mesh` live |
-| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-home-services` (172.20.0.50, 4 vCPU/12 GiB); local SR is `ext` ("Local storage") |
-| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-kvm-xcp1` (172.20.0.90, 4 vCPU/12 GiB) |
-| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **12 vCPU/20 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
-| `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c / — | hypervisor — build VM `mcnf-build-xen-194` (172.20.0.170, 4 vCPU/11 GiB); the **4th dom0** (added after the 3-dom0 table was first written; confirmed live 2026-07-01) |
-| `XEN-196` | `172.20.145.196` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-xen-196` (172.20.0.196, 4 vCPU/7 GiB, 60 GiB disk); cap 1 preserves headroom for the unchanged `mcnf-control`, `testvm-lin`, and `testvm-win` guests |
+Build-VM **root disk** is listed because disk, not CPU, is the binding
+constraint on this farm (§4A.4). The dom0 SR column is what limits how far a
+node can grow: a VDI must not be grown past its SR or the storage overcommits.
+
+| Host | IP | OS | Cores / RAM | dom0 SR | Role |
+|---|---|---|---|---|---|
+| `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | — | Orchestration only; farm dispatch via `xcp-build.sh`; builds and Podman workloads run on farm VMs; this is where the agent + `/root/magic-mesh` live |
+| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | 192 GiB `ext` | hypervisor — build VM `mcnf-build-home-services` (172.20.0.50, 4 vCPU/12 GiB, **105 GiB root**) |
+| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | 192 GiB `ext` | hypervisor — build VM `mcnf-build-kvm-xcp1` (172.20.0.90, 4 vCPU/12 GiB, **130 GiB root**) |
+| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | **398 GiB** `ext` | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **12 vCPU/20 GiB, 180 GiB root**); the high-capacity node and the only one sized for three concurrent heavy slots |
+| `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c / — | **75 GiB** — cannot grow | hypervisor — build VM `mcnf-build-xen-194` (172.20.0.170, 4 vCPU/11 GiB, 64 GiB root); the **4th dom0** (added after the 3-dom0 table was first written; confirmed live 2026-07-01) |
+| `XEN-196` | `172.20.145.196` | XCP-ng 8.3 dom0 | 4c / 24 GiB | **75 GiB** — cannot grow | hypervisor — build VM `mcnf-build-xen-196` (172.20.0.196, 4 vCPU/7 GiB, 60 GiB root); cap 1 preserves headroom for the unchanged `mcnf-control`, `testvm-lin`, and `testvm-win` guests |
+
+> **Growing a build VM's disk** (2026-08-21: BigBoy 80→180 GiB, `.90` 80→130 GiB,
+> `.50` 80→105 GiB). Reserve the node's dispatcher slots with `flock` so nothing
+> lands mid-window, confirm `pgrep -c cargo` is 0, then
+> `xe vm-shutdown` → `xe vdi-resize uuid=<root-vdi> disk-size=<bytes>` →
+> `xe vm-start`. On boot cloud-init's growpart already extends `xvda4` (so
+> `growpart` reports `NOCHANGE`); finish with `sudo btrfs filesystem resize max
+> /home`. **`.170` and `.196` are pinned by 75 GiB SRs** whose VDIs already
+> nearly fill them — growing those would overcommit the SR and trade a guest
+> ENOSPC for a storage-level one. They stay `light-only` by design.
 
 > ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. XEN-196 is a fixed adopt-only node at `.196`, not an elastic lane, because that pool has no golden template and carries control/test guests. The real farm is **5 build VMs: .50 / .90 / .130 / .170 / .196**. The non-BigBoy build hostnames are descriptive; BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2+1 = 10**.
 
@@ -666,6 +680,23 @@ Work these in order; each step is cheap and rules out a whole class.
    killing command's own line and terminates your SSH session).
 6. **Did a supervisor die?** `pgrep -af ship-coordinator`. Locks are released
    automatically on process death, so a dead dispatcher leaks no reservation.
+7. **Is a node wedged rather than down?** A wedged guest answers `ping`, accepts
+   TCP on 22, then stalls with `Connection timed out during banner exchange` —
+   sshd is alive but cannot complete a login, which disk pressure causes. It also
+   makes the toolchain probe fail, so the node reports `TOOLCH bare` even though
+   cargo and g++ are installed; do not "fix" a toolchain on that evidence alone.
+   Repair from the node's dom0 (`install-helpers/farm-topology.sh` holds the
+   dom0 map), reserving its slots first so nothing lands mid-window:
+
+```bash
+# hold the node's slots, then from its dom0:
+V=$(xe vm-list name-label=<build-vm> --minimal)
+xe vm-shutdown uuid=$V            # add force=true when the clean path hangs
+xe vm-start   uuid=$V
+```
+
+   Reboot clears the symptom; it does **not** clear the cause. Follow it by
+   reclaiming disk, or the node wedges again.
 
 **Never edit a farm script in place while it is executing.** Bash reads scripts
 incrementally, so rewriting one under a running dispatcher makes it resume at a
@@ -730,6 +761,8 @@ Another AI/operator can rebuild the whole thing from this repo:
 | `farm-slot-gc.sh` reports 0G reclaimed while nodes sit at 100% | the pressure was the shared `~/magic-mesh/target`, which the GC never globbed | dispatch into `~/magic-mesh-farm-d<N>`, which the GC does reclaim (§4A.3) |
 | ENOSPC *after* admission passed an 8G check | a cold whole-workspace `target/` is ~54G; one flat floor admitted jobs that could never fit | shape-aware headroom, heavy vs light, plus a unit per reserved slot (§4A.4) |
 | the same gate builds on several slots at once | distinct epics tag identical commands, so job ids differ while the work is the same | per-jobid **and** per-command locks; the waiter adopts the finished result (§4A.5) |
+| a node answers ping, accepts TCP on 22, then "Connection timed out during banner exchange" | the guest is wedged (disk pressure / thrashing): sshd is alive but cannot complete a login | force-reboot the build VM from its dom0, then fix the disk — the reboot alone only defers it (§4A.7) |
+| a node reports `TOOLCH bare` although cargo and g++ are installed | a **false negative** from that same wedged SSH: the probe could not run, which is indistinguishable from a missing toolchain unless the probe is bounded | probes are `timeout`-wrapped (`MCNF_DISPATCH_PROBE_TIMEOUT`); confirm by hand before reinstalling anything (§4A.7) |
 | a running farm script dies on a syntax error in code you just wrote | bash reads scripts incrementally, so an in-place rewrite resumes at a stale offset | edit to a temp file and `mv` over it (atomic rename) (§4A.7) |
 | `pkill -f "cargo test"` kills your own SSH session | `-f` matches full command lines, including the wrapper carrying that very pattern | `pkill -x cargo` (§4A.7) |
 | `cannot find -fuse-ld=mold` / link fails on the dev host | gcc 11.5 (EL9) rejects mold | `RUSTFLAGS="…gold"` (§1) |
