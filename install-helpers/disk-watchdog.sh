@@ -39,11 +39,26 @@ done
 # Drop admin entries for worktrees the coordinator already removed.
 git -C "$REPO" worktree prune 2>/dev/null || true
 
+# 2) Reap dead implementation-agent worktrees. Each isolated drain worktree is
+#    ~170M and pins disk the moment its agent exits; the lifecycle reaper
+#    salvages the diff/log first, then removes only worktrees whose recorded PID
+#    is gone (a live agent is never touched). This is the reclaim the old
+#    watchdog missed — it only globbed target/ and reported +0G while /tmp
+#    drain worktrees held the space.
+LIFECYCLE="${MCNF_AGENT_LIFECYCLE:-$REPO/automation/drain/agent-lifecycle.sh}"
+if [ -x "$LIFECYCLE" ]; then
+  "$LIFECYCLE" reap >/dev/null 2>&1 || true
+fi
+
 # 3) aged task-output logs
 find /tmp -maxdepth 2 \( -path '/tmp/codex-*' -o -path '/tmp/magic-mesh-*' \) \
   -name '*.output' -type f -mmin +30 -delete 2>/dev/null || true
 
-# 4) stale farm slot dirs are reclaimed by xcp-build itself; not touched here.
+# 4) aged salvage archives (diffs/logs preserved for a day, then reclaimed).
+find /tmp -maxdepth 1 -type d -name 'mcnf-drain-salvage-*' -mmin +1440 \
+  -exec rm -rf {} + 2>/dev/null || true
+
+# 5) stale farm slot dirs are reclaimed by xcp-build itself; not touched here.
 after="$(free_gb)"
 echo "disk-watchdog: reclaimed -> ${after}G free (+$((after-before))G)"
 exit 0

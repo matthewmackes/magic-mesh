@@ -733,7 +733,12 @@ mod tests {
         // telephone-event negotiated, a queued '5' must arrive as a burst of
         // RFC 4733 packets on PT 101 carrying event code 5.
         let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
-        peer.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        // Short per-recv slices under a generous overall deadline: the media
+        // thread spins up cpal/ALSA before its first send, which on a loaded,
+        // headless build node can take several seconds. A single fixed 2 s read
+        // window flaked there; a deadline loop tolerates slow init without
+        // weakening any assertion below.
+        peer.set_read_timeout(Some(Duration::from_millis(500))).ok();
         let peer_addr = peer.local_addr().expect("peer addr");
         let remote = RemoteMedia {
             addr: peer_addr.ip().to_string(),
@@ -753,7 +758,8 @@ mod tests {
         let mut end_durations = Vec::new();
         #[allow(clippy::cast_possible_truncation)]
         let full_duration = (DTMF_PACKETS * FRAME_SAMPLES as u32) as u16;
-        for _ in 0..(DTMF_PACKETS + 6) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
             match peer.recv(&mut buf) {
                 Ok(n) if n >= 16 && (buf[1] & 0x7F) == 101 => {
                     assert_eq!(buf[12], 5, "DTMF event code is 5");
@@ -762,8 +768,13 @@ mod tests {
                         end_durations.push(u16::from_be_bytes([buf[14], buf[15]]));
                     }
                 }
+                // Keep draining; once an end-of-event packet is in hand the
+                // tone is complete and there is nothing more to wait for.
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => {}
+            }
+            if saw_event && !end_durations.is_empty() {
+                break;
             }
         }
         assert!(saw_event, "received an RFC 4733 telephone-event for '5'");

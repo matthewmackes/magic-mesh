@@ -8,6 +8,8 @@ set -euo pipefail
 
 ROOT="${MCNF_AGENT_WORKTREE_ROOT:-${TMPDIR:-/tmp}/mcnf-drain-worktrees}"
 STALE_SECS="${MCNF_AGENT_STALE_SECS:-3600}"
+REPO="${MCNF_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
+SALVAGE_ROOT="${MCNF_AGENT_SALVAGE_ROOT:-${TMPDIR:-/tmp}/mcnf-drain-salvage}"
 
 die() { printf 'agent-lifecycle: %s\n' "$*" >&2; exit 2; }
 now() { date +%s; }
@@ -36,11 +38,19 @@ status_for() {
     completed|failed|blocked|salvaged|requeued) printf '%s\n' "$state"; return ;;
   esac
   pid="$(read_field "$meta" pid)"
-  heartbeat="$(read_field "$meta" heartbeat_at)"
-  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-    printf 'running\n'
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'running\n'
+    else
+      # A recorded PID that is gone exited/crashed without a terminal record.
+      # Its worktree is residue, not live work — stale immediately, no wait.
+      printf 'stale\n'
+    fi
     return
   fi
+  # No PID recorded yet: still inside the launch window. Fall back to the
+  # heartbeat clock so a launch that dies before recording a PID still ages out.
+  heartbeat="$(read_field "$meta" heartbeat_at)"
   if [[ -f "$worktree/.agent-heartbeat" ]]; then
     heartbeat="$(stat -c %Y "$worktree/.agent-heartbeat" 2>/dev/null || printf '%s\n' "$heartbeat")"
   fi
@@ -65,20 +75,38 @@ status_cmd() {
   done
 }
 
+archive_worktree() {
+  # Preserve a stale/abandoned worktree's diff, log, and metadata, then remove
+  # the worktree so the unit can be dispatched fresh. Prints the archive path.
+  local meta="$1" worktree job archive
+  worktree="$(dirname "$meta")"
+  job="$(read_field "$meta" job_id)"
+  archive="$SALVAGE_ROOT/${job:-unknown}-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$archive"
+  git -C "$worktree" diff --binary >"$archive/worktree.diff" 2>/dev/null || true
+  [ -s "$archive/worktree.diff" ] || rm -f "$archive/worktree.diff"
+  [[ ! -f "$worktree/agent.log" ]] || cp "$worktree/agent.log" "$archive/agent.log" 2>/dev/null || true
+  cp "$meta" "$archive/agent-state" 2>/dev/null || true
+  git -C "$REPO" worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
+  git -C "$REPO" worktree prune 2>/dev/null || true
+  printf '%s\n' "$archive"
+}
+
 reap_cmd() {
-  local meta status
+  # Salvage and clear every stale worktree so a dead agent never blocks the
+  # next dispatch of its unit (native-agent-dispatch exits 75 on residue).
+  local meta status job archive
   shopt -s nullglob
   local -a metas=("$ROOT"/*/.agent-state)
   for meta in "${metas[@]}"; do
     status="$(status_for "$meta")"
     case "$status" in
-      running|completed|failed|blocked|salvaged|requeued) continue ;;
       stale)
-        write_field "$meta" status stale
-        write_field "$meta" stale_at "$(now)"
-        printf 'agent-lifecycle: stale job=%s worktree=%s\n' \
-          "$(read_field "$meta" job_id)" "$(dirname "$meta")"
+        job="$(read_field "$meta" job_id)"
+        archive="$(archive_worktree "$meta")"
+        printf 'agent-lifecycle: reaped stale job=%s -> %s\n' "${job:-unknown}" "$archive"
         ;;
+      *) continue ;;
     esac
   done
 }
@@ -131,13 +159,24 @@ self_test() {
   git -C "$td/worktree" add file
   git -C "$td/worktree" commit -qm fixture
   meta="$td/worktree/.agent-state"
-  printf 'job_id=test12345678\nstatus=dispatching\npid=999999\nheartbeat_at=1\n' >"$meta"
-  MCNF_AGENT_WORKTREE_ROOT="$td" MCNF_AGENT_STALE_SECS=1 "$0" reap >/dev/null
-  grep -q '^status=stale$' "$meta" || die "stale state was not recorded"
-  MCNF_AGENT_WORKTREE_ROOT="$td" MCNF_AGENT_SALVAGE_ROOT="$td/salvage" \
-    "$0" salvage test12345678 >/dev/null
+  printf 'job_id=test12345678\nstatus=running\npid=999999\nheartbeat_at=%s\n' "$(now)" >"$meta"
+  # A recorded-but-dead PID is stale IMMEDIATELY, even with a long stale window.
+  local st
+  st="$(MCNF_AGENT_WORKTREE_ROOT="$td" MCNF_AGENT_STALE_SECS=999999 "$0" status | awk -F'\t' 'NR==2{print $2}')"
+  [[ "$st" == stale ]] || die "dead pid must be stale immediately, got '$st'"
+  # A worktree with no pid yet inside the window is dispatching, not stale.
+  printf 'x\n' >>"$td/worktree/file"; git -C "$td/worktree" add file; git -C "$td/worktree" commit -qm edit
+  printf 'job_id=test12345678\nstatus=dispatching\npid=\nheartbeat_at=%s\n' "$(now)" >"$meta"
+  st="$(MCNF_AGENT_WORKTREE_ROOT="$td" MCNF_AGENT_STALE_SECS=999999 "$0" status | awk -F'\t' 'NR==2{print $2}')"
+  [[ "$st" == dispatching ]] || die "fresh no-pid launch must be dispatching, got '$st'"
+  # Reap salvages the diff AND removes the worktree so redispatch can proceed.
+  printf 'uncommitted agent work\n' >>"$td/worktree/file"
+  printf 'job_id=test12345678\nstatus=running\npid=999999\nheartbeat_at=1\n' >"$meta"
+  MCNF_REPO="$td/worktree" MCNF_AGENT_WORKTREE_ROOT="$td" MCNF_AGENT_SALVAGE_ROOT="$td/salvage" \
+    "$0" reap >/dev/null
+  [[ -e "$meta" ]] && die "reap must remove the stale worktree"
   compgen -G "$td/salvage/test12345678-*/worktree.diff" >/dev/null ||
-    die "salvage archive missing"
+    die "reap salvage archive missing"
   printf 'agent-lifecycle: self-test passed\n'
 }
 
@@ -147,5 +186,5 @@ case "${1:-status}" in
   salvage) shift; salvage_cmd "${1:-}" ;;
   requeue) shift; requeue_cmd "${1:-}" ;;
   --self-test) self_test ;;
-  *) die "usage: $0 {status|reap|--self-test}" ;;
+  *) die "usage: $0 {status|reap|salvage <job>|requeue <job>|--self-test}" ;;
 esac
