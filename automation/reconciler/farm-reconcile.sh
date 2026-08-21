@@ -198,9 +198,25 @@ if [ "${#NEED[@]}" -eq 0 ]; then log "nothing to do — farm converged @ $CUR"; 
 if [ "$DRY" -eq 1 ]; then log "dry-run: would dispatch ${#NEED[@]} job(s)"; exit 0; fi
 
 # Dispatch each needed job in the background; retry-on-busy (EX_TEMPFAIL=75) so
-# jobs queue onto nodes as they free up. dispatch's flock serializes per node.
+# jobs queue onto slots as they free up. dispatch's flock reserves per slot.
+#
+# Back off between retries instead of hammering every 5s. A saturated farm is the
+# NORMAL state while a queue drains, and a flat retry made every waiting job log
+# a "no admissible free slot" line every 5 seconds — tens of lines a second that
+# buried the real pass/fail signal. Builds run for minutes, so a wait that grows
+# to a minute costs no throughput.
+RETRY_MIN="${MCNF_RECONCILE_RETRY_MIN:-5}"
+RETRY_MAX="${MCNF_RECONCILE_RETRY_MAX:-60}"
 for jid in "${NEED[@]}"; do
-  ( while :; do "$LIB/farm-dispatch.sh" run "$jid" "${CMD[$jid]}"; rc=$?; [ "$rc" -eq 75 ] || break; sleep 5; done ) &
+  (
+    delay="$RETRY_MIN"
+    while :; do
+      "$LIB/farm-dispatch.sh" run "$jid" "${CMD[$jid]}"; rc=$?
+      [ "$rc" -eq 75 ] || break
+      sleep "$delay"
+      delay=$(( delay * 2 )); [ "$delay" -gt "$RETRY_MAX" ] && delay="$RETRY_MAX"
+    done
+  ) &
 done
 wait
 
