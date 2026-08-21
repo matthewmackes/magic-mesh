@@ -470,11 +470,35 @@ idempotently (it skips a job whose result already matches a clean HEAD).
 ```
 
 - Jobs are parsed by `automation/lib/farm-jobs.sh` (only open/in-progress tasks are
-  active); dispatched by `automation/lib/farm-dispatch.sh` to a free node
-  (per-node flock, big-iron-first), and the intended BUILD-PLATFORM-1 path is to
+  active); dispatched by `automation/lib/farm-dispatch.sh` to a free **slot**
+  (per-slot flock, big-iron-first), and the intended BUILD-PLATFORM-1 path is to
   build with shared sccache once WL-BUILD-002 is complete. Current agents must
   verify that contract with `install-helpers/farm-sccache-proof.sh status`
   before claiming cross-node cache behavior.
+- **Slot model (why the farm fills).** The dispatcher reserves one SLOT, not a
+  whole node, so the fleet runs to the roster's declared capacity — all ten slots
+  (`.50`=2 `.90`=2 `.130`=3 `.170`=2 `.196`=1), not one job per node. Each slot
+  owns its own lock and its own remote workspace `~/magic-mesh-farm-d<N>`, so
+  concurrent jobs on one node cannot `rsync --delete` over each other or share a
+  `target/`. Those per-slot names are what `install-helpers/farm-slot-gc.sh`
+  reclaims; the retired shared `~/magic-mesh` tree was invisible to the GC and
+  grew past 50G per node. Inspect with `farm-dispatch.sh slots` (per-slot
+  reservations, `TOTAL_FREE=`) and `farm-dispatch.sh nodes` (reach, toolchain,
+  free space, per-node free slots).
+- **Admission is disk-shaped, because disk — not CPU — is this farm's real
+  limit** (a cold whole-workspace `target/` measured 54G, so a 79G node cannot
+  host three of them whatever its CPU cap says). A whole-workspace / `--release`
+  / rpm job needs HEAVY headroom (40 GiB default), a per-crate job LIGHT (8 GiB),
+  plus one LIGHT unit per slot already reserved on that node. A node short of
+  headroom is first offered a bounded reclaim of provably idle rebuildable trees
+  (`target/` of unreserved slots only — never a reserved slot, never a source
+  tree), then re-probed once, and skipped if still short. Tunable via
+  `MCNF_DISPATCH_MIN_FREE_KIB` / `MCNF_DISPATCH_HEAVY_FREE_KIB`.
+- **One run per jobid.** Two supervisor trees reconciling the same worklist
+  resolve the same job ids; the dispatcher holds a per-jobid lock, and a
+  duplicate waits for the owner and adopts its result instead of burning a second
+  slot on identical work. Verify the whole contract offline with
+  `automation/lib/farm-dispatch.sh --self-test`.
 - The reconciler is the *canonical* lane; the other FARM-AUTO capabilities (Forgejo
   on push, etcd pull-agents, the mackesd worker) are alternates over the same substrate.
 - Design + rationale: [`docs/design/build-platform.md`](design/build-platform.md).
