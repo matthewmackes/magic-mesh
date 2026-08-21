@@ -107,6 +107,24 @@ Admit before sync (`AI_GOVERNANCE.md` §10.0.3). Reachability is not capacity.
 Heavy entry point: `install-helpers/xcp-build.sh`. Local Rocky cargo is
 guarded; if you need a linker locally, `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`.
 
+**Operating guide — read, don't rediscover.** `docs/BUILD-ENVIRONMENT.md` §4A is
+the canonical how-to: lane selection (§4A.1), `@farm` markers (§4A.2), the slot
+model (§4A.3), disk-shaped admission (§4A.4), run-once guarantees (§4A.5),
+command reference (§4A.6), the "farm not filling" playbook (§4A.7), and result
+records (§4A.8).
+
+The dispatcher reserves a **slot**, not a node: ten concurrent jobs, each with
+its own lock and remote workspace `~/magic-mesh-farm-d<N>`. Admission is
+disk-shaped (heavy `--workspace`/`--release`/rpm needs ~40 GiB, light per-crate
+~8 GiB, plus a unit per slot already reserved) because a cold whole-workspace
+`target/` is ~54G. Identical job ids **and** identical commands at one clean
+commit are deduplicated — never fan out the same gate twice by hand.
+
+State first, conclusions second: `automation/lib/farm-dispatch.sh nodes` and
+`… slots`. `no admissible free slot … retry later` means the farm is FULL, not
+broken. Never rewrite a farm script in place while it runs (bash reads scripts
+incrementally) — write a temp file and `mv` over it.
+
 ## Parallel drain (§10.0.4)
 
 Existing DRAIN-ENGINE is canonical — do not build a second scheduler.

@@ -458,7 +458,39 @@ golden template (XCP-2) ──tofu (clone via XO)──▶ cloud-init NM-fix ─
 it from `/root/.mcnf-xo-token`). Farm internals + the recovery playbook live in
 [`docs/farm.md`](farm.md).
 
-### Requesting a build — the `@farm` convention (the canonical lane)
+## 4A. Using the farm — the operating guide
+
+This section is the **canonical how-to for running work on the farm**, written so
+any AI agent or IDE can drive it without rediscovering the toolchain. Read §4A.1
+first to pick a lane; everything after it is reference. The mandatory admission
+rules live in [§ Farm admission preflight](#farm-admission-preflight-mandatory-before-every-job)
+and `AI_GOVERNANCE.md §10`, which outrank this section if they ever disagree.
+
+**Never run heavy cargo on the dev host.** `build`/`test`/`clippy` go to the farm;
+only `fmt` and tiny syntax probes are local (`AI_GOVERNANCE.md §10`).
+`install-helpers/cargo-farm-guard.sh` enforces this. If you genuinely need a local
+link, use `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`.
+
+### 4A.1 Pick a lane
+
+| Your goal | Use this | Why |
+|---|---|---|
+| A gate that belongs to a worklist epic | `@farm:{<cmd>}` marker (§4A.2) | Declarative, no AI, auto-retried by the reconciler timer. **Default choice.** |
+| Build/test *right now* from your working tree | `install-helpers/xcp-build.sh cargo <args>` | Syncs dirty tree, no commit needed, shape-routed to a matching node |
+| Full ship gates (fmt + clippy + test) | `xcp-build.sh gates` | The release gate set in one call |
+| Coverage floor | `xcp-build.sh coverage` | Canonical 80% `llvm-cov` floor |
+| RPM / release cut | `xcp-build.sh rpm` | Needs `MCNF_RPM_TARGET_FEDORA`; uses an immutable git-archive source path |
+| Dispatch one known job id programmatically | `automation/lib/farm-dispatch.sh run <jobid> "<cmd>"` | The slot-reserving core the reconciler itself calls |
+| Interactive poke at a node | `xcp-build.sh shell`, or `ssh -i ~/.ssh/mackes_mesh_ed25519 mm@172.20.0.<n>` | Diagnosis only |
+
+Two different things are both called "slot", so keep them apart:
+
+- **`MCNF_BUILD_SLOT`** (`xcp-build.sh`) — *you* pick an isolated workspace
+  suffix by hand to run concurrent jobs on one host: slot `2` → `~/magic-mesh-farm-2`.
+- **A dispatcher slot** (`farm-dispatch.sh`) — *reserved automatically* from the
+  roster's per-node cap, with its own lock and workspace `~/magic-mesh-farm-d<N>`.
+
+### 4A.2 The `@farm` convention (canonical declarative lane)
 
 The default way to get something built is **declarative, no AI, no manual dispatch**:
 tag a worklist task with `@farm:{<command>}` and the **reconciler timer**
@@ -469,39 +501,200 @@ idempotently (it skips a job whose result already matches a clean HEAD).
 - [>] **SOME-TASK: …**  @farm:{cargo test -p mde-bus}  @farm:{cargo clippy -p mackesd}
 ```
 
-- Jobs are parsed by `automation/lib/farm-jobs.sh` (only open/in-progress tasks are
-  active); dispatched by `automation/lib/farm-dispatch.sh` to a free **slot**
-  (per-slot flock, big-iron-first), and the intended BUILD-PLATFORM-1 path is to
-  build with shared sccache once WL-BUILD-002 is complete. Current agents must
-  verify that contract with `install-helpers/farm-sccache-proof.sh status`
-  before claiming cross-node cache behavior.
-- **Slot model (why the farm fills).** The dispatcher reserves one SLOT, not a
-  whole node, so the fleet runs to the roster's declared capacity — all ten slots
-  (`.50`=2 `.90`=2 `.130`=3 `.170`=2 `.196`=1), not one job per node. Each slot
-  owns its own lock and its own remote workspace `~/magic-mesh-farm-d<N>`, so
-  concurrent jobs on one node cannot `rsync --delete` over each other or share a
-  `target/`. Those per-slot names are what `install-helpers/farm-slot-gc.sh`
-  reclaims; the retired shared `~/magic-mesh` tree was invisible to the GC and
-  grew past 50G per node. Inspect with `farm-dispatch.sh slots` (per-slot
-  reservations, `TOTAL_FREE=`) and `farm-dispatch.sh nodes` (reach, toolchain,
-  free space, per-node free slots).
-- **Admission is disk-shaped, because disk — not CPU — is this farm's real
-  limit** (a cold whole-workspace `target/` measured 54G, so a 79G node cannot
-  host three of them whatever its CPU cap says). A whole-workspace / `--release`
-  / rpm job needs HEAVY headroom (40 GiB default), a per-crate job LIGHT (8 GiB),
-  plus one LIGHT unit per slot already reserved on that node. A node short of
-  headroom is first offered a bounded reclaim of provably idle rebuildable trees
-  (`target/` of unreserved slots only — never a reserved slot, never a source
-  tree), then re-probed once, and skipped if still short. Tunable via
-  `MCNF_DISPATCH_MIN_FREE_KIB` / `MCNF_DISPATCH_HEAVY_FREE_KIB`.
-- **One run per jobid.** Two supervisor trees reconciling the same worklist
-  resolve the same job ids; the dispatcher holds a per-jobid lock, and a
-  duplicate waits for the owner and adopts its result instead of burning a second
-  slot on identical work. Verify the whole contract offline with
-  `automation/lib/farm-dispatch.sh --self-test`.
-- The reconciler is the *canonical* lane; the other FARM-AUTO capabilities (Forgejo
-  on push, etcd pull-agents, the mackesd worker) are alternates over the same substrate.
-- Design + rationale: [`docs/design/build-platform.md`](design/build-platform.md).
+Jobs are parsed by `automation/lib/farm-jobs.sh` (only open/in-progress tasks are
+active) and dispatched by `automation/lib/farm-dispatch.sh`. The reconciler is the
+*canonical* lane; the other FARM-AUTO capabilities (Forgejo on push, etcd
+pull-agents, the mackesd worker) are alternates over the same substrate. The
+intended BUILD-PLATFORM-1 path is to build with shared sccache once WL-BUILD-002
+is complete — verify that contract with `install-helpers/farm-sccache-proof.sh
+status` before claiming cross-node cache behavior.
+
+Drive a cycle by hand when you don't want to wait for the timer:
+
+```bash
+automation/lib/farm-jobs.sh active                  # what the worklist is asking for
+automation/reconciler/farm-reconcile.sh --dry-run   # what would dispatch, no farm contact
+automation/reconciler/farm-reconcile.sh             # dispatch + wait + summarize
+```
+
+A job with **no `@farm:{…}` marker never reaches the farm.** If `Remaining` epics
+exist but `farm-jobs.sh active` prints nothing, the markers are missing — that is
+the defect to fix, not a reason to build locally.
+
+### 4A.3 The slot model — why the farm fills
+
+The dispatcher reserves one **slot**, not a whole node, so the fleet runs to the
+roster's declared capacity — all ten slots (`.50`=2 `.90`=2 `.130`=3 `.170`=2
+`.196`=1), not one job per node. The earlier one-lock-per-node model capped the
+whole fleet at five concurrent jobs and left queues stalled behind idle capacity.
+
+Each slot is isolated by **both** a lock and its own remote workspace:
+
+| Per slot | Path |
+|---|---|
+| Reservation lock | `automation/.state/locks/<node>-slot<N>.lock` |
+| Remote workspace | `mm@<node>:~/magic-mesh-farm-d<N>` (own `target/`) |
+
+The separate workspace is what makes concurrency safe: jobs sharing one remote
+directory would `rsync --delete` over each other and contend on a single
+`target/`. It also keeps slots garbage-collectable, because
+`install-helpers/farm-slot-gc.sh` reclaims exactly `~/magic-mesh-farm-*`.
+
+Placement **spreads before it packs** — slot 1 across all nodes (big iron first),
+then slot 2, then slot 3 — so concurrent jobs land on distinct nodes until the
+farm is genuinely full.
+
+> `/.git` is **not** synced to slots (1.1G per slot that no cargo gate needs), so
+> a build stamps `MDE_BUILD_GIT_HASH` as a `non-promotable-*` marker. That is
+> correct for gates. **Promotable release cuts must use `xcp-build.sh rpm`**,
+> which syncs an immutable git archive.
+
+### 4A.4 Admission is disk-shaped
+
+Disk, not CPU, is this farm's real limit: a cold whole-workspace `target/`
+measured **54G**, so a 79G node cannot host three of them whatever its CPU cap
+says. Before syncing, a slot's node must clear a headroom envelope:
+
+| Job shape | Detected by | Headroom |
+|---|---|---|
+| HEAVY | `--workspace`, `--release`, `rpm`, `generate-rpm` | 40 GiB (`MCNF_DISPATCH_HEAVY_FREE_KIB`) |
+| LIGHT | anything else, e.g. `cargo test -p <crate>` | 8 GiB (`MCNF_DISPATCH_MIN_FREE_KIB`) |
+
+plus **one LIGHT unit for every slot already reserved on that node**, so
+concurrent slots cannot jointly overcommit `/home`.
+
+This is a *disk* classifier and deliberately differs from `xcp-build.sh`'s
+placement rule: `cargo test --workspace` is placement-*small* but compiles
+everything, so for admission it is HEAVY.
+
+A node short of headroom is offered one **bounded reclaim** of provably idle
+rebuildable trees, then re-probed once, and skipped if still short. Reclaim only
+ever removes `target/` — never a source tree, never a reserved slot's workspace,
+and never the shared legacy tree while a legacy job holds the node. So a node
+that cannot host the job is skipped rather than forced to build, and no second
+copy of a running job is created.
+
+### 4A.5 Nothing runs twice
+
+Two guards, both automatic:
+
+- **Per job id.** Two supervisor trees reconciling the same worklist resolve the
+  same job ids. A duplicate waits for the in-flight owner (holding no slot) and
+  adopts its result.
+- **Per command.** Distinct epics tag the same gate, so different job ids can
+  carry a byte-identical command — four copies of `cargo test -p mde-collab-egui`
+  once occupied four slots at one commit. Identical commands serialize on one lock
+  and the waiter republishes the finished run under its own job id.
+
+Reuse requires the **same command at the same recorded commit, and a clean tree**
+(the same rule as `farm-reconcile.sh`'s `is_fresh`). On a dirty tree nothing is
+reused, because two runs cannot be proven equal against uncommitted edits. A
+failed result is reused as readily as a passing one — a red gate is still an answer.
+
+### 4A.6 Command reference
+
+```bash
+# --- inspect ---------------------------------------------------------------
+install-helpers/farm-topology.sh table         # canonical roster: nodes, names, caps
+automation/lib/farm-dispatch.sh nodes          # reach/toolchain/free-disk/free-slots + state
+automation/lib/farm-dispatch.sh slots          # per-slot reservations; TOTAL_FREE=
+install-helpers/drain-coordinator.sh plan 7    # preflight + free slots + next N units
+
+# --- run ------------------------------------------------------------------
+install-helpers/xcp-build.sh cargo test -p mde-bus     # one-off, from the dirty tree
+install-helpers/xcp-build.sh route cargo test -p x     # dry: which host + why
+automation/lib/farm-dispatch.sh run <jobid> "cargo test -p x"
+automation/reconciler/farm-reconcile.sh                # the whole worklist cycle
+
+# --- results --------------------------------------------------------------
+automation/lib/farm-dispatch.sh result <jobid>         # the result JSON
+cat automation/.state/logs/<jobid>.log                 # full build output
+
+# --- offline self-tests (no farm contact; run these after editing) --------
+automation/lib/farm-dispatch.sh --self-test
+automation/reconciler/farm-reconcile.sh --self-test
+automation/lib/farm-jobs.sh --self-test
+install-helpers/xcp-build.sh --route-test
+
+# --- housekeeping ---------------------------------------------------------
+MCNF_FARM_KEY=/root/.ssh/mackes_mesh_ed25519 install-helpers/farm-slot-gc.sh --remote
+install-helpers/disk-watchdog.sh 8             # dev-host headroom (NOT the farm VMs)
+```
+
+**Exit codes are signals, not tooling faults.** `farm-topology.sh table` prints
+the roster and then exits **non-zero when any canonical node is unreachable** —
+that is a health verdict about the fleet, so read its output rather than treating
+the status as a broken command. Likewise `farm-dispatch.sh run` returns `75` when
+the farm is simply full (§4A.8).
+
+`farm-dispatch.sh nodes` reports a `STATE` per node — read it before concluding
+the farm is broken:
+
+| STATE | Meaning | Action |
+|---|---|---|
+| `ready` | Admits heavy or light work | none |
+| `light-only` | Enough for a per-crate job, not a workspace build | none; heavy jobs route elsewhere |
+| `saturated` | Every declared slot is reserved | none — this is a full farm working |
+| `FULL(disk)` | Below even the light floor | GC / reclaim (§4A.7) |
+| `unavailable` | Unreachable, or no cargo/g++ | node repair |
+| `…,legacy-job` | A pre-slot whole-node job still holds it | wait for it to drain |
+
+### 4A.7 Diagnosing a farm that is not filling
+
+Work these in order; each step is cheap and rules out a whole class.
+
+1. **Is there anything to dispatch?** `automation/lib/farm-jobs.sh active`. Empty
+   means missing `@farm:{…}` markers, not a farm fault.
+2. **Is the farm actually full?** `farm-dispatch.sh slots`. `TOTAL_FREE=0` with
+   builds running is the healthy saturated state; queued jobs log
+   `no admissible free slot … retry later` and back off. That message is **not**
+   an error.
+3. **Is capacity lost to disk?** `farm-dispatch.sh nodes`. Any `FULL(disk)` or
+   widespread `light-only` means reclaim: run `farm-slot-gc.sh --remote`, and if
+   that frees nothing the pressure is outside the slot dirs — check
+   `ssh mm@<node> 'du -x -d1 -h $HOME'` for stray trees, and confirm nothing is
+   building there before removing anything.
+4. **Are jobs duplicated?** Compare distinct job ids against running dispatchers:
+   `ps -eo args | grep -o 'farm-dispatch.sh run [a-f0-9]*' | sort | uniq -c`. A
+   count above 1 for one id means the idempotence guard is bypassed.
+5. **Are there orphaned remote builds?** Reservations should match live cargo:
+   `farm-dispatch.sh slots` versus
+   `ssh mm@172.20.0.<n> 'pgrep -c cargo'`. Remote cargo with no reservation is an
+   orphan from a dead dispatcher — it holds disk and CPU while producing nothing.
+   Confirm its job already published a result, then kill it by exact name
+   (`pkill -x cargo`; **never** `pkill -f "cargo test"`, whose pattern matches the
+   killing command's own line and terminates your SSH session).
+6. **Did a supervisor die?** `pgrep -af ship-coordinator`. Locks are released
+   automatically on process death, so a dead dispatcher leaks no reservation.
+
+**Never edit a farm script in place while it is executing.** Bash reads scripts
+incrementally, so rewriting one under a running dispatcher makes it resume at a
+stale offset and die on a syntax error in code that did not exist when it
+started. Write to a temp file and `mv` it over (atomic rename leaves running
+processes on the old inode).
+
+### 4A.8 Result records
+
+Every dispatch writes `automation/.state/results/<jobid>.json`; the log is
+`automation/.state/logs/<jobid>.log`. Fields:
+
+| Field | Meaning |
+|---|---|
+| `outcome` / `exit` | `pass`\|`fail`, and the command's exit code |
+| `node` / `slot` | Which node and which slot ran it |
+| `workspace` | Remote directory used (`magic-mesh-farm-d<N>`) |
+| `shape` | `heavy`\|`light` — the admission class |
+| `commit` | Source rev, suffixed `-dirty` if the tree had edits |
+| `reused_from` | Present only when the run was adopted from an identical command |
+
+`commit` is the freshness key: the reconciler re-runs a job whose recorded commit
+does not equal a clean `HEAD`, and a `-dirty` result is never treated as fresh.
+
+Exit codes from `farm-dispatch.sh run`: `0` pass · `1` fail · `2` usage ·
+`75` EX_TEMPFAIL (no admissible slot right now — retry, which the reconciler does
+with backoff).
+
+Design + rationale: [`docs/design/build-platform.md`](design/build-platform.md).
 
 ---
 
@@ -533,6 +726,12 @@ Another AI/operator can rebuild the whole thing from this repo:
 
 | Symptom | Cause → fix | Lives in |
 |---|---|---|
+| farm runs one job per node while the roster declares ten slots | dispatcher took one lock per *node*; jobs also shared one remote tree so they could not safely run side by side | reserve per *slot*, each with its own workspace `~/magic-mesh-farm-d<N>` (§4A.3) |
+| `farm-slot-gc.sh` reports 0G reclaimed while nodes sit at 100% | the pressure was the shared `~/magic-mesh/target`, which the GC never globbed | dispatch into `~/magic-mesh-farm-d<N>`, which the GC does reclaim (§4A.3) |
+| ENOSPC *after* admission passed an 8G check | a cold whole-workspace `target/` is ~54G; one flat floor admitted jobs that could never fit | shape-aware headroom, heavy vs light, plus a unit per reserved slot (§4A.4) |
+| the same gate builds on several slots at once | distinct epics tag identical commands, so job ids differ while the work is the same | per-jobid **and** per-command locks; the waiter adopts the finished result (§4A.5) |
+| a running farm script dies on a syntax error in code you just wrote | bash reads scripts incrementally, so an in-place rewrite resumes at a stale offset | edit to a temp file and `mv` over it (atomic rename) (§4A.7) |
+| `pkill -f "cargo test"` kills your own SSH session | `-f` matches full command lines, including the wrapper carrying that very pattern | `pkill -x cargo` (§4A.7) |
 | `cannot find -fuse-ld=mold` / link fails on the dev host | gcc 11.5 (EL9) rejects mold | `RUSTFLAGS="…gold"` (§1) |
 | `-lopus` not found on EL9 | `opus-devel` is in **CRB**, not default repos | `dnf --enablerepo=crb install opus-devel` |
 | vendored Opus cmake configure fails | CMake 4 dropped policy < 3.5 | `CMAKE_POLICY_VERSION_MINIMUM=3.5` (`.cargo/config.toml`) |
@@ -680,6 +879,9 @@ each is left in place and flagged for the owner rather than "aligned" blindly:
 ---
 
 ## See also
+- **[§4A — Using the farm (operating guide)](#4a-using-the-farm--the-operating-guide)**
+  — start here to actually run work: lane selection, `@farm` markers, slots and
+  admission, command reference, triage playbook, result records.
 - [`AI_GOVERNANCE.md §10`](../AI_GOVERNANCE.md) — the directive pointing here.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — build prereqs, test rules, commit gates.
 - [`docs/farm.md`](farm.md) — farm architecture + dom0 recovery playbook.

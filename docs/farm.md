@@ -9,6 +9,12 @@ it is, how it's automated, and how to recover it.
 > [`docs/BUILD-ENVIRONMENT.md`](BUILD-ENVIRONMENT.md). This file is the farm
 > deep-dive it points to.
 
+> **Looking for how to RUN work on the farm?** That is
+> [`docs/BUILD-ENVIRONMENT.md` §4A — "Using the farm — the operating guide"](BUILD-ENVIRONMENT.md#4a-using-the-farm--the-operating-guide):
+> lane selection, `@farm` markers, the slot/admission model, the command
+> reference, and the "farm is not filling" triage playbook. **This** file is
+> architecture, provisioning, and host recovery — the layer underneath.
+
 > **TL;DR direction (DEVOPS-SUBSTRATE):** the durable Farm Automation Manager is
 > **Xen Orchestra + OpenTofu + Ansible + Packer + a CI runner**, *not* hand-rolled
 > bash. The `install-helpers/*xcp*`/`farm.sh` scripts are a working **stopgap**;

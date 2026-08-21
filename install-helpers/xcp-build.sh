@@ -27,7 +27,10 @@
 # Env overrides: MCNF_BUILD_HOST (for example 172.20.0.130), MCNF_BUILD_USER (mm),
 #   MCNF_BUILD_SLOT (unset) — an isolated remote workspace+target on the SAME host
 #   so multiple concurrent jobs run without colliding (scale workloads per node:
-#   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
+#   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-farm-2
+#   (see REMOTE_DIR below). This is a MANUAL suffix; the reconciler's automatic
+#   per-slot reservations are a separate mechanism using ~/magic-mesh-farm-d<N>
+#   (docs/BUILD-ENVIRONMENT.md §4A.3).
 #   MCNF_BUILD_SHAPE (big|small) — force the job shape, overriding the cargo-args
 #   inference (FA-6 shape-aware routing).
 #   MCNF_BUILD_OUTPUT_BYTES — declared final artifact bytes reserved before sync.

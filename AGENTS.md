@@ -38,9 +38,24 @@ that directory is glue over this file and `AI_GOVERNANCE.md`, not a second lock.
 
 ## Build And Test
 
+- **How to use the farm is documented — do not rediscover it.**
+ `docs/BUILD-ENVIRONMENT.md` **§4A "Using the farm — the operating guide"** is the
+ canonical how-to: which lane to use for which goal (§4A.1), the `@farm` marker
+ convention (§4A.2), the slot/capacity model (§4A.3–4), the guarantee that
+ nothing runs twice (§4A.5), a copy-pasteable command reference (§4A.6), the
+ "farm is not filling" triage playbook (§4A.7), and the result-record schema
+ (§4A.8). Read it before adding farm tooling or declaring the farm broken.
 - Prefer the build farm for heavy work: `install-helpers/xcp-build.sh`.
 - The current farm inventory lives in `docs/BUILD-ENVIRONMENT.md` and
- `install-helpers/farm.sh`; keep scripts and docs in sync.
+ `install-helpers/farm.sh`; keep scripts and docs in sync. The canonical roster
+ is `install-helpers/farm-topology.sh table` — never hardcode nodes or caps.
+- Check state before concluding anything about capacity:
+ `automation/lib/farm-dispatch.sh nodes` (reach/toolchain/disk/free slots) and
+ `automation/lib/farm-dispatch.sh slots` (`TOTAL_FREE=`). A saturated farm
+ logging `no admissible free slot … retry later` is working, not failing.
+- Farm scripts carry offline self-tests (`--self-test`); run the affected one
+ after editing, and never rewrite a farm script in place while it is running —
+ write a temp file and `mv` over it (`docs/BUILD-ENVIRONMENT.md` §4A.7).
 - Local builds on the Rocky dev host need the gold linker override:
  `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`.
 - GUI/runtime claims need either farm verification or an explicit note that the
