@@ -44,6 +44,21 @@ log() { echo "==> dispatch: $*" >&2; }
 reachable()   { timeout 4 bash -c "cat </dev/null >/dev/tcp/$1/22" 2>/dev/null; }
 toolchained() { "${SSH[@]}" -n "mm@$1" '. "$HOME/.cargo/env" 2>/dev/null; command -v cargo >/dev/null && command -v g++ >/dev/null' 2>/dev/null; }
 
+# has_capacity <node> — check if node has at least 8GB free in /home. This
+# pre-filters nodes BEFORE dispatch to prevent ENOSPC failures. The 8GB
+# threshold matches xcp-build.sh's MIN_SYNC_FREE_KIB default.
+MIN_FREE_KIB="${MCNF_DISPATCH_MIN_FREE_KIB:-8388608}"
+has_capacity() {
+  local node="$1" free_kib
+  free_kib="$("${SSH[@]}" -n "mm@$node" 'df -Pk "$HOME" | awk "NR == 2 { print \$4 }"' 2>/dev/null)" || return 1
+  case "$free_kib" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$free_kib" -lt "$MIN_FREE_KIB" ]; then
+    log "  $node has ${free_kib} KiB free, need ${MIN_FREE_KIB} KiB — skipping"
+    return 1
+  fi
+  return 0
+}
+
 # run <jobid> <command> — claim a free node, run, record result JSON.
 cmd_run() {
   local jobid="${1:?jobid}"; shift
@@ -53,13 +68,13 @@ cmd_run() {
   for n in $NODES; do
     exec {lockfd}>"$LOCKS/$n.lock"
     if flock -n "$lockfd"; then
-      if reachable "$n" && toolchained "$n"; then node="$n"; break; fi
-      flock -u "$lockfd"; exec {lockfd}>&-   # not ready → release, try next
+      if reachable "$n" && toolchained "$n" && has_capacity "$n"; then node="$n"; break; fi
+      flock -u "$lockfd"; exec {lockfd}>&-   # not ready/full → release, try next
     else
       exec {lockfd}>&-                        # busy → try next
     fi
   done
-  [ -n "$node" ] || { log "no free ready node (all busy/down) — retry later"; return 75; }  # EX_TEMPFAIL
+  [ -n "$node" ] || { log "no free ready node with capacity (all busy/down/full) — retry later"; return 75; }  # EX_TEMPFAIL
 
   local started log_file; started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; log_file="$LOGS/$jobid.log"
   log "job $jobid → $node : $command"
@@ -87,12 +102,16 @@ cmd_run() {
 cmd_result() { cat "$RESULTS/${1:?jobid}.json" 2>/dev/null || { echo "no result for $1" >&2; return 1; }; }
 
 cmd_nodes() {
-  printf '  %-16s %-7s %-7s %s\n' NODE REACH TOOLCH LOCK
+  printf '  %-16s %-7s %-7s %-7s %s\n' NODE REACH TOOLCH CAPACITY LOCK
   for n in $NODES; do
-    local r="down" t="-" l="free"
-    reachable "$n" && { r="up"; toolchained "$n" && t="ready" || t="bare"; }
+    local r="down" t="-" c="-" l="free"
+    if reachable "$n"; then
+      r="up"
+      toolchained "$n" && t="ready" || t="bare"
+      has_capacity "$n" 2>/dev/null && c="ok" || c="FULL"
+    fi
     exec {fd}>"$LOCKS/$n.lock"; flock -n "$fd" || l="BUSY"; flock -u "$fd" 2>/dev/null; exec {fd}>&-
-    printf '  %-16s %-7s %-7s %s\n' "$n" "$r" "$t" "$l"
+    printf '  %-16s %-7s %-7s %-7s %s\n' "$n" "$r" "$t" "$c" "$l"
   done
 }
 

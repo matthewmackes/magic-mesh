@@ -152,11 +152,9 @@ mod tests {
             .unwrap();
         assert_eq!(reset.steps.first(), Some(&"offboard".to_owned()));
         assert!(reset.validate().is_ok());
-        assert!(
-            controller
-                .plan(LifecycleIntentKind::ResetAndOnboard, "missing")
-                .is_none()
-        );
+        assert!(controller
+            .plan(LifecycleIntentKind::ResetAndOnboard, "missing")
+            .is_none());
     }
 
     fn progress(

@@ -489,19 +489,66 @@ str_hash() {
   printf '%s\n' "$h"
 }
 
+# probe_host_capacity <ip> — check if a host has sufficient disk capacity for a
+# build. Returns 0 (success) if the host has >= MIN_SYNC_FREE_KIB available,
+# returns 1 if insufficient capacity, returns 2 if unreachable. This is a
+# pre-routing capacity gate that filters out full nodes BEFORE job dispatch,
+# preventing repeated ENOSPC failures on nodes like .90/.130 with <1MB free.
+probe_host_capacity() {
+  local ip="$1" free_kib
+  free_kib="$(timeout 8 "${SSH[@]}" "$BUILD_USER@$ip" \
+    'df -Pk "$HOME" | awk "NR == 2 { print \$4 }"' 2>/dev/null)" || return 2
+  case "$free_kib" in
+    ''|*[!0-9]*) return 2 ;;
+  esac
+  if [ "$free_kib" -lt "$MIN_SYNC_FREE_KIB" ]; then
+    log "capacity: $ip has ${free_kib} KiB free, need ${MIN_SYNC_FREE_KIB} KiB — skipping"
+    return 1
+  fi
+  return 0
+}
+
+# filter_hosts_by_capacity <topology-text> — given the topology records (one
+# "<shape> <ip>" per line), probe each candidate and emit only those with
+# sufficient disk capacity. This pre-filters the routing pool so pick_host()
+# never selects a full node. Falls back to returning the original topology if
+# ALL hosts are full or unreachable (better to try and fail with a clear error
+# than to silently degrade to no routing). Set MCNF_SKIP_CAPACITY_PROBE=1 to
+# bypass for offline tests.
+filter_hosts_by_capacity() {
+  local topo="$1" filtered="" s ip has_any=0
+  [ -n "${MCNF_SKIP_CAPACITY_PROBE:-}" ] && { printf '%s\n' "$topo"; return 0; }
+  while IFS=' ' read -r s ip; do
+    [ -n "$s" ] || continue
+    has_any=1
+    if probe_host_capacity "$ip"; then
+      filtered+="$s $ip"$'\n'
+    fi
+  done <<EOF
+$topo
+EOF
+  if [ -n "$filtered" ]; then
+    printf '%s' "$filtered"
+  elif [ "$has_any" -eq 1 ]; then
+    warn "capacity: ALL candidate hosts full or unreachable — falling back to full topology (will fail at sync)"
+    printf '%s\n' "$topo"
+  fi
+}
+
 # resolve_host <cargo-args...> — the routing ENTRYPOINT used by the dispatch.
 # Sets the global BUILD_HOST + DEST. An explicit MCNF_BUILD_HOST short-circuits
 # everything (operator pin wins). Otherwise: infer shape → read live topology →
-# pick_host → log the choice + reason.
+# filter by capacity → pick_host → log the choice + reason.
 resolve_host() {
   if [ -n "${MCNF_BUILD_HOST:-}" ]; then
     BUILD_HOST="$MCNF_BUILD_HOST"
     log "route: MCNF_BUILD_HOST pinned → $BUILD_HOST (shape routing skipped)"
   else
-    local shape topo result
+    local shape topo filtered result
     shape="$(infer_shape "$@")"
     topo="$(read_topology)"
-    result="$(pick_host "$shape" "$topo" "$DEFAULT_BUILD_HOST" "${MCNF_BUILD_SLOT:-0}")"
+    filtered="$(filter_hosts_by_capacity "$topo")"
+    result="$(pick_host "$shape" "$filtered" "$DEFAULT_BUILD_HOST" "${MCNF_BUILD_SLOT:-0}")"
     BUILD_HOST="$(printf '%s\n' "$result" | sed -n '1p')"
     log "route: shape=$shape → $BUILD_HOST ($(printf '%s\n' "$result" | sed -n '2p'))"
   fi
@@ -604,6 +651,14 @@ route_self_test() {
   else
     check "tofu-join (jq unavailable — skipped)" skip skip
   fi
+
+  # --- capacity filter (MCNF_SKIP_CAPACITY_PROBE bypasses live SSH probes) ---
+  # The filter passes topology through unchanged when probe is skipped.
+  check "capacity filter passthrough" \
+    "$(MCNF_SKIP_CAPACITY_PROBE=1 filter_hosts_by_capacity "$TOPO" | tr '\n' '|')" \
+    "big 172.20.0.130|small 172.20.0.50|small 172.20.0.90|small 172.20.0.100|"
+  check "capacity filter empty topo" \
+    "$(MCNF_SKIP_CAPACITY_PROBE=1 filter_hosts_by_capacity "")" ""
 
   echo
   if [ "$fails" -eq 0 ]; then
