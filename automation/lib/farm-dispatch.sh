@@ -255,6 +255,68 @@ reclaim_on() {
   return 1
 }
 
+# current_commit — the source rev exactly as a result records it, so freshness
+# comparisons are apples-to-apples. A dirty tree is marked, never silently equal.
+current_commit() {
+  local c; c="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  git -C "$REPO" diff --quiet 2>/dev/null || c="${c}-dirty"
+  printf '%s\n' "$c"
+}
+
+# command_key <command> — stable short digest used to name the per-command lock.
+command_key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+
+# find_equivalent_result <command> <commit> — print the path of an existing
+# result for the SAME command at the SAME commit. Deliberately mirrors
+# farm-reconcile.sh's is_fresh(): a result counts only when the recorded commit
+# equals the current one, and a dirty tree is never reusable because two runs of
+# one command cannot be proven equal against uncommitted edits.
+find_equivalent_result() {
+  local command="$1" commit="$2" found
+  case "$commit" in *-dirty|unknown) return 1 ;; esac
+  found="$(python3 - "$RESULTS" "$command" "$commit" <<'PY'
+import json, os, sys
+results, cmd, commit = sys.argv[1], sys.argv[2], sys.argv[3]
+for name in sorted(os.listdir(results)):
+    if not name.endswith('.json'):
+        continue
+    try:
+        with open(os.path.join(results, name)) as fh:
+            d = json.load(fh)
+    except Exception:
+        continue
+    if (d.get('command') == cmd and d.get('commit') == commit
+            and d.get('outcome') in ('pass', 'fail')):
+        print(os.path.join(results, name))
+        break
+PY
+)" || return 1
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
+}
+
+# adopt_result <source-json> <jobid> — republish an equivalent run under this
+# jobid so the caller's own result file exists (farm-reconcile.sh reads results
+# per jobid, and a missing one reads as a red build). Returns the outcome's code.
+adopt_result() {
+  local src="$1" jobid="$2" outcome
+  outcome="$(python3 - "$src" "$RESULTS/$jobid.json" "$jobid" <<'PY'
+import json, sys
+src, dst, jobid = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src) as fh:
+    d = json.load(fh)
+d['jobid'] = jobid
+d['reused_from'] = json.load(open(src)).get('jobid')
+with open(dst, 'w') as fh:
+    json.dump(d, fh)
+    fh.write('\n')
+print(d.get('outcome', '?'))
+PY
+)" || return 1
+  log "job $jobid reuses an identical run at the same commit ($outcome) — no second slot spent"
+  [ "$outcome" = "pass" ]
+}
+
 # ============================================================================
 # run — reserve one admissible slot, sync, execute, record.
 # ============================================================================
@@ -292,6 +354,31 @@ cmd_run() {
       return $?
     fi
     # Owner released without publishing a fresh result: fall through and run it.
+  fi
+
+  # DEDUPLICATION BY COMMAND. Distinct worklist epics tag the same gate, so
+  # several unique job ids can carry a byte-identical command — four copies of
+  # `cargo test -p mde-collab-egui` once occupied four slots at the same commit.
+  # Serialize identical commands on one lock, then reuse the finished run instead
+  # of rebuilding it. Lock order is always jobid then command, so two jobs
+  # sharing a command cannot deadlock.
+  local ckey cfd equiv commit
+  commit="$(current_commit)"
+  ckey="$(command_key "$command")"
+  exec {cfd}>"$LOCKS/cmd-$ckey.lock" || { echo "cannot open command lock" >&2; return 2; }
+  if ! flock -n "$cfd"; then
+    log "an identical command is already running — waiting to reuse its result"
+    if ! flock -w "$JOB_WAIT_SECS" "$cfd"; then
+      exec {cfd}>&-; flock -u "$jobfd"; exec {jobfd}>&-
+      log "identical command still running after ${JOB_WAIT_SECS}s — retry later"
+      return 75
+    fi
+  fi
+  if equiv="$(find_equivalent_result "$command" "$commit")"; then
+    flock -u "$cfd"; exec {cfd}>&-
+    adopt_result "$equiv" "$jobid"; local adopted=$?
+    flock -u "$jobfd"; exec {jobfd}>&-
+    return "$adopted"
   fi
 
   # Materialize the candidate list first: probing inside a `read` loop that is
@@ -335,6 +422,7 @@ EOF
   done
 
   if [ -z "$node" ]; then
+    flock -u "$cfd"; exec {cfd}>&-
     flock -u "$jobfd"; exec {jobfd}>&-
     log "no admissible free slot for $jobid ($shape) — all reserved/down/full; retry later"
     return 75   # EX_TEMPFAIL
@@ -363,14 +451,17 @@ EOF
   flock -u "$lockfd"; exec {lockfd}>&-
 
   local outcome="pass"; [ "$exit_code" -eq 0 ] || outcome="fail"
-  # Record the source rev (with -dirty marker) so a reconciler can tell stale from fresh.
-  local commit; commit="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  git -C "$REPO" diff --quiet 2>/dev/null || commit="${commit}-dirty"
+  # Re-read the source rev at completion (with -dirty marker) so a reconciler can
+  # tell stale from fresh even if the tree moved while the job ran.
+  commit="$(current_commit)"
   printf '{"jobid":"%s","outcome":"%s","exit":%d,"node":"%s","slot":%d,"workspace":"%s","shape":"%s","commit":"%s","command":%s,"started":"%s","ended":"%s","log":"%s"}\n' \
     "$jobid" "$outcome" "$exit_code" "$node" "$slot" "$remote_dir" "$shape" "$commit" \
     "$(printf '%s' "$command" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')" \
     "$started" "$ended" "$log_file" > "$RESULTS/$jobid.json"
   log "job $jobid $outcome (exit $exit_code) on $node slot$slot — result $RESULTS/$jobid.json"
+  # Release the command lock only after the result is published, so a waiter on
+  # the same command finds it and reuses it instead of rebuilding.
+  flock -u "$cfd"; exec {cfd}>&-
   flock -u "$jobfd"; exec {jobfd}>&-
   [ "$exit_code" -eq 0 ]
 }
@@ -595,6 +686,33 @@ self_test() {
     *) check "legacy tree protected while its job holds the node" "offered it" "protected" ;;
   esac
   rm -rf "$td"
+
+  # --- dedupe by command: same command + same clean commit is reusable ---
+  local rd; rd="$(mktemp -d "${TMPDIR:-/tmp}/farm-dispatch-res.XXXXXX")" || return 1
+  local RESULTS="$rd"   # shadow the global for these assertions only
+  printf '{"jobid":"j1","outcome":"pass","commit":"abc1234","command":"cargo test -p mde-collab-egui"}\n' >"$rd/j1.json"
+  printf '{"jobid":"j2","outcome":"fail","commit":"abc1234","command":"cargo test -p mde-files"}\n' >"$rd/j2.json"
+  check "same command at same commit is reusable" \
+    "$(find_equivalent_result 'cargo test -p mde-collab-egui' abc1234 >/dev/null && echo yes || echo no)" yes
+  check "a different command is not reusable" \
+    "$(find_equivalent_result 'cargo test -p mackesd' abc1234 >/dev/null && echo yes || echo no)" no
+  check "same command at another commit is not reusable" \
+    "$(find_equivalent_result 'cargo test -p mde-collab-egui' def5678 >/dev/null && echo yes || echo no)" no
+  # A dirty tree must never dedupe: two runs cannot be proven equal.
+  check "dirty tree refuses reuse" \
+    "$(find_equivalent_result 'cargo test -p mde-collab-egui' abc1234-dirty >/dev/null && echo yes || echo no)" no
+  check "a failed run is reusable too (a red gate is still an answer)" \
+    "$(find_equivalent_result 'cargo test -p mde-files' abc1234 >/dev/null && echo yes || echo no)" yes
+  # Adoption republishes under the new jobid and preserves the outcome.
+  adopt_result "$rd/j1.json" j9 >/dev/null 2>&1
+  check "adopted result is published under the adopting jobid" \
+    "$(python3 -c "import json;d=json.load(open('$rd/j9.json'));print(d['jobid'],d['outcome'],d['reused_from'])" 2>/dev/null)" \
+    "j9 pass j1"
+  check "identical commands share one lock key" \
+    "$([ "$(command_key 'cargo test -p x')" = "$(command_key 'cargo test -p x')" ] && echo same || echo differ)" same
+  check "different commands get different lock keys" \
+    "$([ "$(command_key 'cargo test -p x')" = "$(command_key 'cargo test -p y')" ] && echo same || echo differ)" differ
+  rm -rf "$rd"
 
   if [ "$fails" -eq 0 ]; then echo "farm-dispatch: self-test passed"; return 0; fi
   echo "farm-dispatch: SELF-TEST FAILED ($fails)" >&2; return 1
