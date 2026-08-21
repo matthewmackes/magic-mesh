@@ -9,6 +9,7 @@ set -euo pipefail
 
 REPO="${MCNF_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
 ROOT="${MCNF_AGENT_WORKTREE_ROOT:-${TMPDIR:-/tmp}/mcnf-drain-worktrees}"
+LIFECYCLE="${MCNF_AGENT_LIFECYCLE:-$(cd "$(dirname "$0")" && pwd)/agent-lifecycle.sh}"
 RUNTIME=""
 JOB=""
 EPIC=""
@@ -59,7 +60,9 @@ mkdir -p "$ROOT"
 WORKTREE="$ROOT/$RUNTIME-$EPIC-$JOB"
 LOG="$WORKTREE/agent.log"
 if [[ -e "$WORKTREE" ]]; then
-  if [[ -f "$WORKTREE/.agent-pid" ]] && kill -0 "$(cat "$WORKTREE/.agent-pid")" 2>/dev/null; then
+  if [[ -f "$WORKTREE/.agent-state" ]] &&
+      [[ "$(awk -F= '$1 == "pid" { print $2; exit }' "$WORKTREE/.agent-state")" =~ ^[0-9]+$ ]] &&
+      kill -0 "$(awk -F= '$1 == "pid" { print $2; exit }' "$WORKTREE/.agent-state")" 2>/dev/null; then
     echo "native-agent-dispatch: job already running: $WORKTREE" >&2
     exit 0
   fi
@@ -67,6 +70,8 @@ if [[ -e "$WORKTREE" ]]; then
   exit 75
 fi
 git -C "$REPO" worktree add --detach "$WORKTREE" HEAD >/dev/null
+printf 'job_id=%s\nepic=%s\nruntime=%s\ncommand=%s\nstatus=dispatching\npid=\nstarted_at=%s\nheartbeat_at=%s\n' \
+  "$JOB" "$EPIC" "$RUNTIME" "$COMMAND" "$(date +%s)" "$(date +%s)" >"$WORKTREE/.agent-state"
 
 PROMPT="$(cat <<EOF
 You are the $RUNTIME implementation agent for worklist unit $JOB ($EPIC).
@@ -101,5 +106,20 @@ case "$RUNTIME" in
     ;;
 esac
 printf '%s\n' "$!" > "$WORKTREE/.agent-pid"
+agent_pid="$!"
+touch "$WORKTREE/.agent-heartbeat"
+(
+  while kill -0 "$agent_pid" 2>/dev/null; do
+    touch "$WORKTREE/.agent-heartbeat"
+    sleep "${MCNF_AGENT_HEARTBEAT_SECS:-30}"
+  done
+) >/dev/null 2>&1 &
+awk -F= -v pid="$agent_pid" -v heartbeat="$(date +%s)" '
+  $1 == "pid" { print "pid=" pid; next }
+  $1 == "status" { print "status=running"; next }
+  $1 == "heartbeat_at" { print "heartbeat_at=" heartbeat; next }
+  { print }
+' "$WORKTREE/.agent-state" >"$WORKTREE/.agent-state.tmp"
+mv "$WORKTREE/.agent-state.tmp" "$WORKTREE/.agent-state"
 printf 'native-agent-dispatch: started runtime=%s job=%s worktree=%s pid=%s\n' \
-  "$RUNTIME" "$JOB" "$WORKTREE" "$!"
+  "$RUNTIME" "$JOB" "$WORKTREE" "$agent_pid"

@@ -18,6 +18,7 @@ WATCHDOG="${MCNF_DISK_WATCHDOG:-$REPO/install-helpers/disk-watchdog.sh}"
 RECONCILE="${MCNF_FARM_RECONCILE:-$REPO/automation/reconciler/farm-reconcile.sh}"
 GUARD="$REPO/automation/drain/worktree-guard.sh"
 DISPATCH="${MCNF_AGENT_DISPATCH:-$REPO/automation/drain/agent-dispatch.sh}"
+LIFECYCLE="${MCNF_AGENT_LIFECYCLE:-$REPO/automation/drain/agent-lifecycle.sh}"
 DRY=0
 ONCE=1
 
@@ -51,6 +52,11 @@ tick() {
     "$WATCHDOG" || log "disk watchdog reported a non-fatal issue"
   else
     log "disk watchdog missing at $WATCHDOG"
+  fi
+
+  if [ -x "$LIFECYCLE" ]; then
+    log "reconcile implementation-agent lifecycle"
+    "$LIFECYCLE" reap || log "agent lifecycle reported a non-fatal issue"
   fi
 
   log "farm reconcile"

@@ -9,6 +9,7 @@ DISPATCH="$REPO/automation/lib/farm-dispatch.sh"
 RECONCILE="$REPO/automation/reconciler/farm-reconcile.sh"
 AGENT="$REPO/automation/drain/agent-dispatch.sh"
 NATIVE="$REPO/automation/drain/native-agent-dispatch.sh"
+LIFECYCLE="$REPO/automation/drain/agent-lifecycle.sh"
 TOPOLOGY="$REPO/install-helpers/farm-topology.sh"
 
 fail() { echo "lint-luna-design: FAIL: $*" >&2; exit 1; }
@@ -18,6 +19,7 @@ fail() { echo "lint-luna-design: FAIL: $*" >&2; exit 1; }
 [ -f "$RECONCILE" ] || fail "missing $RECONCILE"
 [ -f "$AGENT" ] || fail "missing $AGENT"
 [ -f "$NATIVE" ] || fail "missing $NATIVE"
+[ -f "$LIFECYCLE" ] || fail "missing $LIFECYCLE"
 [ -f "$TOPOLOGY" ] || fail "missing $TOPOLOGY"
 
 grep -q 'Luna — dependable 24-hour build manager' "$DESIGN" || fail "design title missing"
@@ -39,6 +41,11 @@ grep -q -- '--self-test' "$DISPATCH" || fail "farm-dispatch.sh must expose --sel
 grep -q -- '--self-test' "$RECONCILE" || fail "farm-reconcile.sh must expose --self-test"
 grep -q -- '--self-test' "$AGENT" || fail "agent-dispatch.sh must expose --self-test"
 grep -q -- '--self-test' "$NATIVE" || fail "native-agent-dispatch.sh must expose --self-test"
+grep -q -- '--self-test' "$LIFECYCLE" || fail "agent-lifecycle.sh must expose --self-test"
+grep -q 'status_cmd' "$LIFECYCLE" || fail "agent-lifecycle.sh must expose status management"
+grep -q 'reap_cmd' "$LIFECYCLE" || fail "agent-lifecycle.sh must expose stale reaping"
+grep -q 'salvage_cmd' "$LIFECYCLE" || fail "agent-lifecycle.sh must expose salvage"
+grep -q 'requeue_cmd' "$LIFECYCLE" || fail "agent-lifecycle.sh must expose requeue"
 grep -q 'table)' "$TOPOLOGY" || fail "farm-topology.sh must expose table"
 
 # Guard against reintroducing a stale liveness model.
