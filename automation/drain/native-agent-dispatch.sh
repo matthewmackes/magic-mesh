@@ -14,6 +14,30 @@ JOB=""
 EPIC=""
 COMMAND=""
 
+self_test() {
+  local td repo wt root
+  td="$(mktemp -d "${TMPDIR:-/tmp}/native-agent-dispatch.XXXXXX")"
+  trap 'rm -rf "$td"' RETURN
+  repo="$td/repo"
+  root="$td/worktrees"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email luna@example.invalid
+  git -C "$repo" config user.name Luna
+  printf 'x\n' > "$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -qm init
+  MCNF_REPO="$repo" MCNF_AGENT_WORKTREE_ROOT="$root" \
+    "$0" --runtime cursor --job-id 0123456789ab --epic WL-TEST-001 --command 'cargo test -p mde-bus' >/dev/null 2>&1 || true
+  [[ -d "$root/cursor-WL-TEST-001-0123456789ab" ]] || { echo "native-agent-dispatch: self-test failed (worktree missing)" >&2; exit 1; }
+  echo "native-agent-dispatch: self-test passed"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  self_test
+  exit 0
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --runtime) RUNTIME="${2:?runtime}"; shift 2 ;;
@@ -35,8 +59,12 @@ mkdir -p "$ROOT"
 WORKTREE="$ROOT/$RUNTIME-$EPIC-$JOB"
 LOG="$WORKTREE/agent.log"
 if [[ -e "$WORKTREE" ]]; then
-  echo "native-agent-dispatch: job already dispatched: $WORKTREE" >&2
-  exit 0
+  if [[ -f "$WORKTREE/.agent-pid" ]] && kill -0 "$(cat "$WORKTREE/.agent-pid")" 2>/dev/null; then
+    echo "native-agent-dispatch: job already running: $WORKTREE" >&2
+    exit 0
+  fi
+  echo "native-agent-dispatch: stale worktree: $WORKTREE" >&2
+  exit 75
 fi
 git -C "$REPO" worktree add --detach "$WORKTREE" HEAD >/dev/null
 
@@ -72,5 +100,6 @@ case "$RUNTIME" in
       --add-dir "$1" "$2"' bash "$WORKTREE" "$PROMPT" >"$LOG" 2>&1 &
     ;;
 esac
+printf '%s\n' "$!" > "$WORKTREE/.agent-pid"
 printf 'native-agent-dispatch: started runtime=%s job=%s worktree=%s pid=%s\n' \
   "$RUNTIME" "$JOB" "$WORKTREE" "$!"
