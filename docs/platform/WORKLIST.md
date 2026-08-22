@@ -708,16 +708,16 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: Verify `BOUNDS_ENVELOPE` now contains official Erie/Niagara TIGER
-  bbox `[-79.312136,42.437997,-78.460416,43.634799]` (`west -79.35`, `north 43.70`);
-  `parse_bounds` admits that clip. Dest-root raster
-  `buffalo-niagara.pbf-raster.mbtiles` 167936 B sha256
-  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` and clipped PBF
-  34073493 B remain on BigBoy `172.20.0.130` `/home/mm/mcnf-maps-sources`
-  (`production_admitted: false`; bind_receipt still false). Leftover is production
-  dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and the
-  `production_admitted` gate. App VM S3 and Kiron S6 remain admitted. Evidence:
-  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-verify-envelope-r1.md`.
+- Current state: Canonical dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
+  on BigBoy `172.20.0.130` holds dest-root OSM-derived raster 167936 B sha256
+  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` (sidecar
+  `mcnf-maps-dest-install`; `production_admitted: false`; bind_receipt still
+  false). Dest-root fixture `buffalo-niagara.mbtiles` 12288 B sha256
+  `dd7cde7e116cb52f114fc1c886fec32618bdfcb8c82a16e3e45dae601c87046e` is
+  untouched. Not Dell/Seat 15/Surface admission. Leftover is candidate-bound
+  production receipt / `production_admitted` and live-seat dest (WL-TEST-002).
+  App VM S3 and Kiron S6 remain admitted. Evidence:
+  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-dest-install-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -744,12 +744,12 @@ is a capacity incident (§10.0.3), not a silent retry.
        `production_admitted: false`). Osmium clipped NY PBF to
        `erie-niagara.osm.pbf` (sidecar `mcnf-maps-pbf-clip`;
        `production_admitted: false`; official bbox, not envelope-shrunk).
-       Remaining: dest-root OSM-derived raster exists
-       (`buffalo-niagara.pbf-raster.mbtiles`; not production admission).
-       Verify envelope now admits the official TIGER clip. Leftover is
-       production dest
-       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and
-       `production_admitted` (bind_receipt still false). Clipped PBF is not
+       Remaining: BigBoy canonical dest now holds the dest-root OSM-derived
+       raster (sidecar `mcnf-maps-dest-install`; not production admission;
+       not Dell/Seat 15/Surface). Envelope admits official TIGER clip.
+       Leftover is candidate-bound production receipt /
+       `production_admitted` (bind_receipt still false) and live-seat dest
+       (WL-TEST-002). Clipped PBF is not
        MBTiles admission. Fixture PNG raster is not production
        admission. Preserve PBF, boundary, clip,
        renderer/style/font identities, ODbL attribution, aggregate quota,
