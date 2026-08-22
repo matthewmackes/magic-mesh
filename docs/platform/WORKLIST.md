@@ -404,15 +404,16 @@ is a capacity incident (§10.0.3), not a silent retry.
   identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: helper `install-helpers/provision-bootstrap-ssh-identity.py` copies source identity + known-hosts onto dest regular files
-  (no-replace, no symlink, dest outside Git; key mode 0600). Control-host dests exist at `/root/mcnf-private/bootstrap-ssh-key` and
-  `/root/mcnf-private/bootstrap-known-hosts` (sidecar `/root/mcnf-private/bootstrap-ssh-identity.json`, mode 0400, not in Git).
-  `MACKESD_BOOTSTRAP_SSH_KEY` and `MACKESD_BOOTSTRAP_KNOWN_HOSTS` stay unset. Seat 15 `172.20.0.15` is already enrolled
-  (`Basement-Test-Workstation`); first-enroll of that IP is not the leftover. Freeze bar still requires mint bearer, bind those dests
-  as env/credential inputs, then live enroll or offboard/reenroll under red `AI-GENERATED-ALERT` + 5s. Evidence:
-  `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`, `WL-FUNC-023-2026-08-22-bootstrap-identity-provision-r1.md`.
-- Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer, (2) point `MACKESD_BOOTSTRAP_SSH_KEY` and
-  `MACKESD_BOOTSTRAP_KNOWN_HOSTS` at the provisioned regular dests (helper exists; login env remains unset), (3) live enroll or
+- Current state: helper `install-helpers/bind-bootstrap-ssh-env.py` writes a no-replace env file with the two dest-path
+  assignments (mode 0400; dest env + sidecar outside Git). Control-host dests exist at `/root/mcnf-private/bootstrap-ssh-key`
+  and `/root/mcnf-private/bootstrap-known-hosts`; env file `/root/mcnf-private/bootstrap-ssh.env` (sidecar
+  `/root/mcnf-private/bootstrap-ssh-env.json`, mode 0400, not in Git). Login env `MACKESD_BOOTSTRAP_SSH_KEY` and
+  `MACKESD_BOOTSTRAP_KNOWN_HOSTS` stay unset. Seat 15 `172.20.0.15` is already enrolled (`Basement-Test-Workstation`).
+  Freeze bar still requires mint bearer, source/bind those dests for the live enroll worker, then live enroll or
+  offboard/reenroll under red `AI-GENERATED-ALERT` + 5s. Evidence: `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`,
+  `WL-FUNC-023-2026-08-22-bootstrap-identity-provision-r1.md`, `WL-FUNC-023-2026-08-22-bootstrap-env-bind-r1.md`.
+- Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer, (2) source/bind `MACKESD_BOOTSTRAP_SSH_KEY` and
+  `MACKESD_BOOTSTRAP_KNOWN_HOSTS` for the live enroll worker (env file exists; login env remains unset), (3) live enroll or
   authorized offboard/reenroll under red `AI-GENERATED-ALERT` + 5s. Seat 15 is already a named workstation; first-enroll of that IP
   is not the remaining act unless the operator chooses offboard+reenroll. GPT Luna: execute S1-S18 in order; do not close a story
   from compilation alone.
