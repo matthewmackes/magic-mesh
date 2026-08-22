@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 3 `Remaining`, 16 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 2 `Remaining`, 17 `Blocked`, 0 `Needs clarification`.
   Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
   surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
   fetch authorized; preflight template then operator secrets; seats+Vitelity go.
@@ -208,7 +208,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 
 ### WL-REL-007 - Execute the SOL Luna AI production 13.0.0 completion plan
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: the active lifecycle, release-input, source-freeze, build, signing,
@@ -221,17 +221,13 @@ is a capacity incident (§10.0.3), not a silent retry.
   qualify, publish, read back, and archive production
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
-- Current state: the eight owning epics below contain their product and release
-  criteria. Historical preview and source-bound receipts predate the final
-  lifecycle source and cannot satisfy this plan. Surface is approved for
-  `13.0.0`; Android/Cuttlefish is deferred and creates no release dependency.
-  Input selections and self-signing are authorized. WL-REL-006 is parked:
-  remaining inputs need freeze, operator catalog refs, or the RPM signer
-  secret. Remaining coordinator demand is FUNC-023 live enroll and FUNC-033
-  keep `own_nebula_ip`. Keys,
-  provider credentials, farm authority, and publication access are named
-  system credentials verified by unattended preflight. Exact acceptance is
-  Dell, Seat 15, Surface, and three lighthouses.
+- Current state: the eight owning epics contain product and release criteria.
+  Surface is approved for `13.0.0`; Android/Cuttlefish is deferred. WL-REL-006
+  is parked (freeze / catalog refs / RPM secret). Coordinator leftover is
+  FUNC-023 live enroll (no unpublished signed candidate) and FUNC-033 keep
+  `own_nebula_ip`. Do not grind `cargo test --workspace` as filler. Evidence:
+  `WL-REL-007-2026-08-22-coordinator-park-r1.md`. Exact acceptance is Dell,
+  Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      - Inputs: this worklist, governance locks, farm topology, the eight owning
@@ -381,9 +377,9 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Relevant files/components: `docs/platform/WORKLIST.md`, release/farm helpers,
   OpenTofu farm declarations, lifecycle components, release input producers,
   packaging, evidence collectors, and publication verifiers.
-- Dependencies: the eight owning epics and automated credential,
-  Dell/Seat 15/Surface, and three-lighthouse preflight gates. Story-level
-  dependencies are enforced in S1-S8 order; a failed gate reopens its owning
+- Dependencies: WL-FUNC-023 live enroll after an unpublished signed candidate;
+  WL-FUNC-033 keep `own_nebula_ip`; parked WL-REL-006 leftovers; then the
+  remaining release chain in S1-S8 order. A failed gate reopens its owning
   story rather than requesting interactive resolution.
 - Acceptance criteria: one clean source produces exactly six signed roles;
   real governed inputs pass preflight; production topology passes; signed evidence and public
