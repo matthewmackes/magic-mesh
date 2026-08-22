@@ -48,10 +48,32 @@ pub fn found_argv(mesh_id: &str, external_addr: &str, role: SetupRole) -> Vec<St
     ]
 }
 
+/// Command-template placeholder refused when no minted bearer is present.
+/// The wizard must not shell `mackesd join '{{JOIN_TOKEN}}'`.
+const JOIN_TOKEN_TEMPLATE: &str = "{{JOIN_TOKEN}}";
+
+/// Refuse a command-template or empty bearer so join cannot be shelled
+/// without minted enrollment material. A successful value is the trimmed
+/// token and never the authority placeholder.
+pub fn minted_join_bearer(token: &str) -> Result<&str, String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || trimmed.contains(JOIN_TOKEN_TEMPLATE) {
+        return Err("join token is a command template, not a minted bearer".to_owned());
+    }
+    Ok(trimmed)
+}
+
 /// `mackesd join <token> --role <role>` — join an existing mesh (fp-pinned
 /// network enroll + role-aware QNM-Shared via BIRTHRIGHT-1).
+///
+/// Empty input and the authority template produce no argv: the streaming
+/// runner already treats an empty command as failure, so a renderer cannot
+/// launch join without a minted bearer.
 #[must_use]
 pub fn join_argv(token: &str, role: SetupRole) -> Vec<String> {
+    let Ok(token) = minted_join_bearer(token) else {
+        return Vec::new();
+    };
     vec![
         "mackesd".to_owned(),
         "join".to_owned(),
@@ -185,6 +207,27 @@ mod tests {
         assert_eq!(argv[1], "join");
         assert_eq!(argv[3], "--role");
         assert_eq!(argv[4], "workstation");
+    }
+
+    #[test]
+    fn join_argv_refuses_template_and_empty_bearer() {
+        for raw in ["", "   ", JOIN_TOKEN_TEMPLATE, "{{JOIN_TOKEN}} extra"] {
+            let error = minted_join_bearer(raw).expect_err(raw);
+            assert_eq!(
+                error, "join token is a command template, not a minted bearer",
+                "raw={raw:?}"
+            );
+            assert!(
+                join_argv(raw, SetupRole::Workstation).is_empty(),
+                "unminted join must not emit argv: {raw:?}"
+            );
+        }
+        let minted = "mesh:home@1.2.3.4:4243#single-use-bearer";
+        assert_eq!(minted_join_bearer(minted).unwrap(), minted);
+        let argv = join_argv(minted, SetupRole::Lighthouse);
+        assert_eq!(argv[1], "join");
+        assert_eq!(argv[2], minted);
+        assert_ne!(argv[2], JOIN_TOKEN_TEMPLATE);
     }
 
     #[test]
