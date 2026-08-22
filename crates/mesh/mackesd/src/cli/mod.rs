@@ -87,8 +87,8 @@ pub mod validate;
 pub mod vpn_import;
 pub mod wake_peer;
 
-/// WL-FUNC-033 — leftover retirement: `cli/voip_rtt.rs` stays on disk
-/// but is no longer a live `pub mod` path compiled by this CLI tree.
+/// WL-FUNC-033 — leftover retirement: `voip_rtt.rs` is gone from this
+/// tree. Do not reintroduce the leftover file or a live `pub mod` path for it.
 #[cfg(test)]
 mod leftover_retirements {
     /// Live `pub mod` names compiled by this CLI tree (source-parsed).
@@ -126,6 +126,19 @@ mod leftover_retirements {
         assert!(
             live.contains(&"vpn_import") && live.contains(&"validate"),
             "parser still sees neighboring live cli mods"
+        );
+    }
+
+    #[test]
+    fn voip_rtt_rs_leftover_file_is_gone() {
+        let leftover = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cli")
+            .join("voip_rtt.rs");
+        assert!(
+            !leftover.is_file(),
+            "WL-FUNC-033 leftover file is gone and must stay deleted: {}",
+            leftover.display()
         );
     }
 }
