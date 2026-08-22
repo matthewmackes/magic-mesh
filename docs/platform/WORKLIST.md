@@ -1575,12 +1575,10 @@ story execution contract above.
   document to a space, participants join with view/edit permission and
   follow-mode, and the session lifecycle is visible and closable by its
   owner.
-- Current state: the CRDT/collab_session/follow library is carried by the
-  embedded `mde-editor-egui` surface; fixture.rs already projects live
-  sessions. Phase-3c markers are gone; external-write merge against the
-  live editor rope landed. Shell drains DocumentShareCommand locally.
-  Leftover is live two-seat evidence (and session still private in
-  documents.rs until the sibling lands).
+- Current state: documents.rs now exposes live_document_share_session();
+  follow/unfollow/close apply on the attached session. Leftover: shell
+  show() still passes None until the sibling pub+wire lands; live
+  two-seat evidence remains.
 - Remaining work: shell drains DocumentShareCommand locally; leftover
   is live two-seat evidence (and session still private in documents.rs
   until the sibling lands).
