@@ -29,7 +29,7 @@ TILE_CDN_ALT = "https://tiles.openstreetmap.org/1/0/0.png"
 TILE_OSM = "https://tile.osm.org/0/0/0.png"
 FIXTURE_PBF = b"OSM-PBF-FIXTURE\n"
 FIXTURE_CLIP = b"OSM-PBF-CLIP-FIXTURE\n"
-# Official TIGER extract bbox (west is slightly west of verify envelope -79.30).
+# Official TIGER extract bbox (now inside the widened verify envelope).
 OFFICIAL_BBOX = [-79.312136, 42.437997, -78.460416, 43.634799]
 FIXTURE_BBOX = [-79.120000, 42.700000, -78.500000, 43.300000]
 
@@ -182,7 +182,7 @@ def main() -> None:
         assert bbox == [-79.12, 42.70, -78.50, 43.30]
         assert extract.format_bbox_arg(bbox) == "-79.120000,42.700000,-78.500000,43.300000"
         assert extract.bounds_envelope_compatible(bbox) is True
-        assert extract.bounds_envelope_compatible(OFFICIAL_BBOX) is False
+        assert extract.bounds_envelope_compatible(OFFICIAL_BBOX) is True
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -247,7 +247,7 @@ def main() -> None:
                 geometry_sidecar="erie-niagara.geojson.sha256.json",
             )
             assert official_record["bbox"] == OFFICIAL_BBOX
-            assert official_record["bounds_envelope_compatible"] is False
+            assert official_record["bounds_envelope_compatible"] is True
             assert official_record["production_admitted"] is False
             assert official_captured["argv"][3] == "--bbox=-79.312136,42.437997,-78.460416,43.634799"
 

@@ -424,9 +424,8 @@ def write_mbtiles_sqlite(path: Path, rendered: dict[str, Any], bbox: list[float]
         raise Refusal("MBTiles license must be ODbL-1.0")
     if rendered.get("name") not in {None, REGION_ID}:
         raise Refusal("path substitution refused: MBTiles name is not buffalo-niagara")
-    # Official clip bbox is written as-is. Do not call verify.parse_bounds:
-    # west -79.312136 escapes the verifier envelope -79.30, and shrinking
-    # would cheat the leftover production gate.
+    # Official clip bbox is written as-is. Do not shrink west/north to cheat
+    # the verifier envelope; the widened envelope now contains this clip.
     admitted = extract.admit_bbox(bbox, "MBTiles")
     connection = sqlite3.connect(path)
     try:

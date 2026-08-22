@@ -708,17 +708,16 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: BigBoy `172.20.0.130` dest-root `/home/mm/mcnf-maps-sources` now
-  has OSM-derived raster `buffalo-niagara.pbf-raster.mbtiles` 167936 B sha256
-  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` (sidecar
-  `mcnf-maps-pbf-raster`; `production_admitted: false`; z8–z10, 30 PNG tiles;
-  official bbox `[-79.312136,42.437997,-78.460416,43.634799]` unshrunk). Clipped
-  PBF 34073493 B sha256 `c5fd765d68e0051b7a4fb4ae896653bf0a427495497ff13294cb37d4716d481c`
-  and fixture `buffalo-niagara.mbtiles` 12288 B are unchanged. Envelope west
-  `-79.30` still refuses official west `-79.312136`. Leftover is production dest
-  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and the
-  verify-envelope / `production_admitted` gate. App VM S3 and Kiron S6 remain
-  admitted. Evidence: `docs/platform/evidence/WL-REL-006-2026-08-22-maps-pbf-raster-r1.md`.
+- Current state: Verify `BOUNDS_ENVELOPE` now contains official Erie/Niagara TIGER
+  bbox `[-79.312136,42.437997,-78.460416,43.634799]` (`west -79.35`, `north 43.70`);
+  `parse_bounds` admits that clip. Dest-root raster
+  `buffalo-niagara.pbf-raster.mbtiles` 167936 B sha256
+  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` and clipped PBF
+  34073493 B remain on BigBoy `172.20.0.130` `/home/mm/mcnf-maps-sources`
+  (`production_admitted: false`; bind_receipt still false). Leftover is production
+  dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and the
+  `production_admitted` gate. App VM S3 and Kiron S6 remain admitted. Evidence:
+  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-verify-envelope-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -747,9 +746,10 @@ is a capacity incident (§10.0.3), not a silent retry.
        `production_admitted: false`; official bbox, not envelope-shrunk).
        Remaining: dest-root OSM-derived raster exists
        (`buffalo-niagara.pbf-raster.mbtiles`; not production admission).
-       Leftover is production dest
-       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and the
-       verify-envelope / `production_admitted` gate. Clipped PBF is not
+       Verify envelope now admits the official TIGER clip. Leftover is
+       production dest
+       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and
+       `production_admitted` (bind_receipt still false). Clipped PBF is not
        MBTiles admission. Fixture PNG raster is not production
        admission. Preserve PBF, boundary, clip,
        renderer/style/font identities, ODbL attribution, aggregate quota,

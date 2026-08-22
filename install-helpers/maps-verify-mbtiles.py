@@ -32,7 +32,9 @@ MAX_RECEIPT_BYTES = 64 * 1024
 MAX_METADATA_VALUE = 4096
 MAX_ZOOM = 22
 # Erie + Niagara county envelope with a small official-geometry margin.
-BOUNDS_ENVELOPE = {"west": -79.30, "south": 42.35, "east": -78.35, "north": 43.45}
+# Official TIGER clip [-79.312136, 42.437997, -78.460416, 43.634799] must fit;
+# do not open the whole state of New York.
+BOUNDS_ENVELOPE = {"west": -79.35, "south": 42.35, "east": -78.35, "north": 43.70}
 FORBIDDEN_SOURCE_MARKERS = (
     "tile.openstreetmap.org",
     "tiles.openstreetmap.org",

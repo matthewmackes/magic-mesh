@@ -218,7 +218,7 @@ def main() -> None:
         assert raster.RASTER_MBTILES_NAME == "buffalo-niagara.pbf-raster.mbtiles"
         assert raster.FIXTURE_MBTILES_NAME == "buffalo-niagara.mbtiles"
         assert raster.extract.bounds_envelope_compatible(FIXTURE_BBOX) is True
-        assert raster.extract.bounds_envelope_compatible(OFFICIAL_BBOX) is False
+        assert raster.extract.bounds_envelope_compatible(OFFICIAL_BBOX) is True
 
         geojson = fixture_geojson()
         with tempfile.TemporaryDirectory() as raw:
@@ -305,7 +305,7 @@ def main() -> None:
                 raster=fake_raster(official_seams, OFFICIAL_BBOX),
             )
             assert official_record["bbox"] == OFFICIAL_BBOX
-            assert official_record["bounds_envelope_compatible"] is False
+            assert official_record["bounds_envelope_compatible"] is True
             assert official_record["production_admitted"] is False
             assert official_record["kind"] == "mcnf-maps-pbf-raster"
             official_meta = inspect_mbtiles(official_dest / "buffalo-niagara.pbf-raster.mbtiles")
