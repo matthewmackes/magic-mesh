@@ -405,20 +405,20 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: dests exist at `/root/mcnf-private/bootstrap-ssh-key` (0600) and
-  `bootstrap-known-hosts` (0400); env file `bootstrap-ssh.env` (0400; bind helper).
-  Child-only runner `install-helpers/run-with-bootstrap-ssh-env.py` sources dests
-  for a worker process only. Login env stays unset. Seat 15 is already enrolled
-  (`Basement-Test-Workstation`). Freeze bar still requires (1) mint a real
-  43-char bearer and (3) live enroll or offboard/reenroll under red alert + 5s.
-  Evidence: `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`,
+  `bootstrap-known-hosts` (0400); env `bootstrap-ssh.env` (0400). Child-only runner
+  sources dests for a worker only; login env unset. Mint helper
+  `install-helpers/mint-enroll-bearer.py` wraps caller `enroll-token` (no live mint).
+  Seat 15 already enrolled. Freeze bar still (1) production mint through live
+  lifecycle authority and (3) live enroll/offboard+reenroll + 5s. Evidence:
+  `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`,
   `WL-FUNC-023-2026-08-22-bootstrap-identity-provision-r1.md`,
   `WL-FUNC-023-2026-08-22-bootstrap-env-bind-r1.md`,
-  `WL-FUNC-023-2026-08-22-bootstrap-env-run-r1.md`.
-- Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer, (2) child-only runner sources dests
-  for a worker process only (login env remains unset), (3) live enroll or
-  authorized offboard/reenroll under red `AI-GENERATED-ALERT` + 5s. Seat 15 is already a named workstation; first-enroll of that IP
-  is not the remaining act unless the operator chooses offboard+reenroll. GPT Luna: execute S1-S18 in order; do not close a story
-  from compilation alone.
+  `WL-FUNC-023-2026-08-22-bootstrap-env-run-r1.md`, `WL-FUNC-023-2026-08-22-mint-enroll-bearer-helper-r1.md`.
+- Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer
+  through live lifecycle authority (helper exists; this unit did not invoke Seat 15
+  mackesd), (2) child-only runner sources dests for a worker only (login env unset),
+  (3) live enroll or authorized offboard/reenroll under red `AI-GENERATED-ALERT` + 5s.
+  Seat 15 is a named workstation; first-enroll of that IP needs operator offboard+reenroll. GPT Luna: execute S1-S18 in order.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
