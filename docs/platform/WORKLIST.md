@@ -716,13 +716,13 @@ is a capacity incident (§10.0.3), not a silent retry.
   on BigBoy `172.20.0.130` holds dest-root OSM-derived raster 167936 B sha256
   `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` with
   `mcnf-maps-mbtiles-receipt` (`production_admitted: false`). Dest-root fixture
-  12288 B `dd7cde7e…87046e` untouched. Not Dell/Seat 15/Surface. S5 `all-roles`
-  bootc receipt bound to `479ec2b8c` and copied under `/root/mcnf-private/`.
-  Leftover is Maps `production_admitted`, live-seat dest (WL-TEST-002), and S7
-  `REPLACE_*` preflight. App VM S3 and Kiron S6 remain admitted. Evidence:
+  12288 B `dd7cde7e…87046e` untouched. Not Dell/Seat 15/Surface. S3 App VM
+  receipt bound to `aca7573bc`. S5 `all-roles` bootc `479ec2b8c` is under
+  `/root/mcnf-private/`. Kiron S6 remains admitted. Leftover is Maps
+  `production_admitted`, live-seat dest (WL-TEST-002), and S7 `REPLACE_*`
+  (Maps/RPM/App catalog). Evidence: `WL-REL-006-2026-08-22-app-vm-receipt-r1.md`,
   `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`,
-  `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`,
-  `WL-REL-006-2026-08-22-preflight-bootc-private-r1.md`.
+  `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -777,6 +777,10 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Action: inspect the immutable base manifest, deterministically generate
        the production catalog, provision the system Flatpak remote named
        `curated`, and bind installation of the exact refs into the App VM image.
+       Current-revision App VM receipt is bound to `aca7573bc` on `.90` slot 0
+       (`WL-REL-006-2026-08-22-app-vm-receipt-r1.md`). Historical `0e0cd1b3`
+       receipt is stale vs HEAD. Leftover is catalog/`curated` remote plus S7
+       App-catalog `REPLACE_*`; do not claim the release-input gate closed.
      - Deliverable: immutable App VM digest, base receipt, catalog publication
        object, exact-ref inventory, compatibility metadata, and license record.
      - Validation: App VM producer/inspector and build-image admission pass;
