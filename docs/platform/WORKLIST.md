@@ -1697,16 +1697,12 @@ story execution contract above.
 - Required outcome: the retired stack and dead rows are deleted in one sweep;
   the tree builds and runs without them; the parity ledger's retire rows cite
   the deleting revision.
-- Current state: operator Q9 signoff landed 2026-08-22 (delete after fleet
-  negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units
-  are already gone. S1 live-negative is
-  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Ledger Q9,
-  roster+resolve, Q13 voip_rtt, Q29 View, and Q33 SendToEntry retire rows
-  now cite the deleting revisions. `leftover_retirements` source-scans those
-  SHAs. Notifications SQLite table dropped by migration 0017. README
-  telephony bullet now names the softphone path only (evidence
-  `WL-FUNC-033-2026-08-22-readme-live-ref-r1.md`). Leftover is still keep
-  `own_nebula_ip` in lib `voip_rtt.rs`.
+- Current state: operator Q9 signoff landed 2026-08-22. Stack deleted; S1
+  live-negative 2026-08-20 and read-only reread 2026-08-22 (all three seats
+  inactive/not-found; no kamailio/rtpengine process; evidence
+  `WL-FUNC-033-2026-08-22-fleet-negative-reread-r1.md`). Ledger retire rows
+  cite deleting revisions. README telephony bullet names the softphone path
+  only. Leftover is still keep `own_nebula_ip` in lib `voip_rtt.rs`.
 - Remaining work: leftover is still keep `own_nebula_ip` in lib
   `voip_rtt.rs`. Then:
 
