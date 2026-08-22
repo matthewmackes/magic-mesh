@@ -1609,7 +1609,11 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                     } else {
                         Style::SP_M
                     };
-                    ui.add_space(if large_text { Style::SP_XS } else { Style::SP_S });
+                    ui.add_space(if large_text {
+                        Style::SP_XS
+                    } else {
+                        Style::SP_S
+                    });
                     let host = if b.self_node().host.is_empty() {
                         "this node"
                     } else {
@@ -1621,63 +1625,23 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                     // every profile. Start it immediately after identity so
                     // narrow and large-text layouts keep the complete
                     // ten-action inventory ahead of secondary details.
-                    ui.add_space(if large_text { Style::SP_XS } else { Style::SP_S });
+                    ui.add_space(if large_text {
+                        Style::SP_XS
+                    } else {
+                        Style::SP_S
+                    });
                     node_actions_section(ui, b, actions);
-                    ui.add_space(if large_text { Style::SP_XS } else { Style::SP_S });
+                    ui.add_space(if large_text {
+                        Style::SP_XS
+                    } else {
+                        Style::SP_S
+                    });
 
                     ui.colored_label(Style::TEXT_DIM, node_role(b));
                     mesh_badge(ui, b);
                     ui.add_space(section_gap);
 
-                    section_header(ui, "PLACES");
-                    for (idx, bookmark) in b.bookmarks().iter().enumerate() {
-                        let here = matches!(
-                            b.active_tab().location(),
-                            Location::Local(p) if p.as_str() == bookmark.path
-                        );
-                        let resp = local_place_row(
-                            ui,
-                            IconId::FileFolder,
-                            bookmark.label.as_str(),
-                            here,
-                        );
-                        if resp.clicked() {
-                            actions.push(Action::Navigate(
-                                active,
-                                Location::Local(bookmark.path.clone()),
-                            ));
-                        }
-                        files_context_menu(&resp, |ui| {
-                            if ui.button("Rename\u{2026}").clicked() {
-                                actions.push(Action::RenameBookmark(idx));
-                                ui.close_menu();
-                            }
-                            if ui.add_enabled(idx > 0, egui::Button::new("Move Up")).clicked() {
-                                actions.push(Action::ReorderBookmark(idx, -1));
-                                ui.close_menu();
-                            }
-                            if ui
-                                .add_enabled(
-                                    idx + 1 < b.bookmarks().len(),
-                                    egui::Button::new("Move Down"),
-                                )
-                                .clicked()
-                            {
-                                actions.push(Action::ReorderBookmark(idx, 1));
-                                ui.close_menu();
-                            }
-                            if ui.button("Remove").clicked() {
-                                actions.push(Action::UnpinBookmark(idx));
-                                ui.close_menu();
-                            }
-                        });
-                    }
-                    for spot in LOCAL_SPOTS {
-                        let here = matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
-                        if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
-                            actions.push(Action::Navigate(active, Location::Local(spot.path.to_string())));
-                        }
-                    }
+                    places_user_section(ui, b, actions);
                     ui.add_space(section_gap);
 
                     section_header(ui, "MESH");
@@ -1702,8 +1666,7 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                     // Drag a file selection onto a target to queue a transfer;
                     // a click opens the New Transfer dialog pointed here.
                     destinations_section(ui, b, actions);
-                }
-                );
+                });
         });
 }
 
@@ -2659,7 +2622,7 @@ fn entry_interactions(
             }
         });
         if ui.button("Pin to Places").clicked() {
-            actions.push(Action::PinFocused(pane_ix));
+            actions.push(places_pin_action(pane_ix));
             ui.close_menu();
         }
         ui.separator();
@@ -3919,13 +3882,113 @@ fn mesh_badge(ui: &mut egui::Ui, b: &FileBrowser) {
     });
 }
 
-fn section_header(ui: &mut egui::Ui, text: &str) {
+fn section_header(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.label(
         RichText::new(text)
             .color(Style::TEXT_DIM)
             .size(Style::SMALL)
             .strong(),
-    );
+    )
+}
+
+/// Pin the focused folder into Places. Raised from the Places header, each
+/// user-bookmark context menu, and the listing "Pin to Places" item.
+const fn places_pin_action(pane: usize) -> Action {
+    Action::PinFocused(pane)
+}
+
+/// WL-FUNC-027 — every Places user-section intent (pin / rename / reorder /
+/// remove) as the sidebar header and bookmark context raise them. [`apply`]
+/// maps each onto the matching [`FileBrowser`] bookmark method.
+fn places_user_section_actions(pane: usize, idx: usize) -> [Action; 5] {
+    [
+        places_pin_action(pane),
+        Action::RenameBookmark(idx),
+        Action::ReorderBookmark(idx, -1),
+        Action::ReorderBookmark(idx, 1),
+        Action::UnpinBookmark(idx),
+    ]
+}
+
+fn places_user_section_menu(
+    ui: &mut egui::Ui,
+    pane: usize,
+    idx: usize,
+    bookmark_count: usize,
+    actions: &mut Vec<Action>,
+) {
+    for action in places_user_section_actions(pane, idx) {
+        let (label, enabled) = match &action {
+            Action::PinFocused(_) => ("Pin current folder", true),
+            Action::RenameBookmark(_) => ("Rename\u{2026}", true),
+            Action::ReorderBookmark(_, delta) if *delta < 0 => ("Move Up", idx > 0),
+            Action::ReorderBookmark(_, _) => ("Move Down", idx + 1 < bookmark_count),
+            Action::UnpinBookmark(_) => ("Remove", true),
+            _ => continue,
+        };
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            actions.push(action);
+            ui.close_menu();
+        }
+    }
+}
+
+/// User bookmarks above the fixed Places set: pin from the header (and
+/// empty-state copy), rename / reorder / remove from each row's context.
+fn places_user_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let active = b.active_pane_index();
+    ui.horizontal(|ui| {
+        let header = section_header(ui, "PLACES");
+        files_context_menu(&header, |ui| {
+            if ui.button("Pin current folder").clicked() {
+                actions.push(places_pin_action(active));
+                ui.close_menu();
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if files_action_button(
+                ui,
+                "Pin",
+                FilesActionTone::Quiet,
+                "Pin the current folder to Places",
+            )
+            .clicked()
+            {
+                actions.push(places_pin_action(active));
+            }
+        });
+    });
+
+    let count = b.bookmarks().len();
+    if count == 0 {
+        muted_note(ui, "Pin a folder to keep it here.");
+    }
+    for (idx, bookmark) in b.bookmarks().iter().enumerate() {
+        let here = matches!(
+            b.active_tab().location(),
+            Location::Local(p) if p.as_str() == bookmark.path
+        );
+        let resp = local_place_row(ui, IconId::FileFolder, bookmark.label.as_str(), here);
+        if resp.clicked() {
+            actions.push(Action::Navigate(
+                active,
+                Location::Local(bookmark.path.clone()),
+            ));
+        }
+        files_context_menu(&resp, |ui| {
+            places_user_section_menu(ui, active, idx, count, actions);
+        });
+    }
+    for spot in LOCAL_SPOTS {
+        let here =
+            matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
+        if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
+            actions.push(Action::Navigate(
+                active,
+                Location::Local(spot.path.to_string()),
+            ));
+        }
+    }
 }
 
 const fn mime_tag(mime: Mime) -> &'static str {
@@ -3950,9 +4013,10 @@ const fn peer_color(status: PeerStatus) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_files_popup_style, file_type_icon, files_panel, files_tooltip, local_place_icon,
-        scope_files_popup_ui, scope_files_toolbar_ui, tab_strip, ACTION_BUTTON_H,
-        FILES_ICON_BUTTON_ICON, FILES_NAV_ICONS, FILES_TAB_ICONS,
+        apply, apply_files_popup_style, file_type_icon, files_panel, files_tooltip,
+        local_place_icon, places_user_section_actions, scope_files_popup_ui,
+        scope_files_toolbar_ui, tab_strip, Action, ACTION_BUTTON_H, FILES_ICON_BUTTON_ICON,
+        FILES_NAV_ICONS, FILES_TAB_ICONS,
     };
     use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode, LOCAL_SPOTS};
     use crate::transfers::test_support::FakeTransfers;
@@ -5098,6 +5162,61 @@ mod tests {
         b.click(0, 0);
         b.open_extract_to(0);
         assert!(b.extract_to_dialog().is_some(), "Extract To opened");
+        mount(&mut b);
+    }
+
+    // WL-FUNC-027 — Places user-section pin/rename/reorder/remove are the
+    // sidebar header + bookmark context intents; apply maps each onto the
+    // existing FileBrowser bookmark methods.
+    #[test]
+    fn places_user_section_actions_reach_bookmark_methods() {
+        let inventory = places_user_section_actions(0, 1);
+        assert!(
+            matches!(inventory[0], Action::PinFocused(0)),
+            "pin is a Places user-section action"
+        );
+        assert!(inventory
+            .iter()
+            .any(|action| matches!(action, Action::RenameBookmark(1))));
+        assert!(inventory
+            .iter()
+            .any(|action| matches!(action, Action::ReorderBookmark(1, -1))));
+        assert!(inventory
+            .iter()
+            .any(|action| matches!(action, Action::ReorderBookmark(1, 1))));
+        assert!(inventory
+            .iter()
+            .any(|action| matches!(action, Action::UnpinBookmark(1))));
+
+        let store = tempfile::tempdir().expect("bookmark store");
+        let mut b = browser().with_config_dir(store.path());
+        b.click(0, 0);
+        let ctx = egui::Context::default();
+        apply(&ctx, &mut b, Action::PinFocused(0));
+        assert_eq!(b.bookmarks().len(), 1, "pin lands through apply");
+        assert_eq!(b.bookmarks()[0].path, "/data/alpha");
+
+        b.click(0, 1);
+        apply(&ctx, &mut b, Action::PinFocused(0));
+        assert_eq!(b.bookmarks().len(), 2, "second pin is a distinct place");
+        let first = b.bookmarks()[0].path.clone();
+        let second = b.bookmarks()[1].path.clone();
+        assert_ne!(first, second);
+
+        apply(&ctx, &mut b, Action::ReorderBookmark(1, -1));
+        assert_eq!(b.bookmarks()[0].path, second);
+        assert_eq!(b.bookmarks()[1].path, first);
+
+        apply(&ctx, &mut b, Action::RenameBookmark(0));
+        assert!(b.name_dialog().is_some(), "rename opens through apply");
+        apply(&ctx, &mut b, Action::SetNameDialogInput("Projects".into()));
+        apply(&ctx, &mut b, Action::SubmitNameDialog(0));
+        assert_eq!(b.bookmarks()[0].label, "Projects");
+
+        apply(&ctx, &mut b, Action::UnpinBookmark(1));
+        assert_eq!(b.bookmarks().len(), 1);
+        assert_eq!(b.bookmarks()[0].label, "Projects");
+
         mount(&mut b);
     }
 }
