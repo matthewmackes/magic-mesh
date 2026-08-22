@@ -2077,6 +2077,56 @@ fn folder_prefs_survive_restart_and_hostile_files_degrade() {
     assert!(err.contains("larger than"));
 }
 
+// WL-FUNC-026 — a parseable store can still be hostile by count: more than
+// FOLDER_PREFS_CAP entries (or duplicates that would otherwise inflate the
+// map). Hydrate keeps the most recently stored CAP paths, surfaces the drop
+// in `last_note`, and leaves the on-disk bytes untouched until a mutation.
+#[test]
+fn folder_prefs_hydrate_caps_lru_and_leaves_store_untouched() {
+    let dir = tempfile::tempdir().expect("store dir");
+    let store = dir.path().join(super::FOLDER_PREFS_FILE);
+    let entries: Vec<super::FolderPrefsStored> = (0..=super::FOLDER_PREFS_CAP)
+        .map(|i| super::FolderPrefsStored {
+            path: format!("/cap-{i}"),
+            prefs: FolderPrefs {
+                view: ViewMode::Grid,
+                ..FolderPrefs::default()
+            },
+        })
+        .collect();
+    super::write_json_store(&store, &super::FolderPrefsFile { entries }).expect("seed");
+    let raw_before = std::fs::read(&store).expect("seed bytes");
+
+    let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
+    assert_eq!(b.folder_prefs().len(), super::FOLDER_PREFS_CAP);
+    assert!(
+        !b.folder_prefs().contains_key("/cap-0"),
+        "least-recently-used path evicted at the cap"
+    );
+    assert!(
+        b.folder_prefs()
+            .contains_key(&format!("/cap-{}", super::FOLDER_PREFS_CAP)),
+        "most recently stored path survives"
+    );
+    assert_eq!(
+        b.folder_prefs_lru.front().map(String::as_str),
+        Some("/cap-1"),
+        "oldest kept entry is the next-least-recent after eviction"
+    );
+    assert!(
+        b.last_note()
+            .is_some_and(|n| n.contains("Dropped") && n.contains("over-cap")),
+        "honest cap note: {:?}",
+        b.last_note()
+    );
+    drop(b);
+    assert_eq!(
+        std::fs::read(&store).expect("untouched"),
+        raw_before,
+        "hydrate degrades in memory only — no silent rewrite"
+    );
+}
+
 #[test]
 fn persistence_replaces_a_store_symlink_without_following_it() {
     let dir = tempfile::tempdir().expect("store dir");

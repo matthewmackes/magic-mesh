@@ -3672,12 +3672,23 @@ impl FileBrowser {
             Ok(file) => {
                 self.folder_prefs.clear();
                 self.folder_prefs_lru.clear();
+                // Writer order is oldest-first. Keep the most recently stored
+                // CAP entries; a hostile over-cap or duplicate list must not
+                // grow the in-memory map, and the drop is an honest note
+                // (in-memory only — the on-disk bytes stay until a mutation).
+                let stored = file.entries.len();
                 for entry in file.entries.into_iter().rev().take(FOLDER_PREFS_CAP).rev() {
                     if self.folder_prefs.contains_key(&entry.path) {
                         continue;
                     }
                     self.folder_prefs_lru.push_back(entry.path.clone());
                     self.folder_prefs.insert(entry.path, entry.prefs);
+                }
+                let dropped = stored.saturating_sub(self.folder_prefs.len());
+                if dropped > 0 {
+                    self.last_note = Some(format!(
+                        "Dropped {dropped} over-cap or duplicate folder preference(s) — keeping the {FOLDER_PREFS_CAP} most recently used."
+                    ));
                 }
             }
             Err(note) => {
