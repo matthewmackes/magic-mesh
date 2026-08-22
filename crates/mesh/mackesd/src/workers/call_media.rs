@@ -1,4 +1,5 @@
-//! WL-FUNC-024 S2/S3/S6 — WebRTC P2P and elected LiveKit SFU media planes.
+//! WL-FUNC-024 S2/S3/S4/S6 — WebRTC P2P, elected LiveKit SFU, and SIP-leg
+//! publish planes.
 //!
 //! There is no WebRTC stack in this workspace. This worker is therefore a real
 //! offer/answer state machine over existing collab call signaling, a seat-audio
@@ -12,6 +13,12 @@
 //! Mute and DTMF act on the bound live leg. The collab media verifier remains a
 //! separate proof sidecar; this module is the P2P plane it can sample. Visual
 //! attach/detach is worker-owned and publishes through the same MediaSessionV1.
+//!
+//! S4 publishes [`mde_collab_types::SipLegV1`] on
+//! `state/calls/media/<session>/sip`. That path is glue over
+//! [`mde_voice_hud::sip::plan_pstn_agent`] — not a second SIP/RTP stack. No
+//! governed provider means an honest unbridged document; a live Connected or
+//! bridged PSTN is never invented.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,11 +27,12 @@ use std::sync::{Arc, Mutex};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_collab_types::{
-    media_answer_topic, media_offer_topic, media_session_topic, media_sfu_election_topic, ActorId,
-    CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
-    CallMediaReadiness, CallMediaRequirement, CallMediaSession, CollabCommand, MediaDescriptionV1,
-    MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1,
-    MediaTrackKind, SfuElectionV1, SpaceId, MEDIA_SESSION_V1_SCHEMA_VERSION,
+    media_answer_topic, media_offer_topic, media_session_topic, media_sfu_election_topic,
+    media_sip_leg_topic, ActorId, CallId, CallKind, CallMediaAdapter, CallMediaAdmission,
+    CallMediaFrameEvidence, CallMediaReadiness, CallMediaRequirement, CallMediaSession,
+    CollabCommand, MediaDescriptionV1, MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1,
+    MediaSignalingRoleV1, MediaTrackKind, SfuElectionV1, SipLegDirectionV1, SipLegV1, SpaceId,
+    MEDIA_SESSION_V1_SCHEMA_VERSION,
 };
 
 use super::collab_media::{CallMediaFrameVerifier, CallMediaProviderError};
@@ -1826,6 +1834,259 @@ impl CallMediaFrameVerifier for LiveKitSfuPlane {
     }
 }
 
+/// One outbound or inbound PSTN leg the SIP publish plane owns.
+///
+/// The E.164 is captured from the already-authorized
+/// [`CollabCommand::StartOutboundCall`] target. This is not a SIP/RTP
+/// dialog and never claims a bridged or Connected PSTN by itself.
+struct SipSession {
+    local_actor: ActorId,
+    direction: SipLegDirectionV1,
+    e164: String,
+}
+
+struct SipPlaneInner {
+    local_actor: Option<ActorId>,
+    sessions: BTreeMap<CallId, SipSession>,
+}
+
+/// WL-FUNC-024 S4 — publish `state/calls/media/<session>/sip` as [`SipLegV1`].
+///
+/// Glue over [`mde_voice_hud::sip::plan_pstn_agent`]: the voice-hud agent
+/// remains the governed SIP/RTP stack. This plane only materializes the typed
+/// Bus document. Absent provider → `gateway_available = false`, `bridged =
+/// false`. A live Connected or bridged PSTN is never invented here.
+pub(crate) struct SipGatewayPlane {
+    inner: Mutex<SipPlaneInner>,
+    gateway_available: Arc<AtomicBool>,
+}
+
+impl SipGatewayPlane {
+    /// Production constructor. The governed provider is the voice-hud account
+    /// planner — never a fabricated Ready/Connected PSTN.
+    #[must_use]
+    pub(crate) fn production() -> Self {
+        let drive =
+            mde_voice_hud::sip::plan_pstn_agent(mde_voice_hud::sip::SipAccount::load_accounts());
+        Self::new(drive.pstn_leg_available())
+    }
+
+    #[must_use]
+    fn new(gateway_available: bool) -> Self {
+        Self {
+            inner: Mutex::new(SipPlaneInner {
+                local_actor: None,
+                sessions: BTreeMap::new(),
+            }),
+            gateway_available: Arc::new(AtomicBool::new(gateway_available)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_local_actor(self, actor: ActorId) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.local_actor = Some(actor);
+        }
+        self
+    }
+
+    fn lock_inner(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, SipPlaneInner>, CallMediaProviderError> {
+        self.inner
+            .lock()
+            .map_err(|_| CallMediaProviderError::ProviderUnavailable {
+                detail: "SIP media plane lock is unavailable".to_string(),
+            })
+    }
+
+    fn gateway_available(&self) -> bool {
+        self.gateway_available.load(Ordering::SeqCst)
+    }
+
+    fn admit_leg(
+        session: CallId,
+        local_actor: ActorId,
+        direction: SipLegDirectionV1,
+        e164: &str,
+        gateway_available: bool,
+    ) -> Result<SipLegV1, CallMediaProviderError> {
+        // Bridged is intrinsically invalid without a gateway, and this plane
+        // has no LiveKit SIP dialog to prove a bridge. Always unbridged.
+        SipLegV1::new(
+            session,
+            local_actor,
+            direction,
+            e164.trim(),
+            gateway_available,
+            false,
+        )
+        .map_err(|error| CallMediaProviderError::ExecutionRefused {
+            detail: error.to_string(),
+        })
+    }
+
+    fn tick_locked(
+        &self,
+        persist: &Persist,
+        inner: &mut SipPlaneInner,
+        last_published: &mut BTreeMap<String, String>,
+    ) {
+        let Ok(readiness) = read_readiness(persist) else {
+            return;
+        };
+        inner.local_actor = Some(readiness.local_actor.clone());
+        inner.sessions.retain(|call, _| {
+            readiness
+                .sessions
+                .iter()
+                .any(|session| session.call == *call)
+        });
+        let gateway_available = self.gateway_available();
+        for (call, session) in inner.sessions.iter_mut() {
+            let Some(ready) = readiness
+                .sessions
+                .iter()
+                .find(|candidate| candidate.call == *call)
+            else {
+                continue;
+            };
+            if !ready
+                .connected_participants
+                .iter()
+                .any(|actor| actor == &readiness.local_actor)
+            {
+                continue;
+            }
+            session.local_actor = readiness.local_actor.clone();
+            match Self::admit_leg(
+                *call,
+                session.local_actor.clone(),
+                session.direction,
+                &session.e164,
+                gateway_available,
+            ) {
+                Ok(document) => {
+                    if document.bridged || document.gateway_available != gateway_available {
+                        #[cfg(test)]
+                        panic!("refusing to publish a fake Connected PSTN sip leg");
+                        #[cfg(not(test))]
+                        {
+                            tracing::debug!(
+                                target: "mackesd::call_media",
+                                "refusing to publish a fake Connected PSTN sip leg"
+                            );
+                            continue;
+                        }
+                    }
+                    let _ = publish_sip_leg(persist, last_published, &document);
+                }
+                Err(error) => tracing::debug!(
+                    target: "mackesd::call_media",
+                    error = ?error,
+                    "refusing to publish invalid SIP leg"
+                ),
+            }
+        }
+    }
+
+    fn tick(&self, persist: &Persist, last_published: &mut BTreeMap<String, String>) {
+        let Ok(mut inner) = self.lock_inner() else {
+            return;
+        };
+        self.tick_locked(persist, &mut inner, last_published);
+    }
+}
+
+impl CallMediaFrameVerifier for SipGatewayPlane {
+    fn execute_command(
+        &self,
+        command: &CollabCommand,
+        adapter: CallMediaAdapter,
+    ) -> Result<(), CallMediaProviderError> {
+        if adapter != CallMediaAdapter::SipGateway {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "SIP plane was selected for an incompatible adapter".to_string(),
+            });
+        }
+        let mut inner = self.lock_inner()?;
+        match command {
+            CollabCommand::StartOutboundCall { call, target, .. } => {
+                let local_actor = inner
+                    .local_actor
+                    .clone()
+                    .unwrap_or_else(|| ActorId::new("local"));
+                let document = Self::admit_leg(
+                    *call,
+                    local_actor.clone(),
+                    SipLegDirectionV1::Outbound,
+                    target,
+                    self.gateway_available(),
+                )?;
+                inner.sessions.insert(
+                    *call,
+                    SipSession {
+                        local_actor,
+                        direction: document.direction,
+                        e164: document.e164,
+                    },
+                );
+                Ok(())
+            }
+            CollabCommand::StartCall { .. } => Err(CallMediaProviderError::ExecutionRefused {
+                detail: "outbound SIP execution requires an explicit dial target".to_string(),
+            }),
+            CollabCommand::SetCallMuted { .. } | CollabCommand::SendDtmf { .. } => {
+                Err(CallMediaProviderError::ExecutionRefused {
+                    detail: "PSTN mute and DTMF are owned by the SIP gateway agent".to_string(),
+                })
+            }
+            CollabCommand::DeclineCall { call } | CollabCommand::HangUpCall { call } => {
+                inner.sessions.remove(call);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn prove_advancing_frames(
+        &self,
+        _session: &CallMediaSession,
+        adapter: CallMediaAdapter,
+    ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+        if adapter != CallMediaAdapter::SipGateway {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "SIP plane cannot prove a non-SIP adapter".to_string(),
+            });
+        }
+        if !self.gateway_available() {
+            return Err(CallMediaProviderError::ProviderUnavailable {
+                detail: mde_voice_hud::sip::ABSENT_PSTN_PROVIDER.to_string(),
+            });
+        }
+        // A governed account is not advancing-frame proof. Never a fake
+        // Connected PSTN from this publish plane.
+        Err(CallMediaProviderError::ExecutionRefused {
+            detail: "SIP/RTP frame counters are unavailable; live media is not proven".to_string(),
+        })
+    }
+
+    fn publish_p2p_media_sessions(
+        &self,
+        persist: &Persist,
+        last_published: &mut BTreeMap<String, String>,
+    ) {
+        self.tick(persist, last_published);
+    }
+
+    fn owns_call(&self, call: CallId) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|inner| inner.sessions.contains_key(&call))
+    }
+}
+
 fn is_group_call(participants: &[ActorId]) -> bool {
     participants.len() >= 3
 }
@@ -1971,6 +2232,39 @@ fn publish_json<T: serde::Serialize>(
         .map_err(|error| CallMediaProviderError::ProviderUnavailable {
             detail: error.to_string(),
         })?;
+    Ok(())
+}
+
+fn publish_sip_leg(
+    persist: &Persist,
+    last_published: &mut BTreeMap<String, String>,
+    document: &SipLegV1,
+) -> Result<(), CallMediaProviderError> {
+    if document.schema_version != MEDIA_SESSION_V1_SCHEMA_VERSION {
+        return Err(CallMediaProviderError::ExecutionRefused {
+            detail: "refusing to publish a non-V1 SIP leg".to_string(),
+        });
+    }
+    if document.bridged && !document.gateway_available {
+        return Err(CallMediaProviderError::ExecutionRefused {
+            detail: "refusing to publish a bridged SIP leg without a gateway".to_string(),
+        });
+    }
+    let topic = media_sip_leg_topic(document.session);
+    let body = serde_json::to_string(document).map_err(|error| {
+        CallMediaProviderError::ExecutionRefused {
+            detail: error.to_string(),
+        }
+    })?;
+    if last_published.get(&topic).map(String::as_str) == Some(body.as_str()) {
+        return Ok(());
+    }
+    persist
+        .write(&topic, Priority::Default, None, Some(&body))
+        .map_err(|error| CallMediaProviderError::ProviderUnavailable {
+            detail: error.to_string(),
+        })?;
+    last_published.insert(topic, body);
     Ok(())
 }
 
@@ -2630,5 +2924,158 @@ mod tests {
         assert_eq!(detached.offered_tracks, vec![MediaTrackKind::Audio]);
         assert_eq!(detached.state, MediaSessionStateV1::Negotiating);
         assert!(!detached.state.claims_live_media());
+    }
+
+    fn read_sip_leg(persist: &Persist, call: CallId) -> Option<SipLegV1> {
+        persist
+            .read_latest(&media_sip_leg_topic(call))
+            .expect("read sip topic")
+            .map(|msg| SipLegV1::from_json(msg.body.as_deref().expect("body")).expect("admit sip"))
+    }
+
+    #[test]
+    fn sip_publish_fails_closed_without_provider_and_never_fakes_connected_pstn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let absent = SipGatewayPlane::new(false).with_local_actor(ActorId::new("alice"));
+
+        write_readiness(&persist, &two_party_readiness(call, space, "alice"));
+        let mut published = BTreeMap::new();
+        absent.tick(&persist, &mut published);
+        assert!(
+            read_sip_leg(&persist, call).is_none(),
+            "readiness alone must not invent a PSTN leg"
+        );
+
+        assert!(
+            matches!(
+                absent.execute_command(
+                    &CollabCommand::StartCall {
+                        space,
+                        call,
+                        kind: CallKind::Audio,
+                    },
+                    CallMediaAdapter::SipGateway,
+                ),
+                Err(CallMediaProviderError::ExecutionRefused { detail })
+                    if detail.contains("explicit dial target")
+            ),
+            "space-scoped start must not mint a PSTN leg"
+        );
+        assert!(
+            matches!(
+                absent.execute_command(
+                    &CollabCommand::StartOutboundCall {
+                        space,
+                        call,
+                        target: "sip:+15551234567@gw".into(),
+                    },
+                    CallMediaAdapter::SipGateway,
+                ),
+                Err(CallMediaProviderError::ExecutionRefused { .. })
+            ),
+            "a SIP URI must not be admitted as an E.164 PSTN leg"
+        );
+        assert!(!absent.owns_call(call));
+
+        absent
+            .execute_command(
+                &CollabCommand::StartOutboundCall {
+                    space,
+                    call,
+                    target: "+15551234567".into(),
+                },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("honest E.164 is admitted");
+        write_readiness(&persist, &two_party_readiness(call, space, "alice"));
+        absent.tick(&persist, &mut published);
+
+        let leg = read_sip_leg(&persist, call).expect("absent provider still publishes honesty");
+        assert_eq!(leg.session, call);
+        assert_eq!(leg.direction, SipLegDirectionV1::Outbound);
+        assert_eq!(leg.e164, "+15551234567");
+        assert!(!leg.gateway_available);
+        assert!(!leg.bridged);
+        assert_eq!(leg.topic(), media_sip_leg_topic(call));
+        assert!(
+            persist
+                .read_latest(&media_session_topic(call))
+                .expect("read session topic")
+                .is_none(),
+            "SIP publish must not mint a fake Connected MediaSessionV1"
+        );
+        assert!(
+            matches!(
+                absent.prove_advancing_frames(
+                    &two_party_readiness(call, space, "alice").sessions[0],
+                    CallMediaAdapter::SipGateway
+                ),
+                Err(CallMediaProviderError::ProviderUnavailable { detail })
+                    if detail == mde_voice_hud::sip::ABSENT_PSTN_PROVIDER
+            ),
+            "absent provider must not prove live PSTN frames"
+        );
+
+        let present = SipGatewayPlane::new(true).with_local_actor(ActorId::new("alice"));
+        present
+            .execute_command(
+                &CollabCommand::StartOutboundCall {
+                    space,
+                    call,
+                    target: "+18005551212".into(),
+                },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("governed flag still requires a real E.164");
+        write_readiness(&persist, &two_party_readiness(call, space, "alice"));
+        let mut present_pub = BTreeMap::new();
+        present.tick(&persist, &mut present_pub);
+        let present_leg = read_sip_leg(&persist, call).expect("governed path publishes");
+        assert!(present_leg.gateway_available);
+        assert!(
+            !present_leg.bridged,
+            "a governed account is not a fake Connected/bridged PSTN"
+        );
+        assert!(
+            matches!(
+                present.prove_advancing_frames(
+                    &two_party_readiness(call, space, "alice").sessions[0],
+                    CallMediaAdapter::SipGateway
+                ),
+                Err(CallMediaProviderError::ExecutionRefused { detail })
+                    if detail.contains("not proven")
+            ),
+            "governed provider without frames must not prove Connected PSTN"
+        );
+
+        let production = SipGatewayPlane::production();
+        assert!(
+            matches!(
+                production.prove_advancing_frames(
+                    &two_party_readiness(call, space, "alice").sessions[0],
+                    CallMediaAdapter::SipGateway
+                ),
+                Err(CallMediaProviderError::ProviderUnavailable { .. })
+                    | Err(CallMediaProviderError::ExecutionRefused { .. })
+            ),
+            "production SIP publish must stay fail-closed on live frames"
+        );
+
+        let mut hostile = serde_json::to_value(leg).expect("value");
+        hostile["bridged"] = serde_json::json!(true);
+        hostile["gateway_available"] = serde_json::json!(false);
+        let hostile_leg: SipLegV1 =
+            serde_json::from_value(hostile).expect("wire shape still deserializes");
+        assert!(
+            matches!(
+                publish_sip_leg(&persist, &mut published, &hostile_leg),
+                Err(CallMediaProviderError::ExecutionRefused { detail })
+                    if detail.contains("without a gateway")
+            ),
+            "bridged-without-gateway must fail closed at publish"
+        );
     }
 }
