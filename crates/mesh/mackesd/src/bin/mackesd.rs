@@ -177,11 +177,6 @@ enum Cmd {
     /// captive; silent + exit 0 when clear.
     CaptivePortalCheck,
 
-    /// VOIP-4 (v5.0.0) — measure this peer's Vitelity-link RTT (TCP-connect
-    /// to `out.vitelity.net:5061`) + publish it to `voip/link-rtt/<peer>`.
-    /// Prints the RTT in ms (or "unreachable").
-    VoipRtt,
-
     /// E1.2 — list the mackesd workers a deployment role runs (the role-gated
     /// worker subset per plan §12). With no ROLE, prints all three tiers. This
     /// is the static counterpart to the live `worker_names` listing `serve`
@@ -2249,7 +2244,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::ArpSpoofCheck => cli::arp_spoof_check::run()?,
         Cmd::RogueDhcpCheck => cli::rogue_dhcp_check::run()?,
         Cmd::CaptivePortalCheck => cli::captive_portal_check::run()?,
-        Cmd::VoipRtt => cli::voip_rtt::run()?,
         Cmd::Tag { host, set } => cli::tag::run(host, set)?,
         Cmd::HopAdvertise { subnets, exit } => cli::hop_advertise::run(subnets, exit)?,
         Cmd::VpnImport { name, kind, file } => cli::vpn_import::run(name, kind, file)?,
@@ -3638,6 +3632,38 @@ mod lifecycle_cli_boundary_tests {
             parsed.is_ok(),
             "first-boot verb must parse without a caller-selected step: {:?}",
             parsed.err().map(|error| error.kind())
+        );
+    }
+}
+
+#[cfg(test)]
+mod voip_rtt_cli_retirement_tests {
+    //! WL-FUNC-033 / Q9 leftover delete: `voip-rtt` is retired from the live
+    //! binary surface. The module in `cli/voip_rtt.rs` stays (out of scope);
+    //! clap must not advertise or accept the verb.
+    use super::parse_cli_on_large_test_stack;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn voip_rtt_is_not_a_live_subcommand() {
+        let error = match parse_cli_on_large_test_stack(vec!["mackesd".into(), "voip-rtt".into()]) {
+            Ok(_) => panic!("WL-FUNC-033 / Q9: voip-rtt must not parse as a live verb"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn help_does_not_advertise_voip_rtt() {
+        let error = match parse_cli_on_large_test_stack(vec!["mackesd".into(), "--help".into()]) {
+            Ok(_) => panic!("--help must render through clap's help error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("voip-rtt"),
+            "top-level help must not list the retired voip-rtt verb: {rendered}"
         );
     }
 }
