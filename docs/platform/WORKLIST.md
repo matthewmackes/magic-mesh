@@ -409,13 +409,13 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Current state: dests exist at `/root/mcnf-private/bootstrap-ssh-key` (0600) and
   `bootstrap-known-hosts` (0400); env `bootstrap-ssh.env` (0400). Child-only runner
   sources dests for a worker only; login env unset. Mint helper
-  `install-helpers/mint-enroll-bearer.py` wraps caller `enroll-token` (no live mint).
-  Seat 15 already enrolled. Freeze bar still (1) production mint through live
-  lifecycle authority and (3) live enroll/offboard+reenroll + 5s. Evidence:
+  `mint-enroll-bearer.py` wraps `enroll-token`; `/root/mcnf-private` dests refuse
+  until an unpublished signed candidate exists (no live mint). Seat 15 enrolled.
+  Freeze bar still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:
   `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`,
   `WL-FUNC-023-2026-08-22-bootstrap-identity-provision-r1.md`,
   `WL-FUNC-023-2026-08-22-bootstrap-env-bind-r1.md`,
-  `WL-FUNC-023-2026-08-22-bootstrap-env-run-r1.md`, `WL-FUNC-023-2026-08-22-mint-enroll-bearer-helper-r1.md`.
+  `WL-FUNC-023-2026-08-22-bootstrap-env-run-r1.md`, mint-helper + dest-refuse r1.
 - Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer
   through live lifecycle authority (helper exists; this unit did not invoke Seat 15
   mackesd), (2) child-only runner sources dests for a worker only (login env unset),

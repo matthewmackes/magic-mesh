@@ -307,6 +307,22 @@ def main() -> None:
         finally:
             shutil.rmtree(inside_parent, ignore_errors=True)
 
+        before_production = production_snapshot()
+        production_dest = PRODUCTION / "enroll-bearer-probe"
+        command(
+            "--mackesd",
+            str(fake),
+            "--mesh-id",
+            MESH_ID,
+            "--output",
+            str(production_dest),
+            refused=True,
+        )
+        assert not production_dest.exists()
+        after_production = production_snapshot()
+        if before_production is not None and after_production is not None:
+            assert after_production == before_production
+
         failing = write_fake_mackesd(
             root / "mackesd-fail",
             fake_script(join_token(FIXTURE_BEARER) + "\n", exit_code=1),

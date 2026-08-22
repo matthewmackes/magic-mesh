@@ -4,7 +4,9 @@
 Wraps `mackesd enroll-token` supplied by `--mackesd`. It does not mint into
 a production workgroup, does not SSH, and does not enroll. The bearer is
 written only to `--output`. Helper stdout never carries bearer or token
-bytes. This leftover does not claim a production mint.
+bytes. Dest or sidecar under `/root/mcnf-private` refuses while the
+unpublished signed candidate is absent. This leftover does not claim a
+production mint.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_DEST_PARENT = Path("/root/mcnf-private")
+PRODUCTION_DEST_PARENTS = (DEFAULT_DEST_PARENT,)
 SIDECAR_KIND = "mcnf-enroll-bearer-mint"
 DEST_MODE = 0o600
 SIDECAR_MODE = 0o400
@@ -69,6 +72,24 @@ def is_inside(path: Path, root: Path) -> bool:
 
 def dest_resolved(path: Path) -> Path:
     return path.parent.resolve() / path.name
+
+
+def under_production_dest(path: Path) -> bool:
+    resolved = dest_resolved(path)
+    for parent in PRODUCTION_DEST_PARENTS:
+        try:
+            resolved.relative_to(parent.resolve())
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def admit_not_production_dest(path: Path, label: str) -> None:
+    if under_production_dest(path):
+        refuse(
+            f"{label} is a production dest; unpublished signed candidate is absent"
+        )
 
 
 def contain_join_token(*values: object) -> bool:
@@ -344,9 +365,11 @@ def run_mint(
     note = admit_note(note)
     workgroup_root = admit_workgroup_root(workgroup_root)
     dest = admit_no_replace(output, "dest", worktree)
+    admit_not_production_dest(dest, "dest")
     sidecar_path = None
     if sidecar is not None:
         sidecar_path = admit_no_replace(sidecar, "sidecar", worktree)
+        admit_not_production_dest(sidecar_path, "sidecar")
         if sidecar_path == dest:
             refuse("sidecar must be distinct from dest")
     argv = enroll_argv(mackesd, mesh_id, lighthouse, note)
