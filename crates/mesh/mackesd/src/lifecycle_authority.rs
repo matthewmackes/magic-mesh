@@ -21,6 +21,17 @@ use serde::{Deserialize, Serialize};
 const CHECKPOINT: &str = "checkpoint.json";
 const JOURNAL: &str = "journal.jsonl";
 const LOCK: &str = "lifecycle.lock";
+/// The enroll-command placeholder. Bootstrap must mint a real bearer instead
+/// of substituting this into argv or the checkpoint.
+const JOIN_TOKEN_TEMPLATE: &str = "{{JOIN_TOKEN}}";
+
+fn enrollment_bearer_digest_hex(bearer: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bearer.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleCheckpointV1 {
@@ -42,6 +53,12 @@ pub struct LifecycleCheckpointV1 {
     pub retry_count: u8,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// SHA-256 digests of lighthouse enrollment bearers minted for this
+    /// target. The raw bearer is returned once to the caller and is never
+    /// stored here — only the digest is durable so a later confirm/revoke
+    /// can bind the handoff without turning the checkpoint into a secret store.
+    #[serde(default)]
+    pub pending_enrollment_bearer_digests: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -165,6 +182,7 @@ impl LifecycleAuthority {
                 artifact_selection: None,
                 retry_count: 0,
                 last_error: None,
+                pending_enrollment_bearer_digests: Vec::new(),
             },
         };
         authority.persist()?;
@@ -412,6 +430,72 @@ impl LifecycleAuthority {
         self.persist()
     }
 
+    /// Mint a lighthouse-scoped enrollment bearer through the existing
+    /// issued-bearer ledger. The raw secret is returned once and never stored
+    /// in the checkpoint; only its SHA-256 digest is recorded as pending so a
+    /// later confirm/revoke can bind the handoff to this target and generation.
+    ///
+    /// The command-template placeholder `{{JOIN_TOKEN}}` is refused — bootstrap
+    /// must receive a real minted bearer, never the rendered enroll command.
+    pub fn mint_lighthouse_enrollment_bearer(
+        &mut self,
+        workgroup_root: &Path,
+        provided: Option<&str>,
+    ) -> Result<String, LifecycleAuthorityError> {
+        if self.checkpoint.plan.intent != LifecycleIntentKind::Onboard {
+            return Err(LifecycleAuthorityError::InvalidTransition(
+                "enrollment bearer mint is onboard-only",
+            ));
+        }
+        if matches!(
+            self.checkpoint.progress.phase,
+            LifecyclePhase::Failed | LifecyclePhase::Cancelled
+        ) {
+            return Err(LifecycleAuthorityError::InvalidTransition(
+                "enrollment bearer mint after terminal failure",
+            ));
+        }
+        let bearer = match provided {
+            Some(JOIN_TOKEN_TEMPLATE) | Some("") => {
+                return Err(LifecycleAuthorityError::InvalidPlan(
+                    "enrollment bearer template",
+                ));
+            }
+            Some(provided)
+                if provided.trim() != provided || provided.contains(char::is_whitespace) =>
+            {
+                return Err(LifecycleAuthorityError::InvalidPlan(
+                    "enrollment bearer template",
+                ));
+            }
+            Some(provided) => provided.to_owned(),
+            None => crate::bearer_ledger::issue(
+                workgroup_root,
+                crate::bearer_ledger::LIGHTHOUSE_ROLE_NOTE,
+            )?,
+        };
+        if bearer == JOIN_TOKEN_TEMPLATE || bearer.is_empty() {
+            return Err(LifecycleAuthorityError::InvalidPlan(
+                "enrollment bearer template",
+            ));
+        }
+        let digest = enrollment_bearer_digest_hex(&bearer);
+        if self
+            .checkpoint
+            .pending_enrollment_bearer_digests
+            .iter()
+            .any(|existing| existing == &digest)
+        {
+            return Ok(bearer);
+        }
+        self.checkpoint
+            .pending_enrollment_bearer_digests
+            .push(digest.clone());
+        self.append_journal("enrollment_bearer_minted", "mesh", &digest)?;
+        self.persist()?;
+        Ok(bearer)
+    }
+
     /// Persist the exact artifact admission used by this lifecycle request.
     /// Replacing a selection requires a new generation; the current authority
     /// never silently changes bytes after planning.
@@ -558,7 +642,7 @@ impl LifecycleAuthority {
             _ => {
                 return Err(LifecycleAuthorityError::InvalidTransition(
                     "confirmation not required",
-                ))
+                ));
             }
         };
         if confirmation.session_id != self.checkpoint.plan.request_id
@@ -844,10 +928,12 @@ mod tests {
         .unwrap();
         assert_eq!(saved.progress.completed_steps, 1);
         authority.finish().unwrap();
-        assert!(!root
-            .path()
-            .join("lifecycle/seat-15/lifecycle.lock")
-            .exists());
+        assert!(
+            !root
+                .path()
+                .join("lifecycle/seat-15/lifecycle.lock")
+                .exists()
+        );
     }
 
     #[test]
@@ -966,6 +1052,84 @@ mod tests {
             authority.admit_commissioning_capsule(capsule, 1_000, &signing_key.verifying_key()),
             Err(LifecycleAuthorityError::InvalidTransition(
                 "capsule revoked"
+            ))
+        ));
+        authority.finish().unwrap();
+    }
+
+    #[test]
+    fn lighthouse_enrollment_mint_records_digest_and_refuses_command_template() {
+        let root = tempfile::tempdir().unwrap();
+        let mut authority = LifecycleAuthority::begin(root.path(), plan()).unwrap();
+        assert!(matches!(
+            authority.mint_lighthouse_enrollment_bearer(root.path(), Some(JOIN_TOKEN_TEMPLATE)),
+            Err(LifecycleAuthorityError::InvalidPlan(
+                "enrollment bearer template"
+            ))
+        ));
+        assert!(matches!(
+            authority.mint_lighthouse_enrollment_bearer(root.path(), Some("{{JOIN_TOKEN}} extra")),
+            Err(LifecycleAuthorityError::InvalidPlan(
+                "enrollment bearer template"
+            ))
+        ));
+        assert!(
+            authority
+                .checkpoint()
+                .pending_enrollment_bearer_digests
+                .is_empty()
+        );
+
+        let bearer = authority
+            .mint_lighthouse_enrollment_bearer(root.path(), None)
+            .expect("authority mints through the existing ledger");
+        assert_ne!(bearer, JOIN_TOKEN_TEMPLATE);
+        assert_eq!(bearer.len(), 43);
+        assert!(crate::bearer_ledger::is_pending(root.path(), &bearer));
+        assert!(crate::bearer_ledger::is_lighthouse_bearer(
+            root.path(),
+            &bearer
+        ));
+
+        let digest = enrollment_bearer_digest_hex(&bearer);
+        assert_eq!(
+            authority.checkpoint().pending_enrollment_bearer_digests,
+            vec![digest.clone()]
+        );
+        let checkpoint =
+            std::fs::read_to_string(root.path().join("lifecycle/seat-15/checkpoint.json")).unwrap();
+        assert!(
+            !checkpoint.contains(&bearer),
+            "raw enrollment bearer must not persist in the lifecycle checkpoint"
+        );
+        assert!(checkpoint.contains(&digest));
+
+        let replay = authority
+            .mint_lighthouse_enrollment_bearer(root.path(), Some(&bearer))
+            .expect("retry of the same minted bearer is idempotent");
+        assert_eq!(replay, bearer);
+        assert_eq!(
+            authority
+                .checkpoint()
+                .pending_enrollment_bearer_digests
+                .len(),
+            1,
+            "retry must not spray a second pending digest"
+        );
+        authority.finish().unwrap();
+    }
+
+    #[test]
+    fn lighthouse_enrollment_mint_refuses_failed_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut authority = LifecycleAuthority::begin(root.path(), plan()).unwrap();
+        let mut failed = authority.checkpoint().progress.clone();
+        failed.phase = LifecyclePhase::Failed;
+        authority.update(failed).unwrap();
+        assert!(matches!(
+            authority.mint_lighthouse_enrollment_bearer(root.path(), None),
+            Err(LifecycleAuthorityError::InvalidTransition(
+                "enrollment bearer mint after terminal failure"
             ))
         ));
         authority.finish().unwrap();

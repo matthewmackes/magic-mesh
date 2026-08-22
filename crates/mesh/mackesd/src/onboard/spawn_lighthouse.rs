@@ -586,6 +586,76 @@ impl LiveProvisioner {
     }
 }
 
+/// Mint or admit a lighthouse-scoped bearer through the existing lifecycle
+/// authority. The raw secret is returned once; the checkpoint stores only the
+/// digest. A missing prior session starts an Onboard plan for this host.
+fn mint_lighthouse_bearer_via_authority(
+    root: &std::path::Path,
+    host: &str,
+    provided: Option<&str>,
+) -> Result<String, ProvisionError> {
+    use crate::lifecycle_authority::{LifecycleAuthority, LifecycleAuthorityError};
+    use mackes_mesh_types::lifecycle::{LifecycleIntentKind, LifecyclePlanV1};
+
+    if host.is_empty()
+        || host.len() > 128
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(ProvisionError::Failed {
+            step: "push-enroll",
+            reason: "bootstrap host is not a lifecycle target id".to_string(),
+        });
+    }
+    let mut authority = match LifecycleAuthority::resume(root, host) {
+        Ok(authority) => authority,
+        Err(LifecycleAuthorityError::Io(_)) | Err(LifecycleAuthorityError::Json(_)) => {
+            let generation = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().max(1))
+                .unwrap_or(1);
+            let plan = LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: format!("lh-enroll-{host}-{generation}"),
+                target_id: host.to_string(),
+                intent: LifecycleIntentKind::Onboard,
+                generation,
+                steps: vec!["mesh".into()],
+            };
+            LifecycleAuthority::begin(root, plan).map_err(|error| ProvisionError::Failed {
+                step: "push-enroll",
+                reason: format!("lifecycle authority begin: {error:?}"),
+            })?
+        }
+        Err(error) => {
+            return Err(ProvisionError::Failed {
+                step: "push-enroll",
+                reason: format!("lifecycle authority resume: {error:?}"),
+            });
+        }
+    };
+    let minted = authority
+        .mint_lighthouse_enrollment_bearer(root, provided)
+        .map_err(|error| ProvisionError::Failed {
+            step: "push-enroll",
+            reason: format!("mint lighthouse-scoped bearer: {error:?}"),
+        });
+    match minted {
+        Ok(bearer) => {
+            authority.finish().map_err(|error| ProvisionError::Failed {
+                step: "push-enroll",
+                reason: format!("release lifecycle authority: {error:?}"),
+            })?;
+            Ok(bearer)
+        }
+        Err(error) => {
+            let _ = authority.finish();
+            Err(error)
+        }
+    }
+}
+
 /// Map an OW-15 [`RemotePushError`](crate::onboard::remote_push::RemotePushError)
 /// into the provisioner seam's typed error for the push-enroll step.
 fn remote_push_to_provision_error(
@@ -637,14 +707,35 @@ impl Provisioner for LiveProvisioner {
         // and run ONLY the enroll step (the single-use bearer, no ambient key). The
         // enroll invocation (carrying the join-token placeholder substituted at
         // apply time) rides the RunEnroll action; SshBootstrap refuses anything else.
+        // The raw bearer is minted or admitted through the lifecycle authority and
+        // handed to the transport as Action::RunEnroll — never interpolated into
+        // argv or the rendered enroll command.
         let target = crate::onboard::remote_push::Target::Bootstrap {
             host: endpoint.host.clone(),
         };
         let issued_bearer;
-        let bearer = if let Some(bearer) = endpoint.join_bearer.as_deref() {
-            bearer
-        } else {
-            let Some(root) = self.workgroup_root.as_deref() else {
+        let bearer = match (
+            endpoint.join_bearer.as_deref(),
+            self.workgroup_root.as_deref(),
+        ) {
+            (Some(JOIN_TOKEN_PLACEHOLDER) | Some(""), _) => {
+                return Err(ProvisionError::Failed {
+                    step: "push-enroll",
+                    reason: "refusing the enroll command template as an enrollment bearer"
+                        .to_string(),
+                });
+            }
+            (Some(provided), Some(root)) => {
+                issued_bearer =
+                    mint_lighthouse_bearer_via_authority(root, &endpoint.host, Some(provided))?;
+                issued_bearer.as_str()
+            }
+            (Some(provided), None) => provided,
+            (None, Some(root)) => {
+                issued_bearer = mint_lighthouse_bearer_via_authority(root, &endpoint.host, None)?;
+                issued_bearer.as_str()
+            }
+            (None, None) => {
                 return Err(ProvisionError::IntegrationGated {
                     step: "push-enroll",
                     reason: "no lifecycle workgroup root is configured to mint the \
@@ -652,14 +743,7 @@ impl Provisioner for LiveProvisioner {
                              as a bearer"
                         .to_string(),
                 });
-            };
-            issued_bearer =
-                crate::bearer_ledger::issue(root, crate::bearer_ledger::LIGHTHOUSE_ROLE_NOTE)
-                    .map_err(|error| ProvisionError::Failed {
-                        step: "push-enroll",
-                        reason: format!("mint lighthouse-scoped bearer: {error}"),
-                    })?;
-            issued_bearer.as_str()
+            }
         };
         let actions = [crate::onboard::remote_push::Action::RunEnroll {
             bearer: bearer.to_string(),
@@ -1167,6 +1251,79 @@ mod tests {
             .redacted()
             .contains(bearer),
             "bearer never enters the log-safe action description"
+        );
+        let checkpoint = std::fs::read_to_string(
+            root.path()
+                .join("lifecycle")
+                .join(&endpoint.host)
+                .join("checkpoint.json"),
+        )
+        .expect("authority checkpoint");
+        assert!(
+            !checkpoint.contains(bearer),
+            "raw minted bearer must not persist in the lifecycle checkpoint"
+        );
+        assert!(
+            checkpoint.contains("pending_enrollment_bearer_digests"),
+            "authority must record the minted-bearer digest"
+        );
+    }
+
+    #[test]
+    fn push_enroll_refuses_the_join_token_template_even_when_supplied() {
+        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPush {
+            seen: Mutex<Vec<Action>>,
+        }
+        impl RemotePush for RecordingPush {
+            fn apply(&self, _target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+                self.seen
+                    .lock()
+                    .expect("seen mutex")
+                    .extend_from_slice(actions);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let push = Arc::new(RecordingPush::default());
+        let prov = LiveProvisioner::default()
+            .with_remote_push(push.clone())
+            .with_workgroup_root(root.path().to_path_buf());
+        let endpoint = Endpoint {
+            host: "203.0.113.9".into(),
+            overlay_ip: None,
+            join_bearer: Some(JOIN_TOKEN_PLACEHOLDER.to_string()),
+        };
+
+        let error = prov
+            .push_enroll(&endpoint, &enroll_bootstrap("home-deadbeef"))
+            .expect_err("command template cannot ride as a minted bearer");
+        match error {
+            ProvisionError::Failed { step, reason } => {
+                assert_eq!(step, "push-enroll");
+                assert!(
+                    reason.contains("template"),
+                    "failure must name the refused template: {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            push.seen.lock().expect("seen mutex").is_empty(),
+            "refused template must never reach the SSH transport"
+        );
+        assert!(
+            !root
+                .path()
+                .join("lifecycle")
+                .join(&endpoint.host)
+                .join("checkpoint.json")
+                .exists(),
+            "template refusal must not open a lifecycle session"
         );
     }
 }

@@ -569,9 +569,12 @@ pub struct SshBootstrap;
 /// exactly 43 characters.  Enforcing that shape at the transport boundary
 /// prevents a caller from turning the private stdin handoff into an arbitrary
 /// credential channel, while still keeping the bearer out of argv and logs.
+/// The enroll-command placeholder is refused by the same rule — it is not a
+/// minted bearer and must never be written to stdin or a credential file.
 #[cfg(feature = "async-services")]
 fn validate_bootstrap_bearer(bearer: &str) -> Result<(), RemotePushError> {
-    if bearer.len() != 43
+    if bearer == "{{JOIN_TOKEN}}"
+        || bearer.len() != 43
         || bearer
             .bytes()
             .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-' && byte != b'_')
@@ -581,6 +584,53 @@ fn validate_bootstrap_bearer(bearer: &str) -> Result<(), RemotePushError> {
         });
     }
     Ok(())
+}
+
+/// Named systemd credentials that pin the bootstrap SSH identity.
+/// Enrollment material itself still travels on stdin — never argv.
+#[cfg(feature = "async-services")]
+const BOOTSTRAP_SSH_KEY_CREDENTIAL: &str = "bootstrap-ssh-key";
+#[cfg(feature = "async-services")]
+const BOOTSTRAP_KNOWN_HOSTS_CREDENTIAL: &str = "bootstrap-known-hosts";
+
+/// Resolve a bootstrap identity file from a systemd credential descriptor
+/// first, then the explicit env path. A final symlink is refused so a
+/// replaced credential cannot retarget host pinning.
+#[cfg(feature = "async-services")]
+fn resolve_bootstrap_identity(
+    credential_name: &str,
+    env_var: &str,
+) -> Result<std::path::PathBuf, RemotePushError> {
+    if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+        let path = std::path::PathBuf::from(dir).join(credential_name);
+        if path.exists() || std::fs::symlink_metadata(&path).is_ok() {
+            return require_regular_identity_file(path);
+        }
+    }
+    let path = std::env::var_os(env_var)
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| RemotePushError::NotWired {
+            transport: match env_var {
+                "MACKESD_BOOTSTRAP_SSH_KEY" => "ssh-bootstrap (MACKESD_BOOTSTRAP_SSH_KEY missing)",
+                _ => "ssh-bootstrap (MACKESD_BOOTSTRAP_KNOWN_HOSTS missing)",
+            },
+        })?;
+    require_regular_identity_file(path)
+}
+
+#[cfg(feature = "async-services")]
+fn require_regular_identity_file(
+    path: std::path::PathBuf,
+) -> Result<std::path::PathBuf, RemotePushError> {
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| RemotePushError::NotWired {
+        transport: "ssh-bootstrap (configured key or known-hosts file is unavailable)",
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RemotePushError::BundleRejected {
+            why: "bootstrap host identity must be a regular credential file".to_string(),
+        });
+    }
+    Ok(path)
 }
 
 impl RemotePush for SshBootstrap {
@@ -618,16 +668,14 @@ impl RemotePush for SshBootstrap {
                 unreachable!("the action allow-list above admits only one action")
             };
             validate_bootstrap_bearer(bearer)?;
-            let key = std::env::var_os("MACKESD_BOOTSTRAP_SSH_KEY")
-                .map(std::path::PathBuf::from)
-                .ok_or_else(|| RemotePushError::NotWired {
-                    transport: "ssh-bootstrap (MACKESD_BOOTSTRAP_SSH_KEY missing)",
-                })?;
-            let known_hosts = std::env::var_os("MACKESD_BOOTSTRAP_KNOWN_HOSTS")
-                .map(std::path::PathBuf::from)
-                .ok_or_else(|| RemotePushError::NotWired {
-                    transport: "ssh-bootstrap (MACKESD_BOOTSTRAP_KNOWN_HOSTS missing)",
-                })?;
+            let key = resolve_bootstrap_identity(
+                BOOTSTRAP_SSH_KEY_CREDENTIAL,
+                "MACKESD_BOOTSTRAP_SSH_KEY",
+            )?;
+            let known_hosts = resolve_bootstrap_identity(
+                BOOTSTRAP_KNOWN_HOSTS_CREDENTIAL,
+                "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+            )?;
             let args = bootstrap_ssh_argv(host, &key, &known_hosts)?;
             let mut child = std::process::Command::new("ssh")
                 .args(&args)
@@ -1210,9 +1258,10 @@ mod tests {
                 media: true,
             })
             .expect_err("media lighthouse promotion must be refused");
-        assert!(err
-            .to_string()
-            .contains("media/file-sharing lighthouse capability is retired"));
+        assert!(
+            err.to_string()
+                .contains("media/file-sharing lighthouse capability is retired")
+        );
         assert!(!tmp.path().join("role.toml").exists());
     }
 
@@ -1417,25 +1466,29 @@ mod tests {
         let now = 1_800_000_000;
         let b = bundle(now);
         let wrong = SigningKey::from_bytes(&[1_u8; 32]);
-        assert!(process_apply(
-            &b,
-            &b.sign(&wrong),
-            &k.verifying_key(),
-            now,
-            &mut guard,
-            &applier
-        )
-        .is_err());
+        assert!(
+            process_apply(
+                &b,
+                &b.sign(&wrong),
+                &k.verifying_key(),
+                now,
+                &mut guard,
+                &applier
+            )
+            .is_err()
+        );
         // same nonce, now correctly signed → still applies (nonce was not burned)
-        assert!(process_apply(
-            &b,
-            &b.sign(&k),
-            &k.verifying_key(),
-            now,
-            &mut guard,
-            &applier
-        )
-        .is_ok());
+        assert!(
+            process_apply(
+                &b,
+                &b.sign(&k),
+                &k.verifying_key(),
+                now,
+                &mut guard,
+                &applier
+            )
+            .is_ok()
+        );
     }
 
     // ── production transports: honest gate + refusal boundaries (§7) ──
@@ -1516,12 +1569,14 @@ mod tests {
         std::fs::write(&known_hosts, "203.0.113.7 ssh-ed25519 AAAA\n").unwrap();
         let args = bootstrap_ssh_argv("203.0.113.7", &key, &known_hosts).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("lighthouse"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair[0] == "mackesd" && pair[1] == "join"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "mackesd" && pair[1] == "join")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7")
+        );
         assert!(!args.iter().any(|arg| arg.contains("sh -c")));
         assert!(!args.iter().any(|arg| arg.contains("bearer")));
         assert!(args.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));
@@ -1540,6 +1595,49 @@ mod tests {
             bootstrap_ssh_argv("host", key, known_hosts),
             Err(RemotePushError::NotWired { .. })
         ));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn ssh_bootstrap_refuses_join_token_template_before_stdin_handoff() {
+        let err = SshBootstrap
+            .apply(
+                &Target::Bootstrap {
+                    host: "203.0.113.7".into(),
+                },
+                &[Action::RunEnroll {
+                    bearer: "{{JOIN_TOKEN}}".into(),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+        assert!(err.to_string().contains("43 URL-safe"));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn ssh_bootstrap_refuses_a_symlink_host_identity_credential() {
+        static CREDENTIALS_DIRECTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CREDENTIALS_DIRECTORY_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real-known-hosts");
+        std::fs::write(&real, "203.0.113.7 ssh-ed25519 AAAA\n").unwrap();
+        let cred_dir = root.path().join("creds");
+        std::fs::create_dir(&cred_dir).unwrap();
+        std::os::unix::fs::symlink(&real, cred_dir.join(BOOTSTRAP_KNOWN_HOSTS_CREDENTIAL)).unwrap();
+        let previous = std::env::var_os("CREDENTIALS_DIRECTORY");
+        std::env::set_var("CREDENTIALS_DIRECTORY", &cred_dir);
+        let result = resolve_bootstrap_identity(
+            BOOTSTRAP_KNOWN_HOSTS_CREDENTIAL,
+            "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+        );
+        match previous {
+            Some(value) => std::env::set_var("CREDENTIALS_DIRECTORY", value),
+            None => std::env::remove_var("CREDENTIALS_DIRECTORY"),
+        }
+        let err = result.expect_err("a final symlink must not pin host identity");
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+        assert!(err.to_string().contains("regular credential file"));
     }
 
     #[test]
