@@ -54,10 +54,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use mde_collab_egui::{
-    ActivityAdminSnapshot, CollabData, CommandSink, CommunicationsSurface, GatewayCommand,
-    GatewayReadout, Mode, SyncPairCommand, SyncPairView, VoiceAdminCommand, VoiceCutoverPhase,
-    VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState,
-    VoiceSharedOutbound, VOIP_GET_GATEWAY_TOPIC,
+    ActivityAdminSnapshot, CollabData, CommandSink, CommunicationsSurface, DocumentShareCommand,
+    GatewayCommand, GatewayReadout, Mode, SyncPairCommand, SyncPairView, VoiceAdminCommand,
+    VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection,
+    VoiceRegState, VoiceSharedOutbound, VOIP_GET_GATEWAY_TOPIC,
 };
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
@@ -68,6 +68,7 @@ use mde_collab_types::{
 };
 #[cfg(feature = "drm")]
 use mde_collab_types::{ClipboardMimeKind, ClipboardMimeOfferV2, ClipboardPayloadV2};
+use mde_editor_egui::CollabSession;
 
 use crate::bus_reader::BusReader;
 
@@ -1513,7 +1514,10 @@ impl CommunicationsState {
     /// `action/voip/*`. Transfers-mode [`SyncPairCommand`]s drain from the
     /// surface `SyncPairSink` onto the existing transfer inbox as
     /// `TransferVerb::{SaveSyncPair, RemoveSyncPair}` — the worker store stays
-    /// the only pair authority.
+    /// the only pair authority. Documents-mode [`DocumentShareCommand`]s drain
+    /// from the surface share sink and apply locally through the existing
+    /// [`CollabSession`] follow APIs when a session is present — no Bus verb
+    /// and no second CRDT.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut sink = CommandSink::new();
         let selected_before = self.surface.selected_space();
@@ -1574,6 +1578,7 @@ impl CommunicationsState {
         ) {
             self.sync_pair_views_dirty = true;
         }
+        drain_document_share(&self.surface.drain_document_share_commands(), None);
         if self.gateway_get_dirty && self.surface.mode() == Mode::Activity {
             self.maybe_request_gateway_get();
         }
@@ -1847,6 +1852,45 @@ fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
     }
     views.sort_by(|a, b| a.id.cmp(&b.id));
     views
+}
+
+/// Drain Documents share-session intents so they leave the surface sink.
+///
+/// Start / Join / Follow / Unfollow / Close already applied on the
+/// [`CommunicationsSurface`] through its live [`CollabSession`]. This mount
+/// consumes the leftover intents. When a session is supplied, Follow /
+/// Unfollow / Close apply through those existing session methods. Start /
+/// Join never construct another session (that would be a second CRDT).
+/// Nothing is published onto the Bus — `CollabCommand` has no share variants.
+fn drain_document_share(
+    commands: &[DocumentShareCommand],
+    mut session: Option<&mut CollabSession>,
+) -> usize {
+    for command in commands {
+        apply_document_share_command(command, session.as_deref_mut());
+    }
+    commands.len()
+}
+
+fn apply_document_share_command(
+    command: &DocumentShareCommand,
+    session: Option<&mut CollabSession>,
+) {
+    match command {
+        DocumentShareCommand::Start { .. } | DocumentShareCommand::Join { .. } => {
+            // Host / guest attach already happened on the surface.
+        }
+        DocumentShareCommand::Follow { peer, .. } => {
+            if let Some(session) = session {
+                let _ = session.follow(peer);
+            }
+        }
+        DocumentShareCommand::Unfollow { .. } | DocumentShareCommand::Close { .. } => {
+            if let Some(session) = session {
+                session.unfollow();
+            }
+        }
+    }
 }
 
 /// Drain editor-emitted [`SyncPairCommand`]s (the surface's `SyncPairSink`)
@@ -3786,6 +3830,135 @@ mod tests {
         assert!(
             !dir.path().join("inbox").exists(),
             "rejected sink drain must not leave inbox records"
+        );
+    }
+
+    #[test]
+    fn show_drains_document_share_commands_locally_without_a_bus_verb_or_second_crdt() {
+        // CommunicationsState::show drains the Documents share sink every
+        // frame the same way it drains SyncPairSink. A fresh surface has
+        // nothing queued; the mount must not invent a Bus verb or a second
+        // CRDT just because the sink is empty.
+        let mut surface = CommunicationsSurface::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            surface.drain_document_share_commands().is_empty(),
+            "fresh Documents share sink is empty"
+        );
+        assert_eq!(
+            drain_document_share(&surface.drain_document_share_commands(), None),
+            0,
+            "empty share drain must not apply anything"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("tempdir")
+                .next()
+                .is_none(),
+            "empty share drain must not write a Bus verb or pair store"
+        );
+
+        let space = SpaceId::new();
+        let document = mde_collab_types::DocumentId::new();
+        let session = "docs-share".to_owned();
+        let lifecycle = [
+            DocumentShareCommand::Start {
+                space,
+                document,
+                session: session.clone(),
+            },
+            DocumentShareCommand::Join {
+                space,
+                document,
+                session: session.clone(),
+            },
+            DocumentShareCommand::Follow {
+                document,
+                peer: "eagle".to_owned(),
+            },
+            DocumentShareCommand::Unfollow { document },
+            DocumentShareCommand::Close {
+                space,
+                document,
+                session,
+            },
+        ];
+        assert_eq!(
+            drain_document_share(&lifecycle, None),
+            5,
+            "Start/Join/Follow/Unfollow/Close must leave the sink"
+        );
+        assert!(
+            surface.drain_document_share_commands().is_empty(),
+            "draining share intents must clear the per-frame queue"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("tempdir")
+                .next()
+                .is_none(),
+            "share drain must not invent a Bus verb"
+        );
+
+        // Follow / Unfollow / Close apply through the existing CollabSession
+        // APIs when a live session is present — the same session Documents
+        // already attached, never a second CRDT. Guest joins first so the
+        // host poll sees the rostered peer (the library's follow fixture).
+        let bus = mde_editor_egui::FakeBus::new();
+        let sid = mde_editor_egui::SessionId::new("docs-share").expect("session id");
+        let mut host = CollabSession::host(sid.clone(), "eagle", "# shared\n");
+        let mut guest = CollabSession::guest(sid, "falcon");
+        guest.join(&bus);
+        host.poll(&bus);
+        assert!(
+            host.peers().contains_key("falcon"),
+            "host roster must see the guest before Follow can apply"
+        );
+
+        assert_eq!(
+            drain_document_share(
+                &[DocumentShareCommand::Follow {
+                    document,
+                    peer: "falcon".to_owned(),
+                }],
+                Some(&mut host),
+            ),
+            1
+        );
+        assert_eq!(
+            host.following(),
+            Some("falcon"),
+            "Follow must apply through CollabSession::follow"
+        );
+        assert_eq!(
+            drain_document_share(
+                &[
+                    DocumentShareCommand::Unfollow { document },
+                    DocumentShareCommand::Follow {
+                        document,
+                        peer: "falcon".to_owned(),
+                    },
+                    DocumentShareCommand::Close {
+                        space,
+                        document,
+                        session: "docs-share".to_owned(),
+                    },
+                ],
+                Some(&mut host),
+            ),
+            3
+        );
+        assert_eq!(
+            host.following(),
+            None,
+            "Close must detach follow through CollabSession::unfollow"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("tempdir")
+                .next()
+                .is_none(),
+            "local session apply must not invent a Bus verb"
         );
     }
 }
