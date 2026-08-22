@@ -1,11 +1,12 @@
-//! Bounded, versioned live-media session contracts (WL-FUNC-024 S1).
+//! Bounded, versioned live-media session contracts (WL-FUNC-024 S1 / S4).
 //!
 //! These types are the only media facts allowed on the Bus. Offer/answer,
 //! track kind, mute, and session readiness travel as [`MediaSessionV1`] /
-//! [`MediaDescriptionV1`] — never as untyped JSON bags. The crate is still
-//! pure: no I/O, no wall clock, no media stack. A [`MediaSessionStateV1::Connected`]
-//! value is intrinsically invalid unless advancing frames were observed, so a
-//! hostile publisher cannot claim a live call by omitting evidence.
+//! [`MediaDescriptionV1`] — never as untyped JSON bags. PSTN legs travel as
+//! [`SipLegV1`]. The crate is still pure: no I/O, no wall clock, no media
+//! stack. A [`MediaSessionStateV1::Connected`] value is intrinsically invalid
+//! unless advancing frames were observed, so a hostile publisher cannot claim
+//! a live call by omitting evidence.
 
 use std::fmt;
 
@@ -56,10 +57,24 @@ pub fn media_sfu_election_topic(session: CallId) -> String {
     format!("{MEDIA_STATE_PREFIX}{session}/sfu")
 }
 
+/// PSTN leg bridged through the LiveKit SIP gateway:
+/// `state/calls/media/<session>/sip`.
+#[must_use]
+pub fn media_sip_leg_topic(session: CallId) -> String {
+    format!("{MEDIA_STATE_PREFIX}{session}/sip")
+}
+
 /// Maximum encoded JSON body accepted by [`SfuElectionV1::from_json_bytes`].
 pub const MAX_SFU_ELECTION_V1_JSON_BYTES: usize = 8 * 1024;
 /// Maximum participants retained on one SFU election document.
 pub const MAX_SFU_ELECTION_PARTICIPANTS: usize = 16;
+
+/// Maximum encoded JSON body accepted by [`SipLegV1::from_json_bytes`].
+pub const MAX_SIP_LEG_V1_JSON_BYTES: usize = 8 * 1024;
+/// Minimum E.164 significant digits (short codes / emergency numbers).
+pub const MIN_SIP_E164_DIGITS: usize = 3;
+/// Maximum E.164 significant digits (ITU-T E.164 caps the number at 15).
+pub const MAX_SIP_E164_DIGITS: usize = 15;
 
 /// One media track a session may offer. Video and screen are named so a later
 /// plane can attach them; S2 only carries audio.
@@ -406,6 +421,234 @@ impl SfuElectionV1 {
             .iter()
             .min_by_key(|actor| actor.as_str())
             .cloned()
+    }
+}
+
+/// Direction of a PSTN leg on the LiveKit SIP gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SipLegDirectionV1 {
+    /// The local seat originated the PSTN dial.
+    Outbound,
+    /// The gateway presented an inbound PSTN offer.
+    Inbound,
+}
+
+impl SipLegDirectionV1 {
+    /// Canonical snake-case wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Outbound => "outbound",
+            Self::Inbound => "inbound",
+        }
+    }
+}
+
+/// PSTN leg bridged through the LiveKit SIP gateway (WL-FUNC-024 S4).
+///
+/// The document names the call, the local seat, the dial direction, and a
+/// fail-closed E.164. Credentials, SIP URIs, passwords, and raw SDP never
+/// appear on the wire. `bridged` is intrinsically invalid unless the gateway
+/// is available — a hostile publisher cannot claim a live PSTN leg by omitting
+/// evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SipLegV1 {
+    /// Schema discriminator; must equal [`MEDIA_SESSION_V1_SCHEMA_VERSION`].
+    pub schema_version: u16,
+    /// The call this PSTN leg belongs to.
+    pub session: CallId,
+    /// The local seat that owns the gateway path.
+    pub local_actor: ActorId,
+    /// Inbound offer or outbound dial.
+    pub direction: SipLegDirectionV1,
+    /// Canonical E.164: `+` plus [`MIN_SIP_E164_DIGITS`]..=[`MAX_SIP_E164_DIGITS`]
+    /// significant digits. Never a SIP URI, `tel:`, or secret.
+    pub e164: String,
+    /// Whether the LiveKit SIP gateway currently reports a reachable trunk.
+    pub gateway_available: bool,
+    /// Whether this leg is bridged onto a live PSTN path.
+    pub bridged: bool,
+}
+
+impl SipLegV1 {
+    /// Assemble an intrinsically valid PSTN-leg document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the session, actor, E.164, or
+    /// bridged/gateway pairing fail the bounded contract.
+    pub fn new(
+        session: CallId,
+        local_actor: ActorId,
+        direction: SipLegDirectionV1,
+        e164: impl Into<String>,
+        gateway_available: bool,
+        bridged: bool,
+    ) -> Result<Self, SipLegV1ValidationError> {
+        let document = Self {
+            schema_version: MEDIA_SESSION_V1_SCHEMA_VERSION,
+            session,
+            local_actor,
+            direction,
+            e164: e164.into(),
+            gateway_available,
+            bridged,
+        };
+        document.validate()?;
+        Ok(document)
+    }
+
+    /// The retained Bus topic this document belongs on.
+    #[must_use]
+    pub fn topic(&self) -> String {
+        media_sip_leg_topic(self.session)
+    }
+
+    /// Decode and admit a bounded JSON PSTN-leg body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for an oversized, malformed, unknown, duplicate,
+    /// or intrinsically invalid body.
+    pub fn from_json(body: &str) -> Result<Self, SipLegV1DecodeError> {
+        Self::from_json_bytes(body.as_bytes())
+    }
+
+    /// Decode and admit a bounded JSON byte body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for an oversized, malformed, unknown, duplicate,
+    /// or intrinsically invalid body.
+    pub fn from_json_bytes(body: &[u8]) -> Result<Self, SipLegV1DecodeError> {
+        if body.len() > MAX_SIP_LEG_V1_JSON_BYTES {
+            return Err(SipLegV1DecodeError::BodyTooLarge {
+                bytes: body.len(),
+                max: MAX_SIP_LEG_V1_JSON_BYTES,
+            });
+        }
+        reject_duplicate_json_keys(body).map_err(SipLegV1DecodeError::Json)?;
+        let document = serde_json::from_slice::<Self>(body).map_err(SipLegV1DecodeError::Json)?;
+        document
+            .validate()
+            .map_err(SipLegV1DecodeError::Validation)?;
+        Ok(document)
+    }
+
+    /// Validate the intrinsic contract, including fail-closed E.164 and the
+    /// bridged-requires-gateway honesty lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field that fails admission.
+    pub fn validate(&self) -> Result<(), SipLegV1ValidationError> {
+        if self.schema_version != MEDIA_SESSION_V1_SCHEMA_VERSION {
+            return Err(SipLegV1ValidationError::UnsupportedSchema {
+                found: self.schema_version,
+            });
+        }
+        if self.session.is_nil() {
+            return Err(SipLegV1ValidationError::NilSessionId);
+        }
+        validate_sip_actor("local_actor", &self.local_actor)?;
+        validate_e164(&self.e164)?;
+        if self.bridged && !self.gateway_available {
+            return Err(SipLegV1ValidationError::BridgedWithoutGateway);
+        }
+        Ok(())
+    }
+}
+
+/// Why a PSTN-leg document failed intrinsic validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SipLegV1ValidationError {
+    /// Schema discriminator is not supported.
+    UnsupportedSchema {
+        /// Version found on the wire.
+        found: u16,
+    },
+    /// The session/call id was the nil sentinel.
+    NilSessionId,
+    /// A bounded value exceeded its maximum.
+    OutOfBounds {
+        /// Field that exceeded its bound.
+        field: &'static str,
+        /// Maximum admitted value.
+        max: u64,
+    },
+    /// A field failed shape or pairing admission.
+    InvalidField {
+        /// Field that failed.
+        field: &'static str,
+    },
+    /// A free-text or identity field carried a command, path, URL, or secret.
+    ForbiddenValue {
+        /// Field that contained the forbidden value.
+        field: &'static str,
+    },
+    /// `bridged` was claimed without a reachable SIP gateway.
+    BridgedWithoutGateway,
+}
+
+impl fmt::Display for SipLegV1ValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSchema { found } => {
+                write!(formatter, "unsupported SIP leg schema version {found}")
+            }
+            Self::NilSessionId => formatter.write_str("SIP leg session id is nil"),
+            Self::OutOfBounds { field, max } => {
+                write!(formatter, "SIP {field} exceeds bound {max}")
+            }
+            Self::InvalidField { field } => write!(formatter, "invalid SIP leg field {field}"),
+            Self::ForbiddenValue { field } => {
+                write!(formatter, "forbidden SIP value in {field}")
+            }
+            Self::BridgedWithoutGateway => {
+                formatter.write_str("SIP leg cannot be bridged without an available gateway")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SipLegV1ValidationError {}
+
+/// Why a JSON PSTN-leg body could not be decoded and admitted.
+#[derive(Debug)]
+pub enum SipLegV1DecodeError {
+    /// The encoded body was rejected before serde allocation.
+    BodyTooLarge {
+        /// Number of bytes supplied.
+        bytes: usize,
+        /// Maximum encoded body size.
+        max: usize,
+    },
+    /// The body was malformed JSON or had an unknown/duplicate wire field.
+    Json(serde_json::Error),
+    /// The body decoded but failed semantic validation.
+    Validation(SipLegV1ValidationError),
+}
+
+impl fmt::Display for SipLegV1DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BodyTooLarge { bytes, max } => {
+                write!(formatter, "SIP leg body is {bytes} bytes; maximum is {max}")
+            }
+            Self::Json(error) => write!(formatter, "invalid SIP leg JSON: {error}"),
+            Self::Validation(error) => write!(formatter, "invalid SIP leg: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SipLegV1DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(error) => Some(error),
+            Self::BodyTooLarge { .. } | Self::Validation(_) => None,
+        }
     }
 }
 
@@ -795,6 +1038,53 @@ fn looks_forbidden(value: &str) -> bool {
         || lower.contains("token=")
 }
 
+fn validate_sip_actor(field: &'static str, actor: &ActorId) -> Result<(), SipLegV1ValidationError> {
+    let value = actor.as_str();
+    if value.is_empty() || value.len() > MAX_MEDIA_ACTOR_BYTES {
+        return Err(SipLegV1ValidationError::OutOfBounds {
+            field,
+            max: MAX_MEDIA_ACTOR_BYTES as u64,
+        });
+    }
+    if looks_forbidden(value)
+        || value.bytes().any(|byte| {
+            byte.is_ascii_control() || byte == b'/' || byte == b'\\' || byte.is_ascii_whitespace()
+        })
+    {
+        return Err(SipLegV1ValidationError::ForbiddenValue { field });
+    }
+    Ok(())
+}
+
+fn validate_e164(value: &str) -> Result<(), SipLegV1ValidationError> {
+    if looks_forbidden(value)
+        || value.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || byte == b'/'
+                || byte == b'\\'
+                || byte == b'@'
+                || byte == b':'
+                || byte == b';'
+        })
+    {
+        return Err(SipLegV1ValidationError::ForbiddenValue { field: "e164" });
+    }
+    let Some(digits) = value.strip_prefix('+') else {
+        return Err(SipLegV1ValidationError::InvalidField { field: "e164" });
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SipLegV1ValidationError::InvalidField { field: "e164" });
+    }
+    if digits.len() < MIN_SIP_E164_DIGITS || digits.len() > MAX_SIP_E164_DIGITS {
+        return Err(SipLegV1ValidationError::OutOfBounds {
+            field: "e164",
+            max: MAX_SIP_E164_DIGITS as u64,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1355,10 @@ mod tests {
             media_sfu_election_topic(session),
             format!("state/calls/media/{session}/sfu")
         );
+        assert_eq!(
+            media_sip_leg_topic(session),
+            format!("state/calls/media/{session}/sip")
+        );
     }
 
     #[test]
@@ -1095,5 +1389,175 @@ mod tests {
             Some(&carol)
         );
         assert!(SfuElectionV1::new(session, alice.clone(), false, vec![alice, bob]).is_err());
+    }
+
+    fn sample_sip_leg() -> SipLegV1 {
+        SipLegV1::new(
+            CallId::new(),
+            ActorId::new("alice"),
+            SipLegDirectionV1::Outbound,
+            "+15551234567",
+            true,
+            true,
+        )
+        .expect("valid bridged SIP leg")
+    }
+
+    #[test]
+    fn sip_leg_round_trips_and_is_admitted() {
+        let document = sample_sip_leg();
+        let body = serde_json::to_string(&document).expect("json");
+        let decoded = SipLegV1::from_json(&body).expect("admit");
+        assert_eq!(decoded, document);
+        assert!(decoded.bridged);
+        assert_eq!(decoded.topic(), media_sip_leg_topic(document.session));
+        assert_eq!(decoded.direction.as_str(), "outbound");
+    }
+
+    #[test]
+    fn sip_leg_admits_inbound_and_honest_unavailable_gateway() {
+        let inbound = SipLegV1::new(
+            CallId::new(),
+            ActorId::new("alice"),
+            SipLegDirectionV1::Inbound,
+            "+18005551212",
+            true,
+            false,
+        )
+        .expect("valid inbound offer");
+        let body = serde_json::to_string(&inbound).expect("json");
+        assert_eq!(SipLegV1::from_json(&body).expect("admit inbound"), inbound);
+
+        let unavailable = SipLegV1::new(
+            CallId::new(),
+            ActorId::new("alice"),
+            SipLegDirectionV1::Outbound,
+            "+911",
+            false,
+            false,
+        )
+        .expect("honest unavailable");
+        assert!(!unavailable.gateway_available);
+        assert!(!unavailable.bridged);
+
+        let max_digits = SipLegV1::new(
+            CallId::new(),
+            ActorId::new("alice"),
+            SipLegDirectionV1::Outbound,
+            "+155512345678901",
+            true,
+            false,
+        )
+        .expect("15-digit E.164 is the ITU-T maximum");
+        assert_eq!(max_digits.e164.len(), 1 + MAX_SIP_E164_DIGITS);
+    }
+
+    #[test]
+    fn sip_leg_bridged_without_gateway_is_rejected_on_the_wire() {
+        let mut value = serde_json::to_value(sample_sip_leg()).expect("value");
+        value["gateway_available"] = json!(false);
+        assert!(matches!(
+            SipLegV1::from_json(&value.to_string()),
+            Err(SipLegV1DecodeError::Validation(
+                SipLegV1ValidationError::BridgedWithoutGateway
+            ))
+        ));
+    }
+
+    #[test]
+    fn sip_leg_e164_is_fail_closed() {
+        for number in [
+            "",
+            "15551234567",
+            "+1",
+            "+12",
+            "+1555123456789012",
+            "+1-555-123-4567",
+            "+1 5551234567",
+            "tel:+15551234567",
+            "sip:+15551234567@evil.invalid",
+            "+1555secret",
+            "+1555password",
+            "+token=abc",
+        ] {
+            assert!(
+                SipLegV1::new(
+                    CallId::new(),
+                    ActorId::new("alice"),
+                    SipLegDirectionV1::Outbound,
+                    number,
+                    true,
+                    false,
+                )
+                .is_err(),
+                "e164 {number:?} must fail"
+            );
+        }
+        let mut value = serde_json::to_value(sample_sip_leg()).expect("value");
+        value["e164"] = json!("sip:+15551234567@gw");
+        assert!(matches!(
+            SipLegV1::from_json(&value.to_string()),
+            Err(SipLegV1DecodeError::Validation(
+                SipLegV1ValidationError::ForbiddenValue { field: "e164" }
+            ))
+        ));
+    }
+
+    #[test]
+    fn sip_leg_unknown_schema_secrets_and_duplicate_keys_fail_closed() {
+        let mut value = serde_json::to_value(sample_sip_leg()).expect("value");
+        value["schema_version"] = json!(2);
+        assert!(matches!(
+            SipLegV1::from_json(&value.to_string()),
+            Err(SipLegV1DecodeError::Validation(
+                SipLegV1ValidationError::UnsupportedSchema { found: 2 }
+            ))
+        ));
+
+        for (field, payload) in [
+            ("command", json!("rm -rf /")),
+            ("password", json!("hunter2")),
+            ("sip_password", json!("hunter2")),
+            ("authorization", json!("Bearer secret")),
+            ("sdp", json!("v=0\r\no=evil")),
+            ("path", json!("/etc/passwd")),
+        ] {
+            let mut hostile = serde_json::to_value(sample_sip_leg()).expect("value");
+            hostile[field] = payload;
+            assert!(
+                SipLegV1::from_json(&hostile.to_string()).is_err(),
+                "field {field} must fail"
+            );
+        }
+
+        for actor in [
+            "",
+            "../escape",
+            "https://evil.invalid",
+            "alice/bob",
+            "token=abc",
+            "command-host",
+        ] {
+            let mut hostile = serde_json::to_value(sample_sip_leg()).expect("value");
+            hostile["local_actor"] = json!(actor);
+            assert!(
+                SipLegV1::from_json(&hostile.to_string()).is_err(),
+                "actor {actor:?} must fail"
+            );
+        }
+
+        let document = sample_sip_leg();
+        let mut body = serde_json::to_string(&document).expect("json");
+        body.insert_str(1, "\"password\":\"x\",\"password\":\"y\",");
+        assert!(SipLegV1::from_json(&body).is_err());
+    }
+
+    #[test]
+    fn sip_leg_oversized_bodies_are_rejected_before_decode() {
+        let body = vec![b' '; MAX_SIP_LEG_V1_JSON_BYTES + 1];
+        assert!(matches!(
+            SipLegV1::from_json_bytes(&body),
+            Err(SipLegV1DecodeError::BodyTooLarge { .. })
+        ));
     }
 }
