@@ -988,7 +988,7 @@ impl TransfersWorker {
             // so activation never replays retained notifications.
             outbox.prime_existing(retained)?;
         }
-        Ok(Engine {
+        let mut engine = Engine {
             queue,
             v2_ledger,
             sync_pairs,
@@ -1002,7 +1002,9 @@ impl TransfersWorker {
             store_root: self.store_root.clone(),
             notify,
             notification_outbox,
-        })
+        };
+        engine.recover_sync_pair_jobs();
+        Ok(engine)
     }
 }
 
@@ -1062,7 +1064,7 @@ struct Engine {
     /// In-flight rsync jobs minted by [`Engine::schedule_sync_pairs_at`].
     /// Not a second store — only the association from job id back to the
     /// existing [`SyncPairStore`] row so a real lane outcome can replace the
-    /// enqueue stamp.
+    /// enqueue stamp. Rebuilt on open from pairs still showing enqueue `ok`.
     sync_pair_jobs: HashMap<String, String>,
     tasks: HashMap<String, JoinHandle<LaneOutcome>>,
     v2_tasks: HashMap<TransferId, V2Task>,
@@ -1230,6 +1232,28 @@ impl Engine {
                 pair = %id, error = %e,
                 "sync pair last_result stamp failed"
             );
+        }
+    }
+
+    /// Rebuild job→pair associations after a daemon restart.
+    ///
+    /// The HashMap is process-local. Surviving [`SyncPairStore`] rows that still
+    /// show the enqueue stamp are matched to ledger rsync jobs by source/dest
+    /// so a later lane outcome can replace `last_result`. Jobs that already
+    /// reached a terminal state while the map was gone are restamped now.
+    fn recover_sync_pair_jobs(&mut self) {
+        self.sync_pair_jobs = reconstruct_sync_pair_job_map(&self.queue, &self.sync_pairs);
+        let finished: Vec<(String, TransferJob)> = self
+            .sync_pair_jobs
+            .iter()
+            .filter_map(|(job_id, pair_id)| {
+                let job = self.queue.get(job_id)?;
+                job.state.is_terminal().then_some((pair_id.clone(), job))
+            })
+            .collect();
+        for (pair_id, job) in finished {
+            self.sync_pair_jobs.remove(&job.id);
+            self.record_sync_pair_lane_outcome(&pair_id, &job);
         }
     }
 
@@ -1518,6 +1542,55 @@ impl Engine {
             self.tasks.insert(job.id, handle);
         }
     }
+}
+
+/// Rebuild the in-flight pair association from durable store state.
+///
+/// Pairs that still show enqueue `ok` are matched to surviving rsync jobs by
+/// source and dest. In-flight (non-terminal) jobs win over already-complete
+/// ones; among ties, the job closest to `last_fired_ms` is preferred.
+fn reconstruct_sync_pair_job_map(
+    queue: &TransferQueue,
+    sync_pairs: &SyncPairStore,
+) -> HashMap<String, String> {
+    let jobs = queue.list();
+    let mut mapped = HashMap::new();
+    let mut taken = HashSet::new();
+    for pair in sync_pairs.load_all() {
+        if pair.last_result.as_deref() != Some("ok") {
+            continue;
+        }
+        let mut candidates: Vec<&TransferJob> = jobs
+            .iter()
+            .filter(|job| {
+                job.method == Method::Rsync
+                    && job.source == pair.source
+                    && job.dest == pair.dest
+                    && !taken.contains(&job.id)
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_by(|a, b| {
+            a.state
+                .is_terminal()
+                .cmp(&b.state.is_terminal())
+                .then_with(|| match pair.last_fired_ms {
+                    Some(fired) => a
+                        .created_ms
+                        .abs_diff(fired)
+                        .cmp(&b.created_ms.abs_diff(fired))
+                        .then(b.created_ms.cmp(&a.created_ms)),
+                    None => b.created_ms.cmp(&a.created_ms),
+                })
+        });
+        if let Some(job) = candidates.into_iter().next() {
+            taken.insert(job.id.clone());
+            mapped.insert(job.id.clone(), pair.id.clone());
+        }
+    }
+    mapped
 }
 
 fn next_v2_update(current: u64) -> Option<u64> {
@@ -2525,7 +2598,7 @@ mod tests {
     }
 
     fn engine_with(store: &Path, cap: usize, lane: Arc<dyn LaneRunner>) -> Engine {
-        Engine {
+        let mut engine = Engine {
             queue: TransferQueue::open(store, cap).unwrap(),
             v2_ledger: V2Ledger::open(store).unwrap(),
             sync_pairs: SyncPairStore::open(store).unwrap(),
@@ -2539,7 +2612,9 @@ mod tests {
             store_root: store.to_path_buf(),
             notify: None,
             notification_outbox: None,
-        }
+        };
+        engine.recover_sync_pair_jobs();
+        engine
     }
 
     fn engine_with_notify(
@@ -2548,7 +2623,7 @@ mod tests {
         cap: usize,
         lane: Arc<dyn LaneRunner>,
     ) -> Engine {
-        Engine {
+        let mut engine = Engine {
             queue: TransferQueue::open(store, cap).unwrap(),
             v2_ledger: V2Ledger::open(store).unwrap(),
             sync_pairs: SyncPairStore::open(store).unwrap(),
@@ -2562,7 +2637,9 @@ mod tests {
             store_root: store.to_path_buf(),
             notify: Some(TransferNotifier::new(bus.to_path_buf())),
             notification_outbox: Some(TransferNotificationOutbox::open(store).unwrap()),
-        }
+        };
+        engine.recover_sync_pair_jobs();
+        engine
     }
 
     fn job() -> TransferJob {
@@ -4233,6 +4310,93 @@ mod tests {
             result.as_str(),
             "ok",
             "failed recurring rsync must replace the enqueue stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconstructed_engine_restamps_last_result_when_rsync_job_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let job_id;
+        {
+            let mut engine = engine_with(
+                tmp.path(),
+                1,
+                Arc::new(ImmediateLane {
+                    outcome: LaneOutcome::Done,
+                }),
+            );
+            engine
+                .sync_pairs
+                .upsert(&SyncPair::new(
+                    "mirror",
+                    "/src",
+                    "/dst",
+                    3_600,
+                    TransferPolicy::default(),
+                ))
+                .unwrap();
+            // Enqueue only: last_fired is wall-clock so the pair will not
+            // re-fire on the reconstructed engine, and the job stays Queued.
+            engine.schedule_sync_pairs_at(now_ms());
+            assert_eq!(
+                engine
+                    .sync_pairs
+                    .get("mirror")
+                    .unwrap()
+                    .last_result
+                    .as_deref(),
+                Some("ok")
+            );
+            job_id = engine
+                .sync_pair_jobs
+                .iter()
+                .find_map(|(id, pair)| (pair == "mirror").then(|| id.clone()))
+                .expect("enqueue records the in-flight job→pair map");
+        }
+
+        let mut engine = engine_with(
+            tmp.path(),
+            1,
+            Arc::new(ImmediateLane {
+                outcome: LaneOutcome::Done,
+            }),
+        );
+        assert_eq!(
+            engine.sync_pair_jobs.get(&job_id).map(String::as_str),
+            Some("mirror"),
+            "a reconstructed Engine must rebuild the job→pair map from the store"
+        );
+        assert_eq!(
+            engine
+                .sync_pairs
+                .get("mirror")
+                .unwrap()
+                .last_result
+                .as_deref(),
+            Some("ok"),
+            "enqueue stamp survives restart until the surviving rsync job finishes"
+        );
+
+        for _ in 0..20 {
+            engine.tick().await;
+            if engine.tasks.is_empty()
+                && engine
+                    .queue
+                    .list()
+                    .iter()
+                    .any(|j| j.id == job_id && j.state == TransferState::Done)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let done = engine.sync_pairs.get("mirror").unwrap();
+        assert_eq!(done.last_result.as_deref(), Some("done"));
+        assert_eq!(done.peer_reachable, Some(true));
+        assert!(
+            engine.sync_pair_jobs.get(&job_id).is_none(),
+            "the reconstructed map entry is consumed when the lane outcome is stamped"
         );
     }
 }
