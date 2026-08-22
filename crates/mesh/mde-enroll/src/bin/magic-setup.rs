@@ -544,23 +544,39 @@ fn draw_screen(
 
     // Live-log pane (newest lines, bounded to the visible height). Lines are
     // tinted by their leading glyph / self-test tag so the green/red verdict
-    // reads at a glance.
+    // reads at a glance. Token/capsule facts sit in the log header via
+    // Wizard::commissioning_lines — the bearer and capsule signature stay
+    // withheld. Empty lines mean nothing is attached; do not invent ready.
     let height = rows[1].height.saturating_sub(2) as usize;
-    let start = wiz.log.len().saturating_sub(height.max(1));
-    let mut log_lines: Vec<Line> = wiz.log[start..]
-        .iter()
-        .map(|l| Line::styled(l.as_str(), log_line_style(l)))
+    let header_len = wiz.commissioning_lines().len();
+    let log_lines: Vec<Line> = live_log_lines(wiz, height)
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let style = if i < header_len {
+                Style::default().fg(Color::Cyan)
+            } else {
+                log_line_style(&l)
+            };
+            Line::styled(l, style)
+        })
         .collect();
-    if let Some(view) = &wiz.lifecycle_view {
-        log_lines.insert(
-            0,
-            Line::styled(view.status_line(), Style::default().fg(Color::Cyan)),
-        );
-    }
     f.render_widget(
         Paragraph::new(log_lines).block(Block::default().borders(Borders::ALL).title("Log")),
         rows[1],
     );
+}
+
+/// Live-log rows: commissioning identity first, then the newest operator-log
+/// lines that fit `visible`. No ready flag — an empty
+/// [`Wizard::commissioning_lines`] list just leaves the pane as the log.
+fn live_log_lines(wiz: &Wizard, visible: usize) -> Vec<String> {
+    let header = wiz.commissioning_lines();
+    let body_slots = visible.saturating_sub(header.len()).max(1);
+    let start = wiz.log.len().saturating_sub(body_slots);
+    let mut lines = header;
+    lines.extend(wiz.log.iter().skip(start).cloned());
+    lines
 }
 
 /// Tint a live-log line by its meaning: green for a pass (`✓` / self-test
@@ -596,4 +612,51 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mde_enroll::commissioning_view::{CapsuleView, JoinTokenView};
+
+    #[test]
+    fn live_log_binds_commissioning_lines_without_secrets() {
+        let mut wiz = Wizard::new(false);
+        let bearer = "single-use-bearer";
+        let token = format!("mesh:home@10.0.0.5:4243#{bearer}?fp={}", "a".repeat(64));
+        wiz.set_token_view(JoinTokenView::from_wire(&token).unwrap());
+        let signature = "c".repeat(128);
+        let capsule = serde_json::json!({
+            "schema_version": 1,
+            "capsule_id": "capsule-1",
+            "target_id": "seat-15",
+            "expires_at_ms": 2_000,
+            "bootstrap_digest_hex": "b".repeat(64),
+            "one_time": true,
+            "key_id": "commissioning-v1",
+            "signature_hex": signature,
+        })
+        .to_string();
+        wiz.set_capsule_view(CapsuleView::from_wire(&capsule, 1_000).unwrap());
+        wiz.push_log("→ Join an existing mesh".to_string());
+
+        let lines = live_log_lines(&wiz, 8);
+        assert!(
+            lines.iter().any(|l| l.contains("bearer withheld")),
+            "token identity missing from log header: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("signature withheld")),
+            "capsule identity missing from log header: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("→ Join an existing mesh")));
+        assert!(
+            !lines.iter().any(|l| l.contains(bearer)),
+            "wizard live-log leaked the bearer: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains(&signature)),
+            "wizard live-log leaked the capsule signature: {lines:?}"
+        );
+    }
 }
