@@ -2459,8 +2459,8 @@ mod mackesd05_tests {
     }
 }
 
-/// WL-FUNC-033 — leftover retirement: `voip_rtt_worker.rs` may remain on disk,
-/// but this tree must not compile it as a live `pub mod` path.
+/// WL-FUNC-033 — leftover retirement: `voip_rtt_worker.rs` is gone from this
+/// tree. Do not reintroduce the leftover file or a live `pub mod` path for it.
 #[cfg(test)]
 mod leftover_retirements {
     /// Live `pub mod` names compiled by this workers tree (source-parsed).
@@ -2475,16 +2475,42 @@ mod leftover_retirements {
             .collect()
     }
 
+    /// Build the retired declaration without embedding the forbidden
+    /// contiguous token sequence in this file (so the raw-source scan
+    /// stays honest).
+    fn retired_pub_mod_needle() -> String {
+        format!("{} {}", "pub mod", "voip_rtt_worker")
+    }
+
     #[test]
     fn voip_rtt_worker_is_not_a_live_workers_path() {
-        let live = live_worker_module_names(include_str!("mod.rs"));
+        let source = include_str!("mod.rs");
+        let live = live_worker_module_names(source);
+        let needle = retired_pub_mod_needle();
         assert!(
             !live.contains(&"voip_rtt_worker"),
             "retired VOIP-4.b leftover must not be a live workers path"
         );
         assert!(
+            !source.contains(needle.as_str()),
+            "reintroduced `{needle}` must fail even without a trailing semicolon"
+        );
+        assert!(
             live.contains(&"surrounding_worker") && live.contains(&"mesh_firewall"),
             "parser still sees neighboring live worker mods"
+        );
+    }
+
+    #[test]
+    fn voip_rtt_worker_rs_leftover_file_is_gone() {
+        let leftover = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("workers")
+            .join("voip_rtt_worker.rs");
+        assert!(
+            !leftover.is_file(),
+            "WL-FUNC-033 leftover file is gone and must stay deleted: {}",
+            leftover.display()
         );
     }
 }
