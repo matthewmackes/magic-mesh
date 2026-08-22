@@ -70,6 +70,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 16,
         sql: include_str!("../../migrations/0016_clock_request_fingerprint.sql"),
     },
+    // WL-FUNC-033 leftover — drop the retired FDO notifications table
+    // created by 0002; owners have been gone since BUS-4.2.
+    Migration {
+        version: 17,
+        sql: include_str!("../../migrations/0017_drop_retired_notifications.sql"),
+    },
 ];
 
 /// Open the store at `path`, creating its parent directory if needed

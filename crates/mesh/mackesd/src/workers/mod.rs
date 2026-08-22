@@ -2535,4 +2535,21 @@ mod leftover_retirements {
         assert_ledger_cites("afc45f0fb28094aa9662adefe73120b552a14b15");
         assert_ledger_cites("7f46e1f1a8ad3d8d7226fe7131c22d27970bf06a");
     }
+
+    #[test]
+    fn fresh_open_has_no_notifications_table() {
+        let conn = crate::store::open_in_memory().expect("open");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'notifications'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master");
+        assert_eq!(
+            count, 0,
+            "fresh store must not have the retired notifications table"
+        );
+    }
 }
