@@ -155,6 +155,139 @@ impl VoiceAccounts {
 /// unavailable.
 pub const ABSENT_PSTN_PROVIDER: &str = "no governed SIP provider is installed";
 
+/// ITU-T E.164 significant-digit bounds (same contract as collab-types
+/// `SipLegV1`). Kept local so this crate stays the SIP core and does not take
+/// a collab-types dependency.
+const MIN_INBOUND_E164_DIGITS: usize = 3;
+const MAX_INBOUND_E164_DIGITS: usize = 15;
+/// Bare inbound user-parts without `+` must be this long before they are
+/// treated as PSTN. Roster extensions (`1001`) stay [`InboundCallerKind::Other`].
+const MIN_BARE_PSTN_DIGITS: usize = 10;
+
+/// How an inbound From identity lands on the HUD.
+///
+/// A PSTN E.164 is never a fleet-board mesh peer. The HUD must show the
+/// number; it must not invent a connected or bridged PSTN leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundCallerKind {
+    /// Mesh peer name / overlay host — on the board.
+    MeshPeer { display: String },
+    /// Canonical E.164 that is not a board row.
+    OffBoardE164 { e164: String },
+    /// Extension or opaque SIP user — shown as-is, not claimed as PSTN.
+    Other { display: String },
+}
+
+impl InboundCallerKind {
+    /// Identity the HUD / Incoming event should show.
+    #[must_use]
+    pub fn hud_identity(&self) -> &str {
+        match self {
+            Self::MeshPeer { display } | Self::Other { display } => display.as_str(),
+            Self::OffBoardE164 { e164 } => e164.as_str(),
+        }
+    }
+
+    /// One-line incoming-call label. Off-board E.164 is named as PSTN; a
+    /// connected/bridged leg is never claimed.
+    #[must_use]
+    pub fn hud_label(&self) -> String {
+        match self {
+            Self::OffBoardE164 { e164 } => format!("Incoming PSTN · {e164}"),
+            Self::MeshPeer { display } | Self::Other { display } => {
+                format!("Incoming call · {display}")
+            }
+        }
+    }
+
+    /// Whether this inbound caller is an E.164 that is not a fleet-board peer.
+    #[must_use]
+    pub const fn is_off_board_e164(&self) -> bool {
+        matches!(self, Self::OffBoardE164 { .. })
+    }
+
+    /// Always `false`. Classifying an inbound number is not a live PSTN proof.
+    #[must_use]
+    pub const fn claims_connected_pstn(&self) -> bool {
+        false
+    }
+}
+
+/// User part of a `sip:` / `sips:` From URI (`sip:+1555@host` → `+1555`).
+fn sip_user_part(from_uri: &str) -> &str {
+    let rest = from_uri
+        .strip_prefix("sip:")
+        .or_else(|| from_uri.strip_prefix("sips:"))
+        .unwrap_or(from_uri);
+    rest.split('@')
+        .next()
+        .unwrap_or(rest)
+        .split(';')
+        .next()
+        .unwrap_or(rest)
+        .trim()
+}
+
+/// Fail-closed inbound E.164. SIP URIs, `tel:`, and short extensions are
+/// rejected. A bare 10–15 digit user-part (common on Vitelity From) is
+/// canonicalized with `+`.
+fn canonicalize_inbound_e164(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.contains('@')
+        || raw.contains(':')
+        || raw.contains('/')
+        || raw.contains('\\')
+        || raw
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return None;
+    }
+    let digits = raw.strip_prefix('+').unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let min = if raw.starts_with('+') {
+        MIN_INBOUND_E164_DIGITS
+    } else {
+        MIN_BARE_PSTN_DIGITS
+    };
+    if digits.len() < min || digits.len() > MAX_INBOUND_E164_DIGITS {
+        return None;
+    }
+    Some(format!("+{digits}"))
+}
+
+/// Classify an inbound From so the HUD can show an off-board E.164 instead of
+/// a display name like `Unknown` that hides the number.
+///
+/// Mesh-peer user-parts stay board identities. An E.164 is never treated as a
+/// board row. This does not prove a connected PSTN.
+#[must_use]
+pub fn classify_inbound_caller(from_display: &str, from_uri: &str) -> InboundCallerKind {
+    let user = sip_user_part(from_uri);
+    if let Some(e164) =
+        canonicalize_inbound_e164(user).or_else(|| canonicalize_inbound_e164(from_display))
+    {
+        return InboundCallerKind::OffBoardE164 { e164 };
+    }
+    let display = if from_display.trim().is_empty() {
+        if user.is_empty() {
+            "unknown".to_string()
+        } else {
+            user.to_string()
+        }
+    } else {
+        from_display.to_string()
+    };
+    if looks_like_peer(user) {
+        InboundCallerKind::MeshPeer { display }
+    } else {
+        InboundCallerKind::Other { display }
+    }
+}
+
 /// WL-FUNC-024 S4 — how the split/shared-outbound-aware agent is driven so
 /// PSTN legs can terminate through the LiveKit SIP gateway.
 ///
@@ -1392,6 +1525,15 @@ pub struct InboundInvite {
     cseq: String,
 }
 
+impl InboundInvite {
+    /// HUD-facing inbound identity. An off-board E.164 is surfaced as the
+    /// number, not a display name that hid it. Never a connected PSTN proof.
+    #[must_use]
+    pub fn caller_kind(&self) -> InboundCallerKind {
+        classify_inbound_caller(&self.from_display, &self.from_uri)
+    }
+}
+
 /// First value of header `name` (case-insensitive), trimmed.
 fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
     raw.lines().take_while(|l| !l.is_empty()).find_map(|l| {
@@ -2213,8 +2355,9 @@ fn run_agent_inner(
                         &inv, account, &local_ip, local_port, 180, "Ringing", None,
                     );
                     let _ = sock.send_to(ringing.as_bytes(), src);
+                    let caller = inv.caller_kind();
                     let _ = events.send(AgentEvent::Incoming {
-                        from: inv.from_display.clone(),
+                        from: caller.hud_identity().to_string(),
                         call_id: inv.call_id.clone(),
                     });
                     pending = Some(inv);
@@ -2948,6 +3091,79 @@ mod tests {
             other => panic!("absent provider must emit Failed, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no extra registration events");
+    }
+
+    #[test]
+    fn inbound_e164_not_on_the_board_is_surfaced_honestly_not_as_connected_pstn() {
+        // Display name "Unknown" must not hide an off-board PSTN number.
+        let hidden = classify_inbound_caller("Unknown", "sip:+15555550199@sip.vitelity.net");
+        assert_eq!(
+            hidden,
+            InboundCallerKind::OffBoardE164 {
+                e164: "+15555550199".into()
+            }
+        );
+        assert!(hidden.is_off_board_e164());
+        assert!(
+            !hidden.claims_connected_pstn(),
+            "classifying an inbound E.164 is not a live PSTN proof"
+        );
+        assert_eq!(hidden.hud_identity(), "+15555550199");
+        assert_eq!(hidden.hud_label(), "Incoming PSTN · +15555550199");
+
+        // Vitelity often omits `+` on the From user-part.
+        let bare = classify_inbound_caller("", "sip:15551234567@sip.vitelity.net");
+        assert_eq!(
+            bare,
+            InboundCallerKind::OffBoardE164 {
+                e164: "+15551234567".into()
+            }
+        );
+
+        // A SIP URI / tel: must not be admitted as E.164.
+        assert!(!classify_inbound_caller("x", "sip:+15551234567@gw")
+            .hud_identity()
+            .contains('@'));
+        assert!(!matches!(
+            classify_inbound_caller("tel:+15551234567", "tel:+15551234567"),
+            InboundCallerKind::OffBoardE164 { .. }
+        ));
+
+        // Mesh peer on the board stays a board identity, never PSTN.
+        let peer = classify_inbound_caller("eagle", "sip:eagle@eagle.mesh.mde");
+        assert_eq!(
+            peer,
+            InboundCallerKind::MeshPeer {
+                display: "eagle".into()
+            }
+        );
+        assert!(!peer.is_off_board_e164());
+        assert!(!peer.claims_connected_pstn());
+        assert_eq!(peer.hud_label(), "Incoming call · eagle");
+
+        // Roster extension 1001 is not E.164.
+        let ext = classify_inbound_caller("1001", "sip:1001@host");
+        assert_eq!(
+            ext,
+            InboundCallerKind::Other {
+                display: "1001".into()
+            }
+        );
+
+        // Parsed INVITE: HUD identity is the E.164, not "Unknown".
+        let src: std::net::SocketAddr = "203.0.113.9:5060".parse().unwrap();
+        let raw = "INVITE sip:eagle@sip.vitelity.net SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKpstn;rport\r\n\
+             From: \"Unknown\" <sip:+15555550199@sip.vitelity.net>;tag=callerTag\r\n\
+             To: <sip:eagle@sip.vitelity.net>\r\n\
+             Call-ID: inbound-pstn-1\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Length: 0\r\n\r\n";
+        let inv = parse_invite(raw, src).expect("invite");
+        let kind = inv.caller_kind();
+        assert_eq!(kind.hud_identity(), "+15555550199");
+        assert!(kind.is_off_board_e164());
+        assert!(!kind.claims_connected_pstn());
     }
 
     #[test]
