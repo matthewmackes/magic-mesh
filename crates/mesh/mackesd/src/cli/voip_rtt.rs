@@ -1,34 +1,32 @@
-//! `VoipRtt` CLI verb handler.
+//! Retired `voip-rtt` CLI verb (WL-FUNC-033).
 //!
-//! Extracted verbatim from `main()` in `bin/mackesd.rs` (arch-1 SLICE 1:
-//! CLI verb handlers). Behaviour is unchanged; only the location moved.
+//! Q9 signed 2026-08-22. The worker no longer publishes
+//! `voip/link-rtt/<peer>`. This verb fails closed: it does not sample
+//! or publish Vitelity-link RTT. The place-via-peer override is retired.
 
-/// Handle the `voip-rtt` subcommand.
-#[allow(unreachable_code)]
+/// Handle the `voip-rtt` subcommand. Always fails closed.
 pub fn run() -> anyhow::Result<()> {
-    {
-        use mackesd_core::voip_rtt::{
-            own_nebula_ip, publish_link_rtt, rtt_topic, sample_link_rtt, VITELITY_PROXY_HOST,
-            VITELITY_PROXY_PORT,
-        };
-        let peer = own_nebula_ip().unwrap_or_default();
-        let sample = sample_link_rtt(&peer);
-        match sample.rtt_ms {
-            Some(ms) => {
-                println!("voip-link-rtt: {ms} ms ({VITELITY_PROXY_HOST}:{VITELITY_PROXY_PORT})");
-            }
-            None => {
-                println!(
-                    "voip-link-rtt: unreachable ({VITELITY_PROXY_HOST}:{VITELITY_PROXY_PORT})"
-                );
-            }
-        }
-        if peer.is_empty() {
-            eprintln!("voip-rtt: no nebula1 overlay IP — measured but not published");
-        } else {
-            publish_link_rtt(&sample);
-            eprintln!("voip-rtt: published to {}", rtt_topic(&peer));
-        }
+    anyhow::bail!(
+        "voip-rtt is retired: the place-via-peer override is retired \
+         (Q9, 2026-08-22); this verb no longer samples or publishes voip/link-rtt"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_fails_closed_because_place_via_peer_is_retired() {
+        let err = run().expect_err("retired voip-rtt must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("place-via-peer") && msg.contains("retired"),
+            "error must say the place-via-peer override is retired: {msg}"
+        );
+        assert!(
+            !msg.contains("ms") && !msg.contains("published to"),
+            "retired verb must not report a sample or publish: {msg}"
+        );
     }
-    Ok(())
 }
