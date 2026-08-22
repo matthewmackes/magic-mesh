@@ -720,10 +720,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   sidecar, dest-inspect sidecar, and dest-root fixture 12288 B
   `dd7cde7e116cb52f114fc1c886fec32618bdfcb8c82a16e3e45dae601c87046e` are
   untouched. Not Dell/Seat 15/Surface. S5 `all-roles` bootc receipt bound to
-  `479ec2b8c` (`.170` slot 0). Leftover is Maps `production_admitted` (needs the
-  real candidate-bound provider object / freeze), live-seat dest (WL-TEST-002),
-  and S7 private preflight. App VM S3 and Kiron S6 remain admitted. Evidence:
-  dest `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`; bootc `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`.
+  `479ec2b8c` (`.170` slot 0) and copied to `/root/mcnf-private/` (not in Git).
+  Leftover is Maps `production_admitted`, live-seat dest (WL-TEST-002), and S7
+  `REPLACE_*` preflight. App VM S3 and Kiron S6 remain admitted. Evidence:
+  dest `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`; bootc
+  `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`; S7
+  `WL-REL-006-2026-08-22-preflight-bootc-private-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -830,7 +832,10 @@ is a capacity incident (§10.0.3), not a silent retry.
        signer receipt, private paths, target architecture, and release epoch.
      - Action: write one mode-0400 private JSON object outside Git, derive the
        release-driver array from that object, and run release-input-preflight
-       before any build mutation.
+       before any build mutation. Bootc `all-roles` receipt is now a private
+       dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
+       argv object exists; App VM / Maps / RPM fields stay `REPLACE_*`.
+       Template was not overwritten. Do not claim preflight passed.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
