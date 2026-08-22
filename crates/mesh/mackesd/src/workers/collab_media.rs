@@ -18,9 +18,10 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
-    CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
+    ActorId, CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
     CallMediaReadiness, CallMediaRequirement, CallMediaSession, CallMediaVerification,
-    CallMediaVerificationRow, CallMediaVerificationStatus, CollabCommand,
+    CallMediaVerificationRow, CallMediaVerificationStatus, CollabCommand, SipLegDirectionV1,
+    SipLegV1,
 };
 use mde_voice_hud::sip::{AgentCommand, AgentEvent, RegistrationState, SipAccount};
 
@@ -56,6 +57,9 @@ struct SipGatewayProvider {
     active_call: Arc<Mutex<Option<mde_collab_types::CallId>>>,
     revoked_calls: Arc<Mutex<Vec<mde_collab_types::CallId>>>,
     pending_inbound: Arc<Mutex<Option<InboundCallOffer>>>,
+    /// Bound inbound dialogs waiting for a `/sip` tick. The agent adapter
+    /// owns this slot, so the outbound-only publish plane will not mint them.
+    inbound_legs: Arc<Mutex<BTreeMap<CallId, String>>>,
     publish_plane: super::call_media::SipGatewayPlane,
 }
 
@@ -82,6 +86,8 @@ impl SipGatewayProvider {
         let monitor_revoked_calls = Arc::clone(&revoked_calls);
         let pending_inbound = Arc::new(Mutex::new(None));
         let monitor_pending_inbound = Arc::clone(&pending_inbound);
+        let inbound_legs = Arc::new(Mutex::new(BTreeMap::new()));
+        let monitor_inbound_legs = Arc::clone(&inbound_legs);
         std::thread::Builder::new()
             .name("mcnf-collab-sip-agent".to_string())
             .spawn(move || {
@@ -114,7 +120,11 @@ impl SipGatewayProvider {
                             if let Ok(mut pending) = monitor_pending_inbound.lock() {
                                 pending.take();
                             }
-                            revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
+                            forget_revoked_inbound_leg(
+                                &monitor_active_call,
+                                &monitor_revoked_calls,
+                                &monitor_inbound_legs,
+                            );
                             continue;
                         }
                     };
@@ -122,7 +132,11 @@ impl SipGatewayProvider {
                         if let Ok(mut pending) = monitor_pending_inbound.lock() {
                             pending.take();
                         }
-                        revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
+                        forget_revoked_inbound_leg(
+                            &monitor_active_call,
+                            &monitor_revoked_calls,
+                            &monitor_inbound_legs,
+                        );
                     }
                     if let Ok(mut current) = monitor_health.lock() {
                         *current = next;
@@ -131,7 +145,11 @@ impl SipGatewayProvider {
                 if let Ok(mut pending) = monitor_pending_inbound.lock() {
                     pending.take();
                 }
-                revoke_active_call(&monitor_active_call, &monitor_revoked_calls);
+                forget_revoked_inbound_leg(
+                    &monitor_active_call,
+                    &monitor_revoked_calls,
+                    &monitor_inbound_legs,
+                );
                 if let Ok(mut current) = monitor_health.lock() {
                     *current = SipProviderHealth::Unavailable("SIP agent stopped".to_string());
                 }
@@ -143,6 +161,7 @@ impl SipGatewayProvider {
             active_call,
             revoked_calls,
             pending_inbound,
+            inbound_legs,
             publish_plane: super::call_media::SipGatewayPlane::production(),
         })
     }
@@ -158,6 +177,7 @@ impl SipGatewayProvider {
             active_call: Arc::new(Mutex::new(None)),
             revoked_calls: Arc::new(Mutex::new(Vec::new())),
             pending_inbound: Arc::new(Mutex::new(None)),
+            inbound_legs: Arc::new(Mutex::new(BTreeMap::new())),
             publish_plane: super::call_media::SipGatewayPlane::production(),
         }
     }
@@ -208,18 +228,142 @@ impl SipGatewayProvider {
                 detail: bounded_health_detail(&detail),
             })
     }
+
+    fn gateway_is_ready(&self) -> bool {
+        self.health
+            .lock()
+            .map(|health| matches!(*health, SipProviderHealth::Ready))
+            .unwrap_or(false)
+    }
+
+    fn retain_inbound_leg(&self, call: CallId, offer: &InboundCallOffer) {
+        let Some(e164) = inbound_offer_e164(&offer.identity) else {
+            return;
+        };
+        if let Ok(mut legs) = self.inbound_legs.lock() {
+            legs.insert(call, e164);
+        }
+    }
+
+    fn forget_inbound_leg(&self, call: CallId) {
+        if let Ok(mut legs) = self.inbound_legs.lock() {
+            legs.remove(&call);
+        }
+    }
+
+    fn publish_inbound_sip_legs(
+        &self,
+        persist: &Persist,
+        last_published: &mut BTreeMap<String, String>,
+    ) {
+        let Ok(legs) = self.inbound_legs.lock() else {
+            return;
+        };
+        if legs.is_empty() {
+            return;
+        }
+        let Some(readiness) = read_retained_readiness(persist) else {
+            return;
+        };
+        let gateway_available = self.gateway_is_ready();
+        for (call, e164) in legs.iter() {
+            let Some(session) = readiness
+                .sessions
+                .iter()
+                .find(|session| session.call == *call)
+            else {
+                continue;
+            };
+            if !session
+                .connected_participants
+                .iter()
+                .any(|actor| actor == &readiness.local_actor)
+            {
+                continue;
+            }
+            let Ok(document) = SipLegV1::new(
+                *call,
+                readiness.local_actor.clone(),
+                SipLegDirectionV1::Inbound,
+                e164,
+                gateway_available,
+                false,
+            ) else {
+                continue;
+            };
+            if document.bridged || document.direction != SipLegDirectionV1::Inbound {
+                continue;
+            }
+            let topic = document.topic();
+            let Ok(body) = serde_json::to_string(&document) else {
+                continue;
+            };
+            if last_published.get(&topic).map(String::as_str) == Some(body.as_str()) {
+                continue;
+            }
+            if persist
+                .write(&topic, Priority::Default, None, Some(&body))
+                .is_err()
+            {
+                continue;
+            }
+            last_published.insert(topic, body);
+        }
+    }
+}
+
+fn inbound_offer_e164(identity: &str) -> Option<String> {
+    let candidate = identity.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    // Fail closed on SIP URIs, display names, and non-E.164 identities.
+    // Never invent a PSTN number for an inbound offer.
+    SipLegV1::new(
+        CallId::new(),
+        ActorId::new("local"),
+        SipLegDirectionV1::Inbound,
+        candidate,
+        false,
+        false,
+    )
+    .ok()
+    .map(|document| document.e164)
+}
+
+fn read_retained_readiness(persist: &Persist) -> Option<CallMediaReadiness> {
+    let topic = topics::state_topic(proj::CALL_MEDIA_READINESS);
+    let msg = persist.read_latest(&topic).ok()??;
+    let body = msg.body.as_deref()?;
+    if body.len() > MAX_READINESS_BODY_BYTES {
+        return None;
+    }
+    serde_json::from_str(body).ok()
 }
 
 fn revoke_active_call(
     active_call: &Mutex<Option<mde_collab_types::CallId>>,
     revoked_calls: &Mutex<Vec<mde_collab_types::CallId>>,
-) {
+) -> Option<CallId> {
     let call = active_call.lock().ok().and_then(|mut active| active.take());
     if let Some(call) = call {
         if let Ok(mut revoked) = revoked_calls.lock() {
             if !revoked.contains(&call) {
                 revoked.push(call);
             }
+        }
+    }
+    call
+}
+
+fn forget_revoked_inbound_leg(
+    active_call: &Mutex<Option<mde_collab_types::CallId>>,
+    revoked_calls: &Mutex<Vec<mde_collab_types::CallId>>,
+    inbound_legs: &Mutex<BTreeMap<CallId, String>>,
+) {
+    if let Some(call) = revoke_active_call(active_call, revoked_calls) {
+        if let Ok(mut legs) = inbound_legs.lock() {
+            legs.remove(&call);
         }
     }
 }
@@ -272,6 +416,11 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             // an active state. Cleanup remains locally authoritative and the
             // dead adapter receives no command.
             if cleanup {
+                if let CollabCommand::DeclineCall { call } | CollabCommand::HangUpCall { call } =
+                    command
+                {
+                    self.forget_inbound_leg(*call);
+                }
                 let _ = self.publish_plane.execute_command(command, adapter);
                 return Ok(());
             }
@@ -296,16 +445,18 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
                 }
                 return Ok(());
             }
-            CollabCommand::DeclineCall { .. } => {
+            CollabCommand::DeclineCall { call } => {
                 if let Ok(mut active) = self.active_call.lock() {
                     active.take();
                 }
+                self.forget_inbound_leg(*call);
                 AgentCommand::Decline
             }
-            CollabCommand::HangUpCall { .. } => {
+            CollabCommand::HangUpCall { call } => {
                 if let Ok(mut active) = self.active_call.lock() {
                     active.take();
                 }
+                self.forget_inbound_leg(*call);
                 AgentCommand::HangUp
             }
             CollabCommand::SendDtmf { digit, .. } => AgentCommand::Dtmf(*digit),
@@ -403,6 +554,7 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
                 return false;
             }
             *active = Some(call);
+            self.retain_inbound_leg(call, offer);
         }
         true
     }
@@ -414,6 +566,7 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
     ) {
         self.publish_plane
             .publish_p2p_media_sessions(persist, last_published);
+        self.publish_inbound_sip_legs(persist, last_published);
     }
 }
 
@@ -1370,7 +1523,10 @@ impl Error for CallMediaVerificationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mde_collab_types::{media_sip_leg_topic, ActorId, CallId, CallKind, SipLegV1, SpaceId};
+    use mde_collab_types::{
+        media_session_topic, media_sip_leg_topic, ActorId, CallId, CallKind, SipLegDirectionV1,
+        SipLegV1, SpaceId,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1551,6 +1707,67 @@ mod tests {
             Some(call)
         );
         assert!(!provider.bind_inbound_call(&current, Some(CallId::new())));
+    }
+
+    #[test]
+    fn inbound_sip_offer_mints_retained_unbridged_leg_when_agent_owns_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let provider = SipGatewayProvider::with_channel(tx, SipProviderHealth::Ready);
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let offer = InboundCallOffer {
+            identity: "+15551234567".to_string(),
+            provider_call_id: "dlg@example.com".to_string(),
+        };
+        *provider.pending_inbound.lock().expect("pending lock") = Some(offer.clone());
+        assert!(
+            provider.bind_inbound_call(&offer, Some(call)),
+            "inbound offer must bind to the minted call id"
+        );
+
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::SipGateway, provider)
+            .expect("register agent-owned SIP adapter");
+
+        let mut session = ready_audio_session();
+        session.call = call;
+        session.space = space;
+        write_readiness(
+            &persist,
+            &CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: vec![session],
+            },
+        );
+
+        let mut last_published = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+
+        let topic = media_sip_leg_topic(call);
+        let msg = persist.read_latest(&topic).expect("read sip topic").expect(
+            "inbound offer must mint a retained /sip document when the agent owns the slot",
+        );
+        let leg = SipLegV1::from_json(msg.body.as_deref().expect("sip body"))
+            .expect("admit inbound sip document");
+        assert_eq!(leg.session, call);
+        assert_eq!(leg.direction, SipLegDirectionV1::Inbound);
+        assert_eq!(leg.e164, "+15551234567");
+        assert!(!leg.bridged, "inbound mint must not claim a bridged PSTN");
+        assert_eq!(leg.topic(), topic);
+        assert!(
+            last_published.contains_key(&topic),
+            "inbound sip topic must be retained in the worker publish cache"
+        );
+        assert!(
+            persist
+                .read_latest(&media_session_topic(call))
+                .expect("read session topic")
+                .is_none(),
+            "inbound sip mint must not invent a Connected media session"
+        );
     }
 
     #[test]
