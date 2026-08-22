@@ -3639,8 +3639,8 @@ mod lifecycle_cli_boundary_tests {
 #[cfg(test)]
 mod voip_rtt_cli_retirement_tests {
     //! WL-FUNC-033 / Q9 leftover delete: `voip-rtt` is retired from the live
-    //! binary surface. The module in `cli/voip_rtt.rs` stays (out of scope);
-    //! clap must not advertise or accept the verb.
+    //! binary surface. `cli/voip_rtt.rs` is deleted and `cli/mod.rs` no longer
+    //! declares it; clap must not advertise or accept the verb.
     use super::parse_cli_on_large_test_stack;
     use clap::error::ErrorKind;
 
