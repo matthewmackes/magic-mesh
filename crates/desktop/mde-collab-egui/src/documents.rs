@@ -1695,6 +1695,13 @@ impl CommunicationsSurface {
 
     /// Merge an external `document_body` against the last shared base instead of
     /// overwriting the live CRDT / editor buffer.
+    ///
+    /// The live side is the editor rope (in-flight keystrokes), never a stale
+    /// CRDT that still equals `last_shared_base` — that path treated
+    /// `local == base` and took remote wholesale. After a clean merge, the
+    /// consumed disk snapshot is recorded in `last_seen_external` so the next
+    /// frame cannot re-enter as `live == new_base` and clobber the merged local
+    /// lines.
     fn merge_external_document(&mut self, data: &dyn CollabData, document: DocumentId) {
         let Some(external) = data.document_body(document) else {
             return;
@@ -1702,24 +1709,36 @@ impl CommunicationsSurface {
         if self.documents.last_seen_external.as_deref() == Some(external) {
             return;
         }
-        let live = if let Some(share) = &self.documents.share {
-            if share.document == document {
-                share.session.doc().to_text()
-            } else {
-                self.documents.editor.current_text().unwrap_or_default()
+        let live = self.documents.editor.current_text().unwrap_or_default();
+        let Some(base) = self.documents.last_shared_base.clone() else {
+            if live != external {
+                self.documents.last_seen_external = Some(external.to_owned());
+                self.documents.external_conflict = Some(ExternalWriteConflict {
+                    base: String::new(),
+                    local: live,
+                    remote: external.to_owned(),
+                });
+                self.documents.notice = Some(
+                    "External write conflict — live edits kept; incoming file was not applied."
+                        .to_owned(),
+                );
             }
-        } else {
-            self.documents.editor.current_text().unwrap_or_default()
+            return;
         };
-        let base = self.documents.last_shared_base.clone().unwrap_or_default();
         match merge_external_write(&base, &live, external) {
             ExternalWriteMerge::Clean(merged) => {
                 if merged != live {
                     self.documents.editor.replace_text(&merged);
                     self.documents.mirror_merged_into_share(document, &merged);
+                    self.documents.notice = Some("Merged external file changes.".to_owned());
                 }
-                self.documents.remember_shared_base(&merged);
-                self.documents.notice = Some("Merged external file changes.".to_owned());
+                // Ancestor for the *next* write is the merged live buffer.
+                // The snapshot we already reconciled is `external` — do not
+                // point `last_seen_external` at `merged` or the still-present
+                // disk body looks like a fresh write against that ancestor.
+                self.documents.last_shared_base = Some(merged);
+                self.documents.last_seen_external = Some(external.to_owned());
+                self.documents.external_conflict = None;
             }
             ExternalWriteMerge::Conflict(conflict) => {
                 self.documents.last_seen_external = Some(external.to_owned());
@@ -2002,6 +2021,72 @@ mod tests {
                 panic!("overlapping edits must not silently merge, got {text:?}")
             }
         }
+    }
+
+    #[test]
+    fn attached_share_external_write_merges_or_conflicts_without_losing_unpumped_edits() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+
+        // The CRDT is pinned at last_shared_base until pump. An unpumped editor
+        // edit must still be the live merge side, and the same disk snapshot
+        // must not re-enter on the next apply as live==new_base (silent clobber).
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let data = share_fixture("zebra", space, document, &["zebra"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut surface = CommunicationsSurface::new();
+        surface.bind_document_share_bus(bus);
+        surface.select_space(space);
+        surface.open_document(&data, document, "Runbook");
+        assert!(surface.share_document(&data, space));
+        assert_eq!(surface.last_shared_base(), Some("# Runbook\n"));
+
+        surface.set_document_editor_text("# Runbook\nlocal\n");
+        let remote = share_fixture("zebra", space, document, &["zebra"])
+            .with_document_body(document, "remote\n# Runbook\n");
+        surface.apply_external_document_body(&remote);
+        assert_eq!(
+            surface.document_editor_text().as_deref(),
+            Some("remote\n# Runbook\nlocal\n"),
+            "non-overlapping unpumped edit must merge, not yield to the stale CRDT"
+        );
+        assert!(surface.external_write_conflict().is_none());
+
+        surface.apply_external_document_body(&remote);
+        assert_eq!(
+            surface.document_editor_text().as_deref(),
+            Some("remote\n# Runbook\nlocal\n"),
+            "re-applying the same external snapshot must not clobber the merged local line"
+        );
+        assert_eq!(
+            surface.last_shared_base(),
+            Some("remote\n# Runbook\nlocal\n")
+        );
+
+        surface.set_document_editor_text("hello world\n");
+        let overlapping = share_fixture("zebra", space, document, &["zebra"])
+            .with_document_body(document, "hello mesh\n");
+        surface.apply_external_document_body(&overlapping);
+        assert_eq!(
+            surface.document_editor_text().as_deref(),
+            Some("hello world\n"),
+            "overlapping external write must keep the live edit"
+        );
+        let conflict = surface
+            .external_write_conflict()
+            .expect("overlapping external write must surface ExternalWriteConflict");
+        assert_eq!(conflict.local, "hello world\n");
+        assert_eq!(conflict.remote, "hello mesh\n");
+
+        surface.apply_external_document_body(&overlapping);
+        assert_eq!(
+            surface.document_editor_text().as_deref(),
+            Some("hello world\n"),
+            "re-applying a conflicted snapshot must not clobber the kept live edit"
+        );
+        assert!(surface.external_write_conflict().is_some());
     }
 
     fn share_fixture(
