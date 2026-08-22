@@ -146,18 +146,26 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
 }
 
 /// Whether a catalogued Transfers Ctrl chord must **pass through** (refuse to
-/// fire) so Documents or Terminal keep the keystroke.
+/// fire) so Documents, Terminal, Desktop, or Browser keep the keystroke.
 ///
 /// Communications is Documents mode; its editor owns Ctrl+J / Ctrl+N while a
 /// text field has focus. Terminal's PTY is the same: those chords are editing
-/// / line-discipline keys, not host Transfers accelerators.
+/// / line-discipline keys, not host Transfers accelerators. Desktop and
+/// Browser guests keep the same chords while a guest has focus (VDI /
+/// Chromium) — the catalog refuses natively so the apply site does not remap
+/// those surfaces onto Terminal.
 const fn transfer_ctrl_passes_through(surface: Option<Surface>, text_focus: bool) -> bool {
-    text_focus && matches!(surface, Some(Surface::Communications | Surface::Terminal))
+    text_focus
+        && matches!(
+            surface,
+            Some(Surface::Communications | Surface::Terminal | Surface::Desktop | Surface::Browser)
+        )
 }
 
 /// Map a Ctrl-held named key to the catalog chord string. These fire on Construct
-/// chrome without Super. When Documents or Terminal have text focus the catalog
-/// refuses the binding so the keystroke reaches the editor / PTY.
+/// chrome without Super. When Documents, Terminal, Desktop, or Browser have
+/// text / guest focus the catalog refuses the binding so the keystroke reaches
+/// the editor / PTY / guest.
 const fn ctrl_chord(
     press: KeyPress,
     text_surface: Option<Surface>,
@@ -295,16 +303,18 @@ impl HotkeyRouter {
         host_keys: &[HostScan],
         egui_presses: &[KeyPress],
     ) -> Vec<HotkeyAction> {
-        // Chrome / no text field: Transfers chords fire. Documents and Terminal
-        // pass `dispatch_for` with `text_focus` so the catalog can refuse.
+        // Chrome / no text field: Transfers chords fire. Documents, Terminal,
+        // Desktop, and Browser pass `dispatch_for` with `text_focus` so the
+        // catalog can refuse.
         self.dispatch_for(host_keys, egui_presses, None, false)
     }
 
     /// Dispatch with a focused-surface gate for Transfers Ctrl chords.
     ///
     /// `text_surface` + `text_focus` is the catalog input: Communications
-    /// (Documents) and Terminal refuse Ctrl+J / Ctrl+N while a text field or
-    /// PTY has focus. Other surfaces keep the accelerators.
+    /// (Documents), Terminal, Desktop, and Browser refuse Ctrl+J / Ctrl+N
+    /// while a text field, PTY, or guest has focus. Other surfaces keep the
+    /// accelerators.
     pub(crate) fn dispatch_for(
         &mut self,
         host_keys: &[HostScan],
@@ -861,11 +871,18 @@ mod tests {
     #[test]
     fn transfer_chords_pass_through_documents_and_terminal_text_focus() {
         // Leftover WL-FUNC-032: Ctrl+J / New Transfer must not shadow text
-        // editing. The catalog refuses those bindings while Documents
-        // (Communications) or Terminal have text focus; other surfaces and
-        // the same surfaces without a focused field still fire.
+        // editing or guest focus. The catalog refuses those bindings while
+        // Documents (Communications), Terminal, Desktop, or Browser have
+        // text / guest focus; other surfaces and the same surfaces without
+        // a focused field still fire. Desktop/Browser refuse natively — no
+        // apply-site remap onto Terminal.
         let mut r = HotkeyRouter::default();
-        for surface in [Surface::Communications, Surface::Terminal] {
+        for surface in [
+            Surface::Communications,
+            Surface::Terminal,
+            Surface::Desktop,
+            Surface::Browser,
+        ] {
             for (key, action) in [
                 (egui::Key::J, HotkeyAction::OpenTransfers),
                 (egui::Key::N, HotkeyAction::NewTransfer),
@@ -956,8 +973,8 @@ mod tests {
 
         // The System Hotkeys section renders `chord` + `action.label()` from this
         // table. Both Transfers rows must be present with those operator labels,
-        // and they must not be host-first so Documents/Terminal can keep the
-        // keystroke at the apply site.
+        // and they must not be host-first so Documents/Terminal/Desktop/Browser
+        // can keep the keystroke at the apply site.
         let listed: Vec<_> = mde_seat::hotkeys::HOTKEYS
             .iter()
             .filter(|h| h.chord.starts_with("Ctrl+"))
@@ -980,9 +997,10 @@ mod tests {
 
     #[test]
     fn transfer_chords_do_not_claim_documents_or_terminal_editing_keys() {
-        // Hostile: Documents (Communications editor) and Terminal keep their
-        // industry-standard Ctrl chords. The Transfers table may only claim
-        // Ctrl+J / Ctrl+N — do not invent extras that would steal text editing.
+        // Hostile: Documents (Communications editor), Terminal, Desktop, and
+        // Browser keep their industry-standard Ctrl chords. The Transfers
+        // table may only claim Ctrl+J / Ctrl+N — do not invent extras that
+        // would steal text editing or guest focus.
         let editing = [
             egui::Key::A,
             egui::Key::B,
