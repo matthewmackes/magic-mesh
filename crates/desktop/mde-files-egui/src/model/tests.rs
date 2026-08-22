@@ -2127,6 +2127,53 @@ fn folder_prefs_hydrate_caps_lru_and_leaves_store_untouched() {
     );
 }
 
+// WL-FUNC-026 — dirty folder prefs sit in the debounce hold window without
+// touching disk. `flush_persisted` skips that path; the production tick is
+// `pump_ops` → `flush_persisted_if_due`. A frame inside PREFS_DEBOUNCE must
+// leave the store absent; the first due pump writes it.
+#[test]
+fn folder_prefs_debounce_holds_then_flushes() {
+    let dir = tempfile::tempdir().expect("store dir");
+    let store = dir.path().join(super::FOLDER_PREFS_FILE);
+    let rows = vec![FileRow::local("a.txt", Mime::Doc, "1 B", "now").with_path("/work/a.txt")];
+    let mut b = live_posix_browser(rows).with_config_dir(dir.path());
+    b.navigate(0, Location::Local("/work".into()));
+    b.set_view(0, ViewMode::Grid);
+    b.toggle_hidden(0);
+
+    assert_eq!(
+        b.folder_prefs().get("/work").map(|p| p.view),
+        Some(ViewMode::Grid),
+        "prefs stay in memory as soon as they are dirtied"
+    );
+    assert!(
+        !store.exists(),
+        "a mutation must not write before the hold window"
+    );
+
+    b.pump_ops();
+    assert!(
+        !store.exists(),
+        "a pump inside the hold window must not flush"
+    );
+
+    std::thread::sleep(super::PREFS_DEBOUNCE + Duration::from_millis(50));
+    b.pump_ops();
+    assert!(
+        store.is_file(),
+        "the first due pump flushes the dirty folder prefs"
+    );
+
+    let flushed = load_folder_prefs_at(&store).expect("flushed store");
+    let entry = flushed
+        .entries
+        .iter()
+        .find(|e| e.path == "/work")
+        .expect("flushed /work");
+    assert_eq!(entry.prefs.view, ViewMode::Grid);
+    assert!(entry.prefs.show_hidden);
+}
+
 #[test]
 fn persistence_replaces_a_store_symlink_without_following_it() {
     let dir = tempfile::tempdir().expect("store dir");
