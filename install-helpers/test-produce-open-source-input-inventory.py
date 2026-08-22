@@ -20,6 +20,10 @@ APP_RECEIPT = "aca7573bc"
 BOOTC_RECEIPT = "479ec2b8c"
 BROWSER_RECEIPT = "b30954e31"
 BROWSER_DIGEST = "sha256:3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
+ADMITTED_PIN = (
+    "quay.io/fedora/fedora-bootc@sha256:"
+    "3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
+)
 RPM_FINGERPRINT = "06B1C27EA0E08A225155EB3314018AA1497DDC7C"
 
 
@@ -71,12 +75,16 @@ def main() -> None:
         assert families["maps"]["dest"] == "/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles"
         assert families["app-vm"]["receipt_revision"] == APP_RECEIPT
         assert families["app-vm"]["resolved_digest"].startswith("sha256:")
+        assert families["app-vm"]["containerfile_pin"] == ADMITTED_PIN
         assert families["bootc"]["receipt_revision"] == BOOTC_RECEIPT
         assert families["bootc"]["release_role"] == "all-roles"
+        assert families["bootc"]["containerfile_pin"] == ADMITTED_PIN
+        assert "null" in families["bootc"]["leftover"]
         assert families["browser-vm"]["producer"] == "packaging/browser-vm/produce-base-image-receipt.py"
         assert families["browser-vm"]["receipt_revision"] == BROWSER_RECEIPT
         assert families["browser-vm"]["resolved_digest"] == BROWSER_DIGEST
         assert families["browser-vm"]["leftover"].startswith("private dest bound")
+        assert families["browser-vm"]["containerfile_pin"] == ADMITTED_PIN
         assert families["rpm"]["signing_fingerprint"] == RPM_FINGERPRINT
         assert families["ux-014"]["package"] == "kiron"
         assert "cuttlefish" not in json.dumps(document).lower()

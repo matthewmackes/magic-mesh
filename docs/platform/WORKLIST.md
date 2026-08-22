@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 4 `Remaining`, 15 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 3 `Remaining`, 16 `Blocked`, 0 `Needs clarification`.
   Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
   surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
   fetch authorized; preflight template then operator secrets; seats+Vitelity go.
@@ -225,8 +225,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   criteria. Historical preview and source-bound receipts predate the final
   lifecycle source and cannot satisfy this plan. Surface is approved for
   `13.0.0`; Android/Cuttlefish is deferred and creates no release dependency.
-  Input selections and self-signing are authorized; remaining work
-  is to materialize candidate-bound bytes and pass canonical preflight. Keys,
+  Input selections and self-signing are authorized. WL-REL-006 is parked:
+  remaining inputs need freeze, operator catalog refs, or the RPM signer
+  secret. Remaining coordinator demand is FUNC-023 live enroll and FUNC-033
+  keep `own_nebula_ip`. Keys,
   provider credentials, farm authority, and publication access are named
   system credentials verified by unattended preflight. Exact acceptance is
   Dell, Seat 15, Surface, and three lighthouses.
@@ -703,7 +705,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 
 ### WL-REL-006 - Create governed open-source release inputs
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: WL-REL-001 cannot admit the production release until the already
@@ -720,13 +722,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` on BigBoy sha256
   `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`
   (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
-  App VM, Browser VM, and bootc ARGs match `3a5e74e6…`; inventory now names
-  Browser VM dest `b30954e31` (`WL-REL-006-2026-08-22-browser-vm-inventory-r1.md`).
-  Kiron S6 admitted. Surface `bootc_base` still null.
-  Leftover is Maps `production_admitted`, App catalog real refs (producer now
-  refuses `org.example.*`; evidence
-  `WL-REL-006-2026-08-22-catalog-fixture-refuse-r1.md`), RPM signer after freeze,
-  S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
+  App VM, Browser VM, and bootc ARGs and inventory pins match `3a5e74e6…`.
+  Surface `bootc_base` stays null (blocked stack must not guess a digest).
+  Leftover is Maps `production_admitted`, real catalog refs, RPM signer after
+  freeze, S7 `REPLACE_*`, live-seat dest. Evidence:
+  `WL-REL-006-2026-08-22-leftover-park-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -855,12 +855,10 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Relevant files/components: install-helpers/release-input-preflight.sh,
   packaging/app-vm, install-helpers/produce-bootc-digest-receipt.py,
   Maps catalog/verifier tools, and the Kiron asset verifier.
-- Dependencies: the provisional clean candidate identity from WL-REL-001 S1 and
-  its completed S2 version matrix; registry/provider credentials are named
-  system credentials consumed only where the selected reproducible source
-  requires them. There is no remaining input-selection dependency. The
-  coordinator must provision capacity, refresh credentials through supported
-  APIs, or fail and reopen the exact producer/infrastructure story.
+- Dependencies: WL-FUNC-023 live enroll before freeze; WL-REL-001 S1 candidate
+  identity and S2 version matrix; operator-approved curated Flatpak refs; the
+  governed RPM signer secret after freeze; WL-TEST-002 for live-seat dest.
+  Do not invent catalog refs. Do not guess Surface `bootc_base` while blocked.
 - Acceptance criteria: every mandatory first-release input is reproducible,
   licensed, immutable, current-revision-bound, and admitted by preflight; no
   fixture, unavailable input, or external handoff can satisfy the gate.

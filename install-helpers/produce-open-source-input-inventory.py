@@ -85,6 +85,10 @@ def selected_families() -> list[dict[str, object]]:
         },
         {
             "architecture": "amd64",
+            "containerfile_pin": (
+                "quay.io/fedora/fedora-bootc@sha256:"
+                "3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
+            ),
             "family": "app-vm",
             "image_reference": "quay.io/fedora/fedora:42",
             "leftover": "real curated catalog refs remain leftover",
@@ -96,8 +100,13 @@ def selected_families() -> list[dict[str, object]]:
         },
         {
             "architecture": "amd64",
+            "containerfile_pin": (
+                "quay.io/fedora/fedora-bootc@sha256:"
+                "3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
+            ),
             "family": "bootc",
             "image_reference": "quay.io/fedora/fedora-bootc:44",
+            "leftover": "Surface bootc_base stays null while the stack manifest is blocked",
             "license": "Fedora Project terms",
             "receipt_revision": "479ec2b8c",
             "receipt_sha256": "2e1a183fc48de8124624881d7ec5f99770d954d81a61dcc4cf4d07919f2326ae",
