@@ -2124,6 +2124,23 @@ impl Shell {
         }
     }
 
+    /// Catalog inputs the live apply site feeds [`hotkeys::HotkeyRouter::dispatch_for`].
+    ///
+    /// Documents (Communications) and Terminal pass `Some(surface)` plus the
+    /// text-focus bit so Ctrl+J / Ctrl+N stay with the editor / PTY. Other
+    /// surfaces and collapsed chrome stay chrome — no surface, no text focus.
+    fn transfer_dispatch_focus(
+        surface: Surface,
+        expanded: bool,
+        text_focus: bool,
+    ) -> (Option<Surface>, bool) {
+        if expanded && matches!(surface, Surface::Communications | Surface::Terminal) {
+            (Some(surface), text_focus)
+        } else {
+            (None, false)
+        }
+    }
+
     /// Consume the Transfers chord so a focused Construct widget does not also
     /// insert `j`/`n`.
     fn consume_transfer_hotkey(ctx: &egui::Context, action: HotkeyAction) {
@@ -3599,7 +3616,20 @@ impl Shell {
         let host_keys = mde_egui::hostkeys::drain_host_keys();
         let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
         let mut super_tab = false;
-        for action in self.hotkeys.dispatch(&host_keys, &presses) {
+        // WL-FUNC-032 leftover: the catalog refuses Transfers chords while
+        // Documents (Communications) or Terminal have text focus. Terminal's
+        // PTY is the surface, so an expanded Terminal always has text focus;
+        // Communications uses egui's field-focus bit (Documents editor).
+        let text_focus = match self.nav.surface {
+            Surface::Terminal => true,
+            _ => ctx.wants_keyboard_input(),
+        };
+        let (text_surface, text_focus) =
+            Self::transfer_dispatch_focus(self.nav.surface, self.nav.expanded, text_focus);
+        for action in self
+            .hotkeys
+            .dispatch_for(&host_keys, &presses, text_surface, text_focus)
+        {
             // CURTAIN-1 (lock 10): while the curtain is engaged NO chord acts on
             // the seat or the nav. The dispatch itself still runs so the router's
             // leader latch tracks Super press/release across the lock; every
@@ -7589,6 +7619,74 @@ mod tests {
         assert!(shell.nav.expanded);
         assert_eq!(shell.nav.surface, Surface::Communications);
         mde_collab_egui::clear_transfers_hotkey_intent();
+    }
+
+    #[test]
+    fn live_apply_passes_transfer_chords_through_documents_and_terminal_text_focus() {
+        // The live apply site (not apply_hotkey) must feed dispatch_for the
+        // current surface + text-focus bit so Documents (Communications) and
+        // Terminal keep Ctrl+J / Ctrl+N. The catalog already refuses those
+        // bindings; this covers the shell call-site leftover.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        let ctrl_j = super::hotkeys::KeyPress {
+            key: egui::Key::J,
+            shift: false,
+            ctrl: true,
+        };
+        let ctrl_n = super::hotkeys::KeyPress {
+            key: egui::Key::N,
+            shift: false,
+            ctrl: true,
+        };
+
+        for surface in [Surface::Communications, Surface::Terminal] {
+            shell.nav.expanded = true;
+            shell.nav.surface = surface;
+            let (text_surface, text_focus) =
+                Shell::transfer_dispatch_focus(shell.nav.surface, shell.nav.expanded, true);
+            assert_eq!(
+                (text_surface, text_focus),
+                (Some(surface), true),
+                "{surface:?} with text focus must reach dispatch_for"
+            );
+            assert!(
+                shell
+                    .hotkeys
+                    .dispatch_for(&[], &[ctrl_j], text_surface, text_focus)
+                    .is_empty(),
+                "Ctrl+J must pass through {surface:?} text focus"
+            );
+            assert!(
+                shell
+                    .hotkeys
+                    .dispatch_for(&[], &[ctrl_n], text_surface, text_focus)
+                    .is_empty(),
+                "Ctrl+N must pass through {surface:?} text focus"
+            );
+        }
+
+        shell.nav.surface = Surface::Communications;
+        let (text_surface, text_focus) =
+            Shell::transfer_dispatch_focus(shell.nav.surface, true, false);
+        assert_eq!(
+            shell
+                .hotkeys
+                .dispatch_for(&[], &[ctrl_j], text_surface, text_focus),
+            vec![HotkeyAction::OpenTransfers],
+            "Communications without a focused field still fires Ctrl+J"
+        );
+        assert_eq!(
+            Shell::transfer_dispatch_focus(Surface::Workbench, true, true),
+            (None, false),
+            "non-editor surfaces stay chrome dispatch"
+        );
+        assert_eq!(
+            Shell::transfer_dispatch_focus(Surface::Communications, false, true),
+            (None, false),
+            "collapsed chrome is not Documents text focus"
+        );
     }
 
     #[test]
