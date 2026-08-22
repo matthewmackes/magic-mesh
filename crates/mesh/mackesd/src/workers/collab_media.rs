@@ -60,7 +60,7 @@ struct SipGatewayProvider {
     /// Bound inbound dialogs waiting for a `/sip` tick. The agent adapter
     /// owns this slot, so the outbound-only publish plane will not mint them.
     inbound_legs: Arc<Mutex<BTreeMap<CallId, String>>>,
-    publish_plane: super::call_media::SipGatewayPlane,
+    publish_plane: Arc<super::call_media::SipGatewayPlane>,
 }
 
 /// Provider-observed inbound dialog identity.  This is an untrusted offer, not
@@ -88,6 +88,8 @@ impl SipGatewayProvider {
         let monitor_pending_inbound = Arc::clone(&pending_inbound);
         let inbound_legs = Arc::new(Mutex::new(BTreeMap::new()));
         let monitor_inbound_legs = Arc::clone(&inbound_legs);
+        let publish_plane = Arc::new(super::call_media::SipGatewayPlane::production());
+        let monitor_publish_plane = Arc::clone(&publish_plane);
         std::thread::Builder::new()
             .name("mcnf-collab-sip-agent".to_string())
             .spawn(move || {
@@ -124,6 +126,7 @@ impl SipGatewayProvider {
                                 &monitor_active_call,
                                 &monitor_revoked_calls,
                                 &monitor_inbound_legs,
+                                &monitor_publish_plane,
                             );
                             continue;
                         }
@@ -136,6 +139,7 @@ impl SipGatewayProvider {
                             &monitor_active_call,
                             &monitor_revoked_calls,
                             &monitor_inbound_legs,
+                            &monitor_publish_plane,
                         );
                     }
                     if let Ok(mut current) = monitor_health.lock() {
@@ -149,6 +153,7 @@ impl SipGatewayProvider {
                     &monitor_active_call,
                     &monitor_revoked_calls,
                     &monitor_inbound_legs,
+                    &monitor_publish_plane,
                 );
                 if let Ok(mut current) = monitor_health.lock() {
                     *current = SipProviderHealth::Unavailable("SIP agent stopped".to_string());
@@ -162,7 +167,7 @@ impl SipGatewayProvider {
             revoked_calls,
             pending_inbound,
             inbound_legs,
-            publish_plane: super::call_media::SipGatewayPlane::production(),
+            publish_plane,
         })
     }
 
@@ -178,7 +183,7 @@ impl SipGatewayProvider {
             revoked_calls: Arc::new(Mutex::new(Vec::new())),
             pending_inbound: Arc::new(Mutex::new(None)),
             inbound_legs: Arc::new(Mutex::new(BTreeMap::new())),
-            publish_plane: super::call_media::SipGatewayPlane::production(),
+            publish_plane: Arc::new(super::call_media::SipGatewayPlane::production()),
         }
     }
 
@@ -252,6 +257,7 @@ impl SipGatewayProvider {
         if let Ok(mut legs) = self.inbound_legs.lock() {
             legs.remove(&call);
         }
+        drop_plane_inbound_leg(&self.publish_plane, call);
     }
 
     fn publish_inbound_sip_legs(
@@ -359,15 +365,26 @@ fn revoke_active_call(
     call
 }
 
+fn drop_plane_inbound_leg(publish_plane: &super::call_media::SipGatewayPlane, call: CallId) {
+    // HangUp and Decline both drop the retained inbound session on the
+    // publish plane; hang-up is the existing equivalent for revoke too.
+    let _ = publish_plane.execute_command(
+        &CollabCommand::HangUpCall { call },
+        CallMediaAdapter::SipGateway,
+    );
+}
+
 fn forget_revoked_inbound_leg(
     active_call: &Mutex<Option<mde_collab_types::CallId>>,
     revoked_calls: &Mutex<Vec<mde_collab_types::CallId>>,
     inbound_legs: &Mutex<BTreeMap<CallId, String>>,
+    publish_plane: &super::call_media::SipGatewayPlane,
 ) {
     if let Some(call) = revoke_active_call(active_call, revoked_calls) {
         if let Ok(mut legs) = inbound_legs.lock() {
             legs.remove(&call);
         }
+        drop_plane_inbound_leg(publish_plane, call);
     }
 }
 
@@ -1843,6 +1860,66 @@ mod tests {
                 .expect("read session topic")
                 .is_none(),
             "inbound sip retain must not invent a Connected media session"
+        );
+    }
+
+    #[test]
+    fn inbound_hangup_after_bind_forgets_publish_plane_leg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let provider = SipGatewayProvider::with_channel(tx, SipProviderHealth::Ready);
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let offer = InboundCallOffer {
+            identity: "+15551234567".to_string(),
+            provider_call_id: "dlg@example.com".to_string(),
+        };
+        *provider.pending_inbound.lock().expect("pending lock") = Some(offer.clone());
+        assert!(
+            provider.bind_inbound_call(&offer, Some(call)),
+            "inbound offer must bind to the minted call id"
+        );
+        // Drop the leftover local map so only the publish plane can tick /sip.
+        provider.inbound_legs.lock().expect("inbound legs").clear();
+
+        provider
+            .execute_command(
+                &CollabCommand::HangUpCall { call },
+                CallMediaAdapter::SipGateway,
+            )
+            .expect("hangup of a bound inbound must stay locally authoritative");
+
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::SipGateway, provider)
+            .expect("register agent-owned SIP adapter");
+
+        let mut session = ready_audio_session();
+        session.call = call;
+        session.space = space;
+        write_readiness(
+            &persist,
+            &CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: vec![session],
+            },
+        );
+
+        let mut last_published = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+
+        let topic = media_sip_leg_topic(call);
+        assert!(
+            persist
+                .read_latest(&topic)
+                .expect("read sip topic")
+                .is_none(),
+            "hangup after bind must leave /sip without the inbound unbridged leg"
+        );
+        assert!(
+            !last_published.contains_key(&topic),
+            "hangup after bind must not retain the inbound sip topic in the worker publish cache"
         );
     }
 
