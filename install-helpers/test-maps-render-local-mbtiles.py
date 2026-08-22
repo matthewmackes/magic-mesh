@@ -185,7 +185,69 @@ def main() -> None:
             )
             assert injected["called"] is True
             assert injected_record["destination"] == "nested/buffalo-niagara.mbtiles"
+            assert injected_record["production_admitted"] is False
+            assert injected_record["kind"] == "mcnf-maps-local-render"
             assert (injected_dest / "nested" / "buffalo-niagara.mbtiles").is_file()
+
+            def claiming_production(request):
+                payload = render.default_local_render(request)
+                # Hostile: a fixture renderer must not be able to close the
+                # production Maps gate by stamping the sidecar itself.
+                payload["production_admitted"] = True
+                payload["kind"] = render.PRODUCTION_RECEIPT_KIND
+                return payload
+
+            claim_dest = root / "claim-dest"
+            claim_dest.mkdir()
+            claim_record = render_ok(
+                source_root=source_root,
+                dest_root=claim_dest,
+                sidecar="claimed-production.json",
+                render=claiming_production,
+            )
+            if claim_record["production_admitted"] is not False:
+                raise AssertionError("fixture local-render claimed production_admitted")
+            if claim_record["kind"] != render.RENDER_KIND:
+                raise AssertionError("fixture local-render claimed a production receipt kind")
+            if claim_record["kind"] == render.PRODUCTION_RECEIPT_KIND:
+                raise AssertionError("fixture local-render published a production Maps receipt")
+            claimed_sidecar = json.loads((claim_dest / "claimed-production.json").read_bytes())
+            if claimed_sidecar["production_admitted"] is not False:
+                raise AssertionError("published fixture sidecar claimed production_admitted")
+            if claimed_sidecar["kind"] != "mcnf-maps-local-render":
+                raise AssertionError("published fixture sidecar is not a local-render record")
+            try:
+                render.verify.verify_receipt(
+                    claim_dest / "claimed-production.json",
+                    claim_dest / "buffalo-niagara.mbtiles",
+                    "a" * 40,
+                    1,
+                    claim_record["mbtiles_bytes"],
+                )
+            except render.verify.Refusal:
+                pass
+            else:
+                raise AssertionError("local-render sidecar was admitted as a production receipt")
+
+            bound = render.bind_sidecar(
+                sources=render.admit_authorized_sources(LOCK),
+                pbf_sha256=render.digest(FIXTURE_PBF),
+                pbf_size=len(FIXTURE_PBF),
+                geometry_sha256=render.digest(FIXTURE_GEOMETRY),
+                geometry_size=len(FIXTURE_GEOMETRY),
+                clip_geoids=["36029", "36063"],
+                destination="buffalo-niagara.mbtiles",
+                mbtiles_sha256="0" * 64,
+                mbtiles_size=1,
+                tile_count=1,
+                bounds=dict(render.FIXTURE_BOUNDS),
+                min_zoom=1,
+                max_zoom=1,
+            )
+            if bound["production_admitted"] is not False:
+                raise AssertionError("bind_sidecar claimed production_admitted on fixture bytes")
+            if bound["kind"] != render.RENDER_KIND:
+                raise AssertionError("bind_sidecar kind drifted off local-render")
 
             expect_refusal(
                 "wrong-url",
