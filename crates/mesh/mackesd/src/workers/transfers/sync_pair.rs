@@ -35,6 +35,12 @@ pub struct SyncPair {
     /// Last successful enqueue time, in wall-clock epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fired_ms: Option<u64>,
+    /// Last scheduled attempt outcome (`ok` or an honest failure reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+    /// Destination reachability published by the latest scheduled attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_reachable: Option<bool>,
     /// Wall-clock ms when the pair was created.
     pub created_ms: u64,
     /// Wall-clock ms of the last pair mutation or scheduler enqueue.
@@ -60,6 +66,8 @@ impl SyncPair {
             policy,
             enabled: true,
             last_fired_ms: None,
+            last_result: None,
+            peer_reachable: None,
             created_ms: now,
             updated_ms: now,
         }

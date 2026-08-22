@@ -1196,6 +1196,7 @@ impl Engine {
                             "sync pair fired but last_fired stamp failed"
                         );
                     }
+                    self.record_sync_pair_attempt(&id, "ok", true);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1203,8 +1204,25 @@ impl Engine {
                         pair = %id, error = %e,
                         "sync pair enqueue failed"
                     );
+                    self.record_sync_pair_attempt(&id, &e.to_string(), false);
                 }
             }
+        }
+    }
+
+    /// Stamp the existing store after a scheduled attempt (success or honest failure).
+    fn record_sync_pair_attempt(&self, id: &str, last_result: &str, peer_reachable: bool) {
+        let Some(mut pair) = self.sync_pairs.get(id) else {
+            return;
+        };
+        pair.last_result = Some(last_result.to_owned());
+        pair.peer_reachable = Some(peer_reachable);
+        if let Err(e) = self.sync_pairs.upsert(&pair) {
+            tracing::warn!(
+                target: "mackesd::transfers",
+                pair = %id, error = %e,
+                "sync pair last_result stamp failed"
+            );
         }
     }
 
@@ -4012,5 +4030,64 @@ mod tests {
                 .is_some(),
             true
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_sync_pair_persists_last_result_and_peer_reachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with(
+            tmp.path(),
+            1,
+            Arc::new(ImmediateLane {
+                outcome: LaneOutcome::Done,
+            }),
+        );
+        engine
+            .sync_pairs
+            .upsert(&SyncPair::new(
+                "docs",
+                "/src",
+                "/dst",
+                15,
+                TransferPolicy::default(),
+            ))
+            .unwrap();
+
+        engine.schedule_sync_pairs_at(1_000);
+        let ok = engine.sync_pairs.get("docs").unwrap();
+        assert_eq!(ok.last_result.as_deref(), Some("ok"));
+        assert_eq!(ok.peer_reachable, Some(true));
+        assert_eq!(ok.last_fired_ms, Some(1_000));
+
+        engine
+            .sync_pairs
+            .upsert(&SyncPair::new(
+                "blocked",
+                "/src-blocked",
+                "/dst-blocked",
+                15,
+                TransferPolicy::default(),
+            ))
+            .unwrap();
+        let ledger = tmp.path().join("ledger");
+        std::fs::remove_dir_all(&ledger).unwrap();
+        std::fs::write(&ledger, b"not-a-directory").unwrap();
+
+        engine.schedule_sync_pairs_at(1_000);
+        let failed = engine.sync_pairs.get("blocked").unwrap();
+        assert_eq!(
+            failed.last_fired_ms,
+            None,
+            "failed attempt must not stamp last_fired"
+        );
+        assert_eq!(failed.peer_reachable, Some(false));
+        let result = failed.last_result.expect("honest failure is persisted");
+        assert!(
+            !result.is_empty() && result != "ok",
+            "last_result should name the honest enqueue failure, got {result}"
+        );
+        let still_ok = engine.sync_pairs.get("docs").unwrap();
+        assert_eq!(still_ok.last_result.as_deref(), Some("ok"));
+        assert_eq!(still_ok.peer_reachable, Some(true));
     }
 }
