@@ -35,6 +35,10 @@ pub struct SyncPair {
     /// Last successful enqueue time, in wall-clock epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fired_ms: Option<u64>,
+    /// Worker-authored next fire, using the same arithmetic as [`SyncPair::due_at`].
+    /// Absent on records written before this field existed, and on disabled pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_ms: Option<u64>,
     /// Last scheduled attempt outcome (`ok` or an honest failure reason).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<String>,
@@ -66,11 +70,18 @@ impl SyncPair {
             policy,
             enabled: true,
             last_fired_ms: None,
+            next_run_ms: None,
             last_result: None,
             peer_reachable: None,
             created_ms: now,
             updated_ms: now,
         }
+    }
+
+    /// Interval in milliseconds, matching the `due_at` schedule.
+    #[must_use]
+    fn interval_ms(&self) -> u64 {
+        self.every_secs.max(1).saturating_mul(1000)
     }
 
     /// Is this pair due at `now`?
@@ -81,8 +92,23 @@ impl SyncPair {
         }
         match self.last_fired_ms {
             None => true,
-            Some(last) => now >= last.saturating_add(self.every_secs.max(1).saturating_mul(1000)),
+            Some(last) => now >= last.saturating_add(self.interval_ms()),
         }
+    }
+
+    /// Next fire using the same arithmetic as [`due_at`].
+    ///
+    /// Disabled pairs have no next run. Never-fired enabled pairs are due at
+    /// `now`. After a fire, the next run is `last_fired_ms + interval`.
+    #[must_use]
+    pub fn next_run_at(&self, now: u64) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        Some(match self.last_fired_ms {
+            None => now,
+            Some(last) => last.saturating_add(self.interval_ms()),
+        })
     }
 
     /// Mint the ordinary rsync transfer job fired by this pair.
@@ -105,6 +131,8 @@ impl SyncPair {
         if self.created_ms == 0 {
             self.created_ms = self.updated_ms;
         }
+        // Save/enable is a due decision: publish the same stamp `due_at` uses.
+        self.next_run_ms = self.next_run_at(self.updated_ms);
     }
 }
 
@@ -272,6 +300,8 @@ impl SyncPairStore {
         })?;
         pair.last_fired_ms = Some(fired_ms);
         pair.updated_ms = fired_ms;
+        // Stamp before upsert so a subsequent normalize uses last+interval, not `now`.
+        pair.next_run_ms = pair.next_run_at(fired_ms);
         self.upsert(&pair)
     }
 
@@ -355,11 +385,71 @@ mod tests {
     fn due_at_honors_enabled_and_interval() {
         let mut pair = SyncPair::new("pair", "/src", "/dst", 15, TransferPolicy::default());
         assert!(pair.due_at(1000));
+        assert_eq!(pair.next_run_at(1000), Some(1000));
         pair.last_fired_ms = Some(10_000);
         assert!(!pair.due_at(24_999));
         assert!(pair.due_at(25_000));
+        assert_eq!(pair.next_run_at(1_000), Some(25_000));
         pair.enabled = false;
         assert!(!pair.due_at(50_000));
+        assert_eq!(pair.next_run_at(50_000), None);
+    }
+
+    #[test]
+    fn store_stamps_next_run_on_save_and_mark_fired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        let pair = SyncPair::new("docs", "/src", "/dst", 15, TransferPolicy::default());
+        assert_eq!(pair.next_run_ms, None, "in-memory new() is unpublished");
+        store.upsert(&pair).unwrap();
+        let saved = store.get("docs").unwrap();
+        assert_eq!(
+            saved.next_run_ms,
+            Some(saved.updated_ms),
+            "save of a never-fired pair publishes due-now"
+        );
+
+        store.mark_fired("docs", 10_000).unwrap();
+        let fired = store.get("docs").unwrap();
+        assert_eq!(fired.last_fired_ms, Some(10_000));
+        assert_eq!(
+            fired.next_run_ms,
+            Some(25_000),
+            "enqueue stamp is last_fired + interval, not wall now"
+        );
+
+        let mut disabled = fired.clone();
+        disabled.enabled = false;
+        store.upsert(&disabled).unwrap();
+        assert_eq!(
+            store.get("docs").unwrap().next_run_ms,
+            None,
+            "disabled save publishes no next-run"
+        );
+    }
+
+    #[test]
+    fn old_records_without_next_run_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        std::fs::write(
+            store.path("legacy"),
+            r#"{
+                "id": "legacy",
+                "source": "/src",
+                "dest": "/dst",
+                "every_secs": 60,
+                "enabled": true,
+                "created_ms": 1,
+                "updated_ms": 1
+            }"#,
+        )
+        .unwrap();
+        let loaded = store
+            .get("legacy")
+            .expect("legacy record still deserializes");
+        assert_eq!(loaded.next_run_ms, None);
+        assert_eq!(loaded.last_fired_ms, None);
     }
 
     #[test]

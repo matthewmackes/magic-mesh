@@ -1783,8 +1783,9 @@ struct StoredSyncPair {
     policy: StoredSyncPairPolicy,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    /// Worker-authored next fire (epoch ms). Absent until the scheduler publishes one.
     #[serde(default)]
-    last_fired_ms: Option<u64>,
+    next_run_ms: Option<u64>,
     /// Last scheduler/worker outcome, when the worker has published one.
     #[serde(default)]
     last_result: Option<String>,
@@ -1810,7 +1811,6 @@ fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let now_ms = now_unix_ms().max(0) as u64;
     let mut views = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1836,17 +1836,15 @@ fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
         if pair.id.trim().is_empty() || !pair.enabled {
             continue;
         }
-        let every_ms = pair.every_secs.max(1).saturating_mul(1000);
-        let next_run_unix_ms = pair
-            .last_fired_ms
-            .map_or(now_ms, |last| last.saturating_add(every_ms));
         views.push(SyncPairView {
             id: pair.id,
             source: pair.source,
             dest: pair.dest,
             every_secs: pair.every_secs.max(1),
             bwlimit: pair.policy.bwlimit,
-            next_run_unix_ms: Some(i64::try_from(next_run_unix_ms).unwrap_or(i64::MAX)),
+            next_run_unix_ms: pair
+                .next_run_ms
+                .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
             last_result: pair.last_result,
             peer_reachable: pair.peer_reachable,
         });
@@ -3546,6 +3544,7 @@ mod tests {
                 "policy": { "bwlimit": "2m" },
                 "enabled": true,
                 "last_fired_ms": 1000000,
+                "next_run_ms": 1234567,
                 "last_result": "ok",
                 "peer_reachable": false,
                 "created_ms": 1,
@@ -3560,7 +3559,11 @@ mod tests {
         assert_eq!(views[0].dest, "node:oak");
         assert_eq!(views[0].every_secs, 900);
         assert_eq!(views[0].bwlimit.as_deref(), Some("2m"));
-        assert_eq!(views[0].next_run_unix_ms, Some(1_000_000 + 900_000));
+        assert_eq!(
+            views[0].next_run_unix_ms,
+            Some(1_234_567),
+            "fold copies the published next-run; it must not synthesize last_fired + interval"
+        );
         assert_eq!(views[0].last_result.as_deref(), Some("ok"));
         assert_eq!(views[0].peer_reachable, Some(false));
     }
@@ -3589,6 +3592,10 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].last_result, None);
         assert_eq!(views[0].peer_reachable, None);
+        assert_eq!(
+            views[0].next_run_unix_ms, None,
+            "unpublished next-run stays unknown; the shell must not invent now or last+interval"
+        );
     }
 
     #[test]

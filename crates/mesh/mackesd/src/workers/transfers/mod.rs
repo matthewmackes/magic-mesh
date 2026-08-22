@@ -4057,6 +4057,11 @@ mod tests {
             engine.sync_pairs.get("docs").unwrap().last_fired_ms,
             Some(1_000)
         );
+        assert_eq!(
+            engine.sync_pairs.get("docs").unwrap().next_run_ms,
+            Some(16_000),
+            "enqueue must persist last_fired + interval as the worker next-run"
+        );
 
         engine.schedule_sync_pairs_at(15_999);
         assert_eq!(
