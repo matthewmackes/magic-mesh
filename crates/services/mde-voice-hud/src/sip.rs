@@ -121,6 +121,109 @@ impl VoiceAccounts {
             needs_inbound_sub: true,
         })
     }
+
+    /// WL-FUNC-024 S4 — apply [`lift_if_legacy`] in place so the agent always
+    /// sees the split model. Returns whether a lift happened.
+    ///
+    /// Idempotent: a second call on an already-lifted (or already-split)
+    /// account is a no-op, so a flat config is lifted **once** and never
+    /// re-registered as a second identity.
+    #[must_use]
+    pub fn apply_legacy_lift(&mut self) -> bool {
+        match self.lift_if_legacy() {
+            Some(lift) => {
+                self.outbound = Some(lift.shared_outbound);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The inbound identity this node REGISTERs. The shared-outbound trunk is
+    /// never a second REGISTER — outbound PSTN is bridged onto that trunk
+    /// (Vitelity / LiveKit SIP gateway).
+    #[must_use]
+    pub fn register_identity(&self) -> &str {
+        self.inbound.username.as_str()
+    }
+}
+
+/// Reason published when no governed SIP/PSTN provider is installed.
+///
+/// The agent must not emit a fake `Registered` / connected PSTN state for this
+/// case — the Calls surface (and the SIP health monitor) stay visibly
+/// unavailable.
+pub const ABSENT_PSTN_PROVIDER: &str = "no governed SIP provider is installed";
+
+/// WL-FUNC-024 S4 — how the split/shared-outbound-aware agent is driven so
+/// PSTN legs can terminate through the LiveKit SIP gateway.
+///
+/// Pure: no I/O. The worker feeds loaded accounts (or `None` when no governed
+/// provider is installed). The planner lifts a legacy flat account once, names
+/// the single inbound REGISTER target, and refuses to claim a connected PSTN
+/// leg when the provider is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PstnAgentDrive {
+    /// No governed SIP provider — PSTN stays unavailable.
+    Unavailable { reason: String },
+    /// Drive [`run_agent_accounts`] / [`drive_pstn_agent`] with these
+    /// (already-lifted) accounts. `register_identity` is the inbound sub only.
+    Ready {
+        accounts: VoiceAccounts,
+        /// `true` when this plan applied a one-shot legacy lift.
+        lifted_legacy: bool,
+        /// The single REGISTER username (inbound). Never the shared-outbound
+        /// caller-ID.
+        register_identity: String,
+    },
+}
+
+impl PstnAgentDrive {
+    /// Whether a PSTN provider is present and can be driven. Absent is never
+    /// treated as available.
+    #[must_use]
+    pub const fn pstn_leg_available(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Pre-flight PSTN visibility. An absent provider is never
+    /// [`RegistrationState::Registered`].
+    #[must_use]
+    pub fn visible_pstn_state(&self) -> RegistrationState {
+        match self {
+            Self::Unavailable { reason } => RegistrationState::Failed(reason.clone()),
+            Self::Ready { .. } => RegistrationState::Registering,
+        }
+    }
+}
+
+/// Plan the split/shared-outbound-aware PSTN agent path.
+///
+/// - `None` / registrar-less identity → [`PstnAgentDrive::Unavailable`] (no
+///   fake connected PSTN).
+/// - A legacy flat account is lifted **once**; the inbound username remains
+///   the only REGISTER target.
+/// - An already-split account is unchanged and still REGISTERs inbound only.
+#[must_use]
+pub fn plan_pstn_agent(accounts: Option<VoiceAccounts>) -> PstnAgentDrive {
+    let Some(mut accounts) = accounts else {
+        return PstnAgentDrive::Unavailable {
+            reason: ABSENT_PSTN_PROVIDER.to_string(),
+        };
+    };
+    // A registrar-less P2P identity is mesh voice, not a PSTN provider.
+    if accounts.inbound.server_host.trim().is_empty() {
+        return PstnAgentDrive::Unavailable {
+            reason: ABSENT_PSTN_PROVIDER.to_string(),
+        };
+    }
+    let lifted_legacy = accounts.apply_legacy_lift();
+    let register_identity = accounts.register_identity().to_string();
+    PstnAgentDrive::Ready {
+        accounts,
+        lifted_legacy,
+        register_identity,
+    }
 }
 
 /// On-disk shape of `account.toml`.
@@ -1855,17 +1958,44 @@ pub fn run_agent(
 /// (from `accounts.outbound`) in the per-node reg-state (`state/voice/<node>`)
 /// so the callee/board see the shared number. `run_agent` is this with no
 /// outbound (caller-ID empty).
+///
+/// WL-FUNC-024 S4 — routes through [`drive_pstn_agent`] so a legacy flat
+/// account is lifted once, a split account never double-registers, and a
+/// registrar-less (non-PSTN) identity stays visibly unavailable.
 pub fn run_agent_accounts(
     accounts: &VoiceAccounts,
     events: &std::sync::mpsc::Sender<AgentEvent>,
     commands: &std::sync::mpsc::Receiver<AgentCommand>,
 ) {
-    let caller_id = accounts
-        .outbound
-        .as_ref()
-        .map(|o| o.caller_id.as_str())
-        .unwrap_or_default();
-    run_agent_inner(&accounts.inbound, caller_id, events, commands);
+    drive_pstn_agent(Some(accounts.clone()), events, commands);
+}
+
+/// WL-FUNC-024 S4 — drive the split/shared-outbound-aware agent so PSTN legs
+/// can terminate through the LiveKit SIP gateway.
+///
+/// [`plan_pstn_agent`] decides the path. An absent provider publishes
+/// [`RegistrationState::Failed`] (never a fake `Registered` PSTN) and
+/// returns; a ready plan REGISTERs the inbound sub only.
+pub fn drive_pstn_agent(
+    accounts: Option<VoiceAccounts>,
+    events: &std::sync::mpsc::Sender<AgentEvent>,
+    commands: &std::sync::mpsc::Receiver<AgentCommand>,
+) {
+    match plan_pstn_agent(accounts) {
+        PstnAgentDrive::Unavailable { reason } => {
+            let st = RegistrationState::Failed(reason);
+            publish_voice_status(&st, false);
+            let _ = events.send(AgentEvent::Registration(st));
+        }
+        PstnAgentDrive::Ready { accounts, .. } => {
+            let caller_id = accounts
+                .outbound
+                .as_ref()
+                .map(|o| o.caller_id.clone())
+                .unwrap_or_default();
+            run_agent_inner(&accounts.inbound, &caller_id, events, commands);
+        }
+    }
 }
 
 fn run_agent_inner(
@@ -2699,6 +2829,125 @@ mod tests {
         .unwrap();
         assert!(!accts.is_legacy_flat());
         assert!(accts.lift_if_legacy().is_none());
+    }
+
+    // ── WL-FUNC-024 S4: split/shared-outbound PSTN agent drive ──
+
+    #[test]
+    fn pstn_agent_drive_lifts_once_never_double_registers_and_stays_unavailable_without_provider() {
+        // Absent provider: visibly unavailable, never a fake connected PSTN.
+        let absent = plan_pstn_agent(None);
+        assert_eq!(
+            absent,
+            PstnAgentDrive::Unavailable {
+                reason: ABSENT_PSTN_PROVIDER.to_string()
+            }
+        );
+        assert!(!absent.pstn_leg_available());
+        assert!(
+            !matches!(
+                absent.visible_pstn_state(),
+                RegistrationState::Registered { .. }
+            ),
+            "absent provider must not look like a connected PSTN leg"
+        );
+
+        // Registrar-less P2P identity is mesh voice, not a PSTN provider.
+        let p2p = VoiceAccounts {
+            inbound: SipAccount {
+                username: "pine".into(),
+                password: String::new(),
+                server_host: String::new(),
+                server_port: 5060,
+                display_name: "pine".into(),
+                expires: 0,
+                security: SecurityPolicy::UdpOnly,
+            },
+            outbound: None,
+        };
+        let p2p_drive = plan_pstn_agent(Some(p2p));
+        assert!(!p2p_drive.pstn_leg_available());
+        assert!(matches!(
+            p2p_drive.visible_pstn_state(),
+            RegistrationState::Failed(_)
+        ));
+
+        // A legacy flat account lifts once; inbound remains the only REGISTER.
+        let flat = SipAccount::accounts_from_toml(
+            "username = \"15551234567\"\npassword = \"pw\"\nserver = \"sip.vitelity.net\"\n",
+        )
+        .unwrap();
+        let first = plan_pstn_agent(Some(flat));
+        let PstnAgentDrive::Ready {
+            accounts: lifted,
+            lifted_legacy,
+            register_identity,
+        } = first
+        else {
+            panic!("flat account must become a Ready PSTN drive");
+        };
+        assert!(lifted_legacy);
+        assert_eq!(register_identity, "15551234567");
+        assert_eq!(lifted.register_identity(), "15551234567");
+        assert_eq!(
+            lifted.outbound.as_ref().map(|o| o.caller_id.as_str()),
+            Some("15551234567")
+        );
+
+        // Second pass: already lifted → no second lift, still one REGISTER.
+        let second = plan_pstn_agent(Some(lifted));
+        let PstnAgentDrive::Ready {
+            lifted_legacy: lifted_again,
+            register_identity: again,
+            accounts: still,
+        } = second
+        else {
+            panic!("lifted account must stay Ready");
+        };
+        assert!(!lifted_again, "a flat account is lifted once, not twice");
+        assert_eq!(again, "15551234567");
+        assert_eq!(still.register_identity(), again);
+
+        // Already-split: no lift, inbound REGISTER only (never the trunk CID).
+        let split = SipAccount::accounts_from_toml(
+            "[inbound_sub]\nusername = \"eagle\"\nserver = \"sip.vitelity.net\"\n\n\
+             [shared_outbound]\ncaller_id = \"15551230000\"\ntrunk = \"out.vitelity.net\"\n",
+        )
+        .unwrap();
+        let split_drive = plan_pstn_agent(Some(split));
+        let PstnAgentDrive::Ready {
+            accounts: split_accts,
+            lifted_legacy: split_lifted,
+            register_identity: split_reg,
+        } = split_drive
+        else {
+            panic!("split account must be Ready");
+        };
+        assert!(!split_lifted);
+        assert_eq!(split_reg, "eagle");
+        assert_ne!(
+            split_reg,
+            split_accts
+                .outbound
+                .as_ref()
+                .map(|o| o.caller_id.as_str())
+                .unwrap_or_default(),
+            "shared-outbound caller-ID must never be a second REGISTER"
+        );
+        assert_eq!(split_accts.register_identity(), "eagle");
+
+        // Runtime drive: absent provider publishes Failed and returns — never
+        // a Registered event the health monitor could treat as connected PSTN.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        drive_pstn_agent(None, &tx, &cmd_rx);
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(AgentEvent::Registration(RegistrationState::Failed(reason))) => {
+                assert_eq!(reason, ABSENT_PSTN_PROVIDER);
+            }
+            other => panic!("absent provider must emit Failed, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra registration events");
     }
 
     #[test]
