@@ -1685,9 +1685,8 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     ),
     WorkerSpec::responder("voip_bus_responder", WorkerGroup::Actions),
     // WL-FUNC-033 / Q9 — voip_rtt is retired from the live Always-restart
-    // Observation roster after the fleet-negative. The worker implementation
-    // (spawn.rs / voip_rtt_worker.rs) stays until a later leftover-delete
-    // slice; fail closed here so the spec list does not advertise it.
+    // Observation roster after the fleet-negative. Spawn no longer constructs
+    // it; fail closed here so the spec list does not advertise it.
     WorkerSpec::responder("vpn_bus_responder", WorkerGroup::Actions),
 ];
 
@@ -3006,15 +3005,21 @@ mod tests {
             .union(&responder_registry)
             .copied()
             .collect();
-        // WL-FUNC-033 / Q9 leftover: spawn.rs still pushes voip_rtt. That
-        // start site is out of this slice's write scope. Fail closed — the
-        // leftover must not re-enter the spec list.
+        // WL-FUNC-033 / Q9: spawn.rs no longer constructs or census-pushes
+        // voip_rtt. A leftover spawn push is not a current start — fail
+        // closed if that name re-enters the spec list or the literal roster.
         const RETIRED_LEFTOVER_SPAWNS: &[&str] = &["voip_rtt"];
         assert!(
             RETIRED_LEFTOVER_SPAWNS
                 .iter()
                 .all(|name| !literal_registry.contains(name) && spec(name).is_none()),
             "WL-FUNC-033: retired leftover spawn must not re-enter the spec list"
+        );
+        assert!(
+            RETIRED_LEFTOVER_SPAWNS
+                .iter()
+                .all(|name| !pushed.contains(*name)),
+            "WL-FUNC-033: leftover voip_rtt spawn push is not a current start"
         );
         let mut tiered_pushed_literally: Vec<&str> = pushed
             .iter()
@@ -3033,7 +3038,7 @@ mod tests {
         let mut unaccounted: Vec<&str> = pushed
             .iter()
             .map(String::as_str)
-            .filter(|n| !literal_registry.contains(n) && !RETIRED_LEFTOVER_SPAWNS.contains(n))
+            .filter(|n| !literal_registry.contains(n))
             .collect();
         unaccounted.sort_unstable();
         assert!(
