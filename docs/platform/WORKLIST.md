@@ -719,11 +719,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `bind_receipt`/`verify_receipt` with `production_admitted: false`. Dest-install
   sidecar, dest-inspect sidecar, and dest-root fixture 12288 B
   `dd7cde7e116cb52f114fc1c886fec32618bdfcb8c82a16e3e45dae601c87046e` are
-  untouched. Not Dell/Seat 15/Surface admission. Leftover is
-  `production_admitted` (needs the real candidate-bound provider object /
-  freeze) and live-seat dest (WL-TEST-002). App VM S3 and Kiron S6 remain
-  admitted. Evidence:
-  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`.
+  untouched. Not Dell/Seat 15/Surface. S5 `all-roles` bootc receipt bound to
+  `479ec2b8c` (`.170` slot 0). Leftover is Maps `production_admitted` (needs the
+  real candidate-bound provider object / freeze), live-seat dest (WL-TEST-002),
+  and S7 private preflight. App VM S3 and Kiron S6 remain admitted. Evidence:
+  dest `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`; bootc `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -805,6 +805,11 @@ is a capacity incident (§10.0.3), not a silent retry.
        canonical role `all-roles`, and candidate source receipt.
      - Action: inspect exact manifest bytes and produce the canonical bootc
        digest receipt; integrate receipt consumption into release preflight.
+       Current-revision `all-roles` receipt is bound to `479ec2b8c` on `.170`
+       slot 0 (`WL-REL-006-2026-08-22-bootc-all-roles-r1.md`). Historical
+       `52fd0793`/`base` receipt is stale. Leftover is S7 private preflight
+       consuming this receipt and refusing legacy `base`; do not claim the
+       release-input gate closed.
      - Deliverable: immutable bootc receipt and preflight integration evidence.
      - Validation: architecture, role, digest, revision, epoch, and media type
        are all fail-closed; unavailable registry access refuses admission.
