@@ -1,0 +1,27 @@
+{
+  "kind": "mcnf-maps-authorized-sources",
+  "schema_version": 1,
+  "region_id": "buffalo-niagara",
+  "license": "ODbL-1.0",
+  "provider": "openstreetmap-derived",
+  "operator_authorization": "2026-08-22-survey",
+  "never_fetch": [
+    "https://tile.openstreetmap.org/",
+    "https://tiles.openstreetmap.org/",
+    "https://tile.osm.org/"
+  ],
+  "pbf": {
+    "upstream": "geofabrik",
+    "url": "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf",
+    "license": "ODbL-1.0",
+    "pin": "sha256-after-fetch"
+  },
+  "geometry": {
+    "upstream": "census-tiger",
+    "url": "https://www2.census.gov/geo/tiger/TIGER2024/COUNTY/tl_2024_us_county.zip",
+    "select_geoid": ["36029", "36063"],
+    "select_name": ["Erie County", "Niagara County"],
+    "statefp": "36"
+  },
+  "install_path": "/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles"
+}

@@ -7,7 +7,10 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 12 `Remaining`, 7 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 13 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
+  Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
+  surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
+  fetch authorized; preflight template then operator secrets; seats+Vitelity go.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -401,18 +404,17 @@ is a capacity incident (§10.0.3), not a silent retry.
   identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: the resumable authority and typed contracts cover locking, readiness, artifact/capsule admission, destructive confirmation, and terminal
-  evidence. Live leave, decommission, role provisioning, service-add,
-  first-desktop, spawn-lighthouse, mesh-dns/network/create, invite/join/found,
-  and coordinated-upgrade mutations now acquire that authority. Upgrade
-  execution requires a typed artifact selection or compatibility digest; plans
-  are canonical and no CLI can select or complete steps. Downstream package,
-  service, enrollment, fleet-offboarding, and full execution evidence remain.
-  Evidence: `evidence/WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
-  `evidence/WL-FUNC-023-2026-08-16-bearer-handoff-farm-r1.md`,
-  `evidence/WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`; focused authority
-  core passes; bootstrap now refuses the `{{JOIN_TOKEN}}` template when no
-  minted bearer is present, so token minting and live SSH remain open.
+- Current state: resumable authority and typed contracts cover locking,
+  readiness, admission, destructive confirmation, and terminal evidence. Live
+  leave, decommission, role provisioning, service-add, first-desktop,
+  spawn-lighthouse, mesh-dns/network/create, invite/join/found, and upgrade
+  mutations acquire that authority. Plans are canonical; CLI cannot complete
+  steps. Downstream package, fleet-offboard, and live execution remain.
+  Evidence: `WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
+  `WL-FUNC-023-2026-08-16-bearer-handoff-farm-r1.md`,
+  `WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`. Focused authority core
+  passes; bootstrap refuses `{{JOIN_TOKEN}}` without a minted bearer.
+  Operator 2026-08-22: final freeze waits on live SSH enroll/offboard.
 - Remaining work: GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
   deliverable, farm command, result, revision, and evidence; do not close a story
   from compilation alone.
@@ -629,12 +631,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `evidence/WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Re-run S1-S4
   using the two-phase candidate/reconfirmation decision below.
 - Remaining work:
-  1. S1 Select the immutable source. BLOCKED: release branch
-     `agent/drain-worklist-20260725` is 1,423 commits ahead of protected
-     `master`; PR #71 is still Draft, with no reported required checks. The
-     recorded 1dfe6906 candidate predates WL-FUNC-023. Integrate the release
-     work, then establish one clean pushed candidate revision and epoch for
-     WL-REL-006; final freeze waits for input admission against it.
+  1. S1 Select the immutable source. BLOCKED on live FUNC-023 enroll, not Draft:
+     operator 2026-08-22 marked PR #71 Ready and named this branch HEAD the
+     input-generation candidate. Final freeze still waits on a real-seat
+     enroll/offboard over SSH, then REL-006 admission and reconfirmation.
+     Recorded 1dfe6906 predates FUNC-023 and must not receive new inputs.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
@@ -718,13 +719,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   Fedora receipt and Kiron S6 has passed source-bound package admission.
   Evidence: `docs/platform/evidence/WL-REL-006-2026-08-16-app-vm-receipt-r1.md`,
   `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
-  The RPM lane still requires one mode-0400 private JSON input bound to the
-  clean checkout and Maps contract gates are green. Android/Cuttlefish and its
-  former guest-DEB/image inputs are deferred and have been removed from the
-  strict production schema; the hostile loader test rejects stale fields.
-  Input selection is complete; materialize the choices named
-  in S1-S6 without another survey or clarification cycle.
-  Downstream release epics remain blocked until current receipts pass; the preview cannot be reused.
+  RPM lane still needs a mode-0400 private JSON bound to the clean checkout.
+  Operator 2026-08-22: fetch Geofabrik New York PBF plus official Erie/Niagara
+  geometry and render locally (never public OSM tiles). Agents write a redacted
+  preflight template; the operator fills secrets and chmod 0400. Android stays
+  deferred. Materialize S1-S6; do not reopen source selection.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -1092,14 +1091,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   Seat 15, and Surface, prove the three-lighthouse topology, then verify the
   same bytes after WL-REL-005 publication. Eagle and T480 remain non-gating
   inspection/deployment-wave seats.
-- Current state: pre-release harnesses pass; candidate qualification waits for
-  the current-source signed six-role candidate and admitted production-input
-  receipts. The production inputs and topology have already been selected; do
-  not reopen those decisions. When the candidate exists, use exactly Dell,
-  Seat 15, Surface, and the three independently required lighthouses. Probe
-  access and all permanent qualification fixtures are unattended preflight
-  gates. A failure reopens its exact infrastructure/provider story; it cannot
-  waive a feature or request an interactive handoff.
+- Current state: pre-release harnesses pass; qualification waits for the signed
+  six-role candidate. Topology is Dell, Seat 15, Surface, three lighthouses.
+  Operator 2026-08-22: those seats may be mutated (red alert + 5s) when the
+  unpublished candidate exists; use sealed Vitelity/SIP creds. A failure
+  reopens its owning provider/infrastructure story; no feature waiver.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
@@ -1300,7 +1296,7 @@ story execution contract above.
   `crates/services/mde-files/src/fileops.rs`; the surface wires only
   `NameOperation::{NewFolder, Rename}` across
   `crates/desktop/mde-files-egui/src/dialogs.rs`, `model/mod.rs`, and
-  `view.rs`.
+  `view.rs`. Operator 2026-08-22 Q26: Files stays its own OS surface.
 - Remaining work:
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
@@ -1641,7 +1637,7 @@ story execution contract above.
 
 ### WL-FUNC-033 - Retire the legacy mesh-PBX stack and dead parity rows
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Large
 - Problem: the operator-confirmed-dead Kamailio/RTPengine mesh-PBX stack and
@@ -1651,16 +1647,12 @@ story execution contract above.
 - Required outcome: the retired stack and dead rows are deleted in one sweep;
   the tree builds and runs without them; the parity ledger's retire rows cite
   the deleting revision.
-- Current state: the live-spawned removal set per the ledger is
-  `crates/services/mde-voice-config/` (with snapshots),
-  `crates/mesh/mackesd/src/voice/` (mod and materialize),
-  `crates/mesh/mackesd/src/workers/voice_config.rs` (with
-  spawn/registration), `crates/mesh/mackesd/src/cli/voice.rs` plus
-  `VoiceCmd::RenderConfig`, and the kamailio-mde/rtpengine-mde units;
-  orphaned `crates/services/mde-voice-hud/src/{roster.rs,resolve.rs}`; the
-  never-wired voip_rtt worker, CLI, and `voip/link-rtt` topic; dead
-  Cosmic-era file-manager `View` arms with their outbox/downloads responders;
-  and unconstructed `SendToEntry` variants.
+- Current state: operator Q9 signoff landed 2026-08-22 (delete after fleet
+  negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units are
+  already gone from this tree. S1 live-negative is
+  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Remaining live code is
+  the never-wired voip_rtt worker/CLI/topic plus any leftover View/SendToEntry
+  orphans. Re-probe seats before the leftover delete.
 - Remaining work:
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
@@ -1692,12 +1684,12 @@ story execution contract above.
 - Scope: deletion only; no replacement security or policy surface.
 - Relevant files/components: the paths named in Current state plus packaging
   and systemd references.
-- Dependencies: operator final signoff on the Q9 retirement (parity-ledger
-  Decisions note, 2026-07-21).
+- Dependencies: Q9 signed 2026-08-22; re-confirm the 2026-08-20 fleet-negative
+  before deleting remaining voip_rtt spawn sites.
 - Acceptance criteria: the workspace builds and gates green without the
   deleted stack; no live reference remains; the ledger cites the revision.
-- Verification method: full workspace farm gate on BigBoy plus the
-  module-reference greps recorded in evidence.
+- Verification method: focused mackesd farm gate plus module-reference greps
+  recorded in evidence. @farm:{cargo test -p mackesd}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q9, Q10, Q13, Q29,
   and Q33 retire rulings.
 

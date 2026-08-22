@@ -21,10 +21,10 @@
 
 **All 56 consolidated open questions are CLOSED.** Rulings were produced by the completed 7-agent decision workflow (code-grounded, one verdict + rationale + cutover actions per question) and are recorded inline against each question in the **Consolidated open questions** section below as `→ RESOLVED — <token>`. Ruling distribution: **replace-in-communications 20, keep-as-is 16, build-new 9, retire 8, defer-followup 3**.
 
-Two items are flagged for **operator final signoff** before their cutover actions execute:
+Operator final signoff landed **2026-08-22** (survey on the drain branch):
 
-- **Q9 — RETIRE the Kamailio/RTPengine VV mesh-PBX stack** (operator-confirmed dead per the epic direction). This is a large, live-spawned removal: `mde-voice-config` crate + snapshots, `mackesd::voice` (best_path/pick_relay) + `voice/materialize`, the `voice_config` worker + its spawn/registration, the `voice render-config` CLI, and the `kamailio-mde` / `rtpengine-mde` systemd units. The pure-Rust softphone (mde-voice-hud) + WebRTC/LiveKit path in Communications Calls never touches it. Verify no live seat still runs the kamailio-mde/rtpengine-mde daemons for real SIP before deploy.
-- **Q26 — KEEP the POSIX file manager (`Surface::Files` / mde-files + mde-files-egui) as its own OS surface** — it is orthogonal to a communications suite, NOT a competing comms surface; do NOT dissolve it into the collab stack. The `build-new` work is to finally surface the design-lock-1 POSIX ops (rename/mkdir/new-file/duplicate/compress/extract, symlink/hardlink) over the already-complete `OpKind`/`archive.rs` engine on that surface. Flagged for operator confirmation of the keep-as-its-own-surface disposition.
+- **Q9 — RETIRE the Kamailio/RTPengine VV mesh-PBX stack — SIGNED.** Delete after a fleet-wide negative that no seat runs `kamailio-mde` / `rtpengine-mde` for real SIP. Execute under `WL-FUNC-033`.
+- **Q26 — KEEP the POSIX file manager (`Surface::Files` / mde-files + mde-files-egui) as its own OS surface — SIGNED.** Do not dissolve Files into Communications. POSIX ops stay on that surface under `WL-FUNC-025`.
 
 The remaining `defer-followup` rulings (Q15 SIP agent-path binding, Q21 per-document co-edit share-session UI, Q25 DRM platform clipboard provider) are genuinely downstream-gated and tracked as their own units; they do not block cutover parity.
 
