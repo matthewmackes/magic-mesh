@@ -709,16 +709,16 @@ is a capacity incident (§10.0.3), not a silent retry.
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
 - Current state: Operator-authorized Maps sources remain on BigBoy `172.20.0.130`
-  dest-root `/home/mm/mcnf-maps-sources`. Clip now reads the TIGER zip; member/.dbf
-  GEOID scan admits exactly Erie `36029` / Niagara `36063`. Local-render wrote
-  fixture PNG `buffalo-niagara.mbtiles` (12288 B) with `production_admitted: false`.
+  dest-root `/home/mm/mcnf-maps-sources`. Clip-detect admits Erie `36029` /
+  Niagara `36063`. Extract wrote bounded GeoJSON `erie-niagara.geojson` (exactly
+  those two GEOIDs; sidecar `mcnf-maps-tiger-clip`; `production_admitted: false`).
   PBF 495288424 B sha256 `8d7b60bff5d5fafc16d39f4a17f87c9f11014f56b1f4191c4ec64fb43684fd64`.
   TIGER zip 83913260 B sha256 `04e668d3502757c837c13444730547cd967f28a2c49aeffb873d1792ab2cb97b`.
-  Fixture PNG raster is not production admission. Leftover is production dest
-  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and a production
-  renderer. Evidence: `docs/platform/evidence/WL-REL-006-2026-08-22-maps-tiger-clip-r1.md`.
-  App VM S3 and Kiron S6 remain admitted; RPM still needs mode-0400 private JSON.
-  Android stays deferred. Do not reopen source selection.
+  Fixture PNG and extracted clip are not production admission. Leftover is
+  production dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
+  and a production renderer. Evidence:
+  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-tiger-extract-r1.md`.
+  App VM S3 and Kiron S6 remain admitted. Android stays deferred.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -739,10 +739,12 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Inputs: digest-pinned Geofabrik NY PBF and TIGER 2024 county zip now on
        BigBoy `/home/mm/mcnf-maps-sources` (2026-08-22 fetch evidence); approved
        offline-cache policy, candidate source receipt, and license terms.
-     - Action: TIGER zip clip now reads member/.dbf GEOID tokens and admits
-       exactly Erie 36029 / Niagara 36063 (does not invent 36xxx counties).
-       Remaining: render production `buffalo-niagara.mbtiles` (fixture PNG raster
-       is not production admission) and admit dest
+     - Action: TIGER zip clip-detect admits Erie 36029 / Niagara 36063.
+       Extract wrote official-county GeoJSON `erie-niagara.geojson` (exactly
+       those two GEOIDs; sidecar `mcnf-maps-tiger-clip`;
+       `production_admitted: false`). Remaining: render production
+       `buffalo-niagara.mbtiles` (fixture PNG raster is not production
+       admission) and admit dest
        `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`. Preserve
        PBF, boundary, clip, renderer/style/font identities, ODbL attribution,
        aggregate quota, and deterministic transport. Never fetch public OSM
