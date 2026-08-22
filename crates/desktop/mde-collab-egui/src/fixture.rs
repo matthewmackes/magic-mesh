@@ -12,8 +12,8 @@ use mde_collab_types::{
     ActivityEntry, ActivityFeed, ActorClock, ActorId, AlertInbox, CallKind, CallParticipantState,
     CallParticipantView, CallState, CallView, ChannelTasks, ClipboardLane, ConversationTimeline,
     DeliveryState, DiscordBridgeBoard, DocumentId, DocumentSessions, EventId, FileReferences,
-    MessagePins, MessageView, SavedMessages, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
-    SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
+    MediaSessionV1, MessagePins, MessageView, SavedMessages, SpaceDirectory, SpaceId, SpaceKind,
+    SpaceRole, SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -32,6 +32,7 @@ pub struct FixtureData {
     thread_roots: HashMap<EventId, ThreadId>,
     channel_tasks: HashMap<SpaceId, ChannelTasks>,
     call_state: CallState,
+    media_sessions: Vec<MediaSessionV1>,
     file_references: HashMap<SpaceId, FileReferences>,
     transfer_jobs: TransferJobs,
     alert_inbox: AlertInbox,
@@ -62,6 +63,7 @@ impl FixtureData {
             thread_roots: HashMap::new(),
             channel_tasks: HashMap::new(),
             call_state: CallState::default(),
+            media_sessions: Vec::new(),
             file_references: HashMap::new(),
             transfer_jobs: TransferJobs::default(),
             alert_inbox: AlertInbox::default(),
@@ -128,6 +130,14 @@ impl FixtureData {
     #[must_use]
     pub fn with_call(mut self, call: CallView) -> Self {
         self.call_state.active.push(call);
+        self
+    }
+
+    /// Retain published [`MediaSessionV1`] documents as-is. The fixture never
+    /// synthesizes a Connected session from [`CallState`].
+    #[must_use]
+    pub fn with_media_sessions(mut self, sessions: Vec<MediaSessionV1>) -> Self {
+        self.media_sessions = sessions;
         self
     }
 
@@ -410,6 +420,10 @@ impl CollabData for FixtureData {
         &self.call_state
     }
 
+    fn media_sessions(&self) -> &[MediaSessionV1] {
+        &self.media_sessions
+    }
+
     fn file_references(&self, space: SpaceId) -> Option<&FileReferences> {
         self.file_references.get(&space)
     }
@@ -501,5 +515,61 @@ pub fn activity(
         created_unix_ms,
         kind_tag: kind_tag.to_owned(),
         summary: summary.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mde_collab_types::{
+        CallId, CallMediaAdapter, MediaSessionStateV1, MediaSessionV1, MediaTrackKind,
+    };
+
+    fn device_absent_session() -> MediaSessionV1 {
+        MediaSessionV1::new(
+            CallId::new(),
+            SpaceId::new(),
+            ActorId::new("eagle"),
+            ActorId::new("falcon"),
+            CallMediaAdapter::WebRtcP2p,
+            MediaSessionStateV1::DeviceAbsent {
+                track: MediaTrackKind::Audio,
+            },
+            vec![MediaTrackKind::Audio],
+            false,
+            false,
+            false,
+            0,
+            None,
+            None,
+        )
+        .expect("valid device-absent session")
+    }
+
+    #[test]
+    fn media_sessions_returns_retained_documents_without_inventing_connected() {
+        let demo = FixtureData::demo();
+        assert!(
+            !demo.call_state().active.is_empty(),
+            "demo fixture carries a signaling call so a fake Connected session would have a target"
+        );
+        assert!(
+            demo.media_sessions().is_empty(),
+            "signaling CallState must not become a MediaSessionV1"
+        );
+        assert!(
+            demo.media_sessions()
+                .iter()
+                .all(|session| !session.state.claims_live_media()),
+            "default fixture must not invent a connected media session"
+        );
+
+        let session = device_absent_session();
+        let data = demo.with_media_sessions(vec![session.clone()]);
+        assert_eq!(data.media_sessions(), std::slice::from_ref(&session));
+        assert!(
+            !data.media_sessions()[0].state.claims_live_media(),
+            "a published DeviceAbsent document stays DeviceAbsent"
+        );
     }
 }

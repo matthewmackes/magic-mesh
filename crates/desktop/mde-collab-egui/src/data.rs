@@ -13,7 +13,8 @@
 use mde_collab_types::{
     ActivityFeed, ActorId, AlertInbox, CallState, ChannelTasks, ClipboardLane, CollabCommand,
     ConversationTimeline, DiscordBridgeBoard, DocumentId, DocumentSessions, EventId,
-    FileReferences, MessageView, SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs,
+    FileReferences, MediaSessionV1, MessageView, SpaceDirectory, SpaceId, ThreadId, ThreadTimeline,
+    TransferJobs,
 };
 
 /// The message **edit/delete window** in milliseconds: an author may amend
@@ -98,6 +99,17 @@ pub trait CollabData {
     /// an empty (no active call) state, so a source that has not wired calls yet
     /// still renders the honest "no active call" bar.
     fn call_state(&self) -> &CallState;
+
+    /// Retained [`MediaSessionV1`] documents published on
+    /// `state/calls/media/<session>`.
+    ///
+    /// A mount reads these and binds them for the next paint. Defaults to empty
+    /// so a source that has only signaling [`CallState`] never invents a
+    /// Connected media session from the call roster.
+    #[must_use]
+    fn media_sessions(&self) -> &[MediaSessionV1] {
+        &[]
+    }
 
     /// A space's linked-file references (the
     /// [`FileReferences`](mde_collab_types::FileReferences) projection the Files
