@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -221,7 +223,43 @@ def resolve_destination(dest_root: Path, relative: str) -> tuple[PurePosixPath, 
     return rel, fetch.resolve_beneath(dest_root, rel, "destination")
 
 
+def _member_has_locked_geoids(data: bytes) -> bool:
+    # Official TIGER .dbf rows pack STATEFP/COUNTYFP/COUNTYNS/GEOID as adjacent
+    # ASCII digits (`360290097411336029050000`). Word-boundary scans miss them.
+    return all(geoid.encode("ascii") in data for geoid in LOCKED_GEOIDS)
+
+
+def extract_clip_geoids_from_zip(geometry_bytes: bytes) -> list[str] | None:
+    """Return locked Erie/Niagara GEOIDs from a TIGER zip, or None if not a zip.
+
+    Official Census county archives keep GEOID strings inside members
+    (typically `.dbf`). If both locked GEOIDs are present, return exactly
+    Erie/Niagara — never every 36xxx county in the national file.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(geometry_bytes))
+    except (zipfile.BadZipFile, zipfile.LargeZipFile):
+        return None
+    with archive:
+        members = archive.infolist()
+        dbf_first = [info for info in members if info.filename.lower().endswith(".dbf")]
+        others = [info for info in members if info not in dbf_first]
+        for info in dbf_first + others:
+            if info.is_dir():
+                continue
+            try:
+                data = archive.read(info.filename)
+            except (RuntimeError, zipfile.BadZipFile, OSError):
+                continue
+            if _member_has_locked_geoids(data):
+                return list(LOCKED_GEOIDS)
+    raise Refusal("geometry clip is not Erie 36029 / Niagara 36063")
+
+
 def extract_clip_geoids(geometry_bytes: bytes) -> list[str]:
+    zip_geoids = extract_clip_geoids_from_zip(geometry_bytes)
+    if zip_geoids is not None:
+        return zip_geoids
     try:
         value = json.loads(geometry_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError):

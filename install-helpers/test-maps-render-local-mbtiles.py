@@ -9,6 +9,7 @@ production_admitted. Clip is Erie 36029 / Niagara 36063 only.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -69,6 +71,22 @@ def write_lock(path: Path, document: dict) -> Path:
 
 def base_lock() -> dict:
     return json.loads(LOCK.read_text())
+
+
+def make_tiger_zip(*geoids: str, member: str = "tl_2024_us_county.dbf", packed: bool = False) -> bytes:
+    """In-memory TIGER-shaped zip. Never fetches. GEOIDs live in a fake .dbf."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if packed:
+            # Packed TIGER layout: GEOID sits inside adjacent digit fields.
+            body = b"DBF-PACKED\n" + b"".join(
+                f"{geoid}00974113{geoid}050000\n".encode("ascii") for geoid in geoids
+            )
+        else:
+            body = b"DBF-FIXTURE\n" + b"".join(f"{geoid} \n".encode("ascii") for geoid in geoids)
+        archive.writestr(member, body)
+        archive.writestr("tl_2024_us_county.shp", b"SHP-FIXTURE\n")
+    return buffer.getvalue()
 
 
 def write_sources(root: Path, pbf: bytes = FIXTURE_PBF, geometry: bytes = FIXTURE_GEOMETRY) -> Path:
@@ -164,6 +182,46 @@ def main() -> None:
             )
             assert json_record["clip_geoids"] == ["36029", "36063"]
             assert json_record["production_admitted"] is False
+
+            tiger_zip = make_tiger_zip("36029", "36063", "36001")
+            assert render.extract_clip_geoids(tiger_zip) == ["36029", "36063"]
+            assert render.admit_clip_geoids(tiger_zip) == ["36029", "36063"]
+            packed_zip = make_tiger_zip("36029", "36063", "36001", packed=True)
+            with zipfile.ZipFile(io.BytesIO(packed_zip)) as archive:
+                packed_dbf = archive.read("tl_2024_us_county.dbf")
+            assert render.GEOID_TOKEN.findall(packed_dbf.decode("latin-1")) == []
+            assert render.extract_clip_geoids(packed_zip) == ["36029", "36063"]
+            assert render.admit_clip_geoids(packed_zip) == ["36029", "36063"]
+            zip_src = write_sources(root / "tiger-zip-src", geometry=packed_zip)
+            zip_dest = root / "tiger-zip-dest"
+            zip_dest.mkdir()
+            zip_record = render_ok(
+                source_root=zip_src,
+                dest_root=zip_dest,
+                sidecar="tiger-zip-render.json",
+            )
+            assert zip_record["clip_geoids"] == ["36029", "36063"]
+            assert zip_record["production_admitted"] is False
+            assert zip_record["kind"] == "mcnf-maps-local-render"
+
+            missing_niagara_zip = make_tiger_zip("36029", "36001", packed=True)
+            expect_refusal(
+                "zip-missing-niagara",
+                lambda: render.admit_clip_geoids(missing_niagara_zip),
+                "clip",
+            )
+            expect_refusal(
+                "zip-missing-niagara-render",
+                lambda: render_ok(
+                    source_root=write_sources(
+                        root / "zip-miss-src",
+                        geometry=missing_niagara_zip,
+                    ),
+                    dest_root=(root / "zip-miss-dest").mkdir() or (root / "zip-miss-dest"),
+                    sidecar="zip-miss.json",
+                ),
+                "clip",
+            )
 
             injected = {"called": False}
 

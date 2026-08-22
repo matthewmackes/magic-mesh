@@ -715,15 +715,15 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: Operator-authorized Maps sources fetched 2026-08-22 onto
-  BigBoy `172.20.0.130` dest-root `/home/mm/mcnf-maps-sources` (real directory,
-  no-replace mode-0400, `production_admitted: false`, no public OSM tile CDN).
+- Current state: Operator-authorized Maps sources remain on BigBoy `172.20.0.130`
+  dest-root `/home/mm/mcnf-maps-sources`. Clip now reads the TIGER zip; member/.dbf
+  GEOID scan admits exactly Erie `36029` / Niagara `36063`. Local-render wrote
+  fixture PNG `buffalo-niagara.mbtiles` (12288 B) with `production_admitted: false`.
   PBF 495288424 B sha256 `8d7b60bff5d5fafc16d39f4a17f87c9f11014f56b1f4191c4ec64fb43684fd64`.
   TIGER zip 83913260 B sha256 `04e668d3502757c837c13444730547cd967f28a2c49aeffb873d1792ab2cb97b`.
-  Local render refused honestly: TIGER zip clip is not Erie 36029 / Niagara 36063.
-  Leftover is production `buffalo-niagara.mbtiles` admission and operator dest
-  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`. Evidence:
-  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-authorized-fetch-r1.md`.
+  Fixture PNG raster is not production admission. Leftover is production dest
+  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and a production
+  renderer. Evidence: `docs/platform/evidence/WL-REL-006-2026-08-22-maps-tiger-clip-r1.md`.
   App VM S3 and Kiron S6 remain admitted; RPM still needs mode-0400 private JSON.
   Android stays deferred. Do not reopen source selection.
 - Remaining work:
@@ -746,12 +746,14 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Inputs: digest-pinned Geofabrik NY PBF and TIGER 2024 county zip now on
        BigBoy `/home/mm/mcnf-maps-sources` (2026-08-22 fetch evidence); approved
        offline-cache policy, candidate source receipt, and license terms.
-     - Action: clip official Erie 36029 / Niagara 36063 from the fetched TIGER
-       zip, render locally into raster PNG `buffalo-niagara.mbtiles`, and admit
-       the production dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`.
-       Preserve PBF, boundary, clip, renderer/style/font identities, ODbL
-       attribution, aggregate quota, and deterministic transport. Never fetch
-       public OSM tiles; defer installed runtime proof to WL-TEST-002.
+     - Action: TIGER zip clip now reads member/.dbf GEOID tokens and admits
+       exactly Erie 36029 / Niagara 36063 (does not invent 36xxx counties).
+       Remaining: render production `buffalo-niagara.mbtiles` (fixture PNG raster
+       is not production admission) and admit dest
+       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`. Preserve
+       PBF, boundary, clip, renderer/style/font identities, ODbL attribution,
+       aggregate quota, and deterministic transport. Never fetch public OSM
+       tiles; defer installed runtime proof to WL-TEST-002.
      - Deliverable: immutable `buffalo-niagara.mbtiles`, source/build manifest,
        hashes, attribution, license, approval receipt, and package install path.
      - Validation: verify MBTiles schema, PNG payloads, TMS coordinates,
