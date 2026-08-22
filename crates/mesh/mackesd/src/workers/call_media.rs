@@ -1911,19 +1911,21 @@ impl SipGatewayPlane {
         e164: &str,
         gateway_available: bool,
     ) -> Result<SipLegV1, CallMediaProviderError> {
-        // Bridged is intrinsically invalid without a gateway, and this plane
-        // has no LiveKit SIP dialog to prove a bridge. Always unbridged.
-        SipLegV1::new(
-            session,
-            local_actor,
-            direction,
-            e164.trim(),
-            gateway_available,
-            false,
+        // Bridged is reserved for a proven LiveKit SIP dialog in this file.
+        // This plane has none, so the minted document is always unbridged.
+        honest_sip_leg(
+            &SipLegV1::new(
+                session,
+                local_actor,
+                direction,
+                e164.trim(),
+                gateway_available,
+                false,
+            )
+            .map_err(|error| CallMediaProviderError::ExecutionRefused {
+                detail: error.to_string(),
+            })?,
         )
-        .map_err(|error| CallMediaProviderError::ExecutionRefused {
-            detail: error.to_string(),
-        })
     }
 
     fn tick_locked(
@@ -1967,17 +1969,15 @@ impl SipGatewayPlane {
                 gateway_available,
             ) {
                 Ok(document) => {
+                    let Ok(document) = honest_sip_leg(&document) else {
+                        continue;
+                    };
                     if document.bridged || document.gateway_available != gateway_available {
-                        #[cfg(test)]
-                        panic!("refusing to publish a fake Connected PSTN sip leg");
-                        #[cfg(not(test))]
-                        {
-                            tracing::debug!(
-                                target: "mackesd::call_media",
-                                "refusing to publish a fake Connected PSTN sip leg"
-                            );
-                            continue;
-                        }
+                        tracing::debug!(
+                            target: "mackesd::call_media",
+                            "refusing to publish a fake Connected PSTN sip leg"
+                        );
+                        continue;
                     }
                     let _ = publish_sip_leg(persist, last_published, &document);
                 }
@@ -2019,6 +2019,7 @@ impl SipGatewayPlane {
             e164,
             self.gateway_available(),
         )?;
+        let document = honest_sip_leg(&document)?;
         if document.bridged || document.direction != SipLegDirectionV1::Inbound {
             return Err(CallMediaProviderError::ExecutionRefused {
                 detail: "refusing to retain a fake Connected inbound PSTN sip leg".to_string(),
@@ -2273,6 +2274,31 @@ fn publish_json<T: serde::Serialize>(
     Ok(())
 }
 
+/// `bridged=true` is reserved for a live LiveKit SIP dialog owned by this
+/// file. There is no such dialog yet, so a bridge is never proven.
+fn livekit_sip_bridge_proven(_session: CallId) -> bool {
+    false
+}
+
+/// Rewrite a hostile or speculative `bridged=true` row into an honest
+/// unbridged document unless a live LiveKit bridge is proven here.
+fn honest_sip_leg(document: &SipLegV1) -> Result<SipLegV1, CallMediaProviderError> {
+    if !document.bridged || livekit_sip_bridge_proven(document.session) {
+        return Ok(document.clone());
+    }
+    SipLegV1::new(
+        document.session,
+        document.local_actor.clone(),
+        document.direction,
+        document.e164.clone(),
+        document.gateway_available,
+        false,
+    )
+    .map_err(|error| CallMediaProviderError::ExecutionRefused {
+        detail: error.to_string(),
+    })
+}
+
 fn publish_sip_leg(
     persist: &Persist,
     last_published: &mut BTreeMap<String, String>,
@@ -2288,8 +2314,15 @@ fn publish_sip_leg(
             detail: "refusing to publish a bridged SIP leg without a gateway".to_string(),
         });
     }
+    let document = honest_sip_leg(document)?;
+    if document.bridged && !livekit_sip_bridge_proven(document.session) {
+        return Err(CallMediaProviderError::ExecutionRefused {
+            detail: "refusing to publish a bridged SIP leg without a live LiveKit session"
+                .to_string(),
+        });
+    }
     let topic = media_sip_leg_topic(document.session);
-    let body = serde_json::to_string(document).map_err(|error| {
+    let body = serde_json::to_string(&document).map_err(|error| {
         CallMediaProviderError::ExecutionRefused {
             detail: error.to_string(),
         }
@@ -3201,6 +3234,53 @@ mod tests {
                     if detail.contains("not proven")
             ),
             "governed inbound without frames must not prove Connected PSTN"
+        );
+    }
+
+    #[test]
+    fn sip_publish_forces_unbridged_without_proven_livekit_bridge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let call = CallId::new();
+        let reserved = SipLegV1::new(
+            call,
+            ActorId::new("alice"),
+            SipLegDirectionV1::Outbound,
+            "+15551234567",
+            true,
+            true,
+        )
+        .expect("wire contract admits bridged+gateway; LiveKit proof is this file's job");
+        assert!(reserved.bridged);
+        assert!(reserved.gateway_available);
+        assert!(!livekit_sip_bridge_proven(call));
+
+        let mut published = BTreeMap::new();
+        publish_sip_leg(&persist, &mut published, &reserved)
+            .expect("unproven bridge must still publish honest unbridged /sip");
+
+        let persisted = read_sip_leg(&persist, call).expect("honest /sip row is retained");
+        assert_eq!(persisted.session, call);
+        assert_eq!(persisted.e164, "+15551234567");
+        assert!(
+            persisted.gateway_available,
+            "governed gateway availability stays honest"
+        );
+        assert!(
+            !persisted.bridged,
+            "bridged=true is reserved for a proven LiveKit SIP dialog"
+        );
+        let topic = media_sip_leg_topic(call);
+        let cached = published.get(&topic).expect("publish cache retains /sip");
+        let cached_leg = SipLegV1::from_json(cached).expect("cached /sip admits");
+        assert!(
+            !cached_leg.bridged,
+            "publish cache must not retain bridged=true"
+        );
+        assert_ne!(
+            cached,
+            &serde_json::to_string(&reserved).expect("reserved body"),
+            "bridged wire body must not be retained as the published /sip row"
         );
     }
 }
