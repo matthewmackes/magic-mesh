@@ -413,11 +413,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   Evidence: `WL-FUNC-023-2026-08-16-lifecycle-authority-farm-r2.md`,
   `WL-FUNC-023-2026-08-16-bearer-handoff-farm-r1.md`,
   `WL-FUNC-023-2026-08-16-remote-push-farm-r1.md`. Focused authority core
-  passes; bootstrap refuses `{{JOIN_TOKEN}}` without a minted bearer.
-  Operator 2026-08-22: final freeze waits on live SSH enroll/offboard.
-- Remaining work: GPT Luna execution contract: execute S1-S18 in order; read each story first; change only owned components; record the
-  deliverable, farm command, result, revision, and evidence; do not close a story
-  from compilation alone.
+  passes; `join_argv` now refuses `{{JOIN_TOKEN}}` without a minted bearer.
+  Operator 2026-08-22: leftover freeze bar is live SSH enroll/offboard.
+- Remaining work: `join_argv` refuse of `{{JOIN_TOKEN}}` landed; leftover freeze
+  bar is live SSH enroll/offboard. GPT Luna: execute S1-S18 in order; read each
+  story first; change only owned components; record the deliverable, farm command,
+  result, revision, and evidence; do not close a story from compilation alone.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -1194,13 +1195,14 @@ story execution contract above.
   by typed mackesd verbs and never by the renderer.
 - Current state: inbound SIP retain+hangup ticks the publish plane
   (`collab_media.rs`, `call_media.rs`); HUD `calls.rs` names every
-  `MediaFailureReasonV1`. Bridged remints stay unbridged without proven
-  LiveKit. Live audio/video, elected SFU, and PSTN legs remain. Softphone
-  `VoiceAccounts` / `run_agent_accounts` / `lift_if_legacy` stay unused
-  by the surface.
-- Remaining work: leftover is live media/SFU/PSTN (S2-S4) plus remaining
-  S5/S6 live-plane bind; change only owned components; record
-  deliverable, farm command, result, revision, and evidence per story.
+  `MediaFailureReasonV1`. Calls consumes the Q15 `VoiceAccounts` snapshot
+  (no second registrar); the surface no longer leaves VoiceAccounts unused.
+  Bridged remints stay unbridged without proven LiveKit. Leftover: live
+  audio/video, elected SFU, and PSTN legs.
+- Remaining work: VoiceAccounts consume landed; leftover is live
+  media/SFU/PSTN (S2-S4) plus remaining S5/S6 live-plane bind; change only
+  owned components; record deliverable, farm command, result, revision,
+  and evidence per story.
   1. S1 Add the typed media contracts.
      - Inputs: mde-collab-types versioning conventions and the calls.rs command
        set.
@@ -1435,10 +1437,10 @@ story execution contract above.
 - Current state: CLI `mackesd transfer sync-pair add|remove|list` and the
   Transfers GUI editor publish Save/Remove; inbox drain applies them.
   `last_result` is stamped at enqueue and again after the rsync lane
-  outcome. Leftover: `sync_pair_jobs` is in-memory, so a
-  restart-while-in-flight cannot restamp the pair from the surviving job.
-- Remaining work: CLI + GUI producer landed; leftover is persist/rebuild
-  the in-flight pair→job map across restart.
+  outcome. Engine open rebuilds the in-flight job→pair map from
+  enqueue-ok pairs; the leftover "in-memory only" restamp gap is closed.
+- Remaining work: CLI + GUI producer and in-flight job→pair rebuild
+  landed; leftover "in-memory only" restamp gap is closed.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
@@ -1486,10 +1488,11 @@ story execution contract above.
 - Current state: the `voice_provision` worker owns
   `action/voice/{provision,did-route,failover,shared-config}` and the
   `state/voice/*` topics
-  (`crates/mesh/mackesd/src/workers/voice_provision.rs`); Communications
-  Activity (`crates/desktop/mde-collab-egui/src/activity.rs`) has no voice
-  admin section.
-- Remaining work:
+  (`crates/mesh/mackesd/src/workers/voice_provision.rs`). Activity already
+  has the Fleet voice-admin panel and `hydrate_voice` of `state/voice/*`.
+  Leftover: live Vitelity (not a missing Activity section).
+- Remaining work: Fleet voice-admin + `hydrate_voice` landed; leftover is
+  live Vitelity, not a missing panel.
   1. S1 Panel over the existing verbs.
      - Inputs: the voice_provision verb bodies (provision, DID route,
        failover, shared config) and the Activity mode layout.
@@ -1530,9 +1533,11 @@ story execution contract above.
   responder and gateway.toml contract stay unchanged; the existing workgroup
   gateway.toml migrates in place.
 - Current state: the responder in `crates/mesh/mackesd/src/ipc/voip.rs`
-  serves set/get/clear with password redaction on get; no GUI publisher
-  exists.
-- Remaining work:
+  serves set/get/clear with password redaction on get. Activity already
+  has the gateway form and in-place `gateway.toml` hydrate. Leftover:
+  live Bus + migrated workgroup toml (not a missing GUI publisher).
+- Remaining work: gateway form / in-place hydrate landed; leftover is
+  live Bus + migrated workgroup toml, not a missing GUI publisher.
   1. S1 Gateway section in Activity.
      - Inputs: the three verb bodies and redaction contract in ipc/voip.rs.
      - Action: a bounded gateway form (host, port, credentials) publishing
@@ -1568,12 +1573,13 @@ story execution contract above.
   document to a space, participants join with view/edit permission and
   follow-mode, and the session lifecycle is visible and closable by its
   owner.
-- Current state: `crates/desktop/mde-collab-egui/src/documents.rs` marks the
-  seams with `WL-FUNC-011 Phase 3c` notes at the project-editor join,
-  snapshot load, and snapshot emit paths; the CRDT/collab_session/follow
-  library is carried by the embedded `mde-editor-egui` surface; fixture.rs
-  already projects live sessions.
-- Remaining work:
+- Current state: the CRDT/collab_session/follow library is carried by the
+  embedded `mde-editor-egui` surface; fixture.rs already projects live
+  sessions. Phase-3c markers are gone; external-write merge against the
+  live editor rope landed. Leftover: live two-seat co-edit evidence if
+  any (not missing markers or merge).
+- Remaining work: Phase-3c markers gone and rope merge landed; leftover
+  is live two-seat co-edit evidence if any.
   1. S1 Share-session lifecycle UI.
      - Inputs: the documents.rs marked seams, the collab_session library, and
        space membership from the collab store.
@@ -1658,11 +1664,12 @@ story execution contract above.
   negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units
   are already gone from this tree. S1 live-negative is
   `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Roster, spawn,
-  CLI, and workers-mod no longer advertise or spawn `voip_rtt`. Leftover:
-  `voip_rtt_worker.rs`, `cli/voip_rtt.rs`, and `own_nebula_ip` callers.
-  Re-probe seats before the leftover delete.
-- Remaining work: leftover delete is `voip_rtt` file + CLI module +
-  `own_nebula_ip` (roster/spawn already retired); then:
+  CLI, and workers-mod no longer advertise or spawn `voip_rtt`.
+  `voip_rtt_worker.rs` is deleted; `leftover_retirements` asserts it stays
+  gone. Leftover: `cli/voip_rtt.rs` plus `own_nebula_ip` (live helper).
+- Remaining work: leftover is `cli/voip_rtt.rs`; `own_nebula_ip` is a live
+  helper (do not delete); roster/spawn/`voip_rtt_worker.rs` already retired;
+  then:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
