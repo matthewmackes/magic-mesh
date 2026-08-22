@@ -1575,13 +1575,13 @@ story execution contract above.
   document to a space, participants join with view/edit permission and
   follow-mode, and the session lifecycle is visible and closable by its
   owner.
-- Current state: documents.rs now exposes live_document_share_session();
-  follow/unfollow/close apply on the attached session. Leftover: shell
-  show() still passes None until the sibling pub+wire lands; live
-  two-seat evidence remains.
-- Remaining work: shell drains DocumentShareCommand locally; leftover
-  is live two-seat evidence (and session still private in documents.rs
-  until the sibling lands).
+- Current state: documents.rs exposes live_document_share_session();
+  follow/unfollow/close apply on the attached session. show() now
+  passes that live session into the drain (sibling pub+wire landed).
+  Leftover: live two-seat co-edit evidence only, not a missing mount
+  wire.
+- Remaining work: show() mounts live_document_share_session(); leftover
+  is live two-seat co-edit evidence only, not a missing mount wire.
   1. S1 Share-session lifecycle UI.
      - Inputs: the documents.rs marked seams, the collab_session library, and
        space membership from the collab store.
