@@ -709,16 +709,17 @@ is a capacity incident (§10.0.3), not a silent retry.
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
 - Current state: Operator-authorized Maps sources remain on BigBoy `172.20.0.130`
-  dest-root `/home/mm/mcnf-maps-sources`. Clip-detect admits Erie `36029` /
-  Niagara `36063`. Extract wrote bounded GeoJSON `erie-niagara.geojson` (exactly
-  those two GEOIDs; sidecar `mcnf-maps-tiger-clip`; `production_admitted: false`).
-  PBF 495288424 B sha256 `8d7b60bff5d5fafc16d39f4a17f87c9f11014f56b1f4191c4ec64fb43684fd64`.
-  TIGER zip 83913260 B sha256 `04e668d3502757c837c13444730547cd967f28a2c49aeffb873d1792ab2cb97b`.
-  Fixture PNG and extracted clip are not production admission. Leftover is
-  production dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
-  and a production renderer. Evidence:
-  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-tiger-extract-r1.md`.
-  App VM S3 and Kiron S6 remain admitted. Android stays deferred.
+  dest-root `/home/mm/mcnf-maps-sources`. Official Erie `36029` / Niagara `36063`
+  GeoJSON is present. Osmium wrote `erie-niagara.osm.pbf` 34073493 B sha256
+  `c5fd765d68e0051b7a4fb4ae896653bf0a427495497ff13294cb37d4716d481c` (sidecar
+  `mcnf-maps-pbf-clip`; `production_admitted: false`). Official bbox west
+  `-79.312136` escapes verify envelope west `-79.30`; clip used official county
+  bbox unshrunk. NY PBF 495288424 B sha256
+  `8d7b60bff5d5fafc16d39f4a17f87c9f11014f56b1f4191c4ec64fb43684fd64`. Fixture PNG
+  and clipped PBF are not production admission. Leftover is production dest
+  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and a production
+  raster renderer. App VM S3 and Kiron S6 remain admitted. Android stays deferred.
+  Evidence: `docs/platform/evidence/WL-REL-006-2026-08-22-maps-pbf-clip-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -742,13 +743,16 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Action: TIGER zip clip-detect admits Erie 36029 / Niagara 36063.
        Extract wrote official-county GeoJSON `erie-niagara.geojson` (exactly
        those two GEOIDs; sidecar `mcnf-maps-tiger-clip`;
-       `production_admitted: false`). Remaining: render production
-       `buffalo-niagara.mbtiles` (fixture PNG raster is not production
-       admission) and admit dest
-       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`. Preserve
-       PBF, boundary, clip, renderer/style/font identities, ODbL attribution,
-       aggregate quota, and deterministic transport. Never fetch public OSM
-       tiles; defer installed runtime proof to WL-TEST-002.
+       `production_admitted: false`). Osmium clipped NY PBF to
+       `erie-niagara.osm.pbf` (sidecar `mcnf-maps-pbf-clip`;
+       `production_admitted: false`; official bbox, not envelope-shrunk).
+       Remaining: a production raster renderer and dest
+       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`.
+       Clipped PBF is not MBTiles admission. Fixture PNG raster is not
+       production admission. Preserve PBF, boundary, clip,
+       renderer/style/font identities, ODbL attribution, aggregate quota,
+       and deterministic transport. Never fetch public OSM tiles; defer
+       installed runtime proof to WL-TEST-002.
      - Deliverable: immutable `buffalo-niagara.mbtiles`, source/build manifest,
        hashes, attribution, license, approval receipt, and package install path.
      - Validation: verify MBTiles schema, PNG payloads, TMS coordinates,
