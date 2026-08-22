@@ -105,7 +105,9 @@ pub trait FileOps {
     fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     /// Create a symbolic link `link` pointing at `target`.
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;
-    /// Create a hard link `link` to the existing file `target`.
+    /// Create a hard link `link` to the existing **regular file** `target`.
+    /// Directories, symlinks, and other non-regular inodes are refused with
+    /// [`io::ErrorKind::InvalidInput`] before `hard_link(2)`.
     fn hard_link(&self, target: &Path, link: &Path) -> io::Result<()>;
     /// `chmod` — set the permission bits (`mode & 0o7777`).
     fn set_permissions(&self, path: &Path, mode: u32) -> io::Result<()>;
@@ -199,6 +201,27 @@ pub fn is_cross_device_error(err: &io::Error) -> bool {
         return true;
     }
     err.raw_os_error() == Some(18)
+}
+
+/// Refuse a hard-link source that is not a regular file, before `hard_link(2)`.
+/// Linux returns `EPERM` for directories; sockets, FIFOs, devices, and
+/// symbolic links fail the same way. Surface an honest typed error instead
+/// of leaking the kernel errno.
+fn refuse_non_regular_hard_link_target(stat: &FileStat) -> io::Result<()> {
+    if stat.is_file && !stat.is_symlink {
+        return Ok(());
+    }
+    let kind = if stat.is_dir {
+        "directory"
+    } else if stat.is_symlink {
+        "symbolic link"
+    } else {
+        "non-regular file"
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("hard link to a {kind}"),
+    ))
 }
 
 /// Pick the first "`<stem> copy<n>.<ext>`" sibling of `path` for which
@@ -329,6 +352,7 @@ impl FileOps for LiveFileOps {
     }
 
     fn hard_link(&self, target: &Path, link: &Path) -> io::Result<()> {
+        refuse_non_regular_hard_link_target(&self.symlink_metadata(target)?)?;
         std::fs::hard_link(target, link)
     }
 
@@ -864,12 +888,7 @@ impl FileOps for FakeFileOps {
     fn hard_link(&self, target: &Path, link: &Path) -> io::Result<()> {
         let mut st = self.state.borrow_mut();
         let ino = st.lookup(target)?;
-        if matches!(st.inodes[&ino].kind, FakeKind::Dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "hard link to a directory",
-            ));
-        }
+        refuse_non_regular_hard_link_target(&st.stat_of(ino))?;
         if st.paths.contains_key(link) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
         }
@@ -1197,6 +1216,62 @@ mod tests {
         let hl = d.path("a/hard.txt");
         ops.hard_link(&f, &hl).expect("hardlink");
         assert!(ops.metadata(&hl).expect("stat").is_file);
+    }
+
+    #[test]
+    fn live_hard_link_refuses_directories_and_other_non_regular_files() {
+        let ops = LiveFileOps::new();
+        let d = TempDir::new("hardlink-refuse");
+
+        let dir = d.path("folder");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let dir_hl = d.path("folder-hl");
+        let dir_err = ops
+            .hard_link(&dir, &dir_hl)
+            .expect_err("directory hard link must be refused before hard_link(2)");
+        assert_eq!(dir_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            dir_err.to_string().contains("directory"),
+            "honest error must name the directory: {dir_err}"
+        );
+        assert!(
+            !dir_hl.exists(),
+            "directory hard-link destination must not appear"
+        );
+
+        let target = d.path("real.txt");
+        std::fs::write(&target, b"x").expect("write");
+        let symlink = d.path("link");
+        ops.symlink(&target, &symlink).expect("symlink");
+        let symlink_hl = d.path("link-hl");
+        let link_err = ops
+            .hard_link(&symlink, &symlink_hl)
+            .expect_err("symlink hard link must be refused before hard_link(2)");
+        assert_eq!(link_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            link_err.to_string().contains("symbolic link"),
+            "honest error must name the symlink: {link_err}"
+        );
+        assert!(
+            !symlink_hl.exists(),
+            "symlink hard-link destination must not appear"
+        );
+
+        let sock = d.path("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+        let sock_hl = d.path("sock-hl");
+        let sock_err = ops
+            .hard_link(&sock, &sock_hl)
+            .expect_err("socket hard link must be refused before hard_link(2)");
+        assert_eq!(sock_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            sock_err.to_string().contains("non-regular"),
+            "honest error must name the non-regular inode: {sock_err}"
+        );
+        assert!(
+            !sock_hl.exists(),
+            "socket hard-link destination must not appear"
+        );
     }
 
     #[test]
