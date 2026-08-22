@@ -3660,8 +3660,8 @@ impl FileBrowser {
 
     /// Write dirty prefs/bookmarks immediately (tests skip the debounce window).
     pub fn flush_persisted(&mut self) {
-        if self.folder_prefs_dirty.take().is_some() {
-            self.write_folder_prefs();
+        if self.folder_prefs_dirty.is_some() && self.write_folder_prefs() {
+            self.folder_prefs_dirty = None;
         }
         if self.bookmarks_dirty.is_some() && self.write_bookmarks() {
             self.bookmarks_dirty = None;
@@ -3671,8 +3671,9 @@ impl FileBrowser {
     fn flush_persisted_if_due(&mut self) {
         let due = |t: Instant| t.elapsed() >= PREFS_DEBOUNCE;
         if self.folder_prefs_dirty.is_some_and(due) {
-            self.folder_prefs_dirty = None;
-            self.write_folder_prefs();
+            if self.write_folder_prefs() {
+                self.folder_prefs_dirty = None;
+            }
         }
         if self.bookmarks_dirty.is_some_and(due) {
             if self.write_bookmarks() {
@@ -3765,9 +3766,9 @@ impl FileBrowser {
         }
     }
 
-    fn write_folder_prefs(&self) {
-        let Some(path) = self.folder_prefs_path.as_ref() else {
-            return;
+    fn write_folder_prefs(&mut self) -> bool {
+        let Some(path) = self.folder_prefs_path.clone() else {
+            return true;
         };
         let entries = self
             .folder_prefs_lru
@@ -3779,7 +3780,16 @@ impl FileBrowser {
                 })
             })
             .collect();
-        let _ = write_json_store(path, &FolderPrefsFile { entries });
+        match write_json_store(&path, &FolderPrefsFile { entries }) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_note = Some(format!(
+                    "Folder preferences could not be saved to {}: {error}",
+                    path.display()
+                ));
+                false
+            }
+        }
     }
 
     fn write_bookmarks(&mut self) -> bool {
@@ -4181,5 +4191,47 @@ mod tests {
             b.ops().active().is_empty(),
             "read-only dest never reaches the queue"
         );
+    }
+
+    // WL-FUNC-026 — a failed folder-prefs write must be visible instead of
+    // looking durable when the configured store parent cannot be created.
+    #[test]
+    fn folder_prefs_report_persistence_failure_and_keep_dirty_state() {
+        let dir = tempfile::tempdir().expect("config parent");
+        let blocked_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file blocker").expect("seed blocker");
+        let rows = vec![FileRow::local("a.txt", Mime::Doc, "1 B", "now").with_path("/work/a.txt")];
+        let mut b = live_posix_browser(rows).with_config_dir(&blocked_parent);
+        b.navigate(0, Location::Local("/work".into()));
+        b.set_view(0, ViewMode::Grid);
+        b.flush_persisted();
+
+        assert_eq!(
+            b.folder_prefs().get("/work").map(|p| p.view),
+            Some(ViewMode::Grid),
+            "in-memory prefs remain usable"
+        );
+        assert!(
+            b.last_note()
+                .is_some_and(|note| note.contains("Folder preferences could not be saved")),
+            "persistence failure must be visible: {:?}",
+            b.last_note()
+        );
+        assert!(
+            !blocked_parent.join(super::FOLDER_PREFS_FILE).exists(),
+            "a failed write must not claim to have created the store"
+        );
+
+        std::fs::remove_file(&blocked_parent).expect("remove blocker");
+        std::fs::create_dir(&blocked_parent).expect("repair config parent");
+        b.flush_persisted();
+        let saved = load_folder_prefs_at(&blocked_parent.join(super::FOLDER_PREFS_FILE))
+            .expect("retry should persist after repair");
+        let entry = saved
+            .entries
+            .iter()
+            .find(|e| e.path == "/work")
+            .expect("flushed /work");
+        assert_eq!(entry.prefs.view, ViewMode::Grid);
     }
 }
