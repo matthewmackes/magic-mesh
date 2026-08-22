@@ -1510,7 +1510,10 @@ impl CommunicationsState {
     /// [`CommandSink`]; this drains the sink and publishes each command onto
     /// `action/collab/<verb>` so the collab worker applies it. Activity
     /// fleet-voice / SIP-gateway sinks drain onto `action/voice/*` and
-    /// `action/voip/*`.
+    /// `action/voip/*`. Transfers-mode [`SyncPairCommand`]s drain from the
+    /// surface `SyncPairSink` onto the existing transfer inbox as
+    /// `TransferVerb::{SaveSyncPair, RemoveSyncPair}` — the worker store stays
+    /// the only pair authority.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut sink = CommandSink::new();
         let selected_before = self.surface.selected_space();
@@ -3631,6 +3634,85 @@ mod tests {
             verb,
             SyncPairVerbWire::RemoveSyncPair(id) if id == "docs"
         )));
+    }
+
+    #[test]
+    fn show_drains_editor_sync_pair_sink_onto_transfer_verb_inbox_only() {
+        // CommunicationsState::show drains the surface sink every frame. A
+        // fresh surface has nothing queued; the producer must not invent a
+        // pair store or an empty inbox.
+        let mut surface = CommunicationsSurface::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "fresh Transfers SyncPairSink is empty"
+        );
+        assert!(!drain_sync_pair_to_inbox(
+            &surface.drain_sync_pair_commands(),
+            dir.path()
+        ));
+        assert!(
+            !dir.path().join("inbox").exists(),
+            "empty sink must not create an inbox"
+        );
+        assert!(
+            !dir.path().join("sync-pairs").exists(),
+            "empty sink must not invent a second pair store"
+        );
+
+        // Editor-emitted intents (the same Save/Remove the Transfers form
+        // pushes into SyncPairSink). A hostile Remove in the same batch must
+        // not block the valid verbs or write the worker store itself.
+        let editor_cmds = [
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: "node:oak".to_owned(),
+                every_secs: 900,
+                bwlimit: Some("2m".to_owned()),
+            },
+            SyncPairCommand::Remove {
+                id: "../escape".to_owned(),
+            },
+            SyncPairCommand::Remove {
+                id: "docs".to_owned(),
+            },
+        ];
+        assert!(drain_sync_pair_to_inbox(&editor_cmds, dir.path()));
+        let inbox = dir.path().join("inbox");
+        let mut stems = Vec::new();
+        let verbs: Vec<SyncPairVerbWire> = std::fs::read_dir(&inbox)
+            .expect("inbox")
+            .flatten()
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                stems.push(name);
+                serde_json::from_str(&std::fs::read_to_string(entry.path()).expect("read verb"))
+                    .expect("daemon TransferVerb shape")
+            })
+            .collect();
+        assert_eq!(verbs.len(), 2, "hostile Remove must not publish");
+        assert!(stems.iter().any(|name| name.contains("save-sync-pair")));
+        assert!(stems.iter().any(|name| name.contains("remove-sync-pair")));
+        assert!(verbs.iter().any(|verb| matches!(
+            verb,
+            SyncPairVerbWire::SaveSyncPair(pair)
+                if pair.id == "docs"
+                    && pair.source == "/src"
+                    && pair.dest == "node:oak"
+                    && pair.every_secs == 900
+                    && pair.policy.bwlimit.as_deref() == Some("2m")
+                    && !pair.policy.verify
+                    && pair.enabled
+        )));
+        assert!(verbs.iter().any(|verb| matches!(
+            verb,
+            SyncPairVerbWire::RemoveSyncPair(id) if id == "docs"
+        )));
+        assert!(
+            !dir.path().join("sync-pairs").exists(),
+            "GUI producer publishes TransferVerb inbox records only"
+        );
     }
 
     #[test]
