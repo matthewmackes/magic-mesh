@@ -27,6 +27,8 @@ use mde_egui::hostkeys::HostScan;
 
 use mde_seat::hotkeys::{action_for, HotkeyAction};
 
+use crate::surfaces::Surface;
+
 /// A Super+number navigation target. Slot `0` is the first visible launcher
 /// surface; `9` is the tenth (`Super+0`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +145,27 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
     })
 }
 
+/// Whether a catalogued Transfers Ctrl chord must **pass through** (refuse to
+/// fire) so Documents or Terminal keep the keystroke.
+///
+/// Communications is Documents mode; its editor owns Ctrl+J / Ctrl+N while a
+/// text field has focus. Terminal's PTY is the same: those chords are editing
+/// / line-discipline keys, not host Transfers accelerators.
+const fn transfer_ctrl_passes_through(surface: Option<Surface>, text_focus: bool) -> bool {
+    text_focus && matches!(surface, Some(Surface::Communications | Surface::Terminal))
+}
+
 /// Map a Ctrl-held named key to the catalog chord string. These fire on Construct
-/// chrome without Super; Documents/Terminal skip them at the shell apply site so
-/// they never shadow text editing.
-const fn ctrl_chord(press: KeyPress) -> Option<&'static str> {
+/// chrome without Super. When Documents or Terminal have text focus the catalog
+/// refuses the binding so the keystroke reaches the editor / PTY.
+const fn ctrl_chord(
+    press: KeyPress,
+    text_surface: Option<Surface>,
+    text_focus: bool,
+) -> Option<&'static str> {
+    if transfer_ctrl_passes_through(text_surface, text_focus) {
+        return None;
+    }
     if !press.ctrl || press.shift {
         return None;
     }
@@ -276,6 +295,23 @@ impl HotkeyRouter {
         host_keys: &[HostScan],
         egui_presses: &[KeyPress],
     ) -> Vec<HotkeyAction> {
+        // Chrome / no text field: Transfers chords fire. Documents and Terminal
+        // pass `dispatch_for` with `text_focus` so the catalog can refuse.
+        self.dispatch_for(host_keys, egui_presses, None, false)
+    }
+
+    /// Dispatch with a focused-surface gate for Transfers Ctrl chords.
+    ///
+    /// `text_surface` + `text_focus` is the catalog input: Communications
+    /// (Documents) and Terminal refuse Ctrl+J / Ctrl+N while a text field or
+    /// PTY has focus. Other surfaces keep the accelerators.
+    pub(crate) fn dispatch_for(
+        &mut self,
+        host_keys: &[HostScan],
+        egui_presses: &[KeyPress],
+        text_surface: Option<Surface>,
+        text_focus: bool,
+    ) -> Vec<HotkeyAction> {
         let mut actions = Vec::new();
         let has_leader_chord = egui_presses.iter().any(|press| {
             leader_chord(press.key).is_some() || nav_slot_for(press.key, press.shift).is_some()
@@ -302,7 +338,9 @@ impl HotkeyRouter {
             if let Some(a) = self.on_egui_key(*press) {
                 actions.push(a);
             } else if !self.leader && !self.leader_release_pending {
-                if let Some(action) = ctrl_chord(*press).and_then(action_for) {
+                if let Some(action) =
+                    ctrl_chord(*press, text_surface, text_focus).and_then(action_for)
+                {
                     actions.push(action);
                 }
             }
@@ -818,6 +856,50 @@ mod tests {
         assert_eq!(acts, vec![HotkeyAction::OpenTransfers]);
         let acts = r.dispatch(&[], &[press(egui::Key::J)]);
         assert!(acts.is_empty(), "bare J is not a Transfers chord");
+    }
+
+    #[test]
+    fn transfer_chords_pass_through_documents_and_terminal_text_focus() {
+        // Leftover WL-FUNC-032: Ctrl+J / New Transfer must not shadow text
+        // editing. The catalog refuses those bindings while Documents
+        // (Communications) or Terminal have text focus; other surfaces and
+        // the same surfaces without a focused field still fire.
+        let mut r = HotkeyRouter::default();
+        for surface in [Surface::Communications, Surface::Terminal] {
+            for (key, action) in [
+                (egui::Key::J, HotkeyAction::OpenTransfers),
+                (egui::Key::N, HotkeyAction::NewTransfer),
+            ] {
+                assert!(
+                    transfer_ctrl_passes_through(Some(surface), true),
+                    "{surface:?} text focus must refuse the Transfers catalog"
+                );
+                assert!(
+                    r.dispatch_for(&[], &[ctrl_press(key)], Some(surface), true)
+                        .is_empty(),
+                    "Ctrl+{key:?} must pass through {surface:?} text focus"
+                );
+                assert_eq!(
+                    r.dispatch_for(&[], &[ctrl_press(key)], Some(surface), false),
+                    vec![action],
+                    "without text focus {surface:?} still fires Ctrl+{key:?}"
+                );
+            }
+        }
+        assert!(
+            !transfer_ctrl_passes_through(Some(Surface::Files), true),
+            "a Files search field must not steal the Transfers catalog"
+        );
+        assert_eq!(
+            r.dispatch_for(&[], &[ctrl_press(egui::Key::J)], Some(Surface::Files), true),
+            vec![HotkeyAction::OpenTransfers],
+            "Ctrl+J still opens Transfers from a non-editor surface"
+        );
+        assert_eq!(
+            r.dispatch(&[], &[ctrl_press(egui::Key::N)]),
+            vec![HotkeyAction::NewTransfer],
+            "chrome dispatch (no text surface) still fires New Transfer"
+        );
     }
 
     #[test]
