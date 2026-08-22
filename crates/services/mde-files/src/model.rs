@@ -239,39 +239,15 @@ pub enum Mime {
 /// Current routing target for the main content area.
 ///
 /// Default is `MeshOverview` — the mesh is the home base, not
-/// the local filesystem.
-///
-/// v4.x AF-mesh.2 (2026-05-24) — adds `MeshHome` + `MeshHomeChild`
-/// for the shared XDG dirs (Documents, Pictures, Music, Videos,
-/// Downloads). These dirs live on the Syncthing mesh store —
-/// replicated across the fleet over Nebula — so they
-/// belong in the mesh section of the UI, not the Local one.
-/// `Downloads` stays as a top-level shortcut for the common case.
+/// the local filesystem. Cosmic-era arms (`Inbox`, `Outbox`,
+/// `Downloads`, `MeshHome`, `MeshHomeChild`, `MeshUndelete`,
+/// `CloudDevices`, `Network`) were never assigned in production
+/// after the iced GUI strip and are gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
     MeshOverview,
-    Inbox,
-    /// AFM-6 — files this node has sent to peers (the send audit feed).
-    Outbox,
     Peer(String),
-    Downloads,
     Local,
-    /// Mesh Home landing — shows the five shared XDG dirs as
-    /// cards. Clicking a card routes to `MeshHomeChild(slug)`.
-    MeshHome,
-    /// Browsing one of the shared XDG dirs. `slug` is one of
-    /// `docs` / `pics` / `music` / `videos` / `downloads`.
-    MeshHomeChild(String),
-    /// MESHFS-8.1 — "Recycle Bin" view: files recoverable from the
-    /// mesh-storage trash directory within the configured
-    /// retention window (default 48 h).
-    MeshUndelete,
-    /// E10 — Cloud Files: paired KDE-Connect devices (over the Bus). Each row
-    /// is a device; browsing into one (sftp) is a follow-on.
-    CloudDevices,
-    /// E10 — Network: interactive SMB host-browse (type a host → list its Disk
-    /// shares → mount one over GVfs).
-    Network,
 }
 
 impl Default for View {
@@ -282,19 +258,10 @@ impl Default for View {
 
 impl View {
     /// True for any view that operates on mesh content (mesh
-    /// overview, inbox, a peer folder, mesh home).
+    /// overview or a peer folder).
     #[must_use]
     pub fn is_mesh(&self) -> bool {
-        matches!(
-            self,
-            Self::MeshOverview
-                | Self::Inbox
-                | Self::Outbox
-                | Self::Peer(_)
-                | Self::MeshHome
-                | Self::MeshHomeChild(_)
-                | Self::MeshUndelete
-        )
+        matches!(self, Self::MeshOverview | Self::Peer(_))
     }
 
     /// E10.5 — a short title for the browser-tab strip. For `Local` the tab is
@@ -304,16 +271,8 @@ impl View {
     pub fn tab_label(&self) -> &str {
         match self {
             Self::MeshOverview => "Mesh",
-            Self::Inbox => "Inbox",
-            Self::Outbox => "Outbox",
             Self::Peer(_) => "Peer",
-            Self::Downloads => "Downloads",
             Self::Local => "Local",
-            Self::MeshHome => "Mesh Home",
-            Self::MeshHomeChild(slug) => slug,
-            Self::MeshUndelete => "Recycle Bin",
-            Self::CloudDevices => "Cloud Files",
-            Self::Network => "Network",
         }
     }
 }
@@ -412,19 +371,22 @@ mod tests {
     }
 
     #[test]
+    fn view_default_is_mesh_overview() {
+        assert_eq!(View::default(), View::MeshOverview);
+    }
+
+    #[test]
     fn view_is_mesh_recognises_peer_variants() {
         assert!(View::MeshOverview.is_mesh());
-        assert!(View::Inbox.is_mesh());
         assert!(View::Peer("pine".into()).is_mesh());
-        assert!(!View::Downloads.is_mesh());
         assert!(!View::Local.is_mesh());
     }
 
     #[test]
-    fn view_is_mesh_recognises_mesh_home_variants() {
-        assert!(View::MeshHome.is_mesh());
-        assert!(View::MeshHomeChild("docs".into()).is_mesh());
-        assert!(View::MeshHomeChild("pics".into()).is_mesh());
+    fn view_tab_label_local_is_local() {
+        assert_eq!(View::Local.tab_label(), "Local");
+        assert_eq!(View::MeshOverview.tab_label(), "Mesh");
+        assert_eq!(View::Peer("pine".into()).tab_label(), "Peer");
     }
 
     #[test]
