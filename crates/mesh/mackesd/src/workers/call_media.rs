@@ -1996,6 +1996,44 @@ impl SipGatewayPlane {
         };
         self.tick_locked(persist, &mut inner, last_published);
     }
+
+    /// Mint a retained inbound PSTN document from an already-admitted E.164.
+    ///
+    /// This plane has no LiveKit SIP dialog, so the published leg stays
+    /// unbridged and never claims Connected. A SIP URI or other non-E.164
+    /// identity is refused.
+    pub(crate) fn retain_inbound_leg(
+        &self,
+        call: CallId,
+        e164: &str,
+    ) -> Result<(), CallMediaProviderError> {
+        let mut inner = self.lock_inner()?;
+        let local_actor = inner
+            .local_actor
+            .clone()
+            .unwrap_or_else(|| ActorId::new("local"));
+        let document = Self::admit_leg(
+            call,
+            local_actor.clone(),
+            SipLegDirectionV1::Inbound,
+            e164,
+            self.gateway_available(),
+        )?;
+        if document.bridged || document.direction != SipLegDirectionV1::Inbound {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "refusing to retain a fake Connected inbound PSTN sip leg".to_string(),
+            });
+        }
+        inner.sessions.insert(
+            call,
+            SipSession {
+                local_actor,
+                direction: document.direction,
+                e164: document.e164,
+            },
+        );
+        Ok(())
+    }
 }
 
 impl CallMediaFrameVerifier for SipGatewayPlane {
@@ -3076,6 +3114,93 @@ mod tests {
                     if detail.contains("without a gateway")
             ),
             "bridged-without-gateway must fail closed at publish"
+        );
+    }
+
+    #[test]
+    fn sip_inbound_e164_mints_retained_unbridged_leg_without_claiming_connected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let absent = SipGatewayPlane::new(false).with_local_actor(ActorId::new("alice"));
+
+        assert!(
+            matches!(
+                absent.retain_inbound_leg(call, "sip:+15551234567@gw"),
+                Err(CallMediaProviderError::ExecutionRefused { .. })
+            ),
+            "a SIP URI must not be admitted as an inbound E.164 PSTN leg"
+        );
+        assert!(!absent.owns_call(call));
+
+        absent
+            .retain_inbound_leg(call, "+15551234567")
+            .expect("honest inbound E.164 is admitted");
+        assert!(absent.owns_call(call));
+
+        write_readiness(&persist, &two_party_readiness(call, space, "alice"));
+        let mut published = BTreeMap::new();
+        absent.tick(&persist, &mut published);
+
+        let topic = media_sip_leg_topic(call);
+        let leg = read_sip_leg(&persist, call).expect("inbound mint publishes retained /sip");
+        assert_eq!(leg.session, call);
+        assert_eq!(leg.direction, SipLegDirectionV1::Inbound);
+        assert_eq!(leg.e164, "+15551234567");
+        assert!(!leg.gateway_available);
+        assert!(
+            !leg.bridged,
+            "inbound mint must not claim a bridged or Connected PSTN"
+        );
+        assert_eq!(leg.topic(), topic);
+        assert!(
+            published.contains_key(&topic),
+            "inbound sip topic must be retained in the publish cache"
+        );
+        assert!(
+            persist
+                .read_latest(&media_session_topic(call))
+                .expect("read session topic")
+                .is_none(),
+            "inbound SIP mint must not invent a fake Connected MediaSessionV1"
+        );
+        assert!(
+            matches!(
+                absent.prove_advancing_frames(
+                    &two_party_readiness(call, space, "alice").sessions[0],
+                    CallMediaAdapter::SipGateway
+                ),
+                Err(CallMediaProviderError::ProviderUnavailable { detail })
+                    if detail == mde_voice_hud::sip::ABSENT_PSTN_PROVIDER
+            ),
+            "absent inbound provider must not prove live PSTN frames"
+        );
+
+        let present = SipGatewayPlane::new(true).with_local_actor(ActorId::new("alice"));
+        present
+            .retain_inbound_leg(call, "+18005551212")
+            .expect("governed flag still requires a real inbound E.164");
+        write_readiness(&persist, &two_party_readiness(call, space, "alice"));
+        let mut present_pub = BTreeMap::new();
+        present.tick(&persist, &mut present_pub);
+        let present_leg = read_sip_leg(&persist, call).expect("governed inbound path publishes");
+        assert_eq!(present_leg.direction, SipLegDirectionV1::Inbound);
+        assert!(present_leg.gateway_available);
+        assert!(
+            !present_leg.bridged,
+            "a governed inbound account is not a fake Connected/bridged PSTN"
+        );
+        assert!(
+            matches!(
+                present.prove_advancing_frames(
+                    &two_party_readiness(call, space, "alice").sessions[0],
+                    CallMediaAdapter::SipGateway
+                ),
+                Err(CallMediaProviderError::ExecutionRefused { detail })
+                    if detail.contains("not proven")
+            ),
+            "governed inbound without frames must not prove Connected PSTN"
         );
     }
 }
