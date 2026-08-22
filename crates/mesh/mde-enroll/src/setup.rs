@@ -238,9 +238,27 @@ impl Wizard {
         self.token_view = Some(view);
     }
 
+    /// Parse a pasted or issued join-token wire form and attach the withheld
+    /// view. The bearer never enters wizard state. Template, empty, or garbage
+    /// input refuses and leaves any existing view unchanged.
+    pub fn present_join_token(&mut self, raw: &str) -> Result<(), String> {
+        let view = JoinTokenView::from_wire(raw)?;
+        self.set_token_view(view);
+        Ok(())
+    }
+
     /// Attach a renderer-safe commissioning-capsule projection.
     pub fn set_capsule_view(&mut self, view: CapsuleView) {
         self.capsule_view = Some(view);
+    }
+
+    /// Parse an issued or staged commissioning capsule and attach the withheld
+    /// view. The signature never enters wizard state. Expired, replayable, or
+    /// unsigned-looking envelopes refuse and leave any existing view unchanged.
+    pub fn present_capsule(&mut self, capsule_json: &str, now_ms: i64) -> Result<(), String> {
+        let view = CapsuleView::from_wire(capsule_json, now_ms)?;
+        self.set_capsule_view(view);
+        Ok(())
     }
 
     /// Honest commissioning lines for GUI/TUI consumers. Empty when no
@@ -381,6 +399,61 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains(bearer)),
             "wizard commissioning lines leaked the bearer: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn presenting_a_token_or_capsule_fills_commissioning_lines_without_secrets() {
+        let mut w = Wizard::new(false);
+        assert!(w.commissioning_lines().is_empty());
+
+        let bearer = "single-use-bearer";
+        let token = format!("mesh:home@10.0.0.5:4243#{bearer}?fp={}", "a".repeat(64));
+        w.present_join_token(&token).unwrap();
+
+        let signature = "c".repeat(128);
+        let capsule = serde_json::json!({
+            "schema_version": 1,
+            "capsule_id": "capsule-1",
+            "target_id": "seat-15",
+            "expires_at_ms": 2_000,
+            "bootstrap_digest_hex": "b".repeat(64),
+            "one_time": true,
+            "key_id": "commissioning-v1",
+            "signature_hex": signature,
+        })
+        .to_string();
+        w.present_capsule(&capsule, 1_000).unwrap();
+
+        let lines = w.commissioning_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("bearer withheld"));
+        assert!(lines[1].contains("signature withheld"));
+        assert!(
+            !lines.iter().any(|line| line.contains(bearer)),
+            "present_join_token leaked the bearer into commissioning lines: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains(&signature)),
+            "present_capsule leaked the signature into commissioning lines: {lines:?}"
+        );
+        let debug = format!("{w:?}");
+        assert!(
+            !debug.contains(bearer),
+            "wizard debug leaked the bearer: {debug}"
+        );
+        assert!(
+            !debug.contains(&signature),
+            "wizard debug leaked the capsule signature: {debug}"
+        );
+
+        assert!(w.present_join_token("{{JOIN_TOKEN}}").is_err());
+        assert!(w.present_join_token("garbage").is_err());
+        assert!(w.present_capsule(&capsule, 2_000).is_err());
+        assert_eq!(
+            w.commissioning_lines(),
+            lines,
+            "failed present must leave attached views unchanged"
         );
     }
 }
