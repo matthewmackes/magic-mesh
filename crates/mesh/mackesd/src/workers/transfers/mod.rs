@@ -992,6 +992,7 @@ impl TransfersWorker {
             queue,
             v2_ledger,
             sync_pairs,
+            sync_pair_jobs: HashMap::new(),
             tasks: HashMap::new(),
             v2_tasks: HashMap::new(),
             lane: Arc::clone(&self.lane),
@@ -1058,6 +1059,11 @@ struct Engine {
     queue: TransferQueue,
     v2_ledger: V2Ledger,
     sync_pairs: SyncPairStore,
+    /// In-flight rsync jobs minted by [`Engine::schedule_sync_pairs_at`].
+    /// Not a second store — only the association from job id back to the
+    /// existing [`SyncPairStore`] row so a real lane outcome can replace the
+    /// enqueue stamp.
+    sync_pair_jobs: HashMap<String, String>,
     tasks: HashMap<String, JoinHandle<LaneOutcome>>,
     v2_tasks: HashMap<TransferId, V2Task>,
     lane: Arc<dyn LaneRunner>,
@@ -1196,6 +1202,7 @@ impl Engine {
                             "sync pair fired but last_fired stamp failed"
                         );
                     }
+                    self.sync_pair_jobs.insert(job_id, id.clone());
                     self.record_sync_pair_attempt(&id, "ok", true);
                 }
                 Err(e) => {
@@ -1224,6 +1231,23 @@ impl Engine {
                 "sync pair last_result stamp failed"
             );
         }
+    }
+
+    /// Replace the enqueue stamp with the rsync lane's real terminal outcome.
+    fn record_sync_pair_lane_outcome(&self, pair_id: &str, job: &TransferJob) {
+        let (last_result, peer_reachable) = match job.state {
+            TransferState::Done => (TransferState::Done.as_str().to_owned(), true),
+            TransferState::Failed => (
+                job.error
+                    .as_deref()
+                    .filter(|error| !error.is_empty())
+                    .unwrap_or(TransferState::Failed.as_str())
+                    .to_owned(),
+                false,
+            ),
+            _ => return,
+        };
+        self.record_sync_pair_attempt(pair_id, &last_result, peer_reachable);
     }
 
     /// Apply every pending inbox verb (the daemon is the single ledger writer).
@@ -1261,6 +1285,7 @@ impl Engine {
                 }
                 TransferVerb::Cancel(id) => {
                     self.abort_task(&id);
+                    self.sync_pair_jobs.remove(&id);
                     let res = self.queue.cancel(&id);
                     Self::log_verb("cancel", &id, res);
                 }
@@ -1361,6 +1386,9 @@ impl Engine {
                 tracing::warn!(target: "mackesd::transfers", id = %id, error = %e, "complete failed");
             } else if let Some(job) = self.queue.get(&id) {
                 if job.state.is_terminal() {
+                    if let Some(pair_id) = self.sync_pair_jobs.remove(&id) {
+                        self.record_sync_pair_lane_outcome(&pair_id, &job);
+                    }
                     terminal.push(job);
                 }
             }
@@ -2501,6 +2529,7 @@ mod tests {
             queue: TransferQueue::open(store, cap).unwrap(),
             v2_ledger: V2Ledger::open(store).unwrap(),
             sync_pairs: SyncPairStore::open(store).unwrap(),
+            sync_pair_jobs: HashMap::new(),
             tasks: HashMap::new(),
             v2_tasks: HashMap::new(),
             lane,
@@ -2523,6 +2552,7 @@ mod tests {
             queue: TransferQueue::open(store, cap).unwrap(),
             v2_ledger: V2Ledger::open(store).unwrap(),
             sync_pairs: SyncPairStore::open(store).unwrap(),
+            sync_pair_jobs: HashMap::new(),
             tasks: HashMap::new(),
             v2_tasks: HashMap::new(),
             lane,
@@ -4076,8 +4106,7 @@ mod tests {
         engine.schedule_sync_pairs_at(1_000);
         let failed = engine.sync_pairs.get("blocked").unwrap();
         assert_eq!(
-            failed.last_fired_ms,
-            None,
+            failed.last_fired_ms, None,
             "failed attempt must not stamp last_fired"
         );
         assert_eq!(failed.peer_reachable, Some(false));
@@ -4089,5 +4118,121 @@ mod tests {
         let still_ok = engine.sync_pairs.get("docs").unwrap();
         assert_eq!(still_ok.last_result.as_deref(), Some("ok"));
         assert_eq!(still_ok.peer_reachable, Some(true));
+    }
+
+    #[tokio::test]
+    async fn completed_rsync_sync_pair_updates_last_result_beyond_enqueue_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with(
+            tmp.path(),
+            1,
+            Arc::new(ImmediateLane {
+                outcome: LaneOutcome::Done,
+            }),
+        );
+        engine
+            .sync_pairs
+            .upsert(&SyncPair::new(
+                "mirror",
+                "/src",
+                "/dst",
+                3_600,
+                TransferPolicy::default(),
+            ))
+            .unwrap();
+
+        engine.tick().await;
+        assert_eq!(
+            engine
+                .sync_pairs
+                .get("mirror")
+                .unwrap()
+                .last_result
+                .as_deref(),
+            Some("ok"),
+            "enqueue still stamps ok before the rsync lane finishes"
+        );
+
+        for _ in 0..20 {
+            engine.tick().await;
+            if engine.tasks.is_empty()
+                && engine
+                    .queue
+                    .list()
+                    .iter()
+                    .any(|j| j.state == TransferState::Done)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let done = engine.sync_pairs.get("mirror").unwrap();
+        assert_eq!(done.last_result.as_deref(), Some("done"));
+        assert_eq!(done.peer_reachable, Some(true));
+        assert_ne!(
+            done.last_result.as_deref(),
+            Some("ok"),
+            "completed recurring rsync must replace the enqueue stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_rsync_sync_pair_updates_last_result_beyond_enqueue_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with(
+            tmp.path(),
+            1,
+            Arc::new(ImmediateLane {
+                outcome: LaneOutcome::failed("rsync: dest unreachable"),
+            }),
+        );
+        engine
+            .sync_pairs
+            .upsert(&SyncPair::new(
+                "mirror",
+                "/src",
+                "/dst",
+                3_600,
+                TransferPolicy::default(),
+            ))
+            .unwrap();
+
+        engine.tick().await;
+        assert_eq!(
+            engine
+                .sync_pairs
+                .get("mirror")
+                .unwrap()
+                .last_result
+                .as_deref(),
+            Some("ok")
+        );
+
+        for _ in 0..20 {
+            engine.tick().await;
+            if engine.tasks.is_empty()
+                && engine
+                    .queue
+                    .list()
+                    .iter()
+                    .any(|j| j.state == TransferState::Failed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let failed = engine.sync_pairs.get("mirror").unwrap();
+        assert_eq!(failed.peer_reachable, Some(false));
+        let result = failed
+            .last_result
+            .expect("honest lane failure is persisted");
+        assert_eq!(result, "rsync: dest unreachable");
+        assert_ne!(
+            result.as_str(),
+            "ok",
+            "failed recurring rsync must replace the enqueue stamp"
+        );
     }
 }
