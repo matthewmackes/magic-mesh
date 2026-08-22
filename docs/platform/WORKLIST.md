@@ -1197,9 +1197,11 @@ story execution contract above.
   (`collab_media.rs`, `call_media.rs`); HUD `calls.rs` names every
   `MediaFailureReasonV1`. Calls consumes the Q15 `VoiceAccounts` snapshot
   (no second registrar); the surface no longer leaves VoiceAccounts unused.
-  Bridged remints stay unbridged without proven LiveKit. Leftover: live
-  audio/video, elected SFU, and PSTN legs.
-- Remaining work: VoiceAccounts consume landed; leftover is live
+  Bridged remints stay unbridged without proven LiveKit. Mute/DTMF fail
+  closed without a published MediaSessionV1. Leftover is still live
+  media/SFU/PSTN.
+- Remaining work: VoiceAccounts consume landed; mute/DTMF fail closed
+  without a published MediaSessionV1; leftover is still live
   media/SFU/PSTN (S2-S4) plus remaining S5/S6 live-plane bind; change only
   owned components; record deliverable, farm command, result, revision,
   and evidence per story.
@@ -1576,10 +1578,12 @@ story execution contract above.
 - Current state: the CRDT/collab_session/follow library is carried by the
   embedded `mde-editor-egui` surface; fixture.rs already projects live
   sessions. Phase-3c markers are gone; external-write merge against the
-  live editor rope landed. Leftover: live two-seat co-edit evidence if
-  any (not missing markers or merge).
-- Remaining work: Phase-3c markers gone and rope merge landed; leftover
-  is live two-seat co-edit evidence if any.
+  live editor rope landed. Shell drains DocumentShareCommand locally.
+  Leftover is live two-seat evidence (and session still private in
+  documents.rs until the sibling lands).
+- Remaining work: shell drains DocumentShareCommand locally; leftover
+  is live two-seat evidence (and session still private in documents.rs
+  until the sibling lands).
   1. S1 Share-session lifecycle UI.
      - Inputs: the documents.rs marked seams, the collab_session library, and
        space membership from the collab store.
@@ -1666,11 +1670,12 @@ story execution contract above.
   `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Leftover
   `cli/voip_rtt.rs` and `voip_rtt_worker.rs` are deleted;
   `leftover_retirements` asserts both stay gone. Roster, spawn, and CLI
-  do not advertise `voip_rtt`. Unused SendToEntry variants are deleted
-  (Toolbar + ContextMenu only). Leftover is live helper `own_nebula_ip`
-  in lib `voip_rtt.rs` (keep) plus Cosmic-era View arms.
-- Remaining work: leftover is live helper `own_nebula_ip` in lib
-  `voip_rtt.rs` (keep) plus Cosmic-era View arms; then:
+  do not advertise `voip_rtt`. Cosmic-era View arms deleted
+  (MeshOverview/Peer/Local only). SendTo is Toolbar+ContextMenu.
+  Leftover is live helper `own_nebula_ip` in lib `voip_rtt.rs` (keep).
+- Remaining work: Cosmic-era View arms deleted (MeshOverview/Peer/Local
+  only); SendTo is Toolbar+ContextMenu; leftover is live helper
+  `own_nebula_ip` in lib `voip_rtt.rs` (keep); then:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
