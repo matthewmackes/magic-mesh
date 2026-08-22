@@ -43,7 +43,7 @@ use mde_theme::brand::icons::{icon_image, IconId};
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::{Progress, Resolution};
 use mde_files::search::TypeFilter;
-use mde_files::ArchiveFormat;
+use mde_files::{ArchiveFormat, LiveFileOps};
 
 use crate::dialogs::{Perm, PermClass};
 use crate::mesh_mount::{MountPhase, MountView};
@@ -3365,7 +3365,7 @@ fn name_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             if response.changed() {
                 actions.push(Action::SetNameDialogInput(name));
             }
-            let validation = dialog.validation_error();
+            let validation = dialog.surface_error(&LiveFileOps);
             if let Some(error) = validation.as_deref() {
                 ui.colored_label(Style::WARN, error);
             } else if let Some(error) = dialog.error.as_deref() {
@@ -3410,7 +3410,7 @@ fn extract_to_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) 
             if response.changed() {
                 actions.push(Action::SetExtractToDest(dest));
             }
-            let validation = dialog.validation_error();
+            let validation = dialog.surface_error(&LiveFileOps);
             if let Some(error) = validation.as_deref() {
                 ui.colored_label(Style::WARN, error);
             } else if let Some(error) = dialog.error.as_deref() {
@@ -5079,6 +5079,25 @@ mod tests {
         b.click(0, 0);
         b.open_rename(0);
         assert!(b.name_dialog().is_some(), "Rename opened");
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_new_file_and_extract_to_dialogs() {
+        let fixture = RenderFixture {
+            peers: Vec::new(),
+            rows: vec![FileRow::local("payload.zip", Mime::Archive, "1 KB", "now")
+                .with_path("/d/payload.zip")],
+        };
+        let mut b = FileBrowser::with_file_ops(Box::new(fixture), FakeFileOps::new());
+        b.open_new_file(0);
+        assert!(b.name_dialog().is_some(), "New File opened");
+        mount(&mut b);
+        b.cancel_name_dialog();
+
+        b.click(0, 0);
+        b.open_extract_to(0);
+        assert!(b.extract_to_dialog().is_some(), "Extract To opened");
         mount(&mut b);
     }
 }

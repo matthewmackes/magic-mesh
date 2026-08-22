@@ -228,6 +228,33 @@ impl NameDialog {
         };
         Some(parent.join(&self.name))
     }
+
+    /// Live filesystem preflight: refuse New File / folder / links / rename
+    /// when the parent directory (or its nearest existing ancestor) has no
+    /// write bits. Path-shape errors stay in [`validation_error`]; this is the
+    /// honest read-only refuse the Create button consults before FileOps.
+    #[must_use]
+    pub fn read_only_error(&self, ops: &dyn FileOps) -> Option<String> {
+        if self.validation_error().is_some() {
+            return None;
+        }
+        let parent = match &self.operation {
+            NameOperation::NewFolder { parent }
+            | NameOperation::NewFile { parent }
+            | NameOperation::Rename { parent, .. }
+            | NameOperation::Symlink { parent, .. }
+            | NameOperation::HardLink { parent, .. } => parent,
+            NameOperation::BookmarkRename { .. } => return None,
+        };
+        nearest_unwritable_dir(ops, parent)
+    }
+
+    /// Combined surface error: name-shape first, then read-only parent.
+    #[must_use]
+    pub fn surface_error(&self, ops: &dyn FileOps) -> Option<String> {
+        self.validation_error()
+            .or_else(|| self.read_only_error(ops))
+    }
 }
 
 /// Extract-to destination: a writable directory path the archive unpacks into.
@@ -280,6 +307,92 @@ impl ExtractToDialog {
         self.validation_error()
             .is_none()
             .then(|| PathBuf::from(self.dest.trim()))
+    }
+
+    /// Live filesystem preflight: refuse extract-to when the destination (or
+    /// its nearest existing ancestor) has no write bits. Path-shape errors
+    /// stay in [`validation_error`].
+    #[must_use]
+    pub fn read_only_error(&self, ops: &dyn FileOps) -> Option<String> {
+        if self.validation_error().is_some() {
+            return None;
+        }
+        nearest_unwritable_dir(ops, Path::new(self.dest.trim()))
+    }
+
+    /// Combined surface error: dest-shape first, then read-only dest.
+    #[must_use]
+    pub fn surface_error(&self, ops: &dyn FileOps) -> Option<String> {
+        self.validation_error()
+            .or_else(|| self.read_only_error(ops))
+    }
+
+    /// Refuse when any archive member would walk above the destination.
+    #[must_use]
+    pub fn traversal_members_error<I, P>(members: I) -> Option<String>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        members.into_iter().find_map(|member| {
+            let member = member.as_ref();
+            archive_member_escapes(member).then(|| {
+                format!(
+                    "Archive member \u{201c}{}\u{201d} would escape the destination.",
+                    member.display()
+                )
+            })
+        })
+    }
+}
+
+/// `true` when an in-archive member path would escape its extract destination
+/// (absolute, `..`, or empty). The extract engine uses the same rule; the
+/// dialog surfaces it before the queue runs.
+#[must_use]
+pub fn archive_member_escapes(member: &Path) -> bool {
+    if member.as_os_str().is_empty() {
+        return true;
+    }
+    member.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+/// Walk `dest` and its ancestors until an existing path is found. Refuse a
+/// non-directory, a symlink (already an escape hatch), or a directory with no
+/// write bits for anyone (`0555` / procfs).
+fn nearest_unwritable_dir(ops: &dyn FileOps, dest: &Path) -> Option<String> {
+    let mut cursor = dest.to_path_buf();
+    loop {
+        match ops.symlink_metadata(&cursor) {
+            Ok(stat) => {
+                if stat.is_symlink || !stat.is_dir {
+                    return Some(format!(
+                        "The destination is not a writable folder: {}",
+                        cursor.display()
+                    ));
+                }
+                if stat.mode & 0o222 == 0 {
+                    return Some(format!(
+                        "The destination is read-only: {}",
+                        cursor.display()
+                    ));
+                }
+                return None;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if !cursor.pop() || cursor.as_os_str().is_empty() {
+                    return Some("The destination folder is not writable.".to_string());
+                }
+            }
+            Err(e) => {
+                return Some(format!("Couldn't check the destination: {e}"));
+            }
+        }
     }
 }
 
@@ -945,6 +1058,55 @@ mod tests {
         assert!(dialog.validation_error().is_some());
         dialog.dest = "/work/out".to_string();
         assert_eq!(dialog.target(), Some(PathBuf::from("/work/out")));
+    }
+
+    #[test]
+    fn new_file_and_extract_to_refuse_a_read_only_parent() {
+        let fs = FakeFileOps::new();
+        fs.create_dir_all(Path::new("/ro/box")).expect("mkdir");
+        fs.set_permissions(Path::new("/ro/box"), 0o555)
+            .expect("chmod");
+
+        let mut name = NameDialog::new_file(PathBuf::from("/ro/box"));
+        name.name = "notes.txt".to_string();
+        let error = name
+            .surface_error(&fs)
+            .expect("New File refuses a read-only parent");
+        assert!(
+            error.contains("read-only"),
+            "honest read-only New File: {error}"
+        );
+
+        let extract = ExtractToDialog::new(
+            PathBuf::from("/ro/box/payload.zip"),
+            PathBuf::from("/ro/box/out"),
+        );
+        let error = extract
+            .surface_error(&fs)
+            .expect("Extract To refuses a read-only dest");
+        assert!(
+            error.contains("read-only"),
+            "honest read-only Extract To: {error}"
+        );
+
+        fs.create_dir_all(Path::new("/work")).expect("writable");
+        let ok = ExtractToDialog::new(PathBuf::from("/work/a.zip"), PathBuf::from("/work/out"));
+        assert_eq!(ok.read_only_error(&fs), None);
+    }
+
+    #[test]
+    fn extract_to_refuses_path_traversal_members() {
+        assert!(archive_member_escapes(Path::new("../escaped.txt")));
+        assert!(archive_member_escapes(Path::new("/abs/pwned")));
+        assert!(archive_member_escapes(Path::new("a/../../x")));
+        assert!(!archive_member_escapes(Path::new("safe/file.txt")));
+        let error = ExtractToDialog::traversal_members_error(["ok.txt", "../escaped.txt"])
+            .expect("hostile member refused");
+        assert!(
+            error.contains("would escape the destination"),
+            "honest traversal: {error}"
+        );
+        assert!(ExtractToDialog::traversal_members_error(["a/b.txt", "c/d.txt"]).is_none());
     }
 
     // ── ConfirmDelete + typed-arming ─────────────────────────────────────────

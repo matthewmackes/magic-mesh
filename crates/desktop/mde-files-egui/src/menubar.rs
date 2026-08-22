@@ -1023,6 +1023,13 @@ mod tests {
         assert!(items.iter().any(|(_, id, _)| id == &Picked::NewFolder));
         assert!(items.iter().any(|(_, id, _)| id == &Picked::NewFile));
         assert!(items.iter().any(|(_, id, _)| id == &Picked::Duplicate));
+        assert!(items
+            .iter()
+            .any(|(_, id, _)| matches!(id, Picked::Compress(_))));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::ExtractHere));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::ExtractTo));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::Symlink));
+        assert!(items.iter().any(|(_, id, _)| id == &Picked::HardLink));
         assert!(items.iter().any(|(_, id, _)| id == &Picked::Rename));
         assert!(!items.iter().any(|(label, _, _)| label == "Quit"));
     }
@@ -1049,6 +1056,26 @@ mod tests {
         assert!(matches!(
             to_action(Picked::Duplicate, &cx),
             Some(Action::Duplicate(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::Compress(mde_files::ArchiveFormat::Zip), &cx),
+            Some(Action::Compress(0, mde_files::ArchiveFormat::Zip))
+        ));
+        assert!(matches!(
+            to_action(Picked::ExtractHere, &cx),
+            Some(Action::ExtractHere(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::ExtractTo, &cx),
+            Some(Action::OpenExtractTo(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::Symlink, &cx),
+            Some(Action::OpenSymlink(0))
+        ));
+        assert!(matches!(
+            to_action(Picked::HardLink, &cx),
+            Some(Action::OpenHardLink(0))
         ));
         assert!(matches!(
             to_action(Picked::Rename, &cx),
@@ -1169,6 +1196,26 @@ mod tests {
             "Duplicate needs a local selection"
         );
         assert_eq!(
+            enabled(&menus, &Picked::ExtractHere),
+            Some(false),
+            "Extract Here needs a focused archive"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::ExtractTo),
+            Some(false),
+            "Extract To needs a focused archive"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::Symlink),
+            Some(false),
+            "Symlink needs a focused local row"
+        );
+        assert_eq!(
+            enabled(&menus, &Picked::HardLink),
+            Some(false),
+            "Hard Link needs a focused local row"
+        );
+        assert_eq!(
             enabled(&menus, &Picked::Rename),
             Some(false),
             "Rename needs exactly one local row"
@@ -1198,6 +1245,19 @@ mod tests {
         assert_eq!(enabled(&rich, &Picked::Copy), Some(true));
         assert_eq!(enabled(&rich, &Picked::CloseTab), Some(true));
         assert_eq!(enabled(&rich, &Picked::Send), Some(true));
+        assert_eq!(enabled(&rich, &Picked::HardLink), Some(true));
+        let extractable = FilesCtx {
+            can_extract: true,
+            ..fixture()
+        };
+        assert_eq!(
+            enabled(&build_menus(&extractable), &Picked::ExtractHere),
+            Some(true)
+        );
+        assert_eq!(
+            enabled(&build_menus(&extractable), &Picked::ExtractTo),
+            Some(true)
+        );
     }
 
     #[test]
