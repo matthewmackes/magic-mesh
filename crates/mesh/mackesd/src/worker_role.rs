@@ -1684,7 +1684,10 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         WorkerGroup::Integrations,
     ),
     WorkerSpec::responder("voip_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("voip_rtt", RestartPolicy::Always, WorkerGroup::Observation),
+    // WL-FUNC-033 / Q9 — voip_rtt is retired from the live Always-restart
+    // Observation roster after the fleet-negative. The worker implementation
+    // (spawn.rs / voip_rtt_worker.rs) stays until a later leftover-delete
+    // slice; fail closed here so the spec list does not advertise it.
     WorkerSpec::responder("vpn_bus_responder", WorkerGroup::Actions),
 ];
 
@@ -3003,6 +3006,16 @@ mod tests {
             .union(&responder_registry)
             .copied()
             .collect();
+        // WL-FUNC-033 / Q9 leftover: spawn.rs still pushes voip_rtt. That
+        // start site is out of this slice's write scope. Fail closed — the
+        // leftover must not re-enter the spec list.
+        const RETIRED_LEFTOVER_SPAWNS: &[&str] = &["voip_rtt"];
+        assert!(
+            RETIRED_LEFTOVER_SPAWNS
+                .iter()
+                .all(|name| !literal_registry.contains(name) && spec(name).is_none()),
+            "WL-FUNC-033: retired leftover spawn must not re-enter the spec list"
+        );
         let mut tiered_pushed_literally: Vec<&str> = pushed
             .iter()
             .map(String::as_str)
@@ -3020,7 +3033,7 @@ mod tests {
         let mut unaccounted: Vec<&str> = pushed
             .iter()
             .map(String::as_str)
-            .filter(|n| !literal_registry.contains(n))
+            .filter(|n| !literal_registry.contains(n) && !RETIRED_LEFTOVER_SPAWNS.contains(n))
             .collect();
         unaccounted.sort_unstable();
         assert!(
@@ -3087,7 +3100,7 @@ mod tests {
     fn canonical_registry_inventory_hash_covers_every_runtime_field() {
         let hash = registry_inventory_sha256(WORKER_REGISTRY);
         assert_eq!(
-            hash, "7623b72d2c40f0c6d257ff0d9d775f7ff54a94c17f5c6ee0ad6101ff1178c947",
+            hash, "2d86585283a48c4628a0e1a5aa50e29e5b4e6da9e8113c9c0666e1d7c528e1ad",
             "WL-ARCH-009: canonical registration inventory drifted"
         );
 
@@ -3255,7 +3268,8 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 159);
+        // WL-FUNC-033 / Q9 -1 voip_rtt (retired from the live Observation roster).
+        assert_eq!(WORKER_REGISTRY.len(), 158);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3537,6 +3551,42 @@ mod tests {
     }
 
     #[test]
+    fn role_roster_no_longer_names_retired_voip_rtt() {
+        // WL-FUNC-033 / Q9: after the fleet-negative, voip_rtt is not a live
+        // Always-restart Observation worker. Fail closed — the spec list must
+        // not include it. The worker implementation remains until a later
+        // leftover-delete slice.
+        assert!(
+            spec("voip_rtt").is_none(),
+            "WL-FUNC-033: voip_rtt must not appear in the role spec list"
+        );
+        assert!(
+            runtime_spec("voip_rtt").is_none(),
+            "WL-FUNC-033: voip_rtt must not resolve through a runtime alias"
+        );
+        assert!(
+            worker_specs()
+                .iter()
+                .all(|worker| worker.name != "voip_rtt"),
+            "WL-FUNC-033: worker_specs must not advertise voip_rtt"
+        );
+        assert!(
+            !belongs_to_group("voip_rtt", WorkerGroup::Observation),
+            "WL-FUNC-033: voip_rtt must not own the Observation group"
+        );
+        for rank in [Role::Lighthouse.rank(), Role::Workstation.rank()] {
+            assert!(
+                !runs("voip_rtt", rank),
+                "WL-FUNC-033: spawn gate must fail closed for voip_rtt at rank {rank}"
+            );
+            assert!(
+                !workers_for_class(DeployClass::plain(rank)).contains(&"voip_rtt"),
+                "WL-FUNC-033: rank {rank} roster must not name voip_rtt"
+            );
+        }
+    }
+
+    #[test]
     fn music_autoconfig_is_workstation_role_gated_not_media_host_gated() {
         assert!(!runs_in(
             "music_autoconfig",
@@ -3595,12 +3645,13 @@ mod tests {
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
         // gateway proxies brought the real pre-cutover count to 90. The current
-        // canonical roster contains 81 tiered/dynamic registrations, 70 direct
+        // canonical roster contains 81 tiered/dynamic registrations, 69 direct
         // supervisors/responders, and eight process-infrastructure rows. The
         // latter are universal census entries but still have one exact group
         // owner at runtime; all retired VM authorities are absent.
-        assert_eq!(lh.len(), 121);
-        assert_eq!(ws.len(), 159);
+        // WL-FUNC-033 / Q9 -1 voip_rtt (retired from the live Observation roster).
+        assert_eq!(lh.len(), 120);
+        assert_eq!(ws.len(), 158);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
