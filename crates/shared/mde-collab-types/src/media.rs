@@ -1,12 +1,15 @@
-//! Bounded, versioned live-media session contracts (WL-FUNC-024 S1 / S4).
+//! Bounded, versioned live-media session contracts (WL-FUNC-024 S1 / S4 / S6).
 //!
 //! These types are the only media facts allowed on the Bus. Offer/answer,
 //! track kind, mute, and session readiness travel as [`MediaSessionV1`] /
 //! [`MediaDescriptionV1`] — never as untyped JSON bags. PSTN legs travel as
-//! [`SipLegV1`]. The crate is still pure: no I/O, no wall clock, no media
-//! stack. A [`MediaSessionStateV1::Connected`] value is intrinsically invalid
-//! unless advancing frames were observed, so a hostile publisher cannot claim
-//! a live call by omitting evidence.
+//! [`SipLegV1`]. Mid-call honesty (peer drop, SFU loss, device unplug,
+//! permission revoke) is a [`MediaFailureReasonV1`] on the existing
+//! reconnecting/failed ladder — not a parallel schema. The crate is still
+//! pure: no I/O, no wall clock, no media stack. A
+//! [`MediaSessionStateV1::Connected`] value is intrinsically invalid unless
+//! advancing frames were observed, so a hostile publisher cannot claim a live
+//! call by omitting evidence.
 
 use std::fmt;
 
@@ -113,6 +116,11 @@ pub enum MediaSignalingRoleV1 {
 
 /// Typed reason a media session failed. Free-text reasons are forbidden so a
 /// command, URL, or secret cannot ride the Bus as a "failure message".
+///
+/// S6 mid-call honesty uses [`Self::PeerDropped`], [`Self::SfuUnreachable`],
+/// [`Self::DeviceUnplugged`], and [`Self::PermissionRevoked`] on
+/// [`MediaSessionStateV1::Failed`]. Those are distinct from start-of-session
+/// [`MediaSessionStateV1::DeviceAbsent`] / [`MediaSessionStateV1::PermissionDenied`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaFailureReasonV1 {
@@ -124,6 +132,28 @@ pub enum MediaFailureReasonV1 {
     PeerDropped,
     /// Offer/answer did not complete within the worker's bounded wait.
     NegotiationTimeout,
+    /// The elected LiveKit SFU is unreachable; P2P failover may follow.
+    SfuUnreachable,
+    /// A previously bound capture/playback device was unplugged mid-call.
+    DeviceUnplugged,
+    /// Capture/playback permission was revoked after the session started.
+    PermissionRevoked,
+}
+
+impl MediaFailureReasonV1 {
+    /// Canonical snake-case wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::InvalidSignaling => "invalid_signaling",
+            Self::PeerDropped => "peer_dropped",
+            Self::NegotiationTimeout => "negotiation_timeout",
+            Self::SfuUnreachable => "sfu_unreachable",
+            Self::DeviceUnplugged => "device_unplugged",
+            Self::PermissionRevoked => "permission_revoked",
+        }
+    }
 }
 
 /// Honest media-plane state. `connected` is only valid with observed frames.
@@ -1558,6 +1588,116 @@ mod tests {
         assert!(matches!(
             SipLegV1::from_json_bytes(&body),
             Err(SipLegV1DecodeError::BodyTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn s6_failure_reasons_admit_on_the_failed_ladder() {
+        for (reason, token) in [
+            (MediaFailureReasonV1::PeerDropped, "peer_dropped"),
+            (MediaFailureReasonV1::SfuUnreachable, "sfu_unreachable"),
+            (MediaFailureReasonV1::DeviceUnplugged, "device_unplugged"),
+            (
+                MediaFailureReasonV1::PermissionRevoked,
+                "permission_revoked",
+            ),
+        ] {
+            assert_eq!(reason.as_str(), token);
+            let session = unavailable(MediaSessionStateV1::Failed { reason });
+            let body = serde_json::to_string(&session).expect("json");
+            assert!(
+                body.contains(&format!("\"reason\":\"{token}\"")),
+                "wire token {token} must be present"
+            );
+            let decoded = MediaSessionV1::from_json(&body).expect("admit s6 failure");
+            assert_eq!(decoded.state, MediaSessionStateV1::Failed { reason });
+            assert!(!decoded.state.claims_live_media());
+            assert!(decoded.state.is_unavailable());
+        }
+    }
+
+    #[test]
+    fn mid_call_s6_failures_may_retain_prior_frames() {
+        // DeviceAbsent / PermissionDenied reject frames. Mid-call unplug,
+        // permission revoke, SFU loss, and peer drop happen after frames
+        // were observed, so Failed + frames is honest.
+        for reason in [
+            MediaFailureReasonV1::PeerDropped,
+            MediaFailureReasonV1::SfuUnreachable,
+            MediaFailureReasonV1::DeviceUnplugged,
+            MediaFailureReasonV1::PermissionRevoked,
+        ] {
+            let mut session = sample_session();
+            session.state = MediaSessionStateV1::Failed { reason };
+            session
+                .validate()
+                .unwrap_or_else(|error| panic!("{reason:?} with prior frames: {error}"));
+            let body = serde_json::to_string(&session).expect("json");
+            let decoded = MediaSessionV1::from_json(&body).expect("admit mid-call failure");
+            assert_eq!(decoded.frames_observed, 4);
+            assert_eq!(decoded.state, MediaSessionStateV1::Failed { reason });
+            assert!(!decoded.state.claims_live_media());
+        }
+    }
+
+    #[test]
+    fn unknown_failure_reason_and_free_text_reasons_fail_closed() {
+        let session = unavailable(MediaSessionStateV1::Failed {
+            reason: MediaFailureReasonV1::PeerDropped,
+        });
+        let mut value = serde_json::to_value(&session).expect("value");
+        for token in [
+            "unknown_reason",
+            "rm -rf /",
+            "password",
+            "secret",
+            "https://evil.invalid",
+            "sip:alice@evil.invalid",
+            "",
+        ] {
+            value["state"]["reason"] = json!(token);
+            assert!(
+                MediaSessionV1::from_json(&value.to_string()).is_err(),
+                "reason {token:?} must fail"
+            );
+        }
+
+        value = serde_json::to_value(&session).expect("value");
+        value["state"]["message"] = json!("hunter2");
+        assert!(MediaSessionV1::from_json(&value.to_string()).is_err());
+        value = serde_json::to_value(&session).expect("value");
+        value["state"]["detail"] = json!("Authorization: Bearer secret");
+        assert!(MediaSessionV1::from_json(&value.to_string()).is_err());
+        value = serde_json::to_value(&session).expect("value");
+        value["state"]["command"] = json!("rm -rf /");
+        assert!(MediaSessionV1::from_json(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn reconnecting_attempt_is_fail_closed() {
+        let mut value = serde_json::to_value(unavailable(MediaSessionStateV1::Reconnecting {
+            attempt: 1,
+        }))
+        .expect("value");
+        value["state"]["attempt"] = json!(0);
+        assert!(matches!(
+            MediaSessionV1::from_json(&value.to_string()),
+            Err(MediaSessionV1DecodeError::Validation(
+                MediaSessionV1ValidationError::OutOfBounds {
+                    field: "state.attempt",
+                    ..
+                }
+            ))
+        ));
+        value["state"]["attempt"] = json!(u64::from(MAX_MEDIA_RECONNECT_ATTEMPTS) + 1);
+        assert!(matches!(
+            MediaSessionV1::from_json(&value.to_string()),
+            Err(MediaSessionV1DecodeError::Validation(
+                MediaSessionV1ValidationError::OutOfBounds {
+                    field: "state.attempt",
+                    ..
+                }
+            ))
         ));
     }
 }

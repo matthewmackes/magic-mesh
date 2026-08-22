@@ -983,6 +983,11 @@ fn live_audio_unavailable_reason(
             MediaFailureReasonV1::InvalidSignaling => "Unavailable: media signaling failed",
             MediaFailureReasonV1::PeerDropped => "Unavailable: the remote peer dropped",
             MediaFailureReasonV1::NegotiationTimeout => "Unavailable: media negotiation timed out",
+            MediaFailureReasonV1::SfuUnreachable => {
+                "Unavailable: the group media host is unreachable"
+            }
+            MediaFailureReasonV1::DeviceUnplugged => "Unavailable: the media device was unplugged",
+            MediaFailureReasonV1::PermissionRevoked => "Unavailable: media permission was revoked",
         },
         (Some(MediaSessionStateV1::Reconnecting { .. }), _) => {
             "Unavailable: the media session is reconnecting"
