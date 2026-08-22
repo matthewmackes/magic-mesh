@@ -1440,9 +1440,14 @@ story execution contract above.
   Transfers GUI editor publish Save/Remove; inbox drain applies them.
   `last_result` is stamped at enqueue and again after the rsync lane
   outcome. Engine open rebuilds the in-flight job→pair map from
-  enqueue-ok pairs; the leftover "in-memory only" restamp gap is closed.
-- Remaining work: CLI + GUI producer and in-flight job→pair rebuild
-  landed; leftover "in-memory only" restamp gap is closed.
+  enqueue-ok pairs. The worker persists `next_run_ms` on save/enqueue;
+  the shell fold copies that published stamp (or None) and no longer
+  synthesizes last_fired+interval. Leftover is live Bus /
+  operator-visible next-run and last-result on a real pair, not a
+  missing store field.
+- Remaining work: persist + fold copy landed; leftover is live Bus /
+  operator-visible next-run and last-result on a real pair, not a
+  missing store field.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
