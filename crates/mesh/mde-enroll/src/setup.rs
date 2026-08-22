@@ -10,6 +10,7 @@
 //! Lock 1 (one binary grown from `mde-enroll`): the Join screen reuses the
 //! ONBOARD-5 enroll [`crate::app::App`]; `mde-enroll` stays the join-only shim.
 
+use crate::commissioning_view::{CapsuleView, JoinTokenView};
 use crate::lifecycle_view::LifecycleSessionView;
 
 /// Which top-level screen the wizard is showing.
@@ -112,6 +113,10 @@ pub struct Wizard {
     pub log: Vec<String>,
     /// Read-only authority projection rendered by lifecycle-aware clients.
     pub lifecycle_view: Option<LifecycleSessionView>,
+    /// Read-only join-token projection (bearer withheld).
+    pub token_view: Option<JoinTokenView>,
+    /// Read-only commissioning-capsule projection (signature withheld).
+    pub capsule_view: Option<CapsuleView>,
     /// Set when the operator chooses Quit.
     pub should_quit: bool,
 }
@@ -141,6 +146,8 @@ impl Wizard {
             menu_index: 0,
             log: Vec::new(),
             lifecycle_view: None,
+            token_view: None,
+            capsule_view: None,
             should_quit: false,
         }
     }
@@ -223,6 +230,31 @@ impl Wizard {
     /// lifecycle mutation capability.
     pub fn set_lifecycle_view(&mut self, view: LifecycleSessionView) {
         self.lifecycle_view = Some(view);
+    }
+
+    /// Attach a renderer-safe join-token projection. The wizard never stores
+    /// the bearer — only the withheld view.
+    pub fn set_token_view(&mut self, view: JoinTokenView) {
+        self.token_view = Some(view);
+    }
+
+    /// Attach a renderer-safe commissioning-capsule projection.
+    pub fn set_capsule_view(&mut self, view: CapsuleView) {
+        self.capsule_view = Some(view);
+    }
+
+    /// Honest commissioning lines for GUI/TUI consumers. Empty when no
+    /// token or capsule has been attached.
+    #[must_use]
+    pub fn commissioning_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(view) = &self.token_view {
+            lines.push(view.status_line());
+        }
+        if let Some(view) = &self.capsule_view {
+            lines.push(view.status_line());
+        }
+        lines
     }
 }
 
@@ -335,5 +367,20 @@ mod tests {
         let w = Wizard::new(true);
         assert!(!w.menu_items.contains(&MenuItem::CreateMesh));
         assert!(!w.menu_items.contains(&MenuItem::JoinMesh));
+    }
+
+    #[test]
+    fn commissioning_lines_show_token_identity_without_the_bearer() {
+        let mut w = Wizard::new(false);
+        let bearer = "single-use-bearer";
+        let token = format!("mesh:home@10.0.0.5:4243#{bearer}?fp={}", "a".repeat(64));
+        w.set_token_view(JoinTokenView::from_wire(&token).unwrap());
+        let lines = w.commissioning_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("bearer withheld"));
+        assert!(
+            !lines.iter().any(|line| line.contains(bearer)),
+            "wizard commissioning lines leaked the bearer: {lines:?}"
+        );
     }
 }

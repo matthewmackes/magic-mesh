@@ -4,6 +4,8 @@
 //! in `main.rs` (mde-enroll) and `bin/magic-setup.rs` (magic-setup).
 
 pub mod app;
+/// WL-FUNC-023 S6 leftover — renderer-neutral token/capsule projection.
+pub mod commissioning_view;
 pub mod lifecycle_controller;
 /// WL-FUNC-023 S4 — the renderer-neutral lifecycle session projection.
 pub mod lifecycle_view;

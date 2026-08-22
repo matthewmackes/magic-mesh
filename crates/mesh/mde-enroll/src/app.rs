@@ -7,6 +7,7 @@
 
 use mackesd_core::nebula_enroll::{parse_join_token, JoinToken};
 
+use crate::commissioning_view::JoinTokenView;
 use crate::public_roster::{resolve_endpoint, LighthouseEndpoint};
 
 /// A parsed join token plus the separately selected transport destination.
@@ -205,6 +206,12 @@ impl App {
         self.validated_join().map(|join| join.token)
     }
 
+    /// Renderer-safe token identity. The bearer is withheld even when the
+    /// pasted field still holds it for the enroll worker.
+    pub fn token_view(&self) -> Result<JoinTokenView, String> {
+        JoinTokenView::from_wire(&self.token)
+    }
+
     /// Transition into the enrolling phase, marking the first step
     /// active. Clears any prior error.
     pub fn begin_enroll(&mut self) {
@@ -365,5 +372,23 @@ mod tests {
         app.begin_enroll();
         app.push_char('z');
         assert_eq!(app.token, GOOD_TOKEN, "fields are frozen during enroll");
+    }
+
+    #[test]
+    fn token_view_withholds_the_pasted_bearer() {
+        let mut app = App::new();
+        app.token = GOOD_TOKEN.into();
+        let view = app.token_view().expect("minted token");
+        assert_eq!(view.mesh_id, "home");
+        assert!(view.minted);
+        assert!(
+            !view.status_line().contains("bearer?fp="),
+            "view leaked token framing around the bearer"
+        );
+        app.token = "{{JOIN_TOKEN}}".into();
+        assert_eq!(
+            app.token_view().unwrap_err(),
+            "join token is a command template, not a minted bearer"
+        );
     }
 }
