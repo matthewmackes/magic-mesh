@@ -307,6 +307,52 @@ pub fn revoke(workgroup_root: &Path, presented: &str) -> bool {
     crate::bearer_ledger::redeem(workgroup_root, strip_wrapper(presented))
 }
 
+/// Count issued-and-unredeemed enrollment bearers in the workgroup ledger.
+///
+/// First-boot uses this instead of inventing `0`. The ledger stores hashes,
+/// not raw secrets, so the count is the number of pending `.json` entries.
+#[must_use]
+pub fn count_pending(workgroup_root: &Path) -> usize {
+    let dir = crate::bearer_ledger::ledger_dir(workgroup_root);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+                && entry.path().extension().is_some_and(|ext| ext == "json")
+        })
+        .count()
+}
+
+/// Re-record a consumed invite after a failed enrollment so the token stays
+/// retryable (S17). Expired or undecodable codes are not resurrected.
+///
+/// [`redeem_once`] consumes before transport to close replay. When the
+/// enrollment attempt then fails, this is the corrected-forward retain: the
+/// same canonical payload is written back so a later attempt can redeem it
+/// again. An invite that is still pending is left untouched.
+///
+/// # Errors
+/// Propagates an IO failure writing the ledger entry.
+pub fn retain_failed_enrollment(workgroup_root: &Path, presented: &str) -> io::Result<bool> {
+    let Some(invite) = Invite::decode(presented) else {
+        return Ok(false);
+    };
+    if is_recorded(workgroup_root, presented) {
+        return Ok(true);
+    }
+    if !should_record(&invite, now_unix_ms()) {
+        return Ok(false);
+    }
+    crate::bearer_ledger::record_issued(workgroup_root, &invite.canonical())?;
+    Ok(is_recorded(workgroup_root, presented))
+}
+
 // ─────────────────────────────────────────────────────────────────
 // OW-4 (completing slice) — redeem an MDEINV1 code on the JOIN side.
 //
@@ -876,6 +922,46 @@ mod tests {
             Err(RedeemError::NotIssued),
             "a replay through the alternate encoding is refused"
         );
+    }
+
+    #[test]
+    fn retain_failed_enrollment_re_records_a_consumed_live_invite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = issue(tmp.path(), "home-mesh", Duration::from_secs(600)).unwrap();
+        assert_eq!(count_pending(tmp.path()), 1);
+        let token = redeem_once(
+            tmp.path(),
+            &issued.code,
+            issued.invite.exp_ms - 1,
+            "home-mesh",
+            &endpoint(),
+        )
+        .expect("first consume wins");
+        assert_eq!(token.mesh_id, "home-mesh");
+        assert_eq!(count_pending(tmp.path()), 0);
+        assert!(
+            retain_failed_enrollment(tmp.path(), &issued.qr).unwrap(),
+            "a failed enrollment must put the QR twin back on the ledger"
+        );
+        assert!(is_recorded(tmp.path(), &issued.code));
+        assert_eq!(count_pending(tmp.path()), 1);
+        assert!(
+            retain_failed_enrollment(tmp.path(), &issued.code).unwrap(),
+            "a still-pending invite is left untouched"
+        );
+        assert_eq!(count_pending(tmp.path()), 1);
+    }
+
+    #[test]
+    fn retain_failed_enrollment_does_not_resurrect_expired_or_garbage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inv = sample("home-mesh", 5_000);
+        assert!(
+            !retain_failed_enrollment(tmp.path(), &inv.to_code()).unwrap(),
+            "an expired sample was never issued and must not be minted"
+        );
+        assert!(!retain_failed_enrollment(tmp.path(), "garbage").unwrap());
+        assert_eq!(count_pending(tmp.path()), 0);
     }
 
     #[test]

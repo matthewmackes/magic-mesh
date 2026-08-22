@@ -303,6 +303,38 @@ pub fn apply_markers(dir: &Path, ready: bool) -> io::Result<FirstbootMarker> {
     }
 }
 
+/// True when any assembled baseline check is a required Fail or Unknown.
+#[must_use]
+pub fn has_blocking_checks(checks: &[LifecycleRequirementCheckV1]) -> bool {
+    checks
+        .iter()
+        .any(LifecycleRequirementCheckV1::blocks_progress)
+}
+
+/// Stamp markers from the assembled baseline. A planted unit Fail cannot be
+/// ignored by passing `ready: true` to [`apply_markers`].
+pub fn apply_markers_from_checks(
+    dir: &Path,
+    checks: &[LifecycleRequirementCheckV1],
+) -> io::Result<FirstbootMarker> {
+    apply_markers(dir, !has_blocking_checks(checks))
+}
+
+/// After a failed invite enrollment, retain the token and queue
+/// `pending-convergence`. Never stamps Ready: a failed enrollment is a
+/// critical activation failure even if a hostile caller planted healthy facts.
+///
+/// # Errors
+/// Propagates marker or ledger IO failures.
+pub fn queue_after_failed_enrollment(
+    marker_dir: &Path,
+    workgroup_root: &Path,
+    presented: &str,
+) -> io::Result<FirstbootMarker> {
+    crate::onboard::invite::retain_failed_enrollment(workgroup_root, presented)?;
+    apply_markers(marker_dir, false)
+}
+
 fn write_marker(path: &Path, body: &[u8]) -> io::Result<()> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
@@ -316,9 +348,22 @@ fn write_marker(path: &Path, body: &[u8]) -> io::Result<()> {
 }
 
 /// Live seat facts for the CLI. Unknown probes stay fail-closed for core
-/// rows and warning-level for capability rows.
+/// rows and warning-level for capability rows. Pending enrollment tokens
+/// stay `0` unless a workgroup root is supplied via [`gather_live_in`].
 #[must_use]
 pub fn gather_live(target_id: &str, generation: u64, role: Role) -> FirstbootFacts {
+    gather_live_in(target_id, generation, role, None)
+}
+
+/// Live seat facts, counting pending invite/enrollment bearers from the
+/// workgroup ledger when `workgroup_root` is present.
+#[must_use]
+pub fn gather_live_in(
+    target_id: &str,
+    generation: u64,
+    role: Role,
+    workgroup_root: Option<&Path>,
+) -> FirstbootFacts {
     let expected_units: Vec<String> = units_for_role(role)
         .into_iter()
         .map(str::to_owned)
@@ -346,7 +391,9 @@ pub fn gather_live(target_id: &str, generation: u64, role: Role) -> FirstbootFac
         ui_applicable,
         ui_ready: !ui_applicable || unit_is_active("mde-shell-egui.service"),
         hardware_usable: Path::new("/dev/dri").exists(),
-        pending_enrollment_tokens: 0,
+        pending_enrollment_tokens: workgroup_root
+            .map(crate::onboard::invite::count_pending)
+            .unwrap_or(0),
     }
 }
 
@@ -495,6 +542,74 @@ mod tests {
         assert!(!readiness.ready);
         assert_eq!(authority.checkpoint().pending_capsule_ids, pending_before);
         authority.finish().unwrap();
+    }
+
+    #[test]
+    fn failed_invite_enrollment_cannot_ignore_unit_fail_or_burn_token() {
+        use crate::onboard::invite::{self, EnrollEndpoint};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workgroup = tmp.path().join("workgroup");
+        let markers = tmp.path().join("markers");
+        std::fs::create_dir_all(&workgroup).unwrap();
+
+        let issued = invite::issue(&workgroup, "home-mesh", Duration::from_secs(600)).unwrap();
+        assert_eq!(invite::count_pending(&workgroup), 1);
+        let token = invite::redeem_once(
+            &workgroup,
+            &issued.code,
+            issued.invite.exp_ms - 1,
+            "home-mesh",
+            &EnrollEndpoint {
+                lighthouse: "10.0.0.5".into(),
+                port: 4242,
+                fp: None,
+            },
+        )
+        .expect("consume before the failed activation");
+        assert_eq!(token.mesh_id, "home-mesh");
+        assert!(
+            !invite::is_recorded(&workgroup, &issued.code),
+            "redeem_once consumed the bearer before transport"
+        );
+
+        let mut facts = healthy("seat-15");
+        facts.active_units.retain(|unit| unit != "mackesd.service");
+        facts.mesh_identity_present = false;
+        facts.pending_enrollment_tokens = invite::count_pending(&workgroup);
+        let checks = assemble(&facts);
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.check_id == "units" && check.blocks_progress()),
+            "inactive mackesd.service is a critical activation failure"
+        );
+        assert!(
+            apply_markers(&markers, true).unwrap() == FirstbootMarker::Converged,
+            "sanity: the raw marker helper still accepts a hostile ready=true"
+        );
+        assert_eq!(
+            apply_markers_from_checks(&markers, &checks).unwrap(),
+            FirstbootMarker::Pending,
+            "baseline checks, not a caller bool, decide the marker"
+        );
+
+        assert_eq!(
+            queue_after_failed_enrollment(&markers, &workgroup, &issued.code).unwrap(),
+            FirstbootMarker::Pending
+        );
+        assert!(
+            invite::is_recorded(&workgroup, &issued.code),
+            "failed enrollment must re-record the consumed invite"
+        );
+        assert_eq!(invite::count_pending(&workgroup), 1);
+        assert!(!markers.join(FIRSTBOOT_CONVERGED).exists());
+        assert!(markers.join(FIRSTBOOT_PENDING).exists());
+        assert_eq!(
+            std::fs::read(markers.join(FIRSTBOOT_PENDING)).unwrap(),
+            b"queued\n"
+        );
     }
 
     #[test]
