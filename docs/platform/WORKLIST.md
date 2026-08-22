@@ -718,12 +718,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` on BigBoy sha256
   `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`
   (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
-  Browser VM pin matches `3a5e74e6…` (`WL-REL-006-2026-08-22-browser-vm-base-pin-r1.md`).
-  Bootc Containerfile ARG now matches the same index
-  (`WL-REL-006-2026-08-22-bootc-base-pin-r1.md`; receipt `479ec2b8c`). Surface
-  `bootc_base` still null. Kiron S6 admitted. Leftover is Maps
-  `production_admitted`, App catalog real refs, RPM signer after freeze, S7
-  `REPLACE_*`, live-seat dest (WL-TEST-002).
+  App VM, Browser VM, and bootc ARGs now match admitted index `3a5e74e6…`
+  (`WL-REL-006-2026-08-22-app-vm-base-pin-r1.md`, browser-vm and bootc-base-pin-r1;
+  bootc receipt `479ec2b8c`). Surface `bootc_base` still null. Kiron S6 admitted.
+  Leftover is Maps `production_admitted`, App catalog real refs, RPM signer after
+  freeze, S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -780,8 +779,10 @@ is a capacity incident (§10.0.3), not a silent retry.
        `curated`, and bind installation of the exact refs into the App VM image.
        Current-revision App VM receipt is bound to `aca7573bc` on `.90` slot 0
        (`WL-REL-006-2026-08-22-app-vm-receipt-r1.md`). Historical `0e0cd1b3`
-       receipt is stale vs HEAD. Leftover is catalog/`curated` remote plus S7
-       App-catalog `REPLACE_*`; do not claim the release-input gate closed.
+       receipt is stale vs HEAD. Containerfile pin now matches admitted index
+       `3a5e74e6…` (`WL-REL-006-2026-08-22-app-vm-base-pin-r1.md`). Leftover is
+       catalog/`curated` remote plus S7 App-catalog `REPLACE_*`; do not claim
+       the release-input gate closed.
      - Deliverable: immutable App VM digest, base receipt, catalog publication
        object, exact-ref inventory, compatibility metadata, and license record.
      - Validation: App VM producer/inspector and build-image admission pass;

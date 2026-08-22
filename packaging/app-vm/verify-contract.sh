@@ -420,8 +420,22 @@ require 'COPY packaging/app-vm/verify-rpm-supply.sh /tmp/mcnf-app-vm-verify-rpm-
 require 'COPY packaging/app-vm/verify-rpm-build-identity.py /tmp/verify-rpm-build-identity.py' "$APP_VM/Containerfile"
 require 'COPY packaging/app-vm/verify-installed-rpm-identity.sh /tmp/verify-installed-rpm-identity.sh' "$APP_VM/Containerfile"
 require 'COPY packaging/repo/RPM-GPG-KEY-magic-mesh /tmp/RPM-GPG-KEY-magic-mesh' "$APP_VM/Containerfile"
-require_unique_container_arg APP_VM_BASE \
-    'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' "$APP_VM/Containerfile"
+base_image="$(sed -n 's/^ARG APP_VM_BASE=//p' "$APP_VM/Containerfile")"
+base_arg_count=$(awk '
+    $1 == "ARG" {
+        split($2, declaration, "=")
+        if (declaration[1] == "APP_VM_BASE") count++
+    }
+    END { print count + 0 }
+' "$APP_VM/Containerfile")
+[ "$base_arg_count" -eq 1 ] || {
+    echo "FATAL: expected exactly one governed APP_VM_BASE declaration in $APP_VM/Containerfile" >&2
+    exit 1
+}
+[[ "$base_image" =~ ^quay\.io/fedora/fedora-bootc@sha256:[0-9a-f]{64}$ ]] || {
+    echo "FATAL: App VM base is not an immutable Fedora bootc digest" >&2
+    exit 1
+}
 require_governed_container_base "$APP_VM/Containerfile"
 require 'ARG MCNF_APP_VM_SOURCE_COMMIT' "$APP_VM/Containerfile"
 require 'ARG MCNF_APP_VM_BASE_IMAGE_ID' "$APP_VM/Containerfile"
