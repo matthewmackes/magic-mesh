@@ -2127,11 +2127,11 @@ impl Shell {
 
     /// Catalog inputs the live apply site feeds [`hotkeys::HotkeyRouter::dispatch_for`].
     ///
-    /// Documents (Communications) and Terminal pass `Some(surface)` plus the
-    /// text-focus bit so Ctrl+J / Ctrl+N stay with the editor / PTY. Desktop
-    /// and Browser guests reuse Terminal's catalog refuse so guest Chromium /
-    /// VDI keep those keystrokes (`hotkeys.rs` is out of this unit). Other
-    /// surfaces and collapsed chrome stay chrome — no surface, no text focus.
+    /// Documents (Communications), Terminal, Desktop, and Browser pass
+    /// `Some(surface)` plus the text-focus bit so Ctrl+J / Ctrl+N stay with
+    /// the editor / PTY / guest. The catalog refuses those surfaces natively.
+    /// Other surfaces and collapsed chrome stay chrome — no surface, no text
+    /// focus.
     fn transfer_dispatch_focus(
         surface: Surface,
         expanded: bool,
@@ -2141,8 +2141,9 @@ impl Shell {
             return (None, false);
         }
         match surface {
-            Surface::Communications | Surface::Terminal => (Some(surface), text_focus),
-            Surface::Desktop | Surface::Browser => (Some(Surface::Terminal), text_focus),
+            Surface::Communications | Surface::Terminal | Surface::Desktop | Surface::Browser => {
+                (Some(surface), text_focus)
+            }
             _ => (None, false),
         }
     }
@@ -3627,7 +3628,8 @@ impl Shell {
         // surface, so an expanded Terminal always has text focus;
         // Communications uses egui's field-focus bit (Documents editor).
         // Desktop / Browser guests own the same chords (guest Chromium / VDI);
-        // `transfer_dispatch_focus` remaps them onto Terminal's refuse set.
+        // `transfer_dispatch_focus` passes Some(Desktop) / Some(Browser) through
+        // so the catalog refuses natively.
         let text_focus = match self.nav.surface {
             Surface::Terminal | Surface::Desktop | Surface::Browser => true,
             _ => ctx.wants_keyboard_input(),
@@ -7700,10 +7702,10 @@ mod tests {
     #[test]
     fn live_apply_passes_transfer_chords_through_desktop_and_browser_guest_focus() {
         // Desktop / Browser guests must keep Ctrl+J / Ctrl+N the same way
-        // Documents and Terminal refuse at dispatch_for. The catalog's refuse
-        // set is Documents/Terminal; the apply site remaps guest surfaces onto
-        // that gate so chrome-surface dispatch (Workbench, collapsed) is
-        // unchanged.
+        // Documents and Terminal refuse at dispatch_for. The catalog refuses
+        // Desktop/Browser natively; the apply site passes Some(Desktop) /
+        // Some(Browser) through so chrome-surface dispatch (Workbench,
+        // collapsed) is unchanged.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
@@ -7725,8 +7727,8 @@ mod tests {
                 Shell::transfer_dispatch_focus(shell.nav.surface, shell.nav.expanded, true);
             assert_eq!(
                 (text_surface, text_focus),
-                (Some(Surface::Terminal), true),
-                "{surface:?} guest focus remaps onto the catalog refuse set"
+                (Some(surface), true),
+                "{surface:?} guest focus must reach dispatch_for"
             );
             assert!(
                 shell
