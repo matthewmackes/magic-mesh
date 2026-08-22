@@ -284,7 +284,6 @@ impl View {
 pub struct Tab {
     pub view: View,
     pub local_path: String,
-    pub mesh_home_path: Vec<String>,
     pub search: String,
 }
 
