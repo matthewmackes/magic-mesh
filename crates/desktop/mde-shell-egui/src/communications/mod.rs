@@ -1497,7 +1497,10 @@ impl CommunicationsState {
         if let Some(ulid) = drain_gateway_to_bus(&gateway_cmds, self.bus_root.as_deref()) {
             self.pending_gateway_get = Some(ulid);
         }
-        if drain_sync_pair_to_inbox(&self.surface.drain_sync_pair_commands()) {
+        if drain_sync_pair_to_inbox(
+            &self.surface.drain_sync_pair_commands(),
+            &transfers_store_root(),
+        ) {
             self.sync_pair_views_dirty = true;
         }
         if self.gateway_get_dirty && self.surface.mode() == Mode::Activity {
@@ -1775,14 +1778,15 @@ fn fold_sync_pair_views(store_root: &Path) -> Vec<SyncPairView> {
     views
 }
 
-fn drain_sync_pair_to_inbox(commands: &[SyncPairCommand]) -> bool {
+/// Drain editor-emitted [`SyncPairCommand`]s (the surface's `SyncPairSink`)
+/// onto the daemon inbox as `TransferVerb::{SaveSyncPair, RemoveSyncPair}`.
+fn drain_sync_pair_to_inbox(commands: &[SyncPairCommand], store_root: &Path) -> bool {
     if commands.is_empty() {
         return false;
     }
-    let store_root = transfers_store_root();
     let mut wrote = false;
     for command in commands {
-        match write_sync_pair_verb(&store_root, command) {
+        match write_sync_pair_verb(store_root, command) {
             Ok(()) => wrote = true,
             Err(error) => tracing::debug!(
                 target: "shell::communications",
@@ -1838,34 +1842,42 @@ fn write_sync_pair_verb(store_root: &Path, command: &SyncPairCommand) -> Result<
 }
 
 fn validate_sync_pair_command(command: &SyncPairCommand) -> Result<(), String> {
-    let SyncPairCommand::Save {
-        id,
-        source,
-        dest,
-        every_secs,
-        bwlimit,
-    } = command
-    else {
-        return Ok(());
-    };
-    if !valid_sync_pair_id(id) {
-        return Err(format!("invalid sync pair id `{id}`"));
-    }
-    if source.trim().is_empty() || dest.trim().is_empty() {
-        return Err("sync pair requires non-empty source and destination".to_owned());
-    }
-    if source.as_bytes().contains(&0) || dest.as_bytes().contains(&0) {
-        return Err("sync pair source and destination must not contain NUL bytes".to_owned());
-    }
-    if *every_secs == 0 {
-        return Err("sync pair interval must be positive".to_owned());
-    }
-    if let Some(limit) = bwlimit {
-        if !valid_sync_pair_bwlimit(limit) {
-            return Err(format!("invalid sync pair bwlimit `{limit}`"));
+    match command {
+        SyncPairCommand::Remove { id } => {
+            if !valid_sync_pair_id(id) {
+                return Err(format!("invalid sync pair id `{id}`"));
+            }
+            Ok(())
+        }
+        SyncPairCommand::Save {
+            id,
+            source,
+            dest,
+            every_secs,
+            bwlimit,
+        } => {
+            if !valid_sync_pair_id(id) {
+                return Err(format!("invalid sync pair id `{id}`"));
+            }
+            if source.trim().is_empty() || dest.trim().is_empty() {
+                return Err("sync pair requires non-empty source and destination".to_owned());
+            }
+            if source.as_bytes().contains(&0) || dest.as_bytes().contains(&0) {
+                return Err(
+                    "sync pair source and destination must not contain NUL bytes".to_owned(),
+                );
+            }
+            if *every_secs == 0 {
+                return Err("sync pair interval must be positive".to_owned());
+            }
+            if let Some(limit) = bwlimit {
+                if !valid_sync_pair_bwlimit(limit) {
+                    return Err(format!("invalid sync pair bwlimit `{limit}`"));
+                }
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn valid_sync_pair_id(id: &str) -> bool {
@@ -3389,6 +3401,49 @@ mod tests {
     }
 
     #[test]
+    fn sync_pair_sink_drain_publishes_save_and_remove_verbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Same contract as CommunicationsSurface::drain_sync_pair_commands —
+        // the surface's SyncPairSink yields these typed intents for the mount.
+        let drained = vec![
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: "node:oak".to_owned(),
+                every_secs: 900,
+                bwlimit: Some("2m".to_owned()),
+            },
+            SyncPairCommand::Remove {
+                id: "docs".to_owned(),
+            },
+        ];
+        assert!(drain_sync_pair_to_inbox(&drained, dir.path()));
+        let inbox = dir.path().join("inbox");
+        let verbs: Vec<SyncPairVerbWire> = std::fs::read_dir(&inbox)
+            .expect("inbox")
+            .flatten()
+            .map(|entry| {
+                serde_json::from_str(&std::fs::read_to_string(entry.path()).expect("read verb"))
+                    .expect("daemon transfer verb shape")
+            })
+            .collect();
+        assert_eq!(verbs.len(), 2);
+        assert!(verbs.iter().any(|verb| matches!(
+            verb,
+            SyncPairVerbWire::SaveSyncPair(pair)
+                if pair.id == "docs"
+                    && pair.source == "/src"
+                    && pair.dest == "node:oak"
+                    && pair.every_secs == 900
+                    && pair.policy.bwlimit.as_deref() == Some("2m")
+        )));
+        assert!(verbs.iter().any(|verb| matches!(
+            verb,
+            SyncPairVerbWire::RemoveSyncPair(id) if id == "docs"
+        )));
+    }
+
+    #[test]
     fn sync_pair_writer_refuses_inputs_the_worker_would_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
         for command in [
@@ -3419,6 +3474,46 @@ mod tests {
         assert!(
             !dir.path().join("inbox").exists(),
             "rejected GUI commands must not leave inbox records"
+        );
+    }
+
+    #[test]
+    fn sync_pair_sink_drain_refuses_hostile_remove_and_zero_interval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hostile = [
+            SyncPairCommand::Remove {
+                id: "../escape".to_owned(),
+            },
+            SyncPairCommand::Remove { id: String::new() },
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: "/dst".to_owned(),
+                every_secs: 0,
+                bwlimit: None,
+            },
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: String::new(),
+                every_secs: 900,
+                bwlimit: None,
+            },
+            SyncPairCommand::Save {
+                id: "docs".to_owned(),
+                source: "/src".to_owned(),
+                dest: "/dst\0".to_owned(),
+                every_secs: 900,
+                bwlimit: None,
+            },
+        ];
+        assert!(
+            !drain_sync_pair_to_inbox(&hostile, dir.path()),
+            "hostile SyncPairSink drain must not publish any TransferVerb"
+        );
+        assert!(
+            !dir.path().join("inbox").exists(),
+            "rejected sink drain must not leave inbox records"
         );
     }
 }
