@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use mde_enroll::commissioning_view::JoinTokenView;
 use mde_enroll::setup::{Screen, Wizard};
 use mde_enroll::setup_action::{
     add_peer_argv, found_argv, is_active_argv, join_argv, peers_argv, remove_peer_argv,
@@ -234,12 +235,15 @@ fn run_create(wiz: &mut Wizard, mesh_id: &str, role: SetupRole) {
 }
 
 fn run_join(wiz: &mut Wizard, token: &str, role: SetupRole) {
+    // Attach withheld identity before the verb runs so the live-log header
+    // fills from commissioning_lines(); the bearer never enters wizard state.
+    present_join_paste(wiz, token);
     wiz.push_log(format!("joining as {}…", role.as_arg()));
     let argv = join_argv(token, role);
     let mut lines = Vec::new();
     let ok = run_streaming(&argv, |l| lines.push(l));
     for l in lines {
-        wiz.push_log(l);
+        wiz.push_log(redact_issued_line(&l));
     }
     if ok {
         wiz.push_log("✓ joined — overlay up, services enabled, Mesh Sync mounted.".to_string());
@@ -302,8 +306,9 @@ fn run_add_peer(wiz: &mut Wizard, role: SetupRole) {
     ));
     let mut lines = Vec::new();
     let ok = run_streaming(&add_peer_argv(role), |l| lines.push(l));
+    present_issued_material(wiz, &lines, unix_now_ms());
     for l in lines {
-        wiz.push_log(l);
+        wiz.push_log(redact_issued_line(&l));
     }
     if ok {
         wiz.push_log(
@@ -341,6 +346,73 @@ fn run_status(wiz: &mut Wizard) {
         let glyph = if state == "active" { "✓" } else { "✗" };
         wiz.push_log(format!("{glyph} {unit:<22} {state}"));
     }
+}
+
+/// Join-paste path used by [`run_join`]: attach the withheld token view so
+/// [`Wizard::commissioning_lines`] fills the live-log header. Failed present
+/// leaves any existing view unchanged and never logs the raw paste.
+fn present_join_paste(wiz: &mut Wizard, pasted: &str) {
+    if wiz.present_join_token(pasted).is_err() {
+        wiz.push_log("(join token identity not attached)".to_string());
+    }
+}
+
+/// Add-peer / issue path used by [`run_add_peer`]: scan verb output for a
+/// minted join token or commissioning capsule and attach the withheld views.
+/// The bearer and capsule signature never enter wizard state.
+fn present_issued_material(wiz: &mut Wizard, lines: &[String], now_ms: i64) {
+    for line in lines {
+        if let Some(token) = join_token_in_line(line) {
+            let _ = wiz.present_join_token(token);
+        }
+        if let Some(json) = capsule_json_in_line(line) {
+            let _ = wiz.present_capsule(json, now_ms);
+        }
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// First parseable `mesh:…` wire form on `line`, if any.
+fn join_token_in_line(line: &str) -> Option<&str> {
+    let start = line.find("mesh:")?;
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .unwrap_or(rest.len());
+    let candidate = rest.get(..end)?.trim_end_matches(['.', ',', ';', ')']);
+    JoinTokenView::from_wire(candidate).ok()?;
+    Some(candidate)
+}
+
+/// Single-line commissioning-capsule JSON on `line`, if any. Shape-only so an
+/// expired envelope is still redacted; [`Wizard::present_capsule`] applies the
+/// real `now_ms` bound.
+fn capsule_json_in_line(line: &str) -> Option<&str> {
+    let start = line.find('{')?;
+    let candidate = line[start..].trim();
+    if !(candidate.contains("capsule_id") && candidate.contains("signature_hex")) {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(candidate).ok()?;
+    Some(candidate)
+}
+
+/// Operator-log copy of an issued line with the bearer / capsule signature
+/// withheld. Identity belongs in [`Wizard::commissioning_lines`], not here.
+fn redact_issued_line(line: &str) -> String {
+    if let Some(token) = join_token_in_line(line) {
+        return line.replacen(token, "mesh:… (bearer withheld)", 1);
+    }
+    if capsule_json_in_line(line).is_some() {
+        return "capsule issued (signature withheld)".to_string();
+    }
+    line.to_string()
 }
 
 // ── render ──────────────────────────────────────────────────────────────────
@@ -658,5 +730,99 @@ mod tests {
             !lines.iter().any(|l| l.contains(&signature)),
             "wizard live-log leaked the capsule signature: {lines:?}"
         );
+    }
+
+    #[test]
+    fn join_paste_and_add_peer_issue_present_without_leaking_bearer() {
+        let bearer = "single-use-bearer";
+        let token = format!("mesh:home@10.0.0.5:4243#{bearer}?fp={}", "a".repeat(64));
+        let signature = "c".repeat(128);
+        let capsule = serde_json::json!({
+            "schema_version": 1,
+            "capsule_id": "capsule-1",
+            "target_id": "seat-15",
+            "expires_at_ms": 2_000,
+            "bootstrap_digest_hex": "b".repeat(64),
+            "one_time": true,
+            "key_id": "commissioning-v1",
+            "signature_hex": signature,
+        })
+        .to_string();
+
+        let mut pasted = Wizard::new(false);
+        assert!(pasted.commissioning_lines().is_empty());
+        present_join_paste(&mut pasted, &token);
+        pasted.push_log("joining as workstation…".to_string());
+        let paste_lines = live_log_lines(&pasted, 8);
+        assert!(
+            paste_lines.iter().any(|l| l.contains("bearer withheld")),
+            "Join paste must call present_join_token: {paste_lines:?}"
+        );
+        assert!(
+            !paste_lines.iter().any(|l| l.contains(bearer)),
+            "Join paste leaked the bearer: {paste_lines:?}"
+        );
+        assert!(
+            !format!("{pasted:?}").contains(bearer),
+            "wizard debug leaked the bearer after Join paste"
+        );
+
+        let mut refuse = Wizard::new(false);
+        present_join_paste(&mut refuse, "{{JOIN_TOKEN}}");
+        present_join_paste(&mut refuse, "garbage");
+        assert!(
+            refuse.commissioning_lines().is_empty(),
+            "failed present must leave commissioning_lines empty: {:?}",
+            refuse.commissioning_lines()
+        );
+        assert!(
+            !refuse
+                .log
+                .iter()
+                .any(|l| l.contains("{{JOIN_TOKEN}}") || l.contains("garbage")),
+            "failed present logged the raw paste: {:?}",
+            refuse.log
+        );
+
+        let mut issued = Wizard::new(true);
+        assert!(issued.commissioning_lines().is_empty());
+        let verb_out = vec![
+            token.clone(),
+            format!("or:  mackesd join '{token}' --role workstation"),
+            capsule.clone(),
+            "single-use v3 token minted (SETUP-5)".to_string(),
+        ];
+        present_issued_material(&mut issued, &verb_out, 1_000);
+        let header = issued.commissioning_lines();
+        assert!(
+            header.iter().any(|l| l.contains("bearer withheld")),
+            "add-peer issue must call present_join_token: {header:?}"
+        );
+        assert!(
+            header.iter().any(|l| l.contains("signature withheld")),
+            "add-peer issue must call present_capsule: {header:?}"
+        );
+        assert!(
+            !header
+                .iter()
+                .any(|l| l.contains(bearer) || l.contains(&signature)),
+            "issued commissioning_lines leaked a secret: {header:?}"
+        );
+
+        let redacted: Vec<String> = verb_out.iter().map(|l| redact_issued_line(l)).collect();
+        for line in &redacted {
+            issued.push_log(line.clone());
+        }
+        let live = live_log_lines(&issued, 12);
+        assert!(
+            !live.iter().any(|l| l.contains(bearer)),
+            "add-peer live-log leaked the bearer: {live:?}"
+        );
+        assert!(
+            !live.iter().any(|l| l.contains(&signature)),
+            "add-peer live-log leaked the capsule signature: {live:?}"
+        );
+        assert!(redacted.iter().any(|l| l.contains("bearer withheld")));
+        assert!(redacted.iter().any(|l| l.contains("signature withheld")));
     }
 }
