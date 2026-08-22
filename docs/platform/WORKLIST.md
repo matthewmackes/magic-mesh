@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 10 `Remaining`, 9 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 4 `Remaining`, 15 `Blocked`, 0 `Needs clarification`.
   Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
   surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
   fetch authorized; preflight template then operator secrets; seats+Vitelity go.
@@ -1211,7 +1211,7 @@ story execution contract above.
 
 ### WL-FUNC-024 - Carry live audio and video media in Communications Calls
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P1
 - Complexity: Epic
 - Problem: Communications Calls ships the complete call UI and convergent
@@ -1223,18 +1223,13 @@ story execution contract above.
   LiveKit SFU with P2P failover, and PSTN legs terminate through the LiveKit
   SIP gateway reusing the mde-voice-hud softphone, with all media state owned
   by typed mackesd verbs and never by the renderer.
-- Current state: inbound SIP retain+hangup ticks the publish plane
-  (`collab_media.rs`, `call_media.rs`); HUD `calls.rs` names every
-  `MediaFailureReasonV1`. Calls consumes the Q15 `VoiceAccounts` snapshot
-  (no second registrar); the surface no longer leaves VoiceAccounts unused.
-  Bridged remints stay unbridged without proven LiveKit. Mute/DTMF fail
-  closed without a published MediaSessionV1. Leftover is still live
-  media/SFU/PSTN.
-- Remaining work: VoiceAccounts consume landed; mute/DTMF fail closed
-  without a published MediaSessionV1; leftover is still live
-  media/SFU/PSTN (S2-S4) plus remaining S5/S6 live-plane bind; change only
-  owned components; record deliverable, farm command, result, revision,
-  and evidence per story.
+- Current state: in-tree media publish + VoiceAccounts consume landed.
+  Mute/DTMF fail closed without a published MediaSessionV1. Leftover is live
+  media/SFU/PSTN. Seats run `magic-mesh-12.1.6-35`; PSTN depends on FUNC-030
+  (Blocked); no unpublished signed candidate. Evidence:
+  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Remaining work: leftover is still live media/SFU/PSTN after a
+  current-revision unpublished candidate is installed.
   1. S1 Add the typed media contracts.
      - Inputs: mde-collab-types versioning conventions and the calls.rs command
        set.
@@ -1300,7 +1295,8 @@ story execution contract above.
   `crates/services/mde-voice-hud/src/sip.rs`,
   `crates/mesh/mackesd/src/workers/`.
 - Dependencies: WL-FUNC-030 for the operator-facing gateway configuration the
-  PSTN leg consumes.
+  PSTN leg consumes; WL-REL-002 unpublished signed candidate plus red alert +
+  5s before any live media/PSTN seat mutation.
 - Acceptance criteria: two seats complete an audio call with objective tone
   correlation, mute and DTMF act on the live leg, a group call rides the SFU,
   a PSTN leg lands through the gateway, and every failure renders a typed
@@ -1315,7 +1311,7 @@ story execution contract above.
 
 ### WL-FUNC-025 - Surface the full Files POSIX operation set
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P1
 - Complexity: Medium
 - Problem: file-manager design lock 1 requires the full POSIX plus archive
@@ -1325,13 +1321,13 @@ story execution contract above.
 - Required outcome: every lock-1 operation is reachable from the Files menubar
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
-- Current state: menubar and context reach New File, Duplicate, Compress,
-  Extract Here/To, Symlink, and Hardlink through `FileOps`/`OpKind`/
-  archive (`dialogs.rs`, `model/mod.rs`, `view.rs`, `menubar.rs`).
-  Operator 2026-08-22 Q26: Files stays its own OS surface. Live mesh-tree
-  and archive-queue production evidence is still remaining.
-- Remaining work: surface wiring for S1-S3 is in-tree; leftover is live
-  local/mesh and archive-queue evidence, not a missing command.
+- Current state: S1-S3 surface wiring is in-tree. Q26: Files stays its own OS
+  surface. Read-only 2026-08-22: no Files persist files on Dell, Seat 15, or
+  Surface; seats run `magic-mesh-12.1.6-35`. Leftover is live mesh-tree and
+  archive-queue evidence. Evidence:
+  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Remaining work: leftover is live local/mesh and archive-queue evidence, not
+  a missing command.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
@@ -1366,6 +1362,8 @@ story execution contract above.
 - Relevant files/components:
   `crates/desktop/mde-files-egui/src/{dialogs.rs,model/mod.rs,view.rs,menubar.rs}`,
   `crates/services/mde-files/src/{opqueue.rs,fileops.rs,archive.rs}`.
+- Dependencies: WL-REL-002 unpublished signed candidate; operator live Files
+  use on a current-revision seat.
 - Acceptance criteria: all six operations are reachable, execute through the
   existing engine, report progress and cancel honestly, and hostile paths
   refuse.
@@ -1377,20 +1375,19 @@ story execution contract above.
 
 ### WL-FUNC-026 - Persist per-folder Files view preferences
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P2
 - Complexity: Small
 - Problem: file-manager design lock 20 says view and sort persist per folder,
   but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
 - Required outcome: per-folder view mode, sort order, and show-hidden survive
   a shell restart.
-- Current state: `FolderPrefs` persist at
-  `<config>/mcnf/files-folder-prefs.json` (`model/mod.rs`): serde write
-  debounced on mutation, hydrate at construction, LRU cap 256; corrupt,
-  oversize, or symlinked files degrade to defaults. Live restart
-  production evidence is still remaining.
-- Remaining work: persist path is in-tree; leftover is live restart
-  evidence (fixtures do not satisfy production).
+- Current state: persist path is in-tree. Read-only 2026-08-22:
+  `files-folder-prefs.json` is absent on Dell, Seat 15, and Surface; seats
+  run `magic-mesh-12.1.6-35`. Leftover is live restart evidence. Evidence:
+  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Remaining work: leftover is live restart evidence (fixtures do not satisfy
+  production).
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
@@ -1407,6 +1404,8 @@ story execution contract above.
 - Scope: the mde-files-egui model only.
 - Relevant files/components:
   `crates/desktop/mde-files-egui/src/model/mod.rs`.
+- Dependencies: WL-REL-002 unpublished signed candidate; operator live Files
+  use then restart on a current-revision seat.
 - Acceptance criteria: preferences survive restart, stay bounded on disk, and
   hostile files degrade to defaults.
 - Verification method: focused mde-files-egui farm gate.
@@ -1416,7 +1415,7 @@ story execution contract above.
 
 ### WL-FUNC-027 - Add persisted user bookmarks to the Files Places sidebar
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P2
 - Complexity: Small
 - Problem: file-manager design lock 21 requires user-pinnable bookmarks, but
@@ -1424,13 +1423,12 @@ story execution contract above.
   never built.
 - Required outcome: operators pin, rename, reorder, and remove their own
   Places entries, persisted across restarts.
-- Current state: Places pin/rename/reorder/remove persist in
-  `<config>/mcnf/files-bookmarks.json` (`model/mod.rs`, `view.rs`);
-  hostile paths, duplicates, and corrupt stores refuse or degrade. Mesh
-  peers stay a distinct live section. Live restart-and-navigate
-  production evidence is still remaining.
-- Remaining work: bookmark store is in-tree; leftover is live
-  restart/navigate evidence, not a missing store.
+- Current state: bookmark store is in-tree. Read-only 2026-08-22:
+  `files-bookmarks.json` is absent on Dell, Seat 15, and Surface; seats run
+  `magic-mesh-12.1.6-35`. Leftover is live restart/navigate evidence.
+  Evidence: `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Remaining work: leftover is live restart/navigate evidence, not a missing
+  store.
   1. S1 Add the bookmark store and sidebar section.
      - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
        Places render path.
@@ -1447,6 +1445,8 @@ story execution contract above.
 - Relevant files/components:
   `crates/desktop/mde-files-egui/src/model/mod.rs`,
   `crates/desktop/mde-files-egui/src/view.rs`.
+- Dependencies: WL-REL-002 unpublished signed candidate; operator live Files
+  pin then restart on a current-revision seat.
 - Acceptance criteria: pin, rename, reorder, and remove persist and activate;
   the store is bounded and hostile input refuses.
 - Verification method: focused mde-files-egui farm gate.
@@ -1600,7 +1600,7 @@ story execution contract above.
 
 ### WL-FUNC-031 - Build the per-document mesh co-edit share-session UI
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P2
 - Complexity: Medium
 - Problem: the Yrs CRDT co-editing library rides the embedded editor, but no
@@ -1611,13 +1611,12 @@ story execution contract above.
   document to a space, participants join with view/edit permission and
   follow-mode, and the session lifecycle is visible and closable by its
   owner.
-- Current state: documents.rs exposes live_document_share_session();
-  follow/unfollow/close apply on the attached session. show() now
-  passes that live session into the drain (sibling pub+wire landed).
-  Leftover: live two-seat co-edit evidence only, not a missing mount
-  wire.
-- Remaining work: show() mounts live_document_share_session(); leftover
-  is live two-seat co-edit evidence only, not a missing mount wire.
+- Current state: show() mounts live_document_share_session(); sibling pub+wire
+  landed. Leftover is live two-seat co-edit. Seats run `magic-mesh-12.1.6-35`;
+  no unpublished signed candidate. Evidence:
+  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Remaining work: leftover is live two-seat co-edit evidence only, not a
+  missing mount wire.
   1. S1 Share-session lifecycle UI.
      - Inputs: the documents.rs marked seams, the collab_session library, and
        space membership from the collab store.
@@ -1642,6 +1641,8 @@ story execution contract above.
   `crates/desktop/mde-collab-egui/src/documents.rs`,
   `crates/desktop/mde-collab-egui/src/fixture.rs`,
   `crates/desktop/mde-editor-egui/`.
+- Dependencies: WL-REL-002 unpublished signed candidate; two current-revision
+  seats and an operator share session.
 - Acceptance criteria: share, join, follow, and close work between two seats;
   external writes merge safely; no Phase-3c marker remains.
 - Verification method: focused mde-collab-egui farm gates with the
@@ -1652,7 +1653,7 @@ story execution contract above.
 
 ### WL-FUNC-032 - Reserve the Transfers hotkeys
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P3
 - Complexity: Small
 - Problem: no global accelerator opens Transfers, so the industry-standard
@@ -1660,12 +1661,12 @@ story execution contract above.
 - Required outcome: Ctrl+J opens Communications Transfers from any Construct
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
-- Current state: catalog binds Ctrl+J (Open Transfers) and Ctrl+N (New
-  transfer) in `hotkeys.rs`; live apply refuses both on Documents,
-  Terminal, Desktop, and Browser natively (text/guest focus) so those
-  surfaces keep the chord. Hotkeys settings lists both labels.
-- Remaining work: catalog + apply refuse landed; leftover is live-surface
-  proof from every Construct surface, not a missing binding.
+- Current state: catalog + apply refuse landed. Leftover is live-surface
+  proof from every Construct surface. Seats run `magic-mesh-12.1.6-35`; no
+  unpublished signed candidate. Evidence:
+  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Remaining work: leftover is live-surface proof from every Construct
+  surface, not a missing binding.
   1. S1 Register both bindings.
      - Inputs: the hotkeys.rs table and the Communications mode router.
      - Action: bind Ctrl+J to Surface::Communications in Transfers mode and
@@ -1679,6 +1680,8 @@ story execution contract above.
 - Relevant files/components:
   `crates/desktop/mde-shell-egui/src/hotkeys.rs`,
   `crates/desktop/mde-collab-egui/src/transfers.rs`.
+- Dependencies: WL-REL-002 unpublished signed candidate; current-revision
+  Construct on a used acceptance seat.
 - Acceptance criteria: both accelerators work and are catalogued with no
   focus-context shadowing.
 - Verification method: focused mde-shell-egui and mde-collab-egui farm gates.
