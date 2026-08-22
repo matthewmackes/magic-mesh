@@ -241,8 +241,11 @@ impl SipGatewayProvider {
             return;
         };
         if let Ok(mut legs) = self.inbound_legs.lock() {
-            legs.insert(call, e164);
+            legs.insert(call, e164.clone());
         }
+        // Agent-owned leftover map still ticks /sip. Also retain on the
+        // publish plane so both paths tick the same unbridged inbound document.
+        let _ = self.publish_plane.retain_inbound_leg(call, &e164);
     }
 
     fn forget_inbound_leg(&self, call: CallId) {
@@ -1767,6 +1770,79 @@ mod tests {
                 .expect("read session topic")
                 .is_none(),
             "inbound sip mint must not invent a Connected media session"
+        );
+    }
+
+    #[test]
+    fn inbound_bind_of_valid_e164_retains_on_publish_plane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let provider = SipGatewayProvider::with_channel(tx, SipProviderHealth::Ready);
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let offer = InboundCallOffer {
+            identity: "+15551234567".to_string(),
+            provider_call_id: "dlg@example.com".to_string(),
+        };
+        *provider.pending_inbound.lock().expect("pending lock") = Some(offer.clone());
+        assert!(
+            provider.bind_inbound_call(&offer, Some(call)),
+            "inbound offer must bind to the minted call id"
+        );
+        assert_eq!(
+            provider
+                .inbound_legs
+                .lock()
+                .expect("inbound legs")
+                .get(&call)
+                .map(String::as_str),
+            Some("+15551234567"),
+            "agent-owned leftover map still retains the inbound E.164"
+        );
+        // Drop the leftover local map so only the publish plane can tick /sip.
+        provider.inbound_legs.lock().expect("inbound legs").clear();
+
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::SipGateway, provider)
+            .expect("register agent-owned SIP adapter");
+
+        let mut session = ready_audio_session();
+        session.call = call;
+        session.space = space;
+        write_readiness(
+            &persist,
+            &CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: vec![session],
+            },
+        );
+
+        let mut last_published = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+
+        let topic = media_sip_leg_topic(call);
+        let msg = persist.read_latest(&topic).expect("read sip topic").expect(
+            "bind of a valid E.164 must retain on the publish plane so /sip ticks without the leftover local map",
+        );
+        let leg = SipLegV1::from_json(msg.body.as_deref().expect("sip body"))
+            .expect("admit inbound sip document");
+        assert_eq!(leg.session, call);
+        assert_eq!(leg.direction, SipLegDirectionV1::Inbound);
+        assert_eq!(leg.e164, "+15551234567");
+        assert!(!leg.bridged, "publish-plane retain must stay unbridged");
+        assert_eq!(leg.topic(), topic);
+        assert!(
+            last_published.contains_key(&topic),
+            "inbound sip topic must be retained in the worker publish cache"
+        );
+        assert!(
+            persist
+                .read_latest(&media_session_topic(call))
+                .expect("read session topic")
+                .is_none(),
+            "inbound sip retain must not invent a Connected media session"
         );
     }
 
