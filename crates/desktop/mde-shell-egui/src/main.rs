@@ -2110,15 +2110,16 @@ impl Shell {
         ctx.request_repaint();
     }
 
-    /// Transfers chords must not steal keystrokes from Documents text editing,
-    /// the Terminal PTY, or a focused guest. Collapsed Construct chrome is safe.
+    /// Transfers chords must not steal keystrokes from Documents text editing
+    /// or the Terminal PTY. Desktop/Browser guests refuse at
+    /// [`Self::transfer_dispatch_focus`] so the catalog never emits those
+    /// actions. Collapsed Construct chrome is safe.
     fn transfer_hotkey_shadowed(&self, ctx: &egui::Context) -> bool {
         if !self.nav.expanded {
             return false;
         }
         match self.nav.surface {
             Surface::Terminal => true,
-            Surface::Desktop | Surface::Browser => true,
             Surface::Communications => ctx.wants_keyboard_input(),
             _ => false,
         }
@@ -2127,17 +2128,22 @@ impl Shell {
     /// Catalog inputs the live apply site feeds [`hotkeys::HotkeyRouter::dispatch_for`].
     ///
     /// Documents (Communications) and Terminal pass `Some(surface)` plus the
-    /// text-focus bit so Ctrl+J / Ctrl+N stay with the editor / PTY. Other
+    /// text-focus bit so Ctrl+J / Ctrl+N stay with the editor / PTY. Desktop
+    /// and Browser guests reuse Terminal's catalog refuse so guest Chromium /
+    /// VDI keep those keystrokes (`hotkeys.rs` is out of this unit). Other
     /// surfaces and collapsed chrome stay chrome — no surface, no text focus.
     fn transfer_dispatch_focus(
         surface: Surface,
         expanded: bool,
         text_focus: bool,
     ) -> (Option<Surface>, bool) {
-        if expanded && matches!(surface, Surface::Communications | Surface::Terminal) {
-            (Some(surface), text_focus)
-        } else {
-            (None, false)
+        if !expanded {
+            return (None, false);
+        }
+        match surface {
+            Surface::Communications | Surface::Terminal => (Some(surface), text_focus),
+            Surface::Desktop | Surface::Browser => (Some(Surface::Terminal), text_focus),
+            _ => (None, false),
         }
     }
 
@@ -3616,12 +3622,14 @@ impl Shell {
         let host_keys = mde_egui::hostkeys::drain_host_keys();
         let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
         let mut super_tab = false;
-        // WL-FUNC-032 leftover: the catalog refuses Transfers chords while
-        // Documents (Communications) or Terminal have text focus. Terminal's
-        // PTY is the surface, so an expanded Terminal always has text focus;
+        // The catalog refuses Transfers chords while Documents
+        // (Communications) or Terminal have text focus. Terminal's PTY is the
+        // surface, so an expanded Terminal always has text focus;
         // Communications uses egui's field-focus bit (Documents editor).
+        // Desktop / Browser guests own the same chords (guest Chromium / VDI);
+        // `transfer_dispatch_focus` remaps them onto Terminal's refuse set.
         let text_focus = match self.nav.surface {
-            Surface::Terminal => true,
+            Surface::Terminal | Surface::Desktop | Surface::Browser => true,
             _ => ctx.wants_keyboard_input(),
         };
         let (text_surface, text_focus) =
@@ -7686,6 +7694,80 @@ mod tests {
             Shell::transfer_dispatch_focus(Surface::Communications, false, true),
             (None, false),
             "collapsed chrome is not Documents text focus"
+        );
+    }
+
+    #[test]
+    fn live_apply_passes_transfer_chords_through_desktop_and_browser_guest_focus() {
+        // Desktop / Browser guests must keep Ctrl+J / Ctrl+N the same way
+        // Documents and Terminal refuse at dispatch_for. The catalog's refuse
+        // set is Documents/Terminal; the apply site remaps guest surfaces onto
+        // that gate so chrome-surface dispatch (Workbench, collapsed) is
+        // unchanged.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        let ctrl_j = super::hotkeys::KeyPress {
+            key: egui::Key::J,
+            shift: false,
+            ctrl: true,
+        };
+        let ctrl_n = super::hotkeys::KeyPress {
+            key: egui::Key::N,
+            shift: false,
+            ctrl: true,
+        };
+
+        for surface in [Surface::Desktop, Surface::Browser] {
+            shell.nav.expanded = true;
+            shell.nav.surface = surface;
+            let (text_surface, text_focus) =
+                Shell::transfer_dispatch_focus(shell.nav.surface, shell.nav.expanded, true);
+            assert_eq!(
+                (text_surface, text_focus),
+                (Some(Surface::Terminal), true),
+                "{surface:?} guest focus remaps onto the catalog refuse set"
+            );
+            assert!(
+                shell
+                    .hotkeys
+                    .dispatch_for(&[], &[ctrl_j], text_surface, text_focus)
+                    .is_empty(),
+                "Ctrl+J must pass through {surface:?} guest focus"
+            );
+            assert!(
+                shell
+                    .hotkeys
+                    .dispatch_for(&[], &[ctrl_n], text_surface, text_focus)
+                    .is_empty(),
+                "Ctrl+N must pass through {surface:?} guest focus"
+            );
+        }
+
+        shell.nav.surface = Surface::Desktop;
+        let (text_surface, text_focus) =
+            Shell::transfer_dispatch_focus(shell.nav.surface, true, false);
+        assert_eq!(
+            shell
+                .hotkeys
+                .dispatch_for(&[], &[ctrl_j], text_surface, text_focus),
+            vec![HotkeyAction::OpenTransfers],
+            "Desktop chrome without a guest still fires Ctrl+J"
+        );
+        assert_eq!(
+            Shell::transfer_dispatch_focus(Surface::Workbench, true, true),
+            (None, false),
+            "non-guest surfaces stay chrome dispatch"
+        );
+        assert_eq!(
+            Shell::transfer_dispatch_focus(Surface::Desktop, false, true),
+            (None, false),
+            "collapsed chrome is not a Desktop guest"
+        );
+        assert_eq!(
+            Shell::transfer_dispatch_focus(Surface::Browser, false, true),
+            (None, false),
+            "collapsed chrome is not a Browser guest"
         );
     }
 
