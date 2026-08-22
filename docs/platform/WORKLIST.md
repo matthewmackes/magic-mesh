@@ -713,26 +713,23 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: Canonical dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
-  on BigBoy `172.20.0.130` holds dest-root OSM-derived raster 167936 B sha256
-  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` with
-  `mcnf-maps-mbtiles-receipt` (`production_admitted: false`). Dest-root fixture
-  12288 B `dd7cde7e…87046e` untouched. Not Dell/Seat 15/Surface. S3 App VM
-  receipt bound to `aca7573bc`. S5 `all-roles` bootc `479ec2b8c` is under
-  `/root/mcnf-private/`. Kiron S6 remains admitted. Leftover is Maps
-  `production_admitted`, live-seat dest (WL-TEST-002), and S7 `REPLACE_*`
-  (Maps/RPM/App catalog). Evidence: `WL-REL-006-2026-08-22-app-vm-receipt-r1.md`,
-  `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`,
-  `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`.
+- Current state: S1 six-role inventory exists
+  (`WL-REL-006-2026-08-22-open-source-inventory-r1.md`; no Cuttlefish). Maps dest
+  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` on BigBoy sha256
+  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`
+  (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`. S5
+  `all-roles` bootc `479ec2b8c` is under `/root/mcnf-private/`. Kiron S6 admitted.
+  Leftover is Maps `production_admitted`, App catalog real refs, RPM signer
+  receipt after freeze, S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
        licenses, and the existing receipt/verifier contracts.
-     - Action: record the already-selected reproducible open-source sources and
-       local build recipes for each role; record upstream project, license,
-       version, digest method, and required named system credentials. Do not
-       reopen source selection unless an exact selected
-       source is proven unavailable or unlicensed.
+     - Action: six-role redacted inventory is recorded; do not reopen source
+       selection. Leftover is Maps `production_admitted`, App catalog real
+       refs, RPM signer receipt after freeze (WL-REL-001), S7 `REPLACE_*`,
+       and live-seat dest (WL-TEST-002). Browser VM names the in-tree
+       producer/verifier family only; no current-revision-bound image digest.
      - Deliverable: redacted open-source input inventory and license manifest.
       - Validation: every source is redistributable and its credential/preflight
        requirements are machine-verifiable;
