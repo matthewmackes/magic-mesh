@@ -1201,16 +1201,19 @@ pub fn publish_cutover(persist: &Persist, status: &CutoverStatus) {
 
 /// Mirror the current leader-held shared-outbound config to [`SHARED_STATE_TOPIC`]
 /// (lock 13) so the panel can show the value in force (e.g. a lifted legacy
-/// caller-ID). Best-effort; publishes nothing when none is set.
+/// caller-ID). When none is set the topic is still written as retained `null`
+/// so an unprovisioned fleet is honestly empty, not missing.
 fn publish_shared_state(persist: &Persist, store: &SecretStore) {
-    if let Ok(Some(body)) = store.get(&shared_outbound_ref()) {
-        if let Err(e) = persist.write(SHARED_STATE_TOPIC, Priority::Min, None, Some(&body)) {
-            tracing::debug!(
-                target: "mackesd::voice_provision",
-                error = %e,
-                "mirroring shared-outbound config failed"
-            );
-        }
+    let body = match store.get(&shared_outbound_ref()) {
+        Ok(Some(body)) => body,
+        _ => "null".to_string(),
+    };
+    if let Err(e) = persist.write(SHARED_STATE_TOPIC, Priority::Min, None, Some(&body)) {
+        tracing::debug!(
+            target: "mackesd::voice_provision",
+            error = %e,
+            "mirroring shared-outbound config failed"
+        );
     }
 }
 
@@ -1701,8 +1704,11 @@ impl VoiceProvisionWorker {
 
         let desired = self.read_desired();
         if desired.is_empty() {
-            // No enrolled nodes, but still drive the cutover machine off the lift
-            // flag (Legacy vs LiftedSharedOutbound) so the panel prompts honestly.
+            // No enrolled / provisioned account. Published action/voice/* verbs
+            // still land in retained state/voice/* so the panel binds honest
+            // empty projections (empty DID inventory, no invented node rows)
+            // instead of missing topics. Cutover still reflects the lift flag.
+            publish_dids(persist, &[]);
             publish_cutover(persist, &derive_cutover_status(&[], lifted));
             return None;
         }
@@ -2176,6 +2182,35 @@ mod tests {
             nonce,
             ACTION_NOW + 30_000,
         )
+    }
+
+    fn signed_failover_body(node_id: &str, nonce: &str) -> String {
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "node_id": node_id,
+            "policy": "Voicemail"
+        })
+        .to_string();
+        authorize_test_body(
+            ACTION_KEY,
+            &unsigned,
+            MutationContext {
+                verb: VOICE_FAILOVER_AUTH_VERB,
+                node: VOICE_AUTH_NODE,
+                target: node_id,
+            },
+            nonce,
+            ACTION_NOW + 30_000,
+        )
+    }
+
+    fn latest_retained_body(persist: &Persist, topic: &str) -> Option<String> {
+        persist
+            .list_since(topic, None)
+            .unwrap()
+            .into_iter()
+            .last()
+            .and_then(|msg| msg.body)
     }
 
     /// A `LocalAead` store with a real mesh age identity (the same round-trip
@@ -3077,6 +3112,78 @@ mod tests {
         let cfg = read_desired_shared_config(&persist).expect("a config was applied");
         assert_eq!(cfg.caller_id, "15559990000");
         assert_eq!(cfg.outbound_trunk, "shared-vitelity");
+    }
+
+    #[test]
+    fn accepted_voice_verbs_land_in_empty_retained_state_when_unprovisioned() {
+        // No enrolled nodes, no master creds, no shared-outbound — unprovisioned.
+        // Authorized action/voice/* verbs must still write retained state/voice/*
+        // so the panel binds honest empty projections instead of missing topics.
+        let tmp = tempfile::tempdir().unwrap();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            ACTION_KEY,
+            tmp.path().join("action-auth"),
+            ACTION_NOW,
+        ));
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let store = seeded_store(tmp.path());
+        let mut worker = VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:leader".into())
+            .with_db_path(tmp.path().join("voice.sqlite"))
+            .with_bus_root(bus.path().to_path_buf())
+            .with_store(store)
+            .with_authorizer(authorizer);
+
+        assert!(worker
+            .accept_action(
+                PROVISION_TOPIC,
+                Some(&signed_provision_body("voice-empty-provision"))
+            )
+            .unwrap());
+        assert!(worker
+            .accept_action(
+                DID_ROUTE_TOPIC,
+                Some(&signed_did_route_body(
+                    "15551234567",
+                    "peer:eagle",
+                    "voice-empty-route"
+                ))
+            )
+            .unwrap());
+        assert!(worker
+            .accept_action(
+                FAILOVER_TOPIC,
+                Some(&signed_failover_body("peer:eagle", "voice-empty-failover"))
+            )
+            .unwrap());
+
+        assert!(
+            worker.reconcile_and_publish(&persist).is_none(),
+            "unprovisioned fleet has no enrolled nodes to reconcile"
+        );
+
+        let dids = latest_retained_body(&persist, DIDS_TOPIC).expect("state/voice-dids must land");
+        assert_eq!(dids, "[]", "unprovisioned DID inventory stays empty");
+
+        let shared = latest_retained_body(&persist, SHARED_STATE_TOPIC)
+            .expect("state/voice-shared must land");
+        assert_eq!(shared, "null", "unprovisioned shared-outbound stays empty");
+
+        let cutover =
+            latest_retained_body(&persist, CUTOVER_TOPIC).expect("state/voice-cutover must land");
+        let status: CutoverStatus = serde_json::from_str(&cutover).unwrap();
+        assert_eq!(status.phase, CutoverPhase::Legacy);
+        assert_eq!(status.total_nodes, 0);
+        assert!(!status.shared_outbound_lifted);
+        assert!(status.pending_nodes.is_empty());
+
+        assert!(
+            persist
+                .list_since(&format!("{STATE_TOPIC_PREFIX}peer:eagle"), None)
+                .unwrap()
+                .is_empty(),
+            "must not invent a state/voice/<node> row without a provisioned account"
+        );
     }
 
     #[test]
