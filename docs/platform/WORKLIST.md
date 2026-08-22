@@ -708,18 +708,17 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: Operator-authorized Maps sources remain on BigBoy `172.20.0.130`
-  dest-root `/home/mm/mcnf-maps-sources`. Official Erie `36029` / Niagara `36063`
-  GeoJSON is present. Osmium wrote `erie-niagara.osm.pbf` 34073493 B sha256
-  `c5fd765d68e0051b7a4fb4ae896653bf0a427495497ff13294cb37d4716d481c` (sidecar
-  `mcnf-maps-pbf-clip`; `production_admitted: false`). Official bbox west
-  `-79.312136` escapes verify envelope west `-79.30`; clip used official county
-  bbox unshrunk. NY PBF 495288424 B sha256
-  `8d7b60bff5d5fafc16d39f4a17f87c9f11014f56b1f4191c4ec64fb43684fd64`. Fixture PNG
-  and clipped PBF are not production admission. Leftover is production dest
-  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and a production
-  raster renderer. App VM S3 and Kiron S6 remain admitted. Android stays deferred.
-  Evidence: `docs/platform/evidence/WL-REL-006-2026-08-22-maps-pbf-clip-r1.md`.
+- Current state: BigBoy `172.20.0.130` dest-root `/home/mm/mcnf-maps-sources` now
+  has OSM-derived raster `buffalo-niagara.pbf-raster.mbtiles` 167936 B sha256
+  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` (sidecar
+  `mcnf-maps-pbf-raster`; `production_admitted: false`; z8–z10, 30 PNG tiles;
+  official bbox `[-79.312136,42.437997,-78.460416,43.634799]` unshrunk). Clipped
+  PBF 34073493 B sha256 `c5fd765d68e0051b7a4fb4ae896653bf0a427495497ff13294cb37d4716d481c`
+  and fixture `buffalo-niagara.mbtiles` 12288 B are unchanged. Envelope west
+  `-79.30` still refuses official west `-79.312136`. Leftover is production dest
+  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and the
+  verify-envelope / `production_admitted` gate. App VM S3 and Kiron S6 remain
+  admitted. Evidence: `docs/platform/evidence/WL-REL-006-2026-08-22-maps-pbf-raster-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -746,10 +745,13 @@ is a capacity incident (§10.0.3), not a silent retry.
        `production_admitted: false`). Osmium clipped NY PBF to
        `erie-niagara.osm.pbf` (sidecar `mcnf-maps-pbf-clip`;
        `production_admitted: false`; official bbox, not envelope-shrunk).
-       Remaining: a production raster renderer and dest
-       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`.
-       Clipped PBF is not MBTiles admission. Fixture PNG raster is not
-       production admission. Preserve PBF, boundary, clip,
+       Remaining: dest-root OSM-derived raster exists
+       (`buffalo-niagara.pbf-raster.mbtiles`; not production admission).
+       Leftover is production dest
+       `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` and the
+       verify-envelope / `production_admitted` gate. Clipped PBF is not
+       MBTiles admission. Fixture PNG raster is not production
+       admission. Preserve PBF, boundary, clip,
        renderer/style/font identities, ODbL attribution, aggregate quota,
        and deterministic transport. Never fetch public OSM tiles; defer
        installed runtime proof to WL-TEST-002.
