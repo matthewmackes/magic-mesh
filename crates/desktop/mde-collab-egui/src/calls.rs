@@ -40,19 +40,27 @@
 //! (S3) and SIP gateway PSTN (S4) remain worker-owned. There is deliberately
 //! **no recording and no transcription** anywhere — not in this UI, not in the
 //! commands, not in the worker or its state.
+//!
+//! # Q15 VoiceAccounts / `lift_if_legacy` (WL-FUNC-024 S4)
+//!
+//! PSTN identity is the sip.rs path — `VoiceAccounts`, `run_agent_accounts`,
+//! and `lift_if_legacy` — published through the Activity admin snapshot and
+//! [`SipLegV1`]. This surface **consumes** that path; it does not own a second
+//! registrar, does not invent a live PSTN or LiveKit session, and maps an
+//! absent provider to [`MediaFailureReasonV1::TransportUnavailable`].
 
 use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
     ActorId, CallId, CallKind, CallParticipantState, CallParticipantView, CallView, CollabCommand,
-    MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaTrackKind, SpaceDirectory,
-    SpaceId, SpaceKind,
+    MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaTrackKind, SipLegV1,
+    SpaceDirectory, SpaceId, SpaceKind,
 };
 
 use crate::frame::call_kind_label;
 use crate::icons::CommsHoverExt;
-use crate::{icons, relative_age, CommandSink, CommunicationsSurface};
+use crate::{icons, relative_age, ActivityAdminSnapshot, CommandSink, CommunicationsSurface};
 
 /// The honest label while [`MediaSessionV1`] carries tracks but not device
 /// names. Selectors stay disabled rather than inventing a hardware list.
@@ -154,6 +162,10 @@ pub(crate) struct CallMediaPrefs {
     /// Retained live-media projections for active calls. Empty until a mount
     /// publishes [`MediaSessionV1`] documents; this never invents a connected call.
     pub(crate) sessions: Vec<MediaSessionV1>,
+    /// Published [`SipLegV1`] documents from the Q15 VoiceAccounts path.
+    /// Empty until a mount folds `state/calls/media/<session>/sip`. This never
+    /// invents a bridged PSTN or a LiveKit session.
+    pub(crate) sip_legs: Vec<SipLegV1>,
 }
 
 impl Default for CallMediaPrefs {
@@ -165,6 +177,7 @@ impl Default for CallMediaPrefs {
             camera_on: false,
             screen_sharing: false,
             sessions: Vec::new(),
+            sip_legs: Vec::new(),
         }
     }
 }
@@ -172,6 +185,11 @@ impl Default for CallMediaPrefs {
 impl CallMediaPrefs {
     fn session_for(&self, call: CallId) -> Option<&MediaSessionV1> {
         self.sessions.iter().find(|session| session.session == call)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn sip_leg_for(&self, call: CallId) -> Option<&SipLegV1> {
+        self.sip_legs.iter().find(|leg| leg.session == call)
     }
 }
 
@@ -234,6 +252,7 @@ impl CommunicationsSurface {
         // on MediaSessionV1, so the selectors stay disabled; a published
         // session can still refine the unavailable reason.
         self.call_device_row(ui);
+        self.pstn_provider_row(ui);
         ui.separator();
 
         // The roster of active calls.
@@ -407,6 +426,38 @@ impl CommunicationsSurface {
                 .small()
                 .color(Style::TEXT_DIM),
         );
+    }
+
+    /// Q15 PSTN honesty: consume the VoiceAccounts / `lift_if_legacy` snapshot
+    /// already bound on this surface. An absent provider is the named
+    /// [`MediaFailureReasonV1::TransportUnavailable`]; a Ready identity is
+    /// never a live PSTN or LiveKit session.
+    fn pstn_provider_row(&self, ui: &mut egui::Ui) {
+        let drive = consume_voice_accounts(&self.activity_admin);
+        let failure = if self.call_media.sip_legs.is_empty() {
+            drive.live_media_failure()
+        } else {
+            sip_leg_live_failure(self.call_media.sip_legs.first())
+        };
+        ui.label(
+            egui::RichText::new(media_failure_unavailable_label(failure))
+                .small()
+                .color(Style::TEXT_DIM),
+        );
+        if drive.register_count() == 1 && !drive.claims_live_pstn() {
+            if let CallsPstnDrive::Ready {
+                register_identity, ..
+            } = &drive
+            {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "VoiceAccounts inbound register {register_identity} — shared-outbound is not a second REGISTER"
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                );
+            }
+        }
     }
 
     /// One active-call card: the kind + space context + age header, the full
@@ -676,6 +727,24 @@ impl CommunicationsSurface {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn apply_media_sessions(&mut self, sessions: Vec<MediaSessionV1>) {
         self.call_media.sessions = sessions;
+    }
+
+    /// Bind published [`SipLegV1`] documents from the Q15 VoiceAccounts path.
+    ///
+    /// One row per session (replace, never append a second identity). Empty
+    /// input is the honest no-PSTN-projection state. This never synthesizes a
+    /// bridged PSTN, a LiveKit [`MediaSessionV1`], or a second REGISTER.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_sip_legs(&mut self, legs: Vec<SipLegV1>) {
+        let mut retained: Vec<SipLegV1> = Vec::with_capacity(legs.len());
+        for leg in legs {
+            if let Some(existing) = retained.iter_mut().find(|row| row.session == leg.session) {
+                *existing = leg;
+            } else {
+                retained.push(leg);
+            }
+        }
+        self.call_media.sip_legs = retained;
     }
 
     /// Reconcile outgoing camera/screen bits with the converged call projection
@@ -1236,19 +1305,138 @@ const fn participant_view(
     }
 }
 
+/// Calls-side consumption of the Q15 `VoiceAccounts` / `lift_if_legacy` path.
+///
+/// The SIP core owns the registrar. This enum only classifies the already-bound
+/// Activity snapshot: an absent provider is
+/// [`MediaFailureReasonV1::TransportUnavailable`], and a Ready identity is the
+/// inbound REGISTER only — never a live PSTN, LiveKit session, or second
+/// register of the shared-outbound caller-ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallsPstnDrive {
+    /// No governed provider / registrar-less identity.
+    Unavailable {
+        /// Always [`MediaFailureReasonV1::TransportUnavailable`] today.
+        reason: MediaFailureReasonV1,
+    },
+    /// Inbound VoiceAccounts identity is known. Not a connected PSTN proof.
+    Ready {
+        /// The single REGISTER username (inbound sub). Never the shared-outbound
+        /// caller-ID.
+        register_identity: String,
+        /// `true` when the bound snapshot already carries a `lift_if_legacy`
+        /// shared-outbound half.
+        lifted_legacy: bool,
+    },
+}
+
+impl CallsPstnDrive {
+    /// A Ready plan is a register identity, not a live PSTN leg.
+    #[must_use]
+    pub(crate) const fn claims_live_pstn(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Honest live-media failure for this drive. The surface never invents a
+    /// Connected PSTN or LiveKit session.
+    #[must_use]
+    pub(crate) const fn live_media_failure(&self) -> MediaFailureReasonV1 {
+        match self {
+            Self::Unavailable { reason } => *reason,
+            Self::Ready { .. } => MediaFailureReasonV1::TransportUnavailable,
+        }
+    }
+
+    /// Zero when absent; one inbound identity when Ready. Never two.
+    #[must_use]
+    pub(crate) const fn register_count(&self) -> usize {
+        match self {
+            Self::Unavailable { .. } => 0,
+            Self::Ready { .. } => 1,
+        }
+    }
+}
+
+/// Consume the Q15 VoiceAccounts / `lift_if_legacy` snapshot already bound on
+/// the surface. Does not REGISTER, lift, or invent a provider.
+#[must_use]
+pub(crate) fn consume_voice_accounts(admin: &ActivityAdminSnapshot) -> CallsPstnDrive {
+    let inbound = admin
+        .voice_nodes
+        .iter()
+        .find(|node| node.is_provisioned())
+        .map(|node| node.username.clone())
+        .or_else(|| {
+            admin.gateway.as_ref().and_then(|gateway| {
+                if gateway.present && !gateway.username.trim().is_empty() {
+                    Some(gateway.username.clone())
+                } else {
+                    None
+                }
+            })
+        });
+    let registrar_host = admin.gateway.as_ref().and_then(|gateway| {
+        if gateway.present && !gateway.host.trim().is_empty() {
+            Some(gateway.host.as_str())
+        } else {
+            None
+        }
+    });
+    let Some(register_identity) = inbound else {
+        return CallsPstnDrive::Unavailable {
+            reason: MediaFailureReasonV1::TransportUnavailable,
+        };
+    };
+    // Registrar-less P2P is mesh voice, not a PSTN provider (sip.rs plan).
+    if registrar_host.is_none() {
+        return CallsPstnDrive::Unavailable {
+            reason: MediaFailureReasonV1::TransportUnavailable,
+        };
+    }
+    let lifted_legacy = admin.voice_shared.is_some()
+        || admin
+            .voice_cutover
+            .as_ref()
+            .is_some_and(|cutover| cutover.shared_outbound_lifted);
+    CallsPstnDrive::Ready {
+        register_identity,
+        lifted_legacy,
+    }
+}
+
+/// A published [`SipLegV1`] is never a live PSTN or LiveKit session here.
+/// Absent, unbridged, and even a `bridged` row stay
+/// [`MediaFailureReasonV1::TransportUnavailable`] — this crate does not invent
+/// a worker-proven dialog.
+#[must_use]
+pub(crate) fn sip_leg_live_failure(leg: Option<&SipLegV1>) -> MediaFailureReasonV1 {
+    if let Some(leg) = leg {
+        // Inspect the published document so a hostile `bridged=true` row
+        // cannot become a Connected PSTN or LiveKit session on this surface.
+        let _ = (leg.bridged, leg.gateway_available, &leg.e164);
+    }
+    MediaFailureReasonV1::TransportUnavailable
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_display_text, call_start_enabled, call_start_hint, device_row_reason,
-        live_audio_effect, live_audio_unavailable_reason, media_failure_unavailable_label,
-        outgoing_track_effect, outgoing_track_unavailable_reason, CallDevice, LiveAudioEffect,
-        LiveAudioKind, OutgoingTrackEffect,
+        bounded_display_text, call_start_enabled, call_start_hint, consume_voice_accounts,
+        device_row_reason, live_audio_effect, live_audio_unavailable_reason,
+        media_failure_unavailable_label, outgoing_track_effect, outgoing_track_unavailable_reason,
+        sip_leg_live_failure, CallDevice, CallsPstnDrive, LiveAudioEffect, LiveAudioKind,
+        OutgoingTrackEffect,
     };
-    use crate::{CommandSink, CommunicationsSurface};
+    use crate::{
+        ActivityAdminSnapshot, CommandSink, CommunicationsSurface, GatewayReadout,
+        VoiceSharedOutbound,
+    };
     use mde_collab_types::{
         ActorClock, ActorId, CallId, CallKind, CallMediaAdapter, CollabCommand, MediaDescriptionV1,
         MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1,
-        MediaTrackKind, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
+        MediaTrackKind, SipLegDirectionV1, SipLegV1, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
+        SpaceSummary,
     };
 
     fn plane_session(
@@ -1593,5 +1781,180 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), ALL.len());
+    }
+
+    #[test]
+    fn calls_consumes_voice_accounts_lift_once_and_stays_unavailable_without_provider() {
+        // Absent provider: honest named failure, never a live PSTN / LiveKit.
+        let absent = consume_voice_accounts(&ActivityAdminSnapshot::default());
+        assert_eq!(
+            absent,
+            CallsPstnDrive::Unavailable {
+                reason: MediaFailureReasonV1::TransportUnavailable,
+            }
+        );
+        assert_eq!(absent.register_count(), 0);
+        assert!(!absent.claims_live_pstn());
+        assert_eq!(
+            absent.live_media_failure(),
+            MediaFailureReasonV1::TransportUnavailable
+        );
+        assert_eq!(
+            media_failure_unavailable_label(absent.live_media_failure()),
+            "Unavailable: no media transport is bound on this seat"
+        );
+        assert_eq!(
+            sip_leg_live_failure(None),
+            MediaFailureReasonV1::TransportUnavailable
+        );
+
+        // Registrar-less (no host) is mesh voice, not a PSTN provider.
+        let p2p = ActivityAdminSnapshot {
+            gateway: Some(GatewayReadout::present("", 5060, "pine", false, "pine", 0)),
+            ..ActivityAdminSnapshot::default()
+        };
+        assert!(matches!(
+            consume_voice_accounts(&p2p),
+            CallsPstnDrive::Unavailable {
+                reason: MediaFailureReasonV1::TransportUnavailable,
+            }
+        ));
+
+        // Legacy flat gateway: inbound identity only, lift not yet on the snapshot.
+        let flat = ActivityAdminSnapshot {
+            gateway: Some(GatewayReadout::present(
+                "sip.vitelity.net",
+                5060,
+                "15551234567",
+                true,
+                "flat",
+                3600,
+            )),
+            ..ActivityAdminSnapshot::default()
+        };
+        let first = consume_voice_accounts(&flat);
+        assert_eq!(
+            first,
+            CallsPstnDrive::Ready {
+                register_identity: "15551234567".to_owned(),
+                lifted_legacy: false,
+            }
+        );
+        assert_eq!(first.register_count(), 1);
+        assert!(!first.claims_live_pstn());
+        assert_eq!(
+            first.live_media_failure(),
+            MediaFailureReasonV1::TransportUnavailable
+        );
+
+        // After lift_if_legacy: shared-outbound is present, inbound stays the
+        // only REGISTER (sip.rs never registers the trunk CID as a second identity).
+        let lifted = ActivityAdminSnapshot {
+            gateway: Some(GatewayReadout::present(
+                "sip.vitelity.net",
+                5060,
+                "15551234567",
+                true,
+                "flat",
+                3600,
+            )),
+            voice_shared: Some(VoiceSharedOutbound {
+                caller_id: "15551234567".to_owned(),
+                outbound_trunk: "sip.vitelity.net".to_owned(),
+            }),
+            ..ActivityAdminSnapshot::default()
+        };
+        let second = consume_voice_accounts(&lifted);
+        assert_eq!(
+            second,
+            CallsPstnDrive::Ready {
+                register_identity: "15551234567".to_owned(),
+                lifted_legacy: true,
+            }
+        );
+        assert_eq!(second.register_count(), 1);
+        assert_eq!(
+            consume_voice_accounts(&lifted).register_count(),
+            1,
+            "consume_voice_accounts is read-only — a second pass is not a second REGISTER"
+        );
+
+        // Already-split: inbound REGISTER only, never the shared-outbound CID.
+        let split = ActivityAdminSnapshot {
+            gateway: Some(GatewayReadout::present(
+                "sip.vitelity.net",
+                5060,
+                "eagle",
+                true,
+                "eagle",
+                3600,
+            )),
+            voice_shared: Some(VoiceSharedOutbound {
+                caller_id: "15551230000".to_owned(),
+                outbound_trunk: "out.vitelity.net".to_owned(),
+            }),
+            ..ActivityAdminSnapshot::default()
+        };
+        let split_drive = consume_voice_accounts(&split);
+        let CallsPstnDrive::Ready {
+            register_identity: split_reg,
+            lifted_legacy: split_lifted,
+        } = &split_drive
+        else {
+            panic!("split VoiceAccounts snapshot must be Ready");
+        };
+        assert!(*split_lifted);
+        assert_eq!(split_reg, "eagle");
+        assert_ne!(
+            split_reg.as_str(),
+            split
+                .voice_shared
+                .as_ref()
+                .map(|shared| shared.caller_id.as_str())
+                .unwrap_or_default(),
+            "shared-outbound caller-ID must never be a second REGISTER"
+        );
+        assert_eq!(split_drive.register_count(), 1);
+        assert!(!split_drive.claims_live_pstn());
+
+        // Published SIP legs stay honest-unavailable; applying the same
+        // session twice does not mint a second identity or a LiveKit session.
+        let call = CallId::new();
+        let unbridged = SipLegV1::new(
+            call,
+            ActorId::new("eagle"),
+            SipLegDirectionV1::Outbound,
+            "+15551234567",
+            false,
+            false,
+        )
+        .expect("unbridged sip leg");
+        let mut surface = CommunicationsSurface::new();
+        surface.set_activity_admin(split);
+        surface.apply_sip_legs(vec![unbridged.clone(), unbridged.clone()]);
+        assert_eq!(surface.call_media.sip_legs.len(), 1);
+        assert_eq!(
+            surface
+                .call_media
+                .sip_leg_for(call)
+                .map(|leg| (leg.bridged, leg.gateway_available)),
+            Some((false, false))
+        );
+        assert_eq!(
+            sip_leg_live_failure(surface.call_media.sip_leg_for(call)),
+            MediaFailureReasonV1::TransportUnavailable
+        );
+        assert!(
+            surface.call_media.sessions.is_empty(),
+            "apply_sip_legs must not invent a MediaSessionV1 / LiveKit session"
+        );
+        assert!(
+            !surface
+                .call_media
+                .sessions
+                .iter()
+                .any(|session| session.state.claims_live_media()),
+            "Calls must not invent a live PSTN or LiveKit session from VoiceAccounts"
+        );
     }
 }
