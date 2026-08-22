@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PRODUCER = ROOT / "packaging/app-vm/produce-catalog-receipt.py"
 REVISION = "a" * 40
 EPOCH = "1700000000"
-PINNED = "org.example.App@sha256:" + "b" * 64
+PINNED = "org.mcnf.test.CatalogPin@sha256:" + "b" * 64
+FIXTURE_PINNED = "org.example.App@sha256:" + "b" * 64
 
 
 def invoke(catalog: Path, output: Path, revision: str = REVISION) -> subprocess.CompletedProcess[str]:
@@ -51,6 +52,15 @@ def main() -> None:
         receipt = json.loads(output.read_text(encoding="utf-8"))
         if receipt["source_revision"] != REVISION or receipt["refs"] != [PINNED]:
             raise SystemExit("receipt lost candidate identity or immutable ref")
+
+        fixture = root / "fixture.json"
+        fixture.write_text(
+            json.dumps({"schema_version": 1, "remote": "curated", "refs": [FIXTURE_PINNED]}) + "\n",
+            encoding="utf-8",
+        )
+        fixture.chmod(0o444)
+        if invoke(fixture, root / "fixture-receipt.json").returncode == 0:
+            raise SystemExit("reserved example fixture catalog ref was accepted")
 
         mutable = root / "mutable.json"
         mutable.write_text(

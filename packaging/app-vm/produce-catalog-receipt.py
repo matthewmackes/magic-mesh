@@ -7,6 +7,9 @@ class Refusal(ValueError): pass
 
 IMMUTABLE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[0-9a-f]{64}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
+# IANA reserved example ids. Tests may use them as hostile input; they never
+# become a production curated catalog receipt.
+FIXTURE_APP_ID_PREFIX = "org.example."
 
 def main() -> int:
     p = argparse.ArgumentParser()
@@ -30,6 +33,8 @@ def main() -> int:
             raise Refusal("catalog must declare non-empty curated refs")
         if any(not isinstance(ref, str) or IMMUTABLE_REF.fullmatch(ref) is None for ref in value["refs"]):
             raise Refusal("catalog refs must be fully qualified sha256-pinned refs")
+        if any(ref.split("@", 1)[0].startswith(FIXTURE_APP_ID_PREFIX) for ref in value["refs"]):
+            raise Refusal("catalog refs must not use reserved example fixture app ids")
         body = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
         receipt = {"schema_version": 1, "kind": "mcnf-app-vm-curated-catalog", "remote": "curated",
                    "catalog_sha256": hashlib.sha256(body.encode()).hexdigest(), "refs": sorted(value["refs"]),

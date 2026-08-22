@@ -134,7 +134,7 @@ connection.commit()
 connection.close()
 PY
 chmod 0444 "$fixture/maps.mbtiles"
-printf '%s\n' '{"schema_version":1,"remote":"curated","refs":["org.example.App@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}' >"$fixture/app-catalog.json"
+printf '%s\n' '{"schema_version":1,"remote":"curated","refs":["org.mcnf.test.CatalogPin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}' >"$fixture/app-catalog.json"
 chmod 0444 "$fixture/app-catalog.json"
 python3 - "$fixture/bootc-receipt.json" "$bootc_reference" "$bootc_architecture" \
   "$source_revision" "$source_epoch" "$bootc_role" <<'PY'

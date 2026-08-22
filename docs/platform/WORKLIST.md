@@ -723,8 +723,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   App VM, Browser VM, and bootc ARGs now match admitted index `3a5e74e6…`
   (`WL-REL-006-2026-08-22-app-vm-base-pin-r1.md`, browser-vm and bootc-base-pin-r1;
   bootc receipt `479ec2b8c`). Surface `bootc_base` still null. Kiron S6 admitted.
-  Leftover is Maps `production_admitted`, App catalog real refs, RPM signer after
-  freeze, S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
+  Leftover is Maps `production_admitted`, App catalog real refs (producer now
+  refuses `org.example.*`; evidence
+  `WL-REL-006-2026-08-22-catalog-fixture-refuse-r1.md`), RPM signer after freeze,
+  S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
