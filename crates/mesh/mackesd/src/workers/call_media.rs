@@ -1,14 +1,17 @@
-//! WL-FUNC-024 S2/S3 — WebRTC P2P and elected LiveKit SFU media planes.
+//! WL-FUNC-024 S2/S3/S6 — WebRTC P2P and elected LiveKit SFU media planes.
 //!
 //! There is no WebRTC stack in this workspace. This worker is therefore a real
 //! offer/answer state machine over existing collab call signaling, a seat-audio
-//! bind, and an injectable loopback frame callback. It never publishes
-//! [`mde_collab_types::MediaSessionStateV1::Connected`] unless the loopback seam
-//! (or a future transport) observes advancing frames. Device absence and
-//! permission denial publish the typed unavailable states.
+//! bind, camera/screen attach/detach, and an injectable loopback frame callback.
+//! It never publishes [`mde_collab_types::MediaSessionStateV1::Connected`] unless
+//! the loopback seam (or a future transport) observes advancing frames. Device
+//! absence and permission denial — including camera and screen — publish the
+//! typed unavailable states. Mid-call visual attach/detach remints descriptions
+//! and does not keep a stale Connected claim.
 //!
 //! Mute and DTMF act on the bound live leg. The collab media verifier remains a
-//! separate proof sidecar; this module is the P2P plane it can sample.
+//! separate proof sidecar; this module is the P2P plane it can sample. Visual
+//! attach/detach is worker-owned and publishes through the same MediaSessionV1.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,9 +22,9 @@ use mde_bus::persist::Persist;
 use mde_collab_types::{
     media_answer_topic, media_offer_topic, media_session_topic, media_sfu_election_topic, ActorId,
     CallId, CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence,
-    CallMediaReadiness, CallMediaSession, CollabCommand, MediaDescriptionV1, MediaFailureReasonV1,
-    MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1, MediaTrackKind, SfuElectionV1,
-    SpaceId, MEDIA_SESSION_V1_SCHEMA_VERSION,
+    CallMediaReadiness, CallMediaRequirement, CallMediaSession, CollabCommand, MediaDescriptionV1,
+    MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1,
+    MediaTrackKind, SfuElectionV1, SpaceId, MEDIA_SESSION_V1_SCHEMA_VERSION,
 };
 
 use super::collab_media::{CallMediaFrameVerifier, CallMediaProviderError};
@@ -93,6 +96,27 @@ impl SeatAudioBinding {
     fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::SeqCst);
     }
+}
+
+/// Why camera or screen capture could not be bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatVisualBindError {
+    DeviceAbsent,
+    PermissionDenied,
+    UnsupportedTrack,
+}
+
+/// Seat camera/screen bind. Production probes `/dev/video*` and DRM nodes
+/// honestly; tests inject a fixed per-track outcome.
+trait SeatVisualSource: Send + Sync {
+    fn bind(&self, track: MediaTrackKind) -> Result<SeatVisualBinding, SeatVisualBindError>;
+}
+
+/// A bound local camera or screen track. Detach drops this; it is not a
+/// Connected proof.
+#[derive(Debug)]
+struct SeatVisualBinding {
+    track: MediaTrackKind,
 }
 
 /// Injectable loopback/chirp seam. Production leaves this unset so the plane
@@ -259,6 +283,68 @@ impl SeatAudioSource for FixedSeatAudio {
     }
 }
 
+/// Fixed camera/screen bind outcome for tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct FixedSeatVisual {
+    camera: Result<(), SeatVisualBindError>,
+    screen: Result<(), SeatVisualBindError>,
+}
+
+#[cfg(test)]
+impl FixedSeatVisual {
+    #[must_use]
+    fn present() -> Arc<Self> {
+        Arc::new(Self {
+            camera: Ok(()),
+            screen: Ok(()),
+        })
+    }
+
+    #[must_use]
+    fn camera_absent() -> Arc<Self> {
+        Arc::new(Self {
+            camera: Err(SeatVisualBindError::DeviceAbsent),
+            screen: Ok(()),
+        })
+    }
+
+    #[must_use]
+    fn camera_denied() -> Arc<Self> {
+        Arc::new(Self {
+            camera: Err(SeatVisualBindError::PermissionDenied),
+            screen: Ok(()),
+        })
+    }
+
+    #[must_use]
+    fn screen_absent() -> Arc<Self> {
+        Arc::new(Self {
+            camera: Ok(()),
+            screen: Err(SeatVisualBindError::DeviceAbsent),
+        })
+    }
+
+    #[must_use]
+    fn screen_denied() -> Arc<Self> {
+        Arc::new(Self {
+            camera: Ok(()),
+            screen: Err(SeatVisualBindError::PermissionDenied),
+        })
+    }
+}
+
+#[cfg(test)]
+impl SeatVisualSource for FixedSeatVisual {
+    fn bind(&self, track: MediaTrackKind) -> Result<SeatVisualBinding, SeatVisualBindError> {
+        match track {
+            MediaTrackKind::Video => self.camera.map(|()| SeatVisualBinding { track }),
+            MediaTrackKind::Screen => self.screen.map(|()| SeatVisualBinding { track }),
+            MediaTrackKind::Audio => Err(SeatVisualBindError::UnsupportedTrack),
+        }
+    }
+}
+
 /// Production seat-audio probe. Looks for an ALSA capture node; does not open a
 /// WebRTC track and therefore never claims live frames by itself.
 struct AlsaSeatAudio;
@@ -310,6 +396,85 @@ fn probe_capture_device() -> CaptureProbe {
     }
 }
 
+/// Production camera/screen probe. Opens the node; does not start a capture
+/// pipeline and therefore never claims live visual frames by itself.
+struct AlsaSeatVisual;
+
+impl SeatVisualSource for AlsaSeatVisual {
+    fn bind(&self, track: MediaTrackKind) -> Result<SeatVisualBinding, SeatVisualBindError> {
+        let probe = match track {
+            MediaTrackKind::Video => probe_named_nodes("/dev", "video"),
+            MediaTrackKind::Screen => probe_dri_nodes(),
+            MediaTrackKind::Audio => return Err(SeatVisualBindError::UnsupportedTrack),
+        };
+        match probe {
+            CaptureProbe::Absent => Err(SeatVisualBindError::DeviceAbsent),
+            CaptureProbe::PermissionDenied => Err(SeatVisualBindError::PermissionDenied),
+            CaptureProbe::Present => Ok(SeatVisualBinding { track }),
+        }
+    }
+}
+
+fn probe_named_nodes(dir: &str, prefix: &str) -> CaptureProbe {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return CaptureProbe::Absent;
+    };
+    let mut saw = false;
+    let mut denied = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        saw = true;
+        match std::fs::File::open(entry.path()) {
+            Ok(_) => return CaptureProbe::Present,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied = true;
+            }
+            Err(_) => {}
+        }
+    }
+    if denied {
+        CaptureProbe::PermissionDenied
+    } else if saw {
+        CaptureProbe::PermissionDenied
+    } else {
+        CaptureProbe::Absent
+    }
+}
+
+fn probe_dri_nodes() -> CaptureProbe {
+    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+        return CaptureProbe::Absent;
+    };
+    let mut saw = false;
+    let mut denied = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") && !name.starts_with("render") {
+            continue;
+        }
+        saw = true;
+        match std::fs::File::open(entry.path()) {
+            Ok(_) => return CaptureProbe::Present,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied = true;
+            }
+            Err(_) => {}
+        }
+    }
+    if denied {
+        CaptureProbe::PermissionDenied
+    } else if saw {
+        CaptureProbe::PermissionDenied
+    } else {
+        CaptureProbe::Absent
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SignalingRole {
     Offer,
@@ -322,12 +487,17 @@ struct LiveSession {
     remote_actor: ActorId,
     role: SignalingRole,
     offered_tracks: Vec<MediaTrackKind>,
+    attached_visual: Vec<MediaTrackKind>,
     state: MediaSessionStateV1,
     local_muted: bool,
     audio: Option<SeatAudioBinding>,
+    camera: Option<SeatVisualBinding>,
+    screen: Option<SeatVisualBinding>,
     local_description: Option<MediaDescriptionV1>,
     remote_description: Option<MediaDescriptionV1>,
     frames_observed: u64,
+    video_frames_observed: u64,
+    screen_frames_observed: u64,
 }
 
 impl LiveSession {
@@ -357,6 +527,33 @@ impl LiveSession {
         )
         .map_err(|error| error.to_string())
     }
+
+    fn drop_descriptions_for_renegotiate(&mut self) {
+        self.local_description = None;
+        self.remote_description = None;
+        if self.state.claims_live_media() {
+            self.state = MediaSessionStateV1::Negotiating;
+            self.frames_observed = 0;
+            self.video_frames_observed = 0;
+            self.screen_frames_observed = 0;
+        }
+    }
+
+    fn set_offered_tracks(&mut self, tracks: Vec<MediaTrackKind>) {
+        if self.offered_tracks == tracks {
+            return;
+        }
+        self.offered_tracks = tracks;
+        if !self.offered_tracks.contains(&MediaTrackKind::Video) {
+            self.camera = None;
+            self.video_frames_observed = 0;
+        }
+        if !self.offered_tracks.contains(&MediaTrackKind::Screen) {
+            self.screen = None;
+            self.screen_frames_observed = 0;
+        }
+        self.drop_descriptions_for_renegotiate();
+    }
 }
 
 struct PlaneInner {
@@ -369,6 +566,7 @@ struct PlaneInner {
 pub(crate) struct WebrtcP2pPlane {
     inner: Mutex<PlaneInner>,
     audio: Arc<dyn SeatAudioSource>,
+    visual: Arc<dyn SeatVisualSource>,
     loopback: Option<Arc<dyn LoopbackFrameCallback>>,
     frame_counter: AtomicU64,
 }
@@ -376,7 +574,16 @@ pub(crate) struct WebrtcP2pPlane {
 impl WebrtcP2pPlane {
     #[must_use]
     pub(crate) fn production() -> Self {
-        Self::new(Arc::new(AlsaSeatAudio), None)
+        Self {
+            inner: Mutex::new(PlaneInner {
+                local_actor: None,
+                sessions: BTreeMap::new(),
+            }),
+            audio: Arc::new(AlsaSeatAudio),
+            visual: Arc::new(AlsaSeatVisual),
+            loopback: None,
+            frame_counter: AtomicU64::new(1),
+        }
     }
 
     #[must_use]
@@ -390,9 +597,16 @@ impl WebrtcP2pPlane {
                 sessions: BTreeMap::new(),
             }),
             audio,
+            visual: default_test_visual(),
             loopback,
             frame_counter: AtomicU64::new(1),
         }
+    }
+
+    #[cfg(test)]
+    fn with_visual(mut self, visual: Arc<dyn SeatVisualSource>) -> Self {
+        self.visual = visual;
+        self
     }
 
     #[cfg(test)]
@@ -425,12 +639,17 @@ impl WebrtcP2pPlane {
             remote_actor: ActorId::new("peer"),
             role,
             offered_tracks: vec![MediaTrackKind::Audio],
+            attached_visual: Vec::new(),
             state: MediaSessionStateV1::Negotiating,
             local_muted: false,
             audio: None,
+            camera: None,
+            screen: None,
             local_description: None,
             remote_description: None,
             frames_observed: 0,
+            video_frames_observed: 0,
+            screen_frames_observed: 0,
         })
     }
 
@@ -462,6 +681,132 @@ impl WebrtcP2pPlane {
                 session.audio = None;
             }
         }
+    }
+
+    fn apply_visual_bind(session: &mut LiveSession, visual: &Arc<dyn SeatVisualSource>) {
+        if matches!(
+            session.state,
+            MediaSessionStateV1::DeviceAbsent { .. } | MediaSessionStateV1::PermissionDenied { .. }
+        ) {
+            return;
+        }
+        if !session.offered_tracks.contains(&MediaTrackKind::Video) {
+            session.camera = None;
+            session.video_frames_observed = 0;
+        }
+        if !session.offered_tracks.contains(&MediaTrackKind::Screen) {
+            session.screen = None;
+            session.screen_frames_observed = 0;
+        }
+        for track in [MediaTrackKind::Video, MediaTrackKind::Screen] {
+            if !session.offered_tracks.contains(&track) {
+                continue;
+            }
+            let already_bound = match track {
+                MediaTrackKind::Video => session.camera.is_some(),
+                MediaTrackKind::Screen => session.screen.is_some(),
+                MediaTrackKind::Audio => continue,
+            };
+            if already_bound {
+                continue;
+            }
+            match visual.bind(track) {
+                Ok(binding) => match binding.track {
+                    MediaTrackKind::Video => session.camera = Some(binding),
+                    MediaTrackKind::Screen => session.screen = Some(binding),
+                    MediaTrackKind::Audio => {}
+                },
+                Err(SeatVisualBindError::DeviceAbsent) => {
+                    session.frames_observed = 0;
+                    session.video_frames_observed = 0;
+                    session.screen_frames_observed = 0;
+                    session.state = MediaSessionStateV1::DeviceAbsent { track };
+                    return;
+                }
+                Err(SeatVisualBindError::PermissionDenied) => {
+                    session.frames_observed = 0;
+                    session.video_frames_observed = 0;
+                    session.screen_frames_observed = 0;
+                    session.state = MediaSessionStateV1::PermissionDenied { track };
+                    return;
+                }
+                Err(SeatVisualBindError::UnsupportedTrack) => {
+                    session.frames_observed = 0;
+                    session.video_frames_observed = 0;
+                    session.screen_frames_observed = 0;
+                    session.state = MediaSessionStateV1::Failed {
+                        reason: MediaFailureReasonV1::InvalidSignaling,
+                    };
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn attach_visual_track(
+        &self,
+        call: CallId,
+        track: MediaTrackKind,
+    ) -> Result<(), CallMediaProviderError> {
+        if matches!(track, MediaTrackKind::Audio) {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "audio is bound by the seat-audio path, not visual attach".to_string(),
+            });
+        }
+        let mut inner = self.lock_inner()?;
+        let Some(session) = inner.sessions.get_mut(&call) else {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "visual attach requires a bound P2P media leg".to_string(),
+            });
+        };
+        if !session.attached_visual.contains(&track) {
+            session.attached_visual.push(track);
+        }
+        let desired =
+            merge_attached_tracks(session.offered_tracks.clone(), &session.attached_visual);
+        session.set_offered_tracks(desired);
+        Self::apply_visual_bind(session, &self.visual);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn detach_visual_track(
+        &self,
+        call: CallId,
+        track: MediaTrackKind,
+    ) -> Result<(), CallMediaProviderError> {
+        if matches!(track, MediaTrackKind::Audio) {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "audio cannot be detached from a live media session".to_string(),
+            });
+        }
+        let mut inner = self.lock_inner()?;
+        let Some(session) = inner.sessions.get_mut(&call) else {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "visual detach requires a bound P2P media leg".to_string(),
+            });
+        };
+        session.attached_visual.retain(|offered| *offered != track);
+        let mut tracks = session.offered_tracks.clone();
+        tracks.retain(|offered| *offered != track);
+        if !tracks.contains(&MediaTrackKind::Audio) {
+            return Err(CallMediaProviderError::ExecutionRefused {
+                detail: "detaching the last audio track is forbidden".to_string(),
+            });
+        }
+        let unavailable_for_track = matches!(
+            session.state,
+            MediaSessionStateV1::DeviceAbsent { track: denied }
+                | MediaSessionStateV1::PermissionDenied { track: denied }
+                if denied == track
+        );
+        session.set_offered_tracks(tracks);
+        if unavailable_for_track {
+            session.state = MediaSessionStateV1::Negotiating;
+        }
+        Self::apply_visual_bind(session, &self.visual);
+        Ok(())
     }
 
     fn negotiate(
@@ -580,6 +925,12 @@ impl WebrtcP2pPlane {
             .is_some()
         {
             session.frames_observed = session.frames_observed.saturating_add(1);
+            if session.camera.is_some() {
+                session.video_frames_observed = session.video_frames_observed.saturating_add(1);
+            }
+            if session.screen.is_some() {
+                session.screen_frames_observed = session.screen_frames_observed.saturating_add(1);
+            }
             if session.frames_observed > 0 && session.audio_bound() {
                 session.state = MediaSessionStateV1::Connected;
             }
@@ -643,39 +994,62 @@ impl WebrtcP2pPlane {
                     local_actor: readiness.local_actor.clone(),
                     remote_actor: remote.clone(),
                     role,
-                    offered_tracks: tracks_for_call_kind(ready.kind),
+                    offered_tracks: tracks_for_session(ready.kind, &ready.requirements),
+                    attached_visual: Vec::new(),
                     state: MediaSessionStateV1::Negotiating,
                     local_muted: ready.local_muted,
                     audio: None,
+                    camera: None,
+                    screen: None,
                     local_description: None,
                     remote_description: None,
                     frames_observed: 0,
+                    video_frames_observed: 0,
+                    screen_frames_observed: 0,
                 });
             session.space = ready.space;
             session.local_actor = readiness.local_actor.clone();
             session.remote_actor = remote;
-            session.offered_tracks = tracks_for_call_kind(ready.kind);
+            let desired = merge_attached_tracks(
+                tracks_for_session(ready.kind, &ready.requirements),
+                &session.attached_visual,
+            );
+            session.set_offered_tracks(desired);
             if session.audio.is_none() {
                 session.local_muted = ready.local_muted;
             }
             Self::apply_bind(session, &self.audio);
-            if let Err(error) = Self::negotiate(persist, session, ready.call) {
+            Self::apply_visual_bind(session, &self.visual);
+            if matches!(
+                session.state,
+                MediaSessionStateV1::DeviceAbsent { .. }
+                    | MediaSessionStateV1::PermissionDenied { .. }
+            ) {
+                session.local_description = None;
+                session.remote_description = None;
+            } else if let Err(error) = Self::negotiate(persist, session, ready.call) {
                 tracing::debug!(
                     target: "mackesd::call_media",
                     error = ?error,
                     "P2P offer/answer publish failed"
                 );
+            } else {
+                self.pump_loopback(session, ready.call);
             }
-            self.pump_loopback(session, ready.call);
             match session.document(ready.call) {
                 Ok(document) => {
                     let _ = publish_media_session(persist, last_published, &document);
                 }
-                Err(error) => tracing::debug!(
-                    target: "mackesd::call_media",
-                    error = %error,
-                    "refusing to publish invalid media session"
-                ),
+                Err(error) => {
+                    #[cfg(test)]
+                    panic!("refusing to publish invalid media session: {error}");
+                    #[cfg(not(test))]
+                    tracing::debug!(
+                        target: "mackesd::call_media",
+                        error = %error,
+                        "refusing to publish invalid media session"
+                    );
+                }
             }
         }
     }
@@ -786,19 +1160,19 @@ impl CallMediaFrameVerifier for WebrtcP2pPlane {
             MediaSessionStateV1::Connected if live.frames_observed > 0 => {
                 Ok(CallMediaFrameEvidence {
                     audio_frames: live.frames_observed,
-                    video_frames: 0,
-                    screen_frames: 0,
+                    video_frames: live.video_frames_observed,
+                    screen_frames: live.screen_frames_observed,
                     data_messages: 0,
                 })
             }
-            MediaSessionStateV1::DeviceAbsent { .. } => {
+            MediaSessionStateV1::DeviceAbsent { track } => {
                 Err(CallMediaProviderError::ProviderUnavailable {
-                    detail: "seat capture device is absent".to_string(),
+                    detail: format!("seat {} capture device is absent", track.as_str()),
                 })
             }
-            MediaSessionStateV1::PermissionDenied { .. } => {
+            MediaSessionStateV1::PermissionDenied { track } => {
                 Err(CallMediaProviderError::ProviderUnavailable {
-                    detail: "seat capture permission denied".to_string(),
+                    detail: format!("seat {} capture permission denied", track.as_str()),
                 })
             }
             MediaSessionStateV1::Reconnecting { attempt } => {
@@ -1457,15 +1831,57 @@ fn is_group_call(participants: &[ActorId]) -> bool {
 }
 
 fn is_media_call_kind(kind: CallKind) -> bool {
-    matches!(kind, CallKind::Audio | CallKind::Video)
+    matches!(kind, CallKind::Audio | CallKind::Video | CallKind::Screen)
 }
 
 fn tracks_for_call_kind(kind: CallKind) -> Vec<MediaTrackKind> {
     match kind {
         CallKind::Video => vec![MediaTrackKind::Audio, MediaTrackKind::Video],
-        CallKind::Audio | CallKind::Screen | CallKind::CoEdit | CallKind::RemoteDesktop => {
+        CallKind::Screen => vec![MediaTrackKind::Audio, MediaTrackKind::Screen],
+        CallKind::Audio | CallKind::CoEdit | CallKind::RemoteDesktop => {
             vec![MediaTrackKind::Audio]
         }
+    }
+}
+
+fn tracks_for_session(
+    kind: CallKind,
+    requirements: &[CallMediaRequirement],
+) -> Vec<MediaTrackKind> {
+    let mut tracks = tracks_for_call_kind(kind);
+    if requirements.contains(&CallMediaRequirement::Camera)
+        && !tracks.contains(&MediaTrackKind::Video)
+    {
+        tracks.push(MediaTrackKind::Video);
+    }
+    if requirements.contains(&CallMediaRequirement::ScreenCapture)
+        && !tracks.contains(&MediaTrackKind::Screen)
+    {
+        tracks.push(MediaTrackKind::Screen);
+    }
+    tracks
+}
+
+fn merge_attached_tracks(
+    mut tracks: Vec<MediaTrackKind>,
+    extra: &[MediaTrackKind],
+) -> Vec<MediaTrackKind> {
+    for track in extra {
+        if *track != MediaTrackKind::Audio && !tracks.contains(track) {
+            tracks.push(*track);
+        }
+    }
+    tracks
+}
+
+fn default_test_visual() -> Arc<dyn SeatVisualSource> {
+    #[cfg(test)]
+    {
+        FixedSeatVisual::present()
+    }
+    #[cfg(not(test))]
+    {
+        Arc::new(AlsaSeatVisual)
     }
 }
 
@@ -1613,7 +2029,6 @@ fn publish_media_session(
 mod tests {
     use super::*;
     use mde_collab_types::topics::{self, projection as proj};
-    use mde_collab_types::CallMediaRequirement;
 
     fn write_readiness(persist: &Persist, readiness: &CallMediaReadiness) {
         let body = serde_json::to_string(readiness).expect("serialize readiness");
@@ -1651,6 +2066,20 @@ mod tests {
     fn two_party_video_readiness(call: CallId, space: SpaceId, local: &str) -> CallMediaReadiness {
         let mut readiness = two_party_readiness(call, space, local);
         readiness.sessions[0].kind = CallKind::Video;
+        readiness.sessions[0].requirements = vec![
+            CallMediaRequirement::Microphone,
+            CallMediaRequirement::Camera,
+        ];
+        readiness
+    }
+
+    fn two_party_screen_readiness(call: CallId, space: SpaceId, local: &str) -> CallMediaReadiness {
+        let mut readiness = two_party_readiness(call, space, local);
+        readiness.sessions[0].kind = CallKind::Screen;
+        readiness.sessions[0].requirements = vec![
+            CallMediaRequirement::Microphone,
+            CallMediaRequirement::ScreenCapture,
+        ];
         readiness
     }
 
@@ -1704,7 +2133,7 @@ mod tests {
         let msg = persist
             .read_latest(&media_session_topic(call))
             .expect("read session")
-            .expect("session published");
+            .unwrap_or_else(|| panic!("session {call} was not published"));
         MediaSessionV1::from_json(msg.body.as_deref().expect("body")).expect("admit session")
     }
 
@@ -2056,5 +2485,150 @@ mod tests {
 
         let election = read_election(&persist, call);
         assert!(!election.healthy);
+    }
+
+    #[test]
+    fn camera_and_screen_attach_detach_publish_honest_unavailable_states() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let space = SpaceId::new();
+
+        let absent_call = CallId::new();
+        let absent = WebrtcP2pPlane::new(FixedSeatAudio::present(), None)
+            .with_local_actor(ActorId::new("alice"))
+            .with_visual(FixedSeatVisual::camera_absent());
+        write_readiness(
+            &persist,
+            &two_party_video_readiness(absent_call, space, "alice"),
+        );
+        let mut published = BTreeMap::new();
+        absent.tick(&persist, &mut published);
+        let session = read_session(&persist, absent_call);
+        assert_eq!(
+            session.state,
+            MediaSessionStateV1::DeviceAbsent {
+                track: MediaTrackKind::Video
+            }
+        );
+        assert!(!session.state.claims_live_media());
+        assert_eq!(session.frames_observed, 0);
+        assert!(session.audio_bound);
+        assert_eq!(
+            session.offered_tracks,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video]
+        );
+        assert!(
+            matches!(
+                absent.prove_advancing_frames(
+                    &two_party_video_readiness(absent_call, space, "alice").sessions[0],
+                    CallMediaAdapter::WebRtcP2p
+                ),
+                Err(CallMediaProviderError::ProviderUnavailable { detail })
+                    if detail.contains("video") && detail.contains("absent")
+            ),
+            "absent camera must not prove live frames"
+        );
+
+        let denied_call = CallId::new();
+        let denied = WebrtcP2pPlane::new(FixedSeatAudio::present(), None)
+            .with_local_actor(ActorId::new("alice"))
+            .with_visual(FixedSeatVisual::camera_denied());
+        write_readiness(
+            &persist,
+            &two_party_video_readiness(denied_call, space, "alice"),
+        );
+        let mut published = BTreeMap::new();
+        denied.tick(&persist, &mut published);
+        let session = read_session(&persist, denied_call);
+        assert_eq!(
+            session.state,
+            MediaSessionStateV1::PermissionDenied {
+                track: MediaTrackKind::Video
+            }
+        );
+        assert!(!session.state.claims_live_media());
+
+        let screen_call = CallId::new();
+        let screen_absent = WebrtcP2pPlane::new(FixedSeatAudio::present(), None)
+            .with_local_actor(ActorId::new("alice"))
+            .with_visual(FixedSeatVisual::screen_absent());
+        write_readiness(
+            &persist,
+            &two_party_screen_readiness(screen_call, space, "alice"),
+        );
+        let mut published = BTreeMap::new();
+        screen_absent.tick(&persist, &mut published);
+        let session = read_session(&persist, screen_call);
+        assert_eq!(
+            session.state,
+            MediaSessionStateV1::DeviceAbsent {
+                track: MediaTrackKind::Screen
+            }
+        );
+        assert_eq!(
+            session.offered_tracks,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Screen]
+        );
+
+        let attach_call = CallId::new();
+        let attach = WebrtcP2pPlane::new(FixedSeatAudio::present(), None)
+            .with_local_actor(ActorId::new("alice"))
+            .with_visual(FixedSeatVisual::screen_denied());
+        write_readiness(&persist, &two_party_readiness(attach_call, space, "alice"));
+        let mut published = BTreeMap::new();
+        attach.tick(&persist, &mut published);
+        let before = read_session(&persist, attach_call);
+        assert_eq!(before.offered_tracks, vec![MediaTrackKind::Audio]);
+        assert_ne!(before.state, MediaSessionStateV1::Connected);
+
+        assert!(
+            matches!(
+                attach.attach_visual_track(attach_call, MediaTrackKind::Audio),
+                Err(CallMediaProviderError::ExecutionRefused { detail })
+                    if detail.contains("audio")
+            ),
+            "audio must not ride the visual attach path"
+        );
+        assert!(
+            matches!(
+                attach.detach_visual_track(attach_call, MediaTrackKind::Audio),
+                Err(CallMediaProviderError::ExecutionRefused { detail })
+                    if detail.contains("audio")
+            ),
+            "audio must not be detachable"
+        );
+
+        attach
+            .attach_visual_track(attach_call, MediaTrackKind::Screen)
+            .expect("screen attach is admitted");
+        write_readiness(&persist, &two_party_readiness(attach_call, space, "alice"));
+        attach.tick(&persist, &mut published);
+        let attached = read_session(&persist, attach_call);
+        assert_eq!(
+            attached.offered_tracks,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Screen]
+        );
+        assert_eq!(
+            attached.state,
+            MediaSessionStateV1::PermissionDenied {
+                track: MediaTrackKind::Screen
+            }
+        );
+        assert!(!attached.state.claims_live_media());
+        assert_eq!(attached.frames_observed, 0);
+        assert!(
+            attached.local_description.is_none() && attached.remote_description.is_none(),
+            "denied visual attach must remint without a fake negotiated Connected offer"
+        );
+
+        attach
+            .detach_visual_track(attach_call, MediaTrackKind::Screen)
+            .expect("screen detach is admitted");
+        write_readiness(&persist, &two_party_readiness(attach_call, space, "alice"));
+        attach.tick(&persist, &mut published);
+        let detached = read_session(&persist, attach_call);
+        assert_eq!(detached.offered_tracks, vec![MediaTrackKind::Audio]);
+        assert_eq!(detached.state, MediaSessionStateV1::Negotiating);
+        assert!(!detached.state.claims_live_media());
     }
 }
