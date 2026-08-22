@@ -1,47 +1,36 @@
-//! Phase 3.1 — Send-To entry-point routing.
+//! Send-To entry-point routing.
 //!
-//! The Send-To verb is reachable from six entry points (Q3.1
-//! lock):
+//! The live Files surface (`mde-files-egui`) constructs exactly two
+//! [`SendToEntry`] values (Q33 leftover / retired 6-set lock):
 //!
 //!   1. Toolbar primary-action button (`SendToEntry::Toolbar`)
 //!   2. Right-click context menu (`SendToEntry::ContextMenu`)
-//!   3. Command palette (`SendToEntry::CommandPalette`) — keyboard
-//!      shortcut: Ctrl/Cmd + K
-//!   4. Drag-and-drop onto a sidebar peer
-//!      (`SendToEntry::DragDrop`)
-//!   5. Details panel send-button (`SendToEntry::DetailsPanel`)
-//!   6. Bulk-select action bar (`SendToEntry::BulkSelectBar`) —
-//!      lit when `Selection::len() > 1`
 //!
-//! All six entry points dispatch through the same
-//! [`SendToRequest`] type so the orchestrator sees one canonical
-//! shape regardless of where the user clicked.
+//! Command-palette, drag-and-drop, details-panel, and bulk-select-bar
+//! variants were never constructed by the live surface and are gone.
+//! Re-introduce an arm only at a real call site.
 //!
-//! Pure-data module — no Iced widgets here. The
-//! `MdeFiles::update` reducer routes `Message::SendTo(req)` to
-//! the backend (or, in tests, to the in-memory `DemoBackend`).
+//! Both entry points dispatch through the same [`SendToRequest`] type
+//! so the orchestrator sees one canonical shape regardless of where
+//! the user clicked.
+//!
+//! Pure-data module — no GUI widgets here. The Files surface routes
+//! a constructed request to the backend (or, in tests, to the
+//! in-memory `DemoBackend`).
 
 use std::path::PathBuf;
 
 use crate::backend::{ConflictPolicy, Destination, SendMode};
 
-/// Where in the UI the Send-To verb fired from. Locked 6-set
-/// per the Phase 3.1 design lock.
+/// Where in the UI the Send-To verb fired from. Live Files surface
+/// constructs [`Toolbar`](Self::Toolbar) and
+/// [`ContextMenu`](Self::ContextMenu) only (Q33 leftover).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendToEntry {
     /// Toolbar primary-action button.
     Toolbar,
     /// Right-click → "Send to…" context menu item.
     ContextMenu,
-    /// Command palette (Ctrl/Cmd+K).
-    CommandPalette,
-    /// Drag-and-drop onto a sidebar peer card.
-    DragDrop,
-    /// Details-panel "Send" button.
-    DetailsPanel,
-    /// Bulk-select action bar (visible when multi-select set
-    /// has > 1 row).
-    BulkSelectBar,
 }
 
 impl SendToEntry {
@@ -51,24 +40,13 @@ impl SendToEntry {
         match self {
             Self::Toolbar => "toolbar",
             Self::ContextMenu => "context-menu",
-            Self::CommandPalette => "command-palette",
-            Self::DragDrop => "drag-drop",
-            Self::DetailsPanel => "details-panel",
-            Self::BulkSelectBar => "bulk-select-bar",
         }
     }
 
-    /// Every locked entry point. Lock-checked by tests.
+    /// Every live entry point. Lock-checked by tests.
     #[must_use]
     pub fn all() -> &'static [SendToEntry] {
-        &[
-            SendToEntry::Toolbar,
-            SendToEntry::ContextMenu,
-            SendToEntry::CommandPalette,
-            SendToEntry::DragDrop,
-            SendToEntry::DetailsPanel,
-            SendToEntry::BulkSelectBar,
-        ]
+        &[SendToEntry::Toolbar, SendToEntry::ContextMenu]
     }
 }
 
@@ -77,8 +55,8 @@ impl SendToEntry {
 /// pipes the request into `Backend::send_to` after pre-flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendToRequest {
-    /// Sources (file paths). Toolbar/context-menu/drag-drop fill
-    /// these from the focused row or the multi-select set.
+    /// Sources (file paths). Toolbar and context-menu fill these
+    /// from the focused row or the multi-select set.
     pub sources: Vec<PathBuf>,
     /// Destination — peer / group / role / site (mirrors
     /// `backend::Destination`).
@@ -122,8 +100,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_six_entry_points_listed() {
-        assert_eq!(SendToEntry::all().len(), 6);
+    fn all_live_entry_points_listed() {
+        assert_eq!(SendToEntry::all().len(), 2);
     }
 
     #[test]
@@ -173,17 +151,21 @@ mod tests {
     }
 
     #[test]
-    fn locked_six_entry_set_matches_design() {
+    fn live_entry_set_is_toolbar_and_context_menu() {
         let slugs: HashSet<&'static str> = SendToEntry::all().iter().map(|e| e.slug()).collect();
-        for required in [
-            "toolbar",
-            "context-menu",
+        for required in ["toolbar", "context-menu"] {
+            assert!(slugs.contains(required), "missing live entry {required}");
+        }
+        for retired in [
             "command-palette",
             "drag-drop",
             "details-panel",
             "bulk-select-bar",
         ] {
-            assert!(slugs.contains(required), "missing locked entry {required}");
+            assert!(
+                !slugs.contains(retired),
+                "retired 6-set entry {retired} must stay gone"
+            );
         }
     }
 }
