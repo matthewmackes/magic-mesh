@@ -424,6 +424,38 @@ impl VoiceAdminRefuse {
     }
 }
 
+/// Button-level intent on the fleet voice-admin form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceAdminFormIntent {
+    /// Publish `action/voice/provision`.
+    Provision,
+    /// Route the draft DID to `route_node`.
+    DidRoute,
+    /// Unroute the draft DID to the main line.
+    Unroute,
+    /// Apply the draft failover policy.
+    Failover,
+    /// Apply the draft shared-outbound.
+    SharedConfig,
+    /// Arm cutover confirm, or publish cutover when already armed.
+    Cutover,
+    /// Drop a pending cutover confirm.
+    CancelCutover,
+}
+
+/// Result of applying one [`VoiceAdminFormIntent`] to the local form + sink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoiceAdminFormOutcome {
+    /// A typed verb was queued for the shell.
+    Published(VoiceAdminCommand),
+    /// First cutover click — nothing published until confirm.
+    ArmedCutover,
+    /// Confirm was dismissed.
+    CancelledCutover,
+    /// Verb boundary refused; the sink is unchanged.
+    Refused(VoiceAdminRefuse),
+}
+
 /// Redacted `get-gateway` reply shape. `password` is always the empty string;
 /// `password_set` distinguishes a stored secret from an intentionally empty one.
 #[derive(Clone, PartialEq, Eq)]
@@ -1582,8 +1614,39 @@ fn failover_policy_json(policy: &VoiceFailoverPolicy) -> String {
     }
 }
 
-#[derive(Clone, Default)]
-struct VoiceAdminFormState {
+const EMPTY_VOICE_NODES_NOTE: &str = "No state/voice nodes projected.";
+const EMPTY_VOICE_DIDS_NOTE: &str = "No master-account DIDs projected.";
+const EMPTY_VOICE_SHARED_NOTE: &str = "Shared-outbound is not lifted yet.";
+const EMPTY_VOICE_CUTOVER_NOTE: &str = "No cutover status projected.";
+
+/// Honest empty-state copy for missing `state/voice/*` projections. Never
+/// invents demo rows — an empty snapshot yields every note.
+#[must_use]
+pub fn voice_projection_empty_notes(
+    nodes: &[VoiceNodeProjection],
+    dids: &[VoiceDid],
+    shared: Option<&VoiceSharedOutbound>,
+    cutover: Option<&VoiceCutoverStatus>,
+) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if nodes.is_empty() {
+        notes.push(EMPTY_VOICE_NODES_NOTE);
+    }
+    if dids.is_empty() {
+        notes.push(EMPTY_VOICE_DIDS_NOTE);
+    }
+    if shared.is_none() {
+        notes.push(EMPTY_VOICE_SHARED_NOTE);
+    }
+    if cutover.is_none() {
+        notes.push(EMPTY_VOICE_CUTOVER_NOTE);
+    }
+    notes
+}
+
+/// Draft fields for the fleet voice-admin form.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoiceAdminFormState {
     did: String,
     route_node: String,
     failover_node: String,
@@ -1594,6 +1657,34 @@ struct VoiceAdminFormState {
     shared_seeded: bool,
     confirm_cutover: bool,
     notice: Option<String>,
+}
+
+impl VoiceAdminFormState {
+    /// A write draft the apply path (and tests) can fill without painting.
+    #[cfg(test)]
+    #[must_use]
+    pub fn draft(
+        did: impl Into<String>,
+        route_node: impl Into<String>,
+        failover_node: impl Into<String>,
+        failover_kind: usize,
+        failover_number: impl Into<String>,
+        caller_id: impl Into<String>,
+        outbound_trunk: impl Into<String>,
+    ) -> Self {
+        Self {
+            did: did.into(),
+            route_node: route_node.into(),
+            failover_node: failover_node.into(),
+            failover_kind,
+            failover_number: failover_number.into(),
+            caller_id: caller_id.into(),
+            outbound_trunk: outbound_trunk.into(),
+            shared_seeded: false,
+            confirm_cutover: false,
+            notice: None,
+        }
+    }
 }
 
 /// Draft fields for the SIP-gateway form. `password` is write-only: it is
@@ -1686,6 +1777,153 @@ fn seed_voice_shared_form_state(
     form
 }
 
+/// Admit one fleet voice-admin intent. Provision always publishes. DID route,
+/// failover, shared-config, and cutover refuse honestly when `state/voice/*`
+/// projections have no provisioned sub-account.
+pub fn apply_voice_admin(
+    form: &mut VoiceAdminFormState,
+    nodes: &[VoiceNodeProjection],
+    dids: &[VoiceDid],
+    cutover: Option<&VoiceCutoverStatus>,
+    sink: &mut VoiceAdminSink,
+    intent: VoiceAdminFormIntent,
+) -> VoiceAdminFormOutcome {
+    match intent {
+        VoiceAdminFormIntent::Provision => {
+            let command = VoiceAdminCommand::Provision;
+            sink.emit(command.clone());
+            form.notice = Some("Provision published".to_owned());
+            VoiceAdminFormOutcome::Published(command)
+        }
+        VoiceAdminFormIntent::DidRoute => apply_voice_did_route(form, nodes, dids, sink, false),
+        VoiceAdminFormIntent::Unroute => apply_voice_did_route(form, nodes, dids, sink, true),
+        VoiceAdminFormIntent::Failover => apply_voice_failover(form, nodes, sink),
+        VoiceAdminFormIntent::SharedConfig => apply_voice_shared_config(form, nodes, sink),
+        VoiceAdminFormIntent::Cutover => apply_voice_cutover(form, nodes, cutover, sink),
+        VoiceAdminFormIntent::CancelCutover => {
+            form.confirm_cutover = false;
+            VoiceAdminFormOutcome::CancelledCutover
+        }
+    }
+}
+
+fn refuse_unprovisioned_voice(form: &mut VoiceAdminFormState) -> VoiceAdminFormOutcome {
+    form.notice = Some(VoiceAdminRefuse::NoProvisionedAccount.label().to_owned());
+    VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::NoProvisionedAccount)
+}
+
+fn apply_voice_did_route(
+    form: &mut VoiceAdminFormState,
+    nodes: &[VoiceNodeProjection],
+    dids: &[VoiceDid],
+    sink: &mut VoiceAdminSink,
+    unroute: bool,
+) -> VoiceAdminFormOutcome {
+    if !has_provisioned_voice_account(nodes) {
+        return refuse_unprovisioned_voice(form);
+    }
+    let target = if unroute {
+        None
+    } else {
+        let target = form.route_node.trim();
+        if target.is_empty() {
+            form.notice = Some(VoiceAdminRefuse::UnknownNode.label().to_owned());
+            return VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::UnknownNode);
+        }
+        Some(target)
+    };
+    let pending = sink.pending_did_routes();
+    match validate_did_route(&form.did, target, dids, nodes, &pending) {
+        Ok(command) => {
+            sink.emit(command.clone());
+            form.notice = Some(if unroute {
+                "DID unroute published".to_owned()
+            } else {
+                "DID route published".to_owned()
+            });
+            VoiceAdminFormOutcome::Published(command)
+        }
+        Err(refuse) => {
+            form.notice = Some(refuse.label().to_owned());
+            VoiceAdminFormOutcome::Refused(refuse)
+        }
+    }
+}
+
+fn apply_voice_failover(
+    form: &mut VoiceAdminFormState,
+    nodes: &[VoiceNodeProjection],
+    sink: &mut VoiceAdminSink,
+) -> VoiceAdminFormOutcome {
+    if !has_provisioned_voice_account(nodes) {
+        return refuse_unprovisioned_voice(form);
+    }
+    let policy = match form.failover_kind {
+        1 => VoiceFailoverPolicy::Forward {
+            number: form.failover_number.clone(),
+        },
+        2 => VoiceFailoverPolicy::None,
+        _ => VoiceFailoverPolicy::Voicemail,
+    };
+    match validate_failover(&form.failover_node, policy, nodes) {
+        Ok(command) => {
+            sink.emit(command.clone());
+            form.notice = Some("Failover published".to_owned());
+            VoiceAdminFormOutcome::Published(command)
+        }
+        Err(refuse) => {
+            form.notice = Some(refuse.label().to_owned());
+            VoiceAdminFormOutcome::Refused(refuse)
+        }
+    }
+}
+
+fn apply_voice_shared_config(
+    form: &mut VoiceAdminFormState,
+    nodes: &[VoiceNodeProjection],
+    sink: &mut VoiceAdminSink,
+) -> VoiceAdminFormOutcome {
+    if !has_provisioned_voice_account(nodes) {
+        return refuse_unprovisioned_voice(form);
+    }
+    match validate_shared_config(&form.caller_id, &form.outbound_trunk) {
+        Ok(command) => {
+            sink.emit(command.clone());
+            form.notice = Some("Shared-outbound published".to_owned());
+            VoiceAdminFormOutcome::Published(command)
+        }
+        Err(refuse) => {
+            form.notice = Some(refuse.label().to_owned());
+            VoiceAdminFormOutcome::Refused(refuse)
+        }
+    }
+}
+
+fn apply_voice_cutover(
+    form: &mut VoiceAdminFormState,
+    nodes: &[VoiceNodeProjection],
+    cutover: Option<&VoiceCutoverStatus>,
+    sink: &mut VoiceAdminSink,
+) -> VoiceAdminFormOutcome {
+    if !form.confirm_cutover {
+        form.confirm_cutover = true;
+        return VoiceAdminFormOutcome::ArmedCutover;
+    }
+    let outcome = match validate_cutover(cutover, nodes) {
+        Ok(command) => {
+            sink.emit(command.clone());
+            form.notice = Some("Cutover published".to_owned());
+            VoiceAdminFormOutcome::Published(command)
+        }
+        Err(refuse) => {
+            form.notice = Some(refuse.label().to_owned());
+            VoiceAdminFormOutcome::Refused(refuse)
+        }
+    };
+    form.confirm_cutover = false;
+    outcome
+}
+
 fn gateway_admin_form_state(ui: &egui::Ui, readout: Option<&GatewayReadout>) -> GatewayFormState {
     let id = ui.id().with("gateway-admin-form");
     let mut state = ui
@@ -1745,10 +1983,8 @@ fn voice_admin_panel(
                 "Leader/operator console. Verbs publish locally; the shell drains them onto action/voice/*.",
             );
 
-            if provisioned {
-                voice_fleet_board(ui, data, nodes);
-                ui.add_space(Style::SP_S);
-            }
+            voice_fleet_board(ui, data, nodes);
+            ui.add_space(Style::SP_S);
 
             ui.add_space(Style::SP_S);
             if ui
@@ -1756,8 +1992,14 @@ fn voice_admin_panel(
                 .comms_hover_text("Force an immediate reconcile pass for every enrolled node")
                 .clicked()
             {
-                sink.emit(VoiceAdminCommand::Provision);
-                form.notice = Some("Provision published".to_owned());
+                let _ = apply_voice_admin(
+                    &mut form,
+                    nodes,
+                    dids,
+                    admin.voice_cutover(),
+                    sink,
+                    VoiceAdminFormIntent::Provision,
+                );
             }
 
             if !provisioned {
@@ -1768,6 +2010,17 @@ fn voice_admin_panel(
                     "DID routing, failover, shared-outbound, and cutover stay empty until a node has a sub-account.",
                 )
                 .show(ui, |_| {});
+                for note in voice_projection_empty_notes(
+                    nodes,
+                    dids,
+                    admin.voice_shared(),
+                    admin.voice_cutover(),
+                )
+                .into_iter()
+                .filter(|note| *note != EMPTY_VOICE_NODES_NOTE)
+                {
+                    widgets::muted_note(ui, note);
+                }
                 if let Some(notice) = form.notice.as_deref() {
                     widgets::muted_note(ui, notice);
                 }
@@ -1785,7 +2038,7 @@ fn voice_admin_panel(
             ui.add_space(Style::SP_S);
             voice_failover(ui, &mut form, nodes, sink);
             ui.add_space(Style::SP_S);
-            voice_shared_outbound(ui, &mut form, admin.voice_shared(), sink);
+            voice_shared_outbound(ui, &mut form, admin.voice_shared(), nodes, sink);
 
             if let Some(notice) = form.notice.as_deref() {
                 ui.add_space(Style::SP_XS);
@@ -1806,6 +2059,15 @@ fn voice_fleet_board(
         Style::typography_text("Fleet board", TypographyRole::Title)
             .color(theme_color(ui, Style::TEXT_STRONG)),
     );
+    if nodes.is_empty() {
+        widgets::WorkspaceStatePanel::new(
+            widgets::WorkspaceState::Empty,
+            "No state/voice nodes projected",
+            EMPTY_VOICE_NODES_NOTE,
+        )
+        .show(ui, |_| {});
+        return;
+    }
     for node in nodes {
         if !node.sip_uri.is_empty() {
             widgets::field(
@@ -1912,7 +2174,7 @@ fn voice_did_routing(
             .color(theme_color(ui, Style::TEXT_STRONG)),
     );
     if dids.is_empty() {
-        widgets::muted_note(ui, "No master-account DIDs projected.");
+        widgets::muted_note(ui, EMPTY_VOICE_DIDS_NOTE);
     } else {
         let mut list = widgets::DenseList::new();
         for did in dids {
@@ -1947,33 +2209,21 @@ fn voice_did_routing(
                 .hint_text("peer:eagle"),
         );
         if ui.button("Route DID").clicked() {
-            let pending = sink.pending_did_routes();
-            let target = form.route_node.trim();
-            if target.is_empty() {
-                form.notice = Some(VoiceAdminRefuse::UnknownNode.label().to_owned());
-            } else {
-                match validate_did_route(&form.did, Some(target), dids, nodes, &pending) {
-                    Ok(command) => {
-                        sink.emit(command);
-                        form.notice = Some("DID route published".to_owned());
-                    }
-                    Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-                }
-            }
+            let _ = apply_voice_admin(
+                form,
+                nodes,
+                dids,
+                None,
+                sink,
+                VoiceAdminFormIntent::DidRoute,
+            );
         }
         if ui
             .button("Unroute")
             .comms_hover_text("Return this DID to the master account main line")
             .clicked()
         {
-            let pending = sink.pending_did_routes();
-            match validate_did_route(&form.did, None, dids, nodes, &pending) {
-                Ok(command) => {
-                    sink.emit(command);
-                    form.notice = Some("DID unroute published".to_owned());
-                }
-                Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-            }
+            let _ = apply_voice_admin(form, nodes, dids, None, sink, VoiceAdminFormIntent::Unroute);
         }
     });
 }
@@ -2014,20 +2264,7 @@ fn voice_failover(
             );
         }
         if ui.button("Apply failover").clicked() {
-            let policy = match form.failover_kind {
-                1 => VoiceFailoverPolicy::Forward {
-                    number: form.failover_number.clone(),
-                },
-                2 => VoiceFailoverPolicy::None,
-                _ => VoiceFailoverPolicy::Voicemail,
-            };
-            match validate_failover(&form.failover_node, policy, nodes) {
-                Ok(command) => {
-                    sink.emit(command);
-                    form.notice = Some("Failover published".to_owned());
-                }
-                Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-            }
+            let _ = apply_voice_admin(form, nodes, &[], None, sink, VoiceAdminFormIntent::Failover);
         }
     });
 }
@@ -2036,6 +2273,7 @@ fn voice_shared_outbound(
     ui: &mut egui::Ui,
     form: &mut VoiceAdminFormState,
     shared: Option<&VoiceSharedOutbound>,
+    nodes: &[VoiceNodeProjection],
     sink: &mut VoiceAdminSink,
 ) {
     ui.label(
@@ -2058,7 +2296,7 @@ fn voice_shared_outbound(
             );
         }
         None => {
-            widgets::muted_note(ui, "Shared-outbound is not lifted yet.");
+            widgets::muted_note(ui, EMPTY_VOICE_SHARED_NOTE);
         }
     }
     ui.horizontal_wrapped(|ui| {
@@ -2085,13 +2323,14 @@ fn voice_shared_outbound(
             .comms_hover_text("Publish action/voice/shared-config")
             .clicked()
         {
-            match validate_shared_config(&form.caller_id, &form.outbound_trunk) {
-                Ok(command) => {
-                    sink.emit(command);
-                    form.notice = Some("Shared-outbound published".to_owned());
-                }
-                Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-            }
+            let _ = apply_voice_admin(
+                form,
+                nodes,
+                &[],
+                None,
+                sink,
+                VoiceAdminFormIntent::SharedConfig,
+            );
         }
     });
 }
@@ -2137,7 +2376,7 @@ fn voice_cutover(
             );
         }
         None => {
-            widgets::muted_note(ui, "No cutover status projected.");
+            widgets::muted_note(ui, EMPTY_VOICE_CUTOVER_NOTE);
         }
     }
     ui.horizontal(|ui| {
@@ -2147,20 +2386,34 @@ fn voice_cutover(
                 .comms_hover_text("Force remaining nodes onto the split model")
                 .clicked()
             {
-                match validate_cutover(cutover, nodes) {
-                    Ok(command) => {
-                        sink.emit(command);
-                        form.notice = Some("Cutover published".to_owned());
-                    }
-                    Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-                }
-                form.confirm_cutover = false;
+                let _ = apply_voice_admin(
+                    form,
+                    nodes,
+                    &[],
+                    cutover,
+                    sink,
+                    VoiceAdminFormIntent::Cutover,
+                );
             }
             if ui.button("Cancel").clicked() {
-                form.confirm_cutover = false;
+                let _ = apply_voice_admin(
+                    form,
+                    nodes,
+                    &[],
+                    cutover,
+                    sink,
+                    VoiceAdminFormIntent::CancelCutover,
+                );
             }
         } else if ui.button("Continue cutover").clicked() {
-            form.confirm_cutover = true;
+            let _ = apply_voice_admin(
+                form,
+                nodes,
+                &[],
+                cutover,
+                sink,
+                VoiceAdminFormIntent::Cutover,
+            );
         }
     });
 }
@@ -2325,16 +2578,17 @@ mod tests {
     use mde_collab_types::{ActorClock, ActorId, AlertPayload, AlertView, EventId};
 
     use super::{
-        apply_gateway_form, coalesced_activity_rows, has_provisioned_voice_account,
-        seed_voice_shared_form_state, validate_cutover, validate_did_route, validate_failover,
-        validate_gateway_clear, validate_gateway_set, validate_shared_config, ActivityEntry,
-        ActivityFilter, AlertInbox, GatewayCommand, GatewayFormIntent, GatewayFormOutcome,
-        GatewayFormState, GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId,
-        VoiceAdminCommand, VoiceAdminFormState, VoiceAdminRefuse, VoiceCutoverPhase,
-        VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState,
-        VoiceSharedOutbound, VOICE_DID_ROUTE_TOPIC, VOICE_FAILOVER_TOPIC, VOICE_PROVISION_TOPIC,
-        VOICE_SHARED_CONFIG_TOPIC, VOIP_CLEAR_GATEWAY_TOPIC, VOIP_GET_GATEWAY_TOPIC,
-        VOIP_SET_GATEWAY_TOPIC,
+        apply_gateway_form, apply_voice_admin, coalesced_activity_rows,
+        has_provisioned_voice_account, seed_voice_shared_form_state, validate_cutover,
+        validate_did_route, validate_failover, validate_gateway_clear, validate_gateway_set,
+        validate_shared_config, voice_projection_empty_notes, ActivityEntry, ActivityFilter,
+        AlertInbox, GatewayCommand, GatewayFormIntent, GatewayFormOutcome, GatewayFormState,
+        GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId, VoiceAdminCommand,
+        VoiceAdminFormIntent, VoiceAdminFormOutcome, VoiceAdminFormState, VoiceAdminRefuse,
+        VoiceAdminSink, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy,
+        VoiceNodeProjection, VoiceRegState, VoiceSharedOutbound, VOICE_DID_ROUTE_TOPIC,
+        VOICE_FAILOVER_TOPIC, VOICE_PROVISION_TOPIC, VOICE_SHARED_CONFIG_TOPIC,
+        VOIP_CLEAR_GATEWAY_TOPIC, VOIP_GET_GATEWAY_TOPIC, VOIP_SET_GATEWAY_TOPIC,
     };
 
     fn entry(
@@ -2948,5 +3202,164 @@ mod tests {
             VoiceCutoverPhase::CutoverComplete.headline(),
             "Cutover complete — every node on the split model"
         );
+    }
+
+    #[test]
+    fn fleet_voice_admin_apply_publishes_typed_verbs_and_empty_projections_stay_honest() {
+        assert_eq!(
+            voice_projection_empty_notes(&[], &[], None, None),
+            [
+                "No state/voice nodes projected.",
+                "No master-account DIDs projected.",
+                "Shared-outbound is not lifted yet.",
+                "No cutover status projected.",
+            ]
+        );
+
+        let mut empty_form = VoiceAdminFormState::draft(
+            "15551234567",
+            "peer:eagle",
+            "peer:eagle",
+            0,
+            "",
+            "15551234567",
+            "main",
+        );
+        let mut sink = VoiceAdminSink::new();
+        match apply_voice_admin(
+            &mut empty_form,
+            &[],
+            &[],
+            None,
+            &mut sink,
+            VoiceAdminFormIntent::Provision,
+        ) {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(command.topic(), VOICE_PROVISION_TOPIC);
+                assert_eq!(command.json_body(), "{}");
+            }
+            other => panic!("empty projections must still publish provision, got {other:?}"),
+        }
+        for intent in [
+            VoiceAdminFormIntent::DidRoute,
+            VoiceAdminFormIntent::Unroute,
+            VoiceAdminFormIntent::Failover,
+            VoiceAdminFormIntent::SharedConfig,
+        ] {
+            assert_eq!(
+                apply_voice_admin(&mut empty_form, &[], &[], None, &mut sink, intent),
+                VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::NoProvisionedAccount),
+                "{intent:?} must refuse honestly when state/voice projections are empty"
+            );
+        }
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained[0], VoiceAdminCommand::Provision));
+
+        let nodes = vec![provisioned_node("peer:eagle", "eagle", "eagle")];
+        let dids = vec![inventory("15551234567", Some("eagle"))];
+        let shared = VoiceSharedOutbound {
+            caller_id: "15551234567".to_owned(),
+            outbound_trunk: "main".to_owned(),
+        };
+        let cutover = VoiceCutoverStatus {
+            phase: VoiceCutoverPhase::NodesReprovisioning,
+            total_nodes: 2,
+            reprovisioned: 1,
+            pending_nodes: vec!["otter".to_owned()],
+            shared_outbound_lifted: true,
+            updated_at_s: 1,
+        };
+        assert!(
+            voice_projection_empty_notes(&nodes, &dids, Some(&shared), Some(&cutover)).is_empty()
+        );
+
+        let mut form = VoiceAdminFormState::draft(
+            "15551234567",
+            "peer:eagle",
+            "peer:eagle",
+            2,
+            "",
+            "15551234567",
+            "main",
+        );
+        let mut live = VoiceAdminSink::new();
+        let published = [
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                Some(&cutover),
+                &mut live,
+                VoiceAdminFormIntent::Provision,
+            ),
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                Some(&cutover),
+                &mut live,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                Some(&cutover),
+                &mut live,
+                VoiceAdminFormIntent::Failover,
+            ),
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                Some(&cutover),
+                &mut live,
+                VoiceAdminFormIntent::SharedConfig,
+            ),
+        ];
+        assert!(matches!(
+            published[0],
+            VoiceAdminFormOutcome::Published(VoiceAdminCommand::Provision)
+        ));
+        match &published[1] {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(command.topic(), VOICE_DID_ROUTE_TOPIC);
+                assert_eq!(
+                    command.json_body(),
+                    r#"{"did":"15551234567","node_id":"peer:eagle"}"#
+                );
+            }
+            other => panic!("expected published DID route, got {other:?}"),
+        }
+        match &published[2] {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(command.topic(), VOICE_FAILOVER_TOPIC);
+                assert_eq!(
+                    command.json_body(),
+                    r#"{"node_id":"peer:eagle","policy":"None"}"#
+                );
+            }
+            other => panic!("expected published failover, got {other:?}"),
+        }
+        match &published[3] {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(command.topic(), VOICE_SHARED_CONFIG_TOPIC);
+                assert_eq!(
+                    command.json_body(),
+                    r#"{"caller_id":"15551234567","outbound_trunk":"main"}"#
+                );
+            }
+            other => panic!("expected published shared-config, got {other:?}"),
+        }
+        let live_cmds = live.drain();
+        assert_eq!(live_cmds.len(), 4);
+        assert!(matches!(live_cmds[0], VoiceAdminCommand::Provision));
+        assert!(matches!(live_cmds[1], VoiceAdminCommand::DidRoute { .. }));
+        assert!(matches!(live_cmds[2], VoiceAdminCommand::Failover { .. }));
+        assert!(matches!(
+            live_cmds[3],
+            VoiceAdminCommand::SharedConfig { .. }
+        ));
     }
 }
