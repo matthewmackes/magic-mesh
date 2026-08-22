@@ -715,16 +715,17 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: receipt and local-generation paths exist, but no complete
-  current-revision production input set is admitted. App VM S3 has a live
-  Fedora receipt and Kiron S6 has passed source-bound package admission.
-  Evidence: `docs/platform/evidence/WL-REL-006-2026-08-16-app-vm-receipt-r1.md`,
-  `docs/platform/evidence/WL-REL-006-2026-08-16-kiron-assets-r1.md`.
-  RPM lane still needs a mode-0400 private JSON bound to the clean checkout.
-  Operator 2026-08-22: fetch Geofabrik New York PBF plus official Erie/Niagara
-  geometry and render locally (never public OSM tiles). Agents write a redacted
-  preflight template; the operator fills secrets and chmod 0400. Android stays
-  deferred. Materialize S1-S6; do not reopen source selection.
+- Current state: Operator-authorized Maps sources fetched 2026-08-22 onto
+  BigBoy `172.20.0.130` dest-root `/home/mm/mcnf-maps-sources` (real directory,
+  no-replace mode-0400, `production_admitted: false`, no public OSM tile CDN).
+  PBF 495288424 B sha256 `8d7b60bff5d5fafc16d39f4a17f87c9f11014f56b1f4191c4ec64fb43684fd64`.
+  TIGER zip 83913260 B sha256 `04e668d3502757c837c13444730547cd967f28a2c49aeffb873d1792ab2cb97b`.
+  Local render refused honestly: TIGER zip clip is not Erie 36029 / Niagara 36063.
+  Leftover is production `buffalo-niagara.mbtiles` admission and operator dest
+  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`. Evidence:
+  `docs/platform/evidence/WL-REL-006-2026-08-22-maps-authorized-fetch-r1.md`.
+  App VM S3 and Kiron S6 remain admitted; RPM still needs mode-0400 private JSON.
+  Android stays deferred. Do not reopen source selection.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -742,15 +743,15 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Done when: all admitted input families have a named reproducible source and an
        automated producer/verifier; missing inputs fail the owning story.
   2. S2 Produce the Maps input.
-     - Inputs: a digest-pinned New York OpenStreetMap PBF, versioned official
-       Erie/Niagara county geometry, approved offline-cache policy, candidate
-       source receipt, and license terms.
-     - Action: render the Buffalo-Niagara catalog/tile set locally from those
-       immutable sources into raster PNG MBTiles consumed by the production GUI
-       at `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`; preserve
-       the PBF, boundary, clip, renderer/style/font identities, ODbL attribution,
-       aggregate quota, and deterministic transport. Never bulk-fetch the public
-       OSM tile service; defer exact installed runtime proof to WL-TEST-002.
+     - Inputs: digest-pinned Geofabrik NY PBF and TIGER 2024 county zip now on
+       BigBoy `/home/mm/mcnf-maps-sources` (2026-08-22 fetch evidence); approved
+       offline-cache policy, candidate source receipt, and license terms.
+     - Action: clip official Erie 36029 / Niagara 36063 from the fetched TIGER
+       zip, render locally into raster PNG `buffalo-niagara.mbtiles`, and admit
+       the production dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`.
+       Preserve PBF, boundary, clip, renderer/style/font identities, ODbL
+       attribution, aggregate quota, and deterministic transport. Never fetch
+       public OSM tiles; defer installed runtime proof to WL-TEST-002.
      - Deliverable: immutable `buffalo-niagara.mbtiles`, source/build manifest,
        hashes, attribution, license, approval receipt, and package install path.
      - Validation: verify MBTiles schema, PNG payloads, TMS coordinates,
