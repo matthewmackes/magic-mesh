@@ -2513,4 +2513,26 @@ mod leftover_retirements {
             leftover.display()
         );
     }
+
+    fn parity_ledger() -> &'static str {
+        include_str!("../../../../../docs/platform/WL-FUNC-011-parity-ledger.md")
+    }
+
+    fn assert_ledger_cites(sha: &str) {
+        let marker = format!("deleted in `{sha}`");
+        assert!(
+            parity_ledger().contains(marker.as_str()),
+            "parity ledger must contain the deleting-revision marker {marker}"
+        );
+    }
+
+    #[test]
+    fn parity_ledger_cites_deleting_revisions() {
+        assert_ledger_cites("aad4d5115e011195b01df8595a2135438073aeea");
+        assert_ledger_cites("c3b589dae761df9e9e9362b6d4308b7a6bbd4dfe");
+        assert_ledger_cites("1bbd9706e34ca45bec905efab73d1db0b92a3261");
+        assert_ledger_cites("858ec546890fd8ffc7fb16d5e90ae8d5f2d580f7");
+        assert_ledger_cites("afc45f0fb28094aa9662adefe73120b552a14b15");
+        assert_ledger_cites("7f46e1f1a8ad3d8d7226fe7131c22d27970bf06a");
+    }
 }

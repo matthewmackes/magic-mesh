@@ -1664,16 +1664,13 @@ story execution contract above.
   the deleting revision.
 - Current state: operator Q9 signoff landed 2026-08-22 (delete after fleet
   negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units
-  are already gone from this tree. S1 live-negative is
-  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Leftover
-  `cli/voip_rtt.rs` and `voip_rtt_worker.rs` are deleted;
-  `leftover_retirements` asserts both stay gone. Roster, spawn, and CLI
-  do not advertise `voip_rtt`. Cosmic-era View arms deleted
-  (MeshOverview/Peer/Local only). SendTo is Toolbar+ContextMenu.
-  Leftover is live helper `own_nebula_ip` in lib `voip_rtt.rs` (keep).
-- Remaining work: Cosmic-era View arms deleted (MeshOverview/Peer/Local
-  only); SendTo is Toolbar+ContextMenu; leftover is live helper
-  `own_nebula_ip` in lib `voip_rtt.rs` (keep); then:
+  are already gone. S1 live-negative is
+  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Ledger Q9,
+  roster+resolve, Q13 voip_rtt, Q29 View, and Q33 SendToEntry retire rows
+  now cite the deleting revisions. `leftover_retirements` source-scans those
+  SHAs. Leftover is live helper `own_nebula_ip` in lib `voip_rtt.rs` (keep).
+- Remaining work: leftover is live helper `own_nebula_ip` in lib
+  `voip_rtt.rs` (keep) and any still-uncited retire row. Then:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
@@ -1700,8 +1697,8 @@ story execution contract above.
      - Deliverable: no orphan module remains.
      - Validation: the full farm gate passes; the retained responders'
        contract tests stay green.
-     - Done when: the parity ledger's retire rows are amended with the
-       deleting revision.
+     - Done when: the parity ledger's retire rows cite the deleting
+       revision (landed). Leftover is `own_nebula_ip` (keep).
 - Scope: deletion only; no replacement security or policy surface.
 - Relevant files/components: the paths named in Current state plus packaging
   and systemd references.
