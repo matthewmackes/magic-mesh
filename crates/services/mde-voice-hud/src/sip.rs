@@ -9,6 +9,12 @@
 //! so no separate crypto dep). The live registrar round-trip needs a running
 //! SIP server → that is the SIP-server bench; everything here that does not
 //! touch the socket is unit-tested.
+//!
+//! WL-FUNC-024 S4 / Q15: Communications Calls must consume [`VoiceAccounts`],
+//! [`run_agent_accounts`], and [`lift_if_legacy`] as the single registrar path.
+//! Do not add a second registrar. This module does not invent a live PSTN: an
+//! absent governed provider stays unavailable. A legacy flat account is lifted
+//! once; a split account never double-registers.
 
 use std::fmt::Write as _;
 use std::net::{ToSocketAddrs, UdpSocket};
@@ -2972,6 +2978,52 @@ mod tests {
         .unwrap();
         assert!(!accts.is_legacy_flat());
         assert!(accts.lift_if_legacy().is_none());
+    }
+
+    #[test]
+    fn lift_if_legacy_is_once_only_and_split_accounts_never_double_register() {
+        // Fail-closed leftover: the Q15 path is unused by Calls, so the fold
+        // itself must refuse a second lift and a second REGISTER.
+        let mut flat = SipAccount::accounts_from_toml(
+            "username = \"15551234567\"\npassword = \"pw\"\nserver = \"sip.vitelity.net\"\n",
+        )
+        .unwrap();
+        assert!(flat.is_legacy_flat());
+        assert!(flat.lift_if_legacy().is_some());
+        assert!(flat.apply_legacy_lift(), "first lift of a flat account");
+        assert!(!flat.is_legacy_flat());
+        assert!(
+            flat.lift_if_legacy().is_none(),
+            "lift_if_legacy is once-only after apply"
+        );
+        assert!(
+            !flat.apply_legacy_lift(),
+            "a second apply must not lift again"
+        );
+        assert_eq!(flat.register_identity(), "15551234567");
+        assert_eq!(
+            flat.outbound.as_ref().map(|o| o.caller_id.as_str()),
+            Some("15551234567"),
+            "lifted trunk is caller-ID, not a second REGISTER identity"
+        );
+
+        let mut split = SipAccount::accounts_from_toml(
+            "[inbound_sub]\nusername = \"eagle\"\nserver = \"sip.vitelity.net\"\n\n\
+             [shared_outbound]\ncaller_id = \"15551230000\"\ntrunk = \"out.vitelity.net\"\n",
+        )
+        .unwrap();
+        assert!(split.lift_if_legacy().is_none());
+        assert!(!split.apply_legacy_lift());
+        assert_eq!(split.register_identity(), "eagle");
+        assert_ne!(
+            split.register_identity(),
+            split
+                .outbound
+                .as_ref()
+                .map(|o| o.caller_id.as_str())
+                .unwrap_or_default(),
+            "split accounts never double-register the shared-outbound CID"
+        );
     }
 
     // ── WL-FUNC-024 S4: split/shared-outbound PSTN agent drive ──
