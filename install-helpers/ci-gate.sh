@@ -101,6 +101,7 @@ POLICY_LINTS=(
   verify-release-gate-matrix.py
   lint-workload-authority.sh
   lint-worklist.sh
+  lint-func033-keep.sh
 )
 POLICY_SELF_TESTS=(
   lint-bus-names.sh
@@ -113,6 +114,7 @@ POLICY_SELF_TESTS=(
   verify-release-gate-matrix.py
   lint-workload-authority.sh
   lint-worklist.sh
+  lint-func033-keep.sh
 )
 POLICY_ROOT="$HERE"
 

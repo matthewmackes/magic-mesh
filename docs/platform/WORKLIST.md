@@ -1703,8 +1703,8 @@ story execution contract above.
   `WL-FUNC-033-2026-08-22-fleet-negative-reread-r1.md`). Ledger retire rows
   cite deleting revisions. README telephony bullet names the softphone path
   only. Leftover is still keep `own_nebula_ip` in lib `voip_rtt.rs`.
-  Keep lint `install-helpers/lint-func033-keep.sh` (evidence
-  `WL-FUNC-033-2026-08-22-keep-lint-r1.md`).
+  Keep lint `install-helpers/lint-func033-keep.sh` is in ci-gate
+  POLICY_LINTS (evidence `WL-FUNC-033-2026-08-22-keep-ci-gate-r1.md`).
 - Remaining work: leftover is still keep `own_nebula_ip` in lib
   `voip_rtt.rs`. Then:
 
