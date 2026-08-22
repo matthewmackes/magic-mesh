@@ -653,6 +653,10 @@ mod tests {
             shift: true,
             ..Default::default()
         };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
         let events = vec![
             egui::Event::Key {
                 key: egui::Key::L,
@@ -669,6 +673,14 @@ mod tests {
                 repeat: false,
                 modifiers: shifted,
             },
+            // Transfers chords arrive as Ctrl-held named keys (WL-FUNC-032).
+            egui::Event::Key {
+                key: egui::Key::J,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            },
             egui::Event::Key {
                 key: egui::Key::S,
                 physical_key: None,
@@ -680,7 +692,11 @@ mod tests {
         ];
         assert_eq!(
             egui_key_presses(&events),
-            vec![press(egui::Key::L), shift_press(egui::Key::Num1)]
+            vec![
+                press(egui::Key::L),
+                shift_press(egui::Key::Num1),
+                ctrl_press(egui::Key::J),
+            ]
         );
     }
 
@@ -855,5 +871,68 @@ mod tests {
             mde_seat::hotkeys::HOTKEYS.len(),
             "catalog chords must stay unique"
         );
+
+        // The System Hotkeys section renders `chord` + `action.label()` from this
+        // table. Both Transfers rows must be present with those operator labels,
+        // and they must not be host-first so Documents/Terminal can keep the
+        // keystroke at the apply site.
+        let listed: Vec<_> = mde_seat::hotkeys::HOTKEYS
+            .iter()
+            .filter(|h| h.chord.starts_with("Ctrl+"))
+            .map(|h| (h.chord, h.action, h.action.label(), h.action.host_first()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    "Ctrl+J",
+                    HotkeyAction::OpenTransfers,
+                    "Open Transfers",
+                    false
+                ),
+                ("Ctrl+N", HotkeyAction::NewTransfer, "New transfer", false),
+            ],
+            "Hotkeys settings must list exactly the two Transfers chords"
+        );
+    }
+
+    #[test]
+    fn transfer_chords_do_not_claim_documents_or_terminal_editing_keys() {
+        // Hostile: Documents (Communications editor) and Terminal keep their
+        // industry-standard Ctrl chords. The Transfers table may only claim
+        // Ctrl+J / Ctrl+N — do not invent extras that would steal text editing.
+        let editing = [
+            egui::Key::A,
+            egui::Key::B,
+            egui::Key::C,
+            egui::Key::D,
+            egui::Key::E,
+            egui::Key::F,
+            egui::Key::G,
+            egui::Key::H,
+            egui::Key::I,
+            egui::Key::K,
+            egui::Key::L,
+            egui::Key::M,
+            egui::Key::O,
+            egui::Key::P,
+            egui::Key::Q,
+            egui::Key::R,
+            egui::Key::S,
+            egui::Key::T,
+            egui::Key::U,
+            egui::Key::V,
+            egui::Key::W,
+            egui::Key::X,
+            egui::Key::Y,
+            egui::Key::Z,
+        ];
+        let mut r = HotkeyRouter::default();
+        for key in editing {
+            assert!(
+                r.dispatch(&[], &[ctrl_press(key)]).is_empty(),
+                "Ctrl+{key:?} must reach Documents/Terminal text editing"
+            );
+        }
     }
 }
