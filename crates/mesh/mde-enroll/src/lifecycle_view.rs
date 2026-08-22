@@ -7,6 +7,11 @@ use mackes_mesh_types::lifecycle::{
     LifecycleIntentKind, LifecyclePhase, OnboardOffboardSessionV1, SeatReadinessV1,
 };
 
+/// Warnings that begin with this prefix name a withdrawn capability (S13).
+/// The projection derives the capability name from the *typed* warning so a
+/// renderer never re-parses the raw readiness envelope.
+const CAPABILITY_UNAVAILABLE_PREFIX: &str = "capability unavailable: ";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleSessionView {
     pub session_id: String,
@@ -38,6 +43,22 @@ impl ReadinessState {
 }
 
 impl LifecycleSessionView {
+    /// Derive withdrawn-capability names from the typed readiness warnings.
+    ///
+    /// Only a warning whose text *starts with* the capability prefix names a
+    /// capability; a warning that merely mentions the phrase mid-sentence is
+    /// left as an ordinary warning. The trailing name is trimmed and empties
+    /// are dropped so a renderer receives a clean capability list.
+    fn capabilities_from_warnings(warnings: &[String]) -> Vec<String> {
+        warnings
+            .iter()
+            .filter_map(|warning| warning.strip_prefix(CAPABILITY_UNAVAILABLE_PREFIX))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     pub fn from_wire(session_json: &str, readiness_json: &str) -> Result<Self, String> {
         let session: OnboardOffboardSessionV1 = serde_json::from_str(session_json)
             .map_err(|_| "invalid lifecycle session".to_owned())?;
@@ -66,14 +87,7 @@ impl LifecycleSessionView {
         } else {
             ReadinessState::Ready
         };
-        let capabilities = readiness_json
-            .split("capability unavailable: ")
-            .skip(1)
-            .filter_map(|value| value.split(['"', '[', ']']).next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let capabilities = Self::capabilities_from_warnings(&readiness_wire.warnings);
         Ok(Self {
             session_id: session.session_id,
             intent: session.intent,
@@ -150,6 +164,83 @@ mod tests {
             LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
         assert_eq!(view.readiness, ReadinessState::ReadyWithWarnings);
         assert!(view.capability_summary().contains("kvm"));
+    }
+
+    #[test]
+    fn capabilities_are_projected_from_typed_warnings_not_raw_json() {
+        // Pretty-printed readiness must project the same capability list as a
+        // compact one: the projection reads the typed warnings, never the raw
+        // envelope layout.
+        let session = serde_json::json!({
+            "schema_version": 1, "session_id": "session-1", "operator_id": "operator-1",
+            "intent": "verify_and_correct", "target_ids": ["seat-15"], "generation": 1, "phase": "running"
+        });
+        let readiness = serde_json::json!({
+            "schema_version": 1, "target_id": "seat-15", "generation": 1,
+            "ready": true, "missing_requirements": [],
+            "warnings": ["capability unavailable: kvm", "capability unavailable: gpu passthrough"]
+        });
+        let session_json = session.to_string();
+        let compact = serde_json::to_string(&readiness).unwrap();
+        let pretty = serde_json::to_string_pretty(&readiness).unwrap();
+        assert_ne!(
+            compact, pretty,
+            "fixture must actually differ in wire layout"
+        );
+        let compact_view = LifecycleSessionView::from_wire(&session_json, &compact).unwrap();
+        let pretty_view = LifecycleSessionView::from_wire(&session_json, &pretty).unwrap();
+        assert_eq!(compact_view.capabilities, pretty_view.capabilities);
+        assert_eq!(pretty_view.capabilities, vec!["kvm", "gpu passthrough"]);
+        assert_eq!(
+            pretty_view.capability_summary(),
+            "capabilities unavailable: kvm, gpu passthrough"
+        );
+    }
+
+    #[test]
+    fn does_not_harvest_a_capability_from_a_mid_sentence_mention() {
+        // A warning that merely references the phrase is not a capability
+        // withdrawal; only a leading prefix names a capability.
+        let session = serde_json::json!({
+            "schema_version": 1, "session_id": "session-1", "operator_id": "operator-1",
+            "intent": "onboard", "target_ids": ["seat-15"], "generation": 1, "phase": "running"
+        });
+        let readiness = serde_json::json!({
+            "schema_version": 1, "target_id": "seat-15", "generation": 1,
+            "ready": true, "missing_requirements": [],
+            "warnings": ["note: this is not a capability unavailable: report"]
+        });
+        let view =
+            LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
+        assert!(view.capabilities.is_empty());
+        assert_eq!(
+            view.capability_summary(),
+            "capabilities: baseline available"
+        );
+        assert_eq!(view.readiness, ReadinessState::ReadyWithWarnings);
+    }
+
+    #[test]
+    fn drops_empty_capability_names_after_the_typed_prefix() {
+        // A leading prefix with no name (or only whitespace) is not a
+        // withdrawn capability; the renderer must see a clean list.
+        let session = serde_json::json!({
+            "schema_version": 1, "session_id": "session-1", "operator_id": "operator-1",
+            "intent": "onboard", "target_ids": ["seat-15"], "generation": 1, "phase": "running"
+        });
+        let readiness = serde_json::json!({
+            "schema_version": 1, "target_id": "seat-15", "generation": 1,
+            "ready": true, "missing_requirements": [],
+            "warnings": [
+                "capability unavailable: ",
+                "capability unavailable:    ",
+                "capability unavailable: kvm"
+            ]
+        });
+        let view =
+            LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
+        assert_eq!(view.capabilities, vec!["kvm"]);
+        assert_eq!(view.capability_summary(), "capabilities unavailable: kvm");
     }
 
     #[test]
