@@ -209,6 +209,71 @@ impl CollabTransport for DocumentShareTransport {
     }
 }
 
+/// Opaque `CollabMessage` JSON: a host `Leave` is `{"from":"<host>","kind":{"t":"leave"},…}`.
+/// Parsed here as text so this crate does not take a second protocol store or a
+/// new `serde_json` edge — the live [`CollabSession`] remains the only decoder.
+fn frame_is_from_host(body: &str, host: &str) -> bool {
+    !host.is_empty() && body.contains(&format!(r#""from":"{host}""#))
+}
+
+fn frame_is_leave(body: &str) -> bool {
+    body.contains(r#""t":"leave""#)
+}
+
+/// Watches the same transport the live session polls and notes a host `Leave`
+/// even when that peer was never added to the CRDT roster. `join` tails past
+/// history, so an immediate owner-close must still detach every follower.
+struct LeaveWatch<'a> {
+    inner: &'a DocumentShareTransport,
+    host: String,
+    left: std::cell::Cell<bool>,
+}
+
+impl CollabTransport for LeaveWatch<'_> {
+    fn publish(&self, topic: &str, body: &str) {
+        self.inner.publish(topic, body);
+    }
+
+    fn poll(&self, topic: &str, cursor: &mut Option<String>) -> Vec<String> {
+        let bodies = self.inner.poll(topic, cursor);
+        if !self.host.is_empty() {
+            for body in &bodies {
+                if frame_is_from_host(body, &self.host) && frame_is_leave(body) {
+                    self.left.set(true);
+                }
+            }
+        }
+        bodies
+    }
+
+    fn tail(&self, topic: &str) -> Option<String> {
+        self.inner.tail(topic)
+    }
+}
+
+/// Whether `host` has already published `Leave` on this session topic.
+///
+/// Uses an independent cursor so it does not steal frames from the live
+/// [`CollabSession`]. A later join against a stale session row must still
+/// refuse after owner-close.
+fn host_has_left_on_wire(
+    transport: &DocumentShareTransport,
+    session: &SessionId,
+    host: &str,
+) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    let mut cursor = None;
+    let mut left = false;
+    for body in transport.poll(&session.topic(), &mut cursor) {
+        if frame_is_from_host(&body, host) {
+            left = frame_is_leave(&body);
+        }
+    }
+    left
+}
+
 /// One locally attached mesh share-session (host or guest).
 struct LiveShare {
     /// Space the session was started or joined in.
@@ -612,7 +677,18 @@ impl DocumentsState {
         }
         live.session.flush(share_transport);
         live.session.publish_presence(share_transport);
-        let outcome = live.session.poll(share_transport);
+        let watch_host = if !live.expected_host.is_empty() {
+            live.expected_host.clone()
+        } else {
+            live.host_peer.clone()
+        };
+        let watcher = LeaveWatch {
+            inner: share_transport,
+            host: watch_host,
+            left: std::cell::Cell::new(false),
+        };
+        let outcome = live.session.poll(&watcher);
+        let host_left_on_wire = watcher.left.get();
         // Pin the host only after they appear in the roster. Setting
         // `host_peer` from the session row at join time made the first pump
         // treat a not-yet-visible owner as already gone.
@@ -628,8 +704,9 @@ impl DocumentsState {
             }
         }
         let host_left = !live.owner
-            && !live.host_peer.is_empty()
-            && !live.session.peers().contains_key(&live.host_peer);
+            && ((host_left_on_wire && !live.expected_host.is_empty())
+                || (!live.host_peer.is_empty()
+                    && !live.session.peers().contains_key(&live.host_peer)));
         SharePumpOutcome {
             crdt_text: Some(live.session.doc().to_text()),
             follow: outcome.follow,
@@ -1454,17 +1531,23 @@ impl CommunicationsSurface {
             self.documents.notice = Some("Cannot join: that share session is closed.".to_owned());
             return false;
         }
+        let Some(session_id) = session_id_for(space, document) else {
+            self.documents.notice =
+                Some("Cannot join: document id is not a valid session.".to_owned());
+            return false;
+        };
+        let expected_host = host_peer_from_session(data, space, document);
+        if host_has_left_on_wire(&self.documents.share_transport, &session_id, &expected_host) {
+            self.documents.detach_share("");
+            self.documents.notice = Some("Cannot join: that share session is closed.".to_owned());
+            return false;
+        }
         if let Some(live) = &self.documents.share {
             if live.document == document {
                 return true;
             }
             self.documents.detach_share("");
         }
-        let Some(session_id) = session_id_for(space, document) else {
-            self.documents.notice =
-                Some("Cannot join: document id is not a valid session.".to_owned());
-            return false;
-        };
         let mut session = CollabSession::guest(session_id.clone(), data.me().as_str());
         session.join(&self.documents.share_transport);
         self.documents.share = Some(LiveShare {
@@ -1472,7 +1555,7 @@ impl CommunicationsSurface {
             document,
             session,
             owner: false,
-            expected_host: host_peer_from_session(data, space, document),
+            expected_host,
             host_peer: String::new(),
         });
         self.documents
@@ -2128,6 +2211,101 @@ mod tests {
                 .is_some_and(|notice| notice.contains("not a member")),
             "non-member refuse after attach must be honest, got {:?}",
             guest.document_notice()
+        );
+    }
+
+    #[test]
+    fn owner_close_detaches_unpinned_followers_and_refuses_stale_rejoin() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+
+        // Guest join tails past the host Hello. If the owner closes before the
+        // host answers, the follower never pins the host — Leave on the same
+        // transport must still detach, and a later join against the still-
+        // projected session row must refuse as closed.
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("zebra", space, document, &["zebra", "alpha"]);
+        let guest_data = share_fixture("alpha", space, document, &["zebra", "alpha"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus.clone());
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share(&guest_data, space, document));
+        assert_eq!(
+            guest.document_share_host_peer(),
+            Some(""),
+            "host must stay unpinned when it has not answered the join"
+        );
+        assert!(
+            !guest.close_document_share(),
+            "only the owner may close the session"
+        );
+        assert!(
+            guest.has_live_document_share(),
+            "a refused guest close must leave the unpinned follower attached"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("Only the share owner")),
+            "guest close must refuse honestly, got {:?}",
+            guest.document_notice()
+        );
+
+        assert!(host.close_document_share());
+        guest.pump_document_share();
+        assert!(
+            !guest.has_live_document_share(),
+            "owner Leave must detach a follower who never pinned the host"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| { notice.contains("closed") || notice.contains("detached") }),
+            "owner-close detach must be honest, got {:?}",
+            guest.document_notice()
+        );
+
+        let mut late = CommunicationsSurface::new();
+        late.bind_document_share_bus(bus);
+        late.select_space(space);
+        late.open_document(&guest_data, document, "Runbook");
+        assert!(
+            !late.join_document_share(&guest_data, space, document),
+            "a stale session row after owner-close must refuse the join"
+        );
+        assert!(!late.has_live_document_share());
+        assert!(
+            late.document_notice()
+                .is_some_and(|notice| notice.contains("closed")),
+            "closed-session rejoin must refuse honestly, got {:?}",
+            late.document_notice()
+        );
+
+        let outsider = crate::fixture::FixtureData::new("osprey", 1_000);
+        let mut stranger = CommunicationsSurface::new();
+        stranger.select_space(space);
+        stranger.open_document(&outsider, document, "Runbook");
+        assert!(
+            !stranger.join_document_share(&outsider, space, document),
+            "a non-member must be refused at join"
+        );
+        assert!(!stranger.has_live_document_share());
+        assert!(
+            stranger
+                .document_notice()
+                .is_some_and(|notice| notice.contains("not a member")),
+            "non-member join refuse must be honest, got {:?}",
+            stranger.document_notice()
         );
     }
 }
