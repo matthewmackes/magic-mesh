@@ -1746,7 +1746,9 @@ fn new_file_and_duplicate_refuse_a_read_only_directory() {
         .and_then(|d| d.error.as_deref())
         .expect("unwritable create is visible");
     assert!(
-        error.contains("Couldn't create file") || error.to_ascii_lowercase().contains("permission"),
+        error.contains("Couldn't create file")
+            || error.contains("read-only")
+            || error.to_ascii_lowercase().contains("permission"),
         "honest read-only: {error}"
     );
     b.cancel_name_dialog();
@@ -2026,7 +2028,8 @@ fn hardlink_across_devices_is_an_honest_error() {
     assert!(
         error.contains("across devices")
             || error.contains("Couldn't create hard link")
-            || error.contains("Couldn't check the destination"),
+            || error.contains("Couldn't check the destination")
+            || error.contains("read-only"),
         "honest hardlink error: {error}"
     );
 }

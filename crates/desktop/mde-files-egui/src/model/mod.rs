@@ -2783,19 +2783,29 @@ impl FileBrowser {
     }
 
     /// Enqueue extract-to through [`OpKind::Extract`].
+    ///
+    /// Destination-shape and read-only refusal go through
+    /// [`ExtractToDialog::surface_error`] before any queue submit. A more
+    /// specific symlink-in-path walk stays in front of that so a hostile
+    /// destination still uses the existing extract wording.
     pub fn submit_extract_to(&mut self) {
         let Some(dialog) = self.extract_to.as_ref() else {
             return;
         };
-        let Some(dest_dir) = dialog.target() else {
-            return;
-        };
-        if let Some(error) = self.extract_destination_error(&dest_dir) {
+        let dest_dir = dialog.target();
+        let preflight = dest_dir
+            .as_deref()
+            .and_then(|dest| self.extract_destination_error(dest))
+            .or_else(|| dialog.surface_error(self.meta_ops.as_ref()));
+        if let Some(error) = preflight {
             if let Some(dialog) = self.extract_to.as_mut() {
                 dialog.error = Some(error);
             }
             return;
         }
+        let Some(dest_dir) = dest_dir else {
+            return;
+        };
         let archive = dialog.archive.clone();
         self.extract_to = None;
         self.enqueue_extract(archive, dest_dir);
@@ -2909,15 +2919,22 @@ impl FileBrowser {
     }
 
     /// Execute New Folder / New File / Rename / links through the existing
-    /// immediate [`FileOps`] authority. A destination preflight prevents ordinary
-    /// replacement; any validation, preflight, or syscall failure remains visible
-    /// in the dialog.
+    /// immediate [`FileOps`] authority. [`NameDialog::surface_error`] refuses
+    /// name-shape and read-only parents before any create; a destination
+    /// preflight then prevents ordinary replacement. Validation, preflight, or
+    /// syscall failure remains visible in the dialog.
     pub fn submit_name_dialog(&mut self, pane: usize) {
         let Some(dialog) = self.name_dialog.as_ref() else {
             return;
         };
         if matches!(dialog.operation, NameOperation::BookmarkRename { .. }) {
             self.submit_bookmark_rename();
+            return;
+        }
+        if let Some(error) = dialog.surface_error(self.meta_ops.as_ref()) {
+            if let Some(dialog) = self.name_dialog.as_mut() {
+                dialog.error = Some(error);
+            }
             return;
         }
         let Some(target) = dialog.target() else {
@@ -4118,4 +4135,51 @@ mod sort;
 use sort::*;
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("tests.rs");
+
+    #[test]
+    fn submit_name_and_extract_refuse_read_only_via_surface_error() {
+        let fs = FakeFileOps::new();
+        fs.create_dir_all(Path::new("/ro/box")).expect("mkdir");
+        fs.set_permissions(Path::new("/ro/box"), 0o555)
+            .expect("chmod");
+
+        let mut b = FileBrowser::with_file_ops(
+            Box::new(FixtureBackend::new(Vec::new(), Vec::new())),
+            FakeFileOps::new(),
+        )
+        .with_meta_ops(fs, false);
+
+        let mut name = NameDialog::new_file(PathBuf::from("/ro/box"));
+        name.name = "notes.txt".to_string();
+        b.name_dialog = Some(name);
+        b.submit_name_dialog(0);
+        let error = b
+            .name_dialog()
+            .and_then(|d| d.error.as_deref())
+            .expect("read-only New File stays open");
+        assert!(
+            error.contains("read-only"),
+            "name submit uses surface_error: {error}"
+        );
+
+        b.extract_to = Some(ExtractToDialog::new(
+            PathBuf::from("/ro/box/payload.zip"),
+            PathBuf::from("/ro/box/out"),
+        ));
+        b.submit_extract_to();
+        let error = b
+            .extract_to_dialog()
+            .and_then(|d| d.error.as_deref())
+            .expect("read-only Extract To stays open");
+        assert!(
+            error.contains("read-only"),
+            "extract submit uses surface_error: {error}"
+        );
+        assert!(
+            b.ops().active().is_empty(),
+            "read-only dest never reaches the queue"
+        );
+    }
+}
