@@ -2370,3 +2370,118 @@ fn bookmarks_report_persistence_failure_and_keep_dirty_state() {
         .expect("retry should persist after repair");
     assert_eq!(saved.bookmarks, b.bookmarks());
 }
+
+// WL-FUNC-027 — a parseable store can still be hostile: over the count cap,
+// duplicate pins, escaping / peer / `local:..` / `.` paths, empty and
+// over-long labels. Hydrate must keep at most BOOKMARKS_CAP valid unique
+// pins, repair labels in memory, leave the on-disk bytes untouched, and
+// refuse the next pin. An oversize file degrades the same way a corrupt
+// one does.
+#[test]
+fn bookmarks_hydrate_caps_hostile_entries_and_refuses_the_next_pin() {
+    let dir = tempfile::tempdir().expect("store dir");
+    let store = dir.path().join(super::BOOKMARKS_FILE);
+
+    let mut entries = Vec::new();
+    entries.push(serde_json::json!({"label": "keep-0", "path": "/tmp/mcnf-bm-0"}));
+    entries.push(serde_json::json!({"label": "peer", "path": "peer:oak"}));
+    entries.push(serde_json::json!({"label": "escape", "path": "/tmp/../etc/passwd"}));
+    entries.push(serde_json::json!({"label": "relative", "path": "relative"}));
+    entries.push(serde_json::json!({"label": "dotdot-slug", "path": "local:.."}));
+    entries.push(serde_json::json!({"label": "curdir", "path": "/tmp/./secret"}));
+    entries.push(serde_json::json!({"label": "dup", "path": "/tmp/mcnf-bm-0"}));
+    entries.push(serde_json::json!({"label": "", "path": "/tmp/mcnf-bm-empty"}));
+    entries.push(serde_json::json!({
+        "label": "X".repeat(super::BOOKMARK_LABEL_MAX + 16),
+        "path": "/tmp/mcnf-bm-long"
+    }));
+    for i in 1..super::BOOKMARKS_CAP {
+        entries.push(serde_json::json!({
+            "label": format!("keep-{i}"),
+            "path": format!("/tmp/mcnf-bm-{i}")
+        }));
+    }
+    entries.push(serde_json::json!({"label": "overflow", "path": "/tmp/mcnf-bm-overflow"}));
+
+    std::fs::write(
+        &store,
+        serde_json::to_vec_pretty(&serde_json::json!({ "bookmarks": entries })).expect("json"),
+    )
+    .expect("seed store");
+    let raw_before = std::fs::read(&store).expect("seed bytes");
+
+    let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
+    assert_eq!(b.bookmarks().len(), super::BOOKMARKS_CAP);
+    assert_eq!(b.bookmarks()[0].path, "/tmp/mcnf-bm-0");
+    assert!(
+        b.bookmarks()
+            .iter()
+            .any(|bm| bm.path == "/tmp/mcnf-bm-empty" && !bm.label.is_empty()),
+        "empty label repaired to a visible name"
+    );
+    let long = b
+        .bookmarks()
+        .iter()
+        .find(|bm| bm.path == "/tmp/mcnf-bm-long")
+        .expect("long label kept");
+    assert_eq!(long.label.chars().count(), super::BOOKMARK_LABEL_MAX);
+    assert!(b.bookmarks().iter().all(|bm| {
+        bm.path != "peer:oak"
+            && bm.path != "/tmp/../etc/passwd"
+            && bm.path != "relative"
+            && bm.path != "local:.."
+            && bm.path != "/tmp/./secret"
+            && bm.path != "/tmp/mcnf-bm-overflow"
+    }));
+    assert_eq!(
+        b.bookmarks()
+            .iter()
+            .filter(|bm| bm.path == "/tmp/mcnf-bm-0")
+            .count(),
+        1,
+        "duplicate pin collapsed"
+    );
+    assert!(
+        b.last_note()
+            .is_some_and(|n| n.contains("Dropped") && n.contains("hostile")),
+        "honest degrade: {:?}",
+        b.last_note()
+    );
+    drop(b);
+    assert_eq!(
+        std::fs::read(&store).expect("untouched"),
+        raw_before,
+        "hydrate degrades in memory only — no silent rewrite"
+    );
+
+    let extra = dir.path().join("ExtraPin");
+    std::fs::create_dir(&extra).expect("mkdir");
+    let rows = vec![
+        FileRow::local("ExtraPin", Mime::Folder, "\u{2014}", "\u{2014}")
+            .with_path(extra.to_string_lossy()),
+    ];
+    let mut b2 = live_posix_browser(rows).with_config_dir(dir.path());
+    b2.click(0, 0);
+    b2.pin_focused(0);
+    assert_eq!(b2.bookmarks().len(), super::BOOKMARKS_CAP);
+    assert!(
+        b2.last_note()
+            .is_some_and(|n| n.contains("At most") && n.contains(&super::BOOKMARKS_CAP.to_string())),
+        "pin past cap: {:?}",
+        b2.last_note()
+    );
+
+    let oversize = tempfile::tempdir().expect("oversize");
+    std::fs::write(
+        oversize.path().join(super::BOOKMARKS_FILE),
+        vec![b'x'; (super::BOOKMARKS_MAX_BYTES as usize) + 8],
+    )
+    .expect("write");
+    let err = super::load_bookmarks_at(&oversize.path().join(super::BOOKMARKS_FILE))
+        .expect_err("oversize");
+    assert!(err.contains("larger than"), "oversize note: {err}");
+
+    assert!(super::validate_bookmark_path("local:..").is_err());
+    assert!(super::validate_bookmark_path("/tmp/./secret").is_err());
+    assert!(super::validate_bookmark_path("local:home\n").is_err());
+}

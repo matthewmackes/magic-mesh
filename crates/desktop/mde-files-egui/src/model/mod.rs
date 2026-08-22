@@ -3579,7 +3579,7 @@ impl FileBrowser {
             self.last_note = Some(format!("At most {BOOKMARKS_CAP} bookmarks can be pinned."));
             return;
         }
-        let label = bookmark_label(&route);
+        let label = sanitize_bookmark_label(&bookmark_label(&route), &route);
         self.bookmarks.push(UserBookmark { label, path: route });
         self.bookmarks_dirty = Some(Instant::now());
         self.last_note = None;
@@ -3694,12 +3694,41 @@ impl FileBrowser {
         };
         match load_bookmarks_at(&path) {
             Ok(file) => {
-                self.bookmarks = file
-                    .bookmarks
-                    .into_iter()
-                    .filter(|b| validate_bookmark_path(&b.path).is_ok())
-                    .take(BOOKMARKS_CAP)
-                    .collect();
+                let mut kept = Vec::new();
+                let mut dropped = 0usize;
+                let mut repaired = 0usize;
+                for raw in file.bookmarks {
+                    if validate_bookmark_path(&raw.path).is_err()
+                        || kept.iter().any(|b: &UserBookmark| b.path == raw.path)
+                    {
+                        dropped += 1;
+                        continue;
+                    }
+                    if kept.len() >= BOOKMARKS_CAP {
+                        dropped += 1;
+                        continue;
+                    }
+                    let label = sanitize_bookmark_label(&raw.label, &raw.path);
+                    if label != raw.label {
+                        repaired += 1;
+                    }
+                    kept.push(UserBookmark {
+                        label,
+                        path: raw.path,
+                    });
+                }
+                self.bookmarks = kept;
+                // In-memory only: a parseable-but-hostile store is not rewritten
+                // until the operator mutates (same rule as a corrupt file).
+                if dropped > 0 {
+                    self.last_note = Some(format!(
+                        "Dropped {dropped} hostile or over-cap bookmark(s) — using the first {BOOKMARKS_CAP} valid unique pins."
+                    ));
+                } else if repaired > 0 {
+                    self.last_note = Some(format!(
+                        "Repaired {repaired} bookmark label(s) from a hostile store."
+                    ));
+                }
             }
             Err(note) => {
                 self.bookmarks.clear();
@@ -3884,12 +3913,36 @@ fn bookmark_label(route: &str) -> String {
         .to_string()
 }
 
+fn sanitize_bookmark_label(label: &str, route: &str) -> String {
+    let cleaned: String = label.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    let base = if trimmed.is_empty() {
+        let fallback: String = bookmark_label(route)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let fallback = fallback.trim().to_string();
+        if fallback.is_empty() {
+            route.to_string()
+        } else {
+            fallback
+        }
+    } else {
+        trimmed.to_string()
+    };
+    if base.chars().count() > BOOKMARK_LABEL_MAX {
+        base.chars().take(BOOKMARK_LABEL_MAX).collect()
+    } else {
+        base
+    }
+}
+
 fn validate_bookmark_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("A bookmark needs a path.".to_string());
     }
-    if path.as_bytes().contains(&0) {
-        return Err("A bookmark path can't contain a NUL character.".to_string());
+    if path.chars().any(|c| c.is_control()) {
+        return Err("A bookmark path can't contain a control character.".to_string());
     }
     if path.starts_with("peer:") {
         return Err(
@@ -3897,7 +3950,12 @@ fn validate_bookmark_path(path: &str) -> Result<(), String> {
         );
     }
     if let Some(slug) = path.strip_prefix("local:") {
-        if slug.is_empty() || slug.contains('/') || slug.contains('\0') {
+        if slug.is_empty()
+            || slug != slug.trim()
+            || slug.contains('/')
+            || slug.contains('\\')
+            || matches!(slug, "." | "..")
+        {
             return Err("That local place isn't a valid bookmark.".to_string());
         }
         return Ok(());
@@ -3906,10 +3964,10 @@ fn validate_bookmark_path(path: &str) -> Result<(), String> {
     if !p.is_absolute() {
         return Err("Pin an absolute folder path.".to_string());
     }
-    for c in p.components() {
-        if matches!(c, Component::ParentDir) {
-            return Err("A bookmark path can't walk above its root.".to_string());
-        }
+    // `Path::components()` drops interior `.`, so a hostile `/tmp/./secret`
+    // would otherwise hydrate as a normal pin. Inspect the raw segments.
+    if path.split('/').any(|seg| matches!(seg, "." | "..")) {
+        return Err("A bookmark path can't contain '.' or '..' components.".to_string());
     }
     Ok(())
 }
