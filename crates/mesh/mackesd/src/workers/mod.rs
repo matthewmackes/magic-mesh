@@ -408,9 +408,6 @@ pub mod netassess;
 // non-mesh-peer neighbours (mDNS + ARP-MAC + OUI) every 10 min and
 // writes a per-peer snapshot under <workgroup-root>/surrounding/.
 pub mod surrounding_worker;
-// VOIP-4.b (v5.0.0) — voip_rtt_worker. Broadcasts this peer's Vitelity-link
-// RTT to voip/link-rtt/<peer> every 60s for the dialer route override.
-pub mod voip_rtt_worker;
 // MESH-A-5.2 (v5.0.0) — mesh_firewall. Reconciles firewalld source-DROP
 // rich-rules against the mesh-synced Blocked-host consensus every minute.
 pub mod mesh_firewall;
@@ -2459,5 +2456,35 @@ mod mackesd05_tests {
             assert!(cooldown <= COOLDOWN_CAP);
         }
         assert_eq!(cooldown, COOLDOWN_CAP);
+    }
+}
+
+/// WL-FUNC-033 — leftover retirement: `voip_rtt_worker.rs` may remain on disk,
+/// but this tree must not compile it as a live `pub mod` path.
+#[cfg(test)]
+mod leftover_retirements {
+    /// Live `pub mod` names compiled by this workers tree (source-parsed).
+    fn live_worker_module_names(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn voip_rtt_worker_is_not_a_live_workers_path() {
+        let live = live_worker_module_names(include_str!("mod.rs"));
+        assert!(
+            !live.contains(&"voip_rtt_worker"),
+            "retired VOIP-4.b leftover must not be a live workers path"
+        );
+        assert!(
+            live.contains(&"surrounding_worker") && live.contains(&"mesh_firewall"),
+            "parser still sees neighboring live worker mods"
+        );
     }
 }
