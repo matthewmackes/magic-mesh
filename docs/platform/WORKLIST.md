@@ -718,19 +718,20 @@ is a capacity incident (§10.0.3), not a silent retry.
   `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` on BigBoy sha256
   `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`
   (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
-  Browser VM receipt bound to `b30954e31`
-  (`WL-REL-006-2026-08-22-browser-vm-receipt-r1.md`). S5 `all-roles` bootc
-  `479ec2b8c` is under `/root/mcnf-private/`. Kiron S6 admitted. Leftover is
-  Maps `production_admitted`, App catalog real refs, RPM signer after freeze,
-  S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
+  Browser VM Containerfile pin now matches admitted index `3a5e74e6…`
+  (`WL-REL-006-2026-08-22-browser-vm-base-pin-r1.md`; receipt `b30954e31`).
+  S5 `all-roles` bootc `479ec2b8c` is under `/root/mcnf-private/`. Kiron S6
+  admitted. Leftover is Maps `production_admitted`, App catalog real refs,
+  RPM signer after freeze, S7 `REPLACE_*`, live-seat dest (WL-TEST-002).
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
        licenses, and the existing receipt/verifier contracts.
      - Action: six-role redacted inventory is recorded; do not reopen source
-       selection. Browser VM receipt is bound to `b30954e31`. Leftover is Maps
-       `production_admitted`, App catalog real refs, RPM signer receipt after
-       freeze (WL-REL-001), S7 `REPLACE_*`, and live-seat dest (WL-TEST-002).
+       selection. Browser VM Containerfile pin now matches the admitted index
+       `3a5e74e6…`. Leftover is Maps `production_admitted`, App catalog real
+       refs, RPM signer receipt after freeze (WL-REL-001), S7 `REPLACE_*`, and
+       live-seat dest (WL-TEST-002).
      - Deliverable: redacted open-source input inventory and license manifest.
       - Validation: every source is redistributable and its credential/preflight
        requirements are machine-verifiable;
