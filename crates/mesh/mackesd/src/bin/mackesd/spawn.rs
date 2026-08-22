@@ -2801,7 +2801,34 @@ pub(crate) fn spawn_desktop_discovery_workers(
     });
 }
 
-// run_serve extract: fleet compute/virt/network-assessment workers (voice_provision .. voip_rtt); owns fw_host.
+/// WL-FUNC-033 / Q9 leftover delete. The live role roster no longer
+/// advertises `voip_rtt`; this is the unit-testable list of names
+/// `spawn_fleet_compute_workers` still registers (conditionals included).
+/// Spawn consults the list so a reintroduced leftover name fails closed
+/// before it can re-enter the census.
+fn fleet_compute_worker_names_without_voip_rtt() -> &'static [&'static str] {
+    &[
+        "voice_provision",
+        "cups_sync",
+        "firewall_monitor",
+        "selinux_monitor",
+        "router_registry",
+        "media_registry",
+        "navidrome_supervisor",
+        "media_server",
+        "media_airsonic_proxy",
+        "media_jellyfin_proxy",
+        "apps_running",
+        "apps_installed",
+        "compute_expose",
+        "compute_migrate",
+        "netassess",
+        "surrounding_hosts",
+        "mesh_firewall",
+    ]
+}
+
+// run_serve extract: fleet compute/virt/network-assessment workers (voice_provision .. mesh_firewall); owns fw_host.
 pub(crate) fn spawn_fleet_compute_workers(
     sup: &mut mackesd_core::workers::Supervisor,
     worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -3149,19 +3176,14 @@ pub(crate) fn spawn_fleet_compute_workers(
             .lock()
             .expect("worker_names mutex")
             .push("mesh_firewall".into());
-
-        // VOIP-4.b (v5.0.0) — broadcast this peer's Vitelity-link RTT to
-        // voip/link-rtt/<peer> every 60s for the dialer route override.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::voip_rtt_worker::VoipRttWorker::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("voip_rtt".into());
     } else {
         tracing::warn!("netassess: no XDG data dir; skipping network assessment worker");
+    }
+
+    // WL-FUNC-033 / Q9 leftover delete: do not reconstruct the retired
+    // Vitelity-link RTT worker. The role roster no longer advertises it.
+    if fleet_compute_worker_names_without_voip_rtt().contains(&"voip_rtt") {
+        tracing::error!("WL-FUNC-033: fleet compute spawn list must not include voip_rtt");
     }
 }
 
@@ -4098,5 +4120,28 @@ mod process_group_thread_admission_tests {
             "uncensused_process_infrastructure",
             WorkerGroup::Control,
         ));
+    }
+
+    #[test]
+    fn fleet_compute_spawn_list_does_not_include_retired_voip_rtt() {
+        assert!(
+            !fleet_compute_worker_names_without_voip_rtt().contains(&"voip_rtt"),
+            "WL-FUNC-033: fleet compute spawn list must not include voip_rtt"
+        );
+        assert!(
+            !fleet_compute_worker_names_without_voip_rtt().is_empty(),
+            "WL-FUNC-033: remaining fleet compute names must stay testable"
+        );
+        let source = include_str!("spawn.rs");
+        let leftover_ctor = ["VoipRtt", "Worker::new"].concat();
+        assert!(
+            !source.contains(&leftover_ctor),
+            "WL-FUNC-033: spawn.rs must not construct the retired RTT worker"
+        );
+        let leftover_push = [".push(", "\"voip_rtt\""].concat();
+        assert!(
+            !source.contains(&leftover_push),
+            "WL-FUNC-033: spawn.rs must not census voip_rtt"
+        );
     }
 }
