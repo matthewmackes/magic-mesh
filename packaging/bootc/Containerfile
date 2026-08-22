@@ -50,7 +50,7 @@
 # Fedora 42 matches the fleet's RPM channel (the gh-pages repo serves
 # fedora-$releasever; the mesh-service container image is FROM fedora:42 too).
 # Override with --build-arg BOOTC_BASE=… for an F43+ rebase.
-ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:44@sha256:0000000000000000000000000000000000000000000000000000000000000000
+ARG BOOTC_BASE=quay.io/fedora/fedora-bootc@sha256:3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357
 FROM ${BOOTC_BASE}
 ARG BOOTC_BASE
 ARG SURFACE_MANIFEST_SHA256
