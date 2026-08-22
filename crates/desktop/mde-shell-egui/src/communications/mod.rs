@@ -1578,7 +1578,8 @@ impl CommunicationsState {
         ) {
             self.sync_pair_views_dirty = true;
         }
-        drain_document_share(&self.surface.drain_document_share_commands(), None);
+        let document_share = self.surface.drain_document_share_commands();
+        drain_document_share(&document_share, self.surface.live_document_share_session());
         if self.gateway_get_dirty && self.surface.mode() == Mode::Activity {
             self.maybe_request_gateway_get();
         }
@@ -3842,11 +3843,16 @@ mod tests {
         let mut surface = CommunicationsSurface::new();
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(
+            surface.live_document_share_session().is_none(),
+            "fresh surface has no attached share session for the mount to pass"
+        );
+        assert!(
             surface.drain_document_share_commands().is_empty(),
             "fresh Documents share sink is empty"
         );
+        let empty = surface.drain_document_share_commands();
         assert_eq!(
-            drain_document_share(&surface.drain_document_share_commands(), None),
+            drain_document_share(&empty, surface.live_document_share_session()),
             0,
             "empty share drain must not apply anything"
         );

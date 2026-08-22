@@ -1416,12 +1416,11 @@ impl CommunicationsSurface {
     ///
     /// Follow / Unfollow / Close already apply on this session when
     /// [`follow_share_peer`], [`unfollow_share_peer`], and
-    /// [`close_document_share`] emit. The shell mount still drains those
-    /// intents with `session: None` because the session lived only here;
-    /// pass this borrow so Follow / Unfollow / Close hit the same CRDT,
-    /// never a second one.
+    /// [`close_document_share`] emit. The shell mount drains those
+    /// intents with this borrow so Follow / Unfollow / Close hit the
+    /// same CRDT, never a second one.
     #[must_use]
-    pub(crate) fn live_document_share_session(&mut self) -> Option<&mut CollabSession> {
+    pub fn live_document_share_session(&mut self) -> Option<&mut CollabSession> {
         self.documents.share.as_mut().map(|live| &mut live.session)
     }
 
@@ -2412,11 +2411,9 @@ mod tests {
         use crate::CommunicationsSurface;
         use mde_collab_types::{DocumentId, SpaceId};
 
-        // The shell mount drains DocumentShareCommand with session: None
-        // because CollabSession used to stay private. Follow / Unfollow /
-        // Close must still land on the attached session (the same CRDT
-        // share_document / join created), which the pub(crate) accessor
-        // now exposes for the mount to pass through.
+        // The shell mount drains DocumentShareCommand with this live
+        // session so Follow / Unfollow / Close land on the attached
+        // CRDT share_document / join created — never a second one.
         let space = SpaceId::new();
         let document = DocumentId::new();
         let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
