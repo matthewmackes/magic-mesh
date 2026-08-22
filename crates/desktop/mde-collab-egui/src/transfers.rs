@@ -535,9 +535,13 @@ impl CommunicationsSurface {
                 Some("source and destination must not contain NUL bytes".to_owned());
             return;
         }
-        let Some(every_secs) = parse_interval_secs(&self.transfers_ui.draft_interval) else {
-            self.transfers_ui.notice =
-                Some("malformed interval (use 30s, 5m, 1h, or a positive second count)".to_owned());
+        let interval_raw = self.transfers_ui.draft_interval.trim();
+        let Some(every_secs) = parse_interval_secs(interval_raw) else {
+            // Same refusal text as `mackesd transfer sync-pair add` so the
+            // editor cannot look queued while the CLI would have failed fast.
+            self.transfers_ui.notice = Some(format!(
+                "malformed interval `{interval_raw}` (expected a positive duration such as 30s, 5m, 1h, or seconds)"
+            ));
             return;
         };
         let bwlimit = {
@@ -551,6 +555,15 @@ impl CommunicationsSurface {
                 Some(raw.to_owned())
             }
         };
+        // Edit of a pair the worker projection no longer has — refuse like
+        // `mackesd transfer sync-pair remove` on an unknown id. Create (no
+        // `edit_id`) still upserts; that matches CLI add.
+        if let Some(edit_id) = self.transfers_ui.edit_id.as_deref() {
+            if !self.sync_pair_views.iter().any(|pair| pair.id == edit_id) {
+                self.transfers_ui.notice = Some(format!("unknown pair id `{edit_id}`"));
+                return;
+            }
+        }
         self.sync_pair_sink.emit(SyncPairCommand::Save {
             id,
             source: source.to_owned(),
@@ -612,6 +625,11 @@ impl CommunicationsSurface {
     #[cfg(test)]
     pub(crate) fn remove_sync_pair_for_test(&mut self, id: &str) {
         self.remove_sync_pair(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_edit_sync_pair_for_test(&mut self, pair: &SyncPairView) {
+        self.transfers_ui.begin_edit(pair);
     }
 
     fn jobs_section(
@@ -964,6 +982,60 @@ mod tests {
         assert_eq!(parse_interval_secs("15x"), None);
         assert_eq!(parse_interval_secs("15m"), Some(900));
         assert_eq!(parse_interval_secs("1h"), Some(3600));
+    }
+
+    #[test]
+    fn editor_refuses_unknown_pair_id_and_malformed_interval_without_publishing() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_sync_pair_views(vec![projected_pair("docs")]);
+
+        surface.save_sync_pair_draft_for_test("docs", "nope", "/src", "/dst", None);
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "malformed interval must not publish a Save verb"
+        );
+        assert!(
+            surface.editor_open_for_test(),
+            "malformed interval must keep the editor open"
+        );
+        let interval_notice = surface
+            .sync_pair_notice_for_test()
+            .expect("malformed interval must refuse visibly");
+        assert!(
+            interval_notice.contains("malformed interval") && interval_notice.contains("nope"),
+            "notice must name the refused interval, matching the CLI: {interval_notice}"
+        );
+
+        surface.remove_sync_pair_for_test("ghost");
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "unknown pair id must not publish a Remove verb"
+        );
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("unknown pair id") && n.contains("ghost")),
+            "unknown pair id must refuse visibly, matching the CLI"
+        );
+
+        // Edit of a pair the worker projection dropped — refuse, do not upsert.
+        surface.begin_edit_sync_pair_for_test(&projected_pair("docs"));
+        surface.set_sync_pair_views(vec![]);
+        surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "/dst", Some("2m"));
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "editing an unknown pair id must not publish a Save verb"
+        );
+        assert!(
+            surface.editor_open_for_test(),
+            "unknown pair id must keep the editor open"
+        );
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("unknown pair id") && n.contains("docs")),
+            "edit of a vanished pair must refuse visibly"
+        );
     }
 
     #[test]
