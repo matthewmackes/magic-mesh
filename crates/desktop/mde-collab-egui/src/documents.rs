@@ -219,7 +219,10 @@ struct LiveShare {
     session: CollabSession,
     /// Whether this seat hosted the session (owner-close authority).
     owner: bool,
-    /// Host peer identity — guests use this to detach when the owner leaves.
+    /// Session-row owner (first participant that is not this seat). May not be
+    /// in the CRDT roster yet; do not treat this as a Leave until observed.
+    expected_host: String,
+    /// Host peer identity once seen in the roster — guests detach on its Leave.
     host_peer: String,
 }
 
@@ -251,6 +254,25 @@ fn live_document_session<'a>(
         .sessions
         .iter()
         .find(|session| session.document == document)
+}
+
+/// The share owner advertised by the live session row.
+///
+/// The first participant that is not this seat is the session starter (the
+/// mount lists the owner first when it records `Start`). Guests pin that
+/// identity so an owner `Leave` detaches every follower even when another
+/// guest's id sorts first in the CRDT roster.
+fn host_peer_from_session(data: &dyn CollabData, space: SpaceId, document: DocumentId) -> String {
+    live_document_session(data, space, document)
+        .and_then(|session| {
+            session
+                .participants
+                .iter()
+                .map(|actor| actor.as_str())
+                .find(|peer| *peer != data.me().as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 /// Characters that can change the visual direction or structure of a Documents
@@ -591,9 +613,18 @@ impl DocumentsState {
         live.session.flush(share_transport);
         live.session.publish_presence(share_transport);
         let outcome = live.session.poll(share_transport);
+        // Pin the host only after they appear in the roster. Setting
+        // `host_peer` from the session row at join time made the first pump
+        // treat a not-yet-visible owner as already gone.
         if live.host_peer.is_empty() {
-            if let Some(peer) = live.session.peers().keys().next() {
-                live.host_peer = peer.clone();
+            if !live.expected_host.is_empty()
+                && live.session.peers().contains_key(&live.expected_host)
+            {
+                live.host_peer = live.expected_host.clone();
+            } else if live.expected_host.is_empty() && live.session.peers().len() == 1 {
+                if let Some(peer) = live.session.peers().keys().next() {
+                    live.host_peer = peer.clone();
+                }
             }
         }
         let host_left = !live.owner
@@ -666,7 +697,7 @@ impl CommunicationsSurface {
             return;
         };
 
-        self.pump_document_share();
+        self.sync_document_share(data);
         frame::bar_frame().show(ui, |ui| self.documents_strip(ui, data, sink, space));
 
         egui::Frame::NONE.show(ui, |ui| match self.doc_submode() {
@@ -923,7 +954,7 @@ impl CommunicationsSurface {
 
     /// Participant roster + follow-mode toggle + owner close for the live share.
     fn share_session_strip(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, _space: SpaceId) {
-        self.pump_document_share();
+        self.sync_document_share(data);
         let Some(live) = self.documents.share.as_ref() else {
             return;
         };
@@ -1058,7 +1089,7 @@ impl CommunicationsSurface {
             // (§7), never a faked placeholder.
             self.documents.editor.open_text("");
         }
-        self.pump_document_share();
+        self.sync_document_share(data);
     }
 
     /// Replace the Document editor with a fresh one-pane [`EditorSurface`] seeded
@@ -1304,6 +1335,23 @@ impl CommunicationsSurface {
             .and_then(|live| live.session.following())
     }
 
+    /// Honest Documents-mode notice (share refuse, merge, save), if any.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn document_notice(&self) -> Option<&str> {
+        self.documents.notice.as_deref()
+    }
+
+    /// Pinned share-session host identity (test/inspection accessor).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn document_share_host_peer(&self) -> Option<&str> {
+        self.documents
+            .share
+            .as_ref()
+            .map(|live| live.host_peer.as_str())
+    }
+
     /// Remote peer identities currently in the live share roster.
     #[must_use]
     pub(crate) fn document_share_peers(&self) -> Vec<String> {
@@ -1368,12 +1416,14 @@ impl CommunicationsSurface {
         let text = self.documents.editor.current_text().unwrap_or_default();
         let mut session = CollabSession::host(session_id.clone(), data.me().as_str(), &text);
         session.join(&self.documents.share_transport);
+        let me = data.me().as_str().to_owned();
         self.documents.share = Some(LiveShare {
             space,
             document,
             session,
             owner: true,
-            host_peer: data.me().as_str().to_owned(),
+            expected_host: me.clone(),
+            host_peer: me,
         });
         self.documents
             .share_commands
@@ -1422,6 +1472,7 @@ impl CommunicationsSurface {
             document,
             session,
             owner: false,
+            expected_host: host_peer_from_session(data, space, document),
             host_peer: String::new(),
         });
         self.documents
@@ -1507,6 +1558,33 @@ impl CommunicationsSurface {
             });
         self.documents.notice = Some("Share session closed — followers detached.".to_owned());
         true
+    }
+
+    /// Detach an attached share when this seat is no longer a member or the
+    /// projection has closed the session. Owners stay attached until they
+    /// close even if the mount has not yet projected `Start`.
+    fn refuse_stale_share(&mut self, data: &dyn CollabData) {
+        let Some(live) = self.documents.share.as_ref() else {
+            return;
+        };
+        let space = live.space;
+        let document = live.document;
+        let owner = live.owner;
+        if !is_space_member(data, space) {
+            self.documents
+                .detach_share("Cannot stay shared: this seat is not a member of that space.");
+            return;
+        }
+        if !owner && live_document_session(data, space, document).is_none() {
+            self.documents
+                .detach_share("Cannot stay shared: that share session is closed.");
+        }
+    }
+
+    /// Reconcile membership / closed-session honesty, then pump the CRDT.
+    pub(crate) fn sync_document_share(&mut self, data: &dyn CollabData) {
+        self.refuse_stale_share(data);
+        self.pump_document_share();
     }
 
     /// Pump the live share-session: mirror local edits into the CRDT, apply
@@ -1841,5 +1919,215 @@ mod tests {
                 panic!("overlapping edits must not silently merge, got {text:?}")
             }
         }
+    }
+
+    fn share_fixture(
+        me: &str,
+        space: mde_collab_types::SpaceId,
+        document: mde_collab_types::DocumentId,
+        participants: &[&str],
+    ) -> crate::fixture::FixtureData {
+        use crate::fixture::{space_summary, FixtureData};
+        use mde_collab_types::{ActorId, DocumentSession, DocumentSessions, SpaceKind, SpaceRole};
+
+        FixtureData::new(me, 1_000)
+            .with_space(space_summary(
+                space,
+                SpaceKind::Project,
+                "Docs",
+                SpaceRole::Member,
+                0,
+                participants.len() as u32,
+                1_000,
+            ))
+            .with_document_sessions(
+                space,
+                DocumentSessions {
+                    sessions: vec![DocumentSession {
+                        document,
+                        space,
+                        title: "Runbook".to_owned(),
+                        participants: participants.iter().map(|id| ActorId::new(*id)).collect(),
+                        call: None,
+                    }],
+                },
+            )
+            .with_document_body(document, "# Runbook\n")
+    }
+
+    #[test]
+    fn owner_close_detaches_every_follower_even_when_another_guest_sorts_first() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId, SpaceKind, SpaceRole};
+
+        // Host id sorts *after* both guests. The previous first-roster-key pin
+        // would have treated "alpha" as the host and then ignored zebra's Leave.
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("zebra", space, document, &["zebra", "alpha", "beta"]);
+        let alpha_data = share_fixture("alpha", space, document, &["zebra", "alpha", "beta"]);
+        let beta_data = share_fixture("beta", space, document, &["zebra", "alpha", "beta"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut alpha = CommunicationsSurface::new();
+        alpha.bind_document_share_bus(bus.clone());
+        alpha.select_space(space);
+        alpha.open_document(&alpha_data, document, "Runbook");
+        assert!(alpha.join_document_share(&alpha_data, space, document));
+
+        let mut beta = CommunicationsSurface::new();
+        beta.bind_document_share_bus(bus);
+        beta.select_space(space);
+        beta.open_document(&beta_data, document, "Runbook");
+        assert!(beta.join_document_share(&beta_data, space, document));
+
+        for _ in 0..6 {
+            host.pump_document_share();
+            alpha.pump_document_share();
+            beta.pump_document_share();
+        }
+
+        assert_eq!(alpha.document_share_host_peer(), Some("zebra"));
+        assert_eq!(beta.document_share_host_peer(), Some("zebra"));
+        assert!(
+            !alpha.close_document_share(),
+            "only the owner may close the session"
+        );
+        assert!(
+            alpha.has_live_document_share(),
+            "a refused guest close must leave the follower attached"
+        );
+        assert!(
+            alpha
+                .document_notice()
+                .is_some_and(|notice| notice.contains("Only the share owner")),
+            "guest close must refuse honestly, got {:?}",
+            alpha.document_notice()
+        );
+
+        assert!(host.close_document_share());
+        alpha.pump_document_share();
+        beta.pump_document_share();
+        assert!(
+            !alpha.has_live_document_share(),
+            "owner close must detach the guest whose id sorts first"
+        );
+        assert!(
+            !beta.has_live_document_share(),
+            "owner close must detach every follower"
+        );
+
+        // Closed-session honesty after attach: a later projection with no row
+        // (and a non-member directory) must refuse, not stay silently joined.
+        let closed = crate::fixture::FixtureData::new("alpha", 1_000).with_space(
+            crate::fixture::space_summary(
+                space,
+                SpaceKind::Project,
+                "Docs",
+                SpaceRole::Member,
+                0,
+                1,
+                1_000,
+            ),
+        );
+        alpha.open_document(&alpha_data, document, "Runbook");
+        assert!(
+            !alpha.join_document_share(&closed, space, document),
+            "a closed session must refuse a later join"
+        );
+        assert!(!alpha.has_live_document_share());
+        assert!(
+            alpha
+                .document_notice()
+                .is_some_and(|notice| notice.contains("closed")),
+            "closed-session refuse must be honest, got {:?}",
+            alpha.document_notice()
+        );
+
+        let outsider = crate::fixture::FixtureData::new("osprey", 1_000);
+        let mut stranger = CommunicationsSurface::new();
+        stranger.select_space(space);
+        stranger.open_document(&outsider, document, "Runbook");
+        assert!(
+            !stranger.share_document(&outsider, space),
+            "a non-member must be refused at share"
+        );
+        assert!(!stranger.has_live_document_share());
+        assert!(
+            stranger
+                .document_notice()
+                .is_some_and(|notice| notice.contains("not a member")),
+            "non-member share refuse must be honest, got {:?}",
+            stranger.document_notice()
+        );
+    }
+
+    #[test]
+    fn attached_share_refuses_honestly_when_session_closes_or_membership_is_lost() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId, SpaceKind, SpaceRole};
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("zebra", space, document, &["zebra", "alpha"]);
+        let guest_data = share_fixture("alpha", space, document, &["zebra", "alpha"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share(&guest_data, space, document));
+        assert!(guest.has_live_document_share());
+
+        let closed = crate::fixture::FixtureData::new("alpha", 1_000).with_space(
+            crate::fixture::space_summary(
+                space,
+                SpaceKind::Project,
+                "Docs",
+                SpaceRole::Member,
+                0,
+                1,
+                1_000,
+            ),
+        );
+        guest.sync_document_share(&closed);
+        assert!(
+            !guest.has_live_document_share(),
+            "an already-attached guest must detach when the session row disappears"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("closed")),
+            "closed-session refuse after attach must be honest, got {:?}",
+            guest.document_notice()
+        );
+
+        assert!(guest.join_document_share(&guest_data, space, document));
+        guest.sync_document_share(&crate::fixture::FixtureData::new("alpha", 1_000));
+        assert!(
+            !guest.has_live_document_share(),
+            "an already-attached guest must detach after membership loss"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("not a member")),
+            "non-member refuse after attach must be honest, got {:?}",
+            guest.document_notice()
+        );
     }
 }
