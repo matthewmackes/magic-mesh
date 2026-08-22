@@ -426,7 +426,7 @@ impl VoiceAdminRefuse {
 
 /// Redacted `get-gateway` reply shape. `password` is always the empty string;
 /// `password_set` distinguishes a stored secret from an intentionally empty one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GatewayReadout {
     /// Whether `gateway.toml` is present.
     pub present: bool,
@@ -488,6 +488,49 @@ impl GatewayReadout {
     #[must_use]
     pub const fn redacted_password(&self) -> &'static str {
         ""
+    }
+
+    /// Bind a `get-gateway` reply. Any `password` in the JSON is dropped so a
+    /// leaked credential can never become readout copy.
+    #[must_use]
+    pub fn from_get_reply(body: &str) -> Option<Self> {
+        let present = json_flat_bool(body, "present")?;
+        if !present {
+            return Some(Self::absent());
+        }
+        let host = json_flat_string(body, "host").unwrap_or_default();
+        let port = json_flat_u64(body, "port")
+            .and_then(|port| u16::try_from(port).ok())
+            .unwrap_or(5060);
+        let username = json_flat_string(body, "username").unwrap_or_default();
+        let password_set = json_flat_bool(body, "password_set").unwrap_or(false);
+        let display_name = json_flat_string(body, "display_name").unwrap_or_default();
+        let expires = json_flat_u64(body, "expires")
+            .and_then(|expires| u32::try_from(expires).ok())
+            .unwrap_or(3600);
+        Some(Self::present(
+            host,
+            port,
+            username,
+            password_set,
+            display_name,
+            expires,
+        ))
+    }
+}
+
+impl std::fmt::Debug for GatewayReadout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayReadout")
+            .field("present", &self.present)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.redacted_password())
+            .field("password_set", &self.password_set)
+            .field("display_name", &self.display_name)
+            .field("expires", &self.expires)
+            .finish()
     }
 }
 
@@ -669,6 +712,8 @@ pub enum GatewayRefuse {
     InvalidExpiry,
     /// Clear when the gateway is already absent, or a second clear in this sink.
     ReplayClear,
+    /// Clear was clicked without the confirm step.
+    UnconfirmedClear,
 }
 
 impl GatewayRefuse {
@@ -681,6 +726,120 @@ impl GatewayRefuse {
             Self::UsernameRequired => "Gateway username is required",
             Self::InvalidExpiry => "Gateway expiry must be between 1 and 4294967295 seconds",
             Self::ReplayClear => "Gateway is already cleared",
+            Self::UnconfirmedClear => "Confirm clear gateway to remove gateway.toml",
+        }
+    }
+}
+
+/// Button-level intent on the SIP-gateway form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayFormIntent {
+    /// Publish `set-gateway` from the draft fields.
+    Set,
+    /// Publish `get-gateway`.
+    Get,
+    /// Arm the clear confirm, or publish `clear-gateway` when already armed.
+    Clear,
+    /// Drop a pending clear confirm.
+    CancelClear,
+}
+
+/// Result of applying one [`GatewayFormIntent`] to the local form + sink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GatewayFormOutcome {
+    /// A typed verb was queued for the shell.
+    Published(GatewayCommand),
+    /// First clear click — nothing published until confirm.
+    ArmedClear,
+    /// Confirm was dismissed.
+    CancelledClear,
+    /// Verb boundary refused; the sink is unchanged.
+    Refused(GatewayRefuse),
+}
+
+/// Admit one gateway-form intent. The password is wiped after a successful set
+/// or clear and never copied into the notice. Clear is a two-step: first click
+/// arms, second click publishes, a replayed or absent clear refuses.
+pub fn apply_gateway_form(
+    form: &mut GatewayFormState,
+    readout: Option<&GatewayReadout>,
+    sink: &mut GatewaySink,
+    intent: GatewayFormIntent,
+) -> GatewayFormOutcome {
+    match intent {
+        GatewayFormIntent::Set => apply_gateway_set(form, sink),
+        GatewayFormIntent::Get => {
+            let command = GatewayCommand::Get;
+            sink.emit(command.clone());
+            form.notice = Some("Gateway get published".to_owned());
+            GatewayFormOutcome::Published(command)
+        }
+        GatewayFormIntent::Clear => apply_gateway_clear(form, readout, sink),
+        GatewayFormIntent::CancelClear => {
+            form.confirm_clear = false;
+            GatewayFormOutcome::CancelledClear
+        }
+    }
+}
+
+fn apply_gateway_set(form: &mut GatewayFormState, sink: &mut GatewaySink) -> GatewayFormOutcome {
+    let port = parse_optional_u64(&form.port);
+    let expires = parse_optional_u64(&form.expires);
+    let outcome = match (port, expires) {
+        (Err(()), _) => GatewayFormOutcome::Refused(GatewayRefuse::InvalidPort),
+        (_, Err(())) => GatewayFormOutcome::Refused(GatewayRefuse::InvalidExpiry),
+        (Ok(port), Ok(expires)) => {
+            match validate_gateway_set(
+                &form.host,
+                port,
+                &form.username,
+                &form.password,
+                &form.display_name,
+                expires,
+            ) {
+                Ok(command) => {
+                    sink.emit(command.clone());
+                    form.password.clear();
+                    form.notice = Some("Gateway set published".to_owned());
+                    return GatewayFormOutcome::Published(command);
+                }
+                Err(refuse) => GatewayFormOutcome::Refused(refuse),
+            }
+        }
+    };
+    if let GatewayFormOutcome::Refused(refuse) = &outcome {
+        form.notice = Some(refuse.label().to_owned());
+    }
+    outcome
+}
+
+fn apply_gateway_clear(
+    form: &mut GatewayFormState,
+    readout: Option<&GatewayReadout>,
+    sink: &mut GatewaySink,
+) -> GatewayFormOutcome {
+    if !form.confirm_clear {
+        form.confirm_clear = true;
+        form.notice = Some(GatewayRefuse::UnconfirmedClear.label().to_owned());
+        return GatewayFormOutcome::ArmedClear;
+    }
+    match validate_gateway_clear(readout, sink) {
+        Ok(command) => {
+            sink.emit(command.clone());
+            form.host.clear();
+            form.port.clear();
+            form.username.clear();
+            form.display_name.clear();
+            form.expires.clear();
+            form.password.clear();
+            form.confirm_clear = false;
+            form.notice = Some("Gateway clear published".to_owned());
+            GatewayFormOutcome::Published(command)
+        }
+        Err(refuse) => {
+            form.confirm_clear = false;
+            form.notice = Some(refuse.label().to_owned());
+            GatewayFormOutcome::Refused(refuse)
         }
     }
 }
@@ -1312,6 +1471,74 @@ fn is_ipv4_host(host: &str) -> bool {
     count == 4
 }
 
+fn json_flat_bool(body: &str, key: &str) -> Option<bool> {
+    match json_flat_raw(body, key)? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn json_flat_u64(body: &str, key: &str) -> Option<u64> {
+    json_flat_raw(body, key)?.parse().ok()
+}
+
+fn json_flat_string(body: &str, key: &str) -> Option<String> {
+    let raw = json_flat_raw(body, key)?;
+    json_unquote(raw)
+}
+
+fn json_flat_raw<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let after = body.find(&needle)? + needle.len();
+    let rest = body[after..].trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with('"') {
+        let mut end = 1;
+        let bytes = rest.as_bytes();
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\\' if end + 1 < bytes.len() => end += 2,
+                b'"' => return Some(&rest[..=end]),
+                _ => end += 1,
+            }
+        }
+        return None;
+    }
+    let end = rest
+        .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+fn json_unquote(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    hex.push(chars.next()?);
+                }
+                let code = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(code)?);
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
 fn is_dns_label(label: &str) -> bool {
     let bytes = label.as_bytes();
     if bytes.is_empty() || bytes.len() > 63 {
@@ -1369,8 +1596,10 @@ struct VoiceAdminFormState {
     notice: Option<String>,
 }
 
+/// Draft fields for the SIP-gateway form. `password` is write-only: it is
+/// never seeded from a readout and is wiped after a successful set or clear.
 #[derive(Clone, Default)]
-struct GatewayFormState {
+pub struct GatewayFormState {
     host: String,
     port: String,
     username: String,
@@ -1381,6 +1610,34 @@ struct GatewayFormState {
     seeded_present: bool,
     confirm_clear: bool,
     notice: Option<String>,
+}
+
+impl GatewayFormState {
+    /// A write draft. `password` is accepted here so the set verb can carry it;
+    /// it is never used as readout copy.
+    #[cfg(test)]
+    #[must_use]
+    pub fn draft(
+        host: impl Into<String>,
+        port: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        display_name: impl Into<String>,
+        expires: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port: port.into(),
+            username: username.into(),
+            password: password.into(),
+            display_name: display_name.into(),
+            expires: expires.into(),
+            seeded: true,
+            seeded_present: false,
+            confirm_clear: false,
+            notice: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for GatewayFormState {
@@ -1950,41 +2207,14 @@ fn gateway_admin_panel(ui: &mut egui::Ui, admin: &dyn ActivityAdminData, sink: &
 
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Set gateway").clicked() {
-                    let port = parse_optional_u64(&form.port);
-                    let expires = parse_optional_u64(&form.expires);
-                    match (port, expires) {
-                        (Err(()), _) => {
-                            form.notice = Some(GatewayRefuse::InvalidPort.label().to_owned());
-                        }
-                        (_, Err(())) => {
-                            form.notice = Some(GatewayRefuse::InvalidExpiry.label().to_owned());
-                        }
-                        (Ok(port), Ok(expires)) => {
-                            match validate_gateway_set(
-                                &form.host,
-                                port,
-                                &form.username,
-                                &form.password,
-                                &form.display_name,
-                                expires,
-                            ) {
-                                Ok(command) => {
-                                    sink.emit(command);
-                                    form.password.clear();
-                                    form.notice = Some("Gateway set published".to_owned());
-                                }
-                                Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-                            }
-                        }
-                    }
+                    let _ = apply_gateway_form(&mut form, readout, sink, GatewayFormIntent::Set);
                 }
                 if ui
                     .button("Refresh")
                     .comms_hover_text("Publish get-gateway")
                     .clicked()
                 {
-                    sink.emit(GatewayCommand::Get);
-                    form.notice = Some("Gateway get published".to_owned());
+                    let _ = apply_gateway_form(&mut form, readout, sink, GatewayFormIntent::Get);
                 }
                 if form.confirm_clear {
                     if ui
@@ -1992,26 +2222,19 @@ fn gateway_admin_panel(ui: &mut egui::Ui, admin: &dyn ActivityAdminData, sink: &
                         .comms_hover_text("Remove gateway.toml and revert the mesh to P2P")
                         .clicked()
                     {
-                        match validate_gateway_clear(readout, sink) {
-                            Ok(command) => {
-                                sink.emit(command);
-                                form.host.clear();
-                                form.port.clear();
-                                form.username.clear();
-                                form.display_name.clear();
-                                form.expires.clear();
-                                form.password.clear();
-                                form.notice = Some("Gateway clear published".to_owned());
-                            }
-                            Err(refuse) => form.notice = Some(refuse.label().to_owned()),
-                        }
-                        form.confirm_clear = false;
+                        let _ =
+                            apply_gateway_form(&mut form, readout, sink, GatewayFormIntent::Clear);
                     }
                     if ui.button("Cancel clear").clicked() {
-                        form.confirm_clear = false;
+                        let _ = apply_gateway_form(
+                            &mut form,
+                            readout,
+                            sink,
+                            GatewayFormIntent::CancelClear,
+                        );
                     }
                 } else if ui.button("Clear gateway").clicked() {
-                    form.confirm_clear = true;
+                    let _ = apply_gateway_form(&mut form, readout, sink, GatewayFormIntent::Clear);
                 }
             });
 
@@ -2102,10 +2325,11 @@ mod tests {
     use mde_collab_types::{ActorClock, ActorId, AlertPayload, AlertView, EventId};
 
     use super::{
-        coalesced_activity_rows, has_provisioned_voice_account, seed_voice_shared_form_state,
-        validate_cutover, validate_did_route, validate_failover, validate_gateway_clear,
-        validate_gateway_set, validate_shared_config, ActivityEntry, ActivityFilter, AlertInbox,
-        GatewayCommand, GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId,
+        apply_gateway_form, coalesced_activity_rows, has_provisioned_voice_account,
+        seed_voice_shared_form_state, validate_cutover, validate_did_route, validate_failover,
+        validate_gateway_clear, validate_gateway_set, validate_shared_config, ActivityEntry,
+        ActivityFilter, AlertInbox, GatewayCommand, GatewayFormIntent, GatewayFormOutcome,
+        GatewayFormState, GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId,
         VoiceAdminCommand, VoiceAdminFormState, VoiceAdminRefuse, VoiceCutoverPhase,
         VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection, VoiceRegState,
         VoiceSharedOutbound, VOICE_DID_ROUTE_TOPIC, VOICE_FAILOVER_TOPIC, VOICE_PROVISION_TOPIC,
@@ -2580,6 +2804,130 @@ mod tests {
             "Debug echoed the gateway password: {debug}"
         );
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn gateway_form_set_get_clear_never_renders_password() {
+        let leaked = r#"{"present":true,"host":"pbx.example.com","port":5062,"username":"alice","password":"s3cret","password_set":true,"display_name":"Alice","expires":3600}"#;
+        let readout = GatewayReadout::from_get_reply(leaked).expect("present reply binds");
+        assert!(readout.present);
+        assert_eq!(readout.host, "pbx.example.com");
+        assert_eq!(readout.port, 5062);
+        assert!(readout.password.is_empty());
+        assert_eq!(readout.redacted_password(), "");
+        assert!(readout.password_set);
+        let leaked_debug = format!("{readout:?}");
+        assert!(
+            !leaked_debug.contains("s3cret"),
+            "get-reply readout Debug leaked the password: {leaked_debug}"
+        );
+        assert_eq!(
+            GatewayReadout::from_get_reply(r#"{"present":false}"#),
+            Some(GatewayReadout::absent())
+        );
+
+        let mut form = GatewayFormState::draft(
+            "http://pbx.example.com",
+            "5062",
+            "alice",
+            "s3cret",
+            "Alice",
+            "3600",
+        );
+        let mut sink = GatewaySink::new();
+        assert_eq!(
+            apply_gateway_form(&mut form, Some(&readout), &mut sink, GatewayFormIntent::Set),
+            GatewayFormOutcome::Refused(GatewayRefuse::MalformedHost)
+        );
+        assert!(
+            sink.is_empty(),
+            "malformed host must not publish set-gateway"
+        );
+        assert_eq!(form.password, "s3cret");
+
+        form.host = "pbx.example.com".to_owned();
+        match apply_gateway_form(&mut form, Some(&readout), &mut sink, GatewayFormIntent::Set) {
+            GatewayFormOutcome::Published(GatewayCommand::Set { password, .. }) => {
+                assert_eq!(password, "s3cret");
+            }
+            other => panic!("expected published set, got {other:?}"),
+        }
+        assert!(
+            form.password.is_empty(),
+            "write path must wipe the draft password"
+        );
+        let notice = form.notice.clone().expect("set publishes a notice");
+        assert!(
+            !notice.contains("s3cret"),
+            "notice echoed the password: {notice}"
+        );
+        let form_debug = format!("{form:?}");
+        assert!(
+            !form_debug.contains("s3cret"),
+            "form Debug echoed the password: {form_debug}"
+        );
+
+        assert!(matches!(
+            apply_gateway_form(&mut form, Some(&readout), &mut sink, GatewayFormIntent::Get),
+            GatewayFormOutcome::Published(GatewayCommand::Get)
+        ));
+
+        assert_eq!(
+            apply_gateway_form(
+                &mut form,
+                Some(&readout),
+                &mut sink,
+                GatewayFormIntent::Clear
+            ),
+            GatewayFormOutcome::ArmedClear
+        );
+        assert!(
+            !sink
+                .queued()
+                .iter()
+                .any(|c| matches!(c, GatewayCommand::Clear)),
+            "first clear click only arms confirm"
+        );
+        assert_eq!(
+            apply_gateway_form(
+                &mut form,
+                Some(&readout),
+                &mut sink,
+                GatewayFormIntent::Clear
+            ),
+            GatewayFormOutcome::Published(GatewayCommand::Clear)
+        );
+        assert_eq!(
+            apply_gateway_form(
+                &mut form,
+                Some(&readout),
+                &mut sink,
+                GatewayFormIntent::Clear
+            ),
+            GatewayFormOutcome::ArmedClear
+        );
+        assert_eq!(
+            apply_gateway_form(
+                &mut form,
+                Some(&readout),
+                &mut sink,
+                GatewayFormIntent::Clear
+            ),
+            GatewayFormOutcome::Refused(GatewayRefuse::ReplayClear)
+        );
+
+        let drained = sink.drain();
+        assert!(matches!(drained[0], GatewayCommand::Set { .. }));
+        assert!(matches!(drained[1], GatewayCommand::Get));
+        assert!(matches!(drained[2], GatewayCommand::Clear));
+        if let GatewayCommand::Set { password, .. } = &drained[0] {
+            let debug = format!("{:?}", drained[0]);
+            assert_eq!(password, "s3cret");
+            assert!(
+                !debug.contains("s3cret"),
+                "queued set Debug leaked: {debug}"
+            );
+        }
     }
 
     #[test]
