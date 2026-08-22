@@ -11,6 +11,7 @@ use mde_egui::widgets;
 use mde_egui::Style;
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use mde_collab_types::{ActivityEntry, AlertInbox, Severity, SpaceId};
 
@@ -31,6 +32,13 @@ pub const VOIP_SET_GATEWAY_TOPIC: &str = "action/voip/set-gateway";
 pub const VOIP_GET_GATEWAY_TOPIC: &str = "action/voip/get-gateway";
 /// Bus topic the SIP-gateway clear verb is published on.
 pub const VOIP_CLEAR_GATEWAY_TOPIC: &str = "action/voip/clear-gateway";
+
+/// Canonical workgroup path the responder writes: `<workgroup_root>/voip/gateway.toml`.
+/// Activity hydrates from this file in place; it never rewrites it.
+#[must_use]
+pub fn workgroup_gateway_toml_path(workgroup_root: impl AsRef<Path>) -> PathBuf {
+    workgroup_root.as_ref().join("voip").join("gateway.toml")
+}
 
 /// Retained fleet-voice and SIP-gateway projections the Activity admin panels
 /// render. Every method defaults to empty so existing [`CollabData`] callers of
@@ -99,6 +107,20 @@ impl ActivityAdminData for ActivityAdminSnapshot {
 
     fn gateway(&self) -> Option<&GatewayReadout> {
         self.gateway.as_ref()
+    }
+}
+
+impl ActivityAdminSnapshot {
+    /// Load the redacted `get-gateway` projection from an in-place workgroup
+    /// `gateway.toml`, falling back to a retained get-gateway body. The on-disk
+    /// file is not rewritten and the password is never kept.
+    pub fn hydrate_gateway(
+        &mut self,
+        workgroup_root: Option<&Path>,
+        retained_get: Option<&str>,
+    ) -> &GatewayReadout {
+        self.gateway
+            .insert(hydrate_gateway_readout(workgroup_root, retained_get))
     }
 }
 
@@ -549,6 +571,61 @@ impl GatewayReadout {
             expires,
         ))
     }
+
+    /// Bind the voice-agent `account.toml` shape written to `gateway.toml`.
+    /// The password is observed only to set `password_set` and is never kept.
+    #[must_use]
+    pub fn from_gateway_toml(text: &str) -> Option<Self> {
+        let server = toml_flat_string(text, "server")?;
+        if server.is_empty() {
+            return None;
+        }
+        let (host, port) = split_gateway_server(&server);
+        let username = toml_flat_string(text, "username").unwrap_or_default();
+        let password_set =
+            toml_flat_string(text, "password").is_some_and(|password| !password.is_empty());
+        let display_name = toml_flat_string(text, "display_name").unwrap_or_default();
+        let expires = toml_flat_u32(text, "expires").unwrap_or(3600);
+        Some(Self::present(
+            host,
+            port,
+            username,
+            password_set,
+            display_name,
+            expires,
+        ))
+    }
+
+    /// Load `<path>` without rewriting it. Missing or unparseable files yield
+    /// `None` so a retained get-gateway body can still hydrate.
+    #[must_use]
+    pub fn from_gateway_toml_path(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Self::from_gateway_toml(&text)
+    }
+}
+
+/// Hydrate the redacted get-gateway shape from an in-place workgroup
+/// `gateway.toml` (account.toml shape), falling back to a retained
+/// `get-gateway` body. Neither source is rewritten; any password is dropped.
+#[must_use]
+pub fn hydrate_gateway_readout(
+    workgroup_root: Option<&Path>,
+    retained_get: Option<&str>,
+) -> GatewayReadout {
+    if let Some(root) = workgroup_root {
+        if let Some(from_file) =
+            GatewayReadout::from_gateway_toml_path(&workgroup_gateway_toml_path(root))
+        {
+            return from_file;
+        }
+    }
+    if let Some(body) = retained_get {
+        if let Some(from_get) = GatewayReadout::from_get_reply(body) {
+            return from_get;
+        }
+    }
+    GatewayReadout::absent()
 }
 
 impl std::fmt::Debug for GatewayReadout {
@@ -1501,6 +1578,65 @@ fn is_ipv4_host(host: &str) -> bool {
         }
     }
     count == 4
+}
+
+/// Split `host` / `host:port`, defaulting 5060 (mirrors the voip responder).
+fn split_gateway_server(server: &str) -> (String, u16) {
+    match server.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => match port.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (server.to_string(), 5060),
+        },
+        _ => (server.to_string(), 5060),
+    }
+}
+
+fn toml_flat_u32(body: &str, key: &str) -> Option<u32> {
+    toml_flat_raw(body, key)?.parse().ok()
+}
+
+fn toml_flat_string(body: &str, key: &str) -> Option<String> {
+    let raw = toml_flat_raw(body, key)?;
+    if raw.starts_with('"') {
+        json_unquote(raw)
+    } else if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn toml_flat_raw<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            continue;
+        };
+        if lhs.trim() != key {
+            continue;
+        }
+        let rhs = rhs.trim_start();
+        if rhs.starts_with('"') {
+            let mut end = 1;
+            let bytes = rhs.as_bytes();
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'\\' if end + 1 < bytes.len() => end += 2,
+                    b'"' => return Some(&rhs[..=end]),
+                    _ => end += 1,
+                }
+            }
+            return None;
+        }
+        let end = rhs
+            .find(|c: char| c == '#' || c.is_whitespace())
+            .unwrap_or(rhs.len());
+        return Some(rhs[..end].trim());
+    }
+    None
 }
 
 fn json_flat_bool(body: &str, key: &str) -> Option<bool> {
@@ -2579,9 +2715,10 @@ mod tests {
 
     use super::{
         apply_gateway_form, apply_voice_admin, coalesced_activity_rows,
-        has_provisioned_voice_account, seed_voice_shared_form_state, validate_cutover,
-        validate_did_route, validate_failover, validate_gateway_clear, validate_gateway_set,
-        validate_shared_config, voice_projection_empty_notes, ActivityEntry, ActivityFilter,
+        has_provisioned_voice_account, hydrate_gateway_readout, seed_voice_shared_form_state,
+        validate_cutover, validate_did_route, validate_failover, validate_gateway_clear,
+        validate_gateway_set, validate_shared_config, voice_projection_empty_notes,
+        workgroup_gateway_toml_path, ActivityAdminSnapshot, ActivityEntry, ActivityFilter,
         AlertInbox, GatewayCommand, GatewayFormIntent, GatewayFormOutcome, GatewayFormState,
         GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId, VoiceAdminCommand,
         VoiceAdminFormIntent, VoiceAdminFormOutcome, VoiceAdminFormState, VoiceAdminRefuse,
@@ -3182,6 +3319,92 @@ mod tests {
                 "queued set Debug leaked: {debug}"
             );
         }
+    }
+
+    #[test]
+    fn hydrate_migrates_in_place_gateway_toml_without_echoing_password() {
+        let tmp = tempfile::tempdir().expect("workgroup scratch");
+        let path = workgroup_gateway_toml_path(tmp.path());
+        std::fs::create_dir_all(path.parent().expect("voip dir")).expect("voip dir");
+        let toml = concat!(
+            "username = \"alice\"\n",
+            "password = \"s3cret\"\n",
+            "server = \"pbx.example.com:5062\"\n",
+            "display_name = \"Alice\"\n",
+            "expires = 3600\n",
+        );
+        std::fs::write(&path, toml).expect("write in-place gateway.toml");
+        let before = std::fs::read(&path).expect("read gateway.toml");
+
+        let expected =
+            GatewayReadout::present("pbx.example.com", 5062, "alice", true, "Alice", 3600);
+        let readout = hydrate_gateway_readout(Some(tmp.path()), None);
+        assert_eq!(readout, expected);
+        assert!(readout.present);
+        assert!(readout.password.is_empty());
+        assert_eq!(readout.redacted_password(), "");
+        let debug = format!("{readout:?}");
+        assert!(
+            !debug.contains("s3cret"),
+            "hydrated readout Debug leaked the password: {debug}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("re-read gateway.toml"),
+            before,
+            "in-place migrate must not rewrite gateway.toml"
+        );
+        assert!(
+            std::str::from_utf8(&before)
+                .expect("utf8")
+                .contains("s3cret"),
+            "the on-disk secret must stay in the 0600 file"
+        );
+
+        let empty = tempfile::tempdir().expect("empty workgroup");
+        let leaked = r#"{"present":true,"host":"pbx.example.com","port":5062,"username":"alice","password":"s3cret","password_set":true,"display_name":"Alice","expires":3600}"#;
+        let from_get = hydrate_gateway_readout(Some(empty.path()), Some(leaked));
+        assert_eq!(from_get, expected);
+        assert!(from_get.password.is_empty());
+        let from_get_debug = format!("{from_get:?}");
+        assert!(
+            !from_get_debug.contains("s3cret"),
+            "retained get Debug leaked the password: {from_get_debug}"
+        );
+
+        let ignored = r#"{"present":true,"host":"other.example","port":5060,"username":"bob","password":"s3cret","password_set":true,"display_name":"Bob","expires":120}"#;
+        let prefer_file = hydrate_gateway_readout(Some(tmp.path()), Some(ignored));
+        assert_eq!(prefer_file, expected);
+
+        assert_eq!(
+            hydrate_gateway_readout(Some(empty.path()), None),
+            GatewayReadout::absent()
+        );
+
+        let host_only = concat!(
+            "username = \"alice\"\n",
+            "server = \"pbx.example.com\"\n",
+            "display_name = \"Alice\"\n",
+        );
+        assert_eq!(
+            GatewayReadout::from_gateway_toml(host_only),
+            Some(GatewayReadout::present(
+                "pbx.example.com",
+                5060,
+                "alice",
+                false,
+                "Alice",
+                3600
+            ))
+        );
+
+        let mut snapshot = ActivityAdminSnapshot::default();
+        assert!(snapshot.gateway.is_none());
+        snapshot.hydrate_gateway(Some(tmp.path()), Some(leaked));
+        assert_eq!(snapshot.gateway.as_ref(), Some(&expected));
+        assert!(snapshot
+            .gateway
+            .as_ref()
+            .is_some_and(|row| row.password.is_empty() && row.password_set));
     }
 
     #[test]
