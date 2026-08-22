@@ -20,8 +20,8 @@ use mde_egui::Style;
 use mde_collab_types::{
     CallId, CallKind, CallParticipantState, CallView, CollabCommand, DiscordBridgeBoard,
     DiscordBridgeConfigStatus, DiscordBridgeFlowStatus, DiscordBridgeProvenance,
-    DiscordBridgeProvenanceSource, DiscordBridgeView, SpaceDirectory, SpaceId, SpaceKind,
-    SpaceRole, SpaceSummary,
+    DiscordBridgeProvenanceSource, DiscordBridgeView, MediaSessionV1, SpaceDirectory, SpaceId,
+    SpaceKind, SpaceRole, SpaceSummary,
 };
 
 use crate::{icons, icons::CommsHoverExt, ChannelTab, CommunicationsSurface, MeshTeamsApp};
@@ -81,6 +81,20 @@ pub(crate) fn selected_space_in_directory(
     directory: &SpaceDirectory,
 ) -> Option<SpaceId> {
     selected.filter(|selected| directory.spaces.iter().any(|space| space.id == *selected))
+}
+
+/// Pass through retained [`MediaSessionV1`] documents for the call bar.
+///
+/// Empty input is the honest no-projection state. Invalid documents are
+/// dropped rather than painted. This never synthesizes a connected session
+/// from signaling [`CallState`](mde_collab_types::CallState).
+#[must_use]
+pub(crate) fn retained_media_sessions(sessions: &[MediaSessionV1]) -> Vec<MediaSessionV1> {
+    sessions
+        .iter()
+        .filter(|session| session.validate().is_ok())
+        .cloned()
+        .collect()
 }
 
 /// Reconcile the surface's retained selection with the newest directory.

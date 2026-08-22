@@ -115,7 +115,7 @@ pub use transfers::{
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use mde_collab_types::{CallId, EventId, Severity, SpaceId, ThreadId};
+use mde_collab_types::{CallId, EventId, MediaSessionV1, Severity, SpaceId, ThreadId};
 
 pub use files::file_ref_of_path;
 
@@ -532,6 +532,11 @@ pub struct CommunicationsSurface {
     /// Empty by default so the panels stay honestly empty without a provisioned
     /// account.
     activity_admin: ActivityAdminSnapshot,
+    /// Retained [`MediaSessionV1`] documents the frame mount binds each paint.
+    /// Empty by default — the live render path applies this into
+    /// [`CommunicationsSurface::apply_media_sessions`] and never invents a
+    /// connected call from signaling [`CallState`](mde_collab_types::CallState).
+    media_sessions: Vec<MediaSessionV1>,
 }
 
 impl CommunicationsSurface {
@@ -667,6 +672,32 @@ impl CommunicationsSurface {
     /// Bind the retained fleet-voice / SIP-gateway snapshot for this frame.
     pub fn set_activity_admin(&mut self, admin: ActivityAdminSnapshot) {
         self.activity_admin = admin;
+    }
+
+    /// Bind retained [`MediaSessionV1`] documents for the next [`ui`](Self::ui).
+    ///
+    /// Empty input is the honest no-projection state. The mount must supply
+    /// documents already published on `state/calls/media/<session>`; this never
+    /// synthesizes a connected session from call signaling.
+    pub fn set_media_sessions(&mut self, sessions: Vec<MediaSessionV1>) {
+        self.media_sessions = sessions;
+    }
+
+    /// The retained media-session documents bound for this frame.
+    #[must_use]
+    pub fn media_sessions(&self) -> &[MediaSessionV1] {
+        &self.media_sessions
+    }
+
+    /// Feed the frame mount into the Calls view. Called from the live render
+    /// path so mute/DTMF/camera follow published sessions, not local intent.
+    fn sync_media_sessions_from_mount(&mut self) {
+        self.apply_media_sessions(frame::retained_media_sessions(&self.media_sessions));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn applied_media_sessions_for_test(&self) -> &[MediaSessionV1] {
+        &self.call_media.sessions
     }
 
     /// Switch the Teams-style app route.
@@ -805,6 +836,10 @@ impl CommunicationsSurface {
     /// rail, channel header, persistent call bar, and active app body. Reads projections from
     /// `data` and pushes every emitted command into `sink`.
     pub fn ui(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, sink: &mut CommandSink) {
+        // The Calls view only sees MediaSessionV1 through apply_media_sessions.
+        // CollabData does not yet carry that projection, so the frame mount
+        // supplies whatever the shell bound — empty stays empty.
+        self.sync_media_sessions_from_mount();
         if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
             let rect = ui.max_rect();
             eprintln!(
@@ -1131,4 +1166,91 @@ pub(crate) fn car_glance_limit(ui: &egui::Ui, full_len: usize) -> usize {
             .unwrap_or(false)
     });
     bounded_car_list_len(car_mode(ui), in_motion, full_len)
+}
+
+#[cfg(test)]
+mod media_session_mount {
+    use super::*;
+    use mde_collab_types::{
+        ActorId, CallId, CallMediaAdapter, MediaSessionStateV1, MediaTrackKind, SpaceId,
+    };
+
+    fn paint(surface: &mut CommunicationsSurface, data: &dyn CollabData) {
+        let ctx = egui::Context::default();
+        mde_egui::Style::install(&ctx);
+        let mut sink = CommandSink::new();
+        let size = egui::vec2(1000.0, 700.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: Vec::new(),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
+            },
+        );
+    }
+
+    fn device_absent_session() -> MediaSessionV1 {
+        MediaSessionV1::new(
+            CallId::new(),
+            SpaceId::new(),
+            ActorId::new("eagle"),
+            ActorId::new("falcon"),
+            CallMediaAdapter::WebRtcP2p,
+            MediaSessionStateV1::DeviceAbsent {
+                track: MediaTrackKind::Audio,
+            },
+            vec![MediaTrackKind::Audio],
+            false,
+            false,
+            false,
+            0,
+            None,
+            None,
+        )
+        .expect("valid device-absent session")
+    }
+
+    #[test]
+    fn live_render_applies_mounted_media_sessions_without_inventing_connected() {
+        let data = FixtureData::demo();
+        assert!(
+            !data.call_state().active.is_empty(),
+            "demo fixture carries a signaling call so a fake Connected session would have a target"
+        );
+
+        let mut surface = CommunicationsSurface::new();
+        paint(&mut surface, &data);
+        assert!(
+            surface.applied_media_sessions_for_test().is_empty(),
+            "signaling CallState must not become a MediaSessionV1"
+        );
+        assert!(
+            surface
+                .applied_media_sessions_for_test()
+                .iter()
+                .all(|session| !session.state.claims_live_media()),
+            "live render must not invent a connected media session"
+        );
+
+        let session = device_absent_session();
+        surface.set_media_sessions(vec![session.clone()]);
+        paint(&mut surface, &data);
+        let applied = surface.applied_media_sessions_for_test();
+        assert_eq!(applied, std::slice::from_ref(&session));
+        assert!(
+            !applied[0].state.claims_live_media(),
+            "a published DeviceAbsent document stays DeviceAbsent"
+        );
+
+        surface.set_media_sessions(Vec::new());
+        paint(&mut surface, &data);
+        assert!(
+            surface.applied_media_sessions_for_test().is_empty(),
+            "clearing the mount must clear the Calls view"
+        );
+    }
 }
