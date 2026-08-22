@@ -5,6 +5,9 @@ Reads a dest env file whose body is exactly the two dest-path
 assignments and runs a command as a child with a copied environment
 plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
+Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
+`offboard`, `join`, `found`, `mesh-init`, `leave`, or the mint helper)
+refuses while the unpublished signed candidate is absent.
 """
 
 from __future__ import annotations
@@ -32,6 +35,22 @@ EXIT_REFUSED = 2
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 JOIN_TOKEN_PLACEHOLDER = "{{JOIN_TOKEN}}"
 ENV_KEYS = ("MACKESD_BOOTSTRAP_SSH_KEY", "MACKESD_BOOTSTRAP_KNOWN_HOSTS")
+# Live mesh mutation verbs. Operator lock: seats mutate only when an
+# unpublished signed candidate exists. None does.
+LIFECYCLE_MUTATION_NAMES = frozenset(
+    {
+        "enroll-token",
+        "enroll",
+        "reenroll",
+        "offboard",
+        "join",
+        "found",
+        "mesh-init",
+        "leave",
+        "mint-enroll-bearer",
+        "mint-enroll-bearer.py",
+    }
+)
 
 
 class Refusal(ValueError):
@@ -40,6 +59,19 @@ class Refusal(ValueError):
 
 def refuse(message: str) -> None:
     raise Refusal(message)
+
+
+def command_basename(token: str) -> str:
+    return Path(token).name
+
+
+def admit_not_lifecycle_mutation(command: list[str]) -> None:
+    for token in command:
+        name = command_basename(token)
+        if name in LIFECYCLE_MUTATION_NAMES or "enroll-token" in token:
+            refuse(
+                "lifecycle mutation argv refuses; unpublished signed candidate is absent"
+            )
 
 
 def helper_worktree_root() -> Path:
@@ -323,6 +355,7 @@ def child_environment(dest_key: Path, dest_known_hosts: Path) -> dict[str, str]:
 def run_with_env(env_file: Path, command: list[str], sidecar: Path | None = None) -> int:
     if not command:
         refuse("command argv is empty")
+    admit_not_lifecycle_mutation(command)
     worktree = helper_worktree_root()
     env_file = admit_env_file(env_file, worktree)
     body = read_regular(env_file, "env file", MAX_ENV_BYTES)

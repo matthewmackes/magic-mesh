@@ -155,6 +155,11 @@ def main() -> None:
         linked_env.symlink_to(env_file)
         command(*base[:1], str(linked_env), "--", "/usr/bin/true", refused=True)
 
+        command(*base, "--", "/usr/bin/mackesd", "enroll-token", "--mesh-id", "x", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "join", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "offboard", refused=True)
+        command(*base, "--", str(HERE / "mint-enroll-bearer.py"), refused=True)
+
         extra = root / "extra.env"
         extra.write_text(env_body(dest_key, dest_hosts) + "EXTRA=1\n", encoding="ascii")
         os.chmod(extra, 0o400)
