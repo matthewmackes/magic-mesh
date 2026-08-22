@@ -91,7 +91,11 @@ EOF
 case "$RUNTIME" in
   cursor)
     command -v cursor-agent >/dev/null || { echo "cursor-agent missing" >&2; exit 2; }
-    nohup cursor-agent --print --trust --workspace "$WORKTREE" "$PROMPT" \
+    # Default off Opus: a prior fan-out died instantly on the account Opus
+    # usage cap and left 10 stale worktrees. Override with MCNF_AGENT_MODEL.
+    model="${MCNF_AGENT_MODEL:-cursor-grok-4.6-high-fast}"
+    nohup cursor-agent --print --trust --force --model "$model" \
+      --workspace "$WORKTREE" "$PROMPT" \
       >"$LOG" 2>&1 &
     ;;
   codex)

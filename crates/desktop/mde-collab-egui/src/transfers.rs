@@ -495,9 +495,7 @@ impl CommunicationsSurface {
                     )
                     .clicked()
                     {
-                        self.sync_pair_sink.emit(SyncPairCommand::Remove {
-                            id: pair.id.clone(),
-                        });
+                        self.remove_sync_pair(&pair.id);
                     }
                     if icons::icon_button(
                         ui,
@@ -563,6 +561,26 @@ impl CommunicationsSurface {
         self.transfers_ui.close();
     }
 
+    /// Remove a mirrored pair by id. Unknown and malformed ids refuse — same
+    /// early check as `mackesd transfer sync-pair remove` — against the bound
+    /// worker projection, never a second store.
+    fn remove_sync_pair(&mut self, id: &str) {
+        let id = id.trim();
+        if !valid_pair_id(id) {
+            self.transfers_ui.notice = Some("malformed pair id".to_owned());
+            return;
+        }
+        if !self.sync_pair_views.iter().any(|pair| pair.id == id) {
+            self.transfers_ui.notice = Some(format!("unknown pair id `{id}`"));
+            return;
+        }
+        self.sync_pair_sink
+            .emit(SyncPairCommand::Remove { id: id.to_owned() });
+        if self.transfers_ui.edit_id.as_deref() == Some(id) {
+            self.transfers_ui.close();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn save_sync_pair_draft_for_test(
         &mut self,
@@ -589,6 +607,11 @@ impl CommunicationsSurface {
     #[cfg(test)]
     pub(crate) fn editor_open_for_test(&self) -> bool {
         self.transfers_ui.editor_open
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_sync_pair_for_test(&mut self, id: &str) {
+        self.remove_sync_pair(id);
     }
 
     fn jobs_section(
@@ -910,5 +933,72 @@ const fn method_label(method: TransferMethod) -> &'static str {
         TransferMethod::Rsync => "rsync",
         TransferMethod::BrowserDownload => "browser",
         TransferMethod::MusicLibrary => "music",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_interval_secs, SyncPairCommand, SyncPairView};
+    use crate::CommunicationsSurface;
+
+    fn projected_pair(id: &str) -> SyncPairView {
+        SyncPairView {
+            id: id.to_owned(),
+            source: "/src".into(),
+            dest: "/dst".into(),
+            every_secs: 900,
+            bwlimit: Some("2m".into()),
+            next_run_unix_ms: Some(1_060_000),
+            last_result: Some("ok".into()),
+            peer_reachable: Some(true),
+        }
+    }
+
+    #[test]
+    fn parse_interval_secs_refuses_malformed_zero_and_unknown_units() {
+        assert_eq!(parse_interval_secs("nope"), None);
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("0"), None);
+        assert_eq!(parse_interval_secs("0s"), None);
+        assert_eq!(parse_interval_secs("-5m"), None);
+        assert_eq!(parse_interval_secs("15x"), None);
+        assert_eq!(parse_interval_secs("15m"), Some(900));
+        assert_eq!(parse_interval_secs("1h"), Some(3600));
+    }
+
+    #[test]
+    fn remove_refuses_unknown_and_malformed_pair_ids() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_sync_pair_views(vec![projected_pair("docs")]);
+
+        surface.remove_sync_pair_for_test("ghost");
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "unknown pair id must not publish a verb"
+        );
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("unknown pair id")),
+            "unknown pair id must refuse visibly"
+        );
+
+        surface.remove_sync_pair_for_test("../etc");
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "malformed pair id must not publish a verb"
+        );
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("malformed pair id")),
+            "malformed pair id must refuse visibly"
+        );
+
+        surface.remove_sync_pair_for_test("docs");
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Remove { id: "docs".into() }]
+        );
     }
 }
