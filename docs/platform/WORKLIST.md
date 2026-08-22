@@ -1663,13 +1663,15 @@ story execution contract above.
 - Current state: operator Q9 signoff landed 2026-08-22 (delete after fleet
   negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units
   are already gone from this tree. S1 live-negative is
-  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Roster, spawn,
-  CLI, and workers-mod no longer advertise or spawn `voip_rtt`.
-  `voip_rtt_worker.rs` is deleted; `leftover_retirements` asserts it stays
-  gone. Leftover: `cli/voip_rtt.rs` plus `own_nebula_ip` (live helper).
-- Remaining work: leftover is `cli/voip_rtt.rs`; `own_nebula_ip` is a live
-  helper (do not delete); roster/spawn/`voip_rtt_worker.rs` already retired;
-  then:
+  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Leftover
+  `cli/voip_rtt.rs` and `voip_rtt_worker.rs` are deleted;
+  `leftover_retirements` asserts both stay gone. Roster, spawn, and CLI
+  do not advertise `voip_rtt`. Leftover is live helper `own_nebula_ip` in
+  lib `voip_rtt.rs` plus Cosmic-era View arms and unused SendToEntry
+  variants still named.
+- Remaining work: leftover is live helper `own_nebula_ip` in lib
+  `voip_rtt.rs` plus Cosmic-era View arms and unused SendToEntry
+  variants still named; then:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
