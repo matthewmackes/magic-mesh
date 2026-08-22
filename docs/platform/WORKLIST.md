@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 13 `Remaining`, 6 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 10 `Remaining`, 9 `Blocked`, 0 `Needs clarification`.
   Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
   surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
   fetch authorized; preflight template then operator secrets; seats+Vitelity go.
@@ -1456,7 +1456,7 @@ story execution contract above.
 
 ### WL-FUNC-028 - Build the recurring-mirror (sync-pair) producer
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P2
 - Complexity: Medium
 - Problem: the design-locked recurring rsync mirror is code-complete but
@@ -1466,18 +1466,13 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: CLI `mackesd transfer sync-pair add|remove|list` and the
-  Transfers GUI editor publish Save/Remove; inbox drain applies them.
-  `last_result` is stamped at enqueue and again after the rsync lane
-  outcome. Engine open rebuilds the in-flight job→pair map from
-  enqueue-ok pairs. The worker persists `next_run_ms` on save/enqueue;
-  the shell fold copies that published stamp (or None) and no longer
-  synthesizes last_fired+interval. Leftover is live Bus /
-  operator-visible next-run and last-result on a real pair, not a
-  missing store field.
-- Remaining work: persist + fold copy landed; leftover is live Bus /
-  operator-visible next-run and last-result on a real pair, not a
-  missing store field.
+- Current state: in-tree CLI/GUI and persist/fold landed. Read-only 2026-08-22:
+  Dell, Seat 15, and Surface run `magic-mesh-12.1.6-35`; `mackesd transfer` has
+  no `sync-pair` subcommand. Live next-run/last-result cannot be proven until a
+  current-revision unpublished signed candidate is installed (WL-REL-002).
+  Evidence: `WL-FUNC-028-2026-08-22-installed-cli-gap-r1.md`.
+- Remaining work: leftover is live Bus / operator-visible next-run and
+  last-result on a real pair after that RPM is on an acceptance seat.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
@@ -1501,6 +1496,8 @@ story execution contract above.
   `crates/mesh/mackesd/src/cli/transfer.rs`,
   `crates/mesh/mackesd/src/workers/transfers/`,
   `crates/desktop/mde-collab-egui/src/transfers.rs`.
+- Dependencies: WL-REL-002 unpublished signed candidate; no seat package
+  mutation without that candidate plus red alert + 5s.
 - Acceptance criteria: CLI and GUI both manage pairs; the existing worker
   executes them; no second store or scheduler appears.
 - Verification method: focused mackesd transfers and mde-collab-egui farm
@@ -1512,7 +1509,7 @@ story execution contract above.
 
 ### WL-FUNC-029 - Build the Fleet voice-admin panel in Communications Activity
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P2
 - Complexity: Medium
 - Problem: fleet voice provisioning (Vitelity DIDs, routing, failover,
@@ -1522,14 +1519,13 @@ story execution contract above.
 - Required outcome: Communications Activity carries the fleet voice-admin
   panel publishing the existing action/voice verbs and rendering the
   state/voice topics.
-- Current state: the `voice_provision` worker owns
-  `action/voice/{provision,did-route,failover,shared-config}` and the
-  `state/voice/*` topics
-  (`crates/mesh/mackesd/src/workers/voice_provision.rs`). Activity already
-  has the Fleet voice-admin panel and `hydrate_voice` of `state/voice/*`.
-  Leftover: live Vitelity (not a missing Activity section).
-- Remaining work: Fleet voice-admin + `hydrate_voice` landed; leftover is
-  live Vitelity, not a missing panel.
+- Current state: Fleet voice-admin + `hydrate_voice` landed. Leftover is live
+  Vitelity. Operator 2026-08-22 allows seat+Vitelity mutation only when an
+  unpublished signed candidate exists; none does. Seats still run
+  `magic-mesh-12.1.6-35`. Evidence:
+  `WL-FUNC-028-2026-08-22-installed-cli-gap-r1.md`.
+- Remaining work: leftover is live Vitelity on a current-revision seat, not a
+  missing Activity section.
   1. S1 Panel over the existing verbs.
      - Inputs: the voice_provision verb bodies (provision, DID route,
        failover, shared config) and the Activity mode layout.
@@ -1548,6 +1544,8 @@ story execution contract above.
 - Relevant files/components:
   `crates/desktop/mde-collab-egui/src/activity.rs`,
   `crates/mesh/mackesd/src/workers/voice_provision.rs`.
+- Dependencies: WL-REL-002 unpublished signed candidate; operator lock that
+  seats+Vitelity go only with that candidate plus red alert + 5s.
 - Acceptance criteria: provision, DID-route, failover, and shared-config all
   publish from the panel and land in retained state; no mackesd contract
   change.
@@ -1559,7 +1557,7 @@ story execution contract above.
 
 ### WL-FUNC-030 - Build the mesh SIP-gateway config control in Communications Activity
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P2
 - Complexity: Small
 - Problem: the mesh-wide SIP gateway responder
@@ -1569,12 +1567,13 @@ story execution contract above.
 - Required outcome: Communications Activity owns gateway configuration; the
   responder and gateway.toml contract stay unchanged; the existing workgroup
   gateway.toml migrates in place.
-- Current state: the responder in `crates/mesh/mackesd/src/ipc/voip.rs`
-  serves set/get/clear with password redaction on get. Activity already
-  has the gateway form and in-place `gateway.toml` hydrate. Leftover:
-  live Bus + migrated workgroup toml (not a missing GUI publisher).
-- Remaining work: gateway form / in-place hydrate landed; leftover is
-  live Bus + migrated workgroup toml, not a missing GUI publisher.
+- Current state: gateway form / in-place hydrate landed. Read-only 2026-08-22:
+  no `gateway.toml` on Dell, Seat 15, or Surface; seats run
+  `magic-mesh-12.1.6-35`. Live Bus leftover waits on a current-revision RPM
+  plus a migrated workgroup toml. Evidence:
+  `WL-FUNC-028-2026-08-22-installed-cli-gap-r1.md`.
+- Remaining work: leftover is live Bus + migrated workgroup toml, not a
+  missing GUI publisher.
   1. S1 Gateway section in Activity.
      - Inputs: the three verb bodies and redaction contract in ipc/voip.rs.
      - Action: a bounded gateway form (host, port, credentials) publishing
@@ -1590,6 +1589,8 @@ story execution contract above.
 - Relevant files/components:
   `crates/desktop/mde-collab-egui/src/activity.rs`,
   `crates/mesh/mackesd/src/ipc/voip.rs`.
+- Dependencies: WL-REL-002 unpublished signed candidate; a migrated workgroup
+  `gateway.toml` on an acceptance seat.
 - Acceptance criteria: the full set/get/clear cycle works from the panel with
   the redaction contract intact.
 - Verification method: focused mde-collab-egui and mackesd voip farm gates.
