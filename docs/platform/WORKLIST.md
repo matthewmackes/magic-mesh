@@ -1666,12 +1666,11 @@ story execution contract above.
   `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Leftover
   `cli/voip_rtt.rs` and `voip_rtt_worker.rs` are deleted;
   `leftover_retirements` asserts both stay gone. Roster, spawn, and CLI
-  do not advertise `voip_rtt`. Leftover is live helper `own_nebula_ip` in
-  lib `voip_rtt.rs` plus Cosmic-era View arms and unused SendToEntry
-  variants still named.
+  do not advertise `voip_rtt`. Unused SendToEntry variants are deleted
+  (Toolbar + ContextMenu only). Leftover is live helper `own_nebula_ip`
+  in lib `voip_rtt.rs` (keep) plus Cosmic-era View arms.
 - Remaining work: leftover is live helper `own_nebula_ip` in lib
-  `voip_rtt.rs` plus Cosmic-era View arms and unused SendToEntry
-  variants still named; then:
+  `voip_rtt.rs` (keep) plus Cosmic-era View arms; then:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
@@ -1691,10 +1690,10 @@ story execution contract above.
        ledger references.
   3. S3 Delete the orphaned and never-wired rows.
      - Inputs: ledger Q10, Q13, Q29, and Q33 retire rulings.
-     - Action: remove roster.rs and resolve.rs, the voip_rtt worker, CLI, and
-       topic, the dead View arms with their list() branches and responders
-       (keeping fleet-files, files-inbox, and file-ops), and the
-       unconstructed SendToEntry variants (keeping Toolbar and ContextMenu).
+     - Action: remove roster.rs and resolve.rs, and the dead View arms with
+       their list() branches and responders (keeping fleet-files, files-inbox,
+       and file-ops). SendToEntry is Toolbar + ContextMenu only. Keep
+       `own_nebula_ip` in lib `voip_rtt.rs`.
      - Deliverable: no orphan module remains.
      - Validation: the full farm gate passes; the retained responders'
        contract tests stay green.
