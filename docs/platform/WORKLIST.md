@@ -720,9 +720,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` on BigBoy sha256
   `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`
   (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
-  App VM, Browser VM, and bootc ARGs now match admitted index `3a5e74e6…`
-  (`WL-REL-006-2026-08-22-app-vm-base-pin-r1.md`, browser-vm and bootc-base-pin-r1;
-  bootc receipt `479ec2b8c`). Surface `bootc_base` still null. Kiron S6 admitted.
+  App VM, Browser VM, and bootc ARGs match `3a5e74e6…`; inventory now names
+  Browser VM dest `b30954e31` (`WL-REL-006-2026-08-22-browser-vm-inventory-r1.md`).
+  Kiron S6 admitted. Surface `bootc_base` still null.
   Leftover is Maps `production_admitted`, App catalog real refs (producer now
   refuses `org.example.*`; evidence
   `WL-REL-006-2026-08-22-catalog-fixture-refuse-r1.md`), RPM signer after freeze,

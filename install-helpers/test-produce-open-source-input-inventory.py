@@ -18,6 +18,8 @@ FAMILIES = ("maps", "app-vm", "bootc", "browser-vm", "rpm", "ux-014")
 MAPS_SHA256 = "6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895"
 APP_RECEIPT = "aca7573bc"
 BOOTC_RECEIPT = "479ec2b8c"
+BROWSER_RECEIPT = "b30954e31"
+BROWSER_DIGEST = "sha256:3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
 RPM_FINGERPRINT = "06B1C27EA0E08A225155EB3314018AA1497DDC7C"
 
 
@@ -72,7 +74,9 @@ def main() -> None:
         assert families["bootc"]["receipt_revision"] == BOOTC_RECEIPT
         assert families["bootc"]["release_role"] == "all-roles"
         assert families["browser-vm"]["producer"] == "packaging/browser-vm/produce-base-image-receipt.py"
-        assert families["browser-vm"]["image_digest"].startswith("leftover:")
+        assert families["browser-vm"]["receipt_revision"] == BROWSER_RECEIPT
+        assert families["browser-vm"]["resolved_digest"] == BROWSER_DIGEST
+        assert families["browser-vm"]["leftover"].startswith("private dest bound")
         assert families["rpm"]["signing_fingerprint"] == RPM_FINGERPRINT
         assert families["ux-014"]["package"] == "kiron"
         assert "cuttlefish" not in json.dumps(document).lower()

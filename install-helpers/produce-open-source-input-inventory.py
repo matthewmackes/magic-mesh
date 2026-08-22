@@ -51,9 +51,8 @@ def family_is_refused(name: str) -> bool:
 
 
 def catalog_ref_is_fixture(ref: str) -> bool:
-    return ref == FIXTURE_CATALOG_REF or ref.startswith(f"{FIXTURE_CATALOG_REF}@") or ref.startswith(
-        f"{FIXTURE_CATALOG_REF}:"
-    )
+    app_id = ref.split("@", 1)[0].split(":", 1)[0]
+    return app_id == FIXTURE_CATALOG_REF or app_id.startswith("org.example.")
 
 
 def check_family_names(names: list[str]) -> None:
@@ -106,11 +105,22 @@ def selected_families() -> list[dict[str, object]]:
             "resolved_digest": "sha256:3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357",
         },
         {
+            "architecture": "amd64",
+            "containerfile_pin": (
+                "quay.io/fedora/fedora-bootc@sha256:"
+                "3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
+            ),
             "family": "browser-vm",
-            "image_digest": "leftover: no current-revision-bound digest",
+            "image_reference": "quay.io/fedora/fedora-bootc:44",
+            "leftover": "private dest bound to b30954e31 / :44; dest not rebound",
             "license": "Fedora Project terms",
             "producer": "packaging/browser-vm/produce-base-image-receipt.py",
             "profile": "browser-vm-chromium",
+            "receipt_revision": "b30954e31",
+            "receipt_sha256": "ac9755db790445048eb621542b69ec24220b58ecec3e056a9e570309b7c100a9",
+            "resolved_digest": (
+                "sha256:3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357"
+            ),
             "target": "mcnf-browser-vm/browser-vm-chromium-v1",
             "verifier": "packaging/browser-vm/verify-image-manifest.py",
         },
