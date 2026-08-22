@@ -143,8 +143,8 @@ dual-homed (its own Nebula cert + a LAN NIC), default-deny inbound.
 - **Music / media** — `mde-music-egui` + Navidrome on an explicitly provisioned non-lighthouse media host
   (Subsonic-API, DO Spaces object store); `mde-media-egui` + `mde-media-core`
   (libmpv) for local playback; an `mde-jellyfin` client.
-- **Telephony / voice** — `mde-voice-egui` + `mde-voice-config`: a SIP softphone
-  with mesh-internal extensions (Kamailio + RTPengine) and an outbound gateway.
+- **Telephony / voice** — `mde-voice-egui` / `mde-voice-hud` / Communications
+  Calls: the Construct softphone path and Calls surface.
 - **Browser** — a dedicated `browser-vm` Desktop VM running Chromium/Sway. The
   shell owns only the connection boundary; Sunshine/Moonlight is preferred,
   RDP is the explicit alternate, and the guest owns browser chrome, pages,

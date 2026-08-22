@@ -1703,10 +1703,12 @@ story execution contract above.
   `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Ledger Q9,
   roster+resolve, Q13 voip_rtt, Q29 View, and Q33 SendToEntry retire rows
   now cite the deleting revisions. `leftover_retirements` source-scans those
-  SHAs. Notifications SQLite table dropped by migration 0017. Leftover is
-  live helper `own_nebula_ip` in lib `voip_rtt.rs` (keep).
-- Remaining work: leftover is live helper `own_nebula_ip` in lib
-  `voip_rtt.rs` (keep). Then:
+  SHAs. Notifications SQLite table dropped by migration 0017. README
+  telephony bullet now names the softphone path only (evidence
+  `WL-FUNC-033-2026-08-22-readme-live-ref-r1.md`). Leftover is still keep
+  `own_nebula_ip` in lib `voip_rtt.rs`.
+- Remaining work: leftover is still keep `own_nebula_ip` in lib
+  `voip_rtt.rs`. Then:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
