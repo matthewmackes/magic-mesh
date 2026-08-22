@@ -16,12 +16,12 @@
 //!   [`AnswerCall`](CollabCommand::AnswerCall) /
 //!   [`DeclineCall`](CollabCommand::DeclineCall).
 //! * **Mute** the local microphone → [`SetCallMuted`](CollabCommand::SetCallMuted)
-//!   (a real convergent command applied to the live P2P audio leg by the
-//!   mackesd media worker when a seat device is bound; the projection carries
-//!   each participant's muted bit).
-//! * **DTMF** — an in-call keypad whose every press emits
-//!   [`SendDtmf`](CollabCommand::SendDtmf), which the same worker injects into
-//!   the bound live leg.
+//!   only when a published [`MediaSessionV1`] for that call binds audio; otherwise
+//!   the control stays [`TransportUnavailable`](MediaFailureReasonV1::TransportUnavailable)
+//!   and emits nothing (the projection still carries each participant's muted bit).
+//! * **DTMF** — an in-call keypad whose press emits
+//!   [`SendDtmf`](CollabCommand::SendDtmf) only when that same published session
+//!   binds a DTMF sender. No session is fail-closed, never a signaling emit.
 //! * **Hang up** → [`HangUpCall`](CollabCommand::HangUpCall).
 //! * Device selection (mic / camera / screen), reusing the egui combo shape the
 //!   `mde-voice-egui` dialer controls take.
@@ -30,9 +30,10 @@
 //!
 //! Mute and DTMF are live-leg verbs. The renderer still only emits typed
 //! [`CollabCommand`]s; the mackesd P2P worker (`call_media`) applies them to the
-//! bound seat audio. When a [`MediaSessionV1`] projection is present they emit
-//! only if that session binds the matching audio/DTMF sender; otherwise the
-//! control is an honest unavailable state, never a view-only intent bit.
+//! bound seat audio. They emit only when a published [`MediaSessionV1`] for that
+//! call binds the matching audio/DTMF sender. No published session is fail-closed
+//! [`TransportUnavailable`](MediaFailureReasonV1::TransportUnavailable) — never a
+//! signaling emit, a view-only intent bit, or an invented connected/PSTN state.
 //!
 //! Camera and screen follow the same projection: an offered live track renders
 //! as attached, and every other case is unavailable. Device selectors stay
@@ -530,10 +531,11 @@ impl CommunicationsSurface {
     }
 
     /// The connected-seat control cluster: mute, camera, screen-share, the DTMF
-    /// keypad toggle, and hang up. Mute + DTMF emit only when the optional
-    /// [`MediaSessionV1`] binds those senders (or when no session is present,
-    /// so the worker can apply the signaling command once a leg binds). Camera
-    /// and screen render attached or unavailable from that same projection.
+    /// keypad toggle, and hang up. Mute + DTMF emit only when a published
+    /// [`MediaSessionV1`] for this call binds those senders. No session renders
+    /// [`TransportUnavailable`](MediaFailureReasonV1::TransportUnavailable) and
+    /// emits nothing. Camera and screen render attached or unavailable from that
+    /// same projection.
     fn connected_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -553,7 +555,7 @@ impl CommunicationsSurface {
                 LiveAudioEffect::Unavailable => {
                     live_audio_unavailable_reason(session, LiveAudioKind::Mute)
                 }
-                LiveAudioEffect::Live | LiveAudioEffect::Signaling => mic_hint,
+                LiveAudioEffect::Live => mic_hint,
             };
             ui.add_enabled_ui(mute_effect.can_emit(), |ui| {
                 if icons::icon_button(ui, mic_glyph, Style::SP_M, Style::TEXT_DIM, mic_hint)
@@ -589,7 +591,7 @@ impl CommunicationsSurface {
                 LiveAudioEffect::Unavailable => {
                     live_audio_unavailable_reason(session, LiveAudioKind::Dtmf)
                 }
-                LiveAudioEffect::Live | LiveAudioEffect::Signaling => "DTMF keypad",
+                LiveAudioEffect::Live => "DTMF keypad",
             };
             ui.add_enabled_ui(dtmf_effect.can_emit(), |ui| {
                 if icons::icon_button(ui, icons::CALL_DTMF, Style::SP_M, dtmf_tint, dtmf_hint)
@@ -615,8 +617,8 @@ impl CommunicationsSurface {
     }
 
     /// The in-call DTMF keypad: a telephone-order 3×4 grid whose every press emits
-    /// a [`SendDtmf`](CollabCommand::SendDtmf) for `call` when the media session
-    /// binds a DTMF sender (or when no session is present).
+    /// a [`SendDtmf`](CollabCommand::SendDtmf) for `call` only when a published
+    /// media session binds a DTMF sender. No session stays disabled.
     fn dtmf_keypad(
         &self,
         ui: &mut egui::Ui,
@@ -681,14 +683,14 @@ impl CommunicationsSurface {
     }
 
     /// Emit [`SetCallMuted`](CollabCommand::SetCallMuted) for the live audio
-    /// sender owned by the mackesd P2P media worker. No session means the
-    /// signaling path; a present session must bind audio or this is a no-op.
+    /// sender owned by the mackesd P2P media worker. Callers that have a session
+    /// option must go through [`Self::set_call_muted_with_session`].
     pub(crate) fn set_call_muted(&self, sink: &mut CommandSink, call: CallId, muted: bool) {
         sink.emit(CollabCommand::SetCallMuted { call, muted });
     }
 
-    /// Session-aware mute: refuse to record view-only intent when a
-    /// [`MediaSessionV1`] is present without a bound audio sender.
+    /// Session-aware mute: emit only when a published [`MediaSessionV1`] for
+    /// this call binds an audio sender. No session is fail-closed.
     pub(crate) fn set_call_muted_with_session(
         &self,
         sink: &mut CommandSink,
@@ -702,14 +704,14 @@ impl CommunicationsSurface {
     }
 
     /// Emit [`SendDtmf`](CollabCommand::SendDtmf) for the live audio sender
-    /// owned by the mackesd P2P media worker. No session means the signaling
-    /// path; a present session must bind DTMF or this is a no-op.
+    /// owned by the mackesd P2P media worker. Callers that have a session
+    /// option must go through [`Self::send_dtmf_with_session`].
     pub(crate) fn send_dtmf(&self, sink: &mut CommandSink, call: CallId, digit: char) {
         sink.emit(CollabCommand::SendDtmf { call, digit });
     }
 
-    /// Session-aware DTMF: refuse to record view-only intent when a
-    /// [`MediaSessionV1`] is present without a bound DTMF sender.
+    /// Session-aware DTMF: emit only when a published [`MediaSessionV1`] for
+    /// this call binds a DTMF sender. No session is fail-closed.
     pub(crate) fn send_dtmf_with_session(
         &self,
         sink: &mut CommandSink,
@@ -946,21 +948,19 @@ fn call_start_enabled(directory: &SpaceDirectory, space: SpaceId) -> bool {
         .is_some_and(|summary| summary.members > 1)
 }
 
-/// Whether mute or DTMF can act on a live (or still-signaling) audio leg.
+/// Whether mute or DTMF can act on a published live audio leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveAudioEffect {
-    /// No [`MediaSessionV1`]: emit the typed command; the worker applies it when bound.
-    Signaling,
     /// Session proves the matching audio/DTMF bind is present.
     Live,
-    /// Session is present but this control has no live sender.
+    /// No published session for this call, or the session has no live sender.
     Unavailable,
 }
 
 impl LiveAudioEffect {
     #[must_use]
     pub(crate) const fn can_emit(self) -> bool {
-        matches!(self, Self::Live | Self::Signaling)
+        matches!(self, Self::Live)
     }
 }
 
@@ -972,13 +972,17 @@ pub(crate) enum LiveAudioKind {
 }
 
 /// Classify mute/DTMF against an optional live-media projection.
+///
+/// No published [`MediaSessionV1`] for the call is fail-closed
+/// [`Unavailable`](LiveAudioEffect::Unavailable) — never a signaling emit
+/// and never an invented connected or PSTN session.
 #[must_use]
 pub(crate) fn live_audio_effect(
     session: Option<&MediaSessionV1>,
     kind: LiveAudioKind,
 ) -> LiveAudioEffect {
     let Some(session) = session else {
-        return LiveAudioEffect::Signaling;
+        return LiveAudioEffect::Unavailable;
     };
     let bound = match kind {
         LiveAudioKind::Mute => session.audio_bound,
@@ -1069,8 +1073,7 @@ fn live_audio_unavailable_reason(
             track: MediaTrackKind::Video | MediaTrackKind::Screen,
         })
         | Some(MediaSessionStateV1::Negotiating)
-        | Some(MediaSessionStateV1::Connected)
-        | None => match kind {
+        | Some(MediaSessionStateV1::Connected) => match kind {
             LiveAudioKind::Mute => {
                 "Unavailable: mute has no bound audio sender on this media session"
             }
@@ -1078,6 +1081,7 @@ fn live_audio_unavailable_reason(
                 "Unavailable: DTMF has no bound audio sender on this media session"
             }
         },
+        None => media_failure_unavailable_label(MediaFailureReasonV1::TransportUnavailable),
     }
 }
 
@@ -1595,12 +1599,18 @@ mod tests {
 
         let mut sink = CommandSink::new();
         surface.set_call_muted_with_session(&mut sink, call, true, None);
+        surface.send_dtmf_with_session(&mut sink, call, '1', None);
         assert!(
-            matches!(
-                sink.queued().first(),
-                Some(CollabCommand::SetCallMuted { call: c, muted: true }) if *c == call
-            ),
-            "no MediaSessionV1 keeps mute on the signaling path"
+            sink.is_empty(),
+            "no published MediaSessionV1 must fail closed — mute/DTMF stay TransportUnavailable"
+        );
+        assert_eq!(
+            live_audio_effect(None, LiveAudioKind::Mute),
+            LiveAudioEffect::Unavailable
+        );
+        assert_eq!(
+            live_audio_unavailable_reason(None, LiveAudioKind::Mute),
+            media_failure_unavailable_label(MediaFailureReasonV1::TransportUnavailable)
         );
 
         let absent = plane_session(
@@ -1699,6 +1709,90 @@ mod tests {
                 .session_for(call)
                 .map(|session| session.audio_bound),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn mute_and_dtmf_fail_closed_without_published_session_for_that_call() {
+        let call = CallId::new();
+        let other = CallId::new();
+        let surface = CommunicationsSurface::new();
+        let transport = media_failure_unavailable_label(MediaFailureReasonV1::TransportUnavailable);
+
+        assert_eq!(
+            live_audio_effect(None, LiveAudioKind::Mute),
+            LiveAudioEffect::Unavailable
+        );
+        assert_eq!(
+            live_audio_effect(None, LiveAudioKind::Dtmf),
+            LiveAudioEffect::Unavailable
+        );
+        assert!(
+            !live_audio_effect(None, LiveAudioKind::Mute).can_emit()
+                && !live_audio_effect(None, LiveAudioKind::Dtmf).can_emit()
+        );
+        assert_eq!(
+            live_audio_unavailable_reason(None, LiveAudioKind::Mute),
+            transport
+        );
+        assert_eq!(
+            live_audio_unavailable_reason(None, LiveAudioKind::Dtmf),
+            transport
+        );
+
+        let mut sink = CommandSink::new();
+        surface.set_call_muted_with_session(&mut sink, call, true, None);
+        surface.send_dtmf_with_session(&mut sink, call, '7', None);
+        assert!(
+            sink.is_empty(),
+            "no published MediaSessionV1 for the call must not emit mute/DTMF"
+        );
+
+        // A live session for a different call is not this call's published session.
+        let other_live = plane_session(
+            other,
+            MediaSessionStateV1::Connected,
+            vec![MediaTrackKind::Audio],
+            false,
+            true,
+            true,
+            4,
+            true,
+        );
+        let mut surface = CommunicationsSurface::new();
+        surface.apply_media_sessions(vec![other_live]);
+        assert!(
+            surface.call_media.session_for(call).is_none(),
+            "a session for another call must not stand in for this call"
+        );
+        assert!(
+            !surface
+                .call_media
+                .sessions
+                .iter()
+                .any(|session| session.session == call),
+            "must not invent a MediaSessionV1 for the ungoverned call"
+        );
+        assert!(
+            surface.call_media.sip_legs.is_empty(),
+            "must not invent a live PSTN SipLegV1 from a missing session"
+        );
+
+        let published = surface.call_media.session_for(call).cloned();
+        let mut sink = CommandSink::new();
+        surface.set_call_muted_with_session(&mut sink, call, true, published.as_ref());
+        surface.send_dtmf_with_session(&mut sink, call, '*', published.as_ref());
+        assert!(
+            sink.is_empty(),
+            "a session for a different call must fail closed for this call's mute/DTMF"
+        );
+        assert_eq!(
+            live_audio_unavailable_reason(published.as_ref(), LiveAudioKind::Mute),
+            transport
+        );
+        assert_eq!(
+            live_audio_unavailable_reason(published.as_ref(), LiveAudioKind::Dtmf),
+            transport
         );
     }
 
