@@ -1192,13 +1192,14 @@ story execution contract above.
   LiveKit SFU with P2P failover, and PSTN legs terminate through the LiveKit
   SIP gateway reusing the mde-voice-hud softphone, with all media state owned
   by typed mackesd verbs and never by the renderer.
-- Current state: `crates/desktop/mde-collab-egui/src/calls.rs` records
-  mute/DTMF/camera/screen intent as honest local view state behind in-code
-  media-plane markers; call signaling already converges through the collab
-  command/store. The proven softphone account machinery (`VoiceAccounts`,
-  `run_agent_accounts`, `lift_if_legacy` in
-  `crates/services/mde-voice-hud/src/sip.rs`) is unused by the surface.
-- Remaining work: execute S1-S6 in order; change only owned components; record
+- Current state: inbound SIP retain+hangup ticks the publish plane
+  (`collab_media.rs`, `call_media.rs`); HUD `calls.rs` names every
+  `MediaFailureReasonV1`. Bridged remints stay unbridged without proven
+  LiveKit. Live audio/video, elected SFU, and PSTN legs remain. Softphone
+  `VoiceAccounts` / `run_agent_accounts` / `lift_if_legacy` stay unused
+  by the surface.
+- Remaining work: leftover is live media/SFU/PSTN (S2-S4) plus remaining
+  S5/S6 live-plane bind; change only owned components; record
   deliverable, farm command, result, revision, and evidence per story.
   1. S1 Add the typed media contracts.
      - Inputs: mde-collab-types versioning conventions and the calls.rs command
@@ -1290,14 +1291,13 @@ story execution contract above.
 - Required outcome: every lock-1 operation is reachable from the Files menubar
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
-- Current state: `OpKind::{Copy, Move, Delete, Compress, Extract}` and
-  `crates/services/mde-files/src/archive.rs` are complete and tested;
-  `FileOps` carries safe `symlink` and `hard_link` wrappers in
-  `crates/services/mde-files/src/fileops.rs`; the surface wires only
-  `NameOperation::{NewFolder, Rename}` across
-  `crates/desktop/mde-files-egui/src/dialogs.rs`, `model/mod.rs`, and
-  `view.rs`. Operator 2026-08-22 Q26: Files stays its own OS surface.
-- Remaining work:
+- Current state: menubar and context reach New File, Duplicate, Compress,
+  Extract Here/To, Symlink, and Hardlink through `FileOps`/`OpKind`/
+  archive (`dialogs.rs`, `model/mod.rs`, `view.rs`, `menubar.rs`).
+  Operator 2026-08-22 Q26: Files stays its own OS surface. Live mesh-tree
+  and archive-queue production evidence is still remaining.
+- Remaining work: surface wiring for S1-S3 is in-tree; leftover is live
+  local/mesh and archive-queue evidence, not a missing command.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
@@ -1350,11 +1350,13 @@ story execution contract above.
   but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
 - Required outcome: per-folder view mode, sort order, and show-hidden survive
   a shell restart.
-- Current state: `folder_prefs: HashMap<String, FolderPrefs>` lives at
-  `crates/desktop/mde-files-egui/src/model/mod.rs` (struct near line 306,
-  field near line 1058), populated by the set_view/sort setters and read on
-  navigation; nothing serializes it.
-- Remaining work:
+- Current state: `FolderPrefs` persist at
+  `<config>/mcnf/files-folder-prefs.json` (`model/mod.rs`): serde write
+  debounced on mutation, hydrate at construction, LRU cap 256; corrupt,
+  oversize, or symlinked files degrade to defaults. Live restart
+  production evidence is still remaining.
+- Remaining work: persist path is in-tree; leftover is live restart
+  evidence (fixtures do not satisfy production).
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
@@ -1388,10 +1390,13 @@ story execution contract above.
   never built.
 - Required outcome: operators pin, rename, reorder, and remove their own
   Places entries, persisted across restarts.
-- Current state: the sidebar renders the fixed PLACES set and live mesh
-  peers; no bookmark store exists anywhere under
-  `crates/desktop/mde-files-egui/`.
-- Remaining work:
+- Current state: Places pin/rename/reorder/remove persist in
+  `<config>/mcnf/files-bookmarks.json` (`model/mod.rs`, `view.rs`);
+  hostile paths, duplicates, and corrupt stores refuse or degrade. Mesh
+  peers stay a distinct live section. Live restart-and-navigate
+  production evidence is still remaining.
+- Remaining work: bookmark store is in-tree; leftover is live
+  restart/navigate evidence, not a missing store.
   1. S1 Add the bookmark store and sidebar section.
      - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
        Places render path.
@@ -1427,13 +1432,13 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: verbs and store live at
-  `crates/mesh/mackesd/src/workers/transfers/{verb.rs,sync_pair.rs}` with
-  scheduling in `mod.rs` (`schedule_sync_pairs_at`); `TransferCmd`
-  (`crates/mesh/mackesd/src/bin/mackesd.rs`, `cli/transfer.rs`) has
-  Submit/List/Destinations/Cancel/Pause/Resume and no sync-pair arm;
-  Communications `transfers.rs` mirrors the ledger only.
-- Remaining work:
+- Current state: CLI `mackesd transfer sync-pair add|remove|list` and the
+  Transfers GUI editor publish Save/Remove; inbox drain applies them.
+  `last_result` is stamped at enqueue and again after the rsync lane
+  outcome. Leftover: `sync_pair_jobs` is in-memory, so a
+  restart-while-in-flight cannot restamp the pair from the surviving job.
+- Remaining work: CLI + GUI producer landed; leftover is persist/rebuild
+  the in-flight pair→job map across restart.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
@@ -1611,10 +1616,12 @@ story execution contract above.
 - Required outcome: Ctrl+J opens Communications Transfers from any Construct
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
-- Current state: the shell keymap
-  (`crates/desktop/mde-shell-egui/src/hotkeys.rs`) has no Transfers binding;
-  Communications has no in-mode new-transfer accelerator.
-- Remaining work:
+- Current state: catalog binds Ctrl+J (Open Transfers) and Ctrl+N (New
+  transfer) in `hotkeys.rs`; live apply refuses both on Documents,
+  Terminal, Desktop, and Browser natively (text/guest focus) so those
+  surfaces keep the chord. Hotkeys settings lists both labels.
+- Remaining work: catalog + apply refuse landed; leftover is live-surface
+  proof from every Construct surface, not a missing binding.
   1. S1 Register both bindings.
      - Inputs: the hotkeys.rs table and the Communications mode router.
      - Action: bind Ctrl+J to Surface::Communications in Transfers mode and
@@ -1648,12 +1655,15 @@ story execution contract above.
   the tree builds and runs without them; the parity ledger's retire rows cite
   the deleting revision.
 - Current state: operator Q9 signoff landed 2026-08-22 (delete after fleet
-  negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units are
-  already gone from this tree. S1 live-negative is
-  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Remaining live code is
-  the never-wired voip_rtt worker/CLI/topic plus any leftover View/SendToEntry
-  orphans. Re-probe seats before the leftover delete.
-- Remaining work:
+  negative). Crate `mde-voice-config`, `mackesd::voice`, and kamailio units
+  are already gone from this tree. S1 live-negative is
+  `evidence/WL-FUNC-033-2026-08-20-live-negative-r1.md`. Roster, spawn,
+  CLI, and workers-mod no longer advertise or spawn `voip_rtt`. Leftover:
+  `voip_rtt_worker.rs`, `cli/voip_rtt.rs`, and `own_nebula_ip` callers.
+  Re-probe seats before the leftover delete.
+- Remaining work: leftover delete is `voip_rtt` file + CLI module +
+  `own_nebula_ip` (roster/spawn already retired); then:
+
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
      - Action: verify no enrolled seat runs kamailio-mde or rtpengine-mde for
