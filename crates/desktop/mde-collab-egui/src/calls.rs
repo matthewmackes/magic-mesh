@@ -790,44 +790,19 @@ impl CallDevice {
     }
 
     fn unavailable_reason_on_plane(self, session: Option<&MediaSessionV1>) -> &'static str {
-        match (session.map(|plane| &plane.state), self) {
-            (
-                Some(MediaSessionStateV1::DeviceAbsent {
-                    track: MediaTrackKind::Audio,
-                }),
-                Self::Microphone,
-            ) => "Unavailable: no microphone is present on the live media session",
-            (
-                Some(MediaSessionStateV1::DeviceAbsent {
-                    track: MediaTrackKind::Video,
-                }),
-                Self::Camera,
-            ) => "Unavailable: no camera is present on the live media session",
-            (
-                Some(MediaSessionStateV1::DeviceAbsent {
-                    track: MediaTrackKind::Screen,
-                }),
-                Self::Screen,
-            ) => "Unavailable: no screen-capture source is present on the live media session",
-            (
-                Some(MediaSessionStateV1::PermissionDenied {
-                    track: MediaTrackKind::Audio,
-                }),
-                Self::Microphone,
-            ) => "Unavailable: microphone permission denied on the live media session",
-            (
-                Some(MediaSessionStateV1::PermissionDenied {
-                    track: MediaTrackKind::Video,
-                }),
-                Self::Camera,
-            ) => "Unavailable: camera permission denied on the live media session",
-            (
-                Some(MediaSessionStateV1::PermissionDenied {
-                    track: MediaTrackKind::Screen,
-                }),
-                Self::Screen,
-            ) => "Unavailable: screen-capture permission denied on the live media session",
-            _ => self.unavailable_reason(),
+        let Some(session) = session else {
+            return self.unavailable_reason();
+        };
+        match &session.state {
+            MediaSessionStateV1::Failed { reason } => media_failure_unavailable_label(*reason),
+            MediaSessionStateV1::Reconnecting { .. } => media_reconnecting_unavailable_label(),
+            MediaSessionStateV1::DeviceAbsent { track } => device_absent_unavailable_label(*track),
+            MediaSessionStateV1::PermissionDenied { track } => {
+                permission_denied_unavailable_label(*track)
+            }
+            MediaSessionStateV1::Negotiating | MediaSessionStateV1::Connected => {
+                self.unavailable_reason()
+            }
         }
     }
 }
@@ -958,46 +933,82 @@ pub(crate) fn live_audio_effect(
     }
 }
 
+/// Honest unavailable label for every [`MediaFailureReasonV1`]. Adding a
+/// variant is a compile failure here — never discard or silently omit one.
+#[must_use]
+const fn media_failure_unavailable_label(reason: MediaFailureReasonV1) -> &'static str {
+    match reason {
+        MediaFailureReasonV1::TransportUnavailable => {
+            "Unavailable: no media transport is bound on this seat"
+        }
+        MediaFailureReasonV1::InvalidSignaling => "Unavailable: media signaling failed",
+        MediaFailureReasonV1::PeerDropped => "Unavailable: the remote peer dropped",
+        MediaFailureReasonV1::NegotiationTimeout => "Unavailable: media negotiation timed out",
+        MediaFailureReasonV1::SfuUnreachable => "Unavailable: the group media host is unreachable",
+        MediaFailureReasonV1::DeviceUnplugged => "Unavailable: the media device was unplugged",
+        MediaFailureReasonV1::PermissionRevoked => "Unavailable: media permission was revoked",
+    }
+}
+
+#[must_use]
+const fn media_reconnecting_unavailable_label() -> &'static str {
+    "Unavailable: the media session is reconnecting"
+}
+
+#[must_use]
+const fn device_absent_unavailable_label(track: MediaTrackKind) -> &'static str {
+    match track {
+        MediaTrackKind::Audio => "Unavailable: no microphone is present on the live media session",
+        MediaTrackKind::Video => "Unavailable: no camera is present on the live media session",
+        MediaTrackKind::Screen => {
+            "Unavailable: no screen-capture source is present on the live media session"
+        }
+    }
+}
+
+#[must_use]
+const fn permission_denied_unavailable_label(track: MediaTrackKind) -> &'static str {
+    match track {
+        MediaTrackKind::Audio => {
+            "Unavailable: microphone permission denied on the live media session"
+        }
+        MediaTrackKind::Video => "Unavailable: camera permission denied on the live media session",
+        MediaTrackKind::Screen => {
+            "Unavailable: screen-capture permission denied on the live media session"
+        }
+    }
+}
+
 #[must_use]
 fn live_audio_unavailable_reason(
     session: Option<&MediaSessionV1>,
     kind: LiveAudioKind,
 ) -> &'static str {
-    match (session.map(|plane| &plane.state), kind) {
-        (
-            Some(MediaSessionStateV1::DeviceAbsent {
-                track: MediaTrackKind::Audio,
-            }),
-            _,
-        ) => "Unavailable: no microphone is bound on the live media session",
-        (
-            Some(MediaSessionStateV1::PermissionDenied {
-                track: MediaTrackKind::Audio,
-            }),
-            _,
-        ) => "Unavailable: microphone permission denied on the live media session",
-        (Some(MediaSessionStateV1::Failed { reason }), _) => match reason {
-            MediaFailureReasonV1::TransportUnavailable => {
-                "Unavailable: no media transport is bound on this seat"
+    match session.map(|plane| &plane.state) {
+        Some(MediaSessionStateV1::Failed { reason }) => media_failure_unavailable_label(*reason),
+        Some(MediaSessionStateV1::Reconnecting { .. }) => media_reconnecting_unavailable_label(),
+        Some(MediaSessionStateV1::DeviceAbsent {
+            track: MediaTrackKind::Audio,
+        }) => "Unavailable: no microphone is bound on the live media session",
+        Some(MediaSessionStateV1::PermissionDenied {
+            track: MediaTrackKind::Audio,
+        }) => "Unavailable: microphone permission denied on the live media session",
+        Some(MediaSessionStateV1::DeviceAbsent {
+            track: MediaTrackKind::Video | MediaTrackKind::Screen,
+        })
+        | Some(MediaSessionStateV1::PermissionDenied {
+            track: MediaTrackKind::Video | MediaTrackKind::Screen,
+        })
+        | Some(MediaSessionStateV1::Negotiating)
+        | Some(MediaSessionStateV1::Connected)
+        | None => match kind {
+            LiveAudioKind::Mute => {
+                "Unavailable: mute has no bound audio sender on this media session"
             }
-            MediaFailureReasonV1::InvalidSignaling => "Unavailable: media signaling failed",
-            MediaFailureReasonV1::PeerDropped => "Unavailable: the remote peer dropped",
-            MediaFailureReasonV1::NegotiationTimeout => "Unavailable: media negotiation timed out",
-            MediaFailureReasonV1::SfuUnreachable => {
-                "Unavailable: the group media host is unreachable"
+            LiveAudioKind::Dtmf => {
+                "Unavailable: DTMF has no bound audio sender on this media session"
             }
-            MediaFailureReasonV1::DeviceUnplugged => "Unavailable: the media device was unplugged",
-            MediaFailureReasonV1::PermissionRevoked => "Unavailable: media permission was revoked",
         },
-        (Some(MediaSessionStateV1::Reconnecting { .. }), _) => {
-            "Unavailable: the media session is reconnecting"
-        }
-        (_, LiveAudioKind::Mute) => {
-            "Unavailable: mute has no bound audio sender on this media session"
-        }
-        (_, LiveAudioKind::Dtmf) => {
-            "Unavailable: DTMF has no bound audio sender on this media session"
-        }
     }
 }
 
@@ -1031,44 +1042,30 @@ fn outgoing_track_unavailable_reason(
     session: Option<&MediaSessionV1>,
     track: MediaTrackKind,
 ) -> &'static str {
-    match (session.map(|plane| &plane.state), track) {
-        (Some(MediaSessionStateV1::DeviceAbsent { track: absent }), asked) if *absent == asked => {
-            match asked {
-                MediaTrackKind::Video => {
-                    "Unavailable: no camera is present on the live media session"
-                }
-                MediaTrackKind::Screen => {
-                    "Unavailable: no screen-capture source is present on the live media session"
-                }
-                MediaTrackKind::Audio => {
-                    "Unavailable: no microphone is present on the live media session"
-                }
+    match session.map(|plane| &plane.state) {
+        Some(MediaSessionStateV1::Failed { reason }) => media_failure_unavailable_label(*reason),
+        Some(MediaSessionStateV1::Reconnecting { .. }) => media_reconnecting_unavailable_label(),
+        Some(MediaSessionStateV1::DeviceAbsent { track: absent }) if *absent == track => {
+            device_absent_unavailable_label(track)
+        }
+        Some(MediaSessionStateV1::PermissionDenied { track: denied }) if *denied == track => {
+            permission_denied_unavailable_label(track)
+        }
+        Some(MediaSessionStateV1::DeviceAbsent { .. })
+        | Some(MediaSessionStateV1::PermissionDenied { .. })
+        | Some(MediaSessionStateV1::Negotiating)
+        | Some(MediaSessionStateV1::Connected)
+        | None => match track {
+            MediaTrackKind::Video => {
+                "Unavailable: no MediaSessionV1 projection has attached a camera track"
             }
-        }
-        (Some(MediaSessionStateV1::PermissionDenied { track: denied }), asked)
-            if *denied == asked =>
-        {
-            match asked {
-                MediaTrackKind::Video => {
-                    "Unavailable: camera permission denied on the live media session"
-                }
-                MediaTrackKind::Screen => {
-                    "Unavailable: screen-capture permission denied on the live media session"
-                }
-                MediaTrackKind::Audio => {
-                    "Unavailable: microphone permission denied on the live media session"
-                }
+            MediaTrackKind::Screen => {
+                "Unavailable: no MediaSessionV1 projection has attached a screen track"
             }
-        }
-        (_, MediaTrackKind::Video) => {
-            "Unavailable: no MediaSessionV1 projection has attached a camera track"
-        }
-        (_, MediaTrackKind::Screen) => {
-            "Unavailable: no MediaSessionV1 projection has attached a screen track"
-        }
-        (_, MediaTrackKind::Audio) => {
-            "Unavailable: no MediaSessionV1 projection has attached an audio track"
-        }
+            MediaTrackKind::Audio => {
+                "Unavailable: no MediaSessionV1 projection has attached an audio track"
+            }
+        },
     }
 }
 
@@ -1094,6 +1091,8 @@ fn outgoing_track_status(
 
 fn device_row_reason(session: Option<&MediaSessionV1>) -> &'static str {
     match session.map(|plane| &plane.state) {
+        Some(MediaSessionStateV1::Failed { reason }) => media_failure_unavailable_label(*reason),
+        Some(MediaSessionStateV1::Reconnecting { .. }) => media_reconnecting_unavailable_label(),
         Some(MediaSessionStateV1::DeviceAbsent { track }) => match track {
             MediaTrackKind::Audio => {
                 "Provider devices unavailable: the live media session has no microphone."
@@ -1116,7 +1115,9 @@ fn device_row_reason(session: Option<&MediaSessionV1>) -> &'static str {
                 "Provider devices unavailable: screen-capture permission denied on the live media session."
             }
         },
-        _ => {
+        Some(MediaSessionStateV1::Negotiating)
+        | Some(MediaSessionStateV1::Connected)
+        | None => {
             "Provider devices unavailable: no live media provider has published device \
              inventory to this Calls surface yet, so these selectors remain disabled."
         }
@@ -1238,14 +1239,16 @@ const fn participant_view(
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_display_text, call_start_enabled, call_start_hint, live_audio_effect,
-        outgoing_track_effect, CallDevice, LiveAudioEffect, LiveAudioKind, OutgoingTrackEffect,
+        bounded_display_text, call_start_enabled, call_start_hint, device_row_reason,
+        live_audio_effect, live_audio_unavailable_reason, media_failure_unavailable_label,
+        outgoing_track_effect, outgoing_track_unavailable_reason, CallDevice, LiveAudioEffect,
+        LiveAudioKind, OutgoingTrackEffect,
     };
     use crate::{CommandSink, CommunicationsSurface};
     use mde_collab_types::{
         ActorClock, ActorId, CallId, CallKind, CallMediaAdapter, CollabCommand, MediaDescriptionV1,
-        MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1, MediaTrackKind, SpaceDirectory,
-        SpaceId, SpaceKind, SpaceRole, SpaceSummary,
+        MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1,
+        MediaTrackKind, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
     };
 
     fn plane_session(
@@ -1509,5 +1512,86 @@ mod tests {
                 .map(|session| session.audio_bound),
             Some(true)
         );
+    }
+
+    #[test]
+    fn every_media_failure_reason_produces_a_non_empty_unavailable_label() {
+        // Exhaustive: a new MediaFailureReasonV1 variant is a compile failure.
+        const ALL: &[MediaFailureReasonV1] = &[
+            MediaFailureReasonV1::TransportUnavailable,
+            MediaFailureReasonV1::InvalidSignaling,
+            MediaFailureReasonV1::PeerDropped,
+            MediaFailureReasonV1::NegotiationTimeout,
+            MediaFailureReasonV1::SfuUnreachable,
+            MediaFailureReasonV1::DeviceUnplugged,
+            MediaFailureReasonV1::PermissionRevoked,
+        ];
+        let mut seen = Vec::new();
+        for reason in ALL {
+            match reason {
+                MediaFailureReasonV1::TransportUnavailable
+                | MediaFailureReasonV1::InvalidSignaling
+                | MediaFailureReasonV1::PeerDropped
+                | MediaFailureReasonV1::NegotiationTimeout
+                | MediaFailureReasonV1::SfuUnreachable
+                | MediaFailureReasonV1::DeviceUnplugged
+                | MediaFailureReasonV1::PermissionRevoked => {}
+            }
+            let label = media_failure_unavailable_label(*reason);
+            assert!(
+                !label.is_empty(),
+                "{reason:?} must produce a non-empty unavailable label"
+            );
+            assert!(
+                label.starts_with("Unavailable:"),
+                "{reason:?} must render as an honest unavailable string, got {label:?}"
+            );
+            assert!(
+                !seen.contains(&label),
+                "{reason:?} reused another failure's unavailable label: {label}"
+            );
+            seen.push(label);
+
+            let failed = plane_session(
+                CallId::new(),
+                MediaSessionStateV1::Failed { reason: *reason },
+                vec![MediaTrackKind::Audio],
+                false,
+                false,
+                false,
+                0,
+                false,
+            );
+            assert_eq!(
+                live_audio_unavailable_reason(Some(&failed), LiveAudioKind::Mute),
+                label
+            );
+            assert_eq!(
+                live_audio_unavailable_reason(Some(&failed), LiveAudioKind::Dtmf),
+                label
+            );
+            assert_eq!(
+                outgoing_track_unavailable_reason(Some(&failed), MediaTrackKind::Video),
+                label
+            );
+            assert_eq!(
+                outgoing_track_unavailable_reason(Some(&failed), MediaTrackKind::Screen),
+                label
+            );
+            assert_eq!(device_row_reason(Some(&failed)), label);
+            assert_eq!(
+                CallDevice::Microphone.unavailable_reason_on_plane(Some(&failed)),
+                label
+            );
+            assert_eq!(
+                CallDevice::Camera.unavailable_reason_on_plane(Some(&failed)),
+                label
+            );
+            assert_eq!(
+                CallDevice::Screen.unavailable_reason_on_plane(Some(&failed)),
+                label
+            );
+        }
+        assert_eq!(seen.len(), ALL.len());
     }
 }
