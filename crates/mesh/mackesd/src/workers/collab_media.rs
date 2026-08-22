@@ -56,6 +56,7 @@ struct SipGatewayProvider {
     active_call: Arc<Mutex<Option<mde_collab_types::CallId>>>,
     revoked_calls: Arc<Mutex<Vec<mde_collab_types::CallId>>>,
     pending_inbound: Arc<Mutex<Option<InboundCallOffer>>>,
+    publish_plane: super::call_media::SipGatewayPlane,
 }
 
 /// Provider-observed inbound dialog identity.  This is an untrusted offer, not
@@ -142,6 +143,7 @@ impl SipGatewayProvider {
             active_call,
             revoked_calls,
             pending_inbound,
+            publish_plane: super::call_media::SipGatewayPlane::production(),
         })
     }
 
@@ -156,6 +158,7 @@ impl SipGatewayProvider {
             active_call: Arc::new(Mutex::new(None)),
             revoked_calls: Arc::new(Mutex::new(Vec::new())),
             pending_inbound: Arc::new(Mutex::new(None)),
+            publish_plane: super::call_media::SipGatewayPlane::production(),
         }
     }
 
@@ -268,9 +271,13 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             // Provider loss must never trap the signed collaboration call in
             // an active state. Cleanup remains locally authoritative and the
             // dead adapter receives no command.
-            return if cleanup { Ok(()) } else { Err(error) };
+            if cleanup {
+                let _ = self.publish_plane.execute_command(command, adapter);
+                return Ok(());
+            }
+            return Err(error);
         }
-        let command = match command {
+        let agent_command = match command {
             CollabCommand::AnswerCall { call } => {
                 self.commands
                     .try_send(AgentCommand::Answer)
@@ -314,6 +321,7 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
                 if let Ok(mut active) = self.active_call.lock() {
                     *active = Some(*call);
                 }
+                let _ = self.publish_plane.execute_command(command, adapter);
                 return Ok(());
             }
             CollabCommand::SetCallMuted { muted, .. } => {
@@ -330,7 +338,7 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             }
             _ => return Ok(()),
         };
-        self.commands.try_send(command).map_err(|error| {
+        self.commands.try_send(agent_command).map_err(|error| {
             CallMediaProviderError::ProviderUnavailable {
                 detail: match error {
                     std::sync::mpsc::TrySendError::Full(_) => {
@@ -341,7 +349,11 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
                     }
                 },
             }
-        })
+        })?;
+        if cleanup {
+            let _ = self.publish_plane.execute_command(command, adapter);
+        }
+        Ok(())
     }
 
     fn prove_advancing_frames(
@@ -393,6 +405,15 @@ impl CallMediaFrameVerifier for SipGatewayProvider {
             *active = Some(call);
         }
         true
+    }
+
+    fn publish_p2p_media_sessions(
+        &self,
+        persist: &Persist,
+        last_published: &mut BTreeMap<String, String>,
+    ) {
+        self.publish_plane
+            .publish_p2p_media_sessions(persist, last_published);
     }
 }
 
@@ -822,9 +843,10 @@ impl CallMediaProviderRegistry {
         Self::default()
     }
 
-    /// Construct the production registry.  A configured SIP core is admitted
-    /// as the concrete audio provider; absent/failed activation leaves the
-    /// registry empty so no call state can be fabricated.
+    /// Construct the production registry. A configured SIP core is admitted
+    /// as the concrete audio provider. The P2P, SFU, and SIP publish planes
+    /// are always registered on a Workstation so live seats tick
+    /// `state/calls/media/<session>/sip` through the same registry path.
     #[must_use]
     pub(crate) fn production() -> Self {
         let mut registry = Self::empty();
@@ -845,6 +867,12 @@ impl CallMediaProviderRegistry {
         }
         registry.webrtc_p2p = Some(Box::new(super::call_media::WebrtcP2pPlane::production()));
         registry.livekit_sfu = Some(Box::new(super::call_media::LiveKitSfuPlane::production()));
+        // The SIP publish plane is the S4 `/sip` tick, matching P2P + SFU.
+        // A live agent adapter already occupies this slot when a governed
+        // account activated; otherwise the plane still publishes honesty.
+        if registry.sip_gateway.is_none() {
+            registry.sip_gateway = Some(Box::new(super::call_media::SipGatewayPlane::production()));
+        }
         registry
     }
 
@@ -998,6 +1026,9 @@ impl CallMediaProviderRegistry {
             plane.publish_p2p_media_sessions(persist, last_published);
         }
         if let Some(plane) = self.livekit_sfu.as_deref() {
+            plane.publish_p2p_media_sessions(persist, last_published);
+        }
+        if let Some(plane) = self.sip_gateway.as_deref() {
             plane.publish_p2p_media_sessions(persist, last_published);
         }
     }
@@ -1339,7 +1370,7 @@ impl Error for CallMediaVerificationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mde_collab_types::{ActorId, CallId, CallKind, SpaceId};
+    use mde_collab_types::{media_sip_leg_topic, ActorId, CallId, CallKind, SipLegV1, SpaceId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1520,6 +1551,62 @@ mod tests {
             Some(call)
         );
         assert!(!provider.bind_inbound_call(&current, Some(CallId::new())));
+    }
+
+    #[test]
+    fn registry_tick_publishes_retained_sip_leg_topic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let call = CallId::new();
+        let space = SpaceId::new();
+
+        let mut providers = empty_registry();
+        providers
+            .register(
+                CallMediaAdapter::SipGateway,
+                super::super::call_media::SipGatewayPlane::production(),
+            )
+            .expect("register SIP publish plane");
+
+        providers
+            .execute_command(
+                &CollabCommand::StartOutboundCall {
+                    space,
+                    call,
+                    target: "+15551234567".into(),
+                },
+                None,
+            )
+            .expect("outbound SIP is admitted by the publish plane");
+
+        let mut session = ready_audio_session();
+        session.call = call;
+        session.space = space;
+        write_readiness(
+            &persist,
+            &CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: vec![session],
+            },
+        );
+
+        let mut last_published = BTreeMap::new();
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+
+        let topic = media_sip_leg_topic(call);
+        let msg = persist
+            .read_latest(&topic)
+            .expect("read sip topic")
+            .expect("registry tick must publish the retained sip topic");
+        let leg = SipLegV1::from_json(msg.body.as_deref().expect("sip body"))
+            .expect("admit sip document");
+        assert_eq!(leg.session, call);
+        assert!(!leg.bridged, "registry tick must not invent a bridged PSTN");
+        assert_eq!(leg.topic(), topic);
+        assert!(
+            last_published.contains_key(&topic),
+            "sip topic must be retained in the worker publish cache"
+        );
     }
 
     fn empty_registry() -> CallMediaProviderRegistry {
