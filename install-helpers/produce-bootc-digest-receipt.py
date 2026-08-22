@@ -24,6 +24,8 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 ARCH_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
 ROLE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 EPOCH_RE = re.compile(r"[1-9][0-9]{0,11}")
+CANONICAL_ROLE = "all-roles"
+LEGACY_ROLES = frozenset({"base", "unified-seat-server"})
 LIST_MEDIA_TYPES = {
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.oci.image.index.v1+json",
@@ -87,7 +89,9 @@ def validate_identity(reference: str, architecture: str, role: str) -> None:
         raise Refusal("architecture is invalid")
     if not ROLE_RE.fullmatch(role):
         raise Refusal("release role is invalid")
-    if role != "all-roles":
+    if role in LEGACY_ROLES:
+        raise Refusal(f"bootc receipt refuses legacy {role} role identity")
+    if role != CANONICAL_ROLE:
         raise Refusal("bootc receipt must use the canonical all-roles release role")
 
 

@@ -157,7 +157,30 @@ def main() -> None:
         substituted_value = dict(document)
         substituted_value["cuttlefish_image_receipt"] = str(inputs / "missing-image.tar")
         substituted = publish("substituted-reference.json", substituted_value)
-        check(invoke(loader, substituted).returncode == 2, "deferred Cuttlefish input was accepted")
+        cuttlefish = invoke(loader, substituted)
+        check(cuttlefish.returncode == 2, "deferred Cuttlefish input was accepted")
+        check(
+            "stale Cuttlefish-bearing production object refuses" in cuttlefish.stderr,
+            f"Cuttlefish object used a generic refusal: {cuttlefish.stderr}",
+        )
+
+        raw_digest = dict(document)
+        raw_digest["bootc_base_digest"] = "sha256:" + "4" * 64
+        raw = publish("raw-digest.json", raw_digest)
+        raw_result = invoke(loader, raw)
+        check(raw_result.returncode == 2, "raw bootc digest field was accepted")
+        check("raw digest" in raw_result.stderr, f"raw digest used a generic refusal: {raw_result.stderr}")
+
+        for legacy in ("base", "unified-seat-server"):
+            legacy_value = dict(document)
+            legacy_value["bootc_release_role"] = legacy
+            legacy_path = publish(f"legacy-{legacy}.json", legacy_value)
+            legacy_result = invoke(loader, legacy_path)
+            check(legacy_result.returncode == 2, f"legacy {legacy} bootc role was accepted")
+            check(
+                f"legacy {legacy}" in legacy_result.stderr,
+                f"legacy {legacy} role used a generic refusal: {legacy_result.stderr}",
+            )
 
     print("release-input-argv self-test: PASS")
 

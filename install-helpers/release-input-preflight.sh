@@ -47,6 +47,12 @@ while (($#)); do
     --app-vm-base-image-reference) app_vm_base_reference=${2:-}; shift 2 ;;
     --app-vm-base-architecture) app_vm_base_architecture=${2:-}; shift 2 ;;
     --app-vm-catalog-receipt) app_vm_catalog_receipt=${2:-}; shift 2 ;;
+    --bootc-base-digest)
+      die 'bootc raw digest is not a release input; supply --bootc-base-digest-receipt'
+      ;;
+    --cuttlefish-*|--android-*)
+      die "stale Cuttlefish-bearing production argument is not a release input: $1"
+      ;;
     *) die "unknown or incomplete argument: $1" ;;
   esac
 done
@@ -64,6 +70,11 @@ for pair in \
   'App VM base architecture' "$app_vm_base_architecture"; do
   if [[ -z ${label+x} ]]; then label=$pair; else need "$label" "$pair"; unset label; fi
 done
+
+if [[ "$bootc_role" == base || "$bootc_role" == unified-seat-server ]]; then
+  die "bootc release role refuses legacy $bootc_role identity"
+fi
+[[ "$bootc_role" == all-roles ]] || die 'bootc release role must be the canonical all-roles identity'
 
 regular_file 'Maps approval' "$maps_approval"
 directory 'Maps tile source root' "$maps_source_root"

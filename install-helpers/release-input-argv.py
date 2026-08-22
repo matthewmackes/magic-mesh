@@ -17,6 +17,27 @@ PREFLIGHT = Path(__file__).resolve().with_name("release-input-preflight.sh")
 REVISION_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:-]{0,254}\Z")
 IMAGE_REFERENCE_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}\Z")
+CANONICAL_BOOTC_ROLE = "all-roles"
+LEGACY_BOOTC_ROLES = frozenset({"base", "unified-seat-server"})
+RAW_BOOTC_DIGEST_FIELD = "bootc_base_digest"
+STALE_CUTTLEFISH_FIELDS = frozenset(
+    {
+        "cuttlefish_declaration",
+        "cuttlefish_signature",
+        "cuttlefish_readiness_relay",
+        "cuttlefish_vdi_agent",
+        "cuttlefish_image_receipt",
+        "cuttlefish_image_source_kind",
+        "cuttlefish_image_original_source",
+        "cuttlefish_image_architecture",
+        "cuttlefish_provider_identity",
+        "cuttlefish_android_release_id",
+        "cuttlefish_image_compatibility_id",
+        "cuttlefish_image_media_type",
+        "cuttlefish_image_artifact_format",
+        "cuttlefish_guest_packages",
+    }
+)
 
 PATH_FIELDS = {
     "maps_approval",
@@ -150,6 +171,11 @@ def validate_path(value: object, label: str, directory: bool = False) -> str:
 
 
 def validate(document: dict[str, object]) -> dict[str, str | list[str]]:
+    if RAW_BOOTC_DIGEST_FIELD in document:
+        raise Refusal("bootc raw digest is not a release input; supply bootc_base_digest_receipt")
+    stale = sorted(set(document) & STALE_CUTTLEFISH_FIELDS)
+    if stale:
+        raise Refusal("stale Cuttlefish-bearing production object refuses: " + ",".join(stale))
     if set(document) != EXPECTED_FIELDS:
         missing = sorted(EXPECTED_FIELDS - set(document))
         extra = sorted(set(document) - EXPECTED_FIELDS)
@@ -178,6 +204,12 @@ def validate(document: dict[str, object]) -> dict[str, str | list[str]]:
     ):
         if not TOKEN_RE.fullmatch(str(values[field])):
             raise Refusal(f"{field} is malformed")
+
+    role = str(values["bootc_release_role"])
+    if role in LEGACY_BOOTC_ROLES:
+        raise Refusal(f"bootc_release_role refuses legacy {role} identity")
+    if role != CANONICAL_BOOTC_ROLE:
+        raise Refusal("bootc_release_role must be the canonical all-roles identity")
 
     for field in ("bootc_base_image_reference", "app_vm_base_image_reference"):
         reference = str(values[field])

@@ -40,6 +40,15 @@ def main() -> None:
         call(*base,*inspect)
         call(*base,*produce,ok=False)  # no replacement
         call(*base,*inspect[:-1],"foreign-role",ok=False)
+        for legacy in ("base", "unified-seat-server"):
+            refused = call(*base,*inspect[:-1],legacy,ok=False)
+            assert "legacy" in refused.stderr and legacy in refused.stderr
+            produce_legacy = list(produce)
+            produce_legacy[produce_legacy.index("--release-role") + 1] = legacy
+            produce_legacy[-1] = str(root / f"{legacy}.json")
+            produced = call(*base,*produce_legacy,ok=False)
+            assert "legacy" in produced.stderr and legacy in produced.stderr
+            assert not Path(produce_legacy[-1]).exists()
         call(*base,*inspect[:-3],"1700000001",*inspect[-2:],ok=False)
         changed = root / "changed.json"; value["architecture"]="arm64"; changed.write_text(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n")
         changed_inspect = list(inspect); changed_inspect[2] = str(changed)

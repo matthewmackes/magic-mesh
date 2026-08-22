@@ -308,6 +308,39 @@ if run_release "${bad[@]}" >/dev/null 2>&1; then
 fi
 [[ ! -e "$marker" ]] || { echo 'preflight self-test: bad bootc receipt mutated build state' >&2; exit 1; }
 
+for legacy in base unified-seat-server; do
+  bad=("${args[@]}")
+  for ((index = 0; index < ${#bad[@]}; index++)); do
+    if [[ ${bad[index]} == --bootc-release-role ]]; then
+      bad[index + 1]=$legacy
+      break
+    fi
+  done
+  if err=$(run_release "${bad[@]}" 2>&1); then
+    echo "preflight self-test: legacy $legacy bootc role reached build command" >&2; exit 1
+  fi
+  [[ "$err" == *"legacy $legacy"* ]] || {
+    echo "preflight self-test: legacy $legacy role used a generic refusal: $err" >&2; exit 1
+  }
+  [[ ! -e "$marker" ]] || { echo "preflight self-test: legacy $legacy bootc role mutated build state" >&2; exit 1; }
+done
+
+if err=$(run_release "${args[@]}" --bootc-base-digest "sha256:$(printf 'c%.0s' {1..64})" 2>&1); then
+  echo 'preflight self-test: raw bootc digest reached build command' >&2; exit 1
+fi
+[[ "$err" == *'raw digest'* ]] || {
+  echo "preflight self-test: raw bootc digest used a generic refusal: $err" >&2; exit 1
+}
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: raw bootc digest mutated build state' >&2; exit 1; }
+
+if err=$(run_release "${args[@]}" --cuttlefish-image-receipt "$fixture/bootc-receipt.json" 2>&1); then
+  echo 'preflight self-test: stale Cuttlefish argument reached build command' >&2; exit 1
+fi
+[[ "$err" == *'Cuttlefish-bearing'* ]] || {
+  echo "preflight self-test: stale Cuttlefish argument used a generic refusal: $err" >&2; exit 1
+}
+[[ ! -e "$marker" ]] || { echo 'preflight self-test: stale Cuttlefish argument mutated build state' >&2; exit 1; }
+
 bad=("${args[@]}")
 for ((index = 0; index < ${#bad[@]}; index++)); do
   if [[ ${bad[index]} == --app-vm-base-architecture ]]; then
