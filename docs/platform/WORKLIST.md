@@ -714,17 +714,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   exercise contracts but cannot satisfy a production gate.
 - Current state: Canonical dest `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
   on BigBoy `172.20.0.130` holds dest-root OSM-derived raster 167936 B sha256
-  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`. Candidate-bound
-  receipt `mcnf-maps-mbtiles-receipt` wrote sidecar `.mbtiles.receipt.json` via
-  `bind_receipt`/`verify_receipt` with `production_admitted: false`. Dest-install
-  sidecar, dest-inspect sidecar, and dest-root fixture 12288 B
-  `dd7cde7e116cb52f114fc1c886fec32618bdfcb8c82a16e3e45dae601c87046e` are
-  untouched. Not Dell/Seat 15/Surface. S5 `all-roles` bootc receipt bound to
-  `479ec2b8c` (`.170` slot 0) and copied to `/root/mcnf-private/` (not in Git).
+  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895` with
+  `mcnf-maps-mbtiles-receipt` (`production_admitted: false`). Dest-root fixture
+  12288 B `dd7cde7e…87046e` untouched. Not Dell/Seat 15/Surface. S5 `all-roles`
+  bootc receipt bound to `479ec2b8c` and copied under `/root/mcnf-private/`.
   Leftover is Maps `production_admitted`, live-seat dest (WL-TEST-002), and S7
   `REPLACE_*` preflight. App VM S3 and Kiron S6 remain admitted. Evidence:
-  dest `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`; bootc
-  `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`; S7
+  `WL-REL-006-2026-08-22-maps-dest-receipt-r1.md`,
+  `WL-REL-006-2026-08-22-bootc-all-roles-r1.md`,
   `WL-REL-006-2026-08-22-preflight-bootc-private-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
