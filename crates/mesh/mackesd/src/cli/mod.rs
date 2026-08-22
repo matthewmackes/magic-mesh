@@ -84,6 +84,48 @@ pub mod take_leadership;
 pub mod transfer;
 pub mod upgrade;
 pub mod validate;
-pub mod voip_rtt;
 pub mod vpn_import;
 pub mod wake_peer;
+
+/// WL-FUNC-033 — leftover retirement: `cli/voip_rtt.rs` stays on disk
+/// but is no longer a live `pub mod` path compiled by this CLI tree.
+#[cfg(test)]
+mod leftover_retirements {
+    /// Live `pub mod` names compiled by this CLI tree (source-parsed).
+    fn live_cli_module_names(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+            })
+            .collect()
+    }
+
+    /// Build the retired declaration without embedding the forbidden
+    /// contiguous token sequence in this file (so the raw-source scan
+    /// stays honest).
+    fn retired_pub_mod_needle() -> String {
+        format!("{} {}", "pub mod", "voip_rtt")
+    }
+
+    #[test]
+    fn voip_rtt_is_not_a_live_cli_path() {
+        let source = include_str!("mod.rs");
+        let live = live_cli_module_names(source);
+        let needle = retired_pub_mod_needle();
+        assert!(
+            !live.contains(&"voip_rtt"),
+            "retired voip-rtt leftover must not be a live cli path"
+        );
+        assert!(
+            !source.contains(needle.as_str()),
+            "reintroduced `{needle}` must fail even without a trailing semicolon"
+        );
+        assert!(
+            live.contains(&"vpn_import") && live.contains(&"validate"),
+            "parser still sees neighboring live cli mods"
+        );
+    }
+}
