@@ -272,17 +272,31 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             };
             let generation = authority.checkpoint().plan.generation;
             let pending_tokens = authority.checkpoint().pending_capsule_ids.len();
-            let mut facts = firstboot::gather_live(&target_id, generation, role);
-            facts.pending_enrollment_tokens = pending_tokens;
+            // Count invite/enrollment bearers from the workgroup ledger. The
+            // capsule retain check below is independent — do not overwrite
+            // the live ledger count with pending_capsule_ids.
+            let facts =
+                firstboot::gather_live_in(&target_id, generation, role, Some(root.as_path()));
             let checks = firstboot::assemble(&facts);
-            let readiness = firstboot::record_on_authority(&mut authority, checks)
+            let readiness = firstboot::record_on_authority(&mut authority, checks.clone())
                 .map_err(|error| anyhow::anyhow!("cannot record first-boot checks: {error:?}"))?;
             println!("{}", serde_json::to_string(&readiness)?);
             if !report_only {
-                let marker = firstboot::apply_markers(&marker_dir, readiness.ready)
-                    .map_err(|error| anyhow::anyhow!("cannot apply first-boot markers: {error}"))?;
+                // Credential env, never argv: a failed join can re-present
+                // the bearer so first-boot retains it (S6/S17).
+                let presented = std::env::var("MCNF_ENROLLMENT_TOKEN")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                let marker = stamp_lifecycle_firstboot_markers(
+                    &marker_dir,
+                    &root,
+                    &checks,
+                    presented.as_deref(),
+                )
+                .map_err(|error| anyhow::anyhow!("cannot apply first-boot markers: {error}"))?;
                 eprintln!(
-                    "first-boot marker: {marker:?}; pending enrollment tokens: {pending_tokens}"
+                    "first-boot marker: {marker:?}; pending enrollment tokens: {}",
+                    facts.pending_enrollment_tokens
                 );
             }
             let pending_after = authority.checkpoint().pending_capsule_ids.len();
@@ -915,4 +929,139 @@ fn parse_hex_32(value: &str) -> Option<[u8; 32]> {
         *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
     }
     Some(bytes)
+}
+
+/// Stamp first-boot markers from assembled baseline checks.
+///
+/// A blocking audit (including failed enrollment) never consults a caller
+/// `ready` bool. When a presented bearer is supplied, the token is retained
+/// and `pending-convergence` is queued even if a hostile caller planted
+/// healthy facts around the check vector.
+fn stamp_lifecycle_firstboot_markers(
+    marker_dir: &std::path::Path,
+    workgroup_root: &std::path::Path,
+    checks: &[mackes_mesh_types::lifecycle::LifecycleRequirementCheckV1],
+    presented: Option<&str>,
+) -> std::io::Result<mackesd_core::onboard::firstboot::FirstbootMarker> {
+    use mackesd_core::onboard::firstboot;
+    if firstboot::has_blocking_checks(checks) {
+        firstboot::queue_after_failed_enrollment(
+            marker_dir,
+            workgroup_root,
+            presented.unwrap_or(""),
+        )
+    } else {
+        firstboot::apply_markers_from_checks(marker_dir, checks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_lifecycle_firstboot_markers;
+    use mackesd_core::onboard::firstboot::{
+        self, FirstbootFacts, FirstbootMarker, FIRSTBOOT_CONVERGED, FIRSTBOOT_PENDING,
+    };
+    use mackesd_core::onboard::invite::{self, EnrollEndpoint};
+    use std::time::Duration;
+
+    fn healthy(target: &str) -> FirstbootFacts {
+        FirstbootFacts {
+            target_id: target.to_owned(),
+            generation: 1,
+            package_present: true,
+            package_identity: "magic-mesh-13.0.0-1.fc44.x86_64".to_owned(),
+            expected_units: vec!["mackesd.service".into(), "nebula.service".into()],
+            active_units: vec!["mackesd.service".into(), "nebula.service".into()],
+            configuration_present: true,
+            mesh_identity_present: true,
+            compute_usable: true,
+            ui_applicable: false,
+            ui_ready: false,
+            hardware_usable: true,
+            pending_enrollment_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn lifecycle_firstboot_cli_refuses_ready_over_unit_fail_and_retains_invite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workgroup = tmp.path().join("workgroup");
+        let markers = tmp.path().join("markers");
+        std::fs::create_dir_all(&workgroup).unwrap();
+
+        let issued = invite::issue(&workgroup, "home-mesh", Duration::from_secs(600)).unwrap();
+        assert_eq!(invite::count_pending(&workgroup), 1);
+        let _token = invite::redeem_once(
+            &workgroup,
+            &issued.code,
+            issued.invite.exp_ms - 1,
+            "home-mesh",
+            &EnrollEndpoint {
+                lighthouse: "10.0.0.5".into(),
+                port: 4242,
+                fp: None,
+            },
+        )
+        .expect("consume before the failed activation");
+        assert!(
+            !invite::is_recorded(&workgroup, &issued.code),
+            "redeem_once consumed the bearer before transport"
+        );
+
+        let facts =
+            firstboot::gather_live_in("seat-15", 1, mde_role::Role::Lighthouse, Some(&workgroup));
+        assert_eq!(
+            facts.pending_enrollment_tokens, 0,
+            "consumed invite must not be counted until first-boot retains it"
+        );
+
+        let mut blocked = healthy("seat-15");
+        blocked
+            .active_units
+            .retain(|unit| unit != "mackesd.service");
+        blocked.mesh_identity_present = false;
+        blocked.pending_enrollment_tokens = facts.pending_enrollment_tokens;
+        let checks = firstboot::assemble(&blocked);
+        assert!(
+            firstboot::has_blocking_checks(&checks),
+            "inactive mackesd.service is a critical activation failure"
+        );
+        assert_eq!(
+            firstboot::apply_markers(&markers, true).unwrap(),
+            FirstbootMarker::Converged,
+            "sanity: the raw marker helper still accepts a hostile ready=true"
+        );
+
+        assert_eq!(
+            stamp_lifecycle_firstboot_markers(&markers, &workgroup, &checks, Some(&issued.code))
+                .unwrap(),
+            FirstbootMarker::Pending,
+            "CLI first-boot must stamp from checks and retain the failed invite"
+        );
+        assert!(
+            invite::is_recorded(&workgroup, &issued.code),
+            "failed enrollment must re-record the consumed invite"
+        );
+        assert_eq!(invite::count_pending(&workgroup), 1);
+        assert!(!markers.join(FIRSTBOOT_CONVERGED).exists());
+        assert!(markers.join(FIRSTBOOT_PENDING).exists());
+        assert_eq!(
+            firstboot::gather_live_in("seat-15", 1, mde_role::Role::Lighthouse, Some(&workgroup))
+                .pending_enrollment_tokens,
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_firstboot_cli_stamps_converged_from_checks_not_a_ready_bool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = firstboot::assemble(&healthy("seat-15"));
+        assert!(!firstboot::has_blocking_checks(&checks));
+        assert_eq!(
+            stamp_lifecycle_firstboot_markers(tmp.path(), tmp.path(), &checks, None).unwrap(),
+            FirstbootMarker::Converged
+        );
+        assert!(tmp.path().join(FIRSTBOOT_CONVERGED).exists());
+        assert!(!tmp.path().join(FIRSTBOOT_PENDING).exists());
+    }
 }
