@@ -13,9 +13,13 @@
 //!     shapes the surface reads. The heavy per-space mirrors (Activity,
 //!     conversation, threads, files, clipboard, and document sessions) are folded
 //!     for the focused channel instead of every channel on first open; fleet-wide
-//!     rollups and the call bar still fold globally. It is a **pure renderer** over
-//!     the worker's read-model: the shell never depends on the mackesd collab
-//!     worker crate — the Bus JSON is the seam (the same discipline as `chat.rs`).
+//!     rollups and the call bar still fold globally. Published
+//!     [`MediaSessionV1`](mde_collab_types::MediaSessionV1) documents on
+//!     `state/calls/media/<session>` are folded at the same time and bound into
+//!     [`CommunicationsSurface::set_media_sessions`] — never synthesized from
+//!     signaling [`CallState`]. It is a **pure renderer** over the worker's
+//!     read-model: the shell never depends on the mackesd collab worker crate —
+//!     the Bus JSON is the seam (the same discipline as `chat.rs`).
 //!   * [`CommunicationsState`] owns the surface + the data source, refreshes the
 //!     fold on a poll cadence while in view, and drains the surface's emitted
 //!     commands onto `action/collab/<verb>` ([`topics::command_topic_for`]) so the
@@ -59,8 +63,8 @@ use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
     clipboard_clip_id, ActivityFeed, ActorId, AlertInbox, CallState, ChannelTasks,
     ClipboardClipBody, ClipboardLane, CollabCommand, ConversationTimeline, DocumentSessions,
-    EventId, FileReferences, MessagePins, SavedMessages, SpaceDirectory, SpaceId, ThreadId,
-    ThreadTimeline, TransferJobs, MAX_CLIPBOARD_TEXT_BYTES,
+    EventId, FileReferences, MediaSessionV1, MessagePins, SavedMessages, SpaceDirectory, SpaceId,
+    ThreadId, ThreadTimeline, TransferJobs, MAX_CLIPBOARD_TEXT_BYTES, MEDIA_STATE_PREFIX,
 };
 #[cfg(feature = "drm")]
 use mde_collab_types::{ClipboardMimeKind, ClipboardMimeOfferV2, ClipboardPayloadV2};
@@ -98,6 +102,9 @@ const VOIP_GATEWAY_TARGET: &str = "gateway";
 const VOICE_HUD_STATUS_SUFFIX: &str = "status";
 /// Bound the fleet board so a hostile retained prefix cannot stall paint.
 const MAX_VOICE_NODE_ROWS: usize = 512;
+/// Bound the media-session fold so a hostile `state/calls/media/*` prefix
+/// cannot stall paint. Sibling offer/answer/sfu/sip topics are skipped.
+const MAX_MEDIA_SESSIONS: usize = 64;
 /// Hard ceiling for one transfer inbox verb (matches the daemon parser).
 const MAX_TRANSFER_VERB_BYTES: usize = 1024 * 1024;
 
@@ -181,6 +188,51 @@ fn fold_voice_admin(persist: &Persist) -> ActivityAdminSnapshot {
         voice_cutover: read_latest_json(persist, VOICE_CUTOVER_TOPIC).and_then(parse_voice_cutover),
         gateway: None,
     }
+}
+
+/// Fold published [`MediaSessionV1`] documents from `state/calls/media/<session>`.
+///
+/// Sibling `/offer`, `/answer`, `/sfu`, and `/sip` topics are skipped. Decode
+/// goes through [`MediaSessionV1::from_json`], so a hostile Connected-without-
+/// frames body is refused. Signaling [`CallState`] is never turned into a
+/// session — only documents already published on the readiness topic bind.
+fn fold_media_sessions(persist: &Persist) -> Vec<MediaSessionV1> {
+    let Ok(topics) = persist.list_topics_with_prefix(MEDIA_STATE_PREFIX) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for topic in topics {
+        if !is_retained_media_session_topic(&topic) {
+            continue;
+        }
+        let Some(msg) = persist.read_latest(&topic).ok().flatten() else {
+            continue;
+        };
+        let Some(body) = msg.body.as_deref() else {
+            continue;
+        };
+        let Ok(session) = MediaSessionV1::from_json(body) else {
+            continue;
+        };
+        if session.topic() != topic {
+            continue;
+        }
+        sessions.push(session);
+        if sessions.len() >= MAX_MEDIA_SESSIONS {
+            break;
+        }
+    }
+    sessions.sort_by(|a, b| a.session.cmp(&b.session));
+    sessions
+}
+
+/// True only for the readiness topic `state/calls/media/<session>` — not the
+/// sibling offer/answer/sfu/sip documents under the same prefix.
+fn is_retained_media_session_topic(topic: &str) -> bool {
+    let Some(suffix) = topic.strip_prefix(MEDIA_STATE_PREFIX) else {
+        return false;
+    };
+    !suffix.is_empty() && !suffix.contains('/')
 }
 
 fn parse_voice_node(value: serde_json::Value) -> Option<VoiceNodeProjection> {
@@ -956,6 +1008,10 @@ pub(crate) struct LiveCollabData {
     /// The aggregated active-call state — every space's `state/collab/call-state`
     /// concatenated into the one persistent call bar's read model.
     call_state: CallState,
+    /// Published [`MediaSessionV1`] documents folded from
+    /// `state/calls/media/<session>`. Empty until a worker publishes one; never
+    /// synthesized from [`call_state`]. Bound into the surface each paint.
+    media_sessions: Vec<MediaSessionV1>,
     /// Per-space linked-file references (folded from
     /// `state/collab/file-references/<space>`).
     file_references: HashMap<SpaceId, FileReferences>,
@@ -998,6 +1054,7 @@ impl LiveCollabData {
             threads: HashMap::new(),
             thread_roots: HashMap::new(),
             call_state: CallState::default(),
+            media_sessions: Vec::new(),
             file_references: HashMap::new(),
             transfer_jobs: None,
             alert_inbox: None,
@@ -1046,6 +1103,7 @@ impl LiveCollabData {
             self.threads.clear();
             self.thread_roots.clear();
             self.call_state = CallState::default();
+            self.media_sessions.clear();
             self.file_references.clear();
             self.transfer_jobs = None;
             self.alert_inbox = None;
@@ -1177,6 +1235,7 @@ impl LiveCollabData {
         self.threads = threads;
         self.thread_roots = thread_roots;
         self.call_state = call_state;
+        self.media_sessions = fold_media_sessions(&persist);
         self.file_references = file_references;
         self.transfer_jobs = transfer_jobs;
         self.alert_inbox = alert_inbox;
@@ -1410,6 +1469,14 @@ impl CommunicationsState {
         let _ = self.clipboard.read_text();
         self.refresh_sync_pair_views_if_due();
         self.data.poll(ctx, self.surface.selected_space());
+        self.bind_media_sessions();
+    }
+
+    /// Bind the last folded [`MediaSessionV1`] documents into the surface.
+    /// Empty is the honest no-projection state; this never mints Connected.
+    fn bind_media_sessions(&mut self) {
+        self.surface
+            .set_media_sessions(self.data.media_sessions.clone());
     }
 
     /// Borrow the production text provider for the direct DRM runner. The
@@ -1469,6 +1536,7 @@ impl CommunicationsState {
         }
         self.surface
             .set_sync_pair_views(self.sync_pair_views.clone());
+        self.bind_media_sessions();
         self.surface.ui(ui, &self.data, &mut sink);
         let surface_clipboard_preference = self.surface.clipboard_publishing_enabled();
         if surface_clipboard_preference != self.clipboard_publishing_enabled() {
@@ -2115,9 +2183,11 @@ mod tests {
         sha256_hex, AlertActionKind, CallKind, ClipItemKind, DeliveryState, MessageBody, Severity,
     };
     use mde_collab_types::{
-        ActivityEntry, ActorClock, AlertAction, AlertPayload, AlertView, CallParticipantState,
-        CallParticipantView, CallView, ChannelTasks, ClipboardView, EventId, MessagePins,
-        MessageView, SavedMessageView, SavedMessages, SpaceKind, SpaceRole, SpaceSummary, TaskView,
+        media_offer_topic, media_session_topic, ActivityEntry, ActorClock, AlertAction,
+        AlertPayload, AlertView, CallId, CallMediaAdapter, CallParticipantState,
+        CallParticipantView, CallView, ChannelTasks, ClipboardView, EventId, MediaSessionStateV1,
+        MediaTrackKind, MessagePins, MessageView, SavedMessageView, SavedMessages, SpaceKind,
+        SpaceRole, SpaceSummary, TaskView,
     };
 
     fn persist_at(root: &Path) -> Persist {
@@ -2390,9 +2460,129 @@ mod tests {
         assert!(data.space_directory().spaces.is_empty());
         assert!(data.activity(None).is_none());
         assert!(data.call_state().active.is_empty());
+        assert!(data.media_sessions.is_empty());
         assert!(data.thread(SpaceId::new(), ThreadId::new()).is_none());
         assert!(data.transfer_jobs().is_none());
         assert!(data.alert_inbox().is_none());
+    }
+
+    fn device_absent_media_session(space: SpaceId) -> MediaSessionV1 {
+        MediaSessionV1::new(
+            CallId::new(),
+            space,
+            ActorId::new("eagle"),
+            ActorId::new("falcon"),
+            CallMediaAdapter::WebRtcP2p,
+            MediaSessionStateV1::DeviceAbsent {
+                track: MediaTrackKind::Audio,
+            },
+            vec![MediaTrackKind::Audio],
+            false,
+            false,
+            false,
+            0,
+            None,
+            None,
+        )
+        .expect("valid device-absent session")
+    }
+
+    #[test]
+    fn live_collab_data_binds_published_media_sessions_without_inventing_connected() {
+        // WL-FUNC-024 S5 leftover: the shell mount folds published
+        // MediaSessionV1 documents from state/calls/media/<session> and binds
+        // them into CommunicationsSurface. Signaling CallState must not become
+        // a Connected session, sibling offer/sip topics must not fold, and a
+        // hostile Connected-without-frames body is refused.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let ops = SpaceId::new();
+        let me = ActorId::new(crate::explorer::local_hostname());
+        let published = device_absent_media_session(ops);
+        let signaling_call = CallId::new();
+
+        write_state(
+            &persist,
+            &topics::state_topic(proj::SPACE_DIRECTORY),
+            &SpaceDirectory {
+                spaces: vec![space_summary(ops, "Team Ops")],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::CALL_STATE, ops),
+            &CallState {
+                active: vec![CallView {
+                    call: signaling_call,
+                    space: ops,
+                    kind: CallKind::Audio,
+                    started_unix_ms: 1_000,
+                    participants: vec![CallParticipantView {
+                        actor: me,
+                        state: CallParticipantState::Connected,
+                        muted: false,
+                    }],
+                }],
+            },
+        );
+        write_state(&persist, &published.topic(), &published);
+        persist
+            .write(
+                &media_offer_topic(published.session),
+                Priority::Default,
+                None,
+                Some(r#"{"not":"a-media-session"}"#),
+            )
+            .expect("write sibling offer");
+        let mut hostile = serde_json::to_value(&published).expect("session value");
+        let hostile_session = CallId::new();
+        hostile["session"] = serde_json::json!(hostile_session.to_string());
+        hostile["state"] = serde_json::json!({ "kind": "connected" });
+        hostile["frames_observed"] = serde_json::json!(0);
+        persist
+            .write(
+                &media_session_topic(hostile_session),
+                Priority::Default,
+                None,
+                Some(&hostile.to_string()),
+            )
+            .expect("write hostile connected-without-frames");
+
+        let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        data.refresh();
+        assert_eq!(data.call_state().active.len(), 1, "signaling call folded");
+        assert_eq!(
+            data.call_state().active[0].call,
+            signaling_call,
+            "signaling CallState stays a call-bar row"
+        );
+        assert_eq!(
+            data.media_sessions,
+            vec![published.clone()],
+            "only the published DeviceAbsent document folds"
+        );
+        assert!(
+            data.media_sessions
+                .iter()
+                .all(|session| !session.state.claims_live_media()),
+            "fold must not invent a Connected media session"
+        );
+
+        let mut state = CommunicationsState::new(Some(dir.path().to_path_buf()));
+        state.data.refresh();
+        state.bind_media_sessions();
+        assert_eq!(
+            state.surface.media_sessions(),
+            std::slice::from_ref(&published)
+        );
+        assert!(
+            state
+                .surface
+                .media_sessions()
+                .iter()
+                .all(|session| !session.state.claims_live_media()),
+            "surface bind must not invent Connected"
+        );
     }
 
     #[test]
