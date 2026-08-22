@@ -1412,6 +1412,19 @@ impl CommunicationsSurface {
             .and_then(|live| live.session.following())
     }
 
+    /// The live mesh [`CollabSession`] this seat attached, if any.
+    ///
+    /// Follow / Unfollow / Close already apply on this session when
+    /// [`follow_share_peer`], [`unfollow_share_peer`], and
+    /// [`close_document_share`] emit. The shell mount still drains those
+    /// intents with `session: None` because the session lived only here;
+    /// pass this borrow so Follow / Unfollow / Close hit the same CRDT,
+    /// never a second one.
+    #[must_use]
+    pub(crate) fn live_document_share_session(&mut self) -> Option<&mut CollabSession> {
+        self.documents.share.as_mut().map(|live| &mut live.session)
+    }
+
     /// Honest Documents-mode notice (share refuse, merge, save), if any.
     #[cfg(test)]
     #[must_use]
@@ -2391,6 +2404,73 @@ mod tests {
                 .is_some_and(|notice| notice.contains("not a member")),
             "non-member join refuse must be honest, got {:?}",
             stranger.document_notice()
+        );
+    }
+
+    #[test]
+    fn follow_unfollow_close_hit_the_live_attached_session() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+
+        // The shell mount drains DocumentShareCommand with session: None
+        // because CollabSession used to stay private. Follow / Unfollow /
+        // Close must still land on the attached session (the same CRDT
+        // share_document / join created), which the pub(crate) accessor
+        // now exposes for the mount to pass through.
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
+        let guest_data = share_fixture("falcon", space, document, &["eagle", "falcon"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+        assert!(
+            host.live_document_share_session().is_some(),
+            "Share must attach the live CollabSession, not a second CRDT"
+        );
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share(&guest_data, space, document));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+
+        assert!(guest.follow_share_peer("eagle"));
+        assert_eq!(
+            guest
+                .live_document_share_session()
+                .and_then(|session| session.following().map(str::to_owned))
+                .as_deref(),
+            Some("eagle"),
+            "Follow must apply on the attached session, not only the drain queue"
+        );
+
+        assert!(guest.unfollow_share_peer());
+        assert_eq!(
+            guest
+                .live_document_share_session()
+                .and_then(|session| session.following().map(str::to_owned)),
+            None,
+            "Unfollow must clear follow on the attached session"
+        );
+
+        assert!(host.close_document_share());
+        assert!(
+            host.live_document_share_session().is_none(),
+            "owner Close must drop the attached session"
+        );
+        guest.pump_document_share();
+        assert!(
+            guest.live_document_share_session().is_none(),
+            "owner Close must detach the follower's attached session"
         );
     }
 }
