@@ -33,6 +33,20 @@ pub const VOIP_GET_GATEWAY_TOPIC: &str = "action/voip/get-gateway";
 /// Bus topic the SIP-gateway clear verb is published on.
 pub const VOIP_CLEAR_GATEWAY_TOPIC: &str = "action/voip/clear-gateway";
 
+/// Master-account DID inventory published by `voice_provision`. Body is a
+/// JSON array of [`VoiceDid`]; the worker writes `[]` when unprovisioned.
+const VOICE_DIDS_STATE_TOPIC: &str = "state/voice-dids";
+/// Leader-held shared-outbound mirror. Body is [`VoiceSharedOutbound`] or `null`.
+const VOICE_SHARED_STATE_TOPIC: &str = "state/voice-shared";
+/// Fleet cutover status. Body is [`VoiceCutoverStatus`].
+const VOICE_CUTOVER_STATE_TOPIC: &str = "state/voice-cutover";
+/// Per-node fleet-board prefix. One [`VoiceNodeProjection`] per `state/voice/<node>`.
+const VOICE_STATE_PREFIX: &str = "state/voice/";
+/// Observational HUD snapshot suffix — never a fleet-board row.
+const VOICE_HUD_STATUS_SUFFIX: &str = "status";
+/// Bound the fleet board so a hostile retained prefix cannot stall refresh.
+const MAX_VOICE_NODE_ROWS: usize = 512;
+
 /// Canonical workgroup path the responder writes: `<workgroup_root>/voip/gateway.toml`.
 /// Activity hydrates from this file in place; it never rewrites it.
 #[must_use]
@@ -121,6 +135,27 @@ impl ActivityAdminSnapshot {
     ) -> &GatewayReadout {
         self.gateway
             .insert(hydrate_gateway_readout(workgroup_root, retained_get))
+    }
+
+    /// Fold the latest retained `state/voice-dids`, `state/voice-shared`,
+    /// `state/voice-cutover`, and `state/voice/<node>` bodies into this
+    /// snapshot. Call on every refresh.
+    ///
+    /// Missing topics, the worker's honest empty `[]` / `null` bodies, and
+    /// unparseable payloads stay empty. `state/voice/status` and the
+    /// fleet-wide topics never become invented node rows.
+    pub fn hydrate_voice(
+        &mut self,
+        retained_dids: Option<&str>,
+        retained_shared: Option<&str>,
+        retained_cutover: Option<&str>,
+        retained_nodes: &[(&str, &str)],
+    ) -> &Self {
+        self.voice_dids = parse_retained_voice_dids(retained_dids);
+        self.voice_shared = parse_retained_voice_shared(retained_shared);
+        self.voice_cutover = parse_retained_voice_cutover(retained_cutover);
+        self.voice_nodes = parse_retained_voice_nodes(retained_nodes);
+        self
     }
 }
 
@@ -1748,6 +1783,299 @@ fn failover_policy_json(policy: &VoiceFailoverPolicy) -> String {
             format!("{{\"Forward\":{{\"number\":{}}}}}", json_string(number))
         }
     }
+}
+
+fn parse_retained_voice_dids(body: Option<&str>) -> Vec<VoiceDid> {
+    let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
+        return Vec::new();
+    };
+    if body == "null" || body == "[]" {
+        return Vec::new();
+    }
+    let Some(items) = json_top_array_objects(body) else {
+        return Vec::new();
+    };
+    let mut dids = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(number) = json_flat_string(item, "number") else {
+            continue;
+        };
+        if number.trim().is_empty() {
+            continue;
+        }
+        let routed_to = match json_flat_value(item, "routed_to") {
+            Some("null") | None => None,
+            Some(raw) => json_unquote(raw).filter(|value| !value.is_empty()),
+        };
+        dids.push(VoiceDid { number, routed_to });
+    }
+    dids
+}
+
+fn parse_retained_voice_shared(body: Option<&str>) -> Option<VoiceSharedOutbound> {
+    let body = body?.trim();
+    if body.is_empty() || body == "null" || !body.starts_with('{') {
+        return None;
+    }
+    Some(VoiceSharedOutbound {
+        caller_id: json_flat_string(body, "caller_id").unwrap_or_default(),
+        outbound_trunk: json_flat_string(body, "outbound_trunk").unwrap_or_default(),
+    })
+}
+
+fn parse_retained_voice_cutover(body: Option<&str>) -> Option<VoiceCutoverStatus> {
+    let body = body?.trim();
+    if body.is_empty() || body == "null" || !body.starts_with('{') {
+        return None;
+    }
+    Some(VoiceCutoverStatus {
+        phase: parse_cutover_phase(json_flat_string(body, "phase")?.as_str())?,
+        total_nodes: json_flat_u64(body, "total_nodes")
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0),
+        reprovisioned: json_flat_u64(body, "reprovisioned")
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0),
+        pending_nodes: json_flat_string_array(body, "pending_nodes"),
+        shared_outbound_lifted: json_flat_bool(body, "shared_outbound_lifted")?,
+        updated_at_s: json_flat_u64(body, "updated_at_s")?,
+    })
+}
+
+fn parse_cutover_phase(wire: &str) -> Option<VoiceCutoverPhase> {
+    match wire {
+        "legacy" => Some(VoiceCutoverPhase::Legacy),
+        "lifted-shared-outbound" => Some(VoiceCutoverPhase::LiftedSharedOutbound),
+        "nodes-reprovisioning" => Some(VoiceCutoverPhase::NodesReprovisioning),
+        "cutover-complete" => Some(VoiceCutoverPhase::CutoverComplete),
+        _ => None,
+    }
+}
+
+fn parse_retained_voice_nodes(rows: &[(&str, &str)]) -> Vec<VoiceNodeProjection> {
+    let mut nodes = Vec::new();
+    for (topic, body) in rows {
+        if nodes.len() >= MAX_VOICE_NODE_ROWS {
+            break;
+        }
+        let Some(topic_id) = voice_node_topic_id(topic) else {
+            continue;
+        };
+        if let Some(node) = parse_voice_node_body(topic_id, body) {
+            nodes.push(node);
+        }
+    }
+    nodes.sort_by(|left, right| {
+        left.hostname
+            .cmp(&right.hostname)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    nodes
+}
+
+fn voice_node_topic_id(topic: &str) -> Option<&str> {
+    let topic = topic.trim();
+    if topic == VOICE_DIDS_STATE_TOPIC
+        || topic == VOICE_SHARED_STATE_TOPIC
+        || topic == VOICE_CUTOVER_STATE_TOPIC
+    {
+        return None;
+    }
+    if let Some(suffix) = topic.strip_prefix(VOICE_STATE_PREFIX) {
+        if suffix.is_empty() || suffix == VOICE_HUD_STATUS_SUFFIX || suffix.contains('/') {
+            return None;
+        }
+        return Some(suffix);
+    }
+    if topic.is_empty() || topic == VOICE_HUD_STATUS_SUFFIX || topic.contains('/') {
+        return None;
+    }
+    Some(topic)
+}
+
+fn parse_voice_node_body(topic_id: &str, body: &str) -> Option<VoiceNodeProjection> {
+    let body = body.trim();
+    if body.is_empty() || body == "null" || !body.starts_with('{') {
+        return None;
+    }
+    let node_id = json_flat_string(body, "node_id").unwrap_or_else(|| topic_id.to_owned());
+    if node_id.trim().is_empty() {
+        return None;
+    }
+    Some(VoiceNodeProjection {
+        node_id,
+        hostname: json_flat_string(body, "hostname").unwrap_or_default(),
+        username: json_flat_string(body, "username").unwrap_or_default(),
+        sip_uri: json_flat_string(body, "sip_uri").unwrap_or_default(),
+        reg_state: parse_voice_reg_state(body)?,
+        routed_dids: json_flat_string_array(body, "routed_dids"),
+        failover: parse_voice_failover(body),
+        updated_at_s: json_flat_u64(body, "updated_at_s")?,
+    })
+}
+
+fn parse_voice_reg_state(body: &str) -> Option<VoiceRegState> {
+    match json_flat_string(body, "state")?.as_str() {
+        "registered" => Some(VoiceRegState::Registered),
+        "unregistered" => Some(VoiceRegState::Unregistered),
+        "provisioning" => Some(VoiceRegState::Provisioning),
+        "error" => Some(VoiceRegState::Error {
+            reason: json_flat_string(body, "reason").unwrap_or_default(),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_voice_failover(body: &str) -> Option<VoiceFailoverPolicy> {
+    match json_flat_value(body, "failover")? {
+        "null" => None,
+        raw if raw.starts_with('"') => match json_unquote(raw)?.as_str() {
+            "Voicemail" => Some(VoiceFailoverPolicy::Voicemail),
+            "None" => Some(VoiceFailoverPolicy::None),
+            _ => None,
+        },
+        raw if raw.starts_with('{') => {
+            let number = json_flat_string(raw, "number")?;
+            Some(VoiceFailoverPolicy::Forward { number })
+        }
+        _ => None,
+    }
+}
+
+fn json_flat_string_array(body: &str, key: &str) -> Vec<String> {
+    json_flat_value(body, key)
+        .map(json_string_array_items)
+        .unwrap_or_default()
+}
+
+fn json_string_array_items(array: &str) -> Vec<String> {
+    let Some(inner) = array
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    let bytes = inner.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'"' {
+            break;
+        }
+        let rest = &inner[i..];
+        let mut end = 1;
+        let rest_bytes = rest.as_bytes();
+        while end < rest_bytes.len() {
+            match rest_bytes[end] {
+                b'\\' if end + 1 < rest_bytes.len() => end += 2,
+                b'"' => {
+                    if let Some(value) = json_unquote(&rest[..=end]) {
+                        out.push(value);
+                    }
+                    i += end + 1;
+                    break;
+                }
+                _ => end += 1,
+            }
+        }
+        if end >= rest_bytes.len() {
+            break;
+        }
+    }
+    out
+}
+
+fn json_top_array_objects(body: &str) -> Option<Vec<&str>> {
+    let inner = body.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    let bytes = inner.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'{' {
+            return None;
+        }
+        let end = json_balanced_end(inner, i, b'{', b'}')?;
+        out.push(&inner[i..=end]);
+        i = end + 1;
+    }
+    Some(out)
+}
+
+fn json_flat_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let after = body.find(&needle)? + needle.len();
+    let rest = body[after..].trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with('"') {
+        let mut end = 1;
+        let bytes = rest.as_bytes();
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\\' if end + 1 < bytes.len() => end += 2,
+                b'"' => return Some(&rest[..=end]),
+                _ => end += 1,
+            }
+        }
+        return None;
+    }
+    if rest.starts_with('{') {
+        let end = json_balanced_end(rest, 0, b'{', b'}')?;
+        return Some(&rest[..=end]);
+    }
+    if rest.starts_with('[') {
+        let end = json_balanced_end(rest, 0, b'[', b']')?;
+        return Some(&rest[..=end]);
+    }
+    let end = rest
+        .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+fn json_balanced_end(body: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = body.as_bytes();
+    if bytes.get(start) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (idx, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b if b == open => depth += 1,
+            b if b == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 const EMPTY_VOICE_NODES_NOTE: &str = "No state/voice nodes projected.";
@@ -3584,5 +3912,161 @@ mod tests {
             live_cmds[3],
             VoiceAdminCommand::SharedConfig { .. }
         ));
+    }
+
+    #[test]
+    fn hydrate_voice_folds_latest_retained_topics_and_stays_honest_when_empty() {
+        let mut snapshot = ActivityAdminSnapshot::default();
+        snapshot.hydrate_voice(Some("[]"), Some("null"), None, &[]);
+        assert!(snapshot.voice_nodes.is_empty(), "must not invent node rows");
+        assert!(snapshot.voice_dids.is_empty());
+        assert!(snapshot.voice_shared.is_none());
+        assert!(snapshot.voice_cutover.is_none());
+        assert_eq!(
+            voice_projection_empty_notes(
+                &snapshot.voice_nodes,
+                &snapshot.voice_dids,
+                snapshot.voice_shared.as_ref(),
+                snapshot.voice_cutover.as_ref(),
+            ),
+            [
+                "No state/voice nodes projected.",
+                "No master-account DIDs projected.",
+                "Shared-outbound is not lifted yet.",
+                "No cutover status projected.",
+            ]
+        );
+
+        let hud = r#"{"registered":true,"listening":true,"not":"a-fleet-row"}"#;
+        let worker_empty_cutover = concat!(
+            r#"{"phase":"legacy","total_nodes":0,"reprovisioned":0,"#,
+            r#""pending_nodes":[],"shared_outbound_lifted":false,"updated_at_s":1}"#,
+        );
+        snapshot.hydrate_voice(
+            Some("[]"),
+            Some("null"),
+            Some(worker_empty_cutover),
+            &[
+                ("state/voice/status", hud),
+                (
+                    "state/voice-dids",
+                    r#"[{"number":"15551234567","routed_to":"eagle"}]"#,
+                ),
+                (
+                    "state/voice/",
+                    r#"{"node_id":"ghost","state":"registered","updated_at_s":1}"#,
+                ),
+                ("state/voice/peer:missing", "null"),
+            ],
+        );
+        assert!(
+            snapshot.voice_nodes.is_empty(),
+            "HUD / fleet-wide / empty suffix / null body must not invent node rows"
+        );
+        assert!(snapshot.voice_dids.is_empty());
+        assert!(snapshot.voice_shared.is_none());
+        assert_eq!(
+            snapshot.voice_cutover.as_ref().map(|row| row.phase),
+            Some(VoiceCutoverPhase::Legacy)
+        );
+        assert_eq!(
+            snapshot.voice_cutover.as_ref().map(|row| row.total_nodes),
+            Some(0)
+        );
+
+        let node = concat!(
+            r#"{"node_id":"peer:eagle","hostname":"eagle","username":"eagle","#,
+            r#""sip_uri":"eagle@sip.vitelity.net","state":"unregistered","#,
+            r#""routed_dids":["15551234567"],"failover":"Voicemail","updated_at_s":1700000000}"#,
+        );
+        let otter = concat!(
+            r#"{"node_id":"peer:otter","hostname":"otter","username":"otter","#,
+            r#""sip_uri":"otter@sip.vitelity.net","state":"error","reason":"timeout","#,
+            r#""routed_dids":[],"failover":{"Forward":{"number":"15557654321"}},"#,
+            r#""updated_at_s":1700000001}"#,
+        );
+        snapshot.hydrate_voice(
+            Some(r#"[{"number":"15551234567","routed_to":"eagle"},{"number":"15557654321","routed_to":null}]"#),
+            Some(r#"{"caller_id":"15551234567","outbound_trunk":"main"}"#),
+            Some(concat!(
+                r#"{"phase":"nodes-reprovisioning","total_nodes":2,"reprovisioned":1,"#,
+                r#""pending_nodes":["otter"],"shared_outbound_lifted":true,"updated_at_s":1700000000}"#,
+            )),
+            &[
+                ("state/voice/status", hud),
+                ("state/voice/peer:otter", otter),
+                ("state/voice/peer:eagle", node),
+            ],
+        );
+        assert_eq!(
+            snapshot.voice_nodes.len(),
+            2,
+            "only published state/voice/<node> rows bind"
+        );
+        assert_eq!(snapshot.voice_nodes[0].node_id, "peer:eagle");
+        assert_eq!(snapshot.voice_nodes[0].sip_uri, "eagle@sip.vitelity.net");
+        assert_eq!(
+            snapshot.voice_nodes[0].routed_dids,
+            vec!["15551234567".to_owned()]
+        );
+        assert_eq!(
+            snapshot.voice_nodes[0].failover,
+            Some(VoiceFailoverPolicy::Voicemail)
+        );
+        assert_eq!(snapshot.voice_nodes[1].node_id, "peer:otter");
+        assert_eq!(
+            snapshot.voice_nodes[1].reg_state,
+            VoiceRegState::Error {
+                reason: "timeout".to_owned()
+            }
+        );
+        assert_eq!(
+            snapshot.voice_nodes[1].failover,
+            Some(VoiceFailoverPolicy::Forward {
+                number: "15557654321".to_owned()
+            })
+        );
+        assert_eq!(
+            snapshot.voice_dids,
+            vec![
+                inventory("15551234567", Some("eagle")),
+                inventory("15557654321", None),
+            ]
+        );
+        assert_eq!(
+            snapshot.voice_shared.as_ref(),
+            Some(&VoiceSharedOutbound {
+                caller_id: "15551234567".to_owned(),
+                outbound_trunk: "main".to_owned(),
+            })
+        );
+        assert_eq!(
+            snapshot.voice_cutover.as_ref().map(|row| row.phase),
+            Some(VoiceCutoverPhase::NodesReprovisioning)
+        );
+        assert_eq!(
+            snapshot
+                .voice_cutover
+                .as_ref()
+                .map(|row| row.pending_nodes.clone()),
+            Some(vec!["otter".to_owned()])
+        );
+        assert!(voice_projection_empty_notes(
+            &snapshot.voice_nodes,
+            &snapshot.voice_dids,
+            snapshot.voice_shared.as_ref(),
+            snapshot.voice_cutover.as_ref(),
+        )
+        .is_empty());
+
+        snapshot.hydrate_voice(None, None, None, &[]);
+        assert!(snapshot.voice_nodes.is_empty());
+        assert!(snapshot.voice_dids.is_empty());
+        assert!(snapshot.voice_shared.is_none());
+        assert!(snapshot.voice_cutover.is_none());
+        assert!(
+            snapshot.gateway.is_none(),
+            "voice refresh must not invent a gateway"
+        );
     }
 }
