@@ -4295,6 +4295,12 @@ fn sync_pair_editor_emits_save_and_refuses_malformed_interval() {
             bwlimit: Some("2m".into()),
         }]
     );
+    assert!(
+        surface
+            .sync_pair_notice_for_test()
+            .is_some_and(|n| n.contains("queued docs every 900s")),
+        "successful save must keep the CLI queued-next-tick notice"
+    );
 }
 
 #[test]

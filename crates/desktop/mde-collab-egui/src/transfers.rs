@@ -243,6 +243,15 @@ impl SyncPairSource for Vec<SyncPairView> {
     }
 }
 
+/// Tone for the Transfers sync-pair notice line. Refuse stays danger; queued
+/// producer status matches the CLI stdout (not a second store).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SyncPairNoticeKind {
+    #[default]
+    Refuse,
+    Queued,
+}
+
 /// Transfers-mode editor view state (create/edit drafts). Not a pair store.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TransfersUi {
@@ -254,6 +263,7 @@ pub(crate) struct TransfersUi {
     draft_interval: String,
     draft_bwlimit: String,
     notice: Option<String>,
+    notice_kind: SyncPairNoticeKind,
 }
 
 impl TransfersUi {
@@ -266,7 +276,7 @@ impl TransfersUi {
         self.draft_dest.clear();
         self.draft_interval = "1h".to_owned();
         self.draft_bwlimit.clear();
-        self.notice = None;
+        self.clear_notice();
     }
 
     fn begin_edit(&mut self, pair: &SyncPairView) {
@@ -277,13 +287,28 @@ impl TransfersUi {
         self.draft_dest = pair.dest.clone();
         self.draft_interval = format_interval_draft(pair.every_secs);
         self.draft_bwlimit = pair.bwlimit.clone().unwrap_or_default();
-        self.notice = None;
+        self.clear_notice();
     }
 
     fn close(&mut self) {
         self.editor_open = false;
         self.edit_id = None;
+        self.clear_notice();
+    }
+
+    fn clear_notice(&mut self) {
         self.notice = None;
+        self.notice_kind = SyncPairNoticeKind::Refuse;
+    }
+
+    fn set_refuse(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+        self.notice_kind = SyncPairNoticeKind::Refuse;
+    }
+
+    fn set_queued(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+        self.notice_kind = SyncPairNoticeKind::Queued;
     }
 }
 
@@ -354,6 +379,7 @@ impl CommunicationsSurface {
                 .small()
                 .color(theme_color(ui, Style::TEXT_DIM)),
         );
+        self.sync_pair_notice(ui);
 
         if self.transfers_ui.editor_open {
             self.sync_pair_editor(ui);
@@ -392,18 +418,28 @@ impl CommunicationsSurface {
                     .color(theme_color(ui, Style::TEXT_STRONG)),
             );
             ui.add_space(Style::SP_XS);
-            labeled_edit(ui, "Id", &mut self.transfers_ui.draft_id);
+            if self.transfers_ui.edit_id.is_some() {
+                // Replace-by-ID, matching `mackesd transfer sync-pair add --id`.
+                // A mutable id here would mint a second row and orphan the original.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Id")
+                            .small()
+                            .color(theme_color(ui, Style::TEXT_DIM)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&self.transfers_ui.draft_id)
+                            .strong()
+                            .color(theme_color(ui, Style::TEXT_STRONG)),
+                    );
+                });
+            } else {
+                labeled_edit(ui, "Id", &mut self.transfers_ui.draft_id);
+            }
             labeled_edit(ui, "Interval", &mut self.transfers_ui.draft_interval);
             labeled_edit(ui, "Source", &mut self.transfers_ui.draft_source);
             labeled_edit(ui, "Destination", &mut self.transfers_ui.draft_dest);
             labeled_edit(ui, "Bwlimit", &mut self.transfers_ui.draft_bwlimit);
-            if let Some(notice) = &self.transfers_ui.notice {
-                ui.label(
-                    egui::RichText::new(notice)
-                        .small()
-                        .color(theme_color(ui, Style::DANGER)),
-                );
-            }
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     self.save_sync_pair_draft();
@@ -413,6 +449,21 @@ impl CommunicationsSurface {
                 }
             });
         });
+    }
+
+    fn sync_pair_notice(&self, ui: &mut egui::Ui) {
+        let Some(notice) = &self.transfers_ui.notice else {
+            return;
+        };
+        let tone = match self.transfers_ui.notice_kind {
+            SyncPairNoticeKind::Refuse => Style::DANGER,
+            SyncPairNoticeKind::Queued => Style::TEXT_DIM,
+        };
+        ui.label(
+            egui::RichText::new(notice)
+                .small()
+                .color(theme_color(ui, tone)),
+        );
     }
 
     fn sync_pair_row(
@@ -514,32 +565,40 @@ impl CommunicationsSurface {
     }
 
     fn save_sync_pair_draft(&mut self) {
-        let id = self.transfers_ui.draft_id.trim();
         let source = self.transfers_ui.draft_source.trim();
         let dest = self.transfers_ui.draft_dest.trim();
-        let id = if id.is_empty() {
-            slug_pair_id(source, dest)
+        // Edit is replace-by-ID — the same as `mackesd transfer sync-pair add
+        // --id`. A changed draft id must not mint a second store row.
+        let id = if let Some(edit_id) = self.transfers_ui.edit_id.clone() {
+            edit_id
         } else {
-            id.to_owned()
+            let id = self.transfers_ui.draft_id.trim();
+            if id.is_empty() {
+                slug_pair_id(source, dest)
+            } else {
+                id.to_owned()
+            }
         };
         if !valid_pair_id(&id) {
-            self.transfers_ui.notice = Some("malformed pair id".to_owned());
+            self.transfers_ui
+                .set_refuse(format!("invalid sync pair id `{id}`"));
             return;
         }
         if source.is_empty() || dest.is_empty() {
-            self.transfers_ui.notice = Some("sync pair requires source and destination".to_owned());
+            self.transfers_ui
+                .set_refuse("sync pair requires non-empty source and destination");
             return;
         }
         if source.as_bytes().contains(&0) || dest.as_bytes().contains(&0) {
-            self.transfers_ui.notice =
-                Some("source and destination must not contain NUL bytes".to_owned());
+            self.transfers_ui
+                .set_refuse("sync pair source and destination must not contain NUL bytes");
             return;
         }
         let interval_raw = self.transfers_ui.draft_interval.trim();
         let Some(every_secs) = parse_interval_secs(interval_raw) else {
             // Same refusal text as `mackesd transfer sync-pair add` so the
             // editor cannot look queued while the CLI would have failed fast.
-            self.transfers_ui.notice = Some(format!(
+            self.transfers_ui.set_refuse(format!(
                 "malformed interval `{interval_raw}` (expected a positive duration such as 30s, 5m, 1h, or seconds)"
             ));
             return;
@@ -549,21 +608,16 @@ impl CommunicationsSurface {
             if raw.is_empty() {
                 None
             } else if !valid_sync_pair_bwlimit(raw) {
-                self.transfers_ui.notice = Some("malformed bwlimit".to_owned());
+                self.transfers_ui
+                    .set_refuse(format!("invalid sync pair bwlimit `{raw}`"));
                 return;
             } else {
                 Some(raw.to_owned())
             }
         };
-        // Edit of a pair the worker projection no longer has — refuse like
-        // `mackesd transfer sync-pair remove` on an unknown id. Create (no
-        // `edit_id`) still upserts; that matches CLI add.
-        if let Some(edit_id) = self.transfers_ui.edit_id.as_deref() {
-            if !self.sync_pair_views.iter().any(|pair| pair.id == edit_id) {
-                self.transfers_ui.notice = Some(format!("unknown pair id `{edit_id}`"));
-                return;
-            }
-        }
+        let queued = format!(
+            "transfer sync-pair add: queued {id} every {every_secs}s (the daemon saves it on its next tick)"
+        );
         self.sync_pair_sink.emit(SyncPairCommand::Save {
             id,
             source: source.to_owned(),
@@ -572,6 +626,7 @@ impl CommunicationsSurface {
             bwlimit,
         });
         self.transfers_ui.close();
+        self.transfers_ui.set_queued(queued);
     }
 
     /// Remove a mirrored pair by id. Unknown and malformed ids refuse — same
@@ -580,18 +635,25 @@ impl CommunicationsSurface {
     fn remove_sync_pair(&mut self, id: &str) {
         let id = id.trim();
         if !valid_pair_id(id) {
-            self.transfers_ui.notice = Some("malformed pair id".to_owned());
+            self.transfers_ui
+                .set_refuse(format!("invalid sync pair id `{id}`"));
             return;
         }
         if !self.sync_pair_views.iter().any(|pair| pair.id == id) {
-            self.transfers_ui.notice = Some(format!("unknown pair id `{id}`"));
+            self.transfers_ui.set_refuse(format!(
+                "no sync pair `{id}` in the store (see `mackesd transfer sync-pair list`)"
+            ));
             return;
         }
+        let queued = format!(
+            "transfer sync-pair remove: requested for {id} (the daemon applies it on its next tick)"
+        );
         self.sync_pair_sink
             .emit(SyncPairCommand::Remove { id: id.to_owned() });
         if self.transfers_ui.edit_id.as_deref() == Some(id) {
             self.transfers_ui.close();
         }
+        self.transfers_ui.set_queued(queued);
     }
 
     #[cfg(test)]
@@ -1012,29 +1074,37 @@ mod tests {
             "unknown pair id must not publish a Remove verb"
         );
         assert!(
-            surface
-                .sync_pair_notice_for_test()
-                .is_some_and(|n| n.contains("unknown pair id") && n.contains("ghost")),
-            "unknown pair id must refuse visibly, matching the CLI"
+            surface.sync_pair_notice_for_test().is_some_and(|n| {
+                n.contains("no sync pair `ghost`") && n.contains("sync-pair list")
+            }),
+            "unknown pair id must refuse with the CLI remove text"
         );
 
-        // Edit of a pair the worker projection dropped — refuse, do not upsert.
+        // Edit is replace-by-ID (CLI add --id). A vanished projection still
+        // publishes Save; the worker upserts. A renamed draft id must not
+        // orphan the original row.
         surface.begin_edit_sync_pair_for_test(&projected_pair("docs"));
         surface.set_sync_pair_views(vec![]);
-        surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "/dst", Some("2m"));
-        assert!(
-            surface.drain_sync_pair_commands().is_empty(),
-            "editing an unknown pair id must not publish a Save verb"
+        surface.save_sync_pair_draft_for_test("renamed", "15m", "/src", "/dst", Some("2m"));
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Save {
+                id: "docs".into(),
+                source: "/src".into(),
+                dest: "/dst".into(),
+                every_secs: 900,
+                bwlimit: Some("2m".into()),
+            }]
         );
         assert!(
-            surface.editor_open_for_test(),
-            "unknown pair id must keep the editor open"
+            !surface.editor_open_for_test(),
+            "successful replace-by-ID save must close the editor"
         );
         assert!(
             surface
                 .sync_pair_notice_for_test()
-                .is_some_and(|n| n.contains("unknown pair id") && n.contains("docs")),
-            "edit of a vanished pair must refuse visibly"
+                .is_some_and(|n| n.contains("queued docs every 900s") && n.contains("next tick")),
+            "save must keep the CLI queued-next-tick notice after close"
         );
     }
 
@@ -1051,8 +1121,8 @@ mod tests {
         assert!(
             surface
                 .sync_pair_notice_for_test()
-                .is_some_and(|n| n.contains("unknown pair id")),
-            "unknown pair id must refuse visibly"
+                .is_some_and(|n| n.contains("no sync pair `ghost`")),
+            "unknown pair id must refuse with the CLI remove text"
         );
 
         surface.remove_sync_pair_for_test("../etc");
@@ -1063,14 +1133,20 @@ mod tests {
         assert!(
             surface
                 .sync_pair_notice_for_test()
-                .is_some_and(|n| n.contains("malformed pair id")),
-            "malformed pair id must refuse visibly"
+                .is_some_and(|n| n.contains("invalid sync pair id") && n.contains("../etc")),
+            "malformed pair id must refuse with the CLI id text"
         );
 
         surface.remove_sync_pair_for_test("docs");
         assert_eq!(
             surface.drain_sync_pair_commands(),
             vec![SyncPairCommand::Remove { id: "docs".into() }]
+        );
+        assert!(
+            surface.sync_pair_notice_for_test().is_some_and(|n| {
+                n.contains("remove: requested for docs") && n.contains("next tick")
+            }),
+            "remove must keep the CLI queued-next-tick notice"
         );
     }
 }

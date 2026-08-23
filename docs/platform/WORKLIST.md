@@ -1341,8 +1341,10 @@ story execution contract above.
   Surface; seats run unpublished `magic-mesh-13.0.0-35`. Leftover is live
   mesh-tree and archive-queue evidence. Evidence:
   `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is live local/mesh and archive-queue evidence, not
-  a missing command.
+- Remaining work: leftover is live seat Files (local/mesh + archive-queue).
+  Farm fixture mesh-path + zip/tar.gz extract is
+  `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md` (`208/208`
+  `mde-files-egui`). Fixtures do not close the live leftover.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
@@ -1486,8 +1488,10 @@ story execution contract above.
   (no sudo on add). Store shows `last_result=done` and `next_run_ms`. Worker
   `ensure_operator_inbox` now creates that inbox on start. Evidence:
   `WL-FUNC-028-2026-08-23-live-sync-pair-next-run-r1.md`.
-- Remaining work: leftover is S2 GUI Transfers editor parity. CLI live pair
-  proof exists. Farm the new `operator_inbox_is_sticky_world_writable` unit.
+- Remaining work: leftover is live Construct Transfers on a seat. In-tree
+  editor now matches the CLI producer
+  (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`; farm
+  `181/181` `mde-collab-egui`). Inbox unit passed on `.196`.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the

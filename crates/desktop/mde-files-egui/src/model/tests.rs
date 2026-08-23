@@ -7,6 +7,7 @@ use mde_files::model::{PeerKind, PeerStatus};
 use mde_files::opqueue::Resolution;
 use mde_files::{ArchiveFormat, OpKind};
 use std::collections::HashMap as Map;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1796,6 +1797,101 @@ fn new_file_duplicate_and_symlink_execute_on_a_local_tree() {
     assert!(meta.file_type().is_symlink());
 }
 
+fn click_named(b: &mut FileBrowser, name: &str) {
+    let idx = b
+        .active_tab()
+        .rows()
+        .iter()
+        .position(|r| r.name == name)
+        .unwrap_or_else(|| panic!("listing is missing {name} after reload"));
+    b.click(0, idx);
+}
+
+/// S1 leftover: New File and Duplicate must execute on a mesh-mounted tree,
+/// not only a plain local tempdir. S3 leftover: after reload, `lstat` must
+/// still report the created hard link and symlink.
+#[test]
+fn new_file_duplicate_and_links_execute_on_a_mesh_mounted_tree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mount = temp.path().join("run/user/1000/mde-mesh/oak/docs");
+    std::fs::create_dir_all(&mount).expect("mesh mount");
+    std::fs::write(mount.join("notes.txt"), b"notes").expect("seed");
+
+    let mut b = FileBrowser::new(Box::new(LocalFsBackend::new()));
+    b.navigate(0, Location::Local(mount.to_string_lossy().into_owned()));
+    assert!(
+        b.active_tab().rows().iter().any(|r| r.name == "notes.txt"),
+        "mesh tree listed through LocalFsBackend"
+    );
+
+    b.open_new_file(0);
+    b.set_name_dialog_input("empty.txt".to_string());
+    b.submit_name_dialog(0);
+    assert!(
+        b.name_dialog().is_none(),
+        "New File created on the mesh tree"
+    );
+    assert_eq!(
+        std::fs::read(mount.join("empty.txt")).expect("new file"),
+        b""
+    );
+    assert!(
+        b.active_tab().rows().iter().any(|r| r.name == "empty.txt"),
+        "reload lists the new file"
+    );
+
+    click_named(&mut b, "notes.txt");
+    b.duplicate_selection(0);
+    pump_until_idle(&mut b);
+    assert_eq!(
+        std::fs::read(mount.join("notes (copy).txt")).expect("duplicate"),
+        b"notes"
+    );
+    assert!(
+        b.active_tab()
+            .rows()
+            .iter()
+            .any(|r| r.name == "notes (copy).txt"),
+        "reload lists the duplicate"
+    );
+
+    click_named(&mut b, "notes.txt");
+    b.open_hard_link(0);
+    b.set_name_dialog_input("notes.hard".to_string());
+    b.submit_name_dialog(0);
+    assert!(
+        b.name_dialog().is_none(),
+        "hard link created on the mesh tree"
+    );
+    let hard = mount.join("notes.hard");
+    let hard_meta = std::fs::symlink_metadata(&hard).expect("hard lstat after reload");
+    assert!(
+        !hard_meta.file_type().is_symlink(),
+        "hard link stays a regular inode"
+    );
+    assert!(hard_meta.nlink() >= 2, "hard link shares the source inode");
+    assert!(
+        b.active_tab().rows().iter().any(|r| r.name == "notes.hard"),
+        "reload lists the hard link"
+    );
+
+    click_named(&mut b, "notes.txt");
+    b.open_symlink(0);
+    b.set_name_dialog_input("notes.link".to_string());
+    b.submit_name_dialog(0);
+    assert!(
+        b.name_dialog().is_none(),
+        "symlink created on the mesh tree"
+    );
+    let link = mount.join("notes.link");
+    let link_meta = std::fs::symlink_metadata(&link).expect("symlink lstat after reload");
+    assert!(link_meta.file_type().is_symlink());
+    assert!(
+        b.active_tab().rows().iter().any(|r| r.name == "notes.link"),
+        "reload lists the symlink"
+    );
+}
+
 #[test]
 fn duplicate_of_an_existing_copy_name_raises_the_conflict_dialog() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1943,18 +2039,35 @@ fn zip_and_tar_gz_round_trip_through_the_queue() {
     let tgz = temp.path().join("payload.tar.gz");
     assert!(tgz.is_file(), "tar.gz archive written");
 
-    let out = temp.path().join("out");
-    std::fs::create_dir(&out).expect("out");
+    let out_zip = temp.path().join("out-zip");
+    std::fs::create_dir(&out_zip).expect("out-zip");
     let rows = vec![FileRow::local("payload.zip", Mime::Archive, "1 KB", "now")
         .with_path(zip.to_string_lossy())];
     let mut b = live_posix_browser(rows);
     b.click(0, 0);
     b.open_extract_to(0);
-    b.set_extract_to_dest(out.to_string_lossy().into_owned());
+    b.set_extract_to_dest(out_zip.to_string_lossy().into_owned());
     b.submit_extract_to();
     pump_until_idle(&mut b);
     assert_eq!(
-        std::fs::read(out.join("payload.txt")).expect("extracted zip"),
+        std::fs::read(out_zip.join("payload.txt")).expect("extracted zip"),
+        b"round-trip"
+    );
+
+    let out_tgz = temp.path().join("out-tgz");
+    std::fs::create_dir(&out_tgz).expect("out-tgz");
+    let rows = vec![
+        FileRow::local("payload.tar.gz", Mime::Archive, "1 KB", "now")
+            .with_path(tgz.to_string_lossy()),
+    ];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.open_extract_to(0);
+    b.set_extract_to_dest(out_tgz.to_string_lossy().into_owned());
+    b.submit_extract_to();
+    pump_until_idle(&mut b);
+    assert_eq!(
+        std::fs::read(out_tgz.join("payload.txt")).expect("extracted tar.gz"),
         b"round-trip"
     );
 }
