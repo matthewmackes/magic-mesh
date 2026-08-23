@@ -43,8 +43,24 @@ def default_helper() -> Path:
     return DEFAULT_HELPER
 
 
-def admit_warning_helper(path: Path | None = None) -> Path:
-    helper = dest_resolved(path if path is not None else default_helper())
+def resolve_warning_helper(
+    path: Path | None = None,
+    *,
+    for_production_mutation: bool = False,
+) -> Path:
+    if for_production_mutation:
+        return dest_resolved(DEFAULT_HELPER)
+    if path is not None:
+        return dest_resolved(path)
+    return dest_resolved(default_helper())
+
+
+def admit_warning_helper(
+    path: Path | None = None,
+    *,
+    for_production_mutation: bool = False,
+) -> Path:
+    helper = resolve_warning_helper(path, for_production_mutation=for_production_mutation)
     try:
         meta = helper.lstat()
     except OSError:
@@ -68,8 +84,12 @@ def admit_warning_helper(path: Path | None = None) -> Path:
     return helper
 
 
-def require_seat_mutation_warning(path: Path | None = None) -> None:
-    helper = admit_warning_helper(path)
+def require_seat_mutation_warning(
+    path: Path | None = None,
+    *,
+    for_production_mutation: bool = False,
+) -> None:
+    helper = admit_warning_helper(path, for_production_mutation=for_production_mutation)
     try:
         completed = subprocess.run([str(helper)], check=False, capture_output=True, text=True)
     except OSError as error:

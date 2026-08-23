@@ -112,7 +112,7 @@ def admit_not_production_dest(path: Path, label: str) -> None:
         except candidate.Refusal as error:
             refuse(f"{label} is a production dest; {error}")
         try:
-            warning.require_seat_mutation_warning()
+            warning.require_seat_mutation_warning(for_production_mutation=True)
         except warning.Refusal as error:
             refuse(str(error))
 

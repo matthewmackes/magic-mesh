@@ -96,7 +96,7 @@ def admit_not_lifecycle_mutation(command: list[str]) -> None:
             except candidate.Refusal as error:
                 refuse(f"lifecycle mutation argv refuses; {error}")
             try:
-                warning.require_seat_mutation_warning()
+                warning.require_seat_mutation_warning(for_production_mutation=True)
             except warning.Refusal as error:
                 refuse(str(error))
 

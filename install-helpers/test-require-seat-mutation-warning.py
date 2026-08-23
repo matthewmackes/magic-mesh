@@ -7,6 +7,7 @@ seat-update-warning.sh is admitted, not executed.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import stat
 import subprocess
@@ -78,6 +79,21 @@ def main() -> None:
         )
         failed = command("--helper", str(fail), refused=True)
         assert "mutation was not started" in failed.stderr
+
+        loaded = importlib.util.spec_from_file_location("require_warning", HELPER)
+        module = importlib.util.module_from_spec(loaded)
+        assert loaded.loader is not None
+        loaded.loader.exec_module(module)
+        os.environ[module.HELPER_ENV] = str(ok)
+        try:
+            override = module.resolve_warning_helper()
+            pinned = module.resolve_warning_helper(for_production_mutation=True)
+        finally:
+            os.environ.pop(module.HELPER_ENV, None)
+        assert override == ok.resolve()
+        assert pinned == LIVE.resolve()
+        admitted = module.admit_warning_helper(for_production_mutation=True)
+        assert admitted == LIVE.resolve()
 
     print("require seat mutation warning hostile suite passed")
 
