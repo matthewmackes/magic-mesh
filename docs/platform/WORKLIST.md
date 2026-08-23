@@ -407,8 +407,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   signed 13.0.0 dest is bound (`unpublished-signed-candidate.json`,
   `production_admitted: false`; `WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`).
   Child-only runner sources dests; mutation argv refuse; dest-env strip remains.
-  `mint-enroll-bearer.py` wraps `enroll-token`. Seat 15 enrolled. Freeze bar
-  still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:
+  `mint-enroll-bearer.py` wraps `enroll-token`. Dell, Seat 15, and Surface now
+  run `magic-mesh-13.0.0-35` (`WL-TEST-002-2026-08-22-unpublished-seat-install-r1.md`).
+  Freeze bar still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:
   `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`, dest-env strip r1.
 - Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer
   through live lifecycle authority (helper exists; this unit did not invoke Seat 15
@@ -1118,11 +1119,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   Seat 15, and Surface, prove the three-lighthouse topology, then verify the
   same bytes after WL-REL-005 publication. Eagle and T480 remain non-gating
   inspection/deployment-wave seats.
-- Current state: pre-release harnesses pass; qualification waits for the signed
-  six-role candidate. Topology is Dell, Seat 15, Surface, three lighthouses.
-  Operator 2026-08-22: those seats may be mutated (red alert + 5s) when the
-  unpublished candidate exists; use sealed Vitelity/SIP creds. A failure
-  reopens its owning provider/infrastructure story; no feature waiver.
+- Current state: unpublished workstation RPM `13.0.0-35` is installed on Dell,
+  Seat 15, and Surface after red alert + 5s
+  (`WL-TEST-002-2026-08-22-unpublished-seat-install-r1.md`). `mackesd` is
+  13.0.0 / `7e3474eeb` and inactive. Leftover is live enroll plus six-role
+  qualification. Sealed Vitelity/SIP still required for S3. No feature waiver.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
