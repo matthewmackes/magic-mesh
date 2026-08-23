@@ -414,7 +414,9 @@ def main() -> None:
                 f"open({str(leak)!r},'w').write("
                 "os.environ.get('MACKESD_BOOTSTRAP_SSH_KEY','')"
                 "+os.environ.get('MACKESD_BOOTSTRAP_KNOWN_HOSTS','')"
-                "+os.environ.get('JOIN_TOKEN',''))\n"
+                "+os.environ.get('JOIN_TOKEN','')"
+                "+os.environ.get('MCNF_UNPUBLISHED_SIGNED_CANDIDATE','')"
+                "+os.environ.get('MCNF_SEAT_MUTATION_WARNING',''))\n"
                 f"sys.stdout.write({(join_token(FIXTURE_BEARER) + chr(10))!r})\n"
             ),
         )
@@ -432,6 +434,8 @@ def main() -> None:
                 "MACKESD_BOOTSTRAP_SSH_KEY": "/tmp/must-not-leak",
                 "MACKESD_BOOTSTRAP_KNOWN_HOSTS": "/tmp/must-not-leak-hosts",
                 "JOIN_TOKEN": "must-not-leak-token",
+                "MCNF_UNPUBLISHED_SIGNED_CANDIDATE": "/tmp/must-not-leak-candidate",
+                "MCNF_SEAT_MUTATION_WARNING": "/tmp/must-not-leak-warning",
             },
         )
         assert seen.read_text(encoding="ascii") == str(wg.resolve())
@@ -445,6 +449,8 @@ def main() -> None:
         os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
         os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
         os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+        os.environ["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = "/tmp/must-not-leak-candidate"
+        os.environ["MCNF_SEAT_MUTATION_WARNING"] = "/tmp/must-not-leak-warning"
         seen_git: list[dict[str, str] | None] = []
         original = module.subprocess.run
 
@@ -461,6 +467,8 @@ def main() -> None:
             os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
             os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
             os.environ.pop("JOIN_TOKEN", None)
+            os.environ.pop("MCNF_UNPUBLISHED_SIGNED_CANDIDATE", None)
+            os.environ.pop("MCNF_SEAT_MUTATION_WARNING", None)
         assert seen_git and all(env is not None for env in seen_git)
         for env in seen_git:
             assert env is not None

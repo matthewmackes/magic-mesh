@@ -102,12 +102,20 @@ def admit_not_lifecycle_mutation(command: list[str]) -> None:
                 refuse(str(error))
 
 
+def helper_process_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (*ENV_KEYS, "JOIN_TOKEN", candidate.DEST_ENV, warning.HELPER_ENV):
+        env.pop(name, None)
+    return env
+
+
 def helper_worktree_root() -> Path:
     result = subprocess.run(
         ["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
         check=False,
         capture_output=True,
         text=True,
+        env=helper_process_env(),
     )
     root = result.stdout.strip()
     if result.returncode == 0 and root:
@@ -375,7 +383,8 @@ def write_run_sidecar(
 
 def child_environment(dest_key: Path, dest_known_hosts: Path) -> dict[str, str]:
     child_env = os.environ.copy()
-    child_env.pop("JOIN_TOKEN", None)
+    for name in ("JOIN_TOKEN", candidate.DEST_ENV, warning.HELPER_ENV):
+        child_env.pop(name, None)
     child_env[ENV_KEYS[0]] = str(dest_key)
     child_env[ENV_KEYS[1]] = str(dest_known_hosts)
     return child_env

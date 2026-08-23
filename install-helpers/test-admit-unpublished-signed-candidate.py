@@ -203,6 +203,8 @@ def main() -> None:
             os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
             os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
             os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+            os.environ["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = "/tmp/must-not-leak-candidate"
+            os.environ["MCNF_SEAT_MUTATION_WARNING"] = "/tmp/must-not-leak-warning"
             try:
                 stripped = module.child_process_env()
                 seen: list[dict[str, str] | None] = []
@@ -226,6 +228,8 @@ def main() -> None:
                 os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
                 os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
                 os.environ.pop("JOIN_TOKEN", None)
+                os.environ.pop("MCNF_UNPUBLISHED_SIGNED_CANDIDATE", None)
+                os.environ.pop("MCNF_SEAT_MUTATION_WARNING", None)
             for name in module.DEST_CHILD_ENV_STRIP:
                 assert name not in stripped
             assert seen and all(env is not None for env in seen)

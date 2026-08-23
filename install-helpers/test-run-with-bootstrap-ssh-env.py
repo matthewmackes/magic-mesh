@@ -106,7 +106,9 @@ def child_check_script(key: Path, hosts: Path, marker: Path | None = None) -> st
             "k=os.environ.get('MACKESD_BOOTSTRAP_SSH_KEY')",
             "h=os.environ.get('MACKESD_BOOTSTRAP_KNOWN_HOSTS')",
             "t=os.environ.get('JOIN_TOKEN')",
-            f"sys.exit(0 if k=={str(key)!r} and h=={str(hosts)!r} and not t else 1)",
+            "c=os.environ.get('MCNF_UNPUBLISHED_SIGNED_CANDIDATE')",
+            "w=os.environ.get('MCNF_SEAT_MUTATION_WARNING')",
+            f"sys.exit(0 if k=={str(key)!r} and h=={str(hosts)!r} and not t and not c and not w else 1)",
         ]
     )
     return "; ".join(lines)
@@ -295,7 +297,11 @@ def main() -> None:
             *base,
             "--",
             *child_ok,
-            extra_env={"JOIN_TOKEN": "must-not-leak-token"},
+            extra_env={
+                "JOIN_TOKEN": "must-not-leak-token",
+                "MCNF_UNPUBLISHED_SIGNED_CANDIDATE": "/tmp/must-not-leak-candidate",
+                "MCNF_SEAT_MUTATION_WARNING": "/tmp/must-not-leak-warning",
+            },
         )
         assert result.returncode == 0
         assert result.stdout == ""
@@ -303,6 +309,41 @@ def main() -> None:
             assert name not in os.environ
 
         helper = load_helper()
+        os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+        os.environ["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = "/tmp/must-not-leak-candidate"
+        os.environ["MCNF_SEAT_MUTATION_WARNING"] = "/tmp/must-not-leak-warning"
+        os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
+        os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
+        seen_git: list[dict[str, str] | None] = []
+        original = helper.subprocess.run
+
+        def capture(*args: object, **kwargs: object) -> object:
+            env = kwargs.get("env")
+            seen_git.append(env if isinstance(env, dict) else None)
+            return original(*args, **kwargs)
+
+        helper.subprocess.run = capture
+        try:
+            helper.helper_worktree_root()
+        finally:
+            helper.subprocess.run = original
+            os.environ.pop("JOIN_TOKEN", None)
+            os.environ.pop("MCNF_UNPUBLISHED_SIGNED_CANDIDATE", None)
+            os.environ.pop("MCNF_SEAT_MUTATION_WARNING", None)
+            os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
+            os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
+        assert seen_git and all(env is not None for env in seen_git)
+        for env in seen_git:
+            assert env is not None
+            for name in (
+                "JOIN_TOKEN",
+                "MCNF_UNPUBLISHED_SIGNED_CANDIDATE",
+                "MCNF_SEAT_MUTATION_WARNING",
+                "MACKESD_BOOTSTRAP_SSH_KEY",
+                "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+            ):
+                assert name not in env
+
         marker = root / "child-imported"
         imported_code = helper.run_with_env(
             env_file,

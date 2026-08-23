@@ -77,13 +77,16 @@ def main() -> None:
         write_helper(
             recorder,
             "#!/bin/sh\nWAIT_SECONDS=5\n# AI-GENERATED-ALERT\n"
-            f"printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\" >{leak}\n"
+            f"printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN"
+            f"$MCNF_UNPUBLISHED_SIGNED_CANDIDATE$MCNF_SEAT_MUTATION_WARNING\" >{leak}\n"
             "exit 0\n",
         )
         env = os.environ.copy()
         env["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
         env["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
         env["JOIN_TOKEN"] = "must-not-leak-token"
+        env["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = "/tmp/must-not-leak-candidate"
+        env["MCNF_SEAT_MUTATION_WARNING"] = "/tmp/must-not-leak-warning"
         recorded = subprocess.run(
             [sys.executable, str(HELPER), "--helper", str(recorder)],
             check=False,

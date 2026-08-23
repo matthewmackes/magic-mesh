@@ -223,6 +223,8 @@ def main() -> None:
         os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
         os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
         os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+        os.environ["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = "/tmp/must-not-leak-candidate"
+        os.environ["MCNF_SEAT_MUTATION_WARNING"] = "/tmp/must-not-leak-warning"
         seen: list[dict[str, str] | None] = []
         original = module.subprocess.run
 
@@ -242,6 +244,8 @@ def main() -> None:
             os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
             os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
             os.environ.pop("JOIN_TOKEN", None)
+            os.environ.pop("MCNF_UNPUBLISHED_SIGNED_CANDIDATE", None)
+            os.environ.pop("MCNF_SEAT_MUTATION_WARNING", None)
         assert seen and all(env is not None for env in seen)
         for env in seen:
             assert env is not None
@@ -249,6 +253,8 @@ def main() -> None:
                 "MACKESD_BOOTSTRAP_SSH_KEY",
                 "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
                 "JOIN_TOKEN",
+                "MCNF_UNPUBLISHED_SIGNED_CANDIDATE",
+                "MCNF_SEAT_MUTATION_WARNING",
             ):
                 assert name not in env
 
