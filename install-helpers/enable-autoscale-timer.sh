@@ -25,6 +25,12 @@ SYSTEMD_DIR="${MCNF_SYSTEMD_DIR:-/etc/systemd/system}"
 SVC="$SYSTEMD_DIR/mcnf-farm-autoscale-reconcile.service"
 
 [ -d "$REPO" ] || { echo "MCNF_REPO=$REPO does not exist — set MCNF_REPO to the deployed slot" >&2; exit 1; }
+case "$REPO" in
+  */.claude/worktrees/*|*/.claude/worktrees)
+    echo "MCNF_REPO=$REPO is a worktree — refusing (deleted worktrees fail systemd with 200/CHDIR)" >&2
+    exit 1
+    ;;
+esac
 
 cat > "$SVC" <<UNITEOF
 # FARM-AUTOSCALE — elastic-farm reconcile, LIVE on the control VM (operator-armed).
@@ -48,7 +54,7 @@ Environment=FA_APPLY=1
 Environment=TF_VAR_golden_template_name=MDE-VM-golden
 EnvironmentFile=$ENV_OUT
 WorkingDirectory=$REPO
-ExecStart=/bin/bash -lc 'source infra/tofu/env.sh 2>/dev/null; exec install-helpers/farm-reconciler.sh --once'
+ExecStart=/bin/bash $REPO/install-helpers/farm-reconciler.sh --once
 TimeoutStartSec=3600
 Nice=10
 UNITEOF

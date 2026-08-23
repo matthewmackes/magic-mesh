@@ -13,6 +13,9 @@ Environment=HOME=/root
 # Per-mesh config from the rendered env file (no .192/XO literals).
 EnvironmentFile=-/etc/mcnf/reconciler.env
 WorkingDirectory=/opt/mcnf
-ExecStart=/bin/bash -lc 'exec automation/reconciler/farm-reconcile.sh'
+# /bin/bash (not EXEC the shebang, not bash -l): some control-host trees are
+# not systemd-executable, and a login shell is not required. Never a
+# .claude/worktrees path — those get deleted and this unit then dies 200/CHDIR.
+ExecStart=/bin/bash /opt/mcnf/automation/reconciler/farm-reconcile.sh
 TimeoutStartSec=3600
 Nice=10

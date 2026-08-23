@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # farm-dispatch.sh — the shared, SLOT-AWARE "run a job on the fleet" core.
 #
-# Given a command it reserves ONE BUILD SLOT (not a whole node), rsyncs the
-# working tree into that slot's own remote workspace, runs the command THERE,
+# Given a command it reserves ONE BUILD SLOT (not a whole node), syncs the
+# working tree (tar-over-ssh; systemd cannot rsync -e ssh) into that slot's
+# own remote workspace, runs the command THERE,
 # and records a JSON result. Used by every build-farm automation capability.
 #
 # CAPACITY MODEL — why slots, not nodes
@@ -443,24 +444,43 @@ EOF
   local remote_dir="$DIR_BASE-d$slot"
   local started log_file exit_code ended
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; log_file="$LOGS/$jobid.log"
+  : >"$log_file"
   log "job $jobid → $node slot$slot ($shape, ~$remote_dir) : $command"
 
-  # Sync into THIS slot's workspace. target*/ stay on the VM (warm rebuilds);
-  # /.git is excluded — 1.1G of history per slot that no cargo gate needs, and
-  # the same exclusion xcp-build.sh uses so a stale clone cannot reset the tree
-  # mid-build. Build identity still stamps honestly (mde-theme's build.rs
-  # degrades to a non-promotable marker without Git); promotable RPM cuts use
-  # xcp-build.sh's immutable git-archive path, not this dispatcher.
-  timeout "$SYNC_TIMEOUT" rsync -az --delete -e "${SSH[*]}" \
-    --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
-    --exclude '/.git' --exclude '/automation/.state' \
-    "$REPO/" "mm@$node:$remote_dir/" >>"$log_file" 2>&1
+  # systemd oneshots cannot `rsync -e ssh`: rsync's helper exec of ssh is
+  # Permission denied (13) / IPC 14, while a direct `"${SSH[@]}"` works. Sync
+  # over tar|ssh, wipe dest except warm target*/, and treat any miss as
+  # EX_TEMPFAIL so farm-reconcile retries instead of recording a fresh HEAD fail
+  # that parks the farm idle until the next commit.
+  if [ "${#SSH[@]}" -lt 1 ]; then
+    log "job $jobid: SSH command array is empty — retry later"
+    flock -u "$lockfd"; exec {lockfd}>&-
+    flock -u "$cfd"; exec {cfd}>&-
+    flock -u "$jobfd"; exec {jobfd}>&-
+    return 75
+  fi
+  if ! timeout "$SYNC_TIMEOUT" "${SSH[@]}" -n "mm@$node" \
+      "mkdir -p \"\$HOME/$remote_dir\" && find \"\$HOME/$remote_dir\" -mindepth 1 -maxdepth 1 ! -name target ! -name target-f43 ! -name target-f44 -exec rm -rf -- {} +" \
+      >>"$log_file" 2>&1 \
+    || ! tar -C "$REPO" \
+      --exclude='./target' --exclude='./target-f43' --exclude='./target-f44' \
+      --exclude='./.git' --exclude='./automation/.state' \
+      -cf - . \
+      | timeout "$SYNC_TIMEOUT" "${SSH[@]}" "mm@$node" "tar -C \"\$HOME/$remote_dir\" -xf -" \
+      >>"$log_file" 2>&1
+  then
+    log "job $jobid: sync to $node:$remote_dir failed — retry later (no result recorded)"
+    flock -u "$lockfd"; exec {lockfd}>&-
+    flock -u "$cfd"; exec {cfd}>&-
+    flock -u "$jobfd"; exec {jobfd}>&-
+    return 75
+  fi
   # Cap the build itself. A node that dies mid-job leaves an ssh that never
   # returns, and the slot stays reserved while nothing progresses — orphans of
   # 16h and 24h were found holding nodes this way on 2026-08-21. `timeout`
   # reports 124, which records as a normal fail and frees the slot.
   timeout "$JOB_TIMEOUT" "${SSH[@]}" "mm@$node" \
-    ". \"\$HOME/.cargo/env\"; . \"\$HOME/.sccache.env\" 2>/dev/null || true; cd $remote_dir && $command" \
+    ". \"\$HOME/.cargo/env\"; . \"\$HOME/.sccache.env\" 2>/dev/null || true; cd \"\$HOME/$remote_dir\" && $command" \
     >>"$log_file" 2>&1
   exit_code=$?
   [ "$exit_code" -eq 124 ] && log "job $jobid exceeded ${JOB_TIMEOUT}s on $node slot$slot — timed out, slot released"

@@ -698,6 +698,21 @@ xe vm-start   uuid=$V
    Reboot clears the symptom; it does **not** clear the cause. Follow it by
    reclaiming disk, or the node wedges again.
 
+8. **Did the fill timer die before dispatch?** `systemctl status
+   mcnf-farm-reconcile.service` and the autoscale twin. `status=200/CHDIR` means
+   `WorkingDirectory` points at a path that no longer exists — almost always a
+   leftover `.claude/worktrees/*` checkout. Units must use the live control-host
+   tree (`/root/magic-mesh` on `rocky9-kvm2`) or the dedicated `/opt/mcnf` slot,
+   never a worktree. `automation/reconciler/reconciler-up.sh` refuses worktree
+   slots. A missing `/opt/mcnf` is not a reason to invent one; pass
+   `--repo /root/magic-mesh`.
+9. **Did dispatch record a same-second fail at HEAD?** A systemd oneshot cannot
+   `rsync -e ssh` (`Failed to exec ssh: Permission denied` / IPC 14). Direct
+   `ssh` from the same unit works; `farm-dispatch.sh` syncs with tar-over-ssh
+   and must treat a sync miss as `EX_TEMPFAIL` (75) with **no** result JSON. A
+   `fail` JSON at the current clean HEAD makes the next timer skip the job and
+   the farm stays idle until the next commit.
+
 **Never edit a farm script in place while it is executing.** Bash reads scripts
 incrementally, so rewriting one under a running dispatcher makes it resume at a
 stale offset and die on a syntax error in code that did not exist when it
@@ -765,6 +780,8 @@ Another AI/operator can rebuild the whole thing from this repo:
 | a node reports `TOOLCH bare` although cargo and g++ are installed | a **false negative** from that same wedged SSH: the probe could not run, which is indistinguishable from a missing toolchain unless the probe is bounded | probes are `timeout`-wrapped (`MCNF_DISPATCH_PROBE_TIMEOUT`); confirm by hand before reinstalling anything (§4A.7) |
 | a running farm script dies on a syntax error in code you just wrote | bash reads scripts incrementally, so an in-place rewrite resumes at a stale offset | edit to a temp file and `mv` over it (atomic rename) (§4A.7) |
 | `pkill -f "cargo test"` kills your own SSH session | `-f` matches full command lines, including the wrapper carrying that very pattern | `pkill -x cargo` (§4A.7) |
+| `mcnf-farm-reconcile.service` exits `200/CHDIR` every interval | `WorkingDirectory` is a deleted `.claude/worktrees/*` path | retarget the unit at `/root/magic-mesh` or `/opt/mcnf`; do not reinstall from a worktree (§4A.7) |
+| dispatch result JSON is `fail` with `started == ended` and the log ends `cd: magic-mesh-farm-dN: No such file` | systemd blocked `rsync` from execing `ssh`; the old dispatcher recorded that as a fresh HEAD fail | current dispatcher uses tar-over-ssh and returns 75 with no result; delete the poisoned JSON if it is still at HEAD (§4A.7) |
 | `cannot find -fuse-ld=mold` / link fails on the dev host | gcc 11.5 (EL9) rejects mold | `RUSTFLAGS="…gold"` (§1) |
 | `-lopus` not found on EL9 | `opus-devel` is in **CRB**, not default repos | `dnf --enablerepo=crb install opus-devel` |
 | vendored Opus cmake configure fails | CMake 4 dropped policy < 3.5 | `CMAKE_POLICY_VERSION_MINIMUM=3.5` (`.cargo/config.toml`) |

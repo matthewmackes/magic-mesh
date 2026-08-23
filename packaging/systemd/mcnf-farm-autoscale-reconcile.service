@@ -25,6 +25,7 @@ Environment=HOME=/root
 # Per-mesh config (MCNF_REPO, MCNF_ETCD, MCNF_XCP_HOST, golden) — rendered file.
 EnvironmentFile=-/etc/mcnf/reconciler.env
 WorkingDirectory=/opt/mcnf
-ExecStart=/bin/bash -lc 'exec install-helpers/farm-reconciler.sh --once'
+# /bin/bash (not EXEC the shebang, not bash -l). Never a .claude/worktrees path.
+ExecStart=/bin/bash /opt/mcnf/install-helpers/farm-reconciler.sh --once
 TimeoutStartSec=3600
 Nice=10

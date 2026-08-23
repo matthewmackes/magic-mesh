@@ -16,8 +16,9 @@
 # The units point at the DEDICATED release slot ${MCNF_REPO:-/opt/mcnf} — NEVER the
 # resettable .52 build dir (the CI gremlin) and NEVER a .claude/worktrees path.
 #
-# Usage:  reconciler-up.sh [--repo <dir>] [--xcp-host <ip>] [--dry-run]
-#   --dry-run  print what would be written + installed; mutate NOTHING.
+# Usage:  reconciler-up.sh [--repo <dir>] [--xcp-host <ip>] [--dry-run] [--self-test]
+#   --dry-run    print what would be written + installed; mutate NOTHING.
+#   --self-test  unit-shape + worktree-refusal checks (no systemd, no etcd).
 #
 # Env: MCNF_REPO (default /opt/mcnf), MCNF_XCP_HOST, MCNF_ETCD (or the endpoints
 #      file), RECONCILER_ENV_OUT (default /etc/mcnf/reconciler.env).
@@ -28,14 +29,16 @@ REPO="${MCNF_REPO:-/opt/mcnf}"
 ENV_OUT="${RECONCILER_ENV_OUT:-/etc/mcnf/reconciler.env}"
 XCP_HOST="${MCNF_XCP_HOST:-}"
 DRY=0
+SELF_TEST=0
 SYSTEMD_DIR="${MCNF_SYSTEMD_DIR:-/etc/systemd/system}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo)     REPO="$2"; shift 2 ;;
-    --xcp-host) XCP_HOST="$2"; shift 2 ;;
-    --dry-run)  DRY=1; shift ;;
-    -h|--help)  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --repo)      REPO="$2"; shift 2 ;;
+    --xcp-host)  XCP_HOST="$2"; shift 2 ;;
+    --dry-run)   DRY=1; shift ;;
+    --self-test) SELF_TEST=1; shift ;;
+    -h|--help)   sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "reconciler-up: unknown arg '$1'" >&2; exit 2 ;;
   esac
 done
@@ -46,6 +49,19 @@ done
 SRC_REPO="$(cd "$HERE/../.." && pwd)"
 PKG="$SRC_REPO/packaging/systemd"
 say() { echo "==> reconciler-up: $*"; }
+
+# A unit WorkingDirectory that is a .claude/worktrees path dies 200/CHDIR the
+# moment that worktree is removed (observed 2026-08-23: calm-ray-dcr8). Refuse
+# at install time so the timer cannot be pointed at a disposable tree.
+assert_repo_slot() {
+  case "$1" in
+    */.claude/worktrees/*|*/.claude/worktrees)
+      echo "reconciler-up: refusing worktree slot $1 (deleted worktrees fail systemd with 200/CHDIR)" >&2
+      return 2
+      ;;
+  esac
+  return 0
+}
 
 # The two reconcile units, regenerated to point at the deployed slot via an
 # EnvironmentFile (so render-env.sh owns every per-mesh value). The autoscale unit
@@ -68,7 +84,7 @@ Type=oneshot
 Environment=HOME=/root
 EnvironmentFile=$ENV_OUT
 WorkingDirectory=$REPO
-ExecStart=/bin/bash -lc 'exec install-helpers/farm-reconciler.sh --once'
+ExecStart=/bin/bash $REPO/install-helpers/farm-reconciler.sh --once
 TimeoutStartSec=3600
 Nice=10
 EOF
@@ -89,7 +105,7 @@ Type=oneshot
 Environment=HOME=/root
 EnvironmentFile=$ENV_OUT
 WorkingDirectory=$REPO
-ExecStart=/bin/bash -lc 'exec automation/reconciler/farm-reconcile.sh'
+ExecStart=/bin/bash $REPO/automation/reconciler/farm-reconcile.sh
 TimeoutStartSec=3600
 Nice=10
 EOF
@@ -105,6 +121,50 @@ install_file() { # <dest> <generator-fn|src-path>
   fi
   if declare -f "$src" >/dev/null 2>&1; then "$src" >"$dest"; else cp "$src" "$dest"; fi
 }
+
+self_test() {
+  local fails=0 unit
+  echo "reconciler-up --self-test:"
+  chk() { if [ "$2" = "$3" ]; then echo "  ok: $1"; else echo "  FAIL: $1 — got '$2' want '$3'" >&2; fails=$((fails+1)); fi; }
+  if assert_repo_slot "/root/magic-mesh"; then chk "live control-host tree accepted" yes yes; else chk "live control-host tree accepted" no yes; fi
+  if assert_repo_slot "/root/magic-mesh/.claude/worktrees/calm-ray-dcr8"; then
+    chk "worktree slot refused" accepted refused
+  else
+    chk "worktree slot refused" refused refused
+  fi
+  REPO=/opt/mcnf
+  unit="$(build_unit)"
+  case "$unit" in *"bash -l"*) chk "build unit has no login shell" has-lc no-lc ;; *) chk "build unit has no login shell" no-lc no-lc ;; esac
+  case "$unit" in
+    *"/bin/bash /opt/mcnf/automation/reconciler/farm-reconcile.sh"*) chk "build unit execs via bash" yes yes ;;
+    *) chk "build unit execs via bash" no yes ;;
+  esac
+  case "$unit" in *".claude/worktrees"*) chk "build unit has no worktree path" has none ;; *) chk "build unit has no worktree path" none none ;; esac
+  unit="$(autoscale_unit)"
+  case "$unit" in *"bash -l"*) chk "autoscale unit has no login shell" has-lc no-lc ;; *) chk "autoscale unit has no login shell" no-lc no-lc ;; esac
+  case "$unit" in
+    *"/bin/bash /opt/mcnf/install-helpers/farm-reconciler.sh --once"*) chk "autoscale unit execs via bash" yes yes ;;
+    *) chk "autoscale unit execs via bash" no yes ;;
+  esac
+  case "$unit" in *"infra/tofu/env.sh"*) chk "autoscale unit does not source missing env.sh" has none ;; *) chk "autoscale unit does not source missing env.sh" none none ;; esac
+  if [ "$fails" -eq 0 ]; then echo "reconciler-up: self-test passed"; return 0; fi
+  echo "reconciler-up: SELF-TEST FAILED ($fails)" >&2; return 1
+}
+
+if [ "$SELF_TEST" -eq 1 ]; then
+  self_test
+  exit $?
+fi
+
+assert_repo_slot "$REPO" || exit 2
+if [ "$DRY" -eq 0 ] && [ ! -d "$REPO" ]; then
+  echo "reconciler-up: repo slot $REPO does not exist — pass --repo <checkout>" >&2
+  exit 2
+fi
+if [ "$DRY" -eq 0 ] && [ ! -f "$REPO/automation/reconciler/farm-reconcile.sh" ]; then
+  echo "reconciler-up: $REPO is not a magic-mesh checkout (missing automation/reconciler/farm-reconcile.sh)" >&2
+  exit 2
+fi
 
 # 1) Render the env file (idempotent).
 say "render $ENV_OUT (etcd quorum, repo slot, XAPI gate host, golden template)"
