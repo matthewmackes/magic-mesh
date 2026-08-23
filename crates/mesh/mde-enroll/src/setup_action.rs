@@ -51,6 +51,13 @@ pub fn found_argv(mesh_id: &str, external_addr: &str, role: SetupRole) -> Vec<St
 /// Command-template placeholder refused when no minted bearer is present.
 /// The wizard must not shell `mackesd join '{{JOIN_TOKEN}}'`.
 const JOIN_TOKEN_TEMPLATE: &str = "{{JOIN_TOKEN}}";
+/// Dest identity and join-token env must not leak into streamed mackesd verbs.
+/// Login leftover (2): only the dest-env runner sources those vars.
+const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+];
 
 /// Refuse a command-template or empty bearer so join cannot be shelled
 /// without minted enrollment material. A successful value is the trimmed
@@ -146,6 +153,12 @@ pub fn wizard_services(role: SetupRole) -> Vec<&'static str> {
     mackesd_core::onboard::role_provision::units_for_role(role)
 }
 
+fn strip_lifecycle_child_env(command: &mut Command) {
+    for name in LIFECYCLE_CHILD_ENV_STRIP {
+        command.env_remove(*name);
+    }
+}
+
 /// Run `argv` and stream each stdout/stderr line to `on_line`, returning the
 /// process success flag. The wizard pumps `on_line` into its live-log pane so
 /// every step is narrated in real time. An un-spawnable program (verb not on
@@ -155,8 +168,10 @@ pub fn run_streaming<F: FnMut(String)>(argv: &[String], mut on_line: F) -> bool 
         on_line("(empty command)".to_string());
         return false;
     };
-    let child = Command::new(prog)
-        .args(args)
+    let mut command = Command::new(prog);
+    command.args(args);
+    strip_lifecycle_child_env(&mut command);
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -267,6 +282,26 @@ mod tests {
         assert_eq!(wizard_services(SetupRole::Lighthouse).len(), 7);
         assert_eq!(wizard_services(SetupRole::Workstation).len(), 8);
         assert!(wizard_services(SetupRole::Workstation).contains(&"mde-shell-egui.service"));
+    }
+
+    #[test]
+    fn run_streaming_strips_bootstrap_dest_env() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\"",
+        ]);
+        command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
+        command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
+        command.env("JOIN_TOKEN", "must-not-leak-token");
+        strip_lifecycle_child_env(&mut command);
+        let output = command.output().expect("run stripped child");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "streamed child inherited dest env: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]
