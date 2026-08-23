@@ -215,6 +215,8 @@ def main() -> None:
         command(*base, "--", "/usr/bin/mackesd", "onboard", refused=True)
         command(*base, "--", "/usr/bin/mde-enroll", refused=True)
         command(*base, "--", "/usr/bin/magic-setup", refused=True)
+        command(*base, "--", "/usr/bin/ssh", "seat", "mackesd join x", refused=True)
+        command(*base, "--", "/usr/bin/bash", "-c", "mackesd onboard", refused=True)
         command(*base, "--", str(HERE / "mint-enroll-bearer.py"), refused=True)
 
         candidate_dest = write_fixture_candidate(root / "candidate")
@@ -315,6 +317,16 @@ def main() -> None:
             assert name not in os.environ
 
         helper = load_helper()
+        assert helper.command_is_lifecycle_mutation(
+            ["/usr/bin/ssh", "seat", "mackesd join x"]
+        )
+        assert helper.command_is_lifecycle_mutation(
+            ["/usr/bin/bash", "-c", "/usr/bin/mde-enroll"]
+        )
+        assert not helper.command_is_lifecycle_mutation(
+            ["/usr/bin/ssh", "seat", "echo join"]
+        )
+        assert not helper.command_is_lifecycle_mutation(["/usr/bin/true"])
         os.environ["JOIN_TOKEN"] = "must-not-leak-token"
         os.environ["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = "/tmp/must-not-leak-candidate"
         os.environ["MCNF_SEAT_MUTATION_WARNING"] = "/tmp/must-not-leak-warning"

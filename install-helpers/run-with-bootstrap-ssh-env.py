@@ -7,7 +7,8 @@ plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
 Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
 `offboard`, `join`, `found`, `mesh-init`, `leave`, `decommission`,
-`onboard`, `mde-enroll`, `magic-setup`, `meshctl provision`/`init`, or the mint helper)
+`onboard`, `mde-enroll`, `magic-setup`, `meshctl provision`/`init`,
+ssh/bash wrappers embedding those verbs, or the mint helper)
 refuses while the unpublished signed candidate dest is absent. After dest
 admit, mutation argv runs `seat-update-warning.sh`.
 """
@@ -81,6 +82,32 @@ LIFECYCLE_MUTATION_NAMES = frozenset(
 MESHCTL_MUTATION_NAMES = frozenset(
     {"provision", "join", "leave", "decommission", "init"}
 )
+SHELL_WRAPPERS = frozenset(
+    {"ssh", "scp", "sshpass", "bash", "sh", "dash", "python", "python3"}
+)
+LIFECYCLE_BINARIES = frozenset(
+    {
+        "mackesd",
+        "meshctl",
+        "mde-enroll",
+        "magic-setup",
+        "mint-enroll-bearer",
+        "mint-enroll-bearer.py",
+    }
+)
+_MUTATION_WORD = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    + "|".join(
+        re.escape(name)
+        for name in sorted(LIFECYCLE_MUTATION_NAMES | MESHCTL_MUTATION_NAMES, key=len, reverse=True)
+    )
+    + r")(?![A-Za-z0-9_-])"
+)
+_LIFECYCLE_BINARY_WORD = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    + "|".join(re.escape(name) for name in sorted(LIFECYCLE_BINARIES, key=len, reverse=True))
+    + r")(?![A-Za-z0-9_-])"
+)
 
 
 class Refusal(ValueError):
@@ -95,15 +122,33 @@ def command_basename(token: str) -> str:
     return Path(token).name
 
 
-def admit_not_lifecycle_mutation(command: list[str]) -> None:
+def wrapper_embeds_lifecycle_mutation(token: str) -> bool:
+    if "enroll-token" in token:
+        return True
+    if _LIFECYCLE_BINARY_WORD.search(token) and (
+        _MUTATION_WORD.search(token)
+        or command_basename(token) in LIFECYCLE_BINARIES
+    ):
+        return True
+    return False
+
+
+def command_is_lifecycle_mutation(command: list[str]) -> bool:
     names = [command_basename(token) for token in command]
-    mutation = any(
+    if any(
         name in LIFECYCLE_MUTATION_NAMES or "enroll-token" in token
         for token, name in zip(command, names)
-    )
+    ):
+        return True
     if "meshctl" in names and MESHCTL_MUTATION_NAMES.intersection(names):
-        mutation = True
-    if not mutation:
+        return True
+    if SHELL_WRAPPERS.intersection(names):
+        return any(wrapper_embeds_lifecycle_mutation(token) for token in command)
+    return False
+
+
+def admit_not_lifecycle_mutation(command: list[str]) -> None:
+    if not command_is_lifecycle_mutation(command):
         return
     try:
         candidate.admit_unpublished_signed_candidate(for_production_mutation=True)
