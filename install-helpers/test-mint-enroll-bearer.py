@@ -108,11 +108,19 @@ def fake_script(stdout: str, exit_code: int = 0) -> str:
     )
 
 
-def command(*args: str, refused: bool = False) -> subprocess.CompletedProcess[str]:
+def command(
+    *args: str,
+    refused: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         [sys.executable, str(HELPER), *args],
         text=True,
         capture_output=True,
+        env=env,
     )
     combined = result.stdout + result.stderr
     assert FIXTURE_BEARER not in result.stdout
@@ -395,12 +403,17 @@ def main() -> None:
         wg = root / "workgroup"
         wg.mkdir(mode=0o700)
         seen = root / "seen-env"
+        leak = root / "seen-dest-env"
         env_fake = write_fake_mackesd(
             root / "mackesd-env",
             (
                 "#!/usr/bin/env python3\n"
                 "import os,sys\n"
                 f"open({str(seen)!r},'w').write(os.environ.get('MDE_WORKGROUP_ROOT',''))\n"
+                f"open({str(leak)!r},'w').write("
+                "os.environ.get('MACKESD_BOOTSTRAP_SSH_KEY','')"
+                "+os.environ.get('MACKESD_BOOTSTRAP_KNOWN_HOSTS','')"
+                "+os.environ.get('JOIN_TOKEN',''))\n"
                 f"sys.stdout.write({(join_token(FIXTURE_BEARER) + chr(10))!r})\n"
             ),
         )
@@ -414,8 +427,14 @@ def main() -> None:
             str(wg),
             "--output",
             str(env_dest),
+            extra_env={
+                "MACKESD_BOOTSTRAP_SSH_KEY": "/tmp/must-not-leak",
+                "MACKESD_BOOTSTRAP_KNOWN_HOSTS": "/tmp/must-not-leak-hosts",
+                "JOIN_TOKEN": "must-not-leak-token",
+            },
         )
         assert seen.read_text(encoding="ascii") == str(wg.resolve())
+        assert leak.read_text(encoding="ascii") == ""
         assert env_dest.read_bytes() == FIXTURE_BEARER.encode("ascii")
 
         assert_away_from_production(root, dest, sidecar, parent, fake, fp_dest, env_dest)

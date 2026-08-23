@@ -269,8 +269,19 @@ def admit_workgroup_root(path: Path | None) -> Path | None:
     return resolved
 
 
+# Dest identity and join-token env must not leak into enroll-token.
+# Login leftover (2): only the dest-env runner sources those vars.
+DEST_CHILD_ENV_STRIP = (
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+)
+
+
 def child_environment(workgroup_root: Path | None) -> dict[str, str]:
     child_env = os.environ.copy()
+    for name in DEST_CHILD_ENV_STRIP:
+        child_env.pop(name, None)
     if workgroup_root is None:
         return child_env
     # enroll-token has no --workgroup-root flag; mackesd honors MDE_WORKGROUP_ROOT.
