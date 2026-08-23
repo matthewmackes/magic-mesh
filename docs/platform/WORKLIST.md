@@ -7,15 +7,13 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 11 `Remaining`, 8 `Blocked`, 0 `Needs clarification`.
-  Operator survey 2026-08-22 lifted the product questions (Q9 retire mesh-PBX;
-  Q26 Files stays its own OS surface; PR #71 Ready; Maps fetch; preflight
-  template; seats+Vitelity once an unpublished candidate exists). It did
-  **not** lift the release chain: `WL-REL-001` final freeze and therefore
-  `WL-REL-002`–`005`, `WL-TEST-002`, and `WL-REL-007` stay Blocked until live
-  FUNC-023 enroll exists and REL-006 admits current-revision inputs. Feature
-  leftovers (FUNC-024–032) are Remaining: unpublished `13.0.0-35` is installed
-  on Dell, Seat 15, and Surface.
+- **19 active epics:** 19 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+  Operator 2026-08-23 authorized lifting the release chain that the
+  2026-08-22 survey had kept Blocked. Leftovers are unchanged: live FUNC-023
+  mint/enroll, REL-006 admission, then official cut/sign/qualify/publish.
+  Do not invent a mesh-id or bearer. Do not flip `production_admitted`. Do
+  not publish or freeze while those leftovers are open. Unpublished
+  `13.0.0-35` is installed on Dell, Seat 15, and Surface.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -213,7 +211,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 
 ### WL-REL-007 - Execute the SOL Luna AI production 13.0.0 completion plan
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: the active lifecycle, release-input, source-freeze, build, signing,
@@ -230,8 +228,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   Surface is approved for `13.0.0`; Android/Cuttlefish is deferred. WL-REL-006
   is parked (freeze / catalog refs / RPM secret). Coordinator leftover is
   FUNC-023 live enroll (unpublished `13.0.0-35` is installed; freeze still
-  waits on mint + enroll/offboard) and FUNC-033 keep `own_nebula_ip`. Do not
-  grind `cargo test --workspace` as filler. Evidence:
+  waits on mint + enroll/offboard) and FUNC-033 keep `own_nebula_ip`.
+  Operator 2026-08-23 authorized Remaining so the coordinator can run the
+  chain; do not grind `cargo test --workspace` as filler. Evidence:
   `WL-REL-007-2026-08-22-coordinator-park-r1.md`. Exact acceptance is Dell,
   Seat 15, Surface, and three lighthouses.
 - Remaining work:
@@ -619,7 +618,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: production `13.0.0` is newer than the latest published tag, and loose historical artifacts do not define one admissible release source.
@@ -632,7 +631,8 @@ is a capacity incident (§10.0.3), not a silent retry.
   Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
   `WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Final S1/S4 freeze
   still waits on live FUNC-023 enroll, then REL-006 admission and
-  reconfirmation of the dest-cut SHA.
+  reconfirmation of the dest-cut SHA. Operator 2026-08-23 authorized
+  Remaining; do not declare the final freeze until that leftover closes.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded; final freeze BLOCKED
      on live FUNC-023 enroll: 2872293b1 / 1787447942 is the input-generation
@@ -702,11 +702,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   self-signing; exact installed/live proof remains deferred to WL-TEST-002.
 - Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
 - Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
+  @farm:{cargo metadata --format-version 1}
 - Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
 
 ### WL-REL-006 - Create governed open-source release inputs
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: WL-REL-001 cannot admit the production release until the already
@@ -726,9 +727,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   App VM, Browser VM, and bootc ARGs and inventory pins match `3a5e74e6…`.
   Surface `bootc_base` stays null (blocked stack must not guess a digest).
   Leftover is Maps `production_admitted`, real catalog refs, RPM signer after
-  freeze, S7 `REPLACE_*`, live-seat dest. Bind new receipts to 2872293b1, not
-  1dfe6906 (`WL-REL-001-2026-08-22-input-candidate-r1.md`). Evidence:
-  `WL-REL-006-2026-08-22-leftover-park-r1.md`.
+  freeze, S7 `REPLACE_*`, live-seat dest. Operator 2026-08-23 authorized
+  Remaining; do not invent catalog refs or flip `production_admitted`. Bind
+  new receipts to 2872293b1 (`WL-REL-001-2026-08-22-input-candidate-r1.md`),
+  not 1dfe6906. Evidence: `WL-REL-006-2026-08-22-leftover-park-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -872,7 +874,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 
 ### WL-REL-002 - Cut the complete three-RPM unsigned handoff
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
@@ -882,7 +884,8 @@ is a capacity incident (§10.0.3), not a silent retry.
   `172.20.0.131` is up (toolchain-ready;
   `WL-REL-002-2026-08-22-f44-builder-recover-r1.md`). BigBoy F42 `.130` is
   halted for that RAM handoff. Official prepare still needs Maps/catalog
-  `REPLACE_*`. Not freeze.
+  `REPLACE_*`. Not freeze. Operator 2026-08-23 authorized Remaining; do not
+  cut the official handoff before FUNC-023 enroll and REL-006 admission.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
@@ -920,11 +923,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Dependencies: WL-REL-001.
 - Acceptance criteria: one immutable three-role handoff exists; every RPM is exact and same-source; partial or substituted sets refuse.
 - Verification method: BigBoy full RPM lane, independent Server farm lane, RPM/build-identity checks, and handoff hostile verification.
+  @farm:{cargo build -p mackesd}
 - Origin or merged source IDs: archived WL-BUILD-001 and first-release preparation from WL-CRIT-006.
 
 ### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and three verified image roles; no current-revision six-role set exists.
@@ -990,11 +994,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Dependencies: WL-REL-002 and the automated signing-credential preflight.
 - Acceptance criteria: three RPM signatures verify without payload drift; three image roles verify; exactly six roles bind to one revision.
 - Verification method: signing and role-specific verifiers, derivative hostile suite, plan producer, and independent hash/identity comparison.
+  @farm:{cargo test -p mackesd}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016, WL-FUNC-017, and WL-CRIT-006 release roles.
 
 ### WL-REL-004 - Assemble the signed six-role release evidence bundle
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: publication is forbidden until all artifacts, manifests, gates, SBOM data, checksums, and provenance form one exact signed bundle.
@@ -1050,11 +1055,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   of those exact private candidate bytes.
 - Acceptance criteria: one signed immutable six-role evidence bundle passes all mandatory gates and rejects any artifact-set drift.
 - Verification method: farm gates, collector and gate verifiers, SBOM/evidence checks, detached-signature verification, and publication preflight.
+  @farm:{cargo test -p mde-bus}
 - Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006 production-evidence responsibilities.
 
 ### WL-REL-005 - Publish and promote the newest complete release
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: version 13.0.0 has no immutable current tag or complete public asset set, and partial candidates must never enter the package channel.
@@ -1113,11 +1119,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Dependencies: WL-REL-004.
 - Acceptance criteria: tag, release, assets, signatures, provenance, and package metadata agree exactly; no partial release is visible.
 - Verification method: remote tag/release readback, clean-room asset verification, repository queries, and HOLD/partial promotion refusal.
+  @farm:{cargo test -p mde-enroll}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 publication responsibilities.
 
 ### WL-TEST-002 - Install and prove the newest complete release
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P1
 - Complexity: Epic
 - Problem: exact-release installation, providers, direct-DRM rendering, guest/device integrations, and corrected-forward recovery need live proof.
@@ -1129,7 +1136,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   Seat 15, and Surface after red alert + 5s
   (`WL-TEST-002-2026-08-22-unpublished-seat-install-r1.md`). `mackesd` is
   13.0.0 / `7e3474eeb` and inactive. Leftover is live enroll plus six-role
-  qualification. Sealed Vitelity/SIP still required for S3. No feature waiver.
+  qualification. Operator 2026-08-23 authorized Remaining; do not treat the
+  unpublished workstation install as the six-role qualification. Sealed
+  Vitelity/SIP still required for S3. No feature waiver.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
@@ -1202,6 +1211,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   hardware, and the three-seat `13.0.0` qualification lock.
 - Acceptance criteria: tested bytes match the signed release; states remain honest; recovery is corrected-forward; every deferred proof is reconciled.
 - Verification method: focused farm gates followed by exact installed three-seat live checks on Dell, Seat 15, and Surface with redacted evidence and independent readback.
+  @farm:{cargo test -p mde-shell-egui} @farm:{cargo test -p mackesd}
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
 
 ## Feature Completion

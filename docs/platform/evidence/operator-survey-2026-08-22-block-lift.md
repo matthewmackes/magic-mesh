@@ -16,6 +16,8 @@ Recorded from the drain-branch survey. Newest operator lock wins.
 
 `WL-REL-001` final freeze, and therefore `WL-REL-002`–`005` and `WL-TEST-002`, stay Blocked until the live enroll exists and REL-006 admits current-revision inputs against the same SHA.
 
+**Operator override 2026-08-23:** those eight epics (`WL-REL-007`, `WL-REL-001`, `WL-REL-006`, `WL-REL-002`–`005`, `WL-TEST-002`) are authorized Remaining so the drain can work leftovers. The leftovers themselves are not waived: do not invent a mesh-id or bearer, do not flip `production_admitted`, do not declare the final freeze, and do not publish while FUNC-023 live enroll and REL-006 admission are open.
+
 ## Private preflight template
 
 Path (not in Git): `/root/mcnf-private/release-preflight.template.json`
