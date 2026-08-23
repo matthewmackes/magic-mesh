@@ -7,7 +7,7 @@ plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
 Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
 `offboard`, `join`, `found`, `mesh-init`, `leave`, `decommission`,
-`onboard`, `meshctl provision`/`init`, or the mint helper)
+`onboard`, `mde-enroll`, `magic-setup`, `meshctl provision`/`init`, or the mint helper)
 refuses while the unpublished signed candidate dest is absent. After dest
 admit, mutation argv runs `seat-update-warning.sh`.
 """
@@ -73,6 +73,8 @@ LIFECYCLE_MUTATION_NAMES = frozenset(
         "provision",
         "decommission",
         "onboard",
+        "mde-enroll",
+        "magic-setup",
     }
 )
 # meshctl mesh init does not put "mesh-init" on argv.

@@ -5,6 +5,13 @@
 //! CA-backup provisioning helpers are join-exclusive and kept private here.
 use crate::*;
 
+/// Dest identity and join-token env must not leak into the enroll TUI.
+/// Login leftover (2): only the dest-env runner sources those vars.
+const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+];
 const SETUP_ETCD: &str = "/usr/libexec/mackesd/setup-etcd";
 const SETUP_SYNCTHING: &str = "/usr/libexec/mackesd/setup-syncthing";
 const WORKSTATION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -265,6 +272,18 @@ fn load_join_role(requested: Option<mde_role::Role>) -> anyhow::Result<JoinRoleR
         Err(error) => anyhow::bail!("reading role: {error}"),
     };
     resolve_join_role(pinned, requested).map_err(anyhow::Error::msg)
+}
+
+fn strip_lifecycle_child_env(command: &mut std::process::Command) {
+    for name in LIFECYCLE_CHILD_ENV_STRIP {
+        command.env_remove(*name);
+    }
+}
+
+fn enroll_tui_command() -> std::process::Command {
+    let mut command = std::process::Command::new("mde-enroll");
+    strip_lifecycle_child_env(&mut command);
+    command
 }
 
 fn persist_join_role(resolution: JoinRoleResolution) -> anyhow::Result<()> {
@@ -563,7 +582,7 @@ fn run_inner(
         }
     });
     let Some(raw_token) = token else {
-        let launched = std::process::Command::new("mde-enroll").status();
+        let launched = enroll_tui_command().status();
         return match launched {
             Ok(s) if s.success() => Ok(()),
             _ => Err(anyhow::anyhow!(
@@ -1119,6 +1138,26 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
             "timeout did not bound execution"
+        );
+    }
+
+    #[test]
+    fn enroll_tui_strips_bootstrap_dest_env() {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\"",
+        ]);
+        command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
+        command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
+        command.env("JOIN_TOKEN", "must-not-leak-token");
+        strip_lifecycle_child_env(&mut command);
+        let output = command.output().expect("run stripped child");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "enroll TUI inherited dest env: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
