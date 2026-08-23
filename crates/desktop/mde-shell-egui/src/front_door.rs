@@ -5023,6 +5023,7 @@ mod tests {
                 &item.payload,
                 FrontDoorTarget::App(
                     Surface::FleetMesh
+                        | Surface::InfraCode
                         | Surface::Music
                         | Surface::Media
                         | Surface::Phones
@@ -5059,12 +5060,13 @@ mod tests {
             .map(FrontDoorTarget::App)
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
-        assert_eq!(actual[0], FrontDoorTarget::App(Surface::InfraCode));
+        assert_eq!(actual[0], FrontDoorTarget::App(Surface::Desktop));
         assert!(!actual.iter().any(|item| {
             matches!(
                 item,
                 FrontDoorTarget::App(
                     Surface::FleetMesh
+                        | Surface::InfraCode
                         | Surface::Music
                         | Surface::Media
                         | Surface::Phones
@@ -5217,15 +5219,12 @@ mod tests {
     fn blank_front_door_hits_show_initial_shortcuts_in_source_order() {
         let hits = visible_front_door_hits("  ", app_search_items());
         assert_eq!(hits.len(), app_search_items().len());
+        assert_eq!(hits[0].item.payload, FrontDoorTarget::App(Surface::Desktop));
+        assert_eq!(hits[0].item.target, "Desktop & Session");
         assert_eq!(
-            hits[0].item.payload,
-            FrontDoorTarget::App(Surface::InfraCode)
+            hits[1].item.payload,
+            FrontDoorTarget::App(Surface::MapsLocation)
         );
-        assert_eq!(
-            hits[0].item.target,
-            launcher_group_label(Surface::InfraCode)
-        );
-        assert_eq!(hits[1].item.payload, FrontDoorTarget::App(Surface::Desktop));
         assert_eq!(hits[1].item.target, "Desktop & Session");
     }
 
@@ -6648,7 +6647,7 @@ mod tests {
             .expect("blank Front Door search results status");
         let value = results.value().expect("blank Front Door status value");
         assert!(
-            value.contains("local shortcut") && value.contains("Infra as Code highlighted"),
+            value.contains("local shortcut") && value.contains("Remote Sessions highlighted"),
             "blank Front Door should announce available shortcuts: {value}"
         );
     }

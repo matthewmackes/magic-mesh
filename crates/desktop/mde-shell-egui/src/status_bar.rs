@@ -62,13 +62,13 @@ pub(crate) const STATUS_BAR_H: f32 = 24.0;
 /// Width reserved by the bottom taskbar for the Windows-style system tray.
 /// The navigation bar keeps this lane free of app pins so the clock and
 /// controls remain visually stable while the center cluster changes.
-pub(crate) const BOTTOM_TRAY_W: f32 = 448.0;
+pub(crate) const BOTTOM_TRAY_W: f32 = 480.0;
 /// Clear space between the taskbar placement control and the tray.
 pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.8;
 
 /// Construct-owned workspaces promoted into the persistent notification/tool
 /// tray. The navigation rail remains intact in both placement modes.
-pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 4] = TOOL_TRAY_SURFACES;
+pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 5] = TOOL_TRAY_SURFACES;
 const WORKSPACE_TRAY_ICON_W: f32 = STATUS_BAR_H;
 const WORKSPACE_TRAY_GAP: f32 = Style::SP_XS;
 
@@ -571,6 +571,7 @@ fn workspace_tray_rect(bar: egui::Rect, left_anchor: egui::Rect) -> egui::Rect {
 
 const fn workspace_tray_shortcut(surface: Surface) -> &'static str {
     match surface {
+        Surface::InfraCode => "Status tray",
         Surface::Workers => "Super+1",
         Surface::FleetMesh => "Super+1",
         Surface::Music => "Super+4",

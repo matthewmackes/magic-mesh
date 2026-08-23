@@ -607,7 +607,7 @@ const GROUPS: [ConsoleGroup; 7] = [
             desc: "Open the authoritative VM and container inventory",
             tool: "",
             provenance: Provenance::Construct,
-            icon: IconId::Server,
+            icon: IconId::Instances,
             kind: EntryKind::Link(Surface::InfraCode),
         }],
     },

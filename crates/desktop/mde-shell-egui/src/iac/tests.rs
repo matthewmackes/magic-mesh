@@ -354,13 +354,13 @@ fn android_starter_launch_uses_the_audited_typed_exec_lane() {
 
 #[test]
 fn the_surface_is_reachable_in_the_dock() {
-    // §7 reachability: the surface stays in Surface::ALL and wears the server /
-    // infrastructure brand glyph (the dock mount is unchanged by the reshape).
+    // §7 reachability: the surface stays in Surface::ALL and wears the
+    // instances glyph in the right-side tray (not the retired server glyph).
     use crate::surfaces::Surface;
     assert!(Surface::ALL.contains(&Surface::InfraCode));
     assert_eq!(
         Surface::InfraCode.icon_id(),
-        mde_theme::brand::icons::IconId::Server
+        mde_theme::brand::icons::IconId::Instances
     );
 }
 

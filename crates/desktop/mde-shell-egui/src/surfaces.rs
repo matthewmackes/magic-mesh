@@ -81,7 +81,7 @@ impl Surface {
                 IconId::MeshView
             }
             Surface::AutoHome => IconId::Workbench,
-            Surface::InfraCode => IconId::Server,
+            Surface::InfraCode => IconId::Instances,
             Surface::Desktop => IconId::Desktop,
             Surface::Music => IconId::Music,
             Surface::Media => IconId::Media,
@@ -123,7 +123,8 @@ impl Surface {
 /// Workspaces owned by the notification/tool tray. These remain fully
 /// launchable through direct routes and keyboard shortcuts, but are not
 /// duplicated in the central launcher taxonomy.
-pub(crate) const TOOL_TRAY_SURFACES: [Surface; 4] = [
+pub(crate) const TOOL_TRAY_SURFACES: [Surface; 5] = [
+    Surface::InfraCode,
     Surface::Workers,
     Surface::Music,
     Surface::Media,
@@ -136,6 +137,7 @@ pub(crate) const fn is_tool_tray_surface(surface: Surface) -> bool {
         surface,
         Surface::Workers
             | Surface::FleetMesh
+            | Surface::InfraCode
             | Surface::Music
             | Surface::Media
             | Surface::ThisNode
@@ -335,12 +337,7 @@ pub(crate) struct LauncherGroup {
 /// The central launcher taxonomy. Tool-tray-owned workspaces are intentionally
 /// omitted so the center launcher does not duplicate the notification tray;
 /// the single Springboard desktop uses this flattened order.
-pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 4] = [
-    LauncherGroup {
-        label: "Mesh Control",
-        accent: Style::ACCENT_MESH,
-        surfaces: &[Surface::InfraCode],
-    },
+pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 3] = [
     LauncherGroup {
         label: "Desktop & Session",
         accent: Style::ACCENT,
@@ -364,7 +361,7 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 4] = [
 /// desktop, Spotlight, and switcher retain the complete taxonomy, while the
 /// always-present dock carries only the high-frequency app clusters. The
 /// `Infra` pair is the operator's VM/remote-session launcher plus Terminal;
-/// the broader Workloads control plane stays in the full catalog.
+/// the broader Workloads control plane lives in the right-side tool tray.
 pub(crate) const DOCK_LAUNCHER_GROUPS: [LauncherGroup; 3] = [
     LauncherGroup {
         label: "Infra",
@@ -723,12 +720,14 @@ mod tests {
         assert_eq!(
             TOOL_TRAY_SURFACES,
             [
+                Surface::InfraCode,
                 Surface::Workers,
                 Surface::Music,
                 Surface::Media,
                 Surface::Terminal,
             ]
         );
+        assert_eq!(Surface::InfraCode.icon_id(), IconId::Instances);
         assert!(!Surface::ALL.contains(&Surface::System));
         assert!(!Surface::ALL.contains(&Surface::Storage));
         assert!(!Surface::ALL.contains(&Surface::About));

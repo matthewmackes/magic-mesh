@@ -250,8 +250,8 @@ fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
         _ => None,
     }?;
     // Tool-tray workspaces deliberately have no duplicate taskbar marker. The
-    // fixed Workloads and merged Home/Sessions controls do, however, need the
-    // canonical surface to reach `focused_control_index`.
+    // merged Home/Sessions control does, however, need the canonical surface
+    // to reach `focused_control_index`.
     (!crate::surfaces::is_tool_tray_surface(canonical)).then_some(canonical)
 }
 
@@ -259,8 +259,7 @@ fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
 /// Keeping this boundary in the catalog helpers also migrates old persisted
 /// profiles instead of allowing duplicate workspace affordances to survive.
 const fn pin_catalog_surface(surface: Surface) -> bool {
-    !crate::surfaces::is_tool_tray_surface(surface)
-        && !matches!(surface, Surface::InfraCode | Surface::Desktop)
+    !crate::surfaces::is_tool_tray_surface(surface) && !matches!(surface, Surface::Desktop)
 }
 
 fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
@@ -1593,11 +1592,11 @@ fn dock_launcher_count() -> usize {
 }
 
 fn dock_control_capacity(pinned_count: usize) -> usize {
-    7 + dock_launcher_count() + pinned_count
+    4 + dock_launcher_count() + pinned_count
 }
 
 fn dock_control_capacity_for(pinned_count: usize, surface_count: usize) -> usize {
-    7 + surface_count + pinned_count
+    4 + surface_count + pinned_count
 }
 
 fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
@@ -1609,7 +1608,7 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 }
 
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
-    let left_cluster_end = screen.left() + control_span(5, CONTROL_EDGE, gap);
+    let left_cluster_end = screen.left() + control_span(3, CONTROL_EDGE, gap);
     let left_safe_edge = left_cluster_end + gap;
     // Placement occupies the tray's reserved final 40px lane; do not reserve
     // a phantom second placement target to the left of that tray.
@@ -1641,13 +1640,13 @@ fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
     // On compact screens the responsive status tray can consume its entire
     // preferred reservation even though one physical center target still fits
     // between the fixed Home cluster and placement control. Admit that one
-    // slot only from exact hit geometry; at 320px it correctly remains zero
+    // slot only from exact hit geometry; at 280px it correctly remains zero
     // because a centered 40px target would intersect Home.
     let centered = egui::Rect::from_center_size(
         egui::pos2(screen.center().x, screen.bottom() - TASKBAR_H / 2.0),
         egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
     );
-    let fixed_left_edge = screen.left() + control_span(5, CONTROL_EDGE, gap) + gap;
+    let fixed_left_edge = screen.left() + control_span(3, CONTROL_EDGE, gap) + gap;
     let placement_left = screen.right() - Style::SP_S - CONTROL_EDGE - gap;
     usize::from(centered.left() >= fixed_left_edge && centered.right() <= placement_left)
 }
@@ -1725,19 +1724,11 @@ fn floating_geometry_for_catalog_with_sessions(
 ) -> Geometry {
     let gap = FLOATING_GAP;
     let center_capacity = floating_center_capacity(screen, gap);
-    let has_catalog_items = !surfaces.is_empty()
-        || !connected_sessions.is_empty()
-        || pinned_count.min(MAX_PINNED_SOURCES) > 0;
-    // Never emit the Editor when the fixed navigation and status reservations
-    // leave no physical center slot: doing so aliases Home's hit region. Under
-    // one-slot pressure, More takes priority so hidden sessions and apps remain
-    // reachable; Editor remains available through Communications/Documents.
-    let show_editor = center_capacity > usize::from(has_catalog_items);
     let (surface_count, session_count, pinned_count, overflow) = catalog_selection_with_sessions(
         surfaces,
         connected_sessions.len(),
         pinned_count,
-        center_capacity.saturating_sub(usize::from(show_editor)),
+        center_capacity,
     );
     let edge = CONTROL_EDGE;
     let outer = egui::Rect::from_min_size(
@@ -1745,22 +1736,19 @@ fn floating_geometry_for_catalog_with_sessions(
         egui::vec2(screen.width(), TASKBAR_H),
     );
     let y = outer.top() + (TASKBAR_H - edge) / 2.0;
-    // Search is the leading taskbar affordance; do not reserve a decorative
-    // blank lane before its fixed hit target.
+    // Start is the leading taskbar affordance; Search and Editor are no
+    // longer painted here. Workloads lives with the right-side tray icons.
     let left_start = outer.left();
     // Bottom placement reserves the rightmost taskbar slot for Show Desktop;
     // the status clock leaves this exact lane immediately to its right.
     let right_x = (outer.right() - Style::SP_S - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let mut cursor_x = left_start;
-    // Start and Search are distinct typed controls over the one Front Door.
-    // Workloads is the one fixed workspace immediately after them, followed by
-    // Back and Home. This keeps the high-frequency controls grouped and
-    // identical in bottom and left-rail placements.
+    // Start, Back, and Home stay as the fixed left cluster. Workloads is
+    // grouped with the right-side tray icons, immediately before the host
+    // Control Panel shortcut.
     for (kind, surface) in [
         (ControlKind::Start, None),
-        (ControlKind::Search, None),
-        (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
         (ControlKind::Back, None),
         (ControlKind::Home, None),
     ] {
@@ -1779,24 +1767,12 @@ fn floating_geometry_for_catalog_with_sessions(
         }
         cursor_x += edge + gap;
     }
-    let center_count = usize::from(show_editor)
-        + surface_count
-        + session_count
-        + pinned_count
-        + usize::from(overflow.is_some());
+    let center_count =
+        surface_count + session_count + pinned_count + usize::from(overflow.is_some());
     let center_span = control_span(center_count, edge, gap);
     let (center_left, center_right) = floating_center_bounds(screen, gap);
     let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
     cursor_x = center_start;
-    if show_editor {
-        controls.push(Control {
-            kind: ControlKind::Editor,
-            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
-            surface: None,
-            source_index: None,
-        });
-        cursor_x += edge + gap;
-    }
     for surface in surfaces.iter().copied().take(surface_count) {
         controls.push(Control {
             kind: ControlKind::SurfaceLauncher,
@@ -1885,29 +1861,15 @@ fn docked_control_fits_before_pin(
     cursor_y + CONTROL_EDGE <= content_bottom
 }
 
-/// Fixed action order for a vertical rail.  A short/large-text logical
-/// viewport keeps the three orientation actions first; taller rails retain the
-/// familiar Bottom order.  Both profiles contain the exact same typed
-/// authorities, so responsive layout can neither duplicate nor silently
-/// replace an action.
-fn docked_fixed_controls(screen_height: f32) -> [(ControlKind, Option<Surface>); 5] {
-    if screen_height <= 400.0 {
-        [
-            (ControlKind::Start, None),
-            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
-            (ControlKind::Back, None),
-            (ControlKind::Search, None),
-            (ControlKind::Home, None),
-        ]
-    } else {
-        [
-            (ControlKind::Start, None),
-            (ControlKind::Search, None),
-            (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
-            (ControlKind::Back, None),
-            (ControlKind::Home, None),
-        ]
-    }
+/// Fixed action order for a vertical rail. Start, Back, and Home stay as the
+/// only fixed cluster; Search, Editor, and Workloads are no longer painted
+/// here. Workloads lives with the right-side tray icons.
+fn docked_fixed_controls(_screen_height: f32) -> [(ControlKind, Option<Surface>); 3] {
+    [
+        (ControlKind::Start, None),
+        (ControlKind::Back, None),
+        (ControlKind::Home, None),
+    ]
 }
 
 fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
@@ -1967,26 +1929,12 @@ fn docked_geometry_for_catalog_with_sessions(
         available_slots += 1;
         slot_y += CONTROL_EDGE + Style::SP_XS;
     }
-    // Editor consumes one of the remaining pre-placement slots. Placement was
-    // already reserved outside this budget.
     let (surface_count, session_count, pinned_count, overflow) = catalog_selection_with_sessions(
         surfaces,
         connected_sessions.len(),
         pinned_count,
-        available_slots.saturating_sub(1),
+        available_slots,
     );
-    if docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
-        controls.push(Control {
-            kind: ControlKind::Editor,
-            rect: egui::Rect::from_min_size(
-                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
-                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
-            ),
-            surface: None,
-            source_index: None,
-        });
-        cursor_y += CONTROL_EDGE + Style::SP_XS;
-    }
     for surface in surfaces.iter().copied().take(surface_count) {
         if !docked_control_fits_before_pin(screen, cursor_y, pin_rect) {
             break;
@@ -2957,12 +2905,8 @@ mod tests {
             let centered_controls = geometry.controls.iter().filter(|control| {
                 !matches!(
                     control.kind,
-                    ControlKind::Start
-                        | ControlKind::Search
-                        | ControlKind::Back
-                        | ControlKind::Home
-                        | ControlKind::Pin
-                ) && control.surface != Some(Surface::InfraCode)
+                    ControlKind::Start | ControlKind::Back | ControlKind::Home | ControlKind::Pin
+                )
             });
             let (strip_left, strip_right, count) = centered_controls.fold(
                 (f32::INFINITY, f32::NEG_INFINITY, 0_usize),
@@ -3020,7 +2964,7 @@ mod tests {
 
     #[test]
     fn bottom_taskbar_does_not_emit_center_controls_without_a_physical_slot() {
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 240.0));
         assert_eq!(floating_center_capacity(screen, FLOATING_GAP), 0);
 
         let geometry = floating_geometry_for_catalog_with_sessions(
@@ -3037,12 +2981,7 @@ mod tests {
         assert!(geometry.controls.iter().all(|control| {
             matches!(
                 control.kind,
-                ControlKind::Start
-                    | ControlKind::Search
-                    | ControlKind::SurfaceLauncher
-                    | ControlKind::Back
-                    | ControlKind::Home
-                    | ControlKind::Pin
+                ControlKind::Start | ControlKind::Back | ControlKind::Home | ControlKind::Pin
             )
         }));
         assert_eq!(
@@ -3051,8 +2990,8 @@ mod tests {
                 .iter()
                 .filter(|control| control.kind == ControlKind::SurfaceLauncher)
                 .count(),
-            1,
-            "only the fixed Workloads launcher may remain outside the full center lane"
+            0,
+            "Workloads is a right-side tray icon, not a leftover center launcher"
         );
         for (index, control) in geometry.controls.iter().enumerate() {
             assert!(geometry.outer.contains(control.rect.min));
@@ -3260,7 +3199,7 @@ mod tests {
 
     #[test]
     fn docked_rail_drops_launcher_overflow_on_short_screens() {
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 320.0));
         let geometry = docked_geometry_for(screen, MAX_PINNED_SOURCES);
 
         assert_eq!(
@@ -3270,12 +3209,8 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![
-                ControlKind::Start,
-                ControlKind::SurfaceLauncher,
-                ControlKind::Back,
-            ],
-            "search, Workloads, and Back must remain first even when app launchers overflow"
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,],
+            "Start, Back, and Home must remain first even when app launchers overflow"
         );
         assert!(
             geometry
@@ -3481,15 +3416,6 @@ mod tests {
                 geometry
                     .controls
                     .iter()
-                    .filter(|control| control.kind == ControlKind::Search)
-                    .count(),
-                1,
-                "{name}: Search authority"
-            );
-            assert_eq!(
-                geometry
-                    .controls
-                    .iter()
                     .filter(|control| control.kind == ControlKind::Back)
                     .count(),
                 1,
@@ -3508,13 +3434,22 @@ mod tests {
                 geometry
                     .controls
                     .iter()
+                    .filter(|control| control.kind == ControlKind::Search)
+                    .count(),
+                0,
+                "{name}: Search is keyboard-only, not a left-nav icon"
+            );
+            assert_eq!(
+                geometry
+                    .controls
+                    .iter()
                     .filter(|control| {
                         control.kind == ControlKind::SurfaceLauncher
                             && control.surface == Some(Surface::InfraCode)
                     })
                     .count(),
-                1,
-                "{name}: Workloads authority"
+                0,
+                "{name}: Workloads lives in the right-side tray, not the left cluster"
             );
             assert_eq!(
                 geometry
@@ -4145,7 +4080,6 @@ mod tests {
                 .expect("headless navigation bar should publish an AccessKit tree");
             for (kind, expected_label) in [
                 (ControlKind::Start, "Start"),
-                (ControlKind::Search, "Search"),
                 (ControlKind::Back, "Back"),
                 (ControlKind::Home, "Home"),
                 (ControlKind::Pin, "Taskbar placement menu"),
@@ -4567,7 +4501,6 @@ mod tests {
 
             for (kind, expected) in [
                 (ControlKind::Start, Action::OpenFrontDoor),
-                (ControlKind::Search, Action::FocusSearch),
                 (ControlKind::Back, Action::Back),
                 (ControlKind::Home, Action::Home),
                 (ControlKind::Pin, Action::ToggleDock),
@@ -4634,7 +4567,6 @@ mod tests {
             }
 
             for surface in [
-                Surface::InfraCode,
                 Surface::MapsLocation,
                 Surface::Communications,
                 Surface::Browser,
@@ -4986,32 +4918,20 @@ mod tests {
             floating
                 .controls
                 .iter()
-                .take(5)
+                .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![
-                ControlKind::Start,
-                ControlKind::Search,
-                ControlKind::SurfaceLauncher,
-                ControlKind::Back,
-                ControlKind::Home,
-            ],
-            "the taskbar must lead with search-first navigation controls"
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home],
+            "the taskbar must lead with Start, Back, and Home"
         );
         assert_eq!(
             floating
                 .controls
                 .iter()
-                .take(5)
+                .take(3)
                 .map(|control| control_icon(*control))
                 .collect::<Vec<_>>(),
-            vec![
-                IconId::Grid,
-                IconId::Search,
-                IconId::Server,
-                IconId::ArrowLeft,
-                IconId::FileHome,
-            ]
+            vec![IconId::Grid, IconId::ArrowLeft, IconId::FileHome]
         );
         assert_eq!(
             floating
@@ -5020,7 +4940,6 @@ mod tests {
                 .filter_map(|control| control.surface)
                 .collect::<Vec<_>>(),
             vec![
-                Surface::InfraCode,
                 Surface::MapsLocation,
                 Surface::Communications,
                 Surface::Browser,
@@ -5098,20 +5017,14 @@ mod tests {
             settled
                 .controls
                 .iter()
-                .take(5)
+                .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![
-                ControlKind::Start,
-                ControlKind::Search,
-                ControlKind::SurfaceLauncher,
-                ControlKind::Back,
-                ControlKind::Home,
-            ]
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home]
         );
         assert!(settled.controls[0].rect.top() < settled.controls[1].rect.top());
         assert!(settled.controls[1].rect.top() < settled.controls[2].rect.top());
-        assert_eq!(settled.controls[4].kind, ControlKind::Home);
+        assert_eq!(settled.controls[2].kind, ControlKind::Home);
     }
 
     fn tempfile_dir() -> PathBuf {

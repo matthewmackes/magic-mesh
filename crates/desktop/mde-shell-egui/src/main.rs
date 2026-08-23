@@ -6808,10 +6808,10 @@ mod tests {
     }
 
     #[test]
-    fn springboard_slot_zero_is_the_first_mesh_control_tile() {
+    fn springboard_slot_zero_is_the_first_desktop_session_tile() {
         assert_eq!(
             super::surfaces::springboard_surface(0),
-            Some(Surface::InfraCode)
+            Some(Surface::Desktop)
         );
     }
 
