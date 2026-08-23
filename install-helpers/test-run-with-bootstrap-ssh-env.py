@@ -209,6 +209,10 @@ def main() -> None:
         command(*base, "--", "/usr/bin/mackesd", "join", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "offboard", refused=True)
         command(*base, "--", "/usr/bin/meshctl", "provision", "--token", "x", refused=True)
+        command(*base, "--", "/usr/bin/meshctl", "mesh", "init", refused=True)
+        command(*base, "--", "/usr/bin/meshctl", "decommission", "peer:x", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "decommission", "--node-id", "peer:x", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "onboard", refused=True)
         command(*base, "--", str(HERE / "mint-enroll-bearer.py"), refused=True)
 
         candidate_dest = write_fixture_candidate(root / "candidate")

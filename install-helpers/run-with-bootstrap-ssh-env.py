@@ -6,7 +6,8 @@ assignments and runs a command as a child with a copied environment
 plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
 Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
-`offboard`, `join`, `found`, `mesh-init`, `leave`, or the mint helper)
+`offboard`, `join`, `found`, `mesh-init`, `leave`, `decommission`,
+`onboard`, `meshctl provision`/`init`, or the mint helper)
 refuses while the unpublished signed candidate dest is absent. After dest
 admit, mutation argv runs `seat-update-warning.sh`.
 """
@@ -70,7 +71,13 @@ LIFECYCLE_MUTATION_NAMES = frozenset(
         "mint-enroll-bearer",
         "mint-enroll-bearer.py",
         "provision",
+        "decommission",
+        "onboard",
     }
+)
+# meshctl mesh init does not put "mesh-init" on argv.
+MESHCTL_MUTATION_NAMES = frozenset(
+    {"provision", "join", "leave", "decommission", "init"}
 )
 
 
@@ -87,19 +94,23 @@ def command_basename(token: str) -> str:
 
 
 def admit_not_lifecycle_mutation(command: list[str]) -> None:
-    for token in command:
-        name = command_basename(token)
-        if name in LIFECYCLE_MUTATION_NAMES or "enroll-token" in token:
-            try:
-                candidate.admit_unpublished_signed_candidate(
-                    for_production_mutation=True
-                )
-            except candidate.Refusal as error:
-                refuse(f"lifecycle mutation argv refuses; {error}")
-            try:
-                warning.require_seat_mutation_warning(for_production_mutation=True)
-            except warning.Refusal as error:
-                refuse(str(error))
+    names = [command_basename(token) for token in command]
+    mutation = any(
+        name in LIFECYCLE_MUTATION_NAMES or "enroll-token" in token
+        for token, name in zip(command, names)
+    )
+    if "meshctl" in names and MESHCTL_MUTATION_NAMES.intersection(names):
+        mutation = True
+    if not mutation:
+        return
+    try:
+        candidate.admit_unpublished_signed_candidate(for_production_mutation=True)
+    except candidate.Refusal as error:
+        refuse(f"lifecycle mutation argv refuses; {error}")
+    try:
+        warning.require_seat_mutation_warning(for_production_mutation=True)
+    except warning.Refusal as error:
+        refuse(str(error))
 
 
 def helper_process_env() -> dict[str, str]:
