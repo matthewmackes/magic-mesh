@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 2 `Remaining`, 17 `Blocked`, 0 `Needs clarification`.
+- **19 active epics:** 3 `Remaining`, 16 `Blocked`, 0 `Needs clarification`.
   Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
   surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
   fetch authorized; preflight template then operator secrets; seats+Vitelity go.
@@ -1319,10 +1319,10 @@ story execution contract above.
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
 - Current state: S1-S3 surface wiring is in-tree. Q26: Files stays its own OS
-  surface. Read-only 2026-08-22: no Files persist files on Dell, Seat 15, or
-  Surface; seats run `magic-mesh-12.1.6-35`. Leftover is live mesh-tree and
-  archive-queue evidence. Evidence:
-  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+  surface. Read-only 2026-08-23: no Files persist files on Dell, Seat 15, or
+  Surface; seats run unpublished `magic-mesh-13.0.0-35`. Leftover is live
+  mesh-tree and archive-queue evidence. Evidence:
+  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
 - Remaining work: leftover is live local/mesh and archive-queue evidence, not
   a missing command.
   1. S1 New File and Duplicate.
@@ -1379,10 +1379,10 @@ story execution contract above.
   but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
 - Required outcome: per-folder view mode, sort order, and show-hidden survive
   a shell restart.
-- Current state: persist path is in-tree. Read-only 2026-08-22:
+- Current state: persist path is in-tree. Read-only 2026-08-23:
   `files-folder-prefs.json` is absent on Dell, Seat 15, and Surface; seats
-  run `magic-mesh-12.1.6-35`. Leftover is live restart evidence. Evidence:
-  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+  run unpublished `magic-mesh-13.0.0-35`. Leftover is live restart evidence.
+  Evidence: `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
 - Remaining work: leftover is live restart evidence (fixtures do not satisfy
   production).
   1. S1 Serialize on mutation and hydrate at construction.
@@ -1420,10 +1420,11 @@ story execution contract above.
   never built.
 - Required outcome: operators pin, rename, reorder, and remove their own
   Places entries, persisted across restarts.
-- Current state: bookmark store is in-tree. Read-only 2026-08-22:
+- Current state: bookmark store is in-tree. Read-only 2026-08-23:
   `files-bookmarks.json` is absent on Dell, Seat 15, and Surface; seats run
-  `magic-mesh-12.1.6-35`. Leftover is live restart/navigate evidence.
-  Evidence: `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+  unpublished `magic-mesh-13.0.0-35`. Leftover is live restart/navigate
+  evidence. Evidence:
+  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
 - Remaining work: leftover is live restart/navigate evidence, not a missing
   store.
   1. S1 Add the bookmark store and sidebar section.
@@ -1453,7 +1454,7 @@ story execution contract above.
 
 ### WL-FUNC-028 - Build the recurring-mirror (sync-pair) producer
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Medium
 - Problem: the design-locked recurring rsync mirror is code-complete but
@@ -1463,13 +1464,16 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: in-tree CLI/GUI and persist/fold landed. Read-only 2026-08-22:
-  Dell, Seat 15, and Surface run `magic-mesh-12.1.6-35`; `mackesd transfer` has
-  no `sync-pair` subcommand. Live next-run/last-result cannot be proven until a
-  current-revision unpublished signed candidate is installed (WL-REL-002).
-  Evidence: `WL-FUNC-028-2026-08-22-installed-cli-gap-r1.md`.
-- Remaining work: leftover is live Bus / operator-visible next-run and
-  last-result on a real pair after that RPM is on an acceptance seat.
+- Current state: in-tree CLI/GUI and persist/fold landed. Dell, Seat 15, and
+  Surface run unpublished `magic-mesh-13.0.0-35` (`7e3474eeb`);
+  `mackesd transfer sync-pair add|remove|list` is installed. Dell list is
+  empty. Leftover is live next-run / last-result on a saved pair. Evidence:
+  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
+- Remaining work: leftover is still live next-run / last-result on a saved
+  pair. Seat-user `mackesd transfer sync-pair add` on Dell refused
+  EACCES writing the save-sync-pair verb under root-owned
+  `/var/lib/mde/transfers` after red alert + 5s. Empty list is not
+  pair proof.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
@@ -1659,9 +1663,9 @@ story execution contract above.
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
 - Current state: catalog + apply refuse landed. Leftover is live-surface
-  proof from every Construct surface. Seats run `magic-mesh-12.1.6-35`; no
-  unpublished signed candidate. Evidence:
-  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+  proof from every Construct surface. Seats run unpublished
+  `magic-mesh-13.0.0-35`. Evidence:
+  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
 - Remaining work: leftover is live-surface proof from every Construct
   surface, not a missing binding.
   1. S1 Register both bindings.
