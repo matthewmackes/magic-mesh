@@ -871,12 +871,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
 - Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable private production-candidate handoff.
-- Current state: unpublished signed 13.0.0 three-RPM dest is bound
-  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`;
-  `production_admitted: false`). Container-F44 cut of 7e3474eeb, not official
-  prepare (Maps/catalog `REPLACE_*` remain; `.131` native F44 is down).
-  Hostile prepare-path evidence remains
-  `WL-REL-002-2026-08-16-hostile-boundary-r1.md`. Not freeze.
+- Current state: unpublished signed 13.0.0 dest is bound
+  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`). Native F44 builder
+  `172.20.0.131` is up (toolchain-ready;
+  `WL-REL-002-2026-08-22-f44-builder-recover-r1.md`). BigBoy F42 `.130` is
+  halted for that RAM handoff. Official prepare still needs Maps/catalog
+  `REPLACE_*`. Not freeze.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
