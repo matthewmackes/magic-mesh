@@ -157,8 +157,10 @@ drain. The bridge fails closed when the native adapter is absent.
   for the 15-min timer. Do not hand-duplicate a cargo command the
   reconciler already owns. `skip … (fresh @ <old SHA>)` is a waiting
   timer, not a broken farm. Fresh at the current clean HEAD with
-  dest/live leftovers means implementation fan-out, not a filler
-  workspace grind.
+  dest/live leftovers means `automation/drain/leftover-units.sh
+  runnable` (live-seat / source), not a filler workspace grind.
+  `@leftover:{dest-operator}` stays fail-closed until a named dest
+  is authorized. `@leftover:{keep}` is not closable by delete.
 - **Fill control (shared).** The oneshot is
   `automation/reconciler/farm-reconcile.sh` via
   `mcnf-farm-reconcile.service`. Triggers:

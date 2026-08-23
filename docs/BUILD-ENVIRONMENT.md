@@ -618,7 +618,8 @@ failed result is reused as readily as a passing one — a red gate is still an a
 install-helpers/farm-topology.sh table         # canonical roster: nodes, names, caps
 automation/lib/farm-dispatch.sh nodes          # reach/toolchain/free-disk/free-slots + state
 automation/lib/farm-dispatch.sh slots          # per-slot reservations; TOTAL_FREE=
-install-helpers/drain-coordinator.sh plan 7    # preflight + free slots + next N units
+install-helpers/drain-coordinator.sh plan 7    # preflight + free slots + next N + leftovers
+automation/drain/leftover-units.sh runnable    # live-seat/source after cargo is fresh
 
 # --- run ------------------------------------------------------------------
 install-helpers/xcp-build.sh cargo test -p mde-bus     # one-off, from the dirty tree
@@ -638,6 +639,7 @@ automation/lib/farm-dispatch.sh --self-test
 automation/reconciler/farm-reconcile.sh --self-test
 automation/reconciler/reconciler-up.sh --self-test
 automation/reconciler/tick-fill.sh --self-test
+automation/drain/leftover-units.sh --self-test
 automation/lib/farm-jobs.sh --self-test
 install-helpers/xcp-build.sh --route-test
 

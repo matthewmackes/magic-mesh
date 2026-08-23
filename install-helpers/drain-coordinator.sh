@@ -94,6 +94,15 @@ cmd_plan() {
   echo "--- 1. preflight (disk headroom) ---"; cmd_preflight 8
   echo "--- 2. free farm slots ---"; cmd_slots
   echo "--- 3. next $n candidate units ---"; cmd_next "$n"
+  echo "--- 4. leftover units (run these when cargo is fresh at HEAD) ---"
+  if [ -x "$ROOT/automation/drain/leftover-units.sh" ]; then
+    echo "# runnable (live-seat + source):"
+    "$ROOT/automation/drain/leftover-units.sh" runnable || true
+    echo "# parked (dest-operator / keep / release-wait):"
+    "$ROOT/automation/drain/leftover-units.sh" parked || true
+  else
+    echo "leftover-units.sh missing"
+  fi
   echo "### rearm on each completion; park (park-blocker.sh) don't stall; no-flinch."
 }
 

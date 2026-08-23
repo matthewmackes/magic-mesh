@@ -600,7 +600,12 @@ by an operator lock.
  free is a process failure. Do not hand-fan the same cargo command the
  reconciler already owns. A result whose `commit` equals the current
  clean HEAD is cargo-converged; dest/live leftovers then require
- implementation fan-out, not a filler workspace grind.
+ implementation fan-out, not a filler workspace grind. The shared
+ leftover list is `automation/drain/leftover-units.sh` over
+ `@leftover:{…}` markers (`live-seat`, `source`, `dest-operator`,
+ `keep`, `release-wait`). Runnable leftovers are the next act.
+ Dest-operator leftovers stay fail-closed until the operator
+ authorizes a named dest. Keep leftovers are not closable by delete.
 
 ---
 

@@ -50,6 +50,12 @@ After commit/push, fill with `automation/reconciler/tick-fill.sh` (or
 not wait for the 15-min timer, and do not hand-fan a command the
 reconciler already owns.
 
+When cargo is fresh at this HEAD, the next act is
+`automation/drain/leftover-units.sh runnable` over `@leftover:{…}`
+markers (`live-seat`, `source`, `dest-operator`, `keep`,
+`release-wait`). Do not invent dests. Do not treat dest-operator or
+keep leftovers as farm-idle.
+
 `Status: Blocked` and `Status: Needs clarification` epics may omit the
 payload but should record what would unblock the payload landing.
 

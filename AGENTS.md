@@ -100,6 +100,10 @@ authority — this section is the shared operational glue.
  bypass.
  - `automation/drain/park-worklist-item.sh` — park a blocker rather
  than silent retry.
+ - `automation/drain/leftover-units.sh` — leftover demand after cargo
+ is fresh (`runnable` = live-seat + source; `parked` =
+ dest-operator / keep / release-wait). Markers:
+ `@leftover:{live-seat}` etc. in Remaining epic bodies.
 - **Concurrency target.** While Remaining epics exist, keep
  `min(active_farm_jobs, free_slots)` slots busy. If Remaining epics exist
  but `farm-jobs.sh active` returns zero, the responsible agent's first

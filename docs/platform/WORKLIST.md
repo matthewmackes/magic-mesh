@@ -174,8 +174,10 @@ commit/push, start `automation/reconciler/tick-fill.sh` (or
 `systemctl start --no-block mcnf-farm-reconcile.service`);
 `mcnf-farm-reconcile.path` starts the same oneshot on HEAD change. Do not
 wait for the 15-min timer. Do not hand-fan a cargo command the reconciler
-already owns. A fresh skip at the current clean HEAD with dest/live
-leftovers is implementation work, not a filler workspace grind.
+already owns. When cargo is fresh at the current clean HEAD, the next act
+is `automation/drain/leftover-units.sh runnable` (live-seat and source),
+not more cargo. `@leftover:{dest-operator}` / `keep` / `release-wait` do
+not fill slots; they do not authorize invented dests.
 
 Local heavy `cargo` remains blocked by
 `install-helpers/install-drain-guardrails.sh` (exit 97 with a farm redirect).
@@ -400,6 +402,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   across all permanent farm hosts, exact three-seat and
   three-lighthouse acceptance, signed evidence verification, clean-room public
   readback, and repository query. @farm:{cargo test --workspace}
+  @leftover:{dest-operator} @leftover:{release-wait}
 - Origin or merged source IDs: SOL Luna AI completion plan and Android deferral
   direction (2026-08-17).
 
@@ -414,7 +417,8 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover (1) bearer dest and leftover (2) dest-env child
-  remain. Leftover (3) ran on Seat 15: dest-signed `leave`, then `join`
+  exist under `/root/mcnf-private/`. Leftover (3) ran on Seat 15: dest-signed
+  `leave`, then `join`
   with DER enroll-endpoint pin. Overlay `10.42.0.5` rematerialized;
   `nebula.service` is active. Confirmation dest
   `lifecycle-confirmation-ed25519` `0600`. Evidence:
@@ -616,6 +620,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Verification method: focused hostile/unit tests, farm integration and package
   fixtures, GUI/TUI parity, interruption/resume proof, and exactly three physical
   acceptance seats; defer exact release/rollout proof to WL-TEST-002. @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-enroll}
+  @leftover:{dest-operator} @leftover:{live-seat}
 - Origin or merged source IDs: lifecycle consolidation direction, Seat 15 and Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
@@ -708,6 +713,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
 - Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
   @farm:{cargo metadata --format-version 1}
+  @leftover:{dest-operator} @leftover:{release-wait}
 - Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
 
 ### WL-REL-006 - Create governed open-source release inputs
@@ -874,6 +880,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Verification method: farm-only source/image/package gates, receipt inspectors,
   hostile substitution tests, license review, and canonical preflight.
   @farm:{cargo build --workspace}
+  @leftover:{dest-operator}
 - Origin or merged source IDs: WL-CRIT-006, WL-FUNC-017, WL-FUNC-018,
   WL-FUNC-020, and the deferred WL-TEST-002 provider-proof queue.
 
@@ -929,6 +936,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: one immutable three-role handoff exists; every RPM is exact and same-source; partial or substituted sets refuse.
 - Verification method: BigBoy full RPM lane, independent Server farm lane, RPM/build-identity checks, and handoff hostile verification.
   @farm:{cargo build -p mackesd}
+  @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-001 and first-release preparation from WL-CRIT-006.
 
 ### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
@@ -1000,6 +1008,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: three RPM signatures verify without payload drift; three image roles verify; exactly six roles bind to one revision.
 - Verification method: signing and role-specific verifiers, derivative hostile suite, plan producer, and independent hash/identity comparison.
   @farm:{cargo test -p mackesd}
+  @leftover:{dest-operator} @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016, WL-FUNC-017, and WL-CRIT-006 release roles.
 
 ### WL-REL-004 - Assemble the signed six-role release evidence bundle
@@ -1061,6 +1070,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: one signed immutable six-role evidence bundle passes all mandatory gates and rejects any artifact-set drift.
 - Verification method: farm gates, collector and gate verifiers, SBOM/evidence checks, detached-signature verification, and publication preflight.
   @farm:{cargo test -p mde-bus}
+  @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006 production-evidence responsibilities.
 
 ### WL-REL-005 - Publish and promote the newest complete release
@@ -1125,6 +1135,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: tag, release, assets, signatures, provenance, and package metadata agree exactly; no partial release is visible.
 - Verification method: remote tag/release readback, clean-room asset verification, repository queries, and HOLD/partial promotion refusal.
   @farm:{cargo test -p mde-enroll}
+  @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 publication responsibilities.
 
 ### WL-TEST-002 - Install and prove the newest complete release
@@ -1217,6 +1228,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: tested bytes match the signed release; states remain honest; recovery is corrected-forward; every deferred proof is reconciled.
 - Verification method: focused farm gates followed by exact installed three-seat live checks on Dell, Seat 15, and Surface with redacted evidence and independent readback.
   @farm:{cargo test -p mde-shell-egui} @farm:{cargo test -p mackesd}
+  @leftover:{live-seat} @leftover:{release-wait}
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
 
 ## Feature Completion
@@ -1324,6 +1336,7 @@ story execution contract above.
   docs/platform/evidence/.
   @farm:{cargo test -p mde-collab-types} @farm:{cargo test -p mackesd}
   @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mde-voice-hud}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q11/Q15 and the
   calls.rs media-plane follow-up markers.
 
@@ -1390,6 +1403,7 @@ story execution contract above.
 - Verification method: focused mde-files and mde-files-egui farm gates; no
   live hardware required.
   @farm:{cargo test -p mde-files-egui} @farm:{cargo test -p mde-files}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q26
   (build-new:file-manager-posix-ops), file-manager design lock 1.
 
@@ -1430,6 +1444,7 @@ story execution contract above.
   hostile files degrade to defaults.
 - Verification method: focused mde-files-egui farm gate.
   @farm:{cargo test -p mde-files-egui}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q28
   (build-new:file-manager-folderprefs-persist), file-manager design lock 20.
 
@@ -1472,6 +1487,7 @@ story execution contract above.
   the store is bounded and hostile input refuses.
 - Verification method: focused mde-files-egui farm gate.
   @farm:{cargo test -p mde-files-egui}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q27
   (build-new:file-manager-bookmarks), file-manager design lock 21.
 
@@ -1526,6 +1542,7 @@ story execution contract above.
   gates.
   @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-shell-egui}
   @farm:{cargo test -p mde-collab-egui}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q34
   (build-new:recurring-mirror-producer), transfers design lock.
 
@@ -1573,6 +1590,7 @@ story execution contract above.
 - Verification method: focused mde-collab-egui and mackesd voice_provision
   farm gates.
   @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mackesd}
+  @leftover:{live-seat} @leftover:{dest-operator}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q8
   (build-new:fleet-voice-admin@Activity).
 
@@ -1615,6 +1633,7 @@ story execution contract above.
   the redaction contract intact.
 - Verification method: focused mde-collab-egui and mackesd voip farm gates.
   @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mackesd}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q12
   (build-new:sip-gateway-config@Activity).
 
@@ -1668,6 +1687,7 @@ story execution contract above.
 - Verification method: focused mde-collab-egui farm gates with the
   two-instance session fixture.
   @farm:{cargo test -p mde-collab-egui}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q21
   (defer-followup), documents.rs Phase-3c markers.
 
@@ -1706,6 +1726,7 @@ story execution contract above.
   focus-context shadowing.
 - Verification method: focused mde-shell-egui and mde-collab-egui farm gates.
   @farm:{cargo test -p mde-shell-egui} @farm:{cargo test -p mde-collab-egui}
+  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger
   (build-new:reserve-transfer-hotkeys).
 
@@ -1768,6 +1789,7 @@ story execution contract above.
   deleted stack; no live reference remains; the ledger cites the revision.
 - Verification method: focused mackesd farm gate plus module-reference greps
   recorded in evidence. @farm:{cargo test -p mackesd}
+  @leftover:{keep}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q9, Q10, Q13, Q29,
   and Q33 retire rulings.
 

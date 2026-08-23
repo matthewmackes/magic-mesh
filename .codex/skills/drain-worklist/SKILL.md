@@ -67,10 +67,13 @@ agents, not cargo. Do not run a live `reconciler-up.sh` install on
    `docs/platform/WORKLIST.md`.
 2. **Probe live farm.** `./install-helpers/farm-topology.sh check` (must
    report N/5 dom0s up and free-slot totals).
-3. **Read demand.** `./automation/lib/farm-jobs.sh active | wc -l`. If
-   zero and Remaining epics exist, the first act is decomposing the
-   top-priority Remaining epic into disjoint `@farm:{cargo …}` units —
-   not single-threaded implementation.
+3. **Read demand.** `./automation/lib/farm-jobs.sh active | wc -l` and
+   `./automation/drain/leftover-units.sh runnable`. If cargo jobs exist
+   and are not fresh at this HEAD, fill via tick-fill. If cargo is
+   already fresh and leftover-units prints live-seat/source rows, fan
+   those leftovers — do not grind cargo. If Remaining epics exist and
+   both lists are empty, decompose the top epic into `@farm` and
+   `@leftover` markers.
 4. **Plan the tick.** `./install-helpers/drain-coordinator.sh plan <N>`
    (per-node free slot map + next-N candidate units).
 5. **Fan out.** Delegate one background sidecar worker per disjoint
@@ -116,6 +119,7 @@ agents, not cargo. Do not run a live `reconciler-up.sh` install on
 | `install-helpers/farm-reconciler.sh` | build-VM autoscale from queue demand |
 | `install-helpers/farm-slot-gc.sh` | 20-min stale-slot GC (fleet install with `--deploy`) |
 | `install-helpers/cargo-farm-guard.sh` + `install-drain-guardrails.sh` | local heavy cargo hard-blocked |
+| `automation/drain/leftover-units.sh` | leftover demand after cargo is fresh |
 | `automation/drain/park-worklist-item.sh` | park a blocker without stalling the loop |
 | `install-helpers/xcp-build.sh` | heavy build/test on admitted farm slots |
 | `install-helpers/lint-worklist.sh` | §10.0.4 gate + full worklist lint |
