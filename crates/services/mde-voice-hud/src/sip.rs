@@ -338,8 +338,8 @@ impl PstnAgentDrive {
 
 /// Plan the split/shared-outbound-aware PSTN agent path.
 ///
-/// - `None` / registrar-less identity → [`PstnAgentDrive::Unavailable`] (no
-///   fake connected PSTN).
+/// - `None` / registrar-less identity / empty inbound credential →
+///   [`PstnAgentDrive::Unavailable`] (no fake connected PSTN).
 /// - A legacy flat account is lifted **once**; the inbound username remains
 ///   the only REGISTER target.
 /// - An already-split account is unchanged and still REGISTERs inbound only.
@@ -350,8 +350,13 @@ pub fn plan_pstn_agent(accounts: Option<VoiceAccounts>) -> PstnAgentDrive {
             reason: ABSENT_PSTN_PROVIDER.to_string(),
         };
     };
-    // A registrar-less P2P identity is mesh voice, not a PSTN provider.
-    if accounts.inbound.server_host.trim().is_empty() {
+    // A registrar-less P2P identity, or an account with no password, is not a
+    // governed PSTN credential. Username-only + host would otherwise look
+    // Ready and invite a fake connected-PSTN claim after REGISTER 401.
+    if accounts.inbound.server_host.trim().is_empty()
+        || accounts.inbound.username.trim().is_empty()
+        || accounts.inbound.password.is_empty()
+    {
         return PstnAgentDrive::Unavailable {
             reason: ABSENT_PSTN_PROVIDER.to_string(),
         };
@@ -363,6 +368,33 @@ pub fn plan_pstn_agent(accounts: Option<VoiceAccounts>) -> PstnAgentDrive {
         lifted_legacy,
         register_identity,
     }
+}
+
+/// From URI presented on an ExternalTrunk INVITE.
+///
+/// The shared-outbound caller-ID is the fleet number the callee must see.
+/// When it is a fail-closed E.164 it becomes the From user-part on the
+/// inbound sub's registrar host. Anything else (empty, peer name, SIP URI)
+/// falls back to the inbound AOR so we never invent a PSTN identity.
+#[must_use]
+pub fn outbound_pstn_from_uri(account: &SipAccount, caller_id: &str) -> String {
+    match canonicalize_inbound_e164(caller_id) {
+        Some(e164) => format!("sip:{e164}@{}", account.server_host),
+        None => account.aor(),
+    }
+}
+
+/// Fail-closed inbound media admission. A 200 / [`AgentEvent::Established`]
+/// is only honest when the INVITE offered SDP we can bind. This does not
+/// start RTP — the agent starts media after this check succeeds.
+///
+/// # Errors
+///
+/// Returns an error when the INVITE carried no usable SDP offer.
+pub fn inbound_media_offer(inv: &InboundInvite) -> Result<&RemoteMedia, String> {
+    inv.offer
+        .as_ref()
+        .ok_or_else(|| "inbound INVITE has no SDP offer".to_string())
 }
 
 /// On-disk shape of `account.toml`.
@@ -1245,13 +1277,25 @@ pub fn place_call(
     dialed: &str,
     ring_timeout: Duration,
 ) -> Result<CallSession, String> {
+    place_call_presenting(account, dialed, "", ring_timeout)
+}
+
+/// Place an outbound ExternalTrunk call presenting `caller_id` as the From
+/// user-part when it is a fail-closed E.164 (shared-outbound fleet number).
+/// An empty or non-E.164 `caller_id` falls back to the inbound AOR.
+pub fn place_call_presenting(
+    account: &SipAccount,
+    dialed: &str,
+    caller_id: &str,
+    ring_timeout: Duration,
+) -> Result<CallSession, String> {
     let target = target_uri(account, dialed);
     let dest = (account.server_host.as_str(), account.server_port)
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {}: {e}", account.server_host))?
         .next()
         .ok_or_else(|| format!("no address for {}", account.server_host))?;
-    place_call_inner(account, &target, dest, false, ring_timeout)
+    place_call_inner(account, &target, dest, false, caller_id, ring_timeout)
 }
 
 /// VOIP-P2P — place a registrar-less call DIRECTLY to a mesh peer over the
@@ -1272,7 +1316,7 @@ pub fn place_call_direct(
         .map_err(|e| format!("cannot resolve {peer_host}: {e}"))?
         .next()
         .ok_or_else(|| format!("no address for {peer_host}"))?;
-    place_call_inner(account, &target, dest, true, ring_timeout)
+    place_call_inner(account, &target, dest, true, "", ring_timeout)
 }
 
 /// VOIP-P2P — build the request-URI for a direct peer call: `sip:<user>@<host>`
@@ -1366,6 +1410,7 @@ fn place_call_inner(
     target: &str,
     dest_addr: std::net::SocketAddr,
     direct: bool,
+    caller_id: &str,
     ring_timeout: Duration,
 ) -> Result<CallSession, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("socket bind failed ({e})"))?;
@@ -1377,12 +1422,13 @@ fn place_call_inner(
         .map_err(|e| format!("no local addr ({e})"))?;
     let local_host = local.ip().to_string();
     let local_port = local.port();
-    // VOIP-P2P — From identity: registrar AOR for a registrar call; the local
-    // overlay address for a registrar-less direct (P2P) call.
+    // VOIP-P2P — From identity: registrar AOR (or shared-outbound caller-ID)
+    // for a registrar call; the local overlay address for a registrar-less
+    // direct (P2P) call. ExternalTrunk never invents a non-E.164 PSTN From.
     let from_uri = if direct {
         format!("sip:{}@{local_host}", account.username)
     } else {
-        account.aor()
+        outbound_pstn_from_uri(account, caller_id)
     };
     // Advertise an RTP port (slice 3 binds it); derive it from the signaling
     // port range so it is deterministic per call without a second bind here.
@@ -2256,7 +2302,12 @@ fn run_agent_inner(
                             if account.server_host.trim().is_empty() {
                                 Err("external dialing requires a configured SIP trunk".to_string())
                             } else {
-                                place_call(account, &target, Duration::from_secs(30))
+                                place_call_presenting(
+                                    account,
+                                    &target,
+                                    caller_id,
+                                    Duration::from_secs(30),
+                                )
                             }
                         }
                     };
@@ -2274,21 +2325,39 @@ fn run_agent_inner(
             }
             Ok(AgentCommand::Answer) => {
                 if let Some(inv) = pending.take() {
-                    let sdp = build_sdp_answer(&local_ip, rtp_port);
-                    let ok = build_invite_response(
-                        &inv,
-                        account,
-                        &local_ip,
-                        local_port,
-                        200,
-                        "OK",
-                        Some(&sdp),
-                    );
-                    let _ = sock.send_to(ok.as_bytes(), inv.source);
-                    if let Some(offer) = &inv.offer {
-                        media = crate::media::start_media(rtp_port, offer).ok();
+                    // S6 honesty: never emit 200 / Established unless the
+                    // INVITE offered SDP and the RTP session actually bound.
+                    match inbound_media_offer(&inv)
+                        .and_then(|offer| crate::media::start_media(rtp_port, offer))
+                    {
+                        Ok(session) => {
+                            let sdp = build_sdp_answer(&local_ip, rtp_port);
+                            let ok = build_invite_response(
+                                &inv,
+                                account,
+                                &local_ip,
+                                local_port,
+                                200,
+                                "OK",
+                                Some(&sdp),
+                            );
+                            let _ = sock.send_to(ok.as_bytes(), inv.source);
+                            media = Some(session);
+                            let _ = events.send(AgentEvent::Established);
+                        }
+                        Err(_) => {
+                            let fail = build_invite_response(
+                                &inv,
+                                account,
+                                &local_ip,
+                                local_port,
+                                480,
+                                "Temporarily Unavailable",
+                                None,
+                            );
+                            let _ = sock.send_to(fail.as_bytes(), inv.source);
+                        }
                     }
-                    let _ = events.send(AgentEvent::Established);
                 }
             }
             Ok(AgentCommand::Decline) => {
@@ -3105,7 +3174,8 @@ mod tests {
 
         // Already-split: no lift, inbound REGISTER only (never the trunk CID).
         let split = SipAccount::accounts_from_toml(
-            "[inbound_sub]\nusername = \"eagle\"\nserver = \"sip.vitelity.net\"\n\n\
+            "[inbound_sub]\nusername = \"eagle\"\npassword = \"subpw\"\n\
+             server = \"sip.vitelity.net\"\n\n\
              [shared_outbound]\ncaller_id = \"15551230000\"\ntrunk = \"out.vitelity.net\"\n",
         )
         .unwrap();
@@ -3143,6 +3213,71 @@ mod tests {
             other => panic!("absent provider must emit Failed, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no extra registration events");
+    }
+
+    #[test]
+    fn pstn_agent_drive_rejects_an_account_without_a_governed_credential() {
+        // Username + registrar with an empty password is not a governed
+        // provider credential — stay Unavailable, same reason the health
+        // monitor already treats as absent PSTN.
+        let no_secret = SipAccount::accounts_from_toml(
+            "username = \"15551234567\"\npassword = \"\"\nserver = \"sip.vitelity.net\"\n",
+        )
+        .unwrap();
+        let drive = plan_pstn_agent(Some(no_secret));
+        assert_eq!(
+            drive,
+            PstnAgentDrive::Unavailable {
+                reason: ABSENT_PSTN_PROVIDER.to_string()
+            }
+        );
+        assert!(!drive.pstn_leg_available());
+        assert!(
+            !matches!(
+                drive.visible_pstn_state(),
+                RegistrationState::Registered { .. }
+            ),
+            "empty credential must not look like a connected PSTN leg"
+        );
+    }
+
+    #[test]
+    fn outbound_pstn_from_presents_shared_caller_id_and_never_invents_e164() {
+        let inbound = sample_account();
+        assert_eq!(
+            outbound_pstn_from_uri(&inbound, "+15551230000"),
+            "sip:+15551230000@sip.example.com"
+        );
+        // Bare 10-digit fleet number is canonicalized the same way inbound
+        // Vitelity From user-parts are.
+        assert_eq!(
+            outbound_pstn_from_uri(&inbound, "15551230000"),
+            "sip:+15551230000@sip.example.com"
+        );
+        // Empty / peer / SIP URI → inbound AOR. Never a fabricated PSTN From.
+        assert_eq!(
+            outbound_pstn_from_uri(&inbound, ""),
+            "sip:alice@sip.example.com"
+        );
+        assert_eq!(
+            outbound_pstn_from_uri(&inbound, "eagle"),
+            "sip:alice@sip.example.com"
+        );
+        assert_eq!(
+            outbound_pstn_from_uri(&inbound, "sip:+15551230000@gw"),
+            "sip:alice@sip.example.com"
+        );
+    }
+
+    #[test]
+    fn inbound_media_offer_fail_closes_without_sdp() {
+        let (mut inv, _) = sample_inbound();
+        assert!(inbound_media_offer(&inv).is_ok(), "fixture INVITE has SDP");
+        inv.offer = None;
+        assert_eq!(
+            inbound_media_offer(&inv).expect_err("no offer"),
+            "inbound INVITE has no SDP offer"
+        );
     }
 
     #[test]

@@ -413,11 +413,13 @@ is a capacity incident (§10.0.3), not a silent retry.
   `enroll-bearer.json` and `bootstrap-ssh-env-live-r2.json` stay
   `production_admitted: false` / `enroll_succeeded: false`. Evidence:
   `WL-FUNC-023-2026-08-23-live-enroll-bearer-mint-r1.md`,
-  `WL-FUNC-023-2026-08-23-live-dest-env-child-r1.md`.
+  `WL-FUNC-023-2026-08-23-live-dest-env-child-r1.md`,
+  `WL-FUNC-023-2026-08-23-leftover3-confirm-dest-r1.md`.
 - Remaining work: leftover (3) live enroll or authorized offboard+reenroll
-  under red `AI-GENERATED-ALERT` + 5s. Seat 15 is enrolled; `leave` needs a
-  signed `LifecycleConfirmationV1`. LH1 `:4243` is reachable from Seat 15
-  and Dell. Do not flip `production_admitted`. GPT Luna: execute S1-S18.
+  under red `AI-GENERATED-ALERT` + 5s. Seat 15 is enrolled. `leave` needs a
+  signed `LifecycleConfirmationV1`; no confirmation-signing dest exists
+  under `/root/mcnf-private`. Do not invent that key. SshBootstrap refuses
+  enrolled peers. LH1 `:4243` is reachable. GPT Luna: execute S1-S18.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -626,10 +628,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   epoch 1787450205 (maps-verifier lock refresh after 2872293b1 `--locked`
   refuse). Unpublished signed dest is bound; this is not the final freeze.
   Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
-  `WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Final S1/S4 freeze
-  still waits on live FUNC-023 enroll, then REL-006 admission and
-  reconfirmation of the dest-cut SHA. Operator 2026-08-23 authorized
-  Remaining; do not declare the final freeze until that leftover closes.
+  `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
+  2026-08-23 matrix (`WL-REL-001-2026-08-23-version-matrix-r1.md`;
+  `check-release-version-surfaces.sh` PASS). Final S1/S4 freeze still
+  waits on live FUNC-023 enroll, then REL-006 admission and dest-cut SHA
+  reconfirmation. Do not declare the final freeze until that leftover closes.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded; final freeze BLOCKED
      on live FUNC-023 enroll: 2872293b1 / 1787447942 is the input-generation
@@ -1233,12 +1236,11 @@ story execution contract above.
   LiveKit SFU with P2P failover, and PSTN legs terminate through the LiveKit
   SIP gateway reusing the mde-voice-hud softphone, with all media state owned
   by typed mackesd verbs and never by the renderer.
-- Current state: in-tree media publish + VoiceAccounts consume landed.
-  Mute/DTMF fail closed without a published MediaSessionV1. Leftover is live
-  media/SFU/PSTN. Dell, Seat 15, and Surface run unpublished
-  `magic-mesh-13.0.0-35`. PSTN still depends on FUNC-030 live gateway.
-  Survey 2026-08-22 authorized seat+Vitelity mutation on that candidate.
-  Evidence: `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Current state: VoiceAccounts consume landed. S4 fail-closes empty-password
+  PSTN and inbound-as-From (`WL-FUNC-024-2026-08-23-voice-hud-s4-pstn-drive-r1.md`;
+  farm `64/64` `mde-voice-hud`). Leftover is live media/SFU/PSTN on seats.
+  PSTN still depends on FUNC-030 `gateway.toml`. Dell/Seat 15/Surface run
+  unpublished `13.0.0-35`.
 - Remaining work: leftover is still live media/SFU/PSTN after a
   current-revision unpublished candidate is installed.
   1. S1 Add the typed media contracts.

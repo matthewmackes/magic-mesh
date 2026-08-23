@@ -41,7 +41,7 @@ platform version.
 
 | Surface | Required source or reflection | Verification |
 | --- | --- | --- |
-| Cargo/workspace | Root `Cargo.toml` `[workspace.package].version` | `cargo metadata --no-deps --format-version 1` |
+| Cargo/workspace | Root `Cargo.toml` `[workspace.package].version` | `install-helpers/check-release-version-surfaces.sh --repo .` |
 | Rust build identity | `CARGO_PKG_VERSION`, exposed by `mde-theme::brand::build` | `mackesd --version` and `mde-shell-egui --version` |
 | About page | The shared `mde-theme` build identity, including its version line | Open About and compare its Version/build fields with the CLI |
 | Watermark and splash | The shared `mde-theme` release identity | Render the shell and compare the visible release line with About |
@@ -63,10 +63,24 @@ particular release number.
 The following workspace packages are internal libraries or test-only helpers,
 not independently published release roles: `mde-kdc-host`, `mde-kdc-proto`,
 `magic-fleet`, and `mackes-transport` retain `0.0.0`; the isolated Maps
-verifier retains `0.0.0`. They are included in the source workspace for
-dependency and test resolution, but no standalone artifact, RPM, image, or
-runtime version surface is produced for them. The shipped `mde-role-chooser`
-and all isolated browser helper workspaces inherit the platform version.
+verifier (`packaging/maps/verifier`, package `verify-offline-map-catalog`)
+retains `0.0.0`. They are included in the source workspace for dependency and
+test resolution, but no standalone artifact, RPM, image, or runtime version
+surface is produced for them. The shipped `mde-role-chooser` and the isolated
+browser helper workspaces inherit the platform version:
+
+- `install-helpers/browser-vm-production-control`
+- `install-helpers/browser-vm-production-control/guest-controller`
+- `install-helpers/serve-browser-vm-performance-rdp`
+
+`mcnf-cuttlefish-guest` remains a root workspace member and therefore inherits
+the platform version. It is not a `13.0.0` release role. Android/Cuttlefish is
+Deferred and must not appear in preflight or the six-role set.
+
+`install-helpers/check-release-version-surfaces.sh` is the machine check for
+this contract. It reads `cargo metadata` plus the isolated manifests/lockfiles
+and refuses any version other than the workspace release or a documented
+boundary. It does not freeze source or admit release inputs.
 
 ## Bump procedure
 
@@ -76,11 +90,13 @@ and all isolated browser helper workspaces inherit the platform version.
 2. Confirm workspace inheritance:
 
    ```bash
-   cargo metadata --no-deps --format-version 1
+   install-helpers/check-release-version-surfaces.sh --repo .
    ```
 
-   Every shipped workspace package should report the workspace release unless
-   it is intentionally excluded and has its own documented release boundary.
+   That helper runs `cargo metadata --no-deps --format-version 1` and refuses
+   any shipped package that is not the workspace release, unless it is an
+   intentionally excluded documented boundary.
+
    For the isolated browser helpers, update their manifest/lockfile package
    metadata to the same root value; those copies are Cargo packaging metadata,
    not alternate platform release authorities.
