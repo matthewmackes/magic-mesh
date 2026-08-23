@@ -1750,12 +1750,27 @@ fn current_unix_millis() -> u64 {
         .max(1)
 }
 
+/// Dest identity and join-token env must not leak into service-card children.
+/// Login leftover (2): only the dest-env runner sources those vars.
+const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+];
+
+fn strip_lifecycle_child_env(command: &mut Command) {
+    for name in LIFECYCLE_CHILD_ENV_STRIP {
+        command.env_remove(*name);
+    }
+}
+
 fn run_service_card_command(
     verb: ResourceActionVerb,
     service_kind: &str,
     submission: Option<&str>,
 ) -> Result<String, String> {
     let mut command = Command::new("/usr/bin/mackesd");
+    strip_lifecycle_child_env(&mut command);
     command.arg("service-card");
     match verb {
         ResourceActionVerb::Configure => {
@@ -1896,6 +1911,26 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_card_strips_bootstrap_dest_env() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\"",
+        ]);
+        command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
+        command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
+        command.env("JOIN_TOKEN", "must-not-leak-token");
+        strip_lifecycle_child_env(&mut command);
+        let output = command.output().expect("run stripped child");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "service-card child inherited dest env: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     const NOW: u64 = 1_700_000_000_000;
 
