@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::lifecycle::{
-    canonical_lifecycle_baseline, LifecycleCheckStatus, LifecycleRequirementCheckV1,
-    SeatReadinessV1, LIFECYCLE_CONTRACT_SCHEMA_VERSION,
+    LIFECYCLE_CONTRACT_SCHEMA_VERSION, LifecycleCheckStatus, LifecycleRequirementCheckV1,
+    SeatReadinessV1, canonical_lifecycle_baseline,
 };
 use sha2::{Digest, Sha256};
 
@@ -398,8 +398,10 @@ pub fn gather_live_in(
 }
 
 fn unit_is_active(unit: &str) -> bool {
-    std::process::Command::new("systemctl")
-        .args(["is-active", "--quiet", unit])
+    let mut command = std::process::Command::new("systemctl");
+    command.args(["is-active", "--quiet", unit]);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    command
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -473,9 +475,11 @@ mod tests {
         let facts = healthy("seat-15");
         let checks = assemble(&facts);
         assert_eq!(checks.len(), canonical_lifecycle_baseline().len());
-        assert!(!checks
-            .iter()
-            .any(LifecycleRequirementCheckV1::blocks_progress));
+        assert!(
+            !checks
+                .iter()
+                .any(LifecycleRequirementCheckV1::blocks_progress)
+        );
         let tmp = tempfile::tempdir().unwrap();
         let token = tmp.path().join("enrollment.token");
         std::fs::write(&token, b"keep-me").unwrap();
@@ -495,15 +499,21 @@ mod tests {
         facts.compute_usable = false;
         facts.hardware_usable = false;
         let checks = assemble(&facts);
-        assert!(!checks
-            .iter()
-            .any(LifecycleRequirementCheckV1::blocks_progress));
-        assert!(checks
-            .iter()
-            .any(|c| c.check_id == "compute" && c.status == LifecycleCheckStatus::Warn));
-        assert!(checks
-            .iter()
-            .any(|c| c.check_id == "hardware" && c.status == LifecycleCheckStatus::Warn));
+        assert!(
+            !checks
+                .iter()
+                .any(LifecycleRequirementCheckV1::blocks_progress)
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.check_id == "compute" && c.status == LifecycleCheckStatus::Warn)
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.check_id == "hardware" && c.status == LifecycleCheckStatus::Warn)
+        );
     }
 
     #[test]

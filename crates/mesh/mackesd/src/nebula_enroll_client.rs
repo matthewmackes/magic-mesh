@@ -258,6 +258,7 @@ fn generate_requester_nebula_key_with_binary(
         .arg(&private_key_path)
         .arg("-out-pub")
         .arg(&public_key_path);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
     let output = command
         .output()
         .map_err(|e| NetEnrollError::Materialize(format!("nebula-cert keygen: {e}")))?;
@@ -786,9 +787,10 @@ pub fn verify_authenticated_enrollment_bundle(
     let cert_path = requester_key.staging_dir.join("returned-host.crt");
     crate::ca::seal::write_atomic_sealed(&cert_path, bundle.peer_cert_pem.as_bytes())
         .map_err(|e| NetEnrollError::BadBundle(format!("stage returned cert: {e}")))?;
-    let output = std::process::Command::new("nebula-cert")
-        .args(["print", "-json", "-path"])
-        .arg(&cert_path)
+    let mut print_cert = std::process::Command::new("nebula-cert");
+    print_cert.args(["print", "-json", "-path"]).arg(&cert_path);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut print_cert);
+    let output = print_cert
         .output()
         .map_err(|e| NetEnrollError::BadBundle(format!("inspect returned cert: {e}")))?;
     let _ = std::fs::remove_file(&cert_path);
@@ -1050,13 +1052,15 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         generate_requester_nebula_key_with_binary(temp.path(), fake.as_os_str())
             .expect_err("failure must propagate");
-        assert!(!std::fs::read_dir(temp.path())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".enroll-key-")));
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".enroll-key-"))
+        );
     }
 
     #[test]
@@ -1075,11 +1079,13 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
         )
         .expect_err("symlinked config roots must fail before keygen");
         assert!(error.to_string().contains("symlinked directory component"));
-        assert!(victim
-            .read_dir()
-            .expect("victim remains readable")
-            .next()
-            .is_none());
+        assert!(
+            victim
+                .read_dir()
+                .expect("victim remains readable")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1183,9 +1189,11 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
                 .expect("lighthouse secrets"),
         )
         .expect_err("mismatched authority seed must fail closed");
-        assert!(error
-            .to_string()
-            .contains("private key does not match bundle authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("private key does not match bundle authority")
+        );
     }
 
     #[test]
@@ -1199,9 +1207,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         );
         let error = validate_nebula_cert_print(&hostile, "peer:anvil", "10.42.0.2", requester)
             .expect_err("mismatched certificate key must fail closed");
-        assert!(error
-            .to_string()
-            .contains("does not match requester-owned key"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match requester-owned key")
+        );
     }
 
     #[test]
@@ -1242,9 +1252,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         let node_error =
             validate_nebula_cert_print(&wrong_node, "peer:anvil", "10.42.0.2", requester)
                 .expect_err("wrong node must fail closed");
-        assert!(node_error
-            .to_string()
-            .contains("name does not match enrollment node"));
+        assert!(
+            node_error
+                .to_string()
+                .contains("name does not match enrollment node")
+        );
 
         let wrong_ip = format!(
             "{{\"details\":{{\"name\":\"peer:anvil\",\"ips\":[\"10.42.0.99/17\"],\"publicKey\":\"{}\"}}}}",
@@ -1252,9 +1264,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         );
         let ip_error = validate_nebula_cert_print(&wrong_ip, "peer:anvil", "10.42.0.2", requester)
             .expect_err("wrong overlay must fail closed");
-        assert!(ip_error
-            .to_string()
-            .contains("overlay IP does not match bundle"));
+        assert!(
+            ip_error
+                .to_string()
+                .contains("overlay IP does not match bundle")
+        );
     }
 
     // ---- HTTP response parsing ------------------------------
