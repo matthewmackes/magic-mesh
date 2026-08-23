@@ -1901,7 +1901,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "mackes-mesh-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "dirs",
  "ed25519-dalek",
@@ -1938,7 +1938,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mde-bus"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "mde-collab-types"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "mde-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "mde-maps-location-egui"
-version = "12.1.6"
+version = "13.0.0"
 dependencies = [
  "base64",
  "image",
