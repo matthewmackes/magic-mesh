@@ -5,12 +5,13 @@ Reads a dest env file whose body is exactly the two dest-path
 assignments and runs a command as a child with a copied environment
 plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
-Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
-`offboard`, `join`, `found`, `mesh-init`, `leave`, `decommission`,
-`onboard`, `mde-enroll`, `magic-setup`, `meshctl provision`/`init`,
-ssh/bash wrappers embedding those verbs, or the mint helper)
-refuses while the unpublished signed candidate dest is absent. After dest
-admit, mutation argv runs `seat-update-warning.sh`.
+Lifecycle mutation argv (`enroll-token`, `add-peer`, `invite-issue`,
+`enroll`, `reenroll`, `recovery`, `offboard`, `join`, `found`,
+`mesh-init`, `leave`, `decommission`, `onboard`, `mde-enroll`,
+`magic-setup`, `meshctl provision`/`init`, ssh/bash wrappers embedding
+those verbs, or the mint helper) refuses while the unpublished signed
+candidate dest is absent. After dest admit, mutation argv runs
+`seat-update-warning.sh`.
 """
 
 from __future__ import annotations
@@ -62,17 +63,23 @@ ENV_KEYS = ("MACKESD_BOOTSTRAP_SSH_KEY", "MACKESD_BOOTSTRAP_KNOWN_HOSTS")
 LIFECYCLE_MUTATION_NAMES = frozenset(
     {
         "enroll-token",
+        "add-peer",
+        "invite-issue",
         "enroll",
         "reenroll",
+        "recovery",
         "offboard",
         "join",
         "found",
+        "mesh-create",
         "mesh-init",
         "leave",
         "mint-enroll-bearer",
         "mint-enroll-bearer.py",
         "provision",
         "decommission",
+        "remove-peer",
+        "adopt-xcp",
         "onboard",
         "mde-enroll",
         "magic-setup",

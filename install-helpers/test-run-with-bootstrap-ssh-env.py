@@ -206,6 +206,9 @@ def main() -> None:
         command(*base[:1], str(linked_env), "--", "/usr/bin/true", refused=True)
 
         command(*base, "--", "/usr/bin/mackesd", "enroll-token", "--mesh-id", "x", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "add-peer", "--role", "workstation", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "invite-issue", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "recovery", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "join", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "offboard", refused=True)
         command(*base, "--", "/usr/bin/meshctl", "provision", "--token", "x", refused=True)
@@ -321,10 +324,19 @@ def main() -> None:
             ["/usr/bin/ssh", "seat", "mackesd join x"]
         )
         assert helper.command_is_lifecycle_mutation(
+            ["/usr/bin/ssh", "seat", "mackesd add-peer --role workstation"]
+        )
+        assert helper.command_is_lifecycle_mutation(
+            ["/usr/bin/mackesd", "recovery"]
+        )
+        assert helper.command_is_lifecycle_mutation(
             ["/usr/bin/bash", "-c", "/usr/bin/mde-enroll"]
         )
         assert not helper.command_is_lifecycle_mutation(
             ["/usr/bin/ssh", "seat", "echo join"]
+        )
+        assert not helper.command_is_lifecycle_mutation(
+            ["/usr/bin/ssh", "seat", "echo add-peer"]
         )
         assert not helper.command_is_lifecycle_mutation(["/usr/bin/true"])
         os.environ["JOIN_TOKEN"] = "must-not-leak-token"
