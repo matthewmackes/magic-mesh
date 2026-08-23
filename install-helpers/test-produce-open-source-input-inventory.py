@@ -76,6 +76,16 @@ def main() -> None:
         assert families["app-vm"]["receipt_revision"] == APP_RECEIPT
         assert families["app-vm"]["resolved_digest"].startswith("sha256:")
         assert families["app-vm"]["containerfile_pin"] == ADMITTED_PIN
+        leftover = families["app-vm"]["leftover"]
+        dest = Path("/root/mcnf-private/app-catalog-curated.json")
+        if dest.is_file() and not dest.is_symlink():
+            refs = families["app-vm"]["catalog_refs"]
+            assert refs and refs[0].startswith("org.libreoffice.LibreOffice@sha256:")
+            assert families["app-vm"]["catalog_remote"] == "curated"
+            assert "Flathub LibreOffice dest bound" in leftover
+        else:
+            assert "remain leftover" in leftover
+            assert "catalog_refs" not in families["app-vm"]
         assert families["bootc"]["receipt_revision"] == BOOTC_RECEIPT
         assert families["bootc"]["release_role"] == "all-roles"
         assert families["bootc"]["containerfile_pin"] == ADMITTED_PIN
@@ -119,6 +129,20 @@ def main() -> None:
         assert fixture.returncode == 2
         assert "fixture catalog ref" in fixture.stderr
         assert not (root / "fixture-catalog.json").exists()
+
+        invented = invoke(
+            "produce",
+            "--catalog-ref",
+            "org.gimp.GIMP@sha256:" + ("ab" * 32),
+            "--output",
+            str(root / "invented-catalog.json"),
+        )
+        assert invented.returncode == 2
+        assert (
+            "do not invent catalog refs" in invented.stderr
+            or "dest-backed LibreOffice pin" in invented.stderr
+        )
+        assert not (root / "invented-catalog.json").exists()
 
         admitted = json.loads(previous)
         for row in admitted["families"]:

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # leftover-units.sh — leftover demand after cargo is fresh at a clean HEAD.
+# dest-operator / keep / release-wait are fail-closed (secrets, keep-lint,
+# freeze predecessors). They are not a place to park an open-source choice;
+# if a dest-backed open-source path exists, take it (source / live-seat).
 #
 # farm-jobs.sh / farm-reconcile.sh only see @farm:{cargo …}. Once those
 # results match HEAD, slots go idle while Remaining epics still have dest,

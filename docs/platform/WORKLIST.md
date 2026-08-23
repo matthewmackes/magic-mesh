@@ -737,20 +737,20 @@ is a capacity incident (§10.0.3), not a silent retry.
   (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
   App VM, Browser VM, and bootc ARGs and inventory pins match `3a5e74e6…`.
   Surface `bootc_base` stays null (blocked stack must not guess a digest).
-  Leftover is Maps `production_admitted`, RPM signer after freeze, S7
-  `REPLACE_*`, Surface `bootc_base` null. Flathub LibreOffice dest is
-  bound (`WL-REL-006-2026-08-23-flathub-libreoffice-catalog-r1.md`;
-  sha256 `de95022649b2a444791cdca3c88211c8bb06b8ed1a3a64f44f8b0034e6dd3e37`).
-  Do not invent refs or flip `production_admitted`; bind to `7e3474eeb`.
+  Catalog choice is dest-backed Flathub LibreOffice (office guest), not a
+  parked ref. Evidence:
+  `WL-REL-006-2026-08-23-flathub-catalog-chosen-r1.md`. Leftover is Maps
+  `production_admitted`, RPM signer after freeze, S7 Maps/RPM `REPLACE_*`,
+  Surface `bootc_base` null. Do not flip `production_admitted`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
        licenses, and the existing receipt/verifier contracts.
      - Action: six-role redacted inventory is recorded; do not reopen source
        selection. Browser VM Containerfile pin now matches the admitted index
-       `3a5e74e6…`. Leftover is Maps `production_admitted`, App catalog real
-       refs, RPM signer receipt after freeze (WL-REL-001), S7 `REPLACE_*`, and
-       live-seat dest (WL-TEST-002).
+       `3a5e74e6…`.        Leftover is Maps `production_admitted`, RPM signer after freeze,
+       S7 Maps/RPM `REPLACE_*`, Surface `bootc_base`, and live-seat dest
+       (WL-TEST-002). App catalog choice is Flathub LibreOffice dest.
      - Deliverable: redacted open-source input inventory and license manifest.
       - Validation: every source is redistributable and its credential/preflight
        requirements are machine-verifiable;
@@ -799,9 +799,9 @@ is a capacity incident (§10.0.3), not a silent retry.
        Current-revision App VM receipt is bound to `aca7573bc` on `.90` slot 0
        (`WL-REL-006-2026-08-22-app-vm-receipt-r1.md`). Historical `0e0cd1b3`
        receipt is stale vs HEAD. Containerfile pin now matches admitted index
-       `3a5e74e6…` (`WL-REL-006-2026-08-22-app-vm-base-pin-r1.md`). Leftover is
-       catalog/`curated` remote plus S7 App-catalog `REPLACE_*`; do not claim
-       the release-input gate closed.
+       `3a5e74e6…` (`WL-REL-006-2026-08-22-app-vm-base-pin-r1.md`).
+       Catalog choice is dest-backed Flathub LibreOffice. Leftover is S7
+       Maps/RPM `REPLACE_*`; do not claim the release-input gate closed.
      - Deliverable: immutable App VM digest, base receipt, catalog publication
        object, exact-ref inventory, compatibility metadata, and license record.
      - Validation: App VM producer/inspector and build-image admission pass;

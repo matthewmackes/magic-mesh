@@ -2,9 +2,10 @@
 """Emit the redacted six-role open-source input inventory (schema 1).
 
 Records the already-selected Maps, App VM, bootc, Browser VM, RPM, and
-UX-014 families. Does not reopen source selection, invent Flatpak catalog
-refs, admit Maps production, or treat Android/Cuttlefish as a production
-family. No network.
+UX-014 families. The App VM catalog choice is dest-backed Flathub
+LibreOffice when `/root/mcnf-private/app-catalog-curated.json` exists.
+Does not invent other Flatpak refs, admit Maps production, or treat
+Android/Cuttlefish as a production family. No network.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -29,6 +31,9 @@ MAPS_DEST = "/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles"
 MAPS_SHA256 = "6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895"
 RPM_FINGERPRINT = "06B1C27EA0E08A225155EB3314018AA1497DDC7C"
 CATALOG_DEST = Path("/root/mcnf-private/app-catalog-curated.json")
+CHOSEN_CATALOG_REF = re.compile(
+    r"\Aorg\.libreoffice\.LibreOffice@sha256:[0-9a-f]{64}\Z"
+)
 
 
 class Refusal(ValueError):
@@ -66,22 +71,67 @@ def check_family_names(names: list[str]) -> None:
         refuse("families must be exactly the six-role set")
 
 
-def check_catalog_refs(refs: list[str]) -> None:
-    for ref in refs:
-        if catalog_ref_is_fixture(ref):
-            refuse(f"{FIXTURE_CATALOG_REF} is a fixture catalog ref, not a production catalog ref")
-        refuse("production App catalog refs are leftover; do not invent catalog refs")
-
-
-def app_vm_catalog_leftover() -> str:
+def load_curated_catalog() -> dict[str, object] | None:
     dest = CATALOG_DEST
     try:
         meta = dest.lstat()
     except OSError:
-        return "real curated catalog refs remain leftover"
+        return None
     if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
-        return "real curated catalog refs remain leftover"
-    return "Flathub curated dest bound; production_admitted remains false"
+        return None
+    body = dest.read_bytes()
+    if not body or len(body) > MAX_INVENTORY:
+        refuse("curated catalog dest size is outside the allowed bound")
+    try:
+        value = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda item: refuse(f"non-finite JSON number: {item}"),
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        refuse(f"curated catalog dest is malformed: {exc}")
+    if not isinstance(value, dict):
+        refuse("curated catalog dest must be one JSON object")
+    refs = value.get("refs")
+    remote = value.get("remote")
+    if not isinstance(refs, list) or not refs or remote != "curated":
+        refuse("curated catalog dest is not the chosen Flathub remote")
+    pinned: list[str] = []
+    for ref in refs:
+        if not isinstance(ref, str) or CHOSEN_CATALOG_REF.fullmatch(ref) is None:
+            refuse("curated catalog dest is not the chosen LibreOffice pin")
+        if catalog_ref_is_fixture(ref):
+            refuse(f"{FIXTURE_CATALOG_REF} is a fixture catalog ref, not a production catalog ref")
+        pinned.append(ref)
+    return {
+        "catalog_sha256": hashlib.sha256(body).hexdigest(),
+        "refs": pinned,
+        "remote": "curated",
+    }
+
+
+def check_catalog_refs(refs: list[str]) -> None:
+    catalog = load_curated_catalog()
+    for ref in refs:
+        if catalog_ref_is_fixture(ref):
+            refuse(f"{FIXTURE_CATALOG_REF} is a fixture catalog ref, not a production catalog ref")
+        if catalog is None:
+            refuse("production App catalog refs are leftover; do not invent catalog refs")
+        if ref not in catalog["refs"]:
+            refuse("catalog ref is not the dest-backed LibreOffice pin")
+
+
+def app_vm_catalog_fields() -> dict[str, object]:
+    catalog = load_curated_catalog()
+    if catalog is None:
+        return {"leftover": "real curated catalog refs remain leftover"}
+    return {
+        "catalog_dest": str(CATALOG_DEST),
+        "catalog_refs": catalog["refs"],
+        "catalog_remote": "curated",
+        "catalog_sha256": catalog["catalog_sha256"],
+        "leftover": "Flathub LibreOffice dest bound; production_admitted remains false",
+    }
 
 
 def selected_families() -> list[dict[str, object]]:
@@ -105,7 +155,7 @@ def selected_families() -> list[dict[str, object]]:
             ),
             "family": "app-vm",
             "image_reference": "quay.io/fedora/fedora:42",
-            "leftover": app_vm_catalog_leftover(),
+            **app_vm_catalog_fields(),
             "license": "Fedora Project terms",
             "profile": "wayland-standard",
             "receipt_revision": "aca7573bc",
