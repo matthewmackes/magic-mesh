@@ -403,15 +403,13 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: dests exist at `/root/mcnf-private/bootstrap-ssh-key` (0600) and
-  `bootstrap-known-hosts` (0400); env `bootstrap-ssh.env` (0400). Child-only runner
-  sources dests; enroll/add-peer/recovery/join mutation argv refuse; CA, Caddy, and enroll TUI children strip dest env.
-  `mint-enroll-bearer.py` wraps `enroll-token`; `/root/mcnf-private` dests refuse
-  until dest-backed candidate admit; production mutation pins seat-update-warning. Seat 15 enrolled.
-  Freeze bar still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:
-  `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`,
-  `WL-FUNC-023-2026-08-22-bootstrap-identity-provision-r1.md`,
-  `WL-FUNC-023-2026-08-22-bootstrap-env-bind-r1.md`,
-  `WL-FUNC-023-2026-08-22-bootstrap-env-run-r1.md`, dest-env strip r1, mint child strip r1.
+  `bootstrap-known-hosts` (0400); env `bootstrap-ssh.env` (0400). Unpublished
+  signed 13.0.0 dest is bound (`unpublished-signed-candidate.json`,
+  `production_admitted: false`; `WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`).
+  Child-only runner sources dests; mutation argv refuse; dest-env strip remains.
+  `mint-enroll-bearer.py` wraps `enroll-token`. Seat 15 enrolled. Freeze bar
+  still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:
+  `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`, dest-env strip r1.
 - Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer
   through live lifecycle authority (helper exists; this unit did not invoke Seat 15
   mackesd), (2) child-only runner sources dests for a worker only (login env unset),
@@ -621,14 +619,13 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit
   on the protected default branch and bind every release input, version surface,
   note, and tag plan to it.
-- Current state: input-generation candidate is
-  2872293b1393fdb6d645170cea30fc7d1682569d epoch 1787447942 (clean, equals
-  upstream; `WL-REL-001-2026-08-22-input-candidate-r1.md`). This is not the
-  final freeze. Superseded r2 receipt 1dfe6906 must not receive new inputs.
-  S2 13.0.0 metadata remains
+- Current state: dest-cut SHA is 7e3474eeb16cb8c4b8c9a378bfcd1f9c45f5e4ac
+  epoch 1787450205 (maps-verifier lock refresh after 2872293b1 `--locked`
+  refuse). Unpublished signed dest is bound; this is not the final freeze.
+  Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
   `WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Final S1/S4 freeze
   still waits on live FUNC-023 enroll, then REL-006 admission and
-  reconfirmation of this same SHA.
+  reconfirmation of the dest-cut SHA.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded; final freeze BLOCKED
      on live FUNC-023 enroll: 2872293b1 / 1787447942 is the input-generation
@@ -873,11 +870,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
 - Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable private production-candidate handoff.
-- Current state: hostile prepare-path evidence is in
-  `evidence/WL-REL-002-2026-08-16-hostile-boundary-r1.md` and
-  `evidence/WL-REL-002-2026-08-16-private-object-driver-r1.md`; the driver
-  accepts the strict private object directly, but WL-REL-001 is blocked and
-  no current-revision three-RPM handoff exists.
+- Current state: unpublished signed 13.0.0 three-RPM dest is bound
+  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`;
+  `production_admitted: false`). Container-F44 cut of 7e3474eeb, not official
+  prepare (Maps/catalog `REPLACE_*` remain; `.131` native F44 is down).
+  Hostile prepare-path evidence remains
+  `WL-REL-002-2026-08-16-hostile-boundary-r1.md`. Not freeze.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
