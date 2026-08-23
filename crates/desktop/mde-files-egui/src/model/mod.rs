@@ -361,6 +361,61 @@ pub const LOCAL_SPOTS: &[LocalSpot] = &[
     },
 ];
 
+/// Persist key for one folder's view / sort / show-hidden prefs.
+///
+/// Sidebar shortcuts (`local:home`, `local:docs`, …) and the absolute
+/// path they resolve to are the same folder. Lock 20 persists per
+/// folder, so both routes share one store entry — otherwise a restart
+/// that opens Home after the operator set Details via the filesystem
+/// tree would drop the preference.
+fn folder_prefs_key(backend_path: &str) -> String {
+    if let Some(rest) = backend_path.strip_prefix("local:") {
+        if let Some(resolved) = resolve_local_pref_path(rest) {
+            return resolved;
+        }
+    }
+    backend_path.to_string()
+}
+
+/// Map a `local:<slug>[/<subpath>]` tail the same way
+/// [`mde_files::backend::LocalFsBackend`] does, so prefs keys match
+/// the absolute paths `open_row` records on descent.
+fn resolve_local_pref_path(rest: &str) -> Option<String> {
+    let (slug, sub) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+        None => (rest, ""),
+    };
+    if sub.split('/').any(|seg| seg == ".." || seg.contains('\0')) {
+        return None;
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
+    let base = match slug {
+        "home" => home?,
+        "docs" => home?.join("Documents"),
+        "pics" => home?.join("Pictures"),
+        "music" => home?.join("Music"),
+        "videos" => home?.join("Videos"),
+        "code" => home?.join("code"),
+        "downloads" => home?.join("Downloads"),
+        "root" => PathBuf::from("/"),
+        _ => return None,
+    };
+    let resolved = if sub.is_empty() {
+        base
+    } else {
+        let mut joined = base;
+        for segment in sub.split('/') {
+            if !segment.is_empty() {
+                joined.push(segment);
+            }
+        }
+        joined
+    };
+    Some(resolved.to_string_lossy().into_owned())
+}
+
 /// A user-pinnable Places bookmark (lock 21). Path is a local backend route
 /// (absolute `/…` or a `local:` slug); mesh peers stay a live roster section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1868,7 +1923,8 @@ impl FileBrowser {
     pub fn reload(&mut self, pane: usize) {
         let ti = self.tab_index(pane);
         let loc = self.panes[pane].tabs[ti].location.clone();
-        let key = loc.backend_path();
+        let list_path = loc.backend_path();
+        let key = folder_prefs_key(&list_path);
         let prefs = self.folder_prefs.get(&key).copied().unwrap_or_default();
         // A folder visit is a use of its remembered presentation. Keep the
         // persisted order honest so the bounded store evicts the least
@@ -1877,7 +1933,7 @@ impl FileBrowser {
         if self.folder_prefs.contains_key(&key) {
             self.touch_folder_pref(&key);
         }
-        let listing = self.backend.list(&key);
+        let listing = self.backend.list(&list_path);
         let tab = &mut self.panes[pane].tabs[ti];
         match listing {
             Ok(all) => {
@@ -1892,7 +1948,7 @@ impl FileBrowser {
         tab.view = prefs.view;
         tab.sort = prefs.sort;
         tab.show_hidden = prefs.show_hidden;
-        tab.path_edit = key;
+        tab.path_edit = list_path;
         tab.recompute();
     }
 
@@ -2313,7 +2369,7 @@ impl FileBrowser {
         let (key, prefs) = {
             let tab = &self.panes[pane].tabs[ti];
             (
-                tab.location.backend_path(),
+                folder_prefs_key(&tab.location.backend_path()),
                 FolderPrefs {
                     view: tab.view,
                     sort: tab.sort,
@@ -3690,17 +3746,22 @@ impl FileBrowser {
             Ok(file) => {
                 self.folder_prefs.clear();
                 self.folder_prefs_lru.clear();
-                // Writer order is oldest-first. Keep the most recently stored
-                // CAP entries; a hostile over-cap or duplicate list must not
-                // grow the in-memory map, and the drop is an honest note
+                // Writer order is oldest-first. Walk newest-first so a
+                // `local:` slug and its absolute alias keep the later write,
+                // then cap unique keys. A hostile over-cap or duplicate list
+                // must not grow the in-memory map; the drop is an honest note
                 // (in-memory only — the on-disk bytes stay until a mutation).
                 let stored = file.entries.len();
-                for entry in file.entries.into_iter().rev().take(FOLDER_PREFS_CAP).rev() {
-                    if self.folder_prefs.contains_key(&entry.path) {
+                for entry in file.entries.into_iter().rev() {
+                    let key = folder_prefs_key(&entry.path);
+                    if key.is_empty() || self.folder_prefs.contains_key(&key) {
                         continue;
                     }
-                    self.folder_prefs_lru.push_back(entry.path.clone());
-                    self.folder_prefs.insert(entry.path, entry.prefs);
+                    if self.folder_prefs.len() >= FOLDER_PREFS_CAP {
+                        continue;
+                    }
+                    self.folder_prefs_lru.push_front(key.clone());
+                    self.folder_prefs.insert(key, entry.prefs);
                 }
                 let dropped = stored.saturating_sub(self.folder_prefs.len());
                 if dropped > 0 {
@@ -4233,5 +4294,104 @@ mod tests {
             .find(|e| e.path == "/work")
             .expect("flushed /work");
         assert_eq!(entry.prefs.view, ViewMode::Grid);
+    }
+
+    // WL-FUNC-026 — sidebar `local:` shortcuts and the absolute path they
+    // resolve to are one folder. View, sort, and show-hidden must share a
+    // persist key so a restart that opens Home (or navigates to $HOME)
+    // keeps the presentation set from either route.
+    #[test]
+    fn folder_prefs_alias_local_slug_and_absolute_path_across_restart() {
+        let home = std::env::var("HOME").expect("HOME is set in farm/dev");
+        let docs = format!("{home}/Documents");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut b = live_posix_browser(Vec::new()).with_config_dir(temp.path());
+        b.set_view(0, ViewMode::Details);
+        b.sort_by(0, SortKey::Modified);
+        b.toggle_hidden(0);
+        b.toggle_dirs_first(0);
+        assert_eq!(
+            b.folder_prefs().get(&home).map(|p| p.view),
+            Some(ViewMode::Details),
+            "Home shortcut must persist under the resolved home path"
+        );
+        assert!(
+            !b.folder_prefs().contains_key("local:home"),
+            "slug aliases must not take a second store slot"
+        );
+        assert_eq!(b.active_tab().sort().key, SortKey::Modified);
+        assert!(b.active_tab().show_hidden());
+        assert!(!b.active_tab().sort().dirs_first);
+
+        b.navigate(0, Location::Local("local:docs".into()));
+        b.set_view(0, ViewMode::Grid);
+        assert_eq!(
+            b.folder_prefs().get(&docs).map(|p| p.view),
+            Some(ViewMode::Grid)
+        );
+        b.flush_persisted();
+        drop(b);
+
+        let mut b2 = live_posix_browser(Vec::new()).with_config_dir(temp.path());
+        assert_eq!(
+            b2.active_tab().view(),
+            ViewMode::Details,
+            "construction at local:home must hydrate the canonical home prefs"
+        );
+        assert_eq!(b2.active_tab().sort().key, SortKey::Modified);
+        assert!(b2.active_tab().show_hidden());
+        assert!(!b2.active_tab().sort().dirs_first);
+
+        b2.navigate(0, Location::Local(home.clone()));
+        assert_eq!(
+            b2.active_tab().view(),
+            ViewMode::Details,
+            "absolute $HOME is the same folder as local:home"
+        );
+        b2.navigate(0, Location::Local(docs));
+        assert_eq!(
+            b2.active_tab().view(),
+            ViewMode::Grid,
+            "absolute Documents is the same folder as local:docs"
+        );
+    }
+
+    #[test]
+    fn folder_prefs_hydrate_collapses_slug_and_absolute_aliases() {
+        let home = std::env::var("HOME").expect("HOME is set in farm/dev");
+        let dir = tempfile::tempdir().expect("store dir");
+        let store = dir.path().join(super::FOLDER_PREFS_FILE);
+        let entries = vec![
+            super::FolderPrefsStored {
+                path: "local:home".to_string(),
+                prefs: FolderPrefs {
+                    view: ViewMode::List,
+                    ..FolderPrefs::default()
+                },
+            },
+            super::FolderPrefsStored {
+                path: home.clone(),
+                prefs: FolderPrefs {
+                    view: ViewMode::Grid,
+                    show_hidden: true,
+                    ..FolderPrefs::default()
+                },
+            },
+        ];
+        super::write_json_store(&store, &super::FolderPrefsFile { entries }).expect("seed");
+        let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
+        assert_eq!(
+            b.folder_prefs().len(),
+            1,
+            "slug + absolute aliases collapse to one entry"
+        );
+        let prefs = b
+            .folder_prefs()
+            .get(&home)
+            .copied()
+            .expect("canonical home");
+        assert_eq!(prefs.view, ViewMode::Grid, "newer write wins the alias");
+        assert!(prefs.show_hidden);
+        assert_eq!(b.active_tab().view(), ViewMode::Grid);
     }
 }

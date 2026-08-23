@@ -4039,6 +4039,52 @@ fn activity_voice_admin_is_honestly_empty_without_a_provisioned_account() {
 }
 
 #[test]
+fn activity_voice_admin_stays_closed_while_awaiting_vitelity_master_key() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    let awaiting = ActivityAdminSnapshot {
+        voice_nodes: vec![VoiceNodeProjection {
+            node_id: "peer:eagle".to_owned(),
+            hostname: "eagle".to_owned(),
+            username: "eagle".to_owned(),
+            sip_uri: "eagle@sip.vitelity.net".to_owned(),
+            reg_state: VoiceRegState::Provisioning,
+            routed_dids: Vec::new(),
+            failover: None,
+            updated_at_s: 1_700_000_000,
+        }],
+        ..ActivityAdminSnapshot::default()
+    };
+    let shapes = render_activity_admin(&mut surface, &data, &awaiting);
+    let texts = painted_text(&shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("Awaiting Vitelity master key")),
+        "derived username while Provisioning must name the leftover, not unlock the console: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, _)| text.contains("No provisioned voice account")),
+        "awaiting-master-key must not reuse the blank-empty headline: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, _)| text == "DID routing" || text == "Failover policy"),
+        "DID/failover must stay closed until Registered/Unregistered: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.contains("eagle@sip.vitelity.net")),
+        "the fleet board must still paint the retained awaiting row: {texts:?}"
+    );
+}
+
+#[test]
 fn activity_voice_admin_renders_retained_projections_and_round_trips_verbs() {
     let data = FixtureData::demo();
     let mut surface = CommunicationsSurface::new();

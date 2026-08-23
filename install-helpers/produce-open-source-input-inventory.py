@@ -10,8 +10,10 @@ family. No network.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +28,7 @@ FIXTURE_CATALOG_REF = "org.example.App"
 MAPS_DEST = "/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles"
 MAPS_SHA256 = "6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895"
 RPM_FINGERPRINT = "06B1C27EA0E08A225155EB3314018AA1497DDC7C"
+CATALOG_DEST = Path("/root/mcnf-private/app-catalog-curated.json")
 
 
 class Refusal(ValueError):
@@ -70,6 +73,17 @@ def check_catalog_refs(refs: list[str]) -> None:
         refuse("production App catalog refs are leftover; do not invent catalog refs")
 
 
+def app_vm_catalog_leftover() -> str:
+    dest = CATALOG_DEST
+    try:
+        meta = dest.lstat()
+    except OSError:
+        return "real curated catalog refs remain leftover"
+    if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
+        return "real curated catalog refs remain leftover"
+    return "Flathub curated dest bound; production_admitted remains false"
+
+
 def selected_families() -> list[dict[str, object]]:
     return [
         {
@@ -91,7 +105,7 @@ def selected_families() -> list[dict[str, object]]:
             ),
             "family": "app-vm",
             "image_reference": "quay.io/fedora/fedora:42",
-            "leftover": "real curated catalog refs remain leftover",
+            "leftover": app_vm_catalog_leftover(),
             "license": "Fedora Project terms",
             "profile": "wayland-standard",
             "receipt_revision": "aca7573bc",

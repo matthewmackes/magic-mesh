@@ -407,19 +407,16 @@ is a capacity incident (§10.0.3), not a silent retry.
   identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: leftover (1) dest `/root/mcnf-private/enroll-bearer` (0600)
-  from live LH1 `enroll-token` (`mcnf-clean-20260728`). Leftover (2) child-only
-  dest-env run proved dest vars in the child only; login env unset. Sidecars
-  `enroll-bearer.json` and `bootstrap-ssh-env-live-r2.json` stay
-  `production_admitted: false` / `enroll_succeeded: false`. Evidence:
-  `WL-FUNC-023-2026-08-23-live-enroll-bearer-mint-r1.md`,
-  `WL-FUNC-023-2026-08-23-live-dest-env-child-r1.md`,
-  `WL-FUNC-023-2026-08-23-leftover3-confirm-dest-r1.md`.
-- Remaining work: leftover (3) live enroll or authorized offboard+reenroll
-  under red `AI-GENERATED-ALERT` + 5s. Seat 15 is enrolled. `leave` needs a
-  signed `LifecycleConfirmationV1`; no confirmation-signing dest exists
-  under `/root/mcnf-private`. Do not invent that key. SshBootstrap refuses
-  enrolled peers. LH1 `:4243` is reachable. GPT Luna: execute S1-S18.
+- Current state: leftover (1) bearer dest and leftover (2) dest-env child
+  remain. Leftover (3) ran on Seat 15: dest-signed `leave`, then `join`
+  with DER enroll-endpoint pin. Overlay `10.42.0.5` rematerialized;
+  `nebula.service` is active. Confirmation dest
+  `lifecycle-confirmation-ed25519` `0600`. Evidence:
+  `WL-FUNC-023-2026-08-23-leftover3-offboard-reenroll-r1.md`.
+  `production_admitted: false`.
+- Remaining work: S1-S18 Luna execute still listed. Installed
+  `enroll --token-stdin` is the retired CSR path; live leftover (3) used
+  current-tree `join`. Do not flip `production_admitted`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -728,11 +725,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
   App VM, Browser VM, and bootc ARGs and inventory pins match `3a5e74e6…`.
   Surface `bootc_base` stays null (blocked stack must not guess a digest).
-  Leftover is Maps `production_admitted`, real catalog refs, RPM signer after
-  freeze, S7 `REPLACE_*`, live-seat dest. Operator 2026-08-23 authorized
-  Remaining; do not invent catalog refs or flip `production_admitted`. Bind
-  new receipts to 2872293b1 (`WL-REL-001-2026-08-22-input-candidate-r1.md`),
-  not 1dfe6906. Evidence: `WL-REL-006-2026-08-22-leftover-park-r1.md`.
+  Leftover is Maps `production_admitted`, RPM signer after freeze, S7
+  `REPLACE_*`, Surface `bootc_base` null. Flathub LibreOffice dest is
+  bound (`WL-REL-006-2026-08-23-flathub-libreoffice-catalog-r1.md`;
+  `catalog_sha256=de95022649b2a444791cdca3c88211c8bb06b8ed1a3a64f44f8b0034e6dd3e37`).
+  Do not invent more refs or flip `production_admitted`. Bind new receipts
+  to dest-cut `7e3474eeb`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable

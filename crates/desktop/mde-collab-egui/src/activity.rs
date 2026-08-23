@@ -182,10 +182,19 @@ pub struct VoiceNodeProjection {
 }
 
 impl VoiceNodeProjection {
-    /// Whether this node has a provisioned sub-account (a non-empty username).
+    /// Whether this node has a sealed inbound sub-account.
+    ///
+    /// Matches `voice_provision::is_reprovisioned`: only `Registered` or
+    /// `Unregistered` count. A derived username in `Provisioning` is the
+    /// worker's honest "awaiting the master key / live Vitelity" row — not a
+    /// provisioned account. `Error` is a failed pass, never a fake online.
     #[must_use]
     pub fn is_provisioned(&self) -> bool {
         !self.username.trim().is_empty()
+            && matches!(
+                self.reg_state,
+                VoiceRegState::Registered | VoiceRegState::Unregistered
+            )
     }
 }
 
@@ -1393,6 +1402,84 @@ pub fn has_provisioned_voice_account(nodes: &[VoiceNodeProjection]) -> bool {
     nodes.iter().any(VoiceNodeProjection::is_provisioned)
 }
 
+/// Resolve a fleet-board target from the wire `node_id`, a unique hostname,
+/// or a unique sub-account username. The published verb always carries the
+/// worker's `node_id`. Ambiguous hostnames/usernames refuse as unknown.
+pub fn resolve_voice_node<'a>(
+    nodes: &'a [VoiceNodeProjection],
+    identity: &str,
+) -> Result<&'a VoiceNodeProjection, VoiceAdminRefuse> {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err(VoiceAdminRefuse::UnknownNode);
+    }
+    if let Some(node) = nodes.iter().find(|row| row.node_id == identity) {
+        return Ok(node);
+    }
+    let by_host: Vec<&VoiceNodeProjection> = nodes
+        .iter()
+        .filter(|row| row.hostname == identity)
+        .collect();
+    if by_host.len() == 1 {
+        return Ok(by_host[0]);
+    }
+    if by_host.len() > 1 {
+        return Err(VoiceAdminRefuse::UnknownNode);
+    }
+    let by_user: Vec<&VoiceNodeProjection> = nodes
+        .iter()
+        .filter(|row| !row.username.is_empty() && row.username == identity)
+        .collect();
+    if by_user.len() == 1 {
+        return Ok(by_user[0]);
+    }
+    Err(VoiceAdminRefuse::UnknownNode)
+}
+
+/// Operator copy when the fleet board has rows but none are Registered /
+/// Unregistered. Distinguishes awaiting-master-key / live-provider from a
+/// blank snapshot so the leftover Vitelity gate cannot look provisioned.
+#[must_use]
+pub fn voice_unprovisioned_headline(nodes: &[VoiceNodeProjection]) -> &'static str {
+    if nodes.is_empty() {
+        return "No provisioned voice account";
+    }
+    if nodes
+        .iter()
+        .any(|node| matches!(node.reg_state, VoiceRegState::Error { .. }))
+    {
+        return "Voice provider error";
+    }
+    if nodes
+        .iter()
+        .all(|node| matches!(node.reg_state, VoiceRegState::Provisioning))
+    {
+        return "Awaiting Vitelity master key";
+    }
+    "No provisioned voice account"
+}
+
+/// Longer empty-state body under [`voice_unprovisioned_headline`].
+#[must_use]
+pub fn voice_unprovisioned_detail(nodes: &[VoiceNodeProjection]) -> &'static str {
+    if nodes.is_empty() {
+        return "DID routing, failover, shared-outbound, and cutover stay empty until a node has a sub-account.";
+    }
+    if nodes
+        .iter()
+        .any(|node| matches!(node.reg_state, VoiceRegState::Error { .. }))
+    {
+        return "Provider has not sealed a sub-account. The fleet board shows the honest error.";
+    }
+    if nodes
+        .iter()
+        .all(|node| matches!(node.reg_state, VoiceRegState::Provisioning))
+    {
+        return "Enrolled nodes are awaiting a sealed Vitelity master key or a live provider pass. DID routing stays closed until a node is Registered or Unregistered.";
+    }
+    "DID routing, failover, shared-outbound, and cutover stay empty until a node is Registered or Unregistered."
+}
+
 /// Admit a DID-route verb at the UI boundary. Invalid DIDs, unknown nodes, and
 /// conflicting in-flight routes refuse; a DID not in the master inventory is
 /// an invalid DID (route-existing only).
@@ -1410,21 +1497,16 @@ pub fn validate_did_route(
     if !is_valid_did(did) || !inventory.iter().any(|row| row.number == did) {
         return Err(VoiceAdminRefuse::InvalidDid);
     }
-    let node_id = node_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToOwned::to_owned);
-    if let Some(ref node) = node_id {
-        if !nodes.iter().any(|row| row.node_id == *node) {
-            return Err(VoiceAdminRefuse::UnknownNode);
+    let node_id = match node_id {
+        None => None,
+        Some(identity) => {
+            let node = resolve_voice_node(nodes, identity)?;
+            if !node.is_provisioned() {
+                return Err(VoiceAdminRefuse::NoProvisionedAccount);
+            }
+            Some(node.node_id.clone())
         }
-        if !nodes
-            .iter()
-            .any(|row| row.node_id == *node && row.is_provisioned())
-        {
-            return Err(VoiceAdminRefuse::NoProvisionedAccount);
-        }
-    }
+    };
     if pending.iter().any(|(pending_did, pending_node)| {
         pending_did == did && pending_node.as_deref() != node_id.as_deref()
     }) {
@@ -1445,16 +1527,11 @@ pub fn validate_failover(
     if !has_provisioned_voice_account(nodes) {
         return Err(VoiceAdminRefuse::NoProvisionedAccount);
     }
-    let node_id = node_id.trim();
-    if node_id.is_empty() || !nodes.iter().any(|row| row.node_id == node_id) {
-        return Err(VoiceAdminRefuse::UnknownNode);
-    }
-    if !nodes
-        .iter()
-        .any(|row| row.node_id == node_id && row.is_provisioned())
-    {
+    let node = resolve_voice_node(nodes, node_id)?;
+    if !node.is_provisioned() {
         return Err(VoiceAdminRefuse::NoProvisionedAccount);
     }
+    let node_id = node.node_id.as_str();
     if let VoiceFailoverPolicy::Forward { ref number } = policy {
         if !is_valid_did(number) {
             return Err(VoiceAdminRefuse::InvalidDid);
@@ -2470,8 +2547,8 @@ fn voice_admin_panel(
                 ui.add_space(Style::SP_S);
                 widgets::WorkspaceStatePanel::new(
                     widgets::WorkspaceState::Empty,
-                    "No provisioned voice account",
-                    "DID routing, failover, shared-outbound, and cutover stay empty until a node has a sub-account.",
+                    voice_unprovisioned_headline(nodes),
+                    voice_unprovisioned_detail(nodes),
                 )
                 .show(ui, |_| {});
                 for note in voice_projection_empty_notes(
@@ -2578,6 +2655,12 @@ fn voice_fleet_board(
                     Style::typography_text(&node.hostname, TypographyRole::Caption)
                         .color(theme_color(ui, Style::TEXT)),
                 );
+                if node.node_id != node.hostname {
+                    ui.label(
+                        Style::typography_text(&node.node_id, TypographyRole::Caption)
+                            .color(theme_color(ui, Style::TEXT_DIM)),
+                    );
+                }
                 let state_label = match &node.reg_state {
                     VoiceRegState::Error { reason } => format!("error: {reason}"),
                     other => other.wire_tag().to_owned(),
@@ -2664,13 +2747,13 @@ fn voice_did_routing(
                 .hint_text("15551234567"),
         );
         ui.label(
-            Style::typography_text("Node id", TypographyRole::Caption)
+            Style::typography_text("Node", TypographyRole::Caption)
                 .color(theme_color(ui, Style::TEXT_DIM)),
         );
         ui.add(
             egui::TextEdit::singleline(&mut form.route_node)
                 .desired_width(Style::SP_XL * 6.0)
-                .hint_text("peer:eagle"),
+                .hint_text("peer:eagle or hostname"),
         );
         if ui.button("Route DID").clicked() {
             let _ = apply_voice_admin(
@@ -2704,13 +2787,13 @@ fn voice_failover(
     );
     ui.horizontal_wrapped(|ui| {
         ui.label(
-            Style::typography_text("Node id", TypographyRole::Caption)
+            Style::typography_text("Node", TypographyRole::Caption)
                 .color(theme_color(ui, Style::TEXT_DIM)),
         );
         ui.add(
             egui::TextEdit::singleline(&mut form.failover_node)
                 .desired_width(Style::SP_XL * 6.0)
-                .hint_text("peer:eagle"),
+                .hint_text("peer:eagle or hostname"),
         );
         for (index, label) in ["Voicemail", "Forward", "None"].into_iter().enumerate() {
             if ui
@@ -3043,9 +3126,10 @@ mod tests {
 
     use super::{
         apply_gateway_form, apply_voice_admin, coalesced_activity_rows,
-        has_provisioned_voice_account, hydrate_gateway_readout, seed_voice_shared_form_state,
-        validate_cutover, validate_did_route, validate_failover, validate_gateway_clear,
-        validate_gateway_set, validate_shared_config, voice_projection_empty_notes,
+        has_provisioned_voice_account, hydrate_gateway_readout, resolve_voice_node,
+        seed_voice_shared_form_state, validate_cutover, validate_did_route, validate_failover,
+        validate_gateway_clear, validate_gateway_set, validate_shared_config,
+        voice_projection_empty_notes, voice_unprovisioned_detail, voice_unprovisioned_headline,
         workgroup_gateway_toml_path, ActivityAdminSnapshot, ActivityEntry, ActivityFilter,
         AlertInbox, GatewayCommand, GatewayFormIntent, GatewayFormOutcome, GatewayFormState,
         GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId, VoiceAdminCommand,
@@ -3362,6 +3446,101 @@ mod tests {
             validate_failover("peer:eagle", VoiceFailoverPolicy::Voicemail, &unprovisioned)
                 .unwrap_err(),
             VoiceAdminRefuse::NoProvisionedAccount
+        );
+    }
+
+    #[test]
+    fn derived_username_while_provisioning_is_not_a_provisioned_account() {
+        // voice_provision::awaiting_master_key publishes a hostname-derived
+        // username + sip_uri in Provisioning. That is not a sealed sub-account.
+        let awaiting = [VoiceNodeProjection {
+            node_id: "peer:eagle".to_owned(),
+            hostname: "eagle".to_owned(),
+            username: "eagle".to_owned(),
+            sip_uri: "eagle@sip.vitelity.net".to_owned(),
+            reg_state: VoiceRegState::Provisioning,
+            routed_dids: Vec::new(),
+            failover: None,
+            updated_at_s: 1_700_000_000,
+        }];
+        assert!(!awaiting[0].is_provisioned());
+        assert!(!has_provisioned_voice_account(&awaiting));
+        assert_eq!(
+            voice_unprovisioned_headline(&awaiting),
+            "Awaiting Vitelity master key"
+        );
+        assert_eq!(
+            voice_unprovisioned_detail(&awaiting),
+            "Enrolled nodes are awaiting a sealed Vitelity master key or a live provider pass. DID routing stays closed until a node is Registered or Unregistered."
+        );
+        assert_eq!(
+            validate_did_route(
+                "15551234567",
+                Some("eagle"),
+                &[inventory("15551234567", None)],
+                &awaiting,
+                &[]
+            )
+            .unwrap_err(),
+            VoiceAdminRefuse::NoProvisionedAccount
+        );
+        assert_eq!(
+            validate_failover("eagle", VoiceFailoverPolicy::Voicemail, &awaiting).unwrap_err(),
+            VoiceAdminRefuse::NoProvisionedAccount
+        );
+
+        let gated = [VoiceNodeProjection {
+            node_id: "peer:eagle".to_owned(),
+            hostname: "eagle".to_owned(),
+            username: "eagle".to_owned(),
+            sip_uri: String::new(),
+            reg_state: VoiceRegState::Error {
+                reason: "cannot list Vitelity sub-accounts: integration-gated".to_owned(),
+            },
+            routed_dids: Vec::new(),
+            failover: None,
+            updated_at_s: 1_700_000_000,
+        }];
+        assert!(!has_provisioned_voice_account(&gated));
+        assert_eq!(voice_unprovisioned_headline(&gated), "Voice provider error");
+        assert_eq!(
+            voice_unprovisioned_detail(&gated),
+            "Provider has not sealed a sub-account. The fleet board shows the honest error."
+        );
+    }
+
+    #[test]
+    fn route_and_failover_resolve_hostname_and_username_to_the_worker_node_id() {
+        let nodes = vec![provisioned_node("peer:eagle", "eagle", "eagle")];
+        let dids = vec![inventory("15551234567", Some("eagle"))];
+
+        assert_eq!(
+            resolve_voice_node(&nodes, "eagle")
+                .expect("hostname")
+                .node_id,
+            "peer:eagle"
+        );
+        let by_host = validate_did_route("15551234567", Some("eagle"), &dids, &nodes, &[])
+            .expect("hostname route");
+        assert_eq!(
+            by_host,
+            VoiceAdminCommand::DidRoute {
+                did: "15551234567".to_owned(),
+                node_id: Some("peer:eagle".to_owned()),
+            }
+        );
+        let by_user = validate_failover("eagle", VoiceFailoverPolicy::None, &nodes)
+            .expect("username failover");
+        assert_eq!(
+            by_user,
+            VoiceAdminCommand::Failover {
+                node_id: "peer:eagle".to_owned(),
+                policy: VoiceFailoverPolicy::None,
+            }
+        );
+        assert_eq!(
+            validate_did_route("15551234567", Some("peer:ghost"), &dids, &nodes, &[]).unwrap_err(),
+            VoiceAdminRefuse::UnknownNode
         );
     }
 
