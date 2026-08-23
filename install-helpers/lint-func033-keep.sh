@@ -3,7 +3,8 @@
 #
 # The Kamailio/RTPengine stack is deleted. Leftover is keep
 # `own_nebula_ip` in lib `voip_rtt.rs` (other mackesd paths still call it).
-# This gate fails if that function is removed, or if crates/ or packaging/
+# This gate fails if that function is removed, if no other mackesd path
+# still calls `voip_rtt::own_nebula_ip`, or if crates/ or packaging/
 # grow a live `mde-voice-config` / `kamailio-mde` / `rtpengine-mde` spawn.
 # Archive, ledger, evidence, salvage, and COMPLIANCE diary are out of scope.
 #
@@ -33,6 +34,23 @@ keep_present() {
   return 0
 }
 
+keep_callers() {
+  hits="$(
+    {
+      find "$ROOT/crates/mesh/mackesd" -type f -name '*.rs' \
+        ! -path '*/target/*' \
+        ! -name 'voip_rtt.rs' \
+        -print 2>/dev/null \
+      | xargs -r grep -l 'voip_rtt::own_nebula_ip' 2>/dev/null || true
+    }
+  )"
+  if [ -z "$hits" ]; then
+    echo "lint-func033-keep: REFUSED: no mackesd caller of voip_rtt::own_nebula_ip" >&2
+    return 1
+  fi
+  return 0
+}
+
 live_trees_clean() {
   hits="$(
     {
@@ -52,8 +70,9 @@ live_trees_clean() {
 
 scan() {
   keep_present
+  keep_callers
   live_trees_clean
-  echo "lint-func033-keep: PASS: own_nebula_ip kept; crates/packaging have no live PBX spawn"
+  echo "lint-func033-keep: PASS: own_nebula_ip kept with callers; crates/packaging have no live PBX spawn"
 }
 
 self_test() {
@@ -81,9 +100,19 @@ self_test() {
   printf '%s\n' 'pub fn own_nebula_ip() -> Option<String> { None }' \
     >"$td/crates/mesh/mackesd/src/voip_rtt.rs"
   if MCNF_FUNC033_ROOT="$td" "$0" >/dev/null 2>&1; then
-    echo "  ok: keep + clean trees pass"
+    echo "  FAIL: keep without callers should fail" >&2
+    fails=$((fails + 1))
   else
-    echo "  FAIL: keep + clean trees should pass" >&2
+    echo "  ok: keep without callers fails"
+  fi
+
+  mkdir -p "$td/crates/mesh/mackesd/src/cli"
+  printf '%s\n' 'let _ = mackesd_core::voip_rtt::own_nebula_ip();' \
+    >"$td/crates/mesh/mackesd/src/cli/leave.rs"
+  if MCNF_FUNC033_ROOT="$td" "$0" >/dev/null 2>&1; then
+    echo "  ok: keep + callers + clean trees pass"
+  else
+    echo "  FAIL: keep + callers + clean trees should pass" >&2
     fails=$((fails + 1))
   fi
 

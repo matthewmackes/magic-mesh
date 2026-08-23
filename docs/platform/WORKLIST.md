@@ -1704,7 +1704,7 @@ story execution contract above.
   cite deleting revisions. README telephony bullet names the softphone path
   only. Leftover is still keep `own_nebula_ip` in lib `voip_rtt.rs`.
   Keep lint `install-helpers/lint-func033-keep.sh` is in ci-gate
-  POLICY_LINTS (evidence `WL-FUNC-033-2026-08-22-keep-ci-gate-r1.md`).
+  POLICY_LINTS and requires a live caller (`WL-FUNC-033-2026-08-22-keep-caller-lint-r1.md`).
 - Remaining work: leftover is still keep `own_nebula_ip` in lib
   `voip_rtt.rs`. Then:
 

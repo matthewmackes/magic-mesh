@@ -73,6 +73,9 @@ pub fn parse_nebula_ip(stdout: &str) -> Option<String> {
 
 /// This peer's Nebula overlay IP (via `ip -4 addr show nebula1`).
 /// `None` when the interface is absent (pre-enrollment).
+///
+/// FUNC-033 leftover: keep this helper. Other mackesd paths still call it
+/// (`lint-func033-keep.sh` refuses a delete or a caller-less stub).
 #[must_use]
 pub fn own_nebula_ip() -> Option<String> {
     let out = Command::new("ip")
