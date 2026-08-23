@@ -58,13 +58,31 @@ fn intent_label(intent: Intent) -> &'static str {
     }
 }
 
+/// Dest identity and join-token env must not leak into first-boot role-pin.
+/// Login leftover (2): only the dest-env runner sources those vars.
+const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+];
+
+fn strip_lifecycle_child_env(command: &mut std::process::Command) {
+    for name in LIFECYCLE_CHILD_ENV_STRIP {
+        command.env_remove(*name);
+    }
+}
+
+fn pin_role_command(slug: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("mackesd");
+    command.args(["role-pin", slug]);
+    strip_lifecycle_child_env(&mut command);
+    command
+}
+
 /// Pin `slug` via `mackesd role-pin` (upgrade-only, fail-closed). `Ok(())` on a
 /// successful pin; `Err(msg)` otherwise (mackesd missing / refused the downgrade).
 fn pin_role(slug: &str) -> Result<(), String> {
-    match std::process::Command::new("mackesd")
-        .args(["role-pin", slug])
-        .status()
-    {
+    match pin_role_command(slug).status() {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("mackesd role-pin exited with status {s}")),
         Err(e) => Err(format!("could not run mackesd role-pin: {e}")),
@@ -403,9 +421,35 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{intent_label, onboard_path, role_blurb, RoleChooser};
+    use super::{
+        intent_label, onboard_path, pin_role_command, role_blurb, strip_lifecycle_child_env,
+        RoleChooser,
+    };
     use crate::flow::Intent;
     use mde_role::Role;
+
+    #[test]
+    fn pin_role_strips_bootstrap_dest_env() {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\"",
+        ]);
+        command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
+        command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
+        command.env("JOIN_TOKEN", "must-not-leak-token");
+        strip_lifecycle_child_env(&mut command);
+        let output = command.output().expect("run stripped child");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "role-pin child inherited dest env: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let argv = format!("{:?}", pin_role_command("workstation"));
+        assert!(argv.contains("role-pin"), "{argv}");
+        assert!(argv.contains("workstation"), "{argv}");
+    }
 
     #[test]
     fn every_role_has_display_copy() {
