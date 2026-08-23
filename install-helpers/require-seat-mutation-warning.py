@@ -22,6 +22,13 @@ HELPER_ENV = "MCNF_SEAT_MUTATION_WARNING"
 ALERT_FLAG = "AI-GENERATED-ALERT"
 WAIT_MARK = "WAIT_SECONDS=5"
 EXIT_REFUSED = 2
+# Dest identity and join-token env must not leak into the warning child.
+# Login leftover (2): only the dest-env runner sources those vars.
+DEST_CHILD_ENV_STRIP = (
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+)
 
 
 class Refusal(ValueError):
@@ -90,8 +97,17 @@ def require_seat_mutation_warning(
     for_production_mutation: bool = False,
 ) -> None:
     helper = admit_warning_helper(path, for_production_mutation=for_production_mutation)
+    child_env = os.environ.copy()
+    for name in DEST_CHILD_ENV_STRIP:
+        child_env.pop(name, None)
     try:
-        completed = subprocess.run([str(helper)], check=False, capture_output=True, text=True)
+        completed = subprocess.run(
+            [str(helper)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=child_env,
+        )
     except OSError as error:
         refuse(f"seat mutation warning cannot be started: {error}")
         raise AssertionError from error

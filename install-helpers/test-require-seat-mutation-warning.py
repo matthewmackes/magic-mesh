@@ -72,6 +72,28 @@ def main() -> None:
         ran = command("--helper", str(ok))
         assert "warning completed" in ran.stdout
 
+        leak = root / "seen-dest-env"
+        recorder = root / "record.sh"
+        write_helper(
+            recorder,
+            "#!/bin/sh\nWAIT_SECONDS=5\n# AI-GENERATED-ALERT\n"
+            f"printf %s \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\" >{leak}\n"
+            "exit 0\n",
+        )
+        env = os.environ.copy()
+        env["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
+        env["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
+        env["JOIN_TOKEN"] = "must-not-leak-token"
+        recorded = subprocess.run(
+            [sys.executable, str(HELPER), "--helper", str(recorder)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert recorded.returncode == 0, recorded.stderr
+        assert leak.read_text(encoding="ascii") == ""
+
         fail = root / "fail.sh"
         write_helper(
             fail,
