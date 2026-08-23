@@ -568,8 +568,11 @@ impl Projection {
         min_zoom: u8,
         max_zoom: u8,
     ) -> Self {
-        let zoom = if map.zoom.is_finite() { map.zoom } else { 13.0 };
-        let tile_z = (zoom.round() as i32).clamp(i32::from(min_zoom), i32::from(max_zoom)) as u8;
+        // Construct's default viewport is zoom 13. A dest that only has
+        // z8–z10 must display at dest max, not as one z10 tile stretched 8×.
+        let requested = if map.zoom.is_finite() { map.zoom } else { 13.0 };
+        let zoom = requested.clamp(f32::from(min_zoom), f32::from(max_zoom));
+        let tile_z = zoom.round() as u8;
         let scale = (f64::from(zoom) - f64::from(tile_z)).exp2();
         let tile_px = (TILE_SIZE * scale).max(1.0);
         let (cfx, cfy) = tile_frac(center.1, center.0, tile_z);
@@ -1180,6 +1183,34 @@ mod tests {
         let second = cached_meta_in(&ctx, &roots).expect("replacement bundle admitted");
         assert!((second.raw.center_lat - 32.268).abs() < 1e-6);
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn projection_clamps_view_zoom_to_dest_range() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 768.0));
+        let mut map = MapViewState::simulated();
+        map.zoom = 13.0;
+        map.pan = [0.0, 0.0];
+        let meta = RawMeta {
+            center_lat: 42.8864,
+            center_lon: -78.8784,
+            min_zoom: 8,
+            max_zoom: 10,
+            min_lon: -79.31,
+            min_lat: 42.44,
+            max_lon: -78.46,
+            max_lat: 43.63,
+        };
+        let proj = Projection::new(rect, &map, (meta.center_lat, meta.center_lon), &meta);
+        let one_tile_east = proj.project(
+            meta.center_lat,
+            meta.center_lon + 360.0 / f64::from(1u32 << 10),
+        );
+        assert!(
+            (one_tile_east.x - rect.center().x - 256.0).abs() < 1.0,
+            "view zoom 13 must not 8x-stretch a z10 dest tile; got dx={}",
+            one_tile_east.x - rect.center().x
+        );
     }
 
     #[test]

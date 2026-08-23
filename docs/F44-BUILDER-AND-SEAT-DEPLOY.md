@@ -172,10 +172,12 @@ Give it at least a minute and verify with SSH before treating it as a dark VM.
 After the cut, shut down `mcnf-build-f44` and restart `mcnf-build-52` so the
 normal BigBoy farm capacity returns.
 
-**Current handoff state recorded 2026-08-03:** after the five-seat artifact was
-cut, `mcnf-build-f44` (`.131`) was halted and the canonical BigBoy farm VM
-`mcnf-build-52` (`.130`) was restored. This is a dated observation, not a reason
-to skip the live VM-state and active-slot checks before the next handoff.
+**Current handoff state recorded 2026-08-23:** `mcnf-build-f44` (`.131`) is
+halted and the canonical BigBoy farm VM `mcnf-build-52` (`.130`) is running.
+Evidence: `docs/platform/evidence/WL-REL-002-2026-08-23-farm-restore-r1.md`.
+This is a dated observation, not a reason to skip the live VM-state and
+active-slot checks before the next handoff. To cut a native F44 RPM again,
+use the safe handoff above (halt `.52`, wait for ~30 GiB free, start `.131`).
 
 ## 4. Toolchain + build + cut
 
