@@ -30,11 +30,14 @@ pub fn run(
         };
         let display = name.unwrap_or_else(|| {
             std::env::var("HOSTNAME").unwrap_or_else(|_| {
-                std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map_or_else(|| "unknown".to_owned(), |s| s.trim().to_owned())
+                {
+                    let mut hostname = std::process::Command::new("hostname");
+                    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut hostname);
+                    hostname.output()
+                }
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map_or_else(|| "unknown".to_owned(), |s| s.trim().to_owned())
             })
         });
         match (passcode, token) {

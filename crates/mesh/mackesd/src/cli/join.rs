@@ -97,12 +97,13 @@ fn signal_setup_process_group(pid: u32, signal: &str) {
     #[cfg(unix)]
     {
         let process_group = format!("-{pid}");
-        let _ = std::process::Command::new("/usr/bin/kill")
-            .args([signal, "--", &process_group])
+        let mut kill = std::process::Command::new("/usr/bin/kill");
+        kill.args([signal, "--", &process_group])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+            .stderr(std::process::Stdio::null());
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut kill);
+        let _ = kill.status();
     }
     #[cfg(not(unix))]
     let _ = (pid, signal);
@@ -148,6 +149,7 @@ impl SetupCommandRunner for SystemSetupCommandRunner {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -392,11 +394,7 @@ fn setup_workstation_substrate<R: SetupCommandRunner>(
     );
 
     let syncthing_args = vec!["--listen".to_string(), plan.overlay_ip.clone()];
-    match runner.run(
-        SETUP_SYNCTHING,
-        &syncthing_args,
-        WORKSTATION_SETUP_TIMEOUT,
-    ) {
+    match runner.run(SETUP_SYNCTHING, &syncthing_args, WORKSTATION_SETUP_TIMEOUT) {
         Ok(()) => Ok(WorkstationSetupState::Ready),
         Err(failure) => Ok(WorkstationSetupState::Degraded {
             reason: format!(
@@ -815,7 +813,7 @@ fn lighthouse_join_etcd(bundle: &mackesd_core::ca::bundle::NebulaBundle, self_na
 /// warning until the operator provisions it by hand per the unit
 /// comment).
 fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
-    use mackesd_core::ca::backup_provision::{provision, ProvisionOutcome};
+    use mackesd_core::ca::backup_provision::{ProvisionOutcome, provision};
     match provision(role) {
         Ok(ProvisionOutcome::Provisioned { sealed_bytes }) => {
             // Log presence/length only — NEVER the passphrase value.
@@ -1127,6 +1125,29 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
             "timeout did not bound execution"
+        );
+    }
+
+    #[test]
+    fn system_setup_runner_strips_bootstrap_dest_env() {
+        std::env::set_var("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
+        std::env::set_var("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
+        std::env::set_var("JOIN_TOKEN", "must-not-leak-token");
+        let result = SystemSetupCommandRunner.run(
+            "sh",
+            &[
+                "-c".to_string(),
+                "test -z \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\""
+                    .to_string(),
+            ],
+            std::time::Duration::from_secs(2),
+        );
+        std::env::remove_var("MACKESD_BOOTSTRAP_SSH_KEY");
+        std::env::remove_var("MACKESD_BOOTSTRAP_KNOWN_HOSTS");
+        std::env::remove_var("JOIN_TOKEN");
+        assert!(
+            result.is_ok(),
+            "setup helper inherited dest env: {result:?}"
         );
     }
 
