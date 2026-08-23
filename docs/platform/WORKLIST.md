@@ -1478,16 +1478,12 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: in-tree CLI/GUI and persist/fold landed. Dell, Seat 15, and
-  Surface run unpublished `magic-mesh-13.0.0-35` (`7e3474eeb`);
-  `mackesd transfer sync-pair add|remove|list` is installed. Dell list is
-  empty. Leftover is live next-run / last-result on a saved pair. Evidence:
-  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is still live next-run / last-result on a saved
-  pair. Seat-user `mackesd transfer sync-pair add` on Dell refused
-  EACCES writing the save-sync-pair verb under root-owned
-  `/var/lib/mde/transfers` after red alert + 5s. Empty list is not
-  pair proof.
+- Current state: Dell `mm` add of `leftover-028` succeeded after a 1777 inbox
+  (no sudo on add). Store shows `last_result=done` and `next_run_ms`. Worker
+  `ensure_operator_inbox` now creates that inbox on start. Evidence:
+  `WL-FUNC-028-2026-08-23-live-sync-pair-next-run-r1.md`.
+- Remaining work: leftover is S2 GUI Transfers editor parity. CLI live pair
+  proof exists. Farm the new `operator_inbox_is_sticky_world_writable` unit.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the

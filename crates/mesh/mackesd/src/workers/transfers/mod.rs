@@ -84,7 +84,9 @@ pub use v2::{
     ResolvedFilesEndpoint, ResolvedTransferJobV2, TransferV2Identity, TransferV2ProjectionError,
     TransferV2ResolutionError,
 };
-pub use verb::{inbox_dir, take_verbs, write_verb, TransferV2Control, TransferVerb};
+pub use verb::{
+    ensure_operator_inbox, inbox_dir, take_verbs, write_verb, TransferV2Control, TransferVerb,
+};
 
 /// Default number of jobs run in parallel when the cap env is unset (Q12).
 pub const DEFAULT_PARALLEL_CAP: usize = 3;
@@ -954,6 +956,7 @@ impl TransfersWorker {
     /// # Errors
     /// Fails if the ledger directory can't be opened.
     fn engine(&self) -> std::io::Result<Engine> {
+        crate::workers::transfers::verb::ensure_operator_inbox(&self.store_root)?;
         let queue = TransferQueue::open(&self.store_root, self.cap)?;
         let v2_ledger = V2Ledger::open(&self.store_root)?;
         let sync_pairs = SyncPairStore::open(&self.store_root)?;

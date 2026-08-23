@@ -94,12 +94,35 @@ pub fn inbox_dir(store_root: &Path) -> PathBuf {
     store_root.join("inbox")
 }
 
+/// Create the CLI drop inbox so a seat user can enqueue verbs without `sudo`.
+///
+/// The store root stays daemon-owned. Only `inbox/` is sticky world-writable
+/// (`1777`), matching `/run/mde-bus`: the operator path is `mackesd transfer …`,
+/// not a root write. The worker must call this on start; `write_verb` then
+/// only needs write access to the already-created inbox.
+///
+/// # Errors
+/// Directory creation or permission failures.
+pub fn ensure_operator_inbox(store_root: &Path) -> io::Result<PathBuf> {
+    let dir = inbox_dir(store_root);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+    }
+    Ok(dir)
+}
+
 /// Enqueue a mutating verb for the daemon (atomic temp + rename). `List` is a read;
 /// writing it is accepted but the worker treats it as a no-op.
 ///
 /// # Errors
 /// Serialization or IO failures.
 pub fn write_verb(store_root: &Path, verb: &TransferVerb) -> io::Result<()> {
+    // Do not chmod here: the seat-user CLI cannot chmod a root-owned inbox.
+    // The daemon calls `ensure_operator_inbox` so this create is a no-op when
+    // the 1777 inbox already exists.
     let dir = inbox_dir(store_root);
     std::fs::create_dir_all(&dir)?;
     // The seq LEADS the filename (zero-padded, fixed width) so a filename sort in
@@ -252,6 +275,24 @@ mod tests {
             serde_json::from_str::<TransferVerb>(&json).unwrap(),
             TransferVerb::SaveSyncPair(pair)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_inbox_is_sticky_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("transfers");
+        let dir = ensure_operator_inbox(&root).unwrap();
+        assert_eq!(dir, inbox_dir(&root));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o1777,
+            "inbox must be 1777 so seat-user CLI is not sudo"
+        );
+        write_verb(&root, &TransferVerb::List).unwrap();
+        assert_eq!(take_verbs(&root), vec![TransferVerb::List]);
     }
 
     #[test]
