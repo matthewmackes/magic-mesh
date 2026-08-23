@@ -30,6 +30,13 @@ const MIRROR_SUFFIX: &str = "/seat";
 // installed renderer-specific launcher, but default to the shared TUI rather
 // than a binary that is not packaged by the RPM.
 const ONBOARDING_BIN: &str = "/usr/bin/magic-setup";
+/// Dest identity and join-token env must not leak into the lifecycle child.
+/// Login leftover (2): only the dest-env runner sources those vars.
+const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PowerCycleAction {
@@ -604,7 +611,7 @@ impl PowerCycleState {
             egui::Button::new("Open Onboarding & Offboarding ↗"),
         );
         if response.clicked() {
-            match Command::new(&path).spawn() {
+            match lifecycle_launcher_command(&path).spawn() {
                 Ok(_) => {
                     self.status = Some("Opened Onboarding & Offboarding.".to_owned());
                     self.error = None;
@@ -704,6 +711,18 @@ fn fact(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
     ui.end_row();
 }
 
+fn strip_lifecycle_child_env(command: &mut Command) {
+    for name in LIFECYCLE_CHILD_ENV_STRIP {
+        command.env_remove(*name);
+    }
+}
+
+fn lifecycle_launcher_command(path: &Path) -> Command {
+    let mut command = Command::new(path);
+    strip_lifecycle_child_env(&mut command);
+    command
+}
+
 fn onboarding_path() -> PathBuf {
     std::env::var_os("MDE_ONBOARDING_OFFBOARDING_BIN")
         .map(PathBuf::from)
@@ -782,6 +801,39 @@ mod tests {
         );
         assert_eq!(PowerCycleAction::LogOut.power_verb(), None);
         assert_eq!(PowerCycleAction::LogOut.remote_action(), None);
+    }
+
+    #[test]
+    fn lifecycle_launcher_strips_bootstrap_dest_env() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("lifecycle-gui");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\"\n",
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+                .expect("make executable");
+        }
+        let mut command = Command::new(&script);
+        command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
+        command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
+        command.env("JOIN_TOKEN", "must-not-leak-token");
+        strip_lifecycle_child_env(&mut command);
+        let output = command.output().expect("run stripped launcher");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "lifecycle child inherited dest env: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]
