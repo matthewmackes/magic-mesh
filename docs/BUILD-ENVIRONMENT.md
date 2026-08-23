@@ -511,7 +511,7 @@ tag a worklist task with `@farm:{<command>}` and the **reconciler**
 (`mcnf-farm-reconcile.service`, FARM-AUTO-4) runs it on the fleet. Two
 triggers start the same oneshot: the 15-minute timer
 (`mcnf-farm-reconcile.timer`) and the HEAD path unit
-(`mcnf-farm-reconcile.path`, watches `.git/logs/HEAD` and `.git/HEAD`).
+(`mcnf-farm-reconcile.path`, `PathModified` on `.git/logs/HEAD` and `.git/HEAD`).
 It is idempotent (it skips a job whose result already matches a clean HEAD).
 
 ```text
@@ -728,8 +728,8 @@ xe vm-start   uuid=$V
    results are stale, but `OnUnitActiveSec=15min` may not have fired yet —
    `farm-jobs.sh active` is non-zero, `TOTAL_FREE=10`, and the last log says
    `skip … (fresh @ <old SHA>)` / `nothing to do — farm converged @ <old SHA>`.
-   That is a waiting timer, not a broken farm. `mcnf-farm-reconcile.path`
-   starts the existing oneshot on `.git/logs/HEAD` change. Agents must
+   That is a waiting timer, not a broken farm.    `mcnf-farm-reconcile.path`
+   starts the existing oneshot on `.git/logs/HEAD` write. Agents must
    `automation/reconciler/tick-fill.sh` (or `systemctl start --no-block
    mcnf-farm-reconcile.service`) after commit/push and must not hand-fan
    `xcp-build.sh` of a command the reconciler already owns (§4A.5). A fresh

@@ -14,8 +14,8 @@
 #   - 15-min @farm build reconciler (mcnf-farm-reconcile) — dispatches @farm jobs;
 #            no apply gate (it never mutates infra).
 #   - HEAD-change path unit (mcnf-farm-reconcile.path) — starts the same oneshot
-#            when $REPO/.git/logs/HEAD or .git/HEAD changes, so a commit does
-#            not wait up to 15 min with every slot idle.
+#            when $REPO/.git/logs/HEAD is written (same-branch commit) or
+#            .git/HEAD changes, so a commit does not wait up to 15 min idle.
 #
 # The units point at the DEDICATED release slot ${MCNF_REPO:-/opt/mcnf} — NEVER the
 # resettable .52 build dir (the CI gremlin) and NEVER a .claude/worktrees path.
@@ -125,7 +125,7 @@ build_path_unit() {
 Description=MCNF build-farm reconciler — start on HEAD change
 
 [Path]
-PathChanged=$REPO/.git/logs/HEAD
+PathModified=$REPO/.git/logs/HEAD
 PathModified=$REPO/.git/HEAD
 Unit=mcnf-farm-reconcile.service
 
@@ -172,8 +172,8 @@ self_test() {
   case "$unit" in *"infra/tofu/env.sh"*) chk "autoscale unit does not source missing env.sh" has none ;; *) chk "autoscale unit does not source missing env.sh" none none ;; esac
   unit="$(build_path_unit)"
   case "$unit" in
-    *"/opt/mcnf/.git/logs/HEAD"*) chk "path unit watches deployed logs/HEAD" yes yes ;;
-    *) chk "path unit watches deployed logs/HEAD" no yes ;;
+    *"PathModified=/opt/mcnf/.git/logs/HEAD"*) chk "path unit watches deployed logs/HEAD writes" yes yes ;;
+    *) chk "path unit watches deployed logs/HEAD writes" no yes ;;
   esac
   case "$unit" in
     *"Unit=mcnf-farm-reconcile.service"*) chk "path unit starts existing oneshot" yes yes ;;
