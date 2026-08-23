@@ -5,7 +5,7 @@ Wraps `mackesd enroll-token` supplied by `--mackesd`. It does not mint into
 a production workgroup, does not SSH, and does not enroll. The bearer is
 written only to `--output`. Helper stdout never carries bearer or token
 bytes. Dest or sidecar under `/root/mcnf-private` refuses while the
-unpublished signed candidate is absent. This leftover does not claim a
+unpublished signed candidate dest is absent. This leftover does not claim a
 production mint.
 """
 
@@ -19,9 +19,24 @@ import re
 import stat
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+candidate = _load(
+    "admit_unpublished_signed_candidate",
+    HERE / "admit-unpublished-signed-candidate.py",
+)
 DEFAULT_DEST_PARENT = Path("/root/mcnf-private")
 PRODUCTION_DEST_PARENTS = (DEFAULT_DEST_PARENT,)
 SIDECAR_KIND = "mcnf-enroll-bearer-mint"
@@ -87,9 +102,10 @@ def under_production_dest(path: Path) -> bool:
 
 def admit_not_production_dest(path: Path, label: str) -> None:
     if under_production_dest(path):
-        refuse(
-            f"{label} is a production dest; unpublished signed candidate is absent"
-        )
+        try:
+            candidate.admit_unpublished_signed_candidate()
+        except candidate.Refusal as error:
+            refuse(f"{label} is a production dest; {error}")
 
 
 def contain_join_token(*values: object) -> bool:

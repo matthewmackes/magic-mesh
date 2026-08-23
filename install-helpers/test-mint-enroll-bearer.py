@@ -309,7 +309,7 @@ def main() -> None:
 
         before_production = production_snapshot()
         production_dest = PRODUCTION / "enroll-bearer-probe"
-        command(
+        production_result = command(
             "--mackesd",
             str(fake),
             "--mesh-id",
@@ -318,6 +318,7 @@ def main() -> None:
             str(production_dest),
             refused=True,
         )
+        assert "unpublished signed candidate is absent" in production_result.stderr
         assert not production_dest.exists()
         after_production = production_snapshot()
         if before_production is not None and after_production is not None:

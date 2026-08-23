@@ -111,10 +111,53 @@ def child_check_script(key: Path, hosts: Path, marker: Path | None = None) -> st
     return "; ".join(lines)
 
 
-def command(*args: str, refused: bool = False) -> subprocess.CompletedProcess[str]:
+def write_fixture_candidate(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    roles = {}
+    for name, body in (
+        ("workstation", b"ws-rpm-bytes"),
+        ("server", b"server-rpm-bytes"),
+        ("lighthouse", b"lh-rpm-bytes"),
+    ):
+        path = root / f"magic-mesh-{name}.rpm"
+        path.write_bytes(body)
+        os.chmod(path, 0o400)
+        roles[name] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "nevra": f"magic-mesh-{name}-13.0.0-1.fc44.x86_64",
+        }
+    dest = root / "unpublished-signed-candidate.json"
+    dest.write_text(
+        json.dumps(
+            {
+                "kind": "mcnf-unpublished-signed-candidate",
+                "schema_version": 1,
+                "published": False,
+                "production_admitted": False,
+                "signer_fingerprint": "06B1C27EA0E08A225155EB3314018AA1497DDC7C",
+                "roles": roles,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    os.chmod(dest, 0o400)
+    return dest
+
+
+def command(
+    *args: str,
+    refused: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for name in FORBIDDEN_ENV:
         env.pop(name, None)
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         [sys.executable, str(HELPER), *args],
         text=True,
@@ -159,6 +202,27 @@ def main() -> None:
         command(*base, "--", "/usr/bin/mackesd", "join", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "offboard", refused=True)
         command(*base, "--", str(HERE / "mint-enroll-bearer.py"), refused=True)
+
+        candidate_dest = write_fixture_candidate(root / "candidate")
+        fake_enroll = root / "enroll-token"
+        fake_enroll.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        os.chmod(fake_enroll, 0o700)
+        admitted = command(
+            *base,
+            "--",
+            str(fake_enroll),
+            extra_env={"MCNF_UNPUBLISHED_SIGNED_CANDIDATE": str(candidate_dest)},
+        )
+        assert admitted.returncode == 0, admitted.stderr
+        command(
+            *base,
+            "--",
+            "/usr/bin/mackesd",
+            "enroll-token",
+            "--mesh-id",
+            "x",
+            refused=True,
+        )
 
         extra = root / "extra.env"
         extra.write_text(env_body(dest_key, dest_hosts) + "EXTRA=1\n", encoding="ascii")

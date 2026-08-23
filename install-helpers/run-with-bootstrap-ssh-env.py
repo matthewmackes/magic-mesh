@@ -7,7 +7,7 @@ plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
 Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
 `offboard`, `join`, `found`, `mesh-init`, `leave`, or the mint helper)
-refuses while the unpublished signed candidate is absent.
+refuses while the unpublished signed candidate dest is absent.
 """
 
 from __future__ import annotations
@@ -20,9 +20,24 @@ import re
 import stat
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+candidate = _load(
+    "admit_unpublished_signed_candidate",
+    HERE / "admit-unpublished-signed-candidate.py",
+)
 DEFAULT_ENV_FILE = Path("/root/mcnf-private/bootstrap-ssh.env")
 SIDECAR_KIND = "mcnf-bootstrap-ssh-env-run"
 ENV_MODE = 0o400
@@ -36,7 +51,7 @@ SAFE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 JOIN_TOKEN_PLACEHOLDER = "{{JOIN_TOKEN}}"
 ENV_KEYS = ("MACKESD_BOOTSTRAP_SSH_KEY", "MACKESD_BOOTSTRAP_KNOWN_HOSTS")
 # Live mesh mutation verbs. Operator lock: seats mutate only when an
-# unpublished signed candidate exists. None does.
+# unpublished signed candidate dest admits. Missing dest still refuses.
 LIFECYCLE_MUTATION_NAMES = frozenset(
     {
         "enroll-token",
@@ -69,9 +84,10 @@ def admit_not_lifecycle_mutation(command: list[str]) -> None:
     for token in command:
         name = command_basename(token)
         if name in LIFECYCLE_MUTATION_NAMES or "enroll-token" in token:
-            refuse(
-                "lifecycle mutation argv refuses; unpublished signed candidate is absent"
-            )
+            try:
+                candidate.admit_unpublished_signed_candidate()
+            except candidate.Refusal as error:
+                refuse(f"lifecycle mutation argv refuses; {error}")
 
 
 def helper_worktree_root() -> Path:
