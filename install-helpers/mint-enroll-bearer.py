@@ -103,7 +103,7 @@ def under_production_dest(path: Path) -> bool:
 def admit_not_production_dest(path: Path, label: str) -> None:
     if under_production_dest(path):
         try:
-            candidate.admit_unpublished_signed_candidate()
+            candidate.admit_unpublished_signed_candidate(for_production_mutation=True)
         except candidate.Refusal as error:
             refuse(f"{label} is a production dest; {error}")
 

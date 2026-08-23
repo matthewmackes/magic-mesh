@@ -160,6 +160,7 @@ def bind_unpublished_signed_candidate(
             if nevra is not None and nevra != queried:
                 refuse(f"{name} NEVRA does not match rpm -qp")
             nevra = queried
+            admit.verify_rpm_signature(rpm)
         if nevra is None:
             refuse(f"{name} NEVRA is required")
         prefix = admit.ROLE_NEVRA_PREFIX[name]

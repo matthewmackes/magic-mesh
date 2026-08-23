@@ -9,6 +9,7 @@ not a production candidate.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -180,6 +181,37 @@ def main() -> None:
         for path in rpms.values():
             assert stat.S_IMODE(path.stat().st_mode) == 0o400
         assert not str(root).startswith(str(PRODUCTION))
+
+        spec = importlib.util.spec_from_file_location("admit_candidate", HELPER)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        os.environ[module.DEST_ENV] = str(dest)
+        try:
+            try:
+                module.admit_unpublished_signed_candidate(for_production_mutation=True)
+            except module.Refusal as error:
+                assert "unpublished signed candidate is absent" in str(error)
+            else:
+                raise AssertionError("env override must not unlock production mutation")
+            try:
+                module.verify_rpm_signature(rpms["workstation"])
+            except module.Refusal as error:
+                assert "GPG-signed" in str(error) or "signature" in str(error).lower()
+            else:
+                raise AssertionError("fixture bytes must not count as GPG-signed")
+        finally:
+            os.environ.pop(module.DEST_ENV, None)
+
+        historical = Path("/root/mcnf-release-artifacts/magic-mesh-12.1.6-35.x86_64.rpm")
+        if historical.is_file():
+            try:
+                module.verify_rpm_signature(historical)
+            except module.Refusal as error:
+                text = str(error)
+                assert "GPG-signed" in text or "governed fingerprint" in text
+            else:
+                raise AssertionError("unsigned 12.1.6 RPM must not count as governed-signed")
 
     print("admit unpublished signed candidate hostile suite passed")
 

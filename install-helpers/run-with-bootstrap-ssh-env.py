@@ -85,7 +85,9 @@ def admit_not_lifecycle_mutation(command: list[str]) -> None:
         name = command_basename(token)
         if name in LIFECYCLE_MUTATION_NAMES or "enroll-token" in token:
             try:
-                candidate.admit_unpublished_signed_candidate()
+                candidate.admit_unpublished_signed_candidate(
+                    for_production_mutation=True
+                )
             except candidate.Refusal as error:
                 refuse(f"lifecycle mutation argv refuses; {error}")
 

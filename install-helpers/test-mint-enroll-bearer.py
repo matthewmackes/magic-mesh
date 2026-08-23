@@ -320,6 +320,30 @@ def main() -> None:
         )
         assert "unpublished signed candidate is absent" in production_result.stderr
         assert not production_dest.exists()
+
+        fixture_candidate = parent / "unpublished-signed-candidate.json"
+        fixture_candidate.write_text("not-a-candidate\n", encoding="ascii")
+        os.chmod(fixture_candidate, 0o400)
+        override_env = os.environ.copy()
+        override_env["MCNF_UNPUBLISHED_SIGNED_CANDIDATE"] = str(fixture_candidate)
+        override = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER),
+                "--mackesd",
+                str(fake),
+                "--mesh-id",
+                MESH_ID,
+                "--output",
+                str(production_dest),
+            ],
+            text=True,
+            capture_output=True,
+            env=override_env,
+        )
+        assert override.returncode == 2, override.stderr
+        assert "unpublished signed candidate is absent" in override.stderr
+        assert not production_dest.exists()
         after_production = production_snapshot()
         if before_production is not None and after_production is not None:
             assert after_production == before_production

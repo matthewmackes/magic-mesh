@@ -211,13 +211,14 @@ def main() -> None:
         fake_enroll = root / "enroll-token"
         fake_enroll.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
         os.chmod(fake_enroll, 0o700)
-        admitted = command(
+        override = command(
             *base,
             "--",
             str(fake_enroll),
             extra_env={"MCNF_UNPUBLISHED_SIGNED_CANDIDATE": str(candidate_dest)},
+            refused=True,
         )
-        assert admitted.returncode == 0, admitted.stderr
+        assert "unpublished signed candidate is absent" in override.stderr
         command(
             *base,
             "--",
@@ -225,6 +226,7 @@ def main() -> None:
             "enroll-token",
             "--mesh-id",
             "x",
+            extra_env={"MCNF_UNPUBLISHED_SIGNED_CANDIDATE": str(candidate_dest)},
             refused=True,
         )
 

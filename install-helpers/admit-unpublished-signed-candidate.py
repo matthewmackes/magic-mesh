@@ -37,6 +37,8 @@ ROLE_NEVRA_PREFIX = {
     "server": "magic-mesh-server-13.0.0-",
     "lighthouse": "magic-mesh-lighthouse-13.0.0-",
 }
+PRODUCTION_DEST_PARENT = Path("/root/mcnf-private")
+SIGNER_KEY_ID = SIGNER_FINGERPRINT[-8:].lower()
 
 
 class Refusal(ValueError):
@@ -73,6 +75,46 @@ def default_dest() -> Path:
     if raw:
         return Path(raw)
     return DEFAULT_DEST
+
+
+def under_production_dest(path: Path) -> bool:
+    resolved = dest_resolved(path)
+    try:
+        resolved.relative_to(PRODUCTION_DEST_PARENT.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def verify_rpm_signature(rpm: Path) -> None:
+    """Require a GPG signature from the governed fingerprint.
+
+    `rpm --checksig` exits 0 on unsigned packages that only have payload
+    digests. Production mutation must not treat that as a signed candidate.
+    """
+    resolved = dest_resolved(rpm)
+    try:
+        completed = subprocess.run(
+            ["rpm", "--checksig", "-v", str(resolved)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        refuse("rpm signature verify is required for a production candidate dest")
+        raise AssertionError
+    text = f"{completed.stdout}{completed.stderr}"
+    if contain_join_token(text):
+        refuse("JOIN_TOKEN placeholder is not a bearer")
+    if completed.returncode != 0:
+        refuse("RPM signature did not verify")
+    lowered = text.lower()
+    if "not ok" in lowered or "nokey" in lowered:
+        refuse("RPM signature did not verify")
+    if "signature" not in lowered:
+        refuse("RPM is not GPG-signed")
+    if SIGNER_FINGERPRINT.lower() not in lowered and SIGNER_KEY_ID not in lowered:
+        refuse("RPM is not signed by the governed fingerprint")
 
 
 def admit_regular_file(path: Path, label: str, mode: int | None = None) -> os.stat_result:
@@ -138,9 +180,16 @@ def admit_role(name: str, body: object, worktree: Path) -> dict[str, object]:
     return {"path": str(rpm), "sha256": digest, "nevra": nevra}
 
 
-def admit_unpublished_signed_candidate(dest: Path | None = None) -> dict[str, object]:
+def admit_unpublished_signed_candidate(
+    dest: Path | None = None,
+    *,
+    for_production_mutation: bool = False,
+) -> dict[str, object]:
     worktree = helper_worktree_root()
-    dest_path = dest_resolved(dest if dest is not None else default_dest())
+    if for_production_mutation:
+        dest_path = dest_resolved(DEFAULT_DEST)
+    else:
+        dest_path = dest_resolved(dest if dest is not None else default_dest())
     if contain_join_token(dest_path):
         refuse("JOIN_TOKEN placeholder is not a bearer")
     if not dest_path.exists() and not dest_path.is_symlink():
@@ -177,6 +226,9 @@ def admit_unpublished_signed_candidate(dest: Path | None = None) -> dict[str, ob
         roles[name] = admit_role(name, roles_raw.get(name), worktree)
     if set(roles_raw) != set(ROLES):
         refuse("candidate dest roles must be exactly workstation, server, lighthouse")
+    if for_production_mutation or under_production_dest(dest_path):
+        for name in ROLES:
+            verify_rpm_signature(Path(str(roles[name]["path"])))
     return {
         "kind": KIND,
         "production_admitted": False,
