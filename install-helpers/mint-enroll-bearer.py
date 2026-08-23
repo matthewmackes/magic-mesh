@@ -74,6 +74,7 @@ def helper_worktree_root() -> Path:
         check=False,
         capture_output=True,
         text=True,
+        env=child_environment(None),
     )
     root = result.stdout.strip()
     if result.returncode == 0 and root:

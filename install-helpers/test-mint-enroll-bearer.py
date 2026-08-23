@@ -10,6 +10,7 @@ This leftover does not claim a production bearer was minted.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -436,6 +437,35 @@ def main() -> None:
         assert seen.read_text(encoding="ascii") == str(wg.resolve())
         assert leak.read_text(encoding="ascii") == ""
         assert env_dest.read_bytes() == FIXTURE_BEARER.encode("ascii")
+
+        spec = importlib.util.spec_from_file_location("mint_enroll_bearer", HELPER)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
+        os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
+        os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+        seen_git: list[dict[str, str] | None] = []
+        original = module.subprocess.run
+
+        def capture(*args: object, **kwargs: object) -> object:
+            env = kwargs.get("env")
+            seen_git.append(env if isinstance(env, dict) else None)
+            return original(*args, **kwargs)
+
+        module.subprocess.run = capture  # type: ignore[method-assign]
+        try:
+            module.helper_worktree_root()
+        finally:
+            module.subprocess.run = original  # type: ignore[method-assign]
+            os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
+            os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
+            os.environ.pop("JOIN_TOKEN", None)
+        assert seen_git and all(env is not None for env in seen_git)
+        for env in seen_git:
+            assert env is not None
+            for name in module.DEST_CHILD_ENV_STRIP:
+                assert name not in env
 
         assert_away_from_production(root, dest, sidecar, parent, fake, fp_dest, env_dest)
         assert not inside_repo(dest)
