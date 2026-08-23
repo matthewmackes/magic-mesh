@@ -357,10 +357,10 @@ pub fn fingerprint_cert_pem(pem: &str) -> Option<String> {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("mde-fp-{}.crt", std::process::id()));
     std::fs::write(&path, pem).ok()?;
-    let out = std::process::Command::new("nebula-cert")
-        .args(["print", "-json", "-path"])
-        .arg(&path)
-        .output();
+    let mut command = std::process::Command::new("nebula-cert");
+    command.args(["print", "-json", "-path"]).arg(&path);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    let out = command.output();
     let _ = std::fs::remove_file(&path);
     let out = out.ok()?;
     if !out.status.success() {

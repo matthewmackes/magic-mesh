@@ -145,6 +145,7 @@ fn publish_revoke_event(node_id: &str) {
     let body = serde_json::json!({ "node_id": node_id, "ok": true }).to_string();
     let mut cmd = std::process::Command::new("mde-bus");
     cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut cmd);
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 

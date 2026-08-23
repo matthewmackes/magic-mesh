@@ -297,6 +297,7 @@ fn run_nebula_cert(args: &[&str]) -> Result<(), CaError> {
     let mut command = std::process::Command::new("sh");
     command.args(["-c", "umask 077; exec nebula-cert \"$@\"", "nebula-cert"]);
     command.args(args);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
     let output = command.output().map_err(|e| {
         // Missing binary is the dominant failure mode on
         // dev boxes without the Fedora `nebula` package.

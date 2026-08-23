@@ -286,9 +286,10 @@ impl KeyfileSink for SystemConnections {
     }
 
     fn reload(&self) -> std::io::Result<()> {
-        let status = std::process::Command::new("nmcli")
-            .args(["connection", "reload"])
-            .status()?;
+        let mut command = std::process::Command::new("nmcli");
+        command.args(["connection", "reload"]);
+        crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+        let status = command.status()?;
         if status.success() {
             Ok(())
         } else {
@@ -318,7 +319,10 @@ pub fn gather() -> NetworkFacts {
 /// `ip <args>` → stdout, or `None` on a missing binary / non-zero exit. Mirrors
 /// [`crate::router_discovery`]'s `ip`-shell pattern.
 fn run_ip(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("ip").args(args).output().ok()?;
+    let mut command = std::process::Command::new("ip");
+    command.args(args);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    let out = command.output().ok()?;
     if !out.status.success() {
         return None;
     }

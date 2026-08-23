@@ -258,6 +258,7 @@ impl SelfTestReport {
         self.publish_verdict_with(|topic, body| {
             let mut cmd = std::process::Command::new("mde-bus");
             cmd.args(["publish", topic, "--body-flag", body]);
+            crate::lifecycle_child_env::strip_lifecycle_child_env(&mut cmd);
             crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
         });
     }
@@ -508,7 +509,7 @@ fn role_enable_unit_count(role: Role) -> usize {
 /// ([`probe_role_daemons_active`]) iterate this one source, so the expected set
 /// the classifier compares against and the set the seam probes never drift.
 fn role_enable_units(role: Role) -> impl Iterator<Item = &'static str> {
-    use crate::onboard::role_provision::{plan, UnitAction};
+    use crate::onboard::role_provision::{UnitAction, plan};
     plan(role)
         .into_iter()
         .filter(|u| u.action == UnitAction::Enable)
@@ -656,10 +657,10 @@ fn probe_role_daemons_active(role: Role) -> Option<usize> {
 /// Whether `systemctl` can be invoked at all. Gates the role-daemon probe to
 /// Unknown on a box with no systemd instead of reporting every unit inactive.
 fn systemctl_available() -> bool {
-    std::process::Command::new("systemctl")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    let mut command = std::process::Command::new("systemctl");
+    command.arg("--version");
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    command.output().is_ok_and(|o| o.status.success())
 }
 
 /// Read `host.crt` and return its fingerprint iff it is a parseable, CA-signed
@@ -674,12 +675,10 @@ fn read_signed_cert_fingerprint(host_cert: &Path) -> Option<String> {
 /// `systemctl is-active --quiet <unit>` — exit 0 ⇒ active. A missing systemctl (a
 /// dev box) or any non-zero exit reads as inactive.
 fn unit_is_active(unit: &str) -> bool {
-    matches!(
-        std::process::Command::new("systemctl")
-            .args(["is-active", "--quiet", unit])
-            .status(),
-        Ok(status) if status.success()
-    )
+    let mut command = std::process::Command::new("systemctl");
+    command.args(["is-active", "--quiet", unit]);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    matches!(command.status(), Ok(status) if status.success())
 }
 
 /// Whether the store at `db_path` holds at least one minted CA. Read-only: an
@@ -980,7 +979,7 @@ mod tests {
     fn role_daemons_expected_count_comes_from_the_reused_model() {
         // The classifier's "expected" is the role_provision plan's enable-units —
         // proving assemble reuses the role→units model rather than a private copy.
-        use crate::onboard::role_provision::{plan, UnitAction};
+        use crate::onboard::role_provision::{UnitAction, plan};
         for role in [Role::Lighthouse, Role::Workstation] {
             let want = plan(role)
                 .iter()

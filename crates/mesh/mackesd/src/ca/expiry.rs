@@ -28,11 +28,10 @@ pub const CERT_EXPIRY_WARN_DAYS: i64 = 30;
 /// `notAfter`.
 #[must_use]
 pub fn ca_cert_days_remaining(ca_cert_path: &std::path::Path, now_unix: i64) -> Option<i64> {
-    let out = std::process::Command::new("nebula-cert")
-        .args(["print", "-json", "-path"])
-        .arg(ca_cert_path)
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("nebula-cert");
+    command.args(["print", "-json", "-path"]).arg(ca_cert_path);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    let out = command.output().ok()?;
     if !out.status.success() {
         return None;
     }

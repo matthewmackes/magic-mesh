@@ -141,8 +141,10 @@ impl UnitManager for SystemctlUnits {
 /// Run `systemctl <args…>`; `Ok` on exit 0, else an error naming the command. A
 /// missing `systemctl` (a dev box) surfaces as an error the caller records.
 fn systemctl(args: &[&str]) -> Result<(), String> {
-    let status = std::process::Command::new("systemctl")
-        .args(args)
+    let mut command = std::process::Command::new("systemctl");
+    command.args(args);
+    crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    let status = command
         .status()
         .map_err(|e| format!("spawn `systemctl {}`: {e}", args.join(" ")))?;
     if status.success() {
