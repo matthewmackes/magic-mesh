@@ -404,7 +404,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: dests exist at `/root/mcnf-private/bootstrap-ssh-key` (0600) and
   `bootstrap-known-hosts` (0400); env `bootstrap-ssh.env` (0400). Child-only runner
-  sources dests; enroll/offboard/join/ssh-wrapper mutation argv refuse; CA, Caddy, and join/leave/found children strip dest env.
+  sources dests; enroll/offboard/join/ssh-wrapper mutation argv refuse; CA, Caddy, and enroll TUI children strip dest env.
   `mint-enroll-bearer.py` wraps `enroll-token`; `/root/mcnf-private` dests refuse
   until dest-backed candidate admit; production mutation pins seat-update-warning. Seat 15 enrolled.
   Freeze bar still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:

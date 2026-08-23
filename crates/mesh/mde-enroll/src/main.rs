@@ -221,9 +221,10 @@ fn spawn_enroll(join: ValidatedJoin) -> mpsc::Receiver<EnrollMsg> {
         let _ = tx.send(EnrollMsg::Step(Step::Materialize));
 
         // Best-effort overlay bring-up.
-        let _ = std::process::Command::new("systemctl")
-            .args(["start", "nebula.service"])
-            .status();
+        let mut overlay = std::process::Command::new("systemctl");
+        overlay.args(["start", "nebula.service"]);
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut overlay);
+        let _ = overlay.status();
         let _ = tx.send(EnrollMsg::Step(Step::Overlay));
 
         let _ = tx.send(EnrollMsg::Done(format!(
@@ -240,7 +241,9 @@ fn node_id() -> String {
         return v;
     }
     let host = std::env::var("HOSTNAME").ok().or_else(|| {
-        std::process::Command::new("hostname")
+        let mut command = std::process::Command::new("hostname");
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+        command
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
