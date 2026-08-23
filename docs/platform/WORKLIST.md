@@ -9,8 +9,8 @@ tasks.
 
 - **19 active epics:** 19 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-23 authorized lifting the release chain that the
-  2026-08-22 survey had kept Blocked. Leftovers are unchanged: live FUNC-023
-  mint/enroll, REL-006 admission, then official cut/sign/qualify/publish.
+  2026-08-22 survey had kept Blocked. Leftovers: FUNC-023 enroll/offboard,
+  REL-006 admission, then official cut/sign/publish.
   Do not invent a mesh-id or bearer. Do not flip `production_admitted`. Do
   not publish or freeze while those leftovers are open. Unpublished
   `13.0.0-35` is installed on Dell, Seat 15, and Surface.
@@ -407,20 +407,17 @@ is a capacity incident (§10.0.3), not a silent retry.
   identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: dests exist at `/root/mcnf-private/bootstrap-ssh-key` (0600) and
-  `bootstrap-known-hosts` (0400); env `bootstrap-ssh.env` (0400). Unpublished
-  signed 13.0.0 dest is bound (`unpublished-signed-candidate.json`,
-  `production_admitted: false`; `WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`).
-  Child-only runner sources dests; mutation argv refuse; dest-env strip remains.
-  `mint-enroll-bearer.py` wraps `enroll-token`. Dell, Seat 15, and Surface now
-  run `magic-mesh-13.0.0-35` (`WL-TEST-002-2026-08-22-unpublished-seat-install-r1.md`).
-  Freeze bar still (1) live mint and (3) enroll/offboard+reenroll + 5s. Evidence:
-  `WL-FUNC-023-2026-08-22-live-enroll-prereq-r1.md`, dest-env strip r1.
-- Remaining work: leftover freeze bar is still (1) mint a real 43-char enroll bearer
-  through live lifecycle authority (helper exists; this unit did not invoke Seat 15
-  mackesd), (2) child-only runner sources dests for a worker only (login env unset),
-  (3) live enroll or authorized offboard/reenroll under red `AI-GENERATED-ALERT` + 5s.
-  Seat 15 is a named workstation; first-enroll of that IP needs operator offboard+reenroll. GPT Luna: execute S1-S18 in order.
+- Current state: leftover (1) dest `/root/mcnf-private/enroll-bearer` (0600)
+  from live LH1 `enroll-token` (`mcnf-clean-20260728`). Leftover (2) child-only
+  dest-env run proved dest vars in the child only; login env unset. Sidecars
+  `enroll-bearer.json` and `bootstrap-ssh-env-live-r2.json` stay
+  `production_admitted: false` / `enroll_succeeded: false`. Evidence:
+  `WL-FUNC-023-2026-08-23-live-enroll-bearer-mint-r1.md`,
+  `WL-FUNC-023-2026-08-23-live-dest-env-child-r1.md`.
+- Remaining work: leftover (3) live enroll or authorized offboard+reenroll
+  under red `AI-GENERATED-ALERT` + 5s. Seat 15 is enrolled; `leave` needs a
+  signed `LifecycleConfirmationV1`. LH1 `:4243` is reachable from Seat 15
+  and Dell. Do not flip `production_admitted`. GPT Luna: execute S1-S18.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
