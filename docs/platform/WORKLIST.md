@@ -630,9 +630,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
   `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
   2026-08-23 matrix (`WL-REL-001-2026-08-23-version-matrix-r1.md`;
-  `check-release-version-surfaces.sh` PASS). Final S1/S4 freeze still
-  waits on live FUNC-023 enroll, then REL-006 admission and dest-cut SHA
-  reconfirmation. Do not declare the final freeze until that leftover closes.
+  `check-release-version-surfaces.sh` PASS). Brand epoch `13` maps to
+  Construct (`WL-REL-001-2026-08-23-construct-epoch-13-r1.md`; farm
+  `mde-theme` `22/22`). Final S1/S4 freeze still waits on live FUNC-023
+  enroll, then REL-006 admission and dest-cut SHA reconfirmation. Do not
+  declare the final freeze until that leftover closes.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded; final freeze BLOCKED
      on live FUNC-023 enroll: 2872293b1 / 1787447942 is the input-generation

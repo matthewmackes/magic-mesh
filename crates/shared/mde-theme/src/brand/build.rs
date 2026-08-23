@@ -21,15 +21,15 @@ const BUILD_DATE: &str = env!("MDE_BUILD_DATE");
 /// The stamped release channel (`dev` unless the packaging build overrides it).
 const CHANNEL: &str = env!("MDE_BUILD_CHANNEL");
 
-/// The platform codename for a semver major epoch — `12.x` → `"Construct"`.
+/// The platform codename for a semver major epoch — `12.x`/`13.x` → `"Construct"`.
 ///
 /// Unknown epochs return `""` so [`version_line`] degrades to a bare semver
-/// rather than inventing a name. Keyed off the major so a `12.1`/`12.2` point
+/// rather than inventing a name. Keyed off the major so a `12.1`/`13.0` point
 /// release stays "Construct" without touching this map.
 #[must_use]
 pub const fn codename_for(major: u64) -> &'static str {
     match major {
-        12 => "Construct",
+        12 | 13 => "Construct",
         _ => "",
     }
 }
@@ -122,6 +122,7 @@ mod tests {
     #[test]
     fn codename_maps_the_construct_epoch_and_blanks_the_unknown() {
         assert_eq!(codename_for(12), "Construct");
+        assert_eq!(codename_for(13), "Construct");
         assert!(codename_for(11).is_empty());
         assert!(codename_for(99).is_empty());
     }
@@ -164,7 +165,7 @@ mod tests {
         assert_ne!(info.git_hash, "nogit");
         assert!(!info.build_date.is_empty());
         assert!(!info.channel.is_empty());
-        // Codename is "Construct" for the current 12.x epoch.
+        // Codename is "Construct" for the current 12.x/13.x epoch.
         assert_eq!(info.codename, "Construct");
     }
 }
