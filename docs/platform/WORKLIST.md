@@ -621,20 +621,21 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit
   on the protected default branch and bind every release input, version surface,
   note, and tag plan to it.
-- Current state: revision 1dfe6906609d71da9ee2ce20c860912a09b32855 and epoch
-  1786813297 remain recorded in the r2 source-freeze receipt as the clean
-  pre-WL-FUNC-023 candidate. It cannot be the final feature-complete release
-  source because WL-FUNC-023 must land first. Browser helpers and the shipped
-  role chooser resolve to 13.0.0, and the five internal non-release crates are
-  documented in docs/RELEASE-VERSIONING.md. S2 farm metadata evidence is in
-  `evidence/WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Re-run S1-S4
-  using the two-phase candidate/reconfirmation decision below.
+- Current state: input-generation candidate is
+  2872293b1393fdb6d645170cea30fc7d1682569d epoch 1787447942 (clean, equals
+  upstream; `WL-REL-001-2026-08-22-input-candidate-r1.md`). This is not the
+  final freeze. Superseded r2 receipt 1dfe6906 must not receive new inputs.
+  S2 13.0.0 metadata remains
+  `WL-REL-001-2026-08-16-version-metadata-farm-r1.md`. Final S1/S4 freeze
+  still waits on live FUNC-023 enroll, then REL-006 admission and
+  reconfirmation of this same SHA.
 - Remaining work:
-  1. S1 Select the immutable source. BLOCKED on live FUNC-023 enroll, not Draft:
-     operator 2026-08-22 marked PR #71 Ready and named this branch HEAD the
-     input-generation candidate. Final freeze still waits on a real-seat
-     enroll/offboard over SSH, then REL-006 admission and reconfirmation.
-     Recorded 1dfe6906 predates FUNC-023 and must not receive new inputs.
+  1. S1 Select the immutable source. Candidate recorded; final freeze BLOCKED
+     on live FUNC-023 enroll: 2872293b1 / 1787447942 is the input-generation
+     candidate (`WL-REL-001-2026-08-22-input-candidate-r1.md`). Operator
+     2026-08-22 marked PR #71 Ready and authorized this record. Final freeze
+     still waits on real-seat enroll/offboard over SSH, then REL-006 admission
+     and reconfirmation. Superseded 1dfe6906 must not receive new inputs.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
@@ -663,8 +664,8 @@ is a capacity incident (§10.0.3), not a silent retry.
      release-input loader has no final private preflight object. The RPM signer
      receipt has been generated and inspected
      privately for the superseded f095b8ce revision; it must be regenerated for
-     the new S1 candidate revision and epoch. The recorded 1dfe6906 revision is
-     also superseded and must not receive new release inputs. Maps
+     candidate 2872293b1 / 1787447942. Superseded 1dfe6906 must not receive
+     new release inputs. Maps
      approval/source, App VM image/catalog receipt,
      bootc receipt is not admitted for the frozen revision. Android/Cuttlefish
      is deferred and must not appear in the `13.0.0` preflight object. Maps provider/live proof
@@ -721,7 +722,8 @@ is a capacity incident (§10.0.3), not a silent retry.
   App VM, Browser VM, and bootc ARGs and inventory pins match `3a5e74e6…`.
   Surface `bootc_base` stays null (blocked stack must not guess a digest).
   Leftover is Maps `production_admitted`, real catalog refs, RPM signer after
-  freeze, S7 `REPLACE_*`, live-seat dest. Evidence:
+  freeze, S7 `REPLACE_*`, live-seat dest. Bind new receipts to 2872293b1, not
+  1dfe6906 (`WL-REL-001-2026-08-22-input-candidate-r1.md`). Evidence:
   `WL-REL-006-2026-08-22-leftover-park-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
