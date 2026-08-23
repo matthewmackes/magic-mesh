@@ -7,10 +7,15 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 3 `Remaining`, 16 `Blocked`, 0 `Needs clarification`.
-  Operator survey 2026-08-22: Q9 delete authorized; Q26 Files stays its own
-  surface; PR #71 Ready; freeze waits on live FUNC-023 enroll; Geofabrik Maps
-  fetch authorized; preflight template then operator secrets; seats+Vitelity go.
+- **19 active epics:** 11 `Remaining`, 8 `Blocked`, 0 `Needs clarification`.
+  Operator survey 2026-08-22 lifted the product questions (Q9 retire mesh-PBX;
+  Q26 Files stays its own OS surface; PR #71 Ready; Maps fetch; preflight
+  template; seats+Vitelity once an unpublished candidate exists). It did
+  **not** lift the release chain: `WL-REL-001` final freeze and therefore
+  `WL-REL-002`–`005`, `WL-TEST-002`, and `WL-REL-007` stay Blocked until live
+  FUNC-023 enroll exists and REL-006 admits current-revision inputs. Feature
+  leftovers (FUNC-024–032) are Remaining: unpublished `13.0.0-35` is installed
+  on Dell, Seat 15, and Surface.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -224,8 +229,9 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Current state: the eight owning epics contain product and release criteria.
   Surface is approved for `13.0.0`; Android/Cuttlefish is deferred. WL-REL-006
   is parked (freeze / catalog refs / RPM secret). Coordinator leftover is
-  FUNC-023 live enroll (no unpublished signed candidate) and FUNC-033 keep
-  `own_nebula_ip`. Do not grind `cargo test --workspace` as filler. Evidence:
+  FUNC-023 live enroll (unpublished `13.0.0-35` is installed; freeze still
+  waits on mint + enroll/offboard) and FUNC-033 keep `own_nebula_ip`. Do not
+  grind `cargo test --workspace` as filler. Evidence:
   `WL-REL-007-2026-08-22-coordinator-park-r1.md`. Exact acceptance is Dell,
   Seat 15, Surface, and three lighthouses.
 - Remaining work:
@@ -1208,7 +1214,7 @@ story execution contract above.
 
 ### WL-FUNC-024 - Carry live audio and video media in Communications Calls
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P1
 - Complexity: Epic
 - Problem: Communications Calls ships the complete call UI and convergent
@@ -1222,9 +1228,10 @@ story execution contract above.
   by typed mackesd verbs and never by the renderer.
 - Current state: in-tree media publish + VoiceAccounts consume landed.
   Mute/DTMF fail closed without a published MediaSessionV1. Leftover is live
-  media/SFU/PSTN. Seats run `magic-mesh-12.1.6-35`; PSTN depends on FUNC-030
-  (Blocked); no unpublished signed candidate. Evidence:
-  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+  media/SFU/PSTN. Dell, Seat 15, and Surface run unpublished
+  `magic-mesh-13.0.0-35`. PSTN still depends on FUNC-030 live gateway.
+  Survey 2026-08-22 authorized seat+Vitelity mutation on that candidate.
+  Evidence: `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
 - Remaining work: leftover is still live media/SFU/PSTN after a
   current-revision unpublished candidate is installed.
   1. S1 Add the typed media contracts.
@@ -1308,7 +1315,7 @@ story execution contract above.
 
 ### WL-FUNC-025 - Surface the full Files POSIX operation set
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P1
 - Complexity: Medium
 - Problem: file-manager design lock 1 requires the full POSIX plus archive
@@ -1372,7 +1379,7 @@ story execution contract above.
 
 ### WL-FUNC-026 - Persist per-folder Files view preferences
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Small
 - Problem: file-manager design lock 20 says view and sort persist per folder,
@@ -1412,7 +1419,7 @@ story execution contract above.
 
 ### WL-FUNC-027 - Add persisted user bookmarks to the Files Places sidebar
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Small
 - Problem: file-manager design lock 21 requires user-pinnable bookmarks, but
@@ -1510,7 +1517,7 @@ story execution contract above.
 
 ### WL-FUNC-029 - Build the Fleet voice-admin panel in Communications Activity
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Medium
 - Problem: fleet voice provisioning (Vitelity DIDs, routing, failover,
@@ -1521,10 +1528,9 @@ story execution contract above.
   panel publishing the existing action/voice verbs and rendering the
   state/voice topics.
 - Current state: Fleet voice-admin + `hydrate_voice` landed. Leftover is live
-  Vitelity. Operator 2026-08-22 allows seat+Vitelity mutation only when an
-  unpublished signed candidate exists; none does. Seats still run
-  `magic-mesh-12.1.6-35`. Evidence:
-  `WL-FUNC-028-2026-08-22-installed-cli-gap-r1.md`.
+  Vitelity. Survey 2026-08-22 allows seat+Vitelity mutation on the unpublished
+  signed candidate; Dell, Seat 15, and Surface run `magic-mesh-13.0.0-35`.
+  Evidence: `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
 - Remaining work: leftover is live Vitelity on a current-revision seat, not a
   missing Activity section.
   1. S1 Panel over the existing verbs.
@@ -1558,7 +1564,7 @@ story execution contract above.
 
 ### WL-FUNC-030 - Build the mesh SIP-gateway config control in Communications Activity
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Small
 - Problem: the mesh-wide SIP gateway responder
@@ -1569,10 +1575,9 @@ story execution contract above.
   responder and gateway.toml contract stay unchanged; the existing workgroup
   gateway.toml migrates in place.
 - Current state: gateway form / in-place hydrate landed. Read-only 2026-08-22:
-  no `gateway.toml` on Dell, Seat 15, or Surface; seats run
-  `magic-mesh-12.1.6-35`. Live Bus leftover waits on a current-revision RPM
-  plus a migrated workgroup toml. Evidence:
-  `WL-FUNC-028-2026-08-22-installed-cli-gap-r1.md`.
+  no `gateway.toml` on Dell, Seat 15, or Surface. Seats now run unpublished
+  `magic-mesh-13.0.0-35`. Leftover is live Bus + migrated workgroup toml.
+  Evidence: `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
 - Remaining work: leftover is live Bus + migrated workgroup toml, not a
   missing GUI publisher.
   1. S1 Gateway section in Activity.
@@ -1601,7 +1606,7 @@ story execution contract above.
 
 ### WL-FUNC-031 - Build the per-document mesh co-edit share-session UI
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P2
 - Complexity: Medium
 - Problem: the Yrs CRDT co-editing library rides the embedded editor, but no
@@ -1613,8 +1618,8 @@ story execution contract above.
   follow-mode, and the session lifecycle is visible and closable by its
   owner.
 - Current state: show() mounts live_document_share_session(); sibling pub+wire
-  landed. Leftover is live two-seat co-edit. Seats run `magic-mesh-12.1.6-35`;
-  no unpublished signed candidate. Evidence:
+  landed. Leftover is live two-seat co-edit. Dell, Seat 15, and Surface run
+  unpublished `magic-mesh-13.0.0-35`. Evidence:
   `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
 - Remaining work: leftover is live two-seat co-edit evidence only, not a
   missing mount wire.
@@ -1654,7 +1659,7 @@ story execution contract above.
 
 ### WL-FUNC-032 - Reserve the Transfers hotkeys
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P3
 - Complexity: Small
 - Problem: no global accelerator opens Transfers, so the industry-standard
