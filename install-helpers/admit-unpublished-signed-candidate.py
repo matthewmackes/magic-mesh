@@ -32,6 +32,11 @@ JOIN_TOKEN_PLACEHOLDER = "{{JOIN_TOKEN}}"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 NEVRA_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+ROLE_NEVRA_PREFIX = {
+    "workstation": "magic-mesh-13.0.0-",
+    "server": "magic-mesh-server-13.0.0-",
+    "lighthouse": "magic-mesh-lighthouse-13.0.0-",
+}
 
 
 class Refusal(ValueError):
@@ -114,6 +119,9 @@ def admit_role(name: str, body: object, worktree: Path) -> dict[str, object]:
         refuse(f"{name} sha256 is not 64 hex")
     if not NEVRA_RE.fullmatch(nevra):
         refuse(f"{name} nevra is not a bound RPM identity")
+    prefix = ROLE_NEVRA_PREFIX[name]
+    if not nevra.startswith(prefix):
+        refuse(f"{name} nevra is not the 13.0.0 {name} RPM")
     rpm = dest_resolved(Path(path_raw))
     if not str(rpm).endswith(".rpm"):
         refuse(f"{name} path is not an RPM")

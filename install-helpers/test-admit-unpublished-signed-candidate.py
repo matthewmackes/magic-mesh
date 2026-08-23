@@ -110,7 +110,11 @@ def main() -> None:
             role_records[name] = {
                 "path": str(path),
                 "sha256": write_rpm(path, body),
-                "nevra": f"magic-mesh-{name}-13.0.0-1.fc44.x86_64",
+                "nevra": {
+                    "workstation": "magic-mesh-13.0.0-1.fc44.x86_64",
+                    "server": "magic-mesh-server-13.0.0-1.fc44.x86_64",
+                    "lighthouse": "magic-mesh-lighthouse-13.0.0-1.fc44.x86_64",
+                }[name],
             }
             rpms[name] = path
 
@@ -134,6 +138,14 @@ def main() -> None:
         dest_signer = root / "signer.json"
         write_sidecar(dest_signer, sidecar(role_records, signer="0" * 40))
         command(dest=dest_signer, refused=True)
+
+        dest_old = root / "old-nevra.json"
+        old = dict(role_records)
+        old["workstation"] = dict(role_records["workstation"])
+        old["workstation"]["nevra"] = "magic-mesh-12.1.6-35.x86_64"
+        write_sidecar(dest_old, sidecar(old))
+        old_result = command(dest=dest_old, refused=True)
+        assert "13.0.0" in old_result.stderr
 
         dest_digest = root / "digest.json"
         bad = dict(role_records)

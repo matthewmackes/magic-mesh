@@ -125,7 +125,11 @@ def write_fixture_candidate(root: Path) -> Path:
         roles[name] = {
             "path": str(path),
             "sha256": hashlib.sha256(body).hexdigest(),
-            "nevra": f"magic-mesh-{name}-13.0.0-1.fc44.x86_64",
+            "nevra": {
+                "workstation": "magic-mesh-13.0.0-1.fc44.x86_64",
+                "server": "magic-mesh-server-13.0.0-1.fc44.x86_64",
+                "lighthouse": "magic-mesh-lighthouse-13.0.0-1.fc44.x86_64",
+            }[name],
         }
     dest = root / "unpublished-signed-candidate.json"
     dest.write_text(
