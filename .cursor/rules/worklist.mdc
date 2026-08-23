@@ -44,6 +44,12 @@ The queue this feeds is `automation/lib/farm-jobs.sh active` →
 `automation/queue/farm-agent.sh`. Tick with
 `install-helpers/drain-coordinator.sh plan`. Do not invent a second queue.
 
+After commit/push, fill with `automation/reconciler/tick-fill.sh` (or
+`systemctl start --no-block mcnf-farm-reconcile.service`). The path unit
+`mcnf-farm-reconcile.path` starts the same oneshot on HEAD change; do
+not wait for the 15-min timer, and do not hand-fan a command the
+reconciler already owns.
+
 `Status: Blocked` and `Status: Needs clarification` epics may omit the
 payload but should record what would unblock the payload landing.
 

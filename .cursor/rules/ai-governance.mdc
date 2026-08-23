@@ -150,7 +150,20 @@ drain. The bridge fails closed when the native adapter is absent.
 - **Concurrency target.** Keep `min(active_farm_jobs, free_slots)` busy.
   If Remaining epics exist and `farm-jobs.sh active` returns zero, the
   next act is decomposing the top-priority epic into disjoint
-  `@farm:{cargo …}` units, not starting a serial edit.
+  `@farm:{cargo …}` units, not starting a serial edit. After every
+  commit/push, start the shared fill oneshot
+  (`automation/reconciler/tick-fill.sh` or
+  `systemctl start --no-block mcnf-farm-reconcile.service`). Do not wait
+  for the 15-min timer. Do not hand-duplicate a cargo command the
+  reconciler already owns. `skip … (fresh @ <old SHA>)` is a waiting
+  timer, not a broken farm. Fresh at the current clean HEAD with
+  dest/live leftovers means implementation fan-out, not a filler
+  workspace grind.
+- **Fill control (shared).** The oneshot is
+  `automation/reconciler/farm-reconcile.sh` via
+  `mcnf-farm-reconcile.service`. Triggers:
+  `mcnf-farm-reconcile.timer` (15 min) and `mcnf-farm-reconcile.path`
+  (HEAD change). Canonical how-to: `docs/BUILD-ENVIRONMENT.md` §4A.6–4A.7.
 - **Local heavy cargo stays disabled** by `install-drain-guardrails.sh`
   (`cargo-farm-guard.sh` replaces `cargo`; blocked verbs exit 97). Do
   not bypass. Allowed local: `fmt`, `metadata`, `tree`, `--version`,

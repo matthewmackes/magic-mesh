@@ -519,7 +519,7 @@ waive source identity, capacity, checkpoint, artifact-integrity, or
 virtualization/image-contract checks. `docs/BUILD-ENVIRONMENT.md` is the
 operator procedure; this subsection is the durable authority.
 
-**§10.0.4 — Parallel drain contract (newest lock 2026-08-20).** The §10.0
+**§10.0.4 — Parallel drain contract (newest lock 2026-08-23).** The §10.0
 "work the farm, scale out, never grind solo" mandate is now a hard, measurable
 scheduling contract, not aspirational prose. Prior sessions repeatedly left
 nine of ten heavy slots idle because the worklist carried no machine-readable
@@ -589,6 +589,18 @@ by an operator lock.
  `MCNF_AGENT_RUNTIME=cursor|codex|claude` and receives the same runtime; it
  MUST NOT silently fall back to another tool. A plan-only tick without a
  native adapter is a dispatch failure, not healthy utilization.
+9. **Fill control is shared and must be used.** The farm is filled by
+ `automation/reconciler/farm-reconcile.sh` via
+ `mcnf-farm-reconcile.service`. Two triggers start that same oneshot: the
+ 15-minute timer and `mcnf-farm-reconcile.path` (HEAD change). After every
+ commit or push, every agent runtime starts the oneshot with
+ `automation/reconciler/tick-fill.sh` (or
+ `systemctl start --no-block mcnf-farm-reconcile.service`). Waiting for
+ the next timer while `farm-jobs.sh active` is non-zero and slots are
+ free is a process failure. Do not hand-fan the same cargo command the
+ reconciler already owns. A result whose `commit` equals the current
+ clean HEAD is cargo-converged; dest/live leftovers then require
+ implementation fan-out, not a filler workspace grind.
 
 ---
 

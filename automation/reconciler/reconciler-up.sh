@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# reconciler-up.sh — DAR-30: install BOTH reconciler timers on the control VM,
-# PLAN-ONLY, the way state-backend-up.sh stands up its service. One idempotent
-# script: render /etc/mcnf/reconciler.env (DAR-27), ensure the etcd /reconciler/*
-# prefix (DAR-28), drop the two units with EnvironmentFile + WorkingDirectory=
-# /opt/mcnf, and enable both timers WITHOUT arming the live apply.
+# reconciler-up.sh — DAR-30: install BOTH reconciler timers plus the HEAD path
+# unit on the control VM, PLAN-ONLY, the way state-backend-up.sh stands up its
+# service. One idempotent script: render /etc/mcnf/reconciler.env (DAR-27),
+# ensure the etcd /reconciler/* prefix (DAR-28), drop the units with
+# EnvironmentFile + WorkingDirectory=/opt/mcnf, and enable both timers and
+# mcnf-farm-reconcile.path WITHOUT arming the live apply.
 #
 #   - 5-min  autoscale reconciler (mcnf-farm-autoscale-reconcile) — apply-CAPABLE
 #            but PLAN-ONLY here: FA_APPLY is left UNSET (the unit carries no inline
@@ -12,6 +13,9 @@
 #            script, never genesis, never the AI.
 #   - 15-min @farm build reconciler (mcnf-farm-reconcile) — dispatches @farm jobs;
 #            no apply gate (it never mutates infra).
+#   - HEAD-change path unit (mcnf-farm-reconcile.path) — starts the same oneshot
+#            when $REPO/.git/logs/HEAD or .git/HEAD changes, so a commit does
+#            not wait up to 15 min with every slot idle.
 #
 # The units point at the DEDICATED release slot ${MCNF_REPO:-/opt/mcnf} — NEVER the
 # resettable .52 build dir (the CI gremlin) and NEVER a .claude/worktrees path.
@@ -111,6 +115,25 @@ Nice=10
 EOF
 }
 
+# Same oneshot as the 15-min timer; fires when HEAD moves so agents do not wait
+# for OnUnitActiveSec after a commit. Watches the deployed slot only.
+build_path_unit() {
+  cat <<EOF
+# DAR-30 — start mcnf-farm-reconcile.service when HEAD changes. Complements
+# the 15-min timer; does not replace it. Never a disposable agent worktree.
+[Unit]
+Description=MCNF build-farm reconciler — start on HEAD change
+
+[Path]
+PathChanged=$REPO/.git/logs/HEAD
+PathModified=$REPO/.git/HEAD
+Unit=mcnf-farm-reconcile.service
+
+[Install]
+WantedBy=paths.target
+EOF
+}
+
 install_file() { # <dest> <generator-fn|src-path>
   local dest="$1" src="$2"
   if [ "$DRY" -eq 1 ]; then
@@ -147,6 +170,16 @@ self_test() {
     *) chk "autoscale unit execs via bash" no yes ;;
   esac
   case "$unit" in *"infra/tofu/env.sh"*) chk "autoscale unit does not source missing env.sh" has none ;; *) chk "autoscale unit does not source missing env.sh" none none ;; esac
+  unit="$(build_path_unit)"
+  case "$unit" in
+    *"/opt/mcnf/.git/logs/HEAD"*) chk "path unit watches deployed logs/HEAD" yes yes ;;
+    *) chk "path unit watches deployed logs/HEAD" no yes ;;
+  esac
+  case "$unit" in
+    *"Unit=mcnf-farm-reconcile.service"*) chk "path unit starts existing oneshot" yes yes ;;
+    *) chk "path unit starts existing oneshot" no yes ;;
+  esac
+  case "$unit" in *".claude/worktrees"*) chk "path unit has no worktree path" has none ;; *) chk "path unit has no worktree path" none none ;; esac
   if [ "$fails" -eq 0 ]; then echo "reconciler-up: self-test passed"; return 0; fi
   echo "reconciler-up: SELF-TEST FAILED ($fails)" >&2; return 1
 }
@@ -176,12 +209,14 @@ else
     bash "$HERE/render-env.sh"
 fi
 
-# 2) Install the bootstrap oneshot (ensures /reconciler/* prefix) + the two units +
-#    the two timers (timers are static — copied from packaging/systemd verbatim).
+# 2) Install the bootstrap oneshot (ensures /reconciler/* prefix) + the units +
+#    the two timers (timers are static — copied from packaging/systemd verbatim)
+#    + the HEAD path unit (generated against $REPO).
 say "install units into $SYSTEMD_DIR (plan-only — FA_APPLY UNSET)"
 install_file "$SYSTEMD_DIR/mcnf-reconciler-bootstrap.service" "$PKG/mcnf-reconciler-bootstrap.service"
 install_file "$SYSTEMD_DIR/mcnf-farm-autoscale-reconcile.service" autoscale_unit
 install_file "$SYSTEMD_DIR/mcnf-farm-reconcile.service" build_unit
+install_file "$SYSTEMD_DIR/mcnf-farm-reconcile.path" build_path_unit
 install_file "$SYSTEMD_DIR/mcnf-farm-autoscale-reconcile.timer" "$PKG/mcnf-farm-autoscale-reconcile.timer"
 install_file "$SYSTEMD_DIR/mcnf-farm-reconcile.timer" "$PKG/mcnf-farm-reconcile.timer"
 
@@ -195,15 +230,17 @@ systemctl daemon-reload
 systemctl enable --now mcnf-reconciler-bootstrap.service || true
 systemctl enable --now mcnf-farm-autoscale-reconcile.timer
 systemctl enable --now mcnf-farm-reconcile.timer
+systemctl enable --now mcnf-farm-reconcile.path
 
-say "timers enabled (plan-only):"
+say "timers + HEAD path unit enabled (plan-only):"
 systemctl list-timers mcnf-farm-autoscale-reconcile.timer mcnf-farm-reconcile.timer --no-pager || true
+systemctl is-enabled mcnf-farm-reconcile.path --no-pager || true
 cat <<EOF
 
-reconciler-up: DONE. Both timers are active, PLAN-ONLY.
+reconciler-up: DONE. Both timers and the HEAD path unit are active, PLAN-ONLY.
   - autoscale (5-min): apply-capable but FA_APPLY is UNSET → every tick logs
     'apply-gate … → plan-only (FA_APPLY!=1)'. No VM is touched.
-  - @farm build (15-min): dispatches build jobs; never mutates infra.
+  - @farm build (15-min timer + HEAD path): dispatches build jobs; never mutates infra.
 
 To ARM the live autoscale apply (the ONE explicit operator step — never the AI):
   sudo bash install-helpers/enable-autoscale-timer.sh

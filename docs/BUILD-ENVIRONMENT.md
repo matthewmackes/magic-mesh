@@ -507,9 +507,12 @@ Two different things are both called "slot", so keep them apart:
 ### 4A.2 The `@farm` convention (canonical declarative lane)
 
 The default way to get something built is **declarative, no AI, no manual dispatch**:
-tag a worklist task with `@farm:{<command>}` and the **reconciler timer**
-(`mcnf-farm-reconcile.timer`, FARM-AUTO-4) runs it on the fleet within one interval,
-idempotently (it skips a job whose result already matches a clean HEAD).
+tag a worklist task with `@farm:{<command>}` and the **reconciler**
+(`mcnf-farm-reconcile.service`, FARM-AUTO-4) runs it on the fleet. Two
+triggers start the same oneshot: the 15-minute timer
+(`mcnf-farm-reconcile.timer`) and the HEAD path unit
+(`mcnf-farm-reconcile.path`, watches `.git/logs/HEAD` and `.git/HEAD`).
+It is idempotent (it skips a job whose result already matches a clean HEAD).
 
 ```text
 - [>] **SOME-TASK: …**  @farm:{cargo test -p mde-bus}  @farm:{cargo clippy -p mackesd}
@@ -523,12 +526,15 @@ intended BUILD-PLATFORM-1 path is to build with shared sccache once WL-BUILD-002
 is complete — verify that contract with `install-helpers/farm-sccache-proof.sh
 status` before claiming cross-node cache behavior.
 
-Drive a cycle by hand when you don't want to wait for the timer:
+Drive a cycle by hand when you don't want to wait for the timer. After a
+commit, prefer the shared no-block kick (every agent runtime uses this):
 
 ```bash
 automation/lib/farm-jobs.sh active                  # what the worklist is asking for
 automation/reconciler/farm-reconcile.sh --dry-run   # what would dispatch, no farm contact
-automation/reconciler/farm-reconcile.sh             # dispatch + wait + summarize
+automation/reconciler/tick-fill.sh                  # start the oneshot; do not wait
+# equivalent: systemctl start --no-block mcnf-farm-reconcile.service
+automation/reconciler/farm-reconcile.sh             # dispatch + wait + summarize (foreground)
 ```
 
 A job with **no `@farm:{…}` marker never reaches the farm.** If `Remaining` epics
@@ -618,7 +624,10 @@ install-helpers/drain-coordinator.sh plan 7    # preflight + free slots + next N
 install-helpers/xcp-build.sh cargo test -p mde-bus     # one-off, from the dirty tree
 install-helpers/xcp-build.sh route cargo test -p x     # dry: which host + why
 automation/lib/farm-dispatch.sh run <jobid> "cargo test -p x"
-automation/reconciler/farm-reconcile.sh                # the whole worklist cycle
+automation/reconciler/tick-fill.sh                     # start oneshot after commit (shared)
+systemctl start --no-block mcnf-farm-reconcile.service # same as tick-fill.sh
+automation/reconciler/farm-reconcile.sh                # the whole worklist cycle (foreground)
+systemctl status mcnf-farm-reconcile.{service,timer,path}
 
 # --- results --------------------------------------------------------------
 automation/lib/farm-dispatch.sh result <jobid>         # the result JSON
@@ -627,6 +636,8 @@ cat automation/.state/logs/<jobid>.log                 # full build output
 # --- offline self-tests (no farm contact; run these after editing) --------
 automation/lib/farm-dispatch.sh --self-test
 automation/reconciler/farm-reconcile.sh --self-test
+automation/reconciler/reconciler-up.sh --self-test
+automation/reconciler/tick-fill.sh --self-test
 automation/lib/farm-jobs.sh --self-test
 install-helpers/xcp-build.sh --route-test
 
@@ -712,6 +723,22 @@ xe vm-start   uuid=$V
    and must treat a sync miss as `EX_TEMPFAIL` (75) with **no** result JSON. A
    `fail` JSON at the current clean HEAD makes the next timer skip the job and
    the farm stays idle until the next commit.
+10. **Did HEAD move while the 15-min timer was waiting?** `is_fresh` skips a
+   job whose result `commit` equals a clean `HEAD`. After a commit those
+   results are stale, but `OnUnitActiveSec=15min` may not have fired yet —
+   `farm-jobs.sh active` is non-zero, `TOTAL_FREE=10`, and the last log says
+   `skip … (fresh @ <old SHA>)` / `nothing to do — farm converged @ <old SHA>`.
+   That is a waiting timer, not a broken farm. `mcnf-farm-reconcile.path`
+   starts the existing oneshot on `.git/logs/HEAD` change. Agents must
+   `automation/reconciler/tick-fill.sh` (or `systemctl start --no-block
+   mcnf-farm-reconcile.service`) after commit/push and must not hand-fan
+   `xcp-build.sh` of a command the reconciler already owns (§4A.5). A fresh
+   skip at the *current* clean HEAD means cargo is converged; if Remaining
+   leftovers are dest/live/seat work, fan implementation agents — do not
+   grind `cargo test --workspace` as filler (unless that command is the
+   epic's official unit). Do not run a live `reconciler-up.sh` install on
+   `rocky9-kvm2` just to fill slots (default `--repo` is `/opt/mcnf` and
+   autoscale stays plan-only).
 
 **Never edit a farm script in place while it is executing.** Bash reads scripts
 incrementally, so rewriting one under a running dispatcher makes it resume at a

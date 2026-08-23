@@ -44,6 +44,34 @@ farm slots sit idle even though the machinery is running. Under §10.0.4:
 - `install-helpers/lint-worklist.sh` fails commits that violate this.
 - A non-`cargo …` payload is a template and contributes zero demand.
 
+## Farm fill control (shared; do not fork)
+
+The farm is filled by `automation/reconciler/farm-reconcile.sh` via
+`mcnf-farm-reconcile.service`. Two triggers start the same oneshot:
+
+- `mcnf-farm-reconcile.timer` — every 15 minutes
+- `mcnf-farm-reconcile.path` — on `.git/logs/HEAD` / `.git/HEAD` change
+
+`is_fresh` skips a job whose result `commit` equals a clean HEAD. After a
+commit the previous SHA is stale, but the 15-minute timer may still be
+waiting — that looks like an idle farm. Do not treat `fresh @ <old SHA>`
+or `nothing to do — farm converged` at the *previous* HEAD as farm-down.
+
+After every commit/push:
+
+```bash
+automation/reconciler/tick-fill.sh
+# equivalent: systemctl start --no-block mcnf-farm-reconcile.service
+```
+
+Do not hand-fan `xcp-build.sh` of a command the reconciler already owns
+(`docs/BUILD-ENVIRONMENT.md` §4A.5). Do not grind `cargo test --workspace`
+as filler unless that command is the epic's official unit. If every unique
+cargo command is already fresh at this clean HEAD and Remaining leftovers
+are dest/live/seat work, idle slots are correct — fan implementation
+agents, not cargo. Do not run a live `reconciler-up.sh` install on
+`rocky9-kvm2` just to fill slots.
+
 ## Tick recipe (run in this order every session)
 
 1. **Re-read the locks.** `AI_GOVERNANCE.md §10.0.4`, `AGENTS.md`,
@@ -70,6 +98,7 @@ farm slots sit idle even though the machinery is running. Under §10.0.4:
  requires it.
 7. **Fold completions** as they return. Commit (with standing auth)
  grouping cohesive lanes; push. Preserve other agents' dirty edits.
+ Then `automation/reconciler/tick-fill.sh` — do not wait for the timer.
 8. **Re-fan against surfaced blockers.** A worker that hits a
  pre-existing farm-wide blocker (strict-clippy drift, style-leak lint
  failure, farm-side infra breakage) surfaces it as the next fan-out
@@ -91,6 +120,9 @@ farm slots sit idle even though the machinery is running. Under §10.0.4:
 | `automation/lib/farm-jobs.sh` | worklist → queue |
 | `automation/queue/farm-enqueue.sh` | etcd `/farm/queue/*` push |
 | `automation/queue/farm-agent.sh` | slot consumer |
+| `automation/reconciler/farm-reconcile.sh` | converge `@farm` jobs onto slots |
+| `automation/reconciler/tick-fill.sh` | start the fill oneshot after commit |
+| `mcnf-farm-reconcile.{timer,path}` | 15-min timer + HEAD-change trigger |
 | `install-helpers/farm-reconciler.sh` | build-VM autoscale from queue demand |
 | `install-helpers/farm-slot-gc.sh` | 20-min stale-slot GC (fleet install with `--deploy`) |
 | `install-helpers/cargo-farm-guard.sh` + `install-drain-guardrails.sh` | local heavy cargo hard-blocked |
@@ -137,6 +169,10 @@ Long pole always routes to BigBoy first.
  (§10.0.3.5), not a routine retry. Park + report the slot.
 - **New scheduler surface.** The engine exists. Extend it; do not fork
  it.
+- **Waiting on the 15-min timer.** After HEAD moves, start the oneshot.
+- **Filler workspace grind.** Official REL-007 unit is the only
+ workspace grind. Fresh cargo at this HEAD plus dest/live leftovers
+ is implementation work.
 
 ## Related skills
 

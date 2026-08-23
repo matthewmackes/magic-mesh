@@ -169,7 +169,13 @@ While Remaining epics exist, the coordinator must keep
 but `farm-jobs.sh active` returns zero, the responsible agent's next act is
 decomposing the top-priority epic into disjoint `@farm:{cargo …}` units,
 not starting single-threaded implementation. Idle nodes with Remaining
-stories is a process failure, not a resource shortage.
+stories is a process failure, not a resource shortage. After every
+commit/push, start `automation/reconciler/tick-fill.sh` (or
+`systemctl start --no-block mcnf-farm-reconcile.service`);
+`mcnf-farm-reconcile.path` starts the same oneshot on HEAD change. Do not
+wait for the 15-min timer. Do not hand-fan a cargo command the reconciler
+already owns. A fresh skip at the current clean HEAD with dest/live
+leftovers is implementation work, not a filler workspace grind.
 
 Local heavy `cargo` remains blocked by
 `install-helpers/install-drain-guardrails.sh` (exit 97 with a farm redirect).
@@ -728,9 +734,8 @@ is a capacity incident (§10.0.3), not a silent retry.
   Leftover is Maps `production_admitted`, RPM signer after freeze, S7
   `REPLACE_*`, Surface `bootc_base` null. Flathub LibreOffice dest is
   bound (`WL-REL-006-2026-08-23-flathub-libreoffice-catalog-r1.md`;
-  `catalog_sha256=de95022649b2a444791cdca3c88211c8bb06b8ed1a3a64f44f8b0034e6dd3e37`).
-  Do not invent more refs or flip `production_admitted`. Bind new receipts
-  to dest-cut `7e3474eeb`.
+  sha256 `de95022649b2a444791cdca3c88211c8bb06b8ed1a3a64f44f8b0034e6dd3e37`).
+  Do not invent refs or flip `production_admitted`; bind to `7e3474eeb`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable

@@ -85,6 +85,12 @@ authority — this section is the shared operational glue.
  - `automation/queue/farm-enqueue.sh` — push to etcd `/farm/queue/*`.
  - `automation/queue/farm-agent.sh` — slot consumer.
  - `install-helpers/farm-reconciler.sh --once` — autoscale build VMs.
+ - `automation/reconciler/farm-reconcile.sh` — converge `@farm` jobs onto
+ slots (the fill oneshot). After commit/push:
+ `automation/reconciler/tick-fill.sh` or
+ `systemctl start --no-block mcnf-farm-reconcile.service`. Do not wait
+ for the 15-min timer. Triggers:
+ `mcnf-farm-reconcile.timer` and `mcnf-farm-reconcile.path`.
  - `install-helpers/farm-slot-gc.sh` — 20-min timer, `--deploy` for
  fleet install.
  - `install-helpers/cargo-farm-guard.sh` +
@@ -99,7 +105,13 @@ authority — this section is the shared operational glue.
  but `farm-jobs.sh active` returns zero, the responsible agent's first
  act is decomposing the top-priority epic into disjoint `@farm:{cargo …}`
  units, not single-threaded implementation. Idle nodes with Remaining
- stories is a process failure, not a resource shortage.
+ stories is a process failure, not a resource shortage. After every
+ commit/push, start the fill oneshot — do not wait 15 minutes, do not
+ hand-duplicate `xcp-build` of a command the reconciler already owns
+ (`docs/BUILD-ENVIRONMENT.md` §4A.5). `skip … (fresh @ <old SHA>)` at a
+ *previous* HEAD is a waiting timer; a fresh skip at the *current* clean
+ HEAD with dest/live leftovers means fan implementation agents, not a
+ filler `cargo test --workspace` grind.
 - **Disjoint ownership.** Multiple markers on one epic must cover
  non-overlapping subsets of its `Relevant files/components`, so parallel
  workers cannot collide at merge time. Preserve other agents' dirty

@@ -1,0 +1,14 @@
+# FARM-AUTO-4 fill-on-HEAD. TEMPLATE; automation/reconciler/reconciler-up.sh
+# rewrites PathChanged/PathModified to $REPO/.git/{logs/HEAD,HEAD}. Keep the
+# 15-min timer; this only starts the existing oneshot after a commit so slots
+# do not sit empty until OnUnitActiveSec. Never a .claude/worktrees path.
+[Unit]
+Description=MCNF build-farm reconciler — start on HEAD change
+
+[Path]
+PathChanged=/opt/mcnf/.git/logs/HEAD
+PathModified=/opt/mcnf/.git/HEAD
+Unit=mcnf-farm-reconcile.service
+
+[Install]
+WantedBy=paths.target
