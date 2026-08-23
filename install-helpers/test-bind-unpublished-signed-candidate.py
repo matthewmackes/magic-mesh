@@ -9,6 +9,7 @@ not a production candidate.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -214,6 +215,42 @@ def main() -> None:
         finally:
             if inside.exists():
                 inside.unlink()
+
+        spec = importlib.util.spec_from_file_location("bind_candidate", HELPER)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
+        os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
+        os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+        seen: list[dict[str, str] | None] = []
+        original = module.subprocess.run
+
+        def capture(*args: object, **kwargs: object) -> object:
+            env = kwargs.get("env")
+            seen.append(env if isinstance(env, dict) else None)
+            return original(*args, **kwargs)
+
+        module.subprocess.run = capture  # type: ignore[method-assign]
+        try:
+            try:
+                module.query_nevra(rpms["workstation"])
+            except module.admit.Refusal:
+                pass
+        finally:
+            module.subprocess.run = original  # type: ignore[method-assign]
+            os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
+            os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
+            os.environ.pop("JOIN_TOKEN", None)
+        assert seen and all(env is not None for env in seen)
+        for env in seen:
+            assert env is not None
+            for name in (
+                "MACKESD_BOOTSTRAP_SSH_KEY",
+                "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+                "JOIN_TOKEN",
+            ):
+                assert name not in env
 
     after = production_snapshot()
     if before is not None and after is not None:

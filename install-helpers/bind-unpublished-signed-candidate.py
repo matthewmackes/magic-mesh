@@ -58,6 +58,7 @@ def query_nevra(rpm: Path) -> str:
             check=False,
             capture_output=True,
             text=True,
+            env=admit.child_process_env(),
         )
     except OSError:
         refuse("rpm query is required for a production candidate dest")

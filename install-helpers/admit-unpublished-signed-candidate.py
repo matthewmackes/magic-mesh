@@ -39,6 +39,12 @@ ROLE_NEVRA_PREFIX = {
 }
 PRODUCTION_DEST_PARENT = Path("/root/mcnf-private")
 SIGNER_KEY_ID = SIGNER_FINGERPRINT[-8:].lower()
+# Leftover (2): dest identity and join-token env stay off rpm/git children.
+DEST_CHILD_ENV_STRIP = (
+    "MACKESD_BOOTSTRAP_SSH_KEY",
+    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
+    "JOIN_TOKEN",
+)
 
 
 class Refusal(ValueError):
@@ -49,12 +55,20 @@ def refuse(message: str) -> None:
     raise Refusal(message)
 
 
+def child_process_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in DEST_CHILD_ENV_STRIP:
+        env.pop(name, None)
+    return env
+
+
 def helper_worktree_root() -> Path:
     result = subprocess.run(
         ["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
         check=False,
         capture_output=True,
         text=True,
+        env=child_process_env(),
     )
     root = result.stdout.strip()
     if result.returncode == 0 and root:
@@ -99,6 +113,7 @@ def verify_rpm_signature(rpm: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
+            env=child_process_env(),
         )
     except OSError:
         refuse("rpm signature verify is required for a production candidate dest")

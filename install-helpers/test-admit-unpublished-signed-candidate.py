@@ -200,6 +200,39 @@ def main() -> None:
                 assert "GPG-signed" in str(error) or "signature" in str(error).lower()
             else:
                 raise AssertionError("fixture bytes must not count as GPG-signed")
+            os.environ["MACKESD_BOOTSTRAP_SSH_KEY"] = "/tmp/must-not-leak"
+            os.environ["MACKESD_BOOTSTRAP_KNOWN_HOSTS"] = "/tmp/must-not-leak-hosts"
+            os.environ["JOIN_TOKEN"] = "must-not-leak-token"
+            try:
+                stripped = module.child_process_env()
+                seen: list[dict[str, str] | None] = []
+                original = module.subprocess.run
+
+                def capture(*args: object, **kwargs: object) -> object:
+                    env = kwargs.get("env")
+                    seen.append(env if isinstance(env, dict) else None)
+                    return original(*args, **kwargs)
+
+                module.subprocess.run = capture  # type: ignore[method-assign]
+                try:
+                    module.verify_rpm_signature(rpms["workstation"])
+                except module.Refusal:
+                    pass
+                else:
+                    raise AssertionError("fixture bytes must not count as GPG-signed")
+                finally:
+                    module.subprocess.run = original  # type: ignore[method-assign]
+            finally:
+                os.environ.pop("MACKESD_BOOTSTRAP_SSH_KEY", None)
+                os.environ.pop("MACKESD_BOOTSTRAP_KNOWN_HOSTS", None)
+                os.environ.pop("JOIN_TOKEN", None)
+            for name in module.DEST_CHILD_ENV_STRIP:
+                assert name not in stripped
+            assert seen and all(env is not None for env in seen)
+            for env in seen:
+                assert env is not None
+                for name in module.DEST_CHILD_ENV_STRIP:
+                    assert name not in env
         finally:
             os.environ.pop(module.DEST_ENV, None)
 

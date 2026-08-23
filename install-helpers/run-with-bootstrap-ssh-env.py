@@ -69,6 +69,7 @@ LIFECYCLE_MUTATION_NAMES = frozenset(
         "leave",
         "mint-enroll-bearer",
         "mint-enroll-bearer.py",
+        "provision",
     }
 )
 
@@ -374,6 +375,7 @@ def write_run_sidecar(
 
 def child_environment(dest_key: Path, dest_known_hosts: Path) -> dict[str, str]:
     child_env = os.environ.copy()
+    child_env.pop("JOIN_TOKEN", None)
     child_env[ENV_KEYS[0]] = str(dest_key)
     child_env[ENV_KEYS[1]] = str(dest_known_hosts)
     return child_env

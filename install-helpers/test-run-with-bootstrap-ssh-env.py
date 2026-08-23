@@ -105,7 +105,8 @@ def child_check_script(key: Path, hosts: Path, marker: Path | None = None) -> st
         [
             "k=os.environ.get('MACKESD_BOOTSTRAP_SSH_KEY')",
             "h=os.environ.get('MACKESD_BOOTSTRAP_KNOWN_HOSTS')",
-            f"sys.exit(0 if k=={str(key)!r} and h=={str(hosts)!r} else 1)",
+            "t=os.environ.get('JOIN_TOKEN')",
+            f"sys.exit(0 if k=={str(key)!r} and h=={str(hosts)!r} and not t else 1)",
         ]
     )
     return "; ".join(lines)
@@ -205,6 +206,7 @@ def main() -> None:
         command(*base, "--", "/usr/bin/mackesd", "enroll-token", "--mesh-id", "x", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "join", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "offboard", refused=True)
+        command(*base, "--", "/usr/bin/meshctl", "provision", "--token", "x", refused=True)
         command(*base, "--", str(HERE / "mint-enroll-bearer.py"), refused=True)
 
         candidate_dest = write_fixture_candidate(root / "candidate")
@@ -289,7 +291,12 @@ def main() -> None:
             "-c",
             child_check_script(dest_key, dest_hosts),
         ]
-        result = command(*base, "--", *child_ok)
+        result = command(
+            *base,
+            "--",
+            *child_ok,
+            extra_env={"JOIN_TOKEN": "must-not-leak-token"},
+        )
         assert result.returncode == 0
         assert result.stdout == ""
         for name in FORBIDDEN_ENV:
