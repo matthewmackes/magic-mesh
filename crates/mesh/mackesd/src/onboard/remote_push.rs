@@ -874,7 +874,9 @@ fn default_issuer_node_id() -> String {
         }
     }
     let host = std::env::var("HOSTNAME").ok().or_else(|| {
-        std::process::Command::new("hostname")
+        let mut command = std::process::Command::new("hostname");
+        crate::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+        command
             .output()
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())

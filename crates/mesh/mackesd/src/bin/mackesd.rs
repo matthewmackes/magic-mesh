@@ -2528,7 +2528,9 @@ fn log_mesh_service_key_outcome(outcome: &mackesd_core::ipc::mesh_ssh_key::Provi
 
 /// This node's short hostname (`hostname`), or `"unknown"`.
 fn local_hostname() -> String {
-    std::process::Command::new("hostname")
+    let mut command = std::process::Command::new("hostname");
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    command
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -3835,9 +3837,10 @@ fn provision_caddy_if_lighthouse(role: mde_role::Role) {
         return;
     }
     println!("CONNECT-4: provisioning Caddy public ingress (lighthouse role)");
-    match std::process::Command::new("timeout")
-        .args(["360", "/usr/libexec/mackesd/setup-caddy"])
-        .status()
+    let mut command = std::process::Command::new("timeout");
+    command.args(["360", "/usr/libexec/mackesd/setup-caddy"]);
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    match command.status()
     {
         Ok(s) if s.success() => println!("CONNECT-4: Caddy ingress ready"),
         Ok(s) => eprintln!(
@@ -3872,9 +3875,10 @@ fn emit_site_yml_best_effort(role: &str, mesh_id: &str, lighthouses: Vec<String>
 /// automatically on every boot. Best-effort: a container/dev env without
 /// systemd just no-ops (the daemon also self-heals via the supervisor).
 fn enable_now_service(name: &str) {
-    let _ = std::process::Command::new("systemctl")
-        .args(["enable", "--now", name])
-        .status();
+    let mut command = std::process::Command::new("systemctl");
+    command.args(["enable", "--now", name]);
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    let _ = command.status();
 }
 
 fn default_node_id() -> String {
@@ -3882,7 +3886,9 @@ fn default_node_id() -> String {
         return v;
     }
     let host = std::env::var("HOSTNAME").ok().or_else(|| {
-        std::process::Command::new("hostname")
+        let mut command = std::process::Command::new("hostname");
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+        command
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
