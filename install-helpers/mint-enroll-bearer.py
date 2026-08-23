@@ -5,7 +5,8 @@ Wraps `mackesd enroll-token` supplied by `--mackesd`. It does not mint into
 a production workgroup, does not SSH, and does not enroll. The bearer is
 written only to `--output`. Helper stdout never carries bearer or token
 bytes. Dest or sidecar under `/root/mcnf-private` refuses while the
-unpublished signed candidate dest is absent. This leftover does not claim a
+unpublished signed candidate dest is absent. After dest admit, production
+mint runs `seat-update-warning.sh`. This leftover does not claim a
 production mint.
 """
 
@@ -36,6 +37,10 @@ def _load(name: str, path: Path):
 candidate = _load(
     "admit_unpublished_signed_candidate",
     HERE / "admit-unpublished-signed-candidate.py",
+)
+warning = _load(
+    "require_seat_mutation_warning",
+    HERE / "require-seat-mutation-warning.py",
 )
 DEFAULT_DEST_PARENT = Path("/root/mcnf-private")
 PRODUCTION_DEST_PARENTS = (DEFAULT_DEST_PARENT,)
@@ -106,6 +111,10 @@ def admit_not_production_dest(path: Path, label: str) -> None:
             candidate.admit_unpublished_signed_candidate(for_production_mutation=True)
         except candidate.Refusal as error:
             refuse(f"{label} is a production dest; {error}")
+        try:
+            warning.require_seat_mutation_warning()
+        except warning.Refusal as error:
+            refuse(str(error))
 
 
 def contain_join_token(*values: object) -> bool:

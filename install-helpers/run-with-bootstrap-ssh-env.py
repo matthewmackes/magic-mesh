@@ -7,7 +7,8 @@ plus those two vars. It never sets those vars on this process, never
 prints key or env-file bytes, and never claims enroll succeeded.
 Lifecycle mutation argv (`enroll-token`, `enroll`, `reenroll`,
 `offboard`, `join`, `found`, `mesh-init`, `leave`, or the mint helper)
-refuses while the unpublished signed candidate dest is absent.
+refuses while the unpublished signed candidate dest is absent. After dest
+admit, mutation argv runs `seat-update-warning.sh`.
 """
 
 from __future__ import annotations
@@ -37,6 +38,10 @@ def _load(name: str, path: Path):
 candidate = _load(
     "admit_unpublished_signed_candidate",
     HERE / "admit-unpublished-signed-candidate.py",
+)
+warning = _load(
+    "require_seat_mutation_warning",
+    HERE / "require-seat-mutation-warning.py",
 )
 DEFAULT_ENV_FILE = Path("/root/mcnf-private/bootstrap-ssh.env")
 SIDECAR_KIND = "mcnf-bootstrap-ssh-env-run"
@@ -90,6 +95,10 @@ def admit_not_lifecycle_mutation(command: list[str]) -> None:
                 )
             except candidate.Refusal as error:
                 refuse(f"lifecycle mutation argv refuses; {error}")
+            try:
+                warning.require_seat_mutation_warning()
+            except warning.Refusal as error:
+                refuse(str(error))
 
 
 def helper_worktree_root() -> Path:
