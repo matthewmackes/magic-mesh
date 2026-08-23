@@ -47,9 +47,10 @@ pub fn run(
         // Best-effort unit starts — the supervisor (next serve)
         // also materializes + starts; containerized test envs
         // without systemd still get a complete on-disk state.
-        let _ = std::process::Command::new("systemctl")
-            .args(["start", "nebula.service"])
-            .status();
+        let mut start = std::process::Command::new("systemctl");
+        start.args(["start", "nebula.service"]);
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut start);
+        let _ = start.status();
         println!(
             "mesh `{}` initialized — lighthouse {} ({})",
             report.mesh_id, node_id, report.overlay_ip

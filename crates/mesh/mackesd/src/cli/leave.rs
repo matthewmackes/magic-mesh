@@ -12,7 +12,9 @@ pub fn run(yes: bool, confirmation_json: String, verifying_key_hex: String) -> a
         );
     }
     let root = mackesd_core::default_qnm_shared_root();
-    let hostname = std::process::Command::new("hostname")
+    let mut hostname_cmd = std::process::Command::new("hostname");
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut hostname_cmd);
+    let hostname = hostname_cmd
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -196,9 +198,10 @@ fn run_inner(yes: bool, root: std::path::PathBuf, hostname: String) -> anyhow::R
         std::path::Path::new("/var/lib/mde/role.toml"),
     );
     let trust_teardown = ensure_required_trust_teardown_succeeded(&report);
-    let _ = std::process::Command::new("systemctl")
-        .args(["stop", "nebula.service"])
-        .status();
+    let mut stop = std::process::Command::new("systemctl");
+    stop.args(["stop", "nebula.service"]);
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut stop);
+    let _ = stop.status();
     trust_teardown?;
     println!("left the mesh: {report:#?}");
     println!("re-join later with: mackesd join '<fresh token from a lighthouse>'");

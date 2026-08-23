@@ -160,6 +160,8 @@ pub mod leave;
 pub mod lifecycle;
 /// WL-FUNC-023 — exclusive, resumable lifecycle checkpoint authority.
 pub mod lifecycle_authority;
+/// Leftover (2): dest identity env stays off lifecycle grandchildren.
+pub mod lifecycle_child_env;
 pub mod mesh_init;
 pub mod mirrors;
 pub mod surface;

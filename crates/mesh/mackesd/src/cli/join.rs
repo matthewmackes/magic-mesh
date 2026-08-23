@@ -5,13 +5,6 @@
 //! CA-backup provisioning helpers are join-exclusive and kept private here.
 use crate::*;
 
-/// Dest identity and join-token env must not leak into the enroll TUI.
-/// Login leftover (2): only the dest-env runner sources those vars.
-const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
-    "MACKESD_BOOTSTRAP_SSH_KEY",
-    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
-    "JOIN_TOKEN",
-];
 const SETUP_ETCD: &str = "/usr/libexec/mackesd/setup-etcd";
 const SETUP_SYNCTHING: &str = "/usr/libexec/mackesd/setup-syncthing";
 const WORKSTATION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -274,15 +267,9 @@ fn load_join_role(requested: Option<mde_role::Role>) -> anyhow::Result<JoinRoleR
     resolve_join_role(pinned, requested).map_err(anyhow::Error::msg)
 }
 
-fn strip_lifecycle_child_env(command: &mut std::process::Command) {
-    for name in LIFECYCLE_CHILD_ENV_STRIP {
-        command.env_remove(*name);
-    }
-}
-
 fn enroll_tui_command() -> std::process::Command {
     let mut command = std::process::Command::new("mde-enroll");
-    strip_lifecycle_child_env(&mut command);
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
     command
 }
 
@@ -773,16 +760,17 @@ fn lighthouse_join_etcd(bundle: &mackesd_core::ca::bundle::NebulaBundle, self_na
     for attempt in 1..=5 {
         match etcd_membership::add_self_as_voter_blocking(&anchors, self_name, &self_overlay) {
             Some(Ok(csv)) => {
-                let st = std::process::Command::new("/usr/libexec/mackesd/setup-etcd")
-                    .args([
-                        "--join",
-                        &anchor_overlay,
-                        "--listen",
-                        &self_overlay,
-                        "--initial-cluster",
-                        &csv,
-                    ])
-                    .status();
+                let mut setup = std::process::Command::new("/usr/libexec/mackesd/setup-etcd");
+                setup.args([
+                    "--join",
+                    &anchor_overlay,
+                    "--listen",
+                    &self_overlay,
+                    "--initial-cluster",
+                    &csv,
+                ]);
+                mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut setup);
+                let st = setup.status();
                 match st {
                     Ok(s) if s.success() => {
                         println!(
@@ -836,9 +824,10 @@ fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
             );
             // The drop-in is new; reload so the upcoming mackesd.service
             // (re)start surfaces $CREDENTIALS_DIRECTORY/backup-passphrase.
-            let _ = std::process::Command::new("systemctl")
-                .arg("daemon-reload")
-                .status();
+            let mut reload = std::process::Command::new("systemctl");
+            reload.arg("daemon-reload");
+            mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut reload);
+            let _ = reload.status();
         }
         Ok(ProvisionOutcome::AlreadyPresent) => {
             println!("MIG-3: CA-backup passphrase credential already present — left untouched");
@@ -1151,7 +1140,7 @@ mod tests {
         command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
         command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
         command.env("JOIN_TOKEN", "must-not-leak-token");
-        strip_lifecycle_child_env(&mut command);
+        mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
         let output = command.output().expect("run stripped child");
         assert!(output.status.success());
         assert!(

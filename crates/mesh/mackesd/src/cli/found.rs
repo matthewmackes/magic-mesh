@@ -281,14 +281,16 @@ fn record_backoffice_intent(tier: &str, host: &str) {
         );
         return;
     }
-    let status = std::process::Command::new("bash")
+    let mut command = std::process::Command::new("bash");
+    command
         .arg(&script)
         .arg("record-intent")
         .arg("--tier")
         .arg(tier)
         .arg("--host")
-        .arg(host)
-        .status();
+        .arg(host);
+    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
+    let status = command.status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => eprintln!(

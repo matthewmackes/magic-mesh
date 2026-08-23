@@ -482,9 +482,10 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             // declared mesh convergence step resumable for the supervisor.
             if let Some(report) = report {
                 if report.created {
-                    let _ = std::process::Command::new("systemctl")
-                        .args(["start", "nebula.service"])
-                        .status();
+                    let mut start = std::process::Command::new("systemctl");
+                    start.args(["start", "nebula.service"]);
+                    mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut start);
+                    let _ = start.status();
                 }
                 print!("{}", report.human());
             }
