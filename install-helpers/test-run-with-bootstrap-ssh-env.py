@@ -209,6 +209,8 @@ def main() -> None:
         command(*base, "--", "/usr/bin/mackesd", "add-peer", "--role", "workstation", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "invite-issue", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "recovery", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "role-provision", "--role", "workstation", refused=True)
+        command(*base, "--", "/usr/bin/mackesd", "spawn-lighthouse", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "join", refused=True)
         command(*base, "--", "/usr/bin/mackesd", "offboard", refused=True)
         command(*base, "--", "/usr/bin/meshctl", "provision", "--token", "x", refused=True)

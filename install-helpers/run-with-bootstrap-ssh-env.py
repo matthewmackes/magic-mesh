@@ -80,6 +80,8 @@ LIFECYCLE_MUTATION_NAMES = frozenset(
         "decommission",
         "remove-peer",
         "adopt-xcp",
+        "role-provision",
+        "spawn-lighthouse",
         "onboard",
         "mde-enroll",
         "magic-setup",
