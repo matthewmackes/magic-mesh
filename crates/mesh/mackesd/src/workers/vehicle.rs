@@ -21,10 +21,12 @@
 //!    snapshot's heartbeat or erase fresher current fields.
 //! 4. **Drains `action/vehicle/*` control verbs** off the Bus
 //!    ([`VEHICLE_ACTION_PREFIX`]) and answers each on `reply/<ulid>` with a
-//!    [`VehicleReply`] — `get-config` (a READ that pulls a committed oMG config
-//!    file over SSH) and `reboot` (a destructive MUTATION, typed-armed on the
-//!    gateway ESN + audited). Only a node WITH a gateway (`MDE_VEHICLE_GATEWAY`
-//!    set) drains; every other node idles and ignores the queue.
+//!    [`VehicleReply`] — `inspect` / `list-config` / `get-config` (reads;
+//!    `get-config` cats `/opt/inmotiontechnology/config/<file>` because
+//!    `omgconf latest` prints nothing on MGOS 4.3) and `set-mcu` / `set-gps` /
+//!    `reboot` (typed-armed mutations + HMAC). Only a node WITH a gateway
+//!    (`MDE_VEHICLE_GATEWAY` set) drains; every other node idles and ignores
+//!    the queue.
 //!
 //! ## Config (env for now; mde-seal later)
 //! - `MDE_VEHICLE_GATEWAY` — the gateway endpoint, an IP or `ip:sshport`. **When
@@ -68,16 +70,16 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
-    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, ApprovalState, CellLink,
-    DeviceProbeStatus, FreshnessState, GpsFix, ImuSample, ManagerSet, ManagerSetState, RadioId,
-    RadioInventory, RadioOperation, SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState,
-    VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
-    VEHICLE_STATE_V2_SCHEMA_VERSION,
+    ApprovalState, CellLink, DeviceProbeStatus, FreshnessState, GpsFix, ImuSample, ManagerSet,
+    ManagerSetState, RadioId, RadioInventory, RadioOperation, SnapshotProvenance, SnapshotSource,
+    VEHICLE_ACTION_PREFIX, VEHICLE_STATE_V2_SCHEMA_VERSION, VehicleReply, VehicleState,
+    VehicleStateV2, VehicleTelem, WanStatus, parse_gpgga, vehicle_state_topic,
+    vehicle_state_v2_topic,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -189,7 +191,24 @@ const KNOWN_HOSTS_FILE_PACKAGED: &str = "/usr/share/magic-mesh/mg90-known-hosts"
 
 /// Shared-Bus capability context for the destructive gateway reboot verb.
 const VEHICLE_REBOOT_AUTH_VERB: &str = "vehicle-reboot";
+const VEHICLE_SET_MCU_AUTH_VERB: &str = "vehicle-set-mcu";
+const VEHICLE_SET_GPS_AUTH_VERB: &str = "vehicle-set-gps";
 const VEHICLE_REBOOT_AUTH_TARGET: &str = "gateway";
+const MG90_CONFIG_DIR: &str = "/opt/inmotiontechnology/config";
+const MG90_INSPECT_SSH: &str = "sh -c '# mackesd-mg90-inspect; printf \"{\\\"hostname\\\":\\\"%s\\\",\\\"uptime_s\\\":%s,\\\"country\\\":\\\"%s\\\",\\\"gps_enable\\\":\\\"%s\\\",\\\"ign_thresh\\\":\\\"%s\\\",\\\"low_volt\\\":\\\"%s\\\",\\\"high_volt\\\":\\\"%s\\\",\\\"off_delay\\\":\\\"%s\\\",\\\"wlan1_ssid\\\":\\\"%s\\\",\\\"wlan1_type\\\":\\\"%s\\\"}\\n\" \"$(hostname)\" \"$(cut -d. -f1 /proc/uptime)\" \"$(awk \"/^country:/{print \\$2; exit}\" /opt/inmotiontechnology/config/globals.yaml)\" \"$(awk \"/^enable:/{print \\$2; exit}\" /opt/inmotiontechnology/config/gps.yaml)\" \"$(awk \"/^IGNTHRESH:/{print \\$2; exit}\" /opt/inmotiontechnology/config/mcu.yaml)\" \"$(awk \"/^LOWVOLT:/{print \\$2; exit}\" /opt/inmotiontechnology/config/mcu.yaml)\" \"$(awk \"/^HIGHVOLT:/{print \\$2; exit}\" /opt/inmotiontechnology/config/mcu.yaml)\" \"$(awk \"/^OFFDELAY:/{print \\$2; exit}\" /opt/inmotiontechnology/config/mcu.yaml)\" \"$(iw dev wlan1 info 2>/dev/null | awk \"/ssid/{print \\$2; exit}\")\" \"$(iw dev wlan1 info 2>/dev/null | awk \"/type/{print \\$2; exit}\")\"'";
+const MCU_KEYS: &[&str] = &[
+    "IGNTHRESH",
+    "LOWVOLT",
+    "HIGHVOLT",
+    "OFFDELAY",
+    "ONDELAY",
+    "IGNOFFDELAY",
+    "INACTIVETIME",
+    "HARDOFF",
+    "AUTOPWR",
+    "HIGHTEMP",
+    "LOWTEMP",
+];
 
 /// Poll cadence for a fresh MG90 observation. Heartbeats are independent and
 /// use [`ROSTER_HEARTBEAT`] so a slow gateway probe cannot make consumers stale.
@@ -1754,7 +1773,7 @@ impl VehicleRoster {
                 return VehicleRosterPollResult::NoSource {
                     source_id: Some(source_id.clone()),
                     reason,
-                }
+                };
             }
         };
         match self.ingest(snapshot) {
@@ -3644,11 +3663,11 @@ impl VehicleWorker {
                 ..Default::default()
             };
         };
-        if verb == VehicleVerb::Reboot {
+        if verb.is_privileged() {
             if let Err(error) = self.authorizer.authorize(
                 body,
                 MutationContext {
-                    verb: VEHICLE_REBOOT_AUTH_VERB,
+                    verb: verb.auth_verb(),
                     node: &self.host,
                     target: VEHICLE_REBOOT_AUTH_TARGET,
                 },
@@ -3658,7 +3677,7 @@ impl VehicleWorker {
                     host = %self.host,
                     verb = verb_name,
                     %error,
-                    "refused unauthorized vehicle reboot"
+                    "refused unauthorized vehicle mutation"
                 );
                 return VehicleReply {
                     ok: false,
@@ -3671,13 +3690,17 @@ impl VehicleWorker {
         let body = VehicleActionBody::parse(body);
         match verb {
             VehicleVerb::GetConfig => self.handle_get_config(probe.as_ref(), verb_name, &body),
+            VehicleVerb::ListConfig => self.handle_list_config(probe.as_ref(), verb_name),
+            VehicleVerb::Inspect => self.handle_inspect(probe.as_ref(), verb_name),
+            VehicleVerb::SetMcu => self.handle_set_mcu(probe.as_ref(), verb_name, &body),
+            VehicleVerb::SetGps => self.handle_set_gps(probe.as_ref(), verb_name, &body),
             VehicleVerb::Reboot => self.handle_reboot(probe.as_ref(), verb_name, &body),
         }
     }
 
-    /// `get-config` (READ) — pull a committed oMG config file over SSH
-    /// (`omgconf latest <file>`). `file` MUST be a bare `*.yaml` name (no path
-    /// components / traversal), else an honest rejection.
+    /// `get-config` (READ) — cat a committed oMG config file. `omgconf latest`
+    /// does not print the file on MGOS 4.3; the live file is the source of truth.
+    /// `file` MUST be a bare `*.yaml` name (no path components / traversal).
     fn handle_get_config(
         &self,
         probe: &dyn VehicleProbe,
@@ -3707,7 +3730,7 @@ impl VehicleWorker {
                 ..Default::default()
             };
         }
-        match probe.run_ssh(&format!("omgconf latest {file}")) {
+        match probe.run_ssh(&format!("cat {MG90_CONFIG_DIR}/{file}")) {
             Ok(yaml) => VehicleReply {
                 ok: true,
                 verb: verb_name.to_string(),
@@ -3720,6 +3743,164 @@ impl VehicleWorker {
                 gated: Some(format!("gateway ssh unavailable: {e}")),
                 ..Default::default()
             },
+        }
+    }
+
+    fn handle_list_config(&self, probe: &dyn VehicleProbe, verb_name: &str) -> VehicleReply {
+        match probe.run_ssh("omgconf list") {
+            Ok(list) => VehicleReply {
+                ok: true,
+                verb: verb_name.to_string(),
+                applied: Some(list),
+                ..Default::default()
+            },
+            Err(e) => VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(format!("gateway ssh unavailable: {e}")),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn handle_inspect(&self, probe: &dyn VehicleProbe, verb_name: &str) -> VehicleReply {
+        match probe.run_ssh(MG90_INSPECT_SSH) {
+            Ok(json) => VehicleReply {
+                ok: true,
+                verb: verb_name.to_string(),
+                applied: Some(json),
+                ..Default::default()
+            },
+            Err(e) => VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(format!("gateway ssh unavailable: {e}")),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn handle_set_mcu(
+        &self,
+        probe: &dyn VehicleProbe,
+        verb_name: &str,
+        body: &VehicleActionBody,
+    ) -> VehicleReply {
+        if let Some(gated) = self.require_typed_esn(probe, body) {
+            return gated;
+        }
+        let Some(key) = body.key.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some("`set-mcu` requires `key`".to_string()),
+                ..Default::default()
+            };
+        };
+        let Some(value) = body
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some("`set-mcu` requires `value`".to_string()),
+                ..Default::default()
+            };
+        };
+        let Some(cmd) = mcu_set_command(key, value) else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(format!(
+                    "MCU key `{key}` is not allowlisted or value is unsafe"
+                )),
+                ..Default::default()
+            };
+        };
+        match probe.run_ssh(&cmd) {
+            Ok(_) => VehicleReply {
+                ok: true,
+                verb: verb_name.to_string(),
+                applied: Some(format!("{key}={value}")),
+                audited: true,
+                ..Default::default()
+            },
+            Err(e) => VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(format!("gateway ssh unavailable: {e}")),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn handle_set_gps(
+        &self,
+        probe: &dyn VehicleProbe,
+        verb_name: &str,
+        body: &VehicleActionBody,
+    ) -> VehicleReply {
+        if let Some(gated) = self.require_typed_esn(probe, body) {
+            return gated;
+        }
+        let Some(value) = body.value.as_deref().map(str::trim) else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some("`set-gps` requires `value` yes|no".to_string()),
+                ..Default::default()
+            };
+        };
+        if !matches!(value, "yes" | "no") {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some("`set-gps` value must be yes or no".to_string()),
+                ..Default::default()
+            };
+        }
+        let cmd = format!(
+            "sed -i 's/^enable:.*/enable: {value}/' {MG90_CONFIG_DIR}/gps.yaml && omgconf commit gps.yaml 'mackesd set-gps'"
+        );
+        match probe.run_ssh(&cmd) {
+            Ok(_) => VehicleReply {
+                ok: true,
+                verb: verb_name.to_string(),
+                applied: Some(format!("gps enable={value}")),
+                audited: true,
+                ..Default::default()
+            },
+            Err(e) => VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(format!("gateway ssh unavailable: {e}")),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn require_typed_esn(
+        &self,
+        probe: &dyn VehicleProbe,
+        body: &VehicleActionBody,
+    ) -> Option<VehicleReply> {
+        let esn = self.gateway_esn(probe);
+        let typed = body.typed_name.as_deref().map(str::trim).unwrap_or("");
+        let armed = !typed.is_empty() && !esn.is_empty() && typed == esn;
+        if armed {
+            None
+        } else {
+            Some(VehicleReply {
+                ok: false,
+                verb: "typed-arm".to_string(),
+                gated: Some(
+                    "typed-arm required: `typed_name` must equal the gateway ESN".to_string(),
+                ),
+                ..Default::default()
+            })
         }
     }
 
@@ -3928,10 +4109,10 @@ impl VehicleWorker {
                 entry.reply = Some(body.to_string());
             }
             VehicleActionTxnPhase::Completed if entry.reply.as_deref() == Some(body) => {
-                return Ok(())
+                return Ok(());
             }
             VehicleActionTxnPhase::Delivered if entry.reply.as_deref() == Some(body) => {
-                return Ok(())
+                return Ok(());
             }
             _ => return Err(io::Error::other("vehicle action journal result mismatch")),
         }
@@ -4188,8 +4369,16 @@ impl VehicleWorker {
 /// A drained `action/vehicle/<verb>` classified for dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VehicleVerb {
-    /// `get-config` — pull a committed oMG config file over SSH (READ).
+    /// `get-config` — cat a committed oMG config file (READ).
     GetConfig,
+    /// `list-config` — `omgconf list` (READ).
+    ListConfig,
+    /// `inspect` — bounded live identity/power/wifi snapshot (READ).
+    Inspect,
+    /// `set-mcu` — allowlisted MCU key (MUTATION; typed-armed).
+    SetMcu,
+    /// `set-gps` — enable or disable GNSS (MUTATION; typed-armed).
+    SetGps,
     /// `reboot` — reboot the gateway (MUTATION, destructive; typed-armed on the ESN).
     Reboot,
 }
@@ -4199,9 +4388,26 @@ impl VehicleVerb {
     fn from_verb(verb: &str) -> Option<Self> {
         Some(match verb {
             "get-config" => Self::GetConfig,
+            "list-config" => Self::ListConfig,
+            "inspect" => Self::Inspect,
+            "set-mcu" => Self::SetMcu,
+            "set-gps" => Self::SetGps,
             "reboot" => Self::Reboot,
             _ => return None,
         })
+    }
+
+    fn is_privileged(self) -> bool {
+        matches!(self, Self::Reboot | Self::SetMcu | Self::SetGps)
+    }
+
+    fn auth_verb(self) -> &'static str {
+        match self {
+            Self::Reboot => VEHICLE_REBOOT_AUTH_VERB,
+            Self::SetMcu => VEHICLE_SET_MCU_AUTH_VERB,
+            Self::SetGps => VEHICLE_SET_GPS_AUTH_VERB,
+            Self::GetConfig | Self::ListConfig | Self::Inspect => "",
+        }
     }
 }
 
@@ -4213,9 +4419,15 @@ struct VehicleActionBody {
     /// `get-config`'s target config file (a bare `*.yaml` name).
     #[serde(default)]
     file: Option<String>,
-    /// `reboot`'s typed-arming confirmation (must equal the gateway ESN).
+    /// `reboot` / `set-mcu` / `set-gps` typed-arming confirmation (must equal the gateway ESN).
     #[serde(default)]
     typed_name: Option<String>,
+    /// `set-mcu` allowlisted key.
+    #[serde(default)]
+    key: Option<String>,
+    /// `set-mcu` / `set-gps` value.
+    #[serde(default)]
+    value: Option<String>,
 }
 
 impl VehicleActionBody {
@@ -4240,6 +4452,33 @@ fn is_safe_yaml_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+fn is_mcu_value(value: &str) -> bool {
+    let value = value.trim();
+    if matches!(value, "yes" | "no") {
+        return true;
+    }
+    let mut parts = value.split('.');
+    let head = parts.next().unwrap_or("");
+    let tail = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match tail {
+        None => digits(head.trim_start_matches('-')),
+        Some(frac) => digits(head.trim_start_matches('-')) && digits(frac),
+    }
+}
+
+fn mcu_set_command(key: &str, value: &str) -> Option<String> {
+    if !MCU_KEYS.contains(&key) || !is_mcu_value(value) {
+        return None;
+    }
+    Some(format!(
+        "grep -q '^{key}:' {MG90_CONFIG_DIR}/mcu.yaml && sed -i 's/^{key}:.*/{key}: {value}/' {MG90_CONFIG_DIR}/mcu.yaml && omgconf commit mcu.yaml 'mackesd set-mcu {key}'"
+    ))
 }
 
 #[async_trait::async_trait]
@@ -5102,11 +5341,7 @@ fn find_token_after(text: &str, label: &str) -> Option<String> {
     let idx = text.find(label)?;
     let rest = text[idx + label.len()..].trim_start();
     let tok: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-    if tok.is_empty() {
-        None
-    } else {
-        Some(tok)
-    }
+    if tok.is_empty() { None } else { Some(tok) }
 }
 
 /// Fold the authenticated LCI MCU ignition-sense row. Unknown or missing values
@@ -5202,9 +5437,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         /// The captured bench-MG90 fixtures — a no-lock GGA + a real IMU line, and
         /// the general.html rows carrying battery/temp/esn/version.
         fn real() -> Self {
-            let nmea = "$GPGGA,111504.000,3210.07993,N,09550.95445,W,0,00,99.0,081.94,M,-24.2,M,,*66\n\
+            let nmea =
+                "$GPGGA,111504.000,3210.07993,N,09550.95445,W,0,00,99.0,081.94,M,-24.2,M,,*66\n\
                         $PSIWMMPU,49.050,0.25218,0.12537,-10.02395,-3.39966,-0.99182,-0.90637,*3C\n"
-                .to_string();
+                    .to_string();
             let general = "<table>\
                 <tr><td>Model </td><td> MG90</td></tr>\
                 <tr><td>ESN </td><td> ND84720078011035</td></tr>\
@@ -5285,6 +5521,18 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         }
         fn run_ssh(&self, cmd: &str) -> io::Result<String> {
             self.ssh_calls.lock().unwrap().push(cmd.to_string());
+            if cmd == "omgconf list" {
+                return Ok("wan.yaml\nmcu.yaml\ngps.yaml\n".to_string());
+            }
+            if cmd.contains("mackesd-mg90-inspect") {
+                return Ok(
+                    r#"{"hostname":"mg90","uptime_s":100,"country":"US","gps_enable":"yes","ign_thresh":"1.5","low_volt":"11","high_volt":"36","off_delay":"5","wlan1_ssid":"SERRRA-TEST","wlan1_type":"AP"}"#
+                        .to_string(),
+                );
+            }
+            if cmd.contains("mackesd set-mcu") || cmd.contains("mackesd set-gps") {
+                return Ok("committed\n".to_string());
+            }
             to_io(&self.ssh_out)
         }
     }
@@ -5638,14 +5886,18 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(after.esn, before.esn);
         assert_eq!(after.model, before.model);
         assert!((after.telem.battery_v - 13.25).abs() < 0.01);
-        assert!(after
-            .gaps
-            .iter()
-            .any(|gap| gap == "gps/imu unavailable (enrichment timeout)"));
-        assert!(after
-            .gaps
-            .iter()
-            .any(|gap| gap == "wan status unavailable (enrichment timeout)"));
+        assert!(
+            after
+                .gaps
+                .iter()
+                .any(|gap| gap == "gps/imu unavailable (enrichment timeout)")
+        );
+        assert!(
+            after
+                .gaps
+                .iter()
+                .any(|gap| gap == "wan status unavailable (enrichment timeout)")
+        );
         assert_eq!(newer_probe.enrichment_calls(), (0, 0, 0));
     }
 
@@ -5712,19 +5964,25 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             retained.telem.obd_probe_status,
             DeviceProbeStatus::Failed { ref reason } if reason == "application timeout"
         ));
-        assert!(retained
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("gps/imu unavailable") && gap.contains("ssh timeout")));
-        assert!(retained
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("wan status unavailable") && gap.contains("http timeout")));
-        assert!(retained
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("OBD application unavailable")
-                && gap.contains("application timeout")));
+        assert!(
+            retained
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("gps/imu unavailable") && gap.contains("ssh timeout"))
+        );
+        assert!(
+            retained
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("wan status unavailable") && gap.contains("http timeout"))
+        );
+        assert!(
+            retained
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("OBD application unavailable")
+                    && gap.contains("application timeout"))
+        );
     }
 
     #[test]
@@ -5852,11 +6110,13 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             DeviceProbeStatus::Failed { ref reason }
                 if reason == "connection refused"
         ));
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("OBD application unavailable")
-                && gap.contains("connection refused")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("OBD application unavailable")
+                    && gap.contains("connection refused"))
+        );
     }
 
     #[test]
@@ -5925,10 +6185,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.gps.satellites, 7);
         assert!((state.gps.latitude - 35.1234).abs() < 0.0001);
         assert!((state.gps.longitude + 78.4567).abs() < 0.0001);
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("gps/imu unavailable")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("gps/imu unavailable"))
+        );
     }
 
     #[test]
@@ -5943,10 +6205,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.gps, baseline.gps);
         assert_eq!(state.telem.battery_v, baseline.telem.battery_v);
         assert_eq!(state.telem.internal_temp_c, baseline.telem.internal_temp_c);
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("vehicleID does not match gateway ESN")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("vehicleID does not match gateway ESN"))
+        );
     }
 
     #[test]
@@ -6102,18 +6366,24 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.gps, baseline.gps);
         assert_eq!(state.telem.battery_v, baseline.telem.battery_v);
         assert_eq!(state.telem.internal_temp_c, baseline.telem.internal_temp_c);
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("satellite count out of range")));
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("battery voltage out of range")));
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("internal temperature out of range")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("satellite count out of range"))
+        );
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("battery voltage out of range"))
+        );
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("internal temperature out of range"))
+        );
     }
 
     #[test]
@@ -6127,10 +6397,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!((state.telem.battery_v - 12.60).abs() < 0.01);
         assert!((state.telem.internal_temp_c - 33.89).abs() < 0.01);
         assert!(state.telem.ignition_on);
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("status broadcast invalid JSON")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("status broadcast invalid JSON"))
+        );
     }
 
     #[test]
@@ -6157,10 +6429,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
 
         assert!((state.telem.battery_v - 12.60).abs() < 0.01);
         assert!(state.telem.ignition_on);
-        assert!(state
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("no documented telemetry fields")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("no documented telemetry fields"))
+        );
     }
 
     #[test]
@@ -6194,10 +6468,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!(state.online, "the anchor read succeeded ⇒ online");
         assert!(state.imu.is_none());
         assert!(state.gaps.iter().any(|g| g.contains("gps/imu unavailable")));
-        assert!(state
-            .gaps
-            .iter()
-            .any(|g| g.contains("wan status unavailable")));
+        assert!(
+            state
+                .gaps
+                .iter()
+                .any(|g| g.contains("wan status unavailable"))
+        );
         // The general.html data still landed.
         assert_eq!(state.esn, "ND84720078011035");
     }
@@ -6252,7 +6528,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(target_os = "linux")]
     #[test]
     fn root_password_reader_rejects_symlinked_file() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("password");
@@ -6270,7 +6546,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(unix)]
     #[test]
     fn cookie_jar_is_private_exclusive_and_removed_on_drop() {
-        use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
         let tmp = tempfile::tempdir().unwrap();
         let runtime = tmp.path().join("vehicle-http");
@@ -6304,7 +6580,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(unix)]
     #[test]
     fn cookie_runtime_directory_rejects_symlink() {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("real-runtime");
@@ -6433,11 +6709,13 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         .expect("reconnected manager must resume with a new Changed epoch");
 
         tx.send(true).expect("signal shutdown");
-        assert!(tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("worker shutdown")
-            .expect("worker join")
-            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("worker shutdown")
+                .expect("worker join")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -6548,13 +6826,17 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             })
             .collect::<Vec<_>>();
         assert!(states.iter().all(|state| !state.online));
-        assert!(states
-            .iter()
-            .any(|state| state.gaps.iter().any(|gap| gap == "current status pending")));
-        assert!(states.iter().any(|state| state
-            .gaps
-            .iter()
-            .any(|gap| { gap == "current status unavailable (current-status timeout)" })));
+        assert!(
+            states
+                .iter()
+                .any(|state| state.gaps.iter().any(|gap| gap == "current status pending"))
+        );
+        assert!(states.iter().any(|state| {
+            state
+                .gaps
+                .iter()
+                .any(|gap| gap == "current status unavailable (current-status timeout)")
+        }));
 
         probe.release();
         tx.send(true).expect("signal shutdown");
@@ -6798,10 +7080,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 .collect::<Vec<_>>(),
             vec!["mg90-a", "mg90-b"]
         );
-        assert!(roster
-            .take_publications(t0)
-            .iter()
-            .all(|publication| publication.reason == VehiclePublicationReason::Changed));
+        assert!(
+            roster
+                .take_publications(t0)
+                .iter()
+                .all(|publication| publication.reason == VehiclePublicationReason::Changed)
+        );
 
         // A remains delayed. B fails and only releases its enrichment lane;
         // neither outcome is allowed to mutate accepted telemetry.
@@ -6831,9 +7115,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 .collect::<Vec<_>>(),
             vec!["mg90-a", "mg90-b"]
         );
-        assert!(publications
-            .iter()
-            .all(|publication| publication.reason == VehiclePublicationReason::Heartbeat));
+        assert!(
+            publications
+                .iter()
+                .all(|publication| publication.reason == VehiclePublicationReason::Heartbeat)
+        );
         assert_eq!(
             publications[0].snapshot.telem,
             roster_snapshot(&source_a, "manager-a", 100, 100, 1)
@@ -6987,12 +7273,16 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             .register(VehicleRosterSource::remote(source.clone(), "manager-b", plan).unwrap())
             .unwrap();
 
-        assert!(roster
-            .ingest(roster_snapshot(&source, "manager-a", 100, 100, 1))
-            .unwrap());
-        assert!(roster
-            .ingest(roster_snapshot(&source, "manager-b", 200, 200, 1))
-            .unwrap());
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source, "manager-a", 100, 100, 1))
+                .unwrap()
+        );
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source, "manager-b", 200, 200, 1))
+                .unwrap()
+        );
         match roster.select_latest(&source) {
             VehicleRosterSelection::Selected(snapshot) => {
                 assert_eq!(snapshot.manager_id(), "manager-b");
@@ -7001,15 +7291,21 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             other => panic!("expected selected source, got {other:?}"),
         }
 
-        assert!(!roster
-            .ingest(roster_snapshot(&source, "manager-b", 150, 150, 99))
-            .unwrap());
-        assert!(roster
-            .ingest(roster_snapshot(&source, "manager-a", 300, 300, 9))
-            .unwrap());
-        assert!(roster
-            .ingest(roster_snapshot(&source, "manager-b", 300, 300, 9))
-            .unwrap());
+        assert!(
+            !roster
+                .ingest(roster_snapshot(&source, "manager-b", 150, 150, 99))
+                .unwrap()
+        );
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source, "manager-a", 300, 300, 9))
+                .unwrap()
+        );
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source, "manager-b", 300, 300, 9))
+                .unwrap()
+        );
         match roster.select_latest(&source) {
             VehicleRosterSelection::Selected(snapshot) => {
                 assert_eq!(snapshot.manager_id(), "manager-b");
@@ -7157,18 +7453,26 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 .unwrap();
         }
 
-        assert!(roster
-            .ingest(roster_snapshot(&source_a, "manager-a", 200, 200, 4))
-            .unwrap());
-        assert!(roster
-            .ingest(roster_snapshot(&source_a, "manager-b", 200, 200, 4))
-            .unwrap());
-        assert!(roster
-            .ingest(roster_snapshot(&source_b, "manager-a", 100, 100, 1))
-            .unwrap());
-        assert!(roster
-            .ingest(roster_snapshot(&source_b, "manager-c", 300, 300, 1))
-            .unwrap());
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source_a, "manager-a", 200, 200, 4))
+                .unwrap()
+        );
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source_a, "manager-b", 200, 200, 4))
+                .unwrap()
+        );
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source_b, "manager-a", 100, 100, 1))
+                .unwrap()
+        );
+        assert!(
+            roster
+                .ingest(roster_snapshot(&source_b, "manager-c", 300, 300, 1))
+                .unwrap()
+        );
 
         let selections = roster.select_latest_all();
         assert_eq!(selections.len(), 2);
@@ -7366,7 +7670,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let reply = w.handle("get-config", r#"{"file":"wan.yaml"}"#);
         assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
         assert_eq!(reply.applied.as_deref(), Some(FAKE_YAML));
-        assert_eq!(fake.ssh_calls().as_slice(), &["omgconf latest wan.yaml"]);
+        assert_eq!(
+            fake.ssh_calls().as_slice(),
+            &["cat /opt/inmotiontechnology/config/wan.yaml"]
+        );
     }
 
     #[test]
@@ -7390,6 +7697,89 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!(!w.handle("get-config", "{}").ok);
         // Nothing was ever shelled for the rejected inputs.
         assert!(fake.ssh_calls().is_empty(), "no rejected input reached ssh");
+    }
+
+    #[test]
+    fn list_config_and_inspect_are_unprivileged_reads() {
+        let fake = FakeProbe::real();
+        let w = worker().with_probe(Arc::new(fake.clone()));
+        let listed = w.handle("list-config", "{}");
+        assert!(listed.ok);
+        assert!(
+            listed
+                .applied
+                .as_deref()
+                .is_some_and(|body| body.contains("mcu.yaml"))
+        );
+        let inspected = w.handle("inspect", "{}");
+        assert!(inspected.ok);
+        assert!(
+            inspected
+                .applied
+                .as_deref()
+                .is_some_and(|body| body.contains("SERRRA-TEST"))
+        );
+        assert!(fake.ssh_calls().iter().any(|cmd| cmd == "omgconf list"));
+        assert!(
+            fake.ssh_calls()
+                .iter()
+                .any(|cmd| cmd.contains("mackesd-mg90-inspect"))
+        );
+    }
+
+    #[test]
+    fn set_mcu_allowlist_rejects_unsafe_keys_before_ssh() {
+        let fake = FakeProbe::real();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let body = crate::ipc::action_auth::authorize_test_body(
+            ACTION_KEY,
+            r#"{"schema_version":1,"typed_name":"ND84720078011035","key":"rm","value":"-rf"}"#,
+            MutationContext {
+                verb: VEHICLE_SET_MCU_AUTH_VERB,
+                node: "rig-1",
+                target: VEHICLE_REBOOT_AUTH_TARGET,
+            },
+            "vehicle-set-mcu-unsafe",
+            ACTION_NOW + 30_000,
+        );
+        let reply = w.handle("set-mcu", &body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("not allowlisted"));
+        assert!(
+            fake.ssh_calls().iter().all(|cmd| !cmd.contains("sed")),
+            "unsafe MCU keys never reach the gateway"
+        );
+    }
+
+    #[test]
+    fn set_mcu_allowlisted_key_runs_sed_and_commit() {
+        let fake = FakeProbe::real();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let body = crate::ipc::action_auth::authorize_test_body(
+            ACTION_KEY,
+            r#"{"schema_version":1,"typed_name":"ND84720078011035","key":"IGNTHRESH","value":"1.5"}"#,
+            MutationContext {
+                verb: VEHICLE_SET_MCU_AUTH_VERB,
+                node: "rig-1",
+                target: VEHICLE_REBOOT_AUTH_TARGET,
+            },
+            "vehicle-set-mcu-ok",
+            ACTION_NOW + 30_000,
+        );
+        let reply = w.handle("set-mcu", &body);
+        assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
+        assert_eq!(reply.applied.as_deref(), Some("IGNTHRESH=1.5"));
+        assert!(
+            fake.ssh_calls()
+                .iter()
+                .any(|cmd| cmd.contains("mackesd set-mcu IGNTHRESH"))
+        );
     }
 
     #[test]
@@ -7640,7 +8030,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!(w.drain_actions(&mut state).unwrap());
         assert_eq!(
             fake.ssh_calls().as_slice(),
-            &["omgconf latest forward.yaml"]
+            &["cat /opt/inmotiontechnology/config/forward.yaml"]
         );
         drop(first);
 
@@ -7660,7 +8050,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!(!w.drain_actions(&mut state).unwrap());
         assert_eq!(
             fake.ssh_calls().as_slice(),
-            &["omgconf latest forward.yaml"],
+            &["cat /opt/inmotiontechnology/config/forward.yaml"],
             "replacement retained command was skipped"
         );
         let replacement_bus = Persist::open(bus.clone()).unwrap();
@@ -7676,8 +8066,8 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(
             fake.ssh_calls().as_slice(),
             &[
-                "omgconf latest forward.yaml",
-                "omgconf latest replacement-forward.yaml",
+                "cat /opt/inmotiontechnology/config/forward.yaml",
+                "cat /opt/inmotiontechnology/config/replacement-forward.yaml",
             ]
         );
     }
@@ -7871,7 +8261,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(unix)]
     #[test]
     fn hostile_privileged_journal_is_rejected_before_reboot() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let tmp = tempfile::tempdir().unwrap();
         let auth_tmp = tempfile::tempdir().unwrap();
@@ -8005,9 +8395,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let local = worker.build_state(&FakeProbe::real());
         runtime.ingest_local(&worker, &local, now).unwrap();
 
-        assert!(worker
-            .publish_roster_updates(&mut runtime, &local, now)
-            .is_err());
+        assert!(
+            worker
+                .publish_roster_updates(&mut runtime, &local, now)
+                .is_err()
+        );
         assert_eq!(worker.sequence.load(Ordering::Relaxed), 0);
         assert!(runtime.roster.published.is_empty());
 

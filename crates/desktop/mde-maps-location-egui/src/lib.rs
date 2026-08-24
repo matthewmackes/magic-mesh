@@ -24,6 +24,7 @@ pub mod earthquake;
 pub mod firms;
 pub mod geocode;
 pub mod iem_radar;
+pub mod mg90_control;
 pub mod model;
 pub mod navigation_ui;
 pub mod nws_alert;

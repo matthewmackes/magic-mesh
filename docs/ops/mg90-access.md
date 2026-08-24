@@ -19,6 +19,13 @@ The adapter is deliberately pinned to the MG90 SSH host key and uses the MG90's
 legacy SSH algorithms only where required. It does not enable `ssh-dss`, disable
 host-key verification, or put a password in a command argument.
 
+Construct **MG90 Admin** is the operator console. It is a renderer over typed
+`mackesd` Bus verbs, not a second SSH client: `inspect`, `list-config`, and
+`get-config` (reads; `get-config` cats `/opt/inmotiontechnology/config/<file>`),
+plus ESN-armed `set-mcu`, `set-gps`, and `reboot`. Privileged mint stays in the
+root Construct shell. Do not reboot the live gateway from this console unless
+the operator asked.
+
 Live reconciliation (2026-08-02): proof seat `.15` has both root-only files
 installed at `/etc/mackesd/mg90-root-password` and
 `/etc/mackesd/mg90-http-password`, plus the pinned host key. The pinned SSH

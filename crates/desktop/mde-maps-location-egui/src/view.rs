@@ -5,8 +5,10 @@ use mde_egui::egui::{
     Stroke, StrokeKind, Vec2,
 };
 use mde_egui::menubar::{ChipTone, Menu, MenuBar, MenuBarModel, StatusChip};
-use mde_egui::{paint_carbon, Style, StyleColorScheme, TypographyRole};
+use mde_egui::nav_chrome::{Sidebar, SidebarRow, SidebarSection};
+use mde_egui::{Style, StyleColorScheme, TypographyRole, paint_carbon};
 
+use crate::MapsLocationSurface;
 use crate::model::{
     AdminSection, BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination,
     DeviceIoState, EncryptedVaultState, FirmwareWorkflow, LocationManager, LocationSample,
@@ -18,9 +20,9 @@ use crate::model::{
     VehicleMirrorStatus, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
     VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
-use crate::weather_ui::{format_temperature, WeatherField, WeatherRange, WeatherTruth};
-use crate::MapsLocationSurface;
+use crate::weather_ui::{WeatherField, WeatherRange, WeatherTruth, format_temperature};
 
+const MG90_SIDEBAR_SALT: &str = "mg90-control";
 const RAIL_W: f32 = 176.0;
 const RAIL_INNER_MARGIN: f32 = Style::SP_S;
 const MAP_LAYERS_POPUP_ID: &str = "maps-location-layers-popup";
@@ -36,18 +38,18 @@ const ROUTE_BLUE: Color32 = Color32::from_rgb(0x4C, 0xA3, 0xFF); // style-leak-o
 const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3); // style-leak-ok: map-content-color
 const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8); // style-leak-ok: map-content-color
 const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54); // style-leak-ok: map-content-color
-                                                              // --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quazar-dark route palette) ---
-                                                              // A premium GMaps-navigation blue, painted as a top-lit vertical gradient
-                                                              // (HI at the top edge → BASE → DEEP at the bottom) so the banner reads with
-                                                              // depth instead of a single flat fill.
+// --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quazar-dark route palette) ---
+// A premium GMaps-navigation blue, painted as a top-lit vertical gradient
+// (HI at the top edge → BASE → DEEP at the bottom) so the banner reads with
+// depth instead of a single flat fill.
 const MANEUVER_BLUE: Color32 = Color32::from_rgb(0x1A, 0x66, 0xE0); // style-leak-ok: map-content-color
 const MANEUVER_BLUE_HI: Color32 = Color32::from_rgb(0x3E, 0x86, 0xFF); // style-leak-ok: map-content-color
 const MANEUVER_BLUE_DEEP: Color32 = Color32::from_rgb(0x11, 0x4C, 0xB6); // style-leak-ok: map-content-color
 const ROUTE_CASING: Color32 = Color32::from_rgb(0x14, 0x4C, 0x92); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
 const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
-                                                                  // Keep these content colors intentionally distinct from Style::TEXT_STRONG and
-                                                                  // Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
+// Keep these content colors intentionally distinct from Style::TEXT_STRONG and
+// Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
 const MAP_TEXT_STRONG: Color32 = Color32::from_rgb(0xF5, 0xF6, 0xFA); // style-leak-ok: map-content-color
 const MAP_TEXT_DIM: Color32 = Color32::from_rgb(0xB8, 0xC0, 0xCC); // style-leak-ok: map-content-color
 
@@ -487,11 +489,7 @@ fn format_distance(mi: f32) -> String {
 }
 
 fn finite_or(value: f32, default: f32) -> f32 {
-    if value.is_finite() {
-        value
-    } else {
-        default
-    }
+    if value.is_finite() { value } else { default }
 }
 
 /// A finite, non-degenerate rect from raw components (crash-safe layout).
@@ -4374,54 +4372,447 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
 
 fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     apply_admin_keyboard_shortcuts(ui.ctx(), &mut state.admin_section);
+    if !state.control.primed {
+        state.control.primed = true;
+        state.control.queue_read("inspect", "{}", "inspect");
+        state.control.queue_read("list-config", "{}", "config list");
+    }
 
     ui.horizontal_wrapped(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
         let _ = paint_carbon(ui.painter(), rect, "settings", Style::ACCENT_HI);
         ui.add_space(Style::SP_XS);
         ui.label(
-            RichText::new("MG90 Admin · Single Interface")
+            RichText::new("MG90")
                 .size(Style::TITLE)
                 .color(Style::TEXT_STRONG),
         );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            pill(ui, "keys 1–7", Style::ACCENT);
+            pill(ui, "keys 1–9", Style::ACCENT);
+            if let Some(esn) = mg90_esn(state) {
+                pill(ui, &esn, Style::TEXT_DIM);
+            }
         });
     });
     mde_egui::widgets::muted_note(
         ui,
-        "Vehicle, connectivity, local I/O, location-source, setup, settings, and firmware tools are consolidated here. Select a section with the mouse or number keys.",
+        "Full control of the attached AirLink MG90. Status is live; writes are typed Bus verbs armed on the ESN.",
     );
-    ui.add_space(Style::SP_S);
-    admin_section_strip(ui, &mut state.admin_section);
-    ui.add_space(Style::SP_S);
-    divider(ui);
-    ui.add_space(Style::SP_S);
-    mg90_connection_card(ui, state);
+    if let Some(note) = state.control.note.clone() {
+        ui.add_space(Style::SP_XS);
+        mde_egui::widgets::muted_note(ui, &note);
+    }
     ui.add_space(Style::SP_S);
 
-    match state.admin_section {
-        AdminSection::Vehicle => show_vehicle(
-            ui,
-            &state.vehicle,
-            &state.vehicle_radio_health,
-            &state.vehicle_mirror_status,
-        ),
-        AdminSection::Connectivity => show_connectivity(ui, &state.mg90),
-        AdminSection::DevicesIo => show_devices_io(ui, &mut state.devices),
-        AdminSection::LocationSources => show_location_sources(ui, &mut state.locations),
-        AdminSection::Mg90Setup => show_mg90_setup(
-            ui,
-            &mut state.mg90,
-            &state.offline_maps,
-            &state.vault,
-            &state.real_hardware_gaps,
-        ),
-        AdminSection::Mg90Settings => show_mg90_settings(ui, state),
-        AdminSection::FirmwareRecovery => {
-            show_firmware_recovery(ui, &state.firmware, &state.devices)
-        }
+    let visible_w = ui
+        .available_rect_before_wrap()
+        .intersect(ui.clip_rect())
+        .width()
+        .max(1.0);
+    let sidebar_w = 196.0_f32.min(visible_w * 0.34).max(72.0_f32.min(visible_w));
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(sidebar_w, ui.available_height()),
+            egui::Layout::top_down(Align::Min),
+            |ui| {
+                let rows: Vec<SidebarRow<'_, AdminSection>> = AdminSection::ALL
+                    .iter()
+                    .copied()
+                    .map(|section| {
+                        SidebarRow::new(section, section.label()).with_icon(section.icon())
+                    })
+                    .collect();
+                let sections = [SidebarSection {
+                    header: Some("Control"),
+                    rows: rows.as_slice(),
+                }];
+                if let Some(picked) =
+                    Sidebar::show(ui, MG90_SIDEBAR_SALT, &sections, &state.admin_section)
+                {
+                    state.admin_section = picked;
+                }
+            },
+        );
+        ui.add_space(Style::SP_S);
+        ui.vertical(|ui| {
+            mg90_connection_card(ui, state);
+            ui.add_space(Style::SP_S);
+            match state.admin_section {
+                AdminSection::Overview => show_mg90_overview(ui, state),
+                AdminSection::Wan => {
+                    show_connectivity(ui, &state.mg90);
+                    ui.add_space(Style::SP_S);
+                    mg90_open_config_button(ui, state, "wan.yaml");
+                }
+                AdminSection::Wifi => show_mg90_wifi(ui, state),
+                AdminSection::Lan => {
+                    show_mg90_simple_status(
+                        ui,
+                        "LAN",
+                        "Bridge br0 is the management LAN. VLAN/DHCP live in lan.yaml and lan-segments.yaml.",
+                        &[
+                            ("Ethernet", state.mg90.status.ethernet_state.as_str()),
+                        ],
+                    );
+                    ui.add_space(Style::SP_S);
+                    mg90_open_config_button(ui, state, "lan.yaml");
+                }
+                AdminSection::Gnss => show_mg90_gnss(ui, state),
+                AdminSection::Io => show_mg90_io(ui, state),
+                AdminSection::Vpn => {
+                    show_mg90_simple_status(
+                        ui,
+                        "VPN",
+                        "Tunnel state from the vehicle mirror. Config is vpn.yaml.",
+                        &[("VPN", state.mg90.status.vpn_state.as_str())],
+                    );
+                    ui.add_space(Style::SP_S);
+                    mg90_open_config_button(ui, state, "vpn.yaml");
+                }
+                AdminSection::Services => {
+                    show_mg90_simple_status(
+                        ui,
+                        "Services",
+                        "Beacon, NTP, and DELS are committed in services.yaml.",
+                        &[],
+                    );
+                    ui.add_space(Style::SP_S);
+                    mg90_open_config_button(ui, state, "services.yaml");
+                }
+                AdminSection::Access => show_mg90_access(ui, state),
+                AdminSection::Config => show_mg90_config(ui, state),
+                AdminSection::Power => show_mg90_power(ui, state),
+            }
+        });
+    });
+}
+
+fn mg90_esn(state: &MapsLocationSurface) -> Option<String> {
+    state
+        .vehicle_mirror_status
+        .provenance
+        .as_ref()
+        .and_then(|p| p.mg90_id.clone())
+        .filter(|id| !id.is_empty())
+}
+
+fn mg90_open_config_button(ui: &mut egui::Ui, state: &mut MapsLocationSurface, file: &str) {
+    if ui.button(format!("Open {file}")).clicked() && crate::mg90_control::is_config_file_name(file)
+    {
+        state.control.config_file = file.to_string();
+        let body = serde_json::json!({ "file": file }).to_string();
+        state.control.queue_read("get-config", &body, "get config");
+        state.admin_section = AdminSection::Config;
     }
+}
+
+fn mg90_arm_ready(state: &MapsLocationSurface) -> bool {
+    let esn = mg90_esn(state).unwrap_or_default();
+    !esn.is_empty() && state.control.reboot_arm == esn
+}
+
+fn show_mg90_overview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    if let Some(inspect) = state.control.inspect.clone() {
+        mde_egui::widgets::card().show(ui, |ui| {
+            ui.label(
+                RichText::new("Live inspect")
+                    .size(Style::BODY)
+                    .color(Style::TEXT_STRONG),
+            );
+            readout(
+                ui,
+                "Hostname",
+                dash_if_empty(&inspect.hostname),
+                Style::TEXT,
+            );
+            readout(
+                ui,
+                "Uptime",
+                &format!("{} s", inspect.uptime_s),
+                Style::TEXT,
+            );
+            readout(ui, "Country", dash_if_empty(&inspect.country), Style::TEXT);
+            readout(ui, "GNSS", dash_if_empty(&inspect.gps_enable), Style::TEXT);
+            readout(
+                ui,
+                "Ignition threshold",
+                dash_if_empty(&inspect.ign_thresh),
+                Style::TEXT,
+            );
+            readout(
+                ui,
+                "Low volt",
+                dash_if_empty(&inspect.low_volt),
+                Style::TEXT,
+            );
+            readout(
+                ui,
+                "Wi-Fi AP",
+                dash_if_empty(&inspect.wlan1_ssid),
+                Style::TEXT,
+            );
+        });
+        ui.add_space(Style::SP_S);
+    }
+    if ui.button("Refresh inspect").clicked() {
+        state.control.queue_read("inspect", "{}", "inspect");
+    }
+    ui.add_space(Style::SP_S);
+    show_vehicle(
+        ui,
+        &state.vehicle,
+        &state.vehicle_radio_health,
+        &state.vehicle_mirror_status,
+    );
+}
+
+fn show_mg90_wifi(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    let ssid = state
+        .control
+        .inspect
+        .as_ref()
+        .map(|inspect| inspect.wlan1_ssid.as_str())
+        .unwrap_or("");
+    let kind = state
+        .control
+        .inspect
+        .as_ref()
+        .map(|inspect| inspect.wlan1_type.as_str())
+        .unwrap_or("");
+    show_mg90_simple_status(
+        ui,
+        "Wi-Fi",
+        "wlan1 is the AP; wlan0 is the client radio. SSIDs come from a live inspect, never from a guessed config.",
+        &[
+            ("SSID", ssid),
+            ("wlan1 type", kind),
+            ("WAN Wi-Fi", state.mg90.status.wifi_state.as_str()),
+        ],
+    );
+    ui.add_space(Style::SP_S);
+    mg90_open_config_button(ui, state, "wifi-networks.yaml");
+}
+
+fn show_mg90_simple_status(ui: &mut egui::Ui, title: &str, note: &str, rows: &[(&str, &str)]) {
+    mde_egui::widgets::card().show(ui, |ui| {
+        ui.label(
+            RichText::new(title)
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
+        );
+        ui.add_space(Style::SP_XS);
+        mde_egui::widgets::muted_note(ui, note);
+        for (label, value) in rows {
+            readout(ui, label, dash_if_empty(value), Style::TEXT);
+        }
+    });
+}
+
+fn show_mg90_gnss(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    mde_egui::widgets::card().show(ui, |ui| {
+        ui.label(
+            RichText::new("GNSS enable")
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
+        );
+        mde_egui::widgets::muted_note(
+            ui,
+            "Writes sed+commit the live gps.yaml enable flag. Arm with the gateway ESN.",
+        );
+        let esn = mg90_esn(state).unwrap_or_default();
+        readout(ui, "Live ESN", dash_if_empty(&esn), Style::TEXT);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Type ESN");
+            ui.text_edit_singleline(&mut state.control.reboot_arm);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("enable");
+            ui.text_edit_singleline(&mut state.control.gps_enable_draft);
+        });
+        let armed = mg90_arm_ready(state);
+        if ui
+            .add_enabled(
+                matches!(state.control.gps_enable_draft.trim(), "yes" | "no") && armed,
+                egui::Button::new("Apply GNSS enable"),
+            )
+            .clicked()
+        {
+            state.control.queue_mutation(
+                "set-gps",
+                "vehicle-set-gps",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "typed_name": state.control.reboot_arm,
+                    "value": state.control.gps_enable_draft.trim(),
+                }),
+                "set GPS",
+            );
+        }
+    });
+    ui.add_space(Style::SP_S);
+    mg90_open_config_button(ui, state, "gps.yaml");
+    ui.add_space(Style::SP_S);
+    show_location_sources(ui, &mut state.locations);
+}
+
+fn show_mg90_io(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    show_devices_io(ui, &mut state.devices);
+    ui.add_space(Style::SP_S);
+    mde_egui::widgets::card().show(ui, |ui| {
+        ui.label(
+            RichText::new("MCU ignition / voltage")
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
+        );
+        mde_egui::widgets::muted_note(
+            ui,
+            "Writes sed+commit the live mcu.yaml. Arm with the gateway ESN. Privileged mint is the Construct shell.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Key");
+            egui::ComboBox::from_id_salt("mg90-mcu-key")
+                .selected_text(&state.control.mcu_key)
+                .show_ui(ui, |ui| {
+                    for key in crate::mg90_control::MCU_KEYS {
+                        ui.selectable_value(&mut state.control.mcu_key, (*key).to_string(), *key);
+                    }
+                });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Value");
+            ui.text_edit_singleline(&mut state.control.mcu_value);
+        });
+        let esn = mg90_esn(state).unwrap_or_default();
+        readout(ui, "Live ESN", dash_if_empty(&esn), Style::TEXT);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Arm ESN");
+            ui.text_edit_singleline(&mut state.control.reboot_arm);
+        });
+        let ready = crate::mg90_control::is_mcu_value(&state.control.mcu_value) && mg90_arm_ready(state);
+        if ui
+            .add_enabled(ready, egui::Button::new("Apply MCU key"))
+            .clicked()
+        {
+            state.control.queue_mutation(
+                "set-mcu",
+                "vehicle-set-mcu",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "typed_name": state.control.reboot_arm,
+                    "key": state.control.mcu_key,
+                    "value": state.control.mcu_value.trim(),
+                }),
+                "set MCU",
+            );
+        }
+    });
+    ui.add_space(Style::SP_S);
+    ui.horizontal_wrapped(|ui| {
+        mg90_open_config_button(ui, state, "mcu.yaml");
+        mg90_open_config_button(ui, state, "indio.yaml");
+        mg90_open_config_button(ui, state, "obdii.yaml");
+    });
+}
+
+fn show_mg90_access(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    show_mg90_simple_status(
+        ui,
+        "Access",
+        "LCI is admin form-auth on :80. Root SSH is :2222, pinned. HTTP and SSH secrets stay in root-only files.",
+        &[(
+            "Country",
+            state
+                .control
+                .inspect
+                .as_ref()
+                .map(|inspect| inspect.country.as_str())
+                .unwrap_or(""),
+        )],
+    );
+    ui.add_space(Style::SP_S);
+    mg90_open_config_button(ui, state, "access.yaml");
+}
+
+fn show_mg90_config(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    mde_egui::widgets::card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Committed oMG config")
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
+        );
+        mde_egui::widgets::muted_note(
+            ui,
+            "These are the live files in /opt/inmotiontechnology/config. Load one to read it. Secrets in YAML are shown only to the seated operator.",
+        );
+        if ui.button("List files").clicked() {
+            state.control.queue_read("list-config", "{}", "config list");
+        }
+        ui.add_space(Style::SP_XS);
+        if state.control.config_files.is_empty() {
+            mde_egui::widgets::muted_note(ui, "No file list yet. List files or wait for inspect.");
+        } else {
+            egui::ComboBox::from_id_salt("mg90-config-file")
+                .selected_text(&state.control.config_file)
+                .show_ui(ui, |ui| {
+                    for file in &state.control.config_files {
+                        ui.selectable_value(&mut state.control.config_file, file.clone(), file);
+                    }
+                });
+            if ui.button("Load file").clicked()
+                && crate::mg90_control::is_config_file_name(&state.control.config_file)
+            {
+                let body = serde_json::json!({"file": state.control.config_file}).to_string();
+                state
+                    .control
+                    .queue_read("get-config", &body, "get config");
+            }
+        }
+        if let Some(payload) = &state.control.payload {
+            ui.add_space(Style::SP_S);
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    ui.monospace(payload);
+                });
+        }
+    });
+}
+
+fn show_mg90_power(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    show_firmware_recovery(ui, &state.firmware, &state.devices);
+    ui.add_space(Style::SP_S);
+    mde_egui::widgets::card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Armed reboot")
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
+        );
+        mde_egui::widgets::muted_note(
+            ui,
+            "Type the live ESN to arm. The Construct shell mints the 30s capability. This reboots the gateway.",
+        );
+        let esn = mg90_esn(state).unwrap_or_default();
+        readout(ui, "Live ESN", dash_if_empty(&esn), Style::TEXT);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Type ESN");
+            ui.text_edit_singleline(&mut state.control.reboot_arm);
+        });
+        let armed = mg90_arm_ready(state);
+        if ui
+            .add_enabled(armed, egui::Button::new("Reboot MG90"))
+            .clicked()
+        {
+            state.control.queue_mutation(
+                "reboot",
+                "vehicle-reboot",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "typed_name": state.control.reboot_arm,
+                }),
+                "reboot",
+            );
+        }
+    });
 }
 
 /// Keep the MG90 admin surface actionable when the gateway adapter is absent.
@@ -4430,15 +4821,11 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 fn mg90_connection_card(ui: &mut egui::Ui, state: &MapsLocationSurface) {
     let current = state.vehicle_mirror_status.state.is_current();
     let (tone, title, detail) = if current {
-        (
-            Style::OK,
-            "Bench MG90 connected",
-            "Live vehicle mirror accepted",
-        )
+        (Style::OK, "MG90 connected", "Live vehicle mirror accepted")
     } else {
         (
             Style::WARN,
-            "Bench MG90 not connected",
+            "MG90 not connected",
             "No live state/vehicle mirror is available for this workstation",
         )
     };
@@ -4458,7 +4845,7 @@ fn mg90_connection_card(ui: &mut egui::Ui, state: &MapsLocationSurface) {
             ui.add_space(Style::SP_XS);
             mde_egui::widgets::muted_note(
                 ui,
-                "Configure the authorized MDE_VEHICLE_GATEWAY and root-only credential file on this seat, then restart mackesd. No MG90 values are fabricated while that adapter is absent.",
+                "Configure MDE_VEHICLE_GATEWAY and the root-only credential files on this seat, then restart mackesd. No MG90 values are fabricated while that adapter is absent.",
             );
         }
     });
@@ -4470,19 +4857,23 @@ fn apply_admin_keyboard_shortcuts(ctx: &egui::Context, selected: &mut AdminSecti
     }
     let next = ctx.input(|input| {
         if input.key_pressed(egui::Key::Num1) {
-            Some(AdminSection::Vehicle)
+            Some(AdminSection::Overview)
         } else if input.key_pressed(egui::Key::Num2) {
-            Some(AdminSection::Connectivity)
+            Some(AdminSection::Wan)
         } else if input.key_pressed(egui::Key::Num3) {
-            Some(AdminSection::DevicesIo)
+            Some(AdminSection::Wifi)
         } else if input.key_pressed(egui::Key::Num4) {
-            Some(AdminSection::LocationSources)
+            Some(AdminSection::Lan)
         } else if input.key_pressed(egui::Key::Num5) {
-            Some(AdminSection::Mg90Setup)
+            Some(AdminSection::Gnss)
         } else if input.key_pressed(egui::Key::Num6) {
-            Some(AdminSection::Mg90Settings)
+            Some(AdminSection::Io)
         } else if input.key_pressed(egui::Key::Num7) {
-            Some(AdminSection::FirmwareRecovery)
+            Some(AdminSection::Vpn)
+        } else if input.key_pressed(egui::Key::Num8) {
+            Some(AdminSection::Services)
+        } else if input.key_pressed(egui::Key::Num9) {
+            Some(AdminSection::Access)
         } else {
             None
         }
@@ -4492,88 +4883,12 @@ fn apply_admin_keyboard_shortcuts(ctx: &egui::Context, selected: &mut AdminSecti
     }
 }
 
-fn admin_section_strip(ui: &mut egui::Ui, selected: &mut AdminSection) {
-    ui.horizontal_wrapped(|ui| {
-        for section in AdminSection::ALL {
-            if admin_section_button(ui, section, *selected == section).clicked() {
-                *selected = section;
-            }
-        }
-    });
-}
-
-fn admin_section_button(
-    ui: &mut egui::Ui,
-    section: AdminSection,
-    selected: bool,
-) -> egui::Response {
-    let label = format!("{} {}", section.shortcut_label(), section.label());
-    let galley = ui.painter().layout_no_wrap(
-        label.clone(),
-        FontId::proportional(Style::SMALL),
-        Style::TEXT,
-    );
-    // The Admin page is rendered inside the shell-reserved workspace, and on
-    // short/narrow seats the content pane can be smaller than the comfortable
-    // 96 px chip width.  Do not let the chip allocate beyond the current
-    // visible lane: an escaped `interact` rect is exactly how the old
-    // "advanced" menu targets became visible-looking but unclickable.
-    let visible_lane = ui.available_rect_before_wrap().intersect(ui.clip_rect());
-    let screen = ui.ctx().screen_rect();
-    let cursor_left = ui.cursor().left().max(screen.left());
-    let right_edge = visible_lane
-        .right()
-        .min(ui.max_rect().right())
-        .min(screen.right())
-        // Leave a tiny numerical margin at the clip edge.  egui's tessellated
-        // rect can otherwise round an exactly-edge target one fraction beyond
-        // a very narrow 72 px test/display lane.
-        - 1.0;
-    let available = (right_edge - cursor_left)
-        .max(1.0)
-        .min(ui.available_width().max(1.0));
-    let minimum = 96.0_f32.min(available);
-    let width = (galley.size().x + Style::SP_M + Style::SP_S)
-        .max(minimum)
-        .min(available)
-        .max(1.0);
-    let size = egui::vec2(width, Style::SP_XL);
-    let (_, rect) = ui.allocate_space(size);
-    let response = ui.interact(rect, admin_section_item_id(section), Sense::click());
-    let fill = if selected {
-        Style::pressed_fill(Style::ACCENT)
-    } else if response.hovered() {
-        Style::SURFACE_HI
-    } else {
-        Style::SURFACE
-    };
-    ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
-    if selected {
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
-            Style::RADIUS_S,
-            Style::ACCENT,
-        );
-    }
-    let text_color = if selected {
-        Style::TEXT_STRONG
-    } else {
-        Style::TEXT
-    };
-    ui.painter().galley(
-        egui::pos2(
-            rect.left() + Style::SP_S,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        text_color,
-    );
-    ui.add_space(Style::SP_XS);
-    response
-}
-
 fn admin_section_item_id(section: AdminSection) -> egui::Id {
-    egui::Id::new(("maps-location-admin-section", section.label()))
+    let index = AdminSection::ALL
+        .iter()
+        .position(|candidate| *candidate == section)
+        .unwrap_or(0);
+    Sidebar::row_id(MG90_SIDEBAR_SALT, index)
 }
 
 fn show_vehicle(
@@ -4661,11 +4976,7 @@ fn show_vehicle(
                         .fuel_percent
                         .map_or_else(|| "unavailable".to_string(), |fuel| format!("{fuel:.0}%")),
                     telem.fuel_percent.map_or(Style::TEXT_DIM, |fuel| {
-                        if fuel < 15.0 {
-                            Style::WARN
-                        } else {
-                            Style::OK
-                        }
+                        if fuel < 15.0 { Style::WARN } else { Style::OK }
                     }),
                 )
             } else {
@@ -4783,9 +5094,9 @@ fn vehicle_mirror_status_card(ui: &mut egui::Ui, status: &VehicleMirrorStatus) {
             }
             if !status.state.is_current() {
                 mde_egui::widgets::muted_note(
-                ui,
-                "Retained vehicle values are diagnostic only; live telemetry is unavailable until a current snapshot arrives.",
-            );
+                    ui,
+                    "Retained vehicle values are diagnostic only; live telemetry is unavailable until a current snapshot arrives.",
+                );
             }
         },
     );
@@ -5284,11 +5595,7 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
             // "0.00000, 0.00000" as a coordinate.
             let fixed = source.sample.has_fix();
             let on_fix = |value: String| {
-                if fixed {
-                    value
-                } else {
-                    "—".to_string()
-                }
+                if fixed { value } else { "—".to_string() }
             };
             metric(ui, "Fix", &source.sample.fix_type, Style::TEXT);
             metric(
@@ -5369,6 +5676,7 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
     );
 }
 
+#[allow(dead_code)]
 fn show_mg90_setup(
     ui: &mut egui::Ui,
     mg90: &mut Mg90State,
@@ -5675,6 +5983,7 @@ fn cap_pill(ui: &mut egui::Ui, label: &str, present: bool) {
     pill(ui, label, if present { Style::OK } else { Style::TEXT_DIM });
 }
 
+#[allow(dead_code)]
 fn show_mg90_settings(ui: &mut egui::Ui, state: &MapsLocationSurface) {
     if state.moving() {
         warning_strip(
@@ -6527,11 +6836,7 @@ fn coolant_tone(celsius: f32) -> Color32 {
 
 /// SIM/DTC-style tone: zero faults is OK, any present is a warn.
 fn count_tone(count: u32) -> Color32 {
-    if count == 0 {
-        Style::OK
-    } else {
-        Style::WARN
-    }
+    if count == 0 { Style::OK } else { Style::WARN }
 }
 
 /// A trimmed value, or an em-dash for an absent / empty live field (§7 — honest
@@ -6831,11 +7136,7 @@ fn source_readiness_tone(source: &LocationSource) -> Color32 {
 }
 
 fn bool_label(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
+    if value { "yes" } else { "no" }
 }
 
 fn encrypted_label(value: bool) -> &'static str {
@@ -7182,7 +7483,7 @@ mod tests {
 
         click_rail_row(&ctx, &mut surface, screen, admin.rect.center(), false);
         assert_eq!(surface.active, WorkspaceTab::Admin);
-        assert_eq!(surface.admin_section, AdminSection::Vehicle);
+        assert_eq!(surface.admin_section, AdminSection::Overview);
     }
 
     #[test]
@@ -7194,17 +7495,17 @@ mod tests {
         let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 820.0));
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Admin;
-        surface.admin_section = AdminSection::Vehicle;
+        surface.admin_section = AdminSection::Overview;
 
         render_admin_frame(&ctx, &mut surface, screen, Vec::new());
         let target = ctx
-            .read_response(admin_section_item_id(AdminSection::Mg90Settings))
-            .expect("MG90 Settings admin section should register a hit target");
+            .read_response(admin_section_item_id(AdminSection::Config))
+            .expect("Config admin section should register a hit target");
         assert!(screen.contains_rect(target.rect));
 
-        click_admin_section(&ctx, &mut surface, screen, AdminSection::Mg90Settings);
+        click_admin_section(&ctx, &mut surface, screen, AdminSection::Config);
         assert_eq!(surface.active, WorkspaceTab::Admin);
-        assert_eq!(surface.admin_section, AdminSection::Mg90Settings);
+        assert_eq!(surface.admin_section, AdminSection::Config);
     }
 
     #[test]
@@ -7215,12 +7516,13 @@ mod tests {
 
         // Regresses the off-page "Advanced"/MG90 menu failure: after shell
         // chrome, rail, and content margins, the Admin section lane can be
-        // narrower than the old hard-coded 96 px chip width. Each registered
-        // hit target must stay inside the lane it paints in.
+        // narrower than the old hard-coded 96 px chip width. Eleven control
+        // panes may scroll vertically on a short seat; they must not escape
+        // the visible WIDTH.
         let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(72.0, 760.0));
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Admin;
-        surface.admin_section = AdminSection::Vehicle;
+        surface.admin_section = AdminSection::Overview;
 
         render_admin_frame(&ctx, &mut surface, screen, Vec::new());
 
@@ -7230,15 +7532,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{section:?} admin section should register"));
             assert!(target.rect.is_positive(), "{section:?} lost its hit target");
             assert!(
-                screen.contains_rect(target.rect),
-                "{section:?} escaped the visible Admin lane: {:?}",
+                target.rect.left() >= screen.left() && target.rect.right() <= screen.right() + 0.5,
+                "{section:?} escaped the visible Admin width: {:?}",
                 target.rect
             );
         }
 
-        click_admin_section(&ctx, &mut surface, screen, AdminSection::FirmwareRecovery);
+        click_admin_section(&ctx, &mut surface, screen, AdminSection::Wan);
         assert_eq!(surface.active, WorkspaceTab::Admin);
-        assert_eq!(surface.admin_section, AdminSection::FirmwareRecovery);
+        assert_eq!(surface.admin_section, AdminSection::Wan);
     }
 
     #[test]
@@ -7250,12 +7552,12 @@ mod tests {
         let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 820.0));
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Admin;
-        surface.admin_section = AdminSection::Vehicle;
+        surface.admin_section = AdminSection::Overview;
 
         render_admin_frame(&ctx, &mut surface, screen, vec![key(egui::Key::Num7)]);
 
         assert_eq!(surface.active, WorkspaceTab::Admin);
-        assert_eq!(surface.admin_section, AdminSection::FirmwareRecovery);
+        assert_eq!(surface.admin_section, AdminSection::Vpn);
     }
 
     #[test]
@@ -7374,13 +7676,17 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                "Vehicle",
-                "Connectivity",
-                "Devices & I/O",
-                "Location Sources",
-                "MG90 Setup",
-                "MG90 Settings",
-                "Firmware & Recovery",
+                "Overview",
+                "WAN",
+                "Wi-Fi",
+                "LAN",
+                "GNSS",
+                "Vehicle I/O",
+                "VPN",
+                "Services",
+                "Access",
+                "Config",
+                "Power",
             ]
         );
     }
@@ -7547,9 +7853,11 @@ mod tests {
         let no_gps_with_route = route_preview_start_readiness(true, true, false, &ready_status);
         assert_eq!(no_gps_with_route.button_label, "Waiting for GPS");
         assert!(!no_gps_with_route.can_start);
-        assert!(no_gps_with_route
-            .tooltip
-            .contains("MG90 GNSS has no GPS fix"));
+        assert!(
+            no_gps_with_route
+                .tooltip
+                .contains("MG90 GNSS has no GPS fix")
+        );
     }
 
     #[test]
@@ -7570,9 +7878,11 @@ mod tests {
             source.sample.longitude = -79.9959;
         }
         let blocked_texts = painted_texts(&mut blocked);
-        assert!(blocked_texts
-            .iter()
-            .any(|text| text == "Navigation blocked"));
+        assert!(
+            blocked_texts
+                .iter()
+                .any(|text| text == "Navigation blocked")
+        );
 
         let mut no_gps = MapsLocationSurface::simulated();
         no_gps.active = WorkspaceTab::Drive;
@@ -7587,9 +7897,11 @@ mod tests {
         let mut absent = MapsLocationSurface::live();
         absent.active = WorkspaceTab::Drive;
         let absent_texts = painted_texts(&mut absent);
-        assert!(absent_texts
-            .iter()
-            .any(|text| text == "Radio & GNSS health"));
+        assert!(
+            absent_texts
+                .iter()
+                .any(|text| text == "Radio & GNSS health")
+        );
         assert!(absent_texts.iter().any(|text| text == "Unavailable"));
         for label in [
             "Cell A",
@@ -7647,9 +7959,11 @@ mod tests {
         // The same rail remains in place once guidance is active.
         healthy.local_navigation.navigating = true;
         let active_route_texts = painted_texts(&mut healthy);
-        assert!(active_route_texts
-            .iter()
-            .any(|text| text == "Radio & GNSS health"));
+        assert!(
+            active_route_texts
+                .iter()
+                .any(|text| text == "Radio & GNSS health")
+        );
         assert!(active_route_texts.iter().any(|text| text == "Current"));
     }
 
@@ -8089,9 +8403,11 @@ mod tests {
             &simulated.vehicle_radio_health,
             &simulated.vehicle_mirror_status,
         );
-        assert!(simulated_texts
-            .iter()
-            .any(|text| text == "simulated CAN/OBD profile"));
+        assert!(
+            simulated_texts
+                .iter()
+                .any(|text| text == "simulated CAN/OBD profile")
+        );
         for fabricated in ["27", "1840", "91", "13.9", "64%", "78214 mi", "42 min"] {
             assert!(
                 !simulated_texts.iter().any(|text| text == fabricated),
@@ -8143,16 +8459,22 @@ mod tests {
             &live.vehicle_radio_health,
             &live.vehicle_mirror_status,
         );
-        assert!(stale_texts
-            .iter()
-            .any(|text| text.starts_with("live vehicle-gateway mirror")));
+        assert!(
+            stale_texts
+                .iter()
+                .any(|text| text.starts_with("live vehicle-gateway mirror"))
+        );
         assert!(stale_texts.iter().any(|text| text == "Stale retained"));
-        assert!(stale_texts
-            .iter()
-            .any(|text| text == "cached values retained"));
-        assert!(stale_texts
-            .iter()
-            .any(|text| text.ends_with(" s ago") && text != "0.0 s ago"));
+        assert!(
+            stale_texts
+                .iter()
+                .any(|text| text == "cached values retained")
+        );
+        assert!(
+            stale_texts
+                .iter()
+                .any(|text| text.ends_with(" s ago") && text != "0.0 s ago")
+        );
         for stale in ["62", "2100", "91", "13.9", "64%", "78214 mi", "42 min"] {
             assert!(
                 !stale_texts.iter().any(|text| text == stale),
@@ -8214,9 +8536,11 @@ mod tests {
             &empty.vehicle_mirror_status,
         );
         assert!(unavailable.iter().any(|text| text == "unavailable"));
-        assert!(unavailable
-            .iter()
-            .any(|text| text.contains("No valid typed radio inventory")));
+        assert!(
+            unavailable
+                .iter()
+                .any(|text| text.contains("No valid typed radio inventory"))
+        );
     }
 
     #[test]
@@ -8321,10 +8645,12 @@ mod tests {
             source.sample.speed_mph = f32::NAN;
             source.sample.heading_deg = f32::INFINITY;
         }
-        assert!(!surface
-            .locations
-            .primary_sample()
-            .is_some_and(LocationSample::has_fix));
+        assert!(
+            !surface
+                .locations
+                .primary_sample()
+                .is_some_and(LocationSample::has_fix)
+        );
         assert!(tessellate(&mut surface) > 0);
     }
 
@@ -8670,7 +8996,7 @@ mod tests {
     fn location_sources_tessellate_with_blocked_manual_switches() {
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Admin;
-        surface.admin_section = AdminSection::LocationSources;
+        surface.admin_section = AdminSection::Gnss;
         surface.locations.sources[1].status = SourceStatus::Disconnected;
         surface.locations.sources[2].sample.update_age_s = 6.0;
         surface.locations.sources[3].sample.accuracy_m = 6.0;

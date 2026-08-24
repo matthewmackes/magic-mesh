@@ -80,25 +80,32 @@ impl WorkspaceTab {
     }
 }
 
-/// Internal sections of the single MG90 administrative interface, preserving the
-/// operator-requested order.
+/// Internal panes of the MG90 control console, matching live oMG config domains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AdminSection {
-    /// Ford 2020 Police Interceptor vehicle telemetry.
+    /// Gateway identity, power, WAN, and GNSS at a glance.
     #[default]
-    Vehicle,
-    /// MG90 WAN/cellular/connectivity view.
-    Connectivity,
-    /// Serial recovery, GPIO, USB, Ethernet, CAN/OBD.
-    DevicesIo,
-    /// Primary-source selection and health diagnostics.
-    LocationSources,
-    /// First-time direct-Ethernet setup and reset guardrails.
-    Mg90Setup,
-    /// Native MG90 setting descriptors and pending changes.
-    Mg90Settings,
-    /// Firmware lifecycle and serial recovery workflows.
-    FirmwareRecovery,
+    Overview,
+    /// Cellular / Ethernet / Wi-Fi WAN and failover.
+    Wan,
+    /// Access-point and client radios.
+    Wifi,
+    /// LAN bridge, DHCP, VLAN.
+    Lan,
+    /// GNSS receiver and location-source health.
+    Gnss,
+    /// MCU ignition, GPIO, OBD/serial.
+    Io,
+    /// VPN tunnels.
+    Vpn,
+    /// Beacon, NTP, DELS, and other oMG services.
+    Services,
+    /// LCI / console access.
+    Access,
+    /// Committed `omgconf` YAML browser.
+    Config,
+    /// Armed reboot and power policy.
+    Power,
 }
 
 /// Coarse availability of the typed MG90 radio inventory presented to Car.
@@ -956,42 +963,71 @@ fn effective_freshness(
 }
 
 impl AdminSection {
-    /// Stable section order inside the single Admin interface.
-    pub const ALL: [Self; 7] = [
-        Self::Vehicle,
-        Self::Connectivity,
-        Self::DevicesIo,
-        Self::LocationSources,
-        Self::Mg90Setup,
-        Self::Mg90Settings,
-        Self::FirmwareRecovery,
+    /// Stable pane order inside the MG90 console.
+    pub const ALL: [Self; 11] = [
+        Self::Overview,
+        Self::Wan,
+        Self::Wifi,
+        Self::Lan,
+        Self::Gnss,
+        Self::Io,
+        Self::Vpn,
+        Self::Services,
+        Self::Access,
+        Self::Config,
+        Self::Power,
     ];
 
     /// Human label.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Vehicle => "Vehicle",
-            Self::Connectivity => "Connectivity",
-            Self::DevicesIo => "Devices & I/O",
-            Self::LocationSources => "Location Sources",
-            Self::Mg90Setup => "MG90 Setup",
-            Self::Mg90Settings => "MG90 Settings",
-            Self::FirmwareRecovery => "Firmware & Recovery",
+            Self::Overview => "Overview",
+            Self::Wan => "WAN",
+            Self::Wifi => "Wi-Fi",
+            Self::Lan => "LAN",
+            Self::Gnss => "GNSS",
+            Self::Io => "Vehicle I/O",
+            Self::Vpn => "VPN",
+            Self::Services => "Services",
+            Self::Access => "Access",
+            Self::Config => "Config",
+            Self::Power => "Power",
         }
     }
 
-    /// One-based keyboard selector shown in the Admin section strip.
+    /// Carbon glyph for the console sidebar.
     #[must_use]
-    pub const fn shortcut_label(self) -> &'static str {
+    pub const fn icon(self) -> &'static str {
         match self {
-            Self::Vehicle => "1",
-            Self::Connectivity => "2",
-            Self::DevicesIo => "3",
-            Self::LocationSources => "4",
-            Self::Mg90Setup => "5",
-            Self::Mg90Settings => "6",
-            Self::FirmwareRecovery => "7",
+            Self::Overview => "dashboard",
+            Self::Wan => "network-4",
+            Self::Wifi => "wifi",
+            Self::Lan => "ethernet",
+            Self::Gnss => "location",
+            Self::Io => "chip",
+            Self::Vpn => "locked",
+            Self::Services => "application",
+            Self::Access => "user-admin",
+            Self::Config => "document",
+            Self::Power => "power",
+        }
+    }
+
+    /// One-based keyboard selector for the first nine panes.
+    #[must_use]
+    pub const fn shortcut_label(self) -> Option<&'static str> {
+        match self {
+            Self::Overview => Some("1"),
+            Self::Wan => Some("2"),
+            Self::Wifi => Some("3"),
+            Self::Lan => Some("4"),
+            Self::Gnss => Some("5"),
+            Self::Io => Some("6"),
+            Self::Vpn => Some("7"),
+            Self::Services => Some("8"),
+            Self::Access => Some("9"),
+            Self::Config | Self::Power => None,
         }
     }
 }
@@ -1001,8 +1037,10 @@ impl AdminSection {
 pub struct MapsLocationSurface {
     /// Selected workspace tab.
     pub active: WorkspaceTab,
-    /// Selected section inside the single MG90 Admin interface.
+    /// Selected pane inside the MG90 control console.
     pub admin_section: AdminSection,
+    /// Live MG90 control session (inspect / config / armed mutations).
+    pub control: crate::mg90_control::Mg90ControlState,
     /// Airspace — the real-time wardriving radar state (WiFi/cell/BT around the
     /// vehicle). Live-only; simulated feed until the MG90 `airspace` worker lands.
     pub airspace: crate::airspace::AirspaceState,
@@ -1106,7 +1144,8 @@ impl MapsLocationSurface {
         let map = MapViewState::live(!offline_maps.installed_regions.is_empty());
         Self {
             active: WorkspaceTab::Drive,
-            admin_section: AdminSection::Vehicle,
+            admin_section: AdminSection::Overview,
+            control: crate::mg90_control::Mg90ControlState::live(),
             airspace: crate::airspace::AirspaceState::live(),
             route_preview: false,
             destination_search: false,
@@ -1162,7 +1201,8 @@ impl MapsLocationSurface {
     pub fn simulated() -> Self {
         Self {
             active: WorkspaceTab::Drive,
-            admin_section: AdminSection::Vehicle,
+            admin_section: AdminSection::Overview,
+            control: crate::mg90_control::Mg90ControlState::live(),
             airspace: crate::airspace::AirspaceState::simulated(),
             route_preview: false,
             destination_search: false,
@@ -1913,6 +1953,7 @@ impl MapsLocationSurface {
         if !has_pending_viewport
             && !has_pending_location
             && !has_pending_navigation
+            && !self.control.needs_bus()
             && self
                 .last_bus_poll
                 .is_some_and(|t| t.elapsed() < BUS_REFRESH)
@@ -2143,6 +2184,7 @@ impl MapsLocationSurface {
             read_weather_map_mirror(&reader, node, now_ms),
             read_weather_map_viewport_mirror(&reader, node, now_ms),
         );
+        self.control.sync_bus(persist);
     }
 
     /// Queue a route intent using only the currently admitted immutable model
@@ -2384,7 +2426,7 @@ impl MapsLocationSurface {
     /// default Drive HUD or a stale Admin section.
     pub fn focus_vehicle_tab(&mut self) {
         self.active = WorkspaceTab::Admin;
-        self.admin_section = AdminSection::Vehicle;
+        self.admin_section = AdminSection::Overview;
     }
 
     /// Open the cockpit on the Navigation home/Drive HUD. Car Mode may have
@@ -2405,6 +2447,28 @@ impl MapsLocationSurface {
     pub fn focus_airspace_tab(&mut self) {
         self.active = WorkspaceTab::Airspace;
         self.airspace.active = true;
+    }
+
+    /// Drain privileged MG90 mutations for the Construct shell mint path.
+    pub fn take_mg90_mutations(&mut self) -> Vec<crate::mg90_control::PendingVehicleMutation> {
+        self.control.take_mutations()
+    }
+
+    /// One privileged MG90 mutation when no other vehicle request is in flight.
+    pub fn take_mg90_mutation_if_idle(
+        &mut self,
+    ) -> Option<crate::mg90_control::PendingVehicleMutation> {
+        self.control.take_mutation_if_idle()
+    }
+
+    /// Track a shell-minted vehicle request so the console harvests its reply.
+    pub fn track_mg90_inflight(&mut self, ulid: String, label: &str) {
+        self.control.track_inflight(ulid, label);
+    }
+
+    /// Surface a mint/publish failure on the MG90 console.
+    pub fn note_mg90_error(&mut self, error: String) {
+        self.control.fail_note(error);
     }
 }
 
@@ -5877,8 +5941,8 @@ impl EncryptedVaultState {
 mod tests {
     use super::*;
     use mackes_mesh_types::navigation::{
-        ManeuverKind, NavigationPhase, NavigationProgress, NavigationSnapshot, RouteAttribution,
-        RouteManeuver, RouteResult, NAVIGATION_SCHEMA_VERSION,
+        ManeuverKind, NAVIGATION_SCHEMA_VERSION, NavigationPhase, NavigationProgress,
+        NavigationSnapshot, RouteAttribution, RouteManeuver, RouteResult,
     };
     use mackes_mesh_types::nws_alert::GeoPoint;
 
@@ -6096,9 +6160,11 @@ mod tests {
         assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
         assert!(!manager.auto_failover);
         assert!(manager.primary_warning().is_some());
-        assert!(manager
-            .healthy_alternatives()
-            .contains(&LocationSourceKind::UsbGpsd));
+        assert!(
+            manager
+                .healthy_alternatives()
+                .contains(&LocationSourceKind::UsbGpsd)
+        );
         assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
     }
 
@@ -6134,9 +6200,11 @@ mod tests {
 
         let warning = manager.primary_warning().expect("status warning");
         assert!(warning.contains("source is unhealthy"));
-        assert!(manager
-            .healthy_alternatives()
-            .contains(&LocationSourceKind::UsbGpsd));
+        assert!(
+            manager
+                .healthy_alternatives()
+                .contains(&LocationSourceKind::UsbGpsd)
+        );
     }
 
     #[test]
@@ -6153,10 +6221,12 @@ mod tests {
             Some("Default state/province region")
         );
         assert_eq!(status.coverage_percent, Some(100));
-        assert!(status
-            .notes
-            .iter()
-            .any(|note| note.contains("Simulator fixture")));
+        assert!(
+            status
+                .notes
+                .iter()
+                .any(|note| note.contains("Simulator fixture"))
+        );
     }
 
     #[test]
@@ -6167,14 +6237,18 @@ mod tests {
         let blocked = state.offline_navigation_status();
         assert_eq!(blocked.readiness, OfflineNavigationReadiness::Blocked);
         assert!(!blocked.can_claim_turn_by_turn());
-        assert!(blocked
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("stale")));
-        assert!(blocked
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("manual switch required")));
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("stale"))
+        );
+        assert!(
+            blocked
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("manual switch required"))
+        );
 
         state.locations.set_primary(LocationSourceKind::UsbGpsd);
         let restored = state.offline_navigation_status();
@@ -6190,10 +6264,12 @@ mod tests {
         let status = state.offline_navigation_status();
         assert_eq!(status.readiness, OfflineNavigationReadiness::Blocked);
         assert_eq!(status.loaded_region, None);
-        assert!(status
-            .blockers
-            .iter()
-            .any(|blocker| blocker == "No loaded offline map region is available."));
+        assert!(
+            status
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "No loaded offline map region is available.")
+        );
 
         state.simulate_ready_offline_navigation();
         assert_eq!(
@@ -6209,18 +6285,21 @@ mod tests {
             .setting_change_plan("wan.policy")
             .expect("sample setting exists");
         assert!(plan.backup_required);
-        assert!(plan
-            .steps
-            .iter()
-            .any(|step| step == "Create versioned backup"));
-        assert!(plan
-            .steps
-            .iter()
-            .any(|step| step == "Read back current value"));
-        assert!(plan
-            .steps
-            .iter()
-            .any(|step| step == "Verify direct-Ethernet management path"));
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step == "Create versioned backup")
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step == "Read back current value")
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step == "Verify direct-Ethernet management path")
+        );
         assert!(plan.moving_warning);
     }
 
@@ -6334,10 +6413,11 @@ mod tests {
     #[test]
     fn destinations_carry_an_address_for_the_preview_summary() {
         let nav = LocalNavigationState::simulated();
-        assert!(nav
-            .destinations
-            .iter()
-            .all(|destination| !destination.address.trim().is_empty()));
+        assert!(
+            nav.destinations
+                .iter()
+                .all(|destination| !destination.address.trim().is_empty())
+        );
     }
 
     #[test]
@@ -6478,13 +6558,17 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                "Vehicle",
-                "Connectivity",
-                "Devices & I/O",
-                "Location Sources",
-                "MG90 Setup",
-                "MG90 Settings",
-                "Firmware & Recovery",
+                "Overview",
+                "WAN",
+                "Wi-Fi",
+                "LAN",
+                "GNSS",
+                "Vehicle I/O",
+                "VPN",
+                "Services",
+                "Access",
+                "Config",
+                "Power",
             ]
         );
     }
@@ -6493,18 +6577,18 @@ mod tests {
     fn vehicle_focus_opens_admin_vehicle_while_navigation_opens_drive() {
         let mut state = MapsLocationSurface::simulated();
         assert_eq!(state.active, WorkspaceTab::Drive);
-        assert_eq!(state.admin_section, AdminSection::Vehicle);
+        assert_eq!(state.admin_section, AdminSection::Overview);
 
-        state.focus_admin_section(AdminSection::Mg90Settings);
+        state.focus_admin_section(AdminSection::Config);
         assert_eq!(state.active, WorkspaceTab::Admin);
-        assert_eq!(state.admin_section, AdminSection::Mg90Settings);
+        assert_eq!(state.admin_section, AdminSection::Config);
 
         state.focus_navigation_tab();
         assert_eq!(state.active, WorkspaceTab::Drive);
 
         state.focus_vehicle_tab();
         assert_eq!(state.active, WorkspaceTab::Admin);
-        assert_eq!(state.admin_section, AdminSection::Vehicle);
+        assert_eq!(state.admin_section, AdminSection::Overview);
     }
 
     #[test]
@@ -6612,23 +6696,29 @@ mod tests {
             .filter(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX))
             .collect();
         assert_eq!(adapter_notes.len(), MAX_RETAINED_VEHICLE_GAPS);
-        assert!(adapter_notes
-            .iter()
-            .all(|note| note.len()
-                <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3));
-        assert!(state
-            .real_hardware_gaps
-            .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
+        assert!(
+            adapter_notes.iter().all(|note| note.len()
+                <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3)
+        );
+        assert!(
+            state
+                .real_hardware_gaps
+                .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string())
+        );
 
         mirror.gaps.clear();
         state.refresh_from_vehicle(&mirror);
-        assert!(!state
-            .real_hardware_gaps
-            .iter()
-            .any(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX)));
-        assert!(!state
-            .real_hardware_gaps
-            .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
+        assert!(
+            !state
+                .real_hardware_gaps
+                .iter()
+                .any(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX))
+        );
+        assert!(
+            !state
+                .real_hardware_gaps
+                .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string())
+        );
     }
 
     #[test]
@@ -6639,15 +6729,17 @@ mod tests {
         let mut state = MapsLocationSurface::simulated();
         state.refresh_from_bus("no-such-node-4c1f9e2a");
         assert!(state.simulator_enabled);
-        assert!(state
-            .real_hardware_gaps
-            .iter()
-            .any(|g| g == SIMULATED_MG90_GAP_NOTE));
+        assert!(
+            state
+                .real_hardware_gaps
+                .iter()
+                .any(|g| g == SIMULATED_MG90_GAP_NOTE)
+        );
     }
 
     #[test]
     fn live_bus_vehicle_mirror_drives_car_readouts_and_glance() {
-        use crate::car_status::{live_speed_mph, CarStatusItem};
+        use crate::car_status::{CarStatusItem, live_speed_mph};
         use mackes_mesh_types::vehicle::{
             CellLink, GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
         };
@@ -6859,15 +6951,15 @@ mod tests {
     #[test]
     fn weather_ui_folds_canonical_topics_and_retracts_old_generation() {
         use mackes_mesh_types::location::{
-            weather_location_state_topic, EffectiveLocationProvenance, EffectiveLocationSnapshot,
-            EffectiveLocationState, EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
-            WEATHER_LOCATION_SCHEMA_VERSION,
+            EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
+            EffectiveWeatherLocation, WEATHER_LOCATION_SCHEMA_VERSION, WeatherCoverage,
+            WeatherLocationMode, weather_location_state_topic,
         };
         use mackes_mesh_types::nws_alert::GeoPoint;
         use mackes_mesh_types::weather::{
-            weather_current_state_topic, CurrentConditions, CurrentWeatherSnapshot, Temperature,
-            TemperatureUnit, WeatherAttribution, WeatherAvailability, WeatherConditionKind,
-            WeatherProvider, WEATHER_CONTRACT_SCHEMA_VERSION,
+            CurrentConditions, CurrentWeatherSnapshot, Temperature, TemperatureUnit,
+            WEATHER_CONTRACT_SCHEMA_VERSION, WeatherAttribution, WeatherAvailability,
+            WeatherConditionKind, WeatherProvider, weather_current_state_topic,
         };
 
         let dir = tempfile::tempdir().expect("bus dir");
@@ -6975,12 +7067,12 @@ mod tests {
     fn interactive_weather_viewport_publishes_typed_latest_action() {
         use mackes_mesh_types::location::{
             EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
-            EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
-            WEATHER_LOCATION_SCHEMA_VERSION,
+            EffectiveWeatherLocation, WEATHER_LOCATION_SCHEMA_VERSION, WeatherCoverage,
+            WeatherLocationMode,
         };
         use mackes_mesh_types::nws_alert::GeoPoint;
         use mackes_mesh_types::weather::{
-            weather_set_map_viewport_topic, SetWeatherMapViewportRequest,
+            SetWeatherMapViewportRequest, weather_set_map_viewport_topic,
         };
 
         let dir = tempfile::tempdir().expect("bus dir");
@@ -7033,8 +7125,8 @@ mod tests {
     #[test]
     fn manual_weather_selection_publishes_exact_typed_action() {
         use mackes_mesh_types::location::{
-            SetWeatherLocationRequest, WeatherCoverage, WeatherLocationMode,
-            WEATHER_SET_LOCATION_TOPIC,
+            SetWeatherLocationRequest, WEATHER_SET_LOCATION_TOPIC, WeatherCoverage,
+            WeatherLocationMode,
         };
 
         let dir = tempfile::tempdir().expect("bus dir");
@@ -7614,10 +7706,12 @@ mod tests {
         assert!(!state.map.traffic_event_overlay);
         assert!(!state.map.attribution_line().contains("NCDOT"));
         state.map.traffic_event_overlay = true;
-        assert!(state
-            .map
-            .attribution_line()
-            .contains("NCDOT DriveNC / TIMS"));
+        assert!(
+            state
+                .map
+                .attribution_line()
+                .contains("NCDOT DriveNC / TIMS")
+        );
     }
 
     #[test]
@@ -7629,10 +7723,12 @@ mod tests {
         assert!(!state.map.air_quality_overlay);
         assert!(!state.map.attribution_line().contains("US EPA AirNow"));
         state.map.air_quality_overlay = true;
-        assert!(state
-            .map
-            .attribution_line()
-            .contains("US EPA AirNow (preliminary)"));
+        assert!(
+            state
+                .map
+                .attribution_line()
+                .contains("US EPA AirNow (preliminary)")
+        );
     }
 
     // ── WL-UX-007/S1 — production simulator removal ─────────────────────────
@@ -7688,10 +7784,11 @@ mod tests {
         assert!(s.mg90.status.active_cellular_link().is_none());
 
         // The honest gap report leads with the awaiting-mirror note.
-        assert!(s
-            .real_hardware_gaps
-            .iter()
-            .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
+        assert!(
+            s.real_hardware_gaps
+                .iter()
+                .any(|g| g == AWAITING_MIRROR_GAP_NOTE)
+        );
     }
 
     #[test]
@@ -7861,10 +7958,11 @@ mod tests {
         assert!(s.vehicle.telemetry.is_live());
         assert_eq!(s.mg90.status.active_wan, "Cellular A");
         // The awaiting-mirror gap retracts once the mirror is live.
-        assert!(!s
-            .real_hardware_gaps
-            .iter()
-            .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
+        assert!(
+            !s.real_hardware_gaps
+                .iter()
+                .any(|g| g == AWAITING_MIRROR_GAP_NOTE)
+        );
     }
 
     #[test]
@@ -7889,11 +7987,13 @@ mod tests {
 
         let mut state = MapsLocationSurface::live();
         state.refresh_from_vehicle(&mirror);
-        assert!(!state
-            .locations
-            .primary_sample()
-            .expect("MG90 source")
-            .has_fix());
+        assert!(
+            !state
+                .locations
+                .primary_sample()
+                .expect("MG90 source")
+                .has_fix()
+        );
         assert!(state.vehicle.telemetry.is_live());
         assert!(
             state.moving(),
@@ -7908,11 +8008,13 @@ mod tests {
         state.refresh_from_vehicle(&mirror);
         assert!(state.vehicle.telemetry.has_live_gateway_source());
         assert!(!state.vehicle.telemetry.is_live());
-        assert!(state
-            .locations
-            .primary_sample()
-            .expect("MG90 source")
-            .stale());
+        assert!(
+            state
+                .locations
+                .primary_sample()
+                .expect("MG90 source")
+                .stale()
+        );
         assert!(!state.moving(), "stale motion must fail safe to parked");
         assert_eq!(state.vehicle_glance(), None);
     }
@@ -8132,10 +8234,12 @@ mod tests {
         assert_eq!(health.snapshot_age_ms, Some(6_000));
         assert_eq!(health.radios_freshness.state, VehicleFreshnessState::Stale);
         assert_eq!(health.gnss_freshness.state, VehicleFreshnessState::Stale);
-        assert!(health
-            .radios
-            .iter()
-            .all(|row| row.operation == VehicleRadioOperation::Stale));
+        assert!(
+            health
+                .radios
+                .iter()
+                .all(|row| row.operation == VehicleRadioOperation::Stale)
+        );
         assert!(health.radios.iter().all(|row| !row.active_path));
         assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
     }
@@ -8237,10 +8341,12 @@ mod tests {
         surface.refresh_from_vehicle_v2(&snapshot);
         let stale = surface.vehicle_health_rail();
         assert_eq!(stale.state, VehicleHealthRailState::Stale);
-        assert!(stale
-            .slots
-            .iter()
-            .all(|slot| slot.state == VehicleHealthRailState::Stale));
+        assert!(
+            stale
+                .slots
+                .iter()
+                .all(|slot| slot.state == VehicleHealthRailState::Stale)
+        );
 
         let resyncing = surface
             .vehicle_mirror_status
@@ -8248,10 +8354,12 @@ mod tests {
         surface.set_vehicle_mirror_status(resyncing);
         let resync = surface.vehicle_health_rail();
         assert_eq!(resync.state, VehicleHealthRailState::Resyncing);
-        assert!(resync
-            .slots
-            .iter()
-            .all(|slot| slot.state == VehicleHealthRailState::Resyncing));
+        assert!(
+            resync
+                .slots
+                .iter()
+                .all(|slot| slot.state == VehicleHealthRailState::Resyncing)
+        );
         assert!(resync.slots.iter().all(|slot| slot.presence.is_some()));
     }
 
@@ -8564,14 +8672,18 @@ mod tests {
 
         let readiness = s.navigation_start_readiness();
         assert!(!readiness.can_start());
-        assert!(readiness
-            .blockers()
-            .iter()
-            .any(|reason| reason.contains("verified geographic coordinates")));
-        assert!(readiness
-            .blockers()
-            .iter()
-            .any(|reason| reason.contains("verified GPS fix")));
+        assert!(
+            readiness
+                .blockers()
+                .iter()
+                .any(|reason| reason.contains("verified geographic coordinates"))
+        );
+        assert!(
+            readiness
+                .blockers()
+                .iter()
+                .any(|reason| reason.contains("verified GPS fix"))
+        );
     }
 
     #[test]

@@ -102,20 +102,20 @@ use std::time::{Duration, Instant};
 
 use mde_egui::nav_chrome::AppFrame;
 use mde_egui::search_omnibox::SearchItem;
-use mde_egui::{eframe, egui, run_client, LayoutProfile, Motion, Style};
+use mde_egui::{LayoutProfile, Motion, Style, eframe, egui, run_client};
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 use mde_theme::brand::icons::IconId;
 
-use mde_files_egui::{files_panel, model::SurfaceTab, FileBrowser};
-use mde_maps_location_egui::{maps_location_panel, real_maps_location, MapsLocationSurface};
+use mde_files_egui::{FileBrowser, files_panel, model::SurfaceTab};
+use mde_maps_location_egui::{MapsLocationSurface, maps_location_panel, real_maps_location};
 use mde_media_egui::{
-    media_header, media_panel, media_pump, real_media, MediaSurface, VideoTextureCache,
+    MediaSurface, VideoTextureCache, media_header, media_panel, media_pump, real_media,
 };
-use mde_music_egui::{music_pump, music_workspace, MusicApp};
-use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
+use mde_music_egui::{MusicApp, music_pump, music_workspace};
+use mde_term_egui::{TerminalSurface, real_terminal, terminal_panel, terminal_pump};
 
-use surfaces::{canonical_workspace_surface, Surface};
+use surfaces::{Surface, canonical_workspace_surface};
 use web::MediaTransportAction;
 // CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
 // listener source for `loginctl lock-session` (the trait's `poll`).
@@ -3053,11 +3053,20 @@ impl Shell {
                 // `local_hostname()`). Fail-soft: no mirror yet (no adapter worker,
                 // no spool) leaves the simulated seed untouched. Per-frame is fine
                 // for v1 — one bounded `read_latest` index probe, not a full load.
+                // Privileged MG90 mutations are minted here: the Maps crate queues
+                // unsigned bodies; production arming stays in the root shell.
+                let host = self.local_host.clone();
                 let maps_location = &mut self.maps_location;
-                maps_location.refresh_from_bus(&self.local_host);
+                maps_location.refresh_from_bus(&host);
                 ui.push_id("shell-maps-location", |ui| {
                     maps_location_panel(ui, maps_location);
                 });
+                if let Some(mutation) = maps_location.take_mg90_mutation_if_idle() {
+                    match publish_vehicle_mutation(&host, &mutation) {
+                        Ok(ulid) => maps_location.track_mg90_inflight(ulid, &mutation.label),
+                        Err(error) => maps_location.note_mg90_error(error),
+                    }
+                }
             }
             Surface::Terminal => {
                 // The Terminator-class terminal (TERM-16) over a real local PTY —
@@ -4710,6 +4719,30 @@ fn publish_music_workspace_action(body: &str) -> Result<(), String> {
         .map_err(|error| format!("publish Music workspace action: {error}"))
 }
 
+/// Publish one privileged MG90 mutation from the shell's root mutation
+/// authority. The Maps console supplies the unsigned body and capability verb;
+/// this boundary mints the 30s HMAC and writes `action/vehicle/<verb>`.
+fn publish_vehicle_mutation(
+    host: &str,
+    mutation: &mde_maps_location_egui::mg90_control::PendingVehicleMutation,
+) -> Result<String, String> {
+    let body =
+        iac::authorize_root_mutation_body(&mutation.body, &mutation.auth_verb, host, "gateway")?;
+    let bus_root = mde_bus::client_data_dir()
+        .ok_or_else(|| "Vehicle action Bus root is unavailable".to_owned())?;
+    mde_bus::persist::Persist::open(bus_root)
+        .and_then(|persist| {
+            persist.write(
+                &mackes_mesh_types::vehicle::vehicle_action_topic(&mutation.verb),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+        })
+        .map(|msg| msg.ulid)
+        .map_err(|error| format!("publish vehicle {}: {error}", mutation.verb))
+}
+
 /// Publish one read-only Music browse request from the shell's Bus boundary.
 /// Search is intentionally separate from the mutation publisher: the daemon
 /// records the bounded result in its catalog projection, while the UI consumes
@@ -5027,23 +5060,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        car_home, car_home_vehicle_glance, car_keymap, chat, complete_menu_bar_minimize, console,
-        construct, datacenter, desktop_reconnect_should_query_recents, files_panel, front_door,
-        front_door_peer_apps, install_layout_mode_button_accessibility,
-        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
-        layout_mode_button_rect, layout_mode_control_visible, layout_mode_menu_rect,
-        layout_mode_primary_toggle, layout_profile_row_accesskit_value, layout_profile_tooltip,
-        matching_this_node_groups, media_header, media_panel, menu_bar_shuffle_cards,
-        menu_bar_shuffle_paint_order, music_browse_topic, nav_bar, nav_bar_action_label,
-        paint_car_speedometer, paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
-        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
-        real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
-        screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
-        this_node_search_is_compact, this_node_system_route, this_node_system_section,
-        toast_bridge, vdi, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
-        VideoTextureCache, WorkersDestination, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT,
-        LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W,
-        LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
+        Boot, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
+        LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
+        MENU_BAR_MINIMIZE_DURATION, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
+        VideoTextureCache, WorkersDestination, WorkersTab, car_home, car_home_vehicle_glance,
+        car_keymap, chat, complete_menu_bar_minimize, console, construct, datacenter,
+        desktop_reconnect_should_query_recents, files_panel, front_door, front_door_peer_apps,
+        install_layout_mode_button_accessibility, install_layout_profile_row_accessibility,
+        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_control_visible,
+        layout_mode_menu_rect, layout_mode_primary_toggle, layout_profile_row_accesskit_value,
+        layout_profile_tooltip, matching_this_node_groups, media_header, media_panel,
+        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, music_browse_topic, nav_bar,
+        nav_bar_action_label, paint_car_speedometer, paint_car_status_tile,
+        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
+        publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
+        remote_sessions_fallback_pos, route_file_operation_request, screenshot, splash, status,
+        surface_needs_remote_sessions_fallback, terminal_panel, this_node_search_is_compact,
+        this_node_system_route, this_node_system_section, toast_bridge, vdi,
     };
     use crate::this_node_catalog::{self, Section, SectionGroup};
     use mde_bus::hooks::config::Priority;
@@ -5052,7 +5085,7 @@ mod tests {
         AlertAction, AlertActionKind, Contact, Conversation, Message, MessageKind, NodeRole,
         Roster, Severity,
     };
-    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::egui::{self, Rect, pos2, vec2};
     use mde_egui::{LayoutProfile, Style, StyleColorScheme};
     use mde_files::backend::{
         AuditEntry, Backend, BackendError, ConflictPolicy, Destination, SendMode,
@@ -5281,7 +5314,7 @@ mod tests {
 
     #[test]
     fn unified_this_node_child_routes_keep_their_detail_authority() {
-        use crate::this_node_catalog::{first_page_for_section, page_for_route, Section};
+        use crate::this_node_catalog::{Section, first_page_for_section, page_for_route};
 
         assert_eq!(
             first_page_for_section(Section::Hardware)
@@ -6262,7 +6295,7 @@ mod tests {
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.maps_location.focus_vehicle_tab();
         assert_eq!(shell.maps_location.active, WorkspaceTab::Admin);
-        assert_eq!(shell.maps_location.admin_section, AdminSection::Vehicle);
+        assert_eq!(shell.maps_location.admin_section, AdminSection::Overview);
 
         shell.apply_car_tile(CarTile::Nav);
 
@@ -6282,8 +6315,8 @@ mod tests {
         );
         assert_eq!(
             shell.maps_location.admin_section,
-            AdminSection::Vehicle,
-            "Vehicle must land on the Admin Vehicle section"
+            AdminSection::Overview,
+            "Vehicle must land on the Admin Overview section"
         );
     }
 
@@ -7413,7 +7446,7 @@ mod tests {
             .expect("seed source file");
 
         let rows = vec![
-            FileRow::local("report.txt", Mime::Doc, "6 B", "now").with_path("/src/report.txt")
+            FileRow::local("report.txt", Mime::Doc, "6 B", "now").with_path("/src/report.txt"),
         ];
         let mut files = mde_files_egui::FileBrowser::with_file_ops(
             Box::new(ShellFilesBackend::new(rows)),
@@ -8291,10 +8324,12 @@ mod tests {
             body["schema_version"],
             mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
         );
-        assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
-            body["armed_token"].as_str().expect("armed token")
-        )
-        .is_some());
+        assert!(
+            mackes_mesh_types::cloud::CloudArmedToken::parse(
+                body["armed_token"].as_str().expect("armed token")
+            )
+            .is_some()
+        );
         assert!(
             publish_front_door_instance_lifecycle_to_bus(
                 dir.path(),
