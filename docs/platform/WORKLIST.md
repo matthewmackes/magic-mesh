@@ -1260,13 +1260,20 @@ story execution contract above.
   LiveKit SFU with P2P failover, and PSTN legs terminate through the LiveKit
   SIP gateway reusing the mde-voice-hud softphone, with all media state owned
   by typed mackesd verbs and never by the renderer.
-- Current state: VoiceAccounts consume landed. S4 fail-closes empty-password
-  PSTN and inbound-as-From (`WL-FUNC-024-2026-08-23-voice-hud-s4-pstn-drive-r1.md`;
-  farm `64/64` `mde-voice-hud`). Leftover is live media/SFU/PSTN on seats.
-  PSTN still depends on FUNC-030 `gateway.toml`. Dell/Seat 15/Surface run
-  unpublished `13.0.0-35`.
-- Remaining work: leftover is still live media/SFU/PSTN after a
-  current-revision unpublished candidate is installed.
+- Current state: In-tree S1–S4/S6 planes remain. S4 fail-closes empty-password
+  PSTN (`WL-FUNC-024-2026-08-23-voice-hud-s4-pstn-drive-r1.md`; farm `64/64`
+  `mde-voice-hud`). Seat 15 2026-08-24 16:25Z: unpublished `13.0.0-35` /
+  `7e3474ee`; data-group `collab` running (gen 311) hosts the media planes.
+  Journal: SIP provider not activated (no governed account). Empty
+  `call-media-readiness`/`verification`; no `state/calls/media`; no LiveKit
+  process or `livekit-server`; no chirp fixture; no `gateway.toml`. ALSA +
+  PipeWire analog-stereo present; no `/dev/video*`. Evidence:
+  `WL-FUNC-024-2026-08-24-live-media-r1.md`.
+- Remaining work: leftover is live two-seat audio (objective chirp/tone
+  correlation), group SFU, and PSTN after a current-revision unpublished
+  candidate is installed. Worker census and empty readiness are not a call.
+  Production loopback is unset; farm chirp is not a seat fixture. PSTN still
+  depends on FUNC-030 `gateway.toml`. Do not invent a dest.
   1. S1 Add the typed media contracts.
      - Inputs: mde-collab-types versioning conventions and the calls.rs command
        set.
