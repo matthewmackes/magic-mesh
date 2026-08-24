@@ -1151,15 +1151,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   same bytes after WL-REL-005 publication. Eagle and T480 remain non-gating
   inspection/deployment-wave seats.
 - Current state: unpublished workstation RPM `13.0.0-35` is on Dell, Seat 15,
-  and Surface (`WL-TEST-002-2026-08-22-unpublished-seat-install-r1.md`).
-  Compute/observation now run after identity `Wants=`
-  (`WL-TEST-002-2026-08-23-vm-support-hosts-r1.md`); `event/kvm/services` is
-  5/5 on Dell and Seat 15 (Surface 4/5). Installed `mackesd` still publishes
-  provider `unknown` until the virtqemud/`mde-vms` fold is on a seat.
-  Leftover is that package plus S6. Eagle/T480 have KVM without passwordless
-  sudo. Operator 2026-08-23 authorized Remaining; do not treat this install
-  as six-role qualification. Sealed Vitelity/SIP still required for S3. No
-  feature waiver.
+  Surface, Eagle, and T480. Compute/observation run after identity `Wants=`
+  (`WL-TEST-002-2026-08-23-vm-support-hosts-r1.md`,
+  `WL-TEST-002-2026-08-24-eagle-t480-sudo-vm-r1.md`). Eagle/T480 now match
+  Dell/Seat 15 `90-mm-nopasswd` and mesh-key SSH. Installed `mackesd` still
+  publishes provider `unknown` until the virtqemud/`mde-vms` fold is on a
+  seat. Leftover is that package plus S6. Operator 2026-08-23 authorized
+  Remaining; do not treat this install as six-role qualification. Sealed
+  Vitelity/SIP still required for S3. No feature waiver.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,

@@ -376,6 +376,12 @@ mod tests {
             "base RPM post-install must grant known non-root seat users the libvirt group so virsh qemu:///system works without a polkit agent"
         );
         assert!(
+            post_install.contains("/etc/sudoers.d/90-mm-nopasswd")
+                && post_install.contains("mm ALL=(ALL) NOPASSWD:ALL")
+                && post_install.contains("visudo -cf"),
+            "base RPM post-install must install the Dell/Seat 15 mm NOPASSWD drop-in so agents can sudo -n"
+        );
+        assert!(
             post_install.contains("loginctl enable-linger \"$user\"")
                 && post_install.contains("systemctl start \"user@$uid.service\""),
             "base RPM post-install must keep the primary seat PipeWire user manager boot-durable"

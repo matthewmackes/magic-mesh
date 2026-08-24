@@ -1084,6 +1084,20 @@ set_gtk_icon_theme() {
 set_gtk_icon_theme /etc/gtk-3.0/settings.ini
 set_gtk_icon_theme /etc/gtk-4.0/settings.ini
 timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
+# Seat agents need the same passwordless sudo Dell/Seat 15 already ship as
+# /etc/sudoers.d/90-mm-nopasswd. Wheel still requires a password on Fedora.
+if id mm >/dev/null 2>&1 && command -v visudo >/dev/null 2>&1; then
+  mcnf_sudoers=/etc/sudoers.d/90-mm-nopasswd
+  if [ ! -e "$mcnf_sudoers" ]; then
+    mcnf_sudoers_tmp="$(mktemp)"
+    printf 'mm ALL=(ALL) NOPASSWD:ALL\n' > "$mcnf_sudoers_tmp" || :
+    chmod 0440 "$mcnf_sudoers_tmp" || :
+    if visudo -cf "$mcnf_sudoers_tmp" >/dev/null 2>&1; then
+      install -m 0440 -o root -g root "$mcnf_sudoers_tmp" "$mcnf_sudoers" || :
+    fi
+    rm -f "$mcnf_sudoers_tmp"
+  fi
+fi
 # RPM-UPGRADE-ACTIVATION — replacing an executable does not replace a running
 # process. Restart only already-active system authorities after package setup so
 # upgrades cannot leave the old shell or daemon mapped through a deleted inode;
