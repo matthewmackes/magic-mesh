@@ -1428,12 +1428,15 @@ story execution contract above.
   but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
 - Required outcome: per-folder view mode, sort order, and show-hidden survive
   a shell restart.
-- Current state: persist path is in-tree. Read-only 2026-08-23:
-  `files-folder-prefs.json` is absent on Dell, Seat 15, and Surface; seats
-  run unpublished `magic-mesh-13.0.0-35`. Leftover is live restart evidence.
-  Evidence: `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is live restart evidence (fixtures do not satisfy
-  production).
+- Current state: persist path is in-tree. Seat 15 dest 2026-08-24: root DRM
+  shell had no `HOME`/`XDG_CONFIG_HOME` so `default_config_file()` was `None`.
+  After red `AI-GENERATED-ALERT` + 5s, drop-in `XDG_CONFIG_HOME=/root/.config`
+  plus bounded `/root/.config/mcnf/files-folder-prefs.json` survived restart
+  (identical SHA) and OPEN-hydrated at `surfaces`. No GUI click (no capture
+  dest). Evidence: `WL-FUNC-026-2026-08-24-seat15-folder-prefs-r1.md`.
+- Remaining work: leftover is operator GUI view/sort/hidden then restart on a
+  current-revision seat (dest hydrate is not operator use). RPM unit still
+  omits `XDG_CONFIG_HOME`; Seat 15 has a local drop-in dest.
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
@@ -1470,13 +1473,14 @@ story execution contract above.
   never built.
 - Required outcome: operators pin, rename, reorder, and remove their own
   Places entries, persisted across restarts.
-- Current state: bookmark store is in-tree. Read-only 2026-08-23:
-  `files-bookmarks.json` is absent on Dell, Seat 15, and Surface; seats run
-  unpublished `magic-mesh-13.0.0-35`. Leftover is live restart/navigate
-  evidence. Evidence:
-  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is live restart/navigate evidence, not a missing
-  store.
+- Current state: bookmark store is in-tree. Seat 15 dest 2026-08-24: same
+  `XDG_CONFIG_HOME=/root/.config` drop-in; bounded
+  `/root/.config/mcnf/files-bookmarks.json` survived restart (identical SHA)
+  and OPEN-hydrated at `surfaces`. No pin/navigate GUI (no capture dest).
+  Evidence: `WL-FUNC-027-2026-08-24-seat15-bookmarks-r1.md`.
+- Remaining work: leftover is operator pin then restart/navigate on a
+  current-revision seat (dest hydrate is not operator use). RPM unit still
+  omits `XDG_CONFIG_HOME`; Seat 15 has a local drop-in dest.
   1. S1 Add the bookmark store and sidebar section.
      - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
        Places render path.
