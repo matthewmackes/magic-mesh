@@ -419,16 +419,11 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover (1) bearer dest and leftover (2) dest-env child
-  exist under `/root/mcnf-private/`. Leftover (3) ran on Seat 15: dest-signed
-  `leave`, then `join` with DER enroll-endpoint pin. Overlay `10.42.0.5`
-  rematerialized; `nebula.service` is active. 2026-08-24: LH1 Nebula was
-  wedged (`/run` full + UDP Recv-Q); corrected-forward recovered overlay
-  and three-member etcd without replacing a droplet. Seat 15 and Surface
-  overlay-ping `.1`/`.2`/each other. Surface collaboration-identity dest
-  admitted (`peer:SURFACE`, revision `7e3474eeb`). Dell `172.20.146.225`
-  still unpowered; EdgeOS static mapping `DELL-LAPTOP` added; WoL did not
-  raise the host. Evidence:
-  `WL-FUNC-023-2026-08-23-leftover3-offboard-reenroll-r1.md`,
+  exist under `/root/mcnf-private/`. Leftover (3) ran on Seat 15. 2026-08-24:
+  LH1 overlay/etcd recovered (wedged Nebula + `/run` full; quorum kept).
+  Seat 15 and Surface overlay-ping `.1`/`.2`/each other. Surface
+  collaboration-identity dest admitted (`peer:SURFACE`, `7e3474eeb`). Dell
+  still unpowered; EdgeOS `DELL-LAPTOP` mapping added. Evidence:
   `WL-FUNC-023-2026-08-24-lighthouse-overlay-recovered-r1.md`,
   `WL-FUNC-023-2026-08-24-surface-collab-dest-admitted-r1.md`,
   `WL-FUNC-023-2026-08-24-dell-dhcp-wol-leftover-r1.md`.
