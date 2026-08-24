@@ -1358,19 +1358,21 @@ story execution contract above.
 - Required outcome: every lock-1 operation is reachable from the Files menubar
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
-- Current state: S1-S3 surface wiring is in-tree and in installed `7e3474ee`
-  (`13.0.0-35`). Q26: Files stays its own OS surface. Read-only 2026-08-23:
-  Construct running on Dell, Seat 15, and Surface; no Files persist, no
-  `/run/user/*/mde-mesh`, no `state/mesh-mount` topics, no archive-queue
-  persist. Seat 15 has no data-group `mesh_mount`. Fixtures do not close.
-  Evidence: `WL-FUNC-025-2026-08-23-live-seat-files-archive-r1.md`.
-- Remaining work: leftover is live seat Files (local/mesh + archive-queue) on
-  a current-revision seat. Installed `13.0.0-35` matches current-tree
-  menubar/view/dialogs; farm fixture mesh-path + zip/tar.gz extract is
-  `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md` (`208/208`
-  `mde-files-egui`). Live probe is
-  `WL-FUNC-025-2026-08-23-live-seat-files-archive-r1.md`. Fixtures do not
-  close the live leftover.
+- Current state: S1-S3 wiring is in-tree and in installed `7e3474ee`
+  (`13.0.0-35`). Q26: Files stays its own OS surface. Seat 15 2026-08-24
+  15:47Z: `mackesd-data` active; `mesh_mount` worker running since 15:34:29Z
+  (heartbeat `running`, `peer:Basement-Test-Workstation`, generation 168).
+  No `state/mesh-mount` topics, no `/run/user/*/mde-mesh`, no Files persist,
+  no archive-queue persist. Construct has in-process `mde-files-opqueue`.
+  No FileOps CLI; SSH cannot run POSIX ops. Dell unreachable. Fixtures do
+  not close. Evidence:
+  `WL-FUNC-025-2026-08-24-seat15-mesh-mount-r1.md`.
+- Remaining work: leftover is live seat Files (local/mesh + archive-queue)
+  on a current-revision seat. Worker census is not a mount or POSIX op.
+  Installed `13.0.0-35` matches current-tree menubar/view/dialogs. Farm
+  fixture: `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md` (`208/208`
+  `mde-files-egui`). Live Seat 15:
+  `WL-FUNC-025-2026-08-24-seat15-mesh-mount-r1.md`. Fixtures do not close.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
