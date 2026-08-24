@@ -420,11 +420,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover (1)/(2) dests under `/root/mcnf-private/`; leftover
   (3) ran on Seat 15. 2026-08-24: LH1 overlay/etcd recovered; Surface and
-  Dell collaboration-identity dests admitted (`peer:SURFACE` /
-  `peer:DELL-LAPTOP`, `7e3474eeb`). Evidence:
-  `WL-FUNC-023-2026-08-24-lighthouse-overlay-recovered-r1.md`,
+  Dell identity dests admitted (`7e3474eeb`). Surface reboot: overlay-ip
+  and XDG binds restored; firstboot still Pending (grouped units vs
+  `mackesd.service` catalog, 66 pending tokens). Evidence:
   `WL-FUNC-023-2026-08-24-surface-collab-dest-admitted-r1.md`,
-  `WL-FUNC-023-2026-08-24-dell-collab-dest-admitted-r1.md`.
+  `WL-FUNC-023-2026-08-24-dell-collab-dest-admitted-r1.md`,
+  `WL-FUNC-023-2026-08-24-surface-post-reboot-r1.md`.
   `production_admitted: false`.
 - Remaining work: S1-S18 Luna execute still listed. Current-tree
   `enroll --token-stdin` now uses fingerprint-pinned `join`
