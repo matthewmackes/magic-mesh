@@ -13,6 +13,9 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, BrowserVmProfile, CloudArmedToken, CloudTokenSigner, CLOUD_ARM_CREDENTIAL,
+};
 use mackes_mesh_types::device_inventory::{self, DeviceInventory, DeviceStatus};
 use mackes_mesh_types::health::{
     action_result_topic, fold_snapshot_with_availability, node_health_topic, GradeFactors,
@@ -22,6 +25,10 @@ use mackes_mesh_types::health::{
     NodeAvailabilityPolicy, NodeGrade, NodeHealthState, RequirementClass, SystemMeshHealthSnapshot,
     ACTION_TOPIC, CRITICAL_NOTIFY_TOPIC, HEALTH_KIRON_SCHEMA_VERSION, HEALTH_SCHEMA_VERSION,
     MAX_NODE_HEALTH_CONDITIONS, SNAPSHOT_TOPIC,
+};
+use mackes_mesh_types::workloads::{
+    WorkloadBackend, WorkloadId, WorkloadOperationAction, WorkloadOperationRequest,
+    WorkloadResources, WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -69,6 +76,14 @@ const SETUP_ETCD: &str = "/usr/libexec/mackesd/setup-etcd";
 const HEALTH_TOAST_TOPIC: &str = "event/toast/show";
 const LIFECYCLE_FIRSTBOOT_UNIT: &str = "mcnf-lifecycle-firstboot.service";
 const XDG_BIND_RECOVERY_UNIT: &str = "mcnf-xdg-bind-recovery.service";
+const SETUP_SYNCTHING: &str = "/usr/libexec/mackesd/setup-syncthing";
+const MESH_STORAGE_PATH: &str = "/mnt/mesh-storage";
+const BROWSER_VM_IMAGE: &str = "/var/lib/libvirt/images/browser-vm-chromium.qcow2";
+const BROWSER_VM_DOMAIN: &str = "/etc/libvirt/qemu/browser-vm.xml";
+const BROWSER_VM_PID: &str = "/run/libvirt/qemu/browser-vm.pid";
+const BROWSER_VM_WORKLOAD_NAME: &str = "browser-vm";
+const BROWSER_VM_START_TTL_MS: u64 = 30_000;
+const BROWSER_VM_START_DEADLINE_MS: u64 = 20_000;
 // Audio discovery shells out through runuser and several user-session tools.
 // Keep the health contract fresh without repeating that fork-heavy probe on
 // every 10-second node-grade sample. A failed probe is cached too, preventing
@@ -205,6 +220,11 @@ struct HealthObservations {
     collab_identity_admitted: bool,
     grouped_mackesd_installed: bool,
     node_virt_active: bool,
+    cloud_arming_present: bool,
+    browser_vm_image_present: bool,
+    browser_vm_defined: bool,
+    browser_vm_running: bool,
+    mesh_storage_present: bool,
 }
 
 trait HealthSampler: Send {
@@ -441,6 +461,14 @@ impl HealthSampler for SystemSampler {
                     .args(["is-active", "--quiet", "mcnf-node-virt.service"])
                     .status()
                     .is_ok_and(|status| status.success()),
+            cloud_arming_present: self.role != "workstation" || cloud_arming_credential_present(),
+            browser_vm_image_present: self.role != "workstation"
+                || Path::new(BROWSER_VM_IMAGE).is_file(),
+            browser_vm_defined: self.role != "workstation"
+                || Path::new(BROWSER_VM_DOMAIN).is_file(),
+            browser_vm_running: self.role != "workstation" || Path::new(BROWSER_VM_PID).is_file(),
+            mesh_storage_present: self.role != "workstation"
+                || Path::new(MESH_STORAGE_PATH).is_dir(),
         }
     }
 }
@@ -818,6 +846,82 @@ fn evaluate_conditions(
                 HealthAction::StartNodeVirt,
                 generation,
                 "Enable and start mcnf-node-virt so KVM/libvirt and mm sudo are prepared.",
+                true,
+            )],
+        ));
+    }
+    if observations.role == "workstation" && !observations.cloud_arming_present {
+        conditions.push(condition(
+            host,
+            "cloud-arming-missing",
+            HealthComponent::System,
+            "cloud-arm-credential",
+            HealthSeverity::Warning,
+            "The systemd cloud arming credential is unavailable; privileged Bus mutations stay disabled.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::OpenOnboarding,
+                generation,
+                "Open Onboarding to admit this node's signed arming dest. Do not invent a systemd credential.",
+                true,
+            )],
+        ));
+    }
+    if observations.role == "workstation"
+        && observations.node_virt_active
+        && !observations.browser_vm_running
+    {
+        if observations.browser_vm_defined && observations.cloud_arming_present {
+            conditions.push(condition(
+                host,
+                "browser-vm-stopped",
+                HealthComponent::System,
+                "browser-vm",
+                HealthSeverity::Warning,
+                "Workstation virt is up but the Browser VM is not running.",
+                now_ms,
+                vec![remediation(
+                    host,
+                    HealthAction::StartBrowserVm,
+                    generation,
+                    "Start browser-vm through the typed Workload verb. Never use raw virsh.",
+                    true,
+                )],
+            ));
+        } else if !observations.browser_vm_image_present || !observations.browser_vm_defined {
+            conditions.push(condition(
+                host,
+                "browser-vm-image-missing",
+                HealthComponent::System,
+                "browser-vm",
+                HealthSeverity::Warning,
+                "No signed Browser VM dest is defined; a fresh install cannot invent a guest.",
+                now_ms,
+                vec![remediation(
+                    host,
+                    HealthAction::OpenOnboarding,
+                    generation,
+                    "Open Onboarding to admit the signed Browser VM image and domain dest.",
+                    true,
+                )],
+            ));
+        }
+    }
+    if observations.role == "workstation" && !observations.mesh_storage_present {
+        conditions.push(condition(
+            host,
+            "mesh-storage-missing",
+            HealthComponent::System,
+            "syncthing-folder",
+            HealthSeverity::Critical,
+            "Governed file-plane path /mnt/mesh-storage is missing; Syncthing cannot share workgroup files.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::SetupSyncthing,
+                generation,
+                "Run packaged setup-syncthing --listen <live overlay IP>; the helper is idempotent.",
                 true,
             )],
         ));
@@ -1874,8 +1978,10 @@ fn execute_action(
             &["enable", "--now", "mcnf-node-virt.service"],
             "node virt stack enabled and started",
         ),
+        HealthAction::StartBrowserVm => start_browser_vm(host),
+        HealthAction::SetupSyncthing => setup_syncthing(),
         HealthAction::OpenOnboarding => Err(
-            "collaboration identity requires Construct Onboarding; the shell launches magic-setup"
+            "dest-gated material requires Construct Onboarding; the shell launches magic-setup"
                 .into(),
         ),
         HealthAction::Acknowledge | HealthAction::SnoozeOneHour => {
@@ -1954,6 +2060,86 @@ fn setup_etcd_client(workgroup_root: &Path, host: &str) -> Result<String, String
         &["--client-only", "--anchors", &csv],
         "etcd client endpoints written from the signed lighthouse roster",
     )
+}
+
+fn cloud_arming_credential_present() -> bool {
+    std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .is_some_and(|directory| directory.join(CLOUD_ARM_CREDENTIAL).is_file())
+}
+
+fn setup_syncthing() -> Result<String, String> {
+    let overlay_ip = crate::voip_rtt::own_nebula_ip().ok_or_else(|| {
+        "nebula1 has no live overlay address for setup-syncthing --listen".to_string()
+    })?;
+    run_checked(
+        SETUP_SYNCTHING,
+        &["--listen", &overlay_ip],
+        "Syncthing file plane configured on the live overlay address",
+    )
+}
+
+fn start_browser_vm(host: &str) -> Result<String, String> {
+    let signer = crate::workers::cloud::HmacTokenSigner::from_systemd_credential()?;
+    let signer: &dyn CloudTokenSigner = &signer;
+    let profile = BrowserVmProfile::default();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let request_id = format!("health-start-browser-{now_ms}");
+    let workload_id = WorkloadId::new(format!("vm:{host}:{BROWSER_VM_WORKLOAD_NAME}"))
+        .map_err(|error| format!("invalid Browser VM workload id: {error}"))?;
+    let request = WorkloadOperationRequest {
+        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        request_id: request_id.clone(),
+        workload_id: workload_id.clone(),
+        backend: WorkloadBackend::LibvirtVirtqemud,
+        resources: WorkloadResources {
+            vcpu: 3,
+            memory_mb: profile.memory_mb,
+            disk_gb: profile.disk_gb,
+        },
+        image_ref: None,
+        target_node: host.to_owned(),
+        expected_generation: 0,
+        action: WorkloadOperationAction::Start,
+        target_request_id: None,
+        deadline_at_ms: now_ms.saturating_add(BROWSER_VM_START_DEADLINE_MS),
+        preferred_attachment: None,
+        armed_token: None,
+    };
+    let unsigned = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    let digest = cloud_request_digest(&unsigned).map_err(|error| error.to_string())?;
+    let target = format!("workload:{}", workload_id.as_str());
+    let token = CloudArmedToken::mint(
+        signer,
+        &request_id,
+        i64::try_from(now_ms.saturating_add(BROWSER_VM_START_TTL_MS)).unwrap_or(i64::MAX),
+        "workload-operation",
+        host,
+        &target,
+        &digest,
+    )
+    .encode();
+    let mut value: serde_json::Value =
+        serde_json::from_str(&unsigned).map_err(|error| error.to_string())?;
+    value["armed_token"] = serde_json::Value::String(token);
+    let body = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    let root = crate::bus_publish::default_bus_root()
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT));
+    let persist = Persist::open(root.clone())
+        .map_err(|error| format!("cannot open Workload Bus {}: {error}", root.display()))?;
+    persist
+        .write(
+            WORKLOAD_OPERATION_TOPIC,
+            Priority::Default,
+            Some("Workload Start"),
+            Some(&body),
+        )
+        .map_err(|error| format!("cannot publish Browser VM Start: {error}"))?;
+    Ok("published typed Browser VM Start".into())
 }
 
 fn restore_workstation_audio() -> Result<String, String> {
@@ -3148,6 +3334,11 @@ mod tests {
             collab_identity_admitted: true,
             grouped_mackesd_installed: false,
             node_virt_active: true,
+            cloud_arming_present: true,
+            browser_vm_image_present: true,
+            browser_vm_defined: true,
+            browser_vm_running: true,
+            mesh_storage_present: true,
             device_inventory: Some(DeviceInventory {
                 host: "node".into(),
                 published_at_ms: 100,
@@ -3584,6 +3775,74 @@ mod tests {
                     .iter()
                     .any(|action| action.action == HealthAction::StartNodeVirt)
         }));
+    }
+
+    #[test]
+    fn workstation_turnkey_nags_cover_arming_browser_vm_and_mesh_storage() {
+        let mut sample = observations("workstation");
+        sample.cloud_arming_present = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:cloud-arming-missing"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::OpenOnboarding)
+        }));
+
+        sample.cloud_arming_present = true;
+        sample.node_virt_active = true;
+        sample.browser_vm_running = false;
+        sample.browser_vm_image_present = false;
+        sample.browser_vm_defined = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:browser-vm-image-missing"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::OpenOnboarding)
+        }));
+        assert!(
+            !conditions
+                .iter()
+                .any(|condition| condition.id == "node:browser-vm-stopped"),
+            "missing image dest must not offer a typed start that cannot succeed"
+        );
+
+        sample.browser_vm_image_present = true;
+        sample.browser_vm_defined = true;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:browser-vm-stopped"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::StartBrowserVm)
+        }));
+
+        sample.mesh_storage_present = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:mesh-storage-missing"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::SetupSyncthing)
+        }));
+
+        let lighthouse = observations("lighthouse");
+        let lighthouse_conditions =
+            evaluate_conditions("node", &lighthouse, &PressureWindow::default(), 1, 100);
+        assert!(
+            !lighthouse_conditions.iter().any(|condition| {
+                condition.id.ends_with("cloud-arming-missing")
+                    || condition.id.ends_with("browser-vm-stopped")
+                    || condition.id.ends_with("browser-vm-image-missing")
+                    || condition.id.ends_with("mesh-storage-missing")
+            }),
+            "thin lighthouse is not a workstation Browser VM or file-plane seat"
+        );
     }
 
     #[test]

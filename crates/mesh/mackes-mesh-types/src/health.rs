@@ -1153,6 +1153,8 @@ pub enum HealthAction {
     RunLifecycleFirstboot,
     OpenOnboarding,
     StartNodeVirt,
+    StartBrowserVm,
+    SetupSyncthing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

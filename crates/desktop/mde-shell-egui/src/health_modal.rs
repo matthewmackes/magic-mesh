@@ -2195,6 +2195,8 @@ const fn action_label(action: HealthAction) -> &'static str {
         HealthAction::RunLifecycleFirstboot => "Retry first-boot convergence",
         HealthAction::OpenOnboarding => "Open Onboarding",
         HealthAction::StartNodeVirt => "Start node virt stack",
+        HealthAction::StartBrowserVm => "Start Browser VM",
+        HealthAction::SetupSyncthing => "Configure Syncthing file plane",
     }
 }
 
@@ -2771,6 +2773,8 @@ mod tests {
             HealthAction::RunLifecycleFirstboot,
             HealthAction::OpenOnboarding,
             HealthAction::StartNodeVirt,
+            HealthAction::StartBrowserVm,
+            HealthAction::SetupSyncthing,
         ] {
             assert!(!action_label(action).is_empty());
         }
