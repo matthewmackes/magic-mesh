@@ -1153,12 +1153,14 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Current state: unpublished workstation RPM `13.0.0-35` is on Dell, Seat 15,
   Surface, Eagle, and T480. Compute/observation run after identity `Wants=`
   (`WL-TEST-002-2026-08-23-vm-support-hosts-r1.md`,
-  `WL-TEST-002-2026-08-24-eagle-t480-sudo-vm-r1.md`). Eagle/T480 now match
-  Dell/Seat 15 `90-mm-nopasswd` and mesh-key SSH. Installed `mackesd` still
-  publishes provider `unknown` until the virtqemud/`mde-vms` fold is on a
-  seat. Leftover is that package plus S6. Operator 2026-08-23 authorized
-  Remaining; do not treat this install as six-role qualification. Sealed
-  Vitelity/SIP still required for S3. No feature waiver.
+  `WL-TEST-002-2026-08-24-eagle-t480-sudo-vm-r1.md`,
+  `WL-TEST-002-2026-08-24-node-virt-packaged-r1.md`). Eagle/T480 now match
+  Dell/Seat 15 `90-mm-nopasswd` and mesh-key SSH. RPM now ships
+  `install-mm-nopasswd` + `prepare-node-virt` (`mcnf-node-virt.service`).
+  Installed `mackesd` still publishes provider `unknown` until that package
+  is on a seat. Leftover is that package plus S6. Operator 2026-08-23
+  authorized Remaining; do not treat this install as six-role qualification.
+  Sealed Vitelity/SIP still required for S3. No feature waiver.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,

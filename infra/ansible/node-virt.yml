@@ -10,6 +10,11 @@
 #   ansible-playbook node-virt.yml                 # all mesh nodes
 #   ansible-playbook node-virt.yml -l <host>       # one node
 #   ansible-playbook node-virt.yml -e virt_target=build_vms   # any group
+#
+# The RPM path is `install-helpers/prepare-node-virt.sh` (Fedora modular
+# virtqemud/virtnetworkd/virtstoraged + podman sockets) started by
+# `mcnf-node-virt.service`. Keep this playbook and that helper on the same
+# packages, sockets, pool, and libvirt group.
 ---
 - name: MCNF node KVM virtualization stack (libvirt + Podman)
   hosts: "{{ virt_target | default('mesh_nodes') }}"

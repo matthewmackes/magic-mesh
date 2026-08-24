@@ -58,8 +58,15 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("mesh-health.timer", 0),
     ("mesh-status.timer", 0),
     ("mcnf-lifecycle-firstboot.service", 0),
-    // ── Rank 1 — Workstation-only: the DRM-seat shell.
+    // ── Rank 1 — Workstation-only: DRM seat + the node-virt stack
+    // (`infra/ansible/node-virt.yml`, Fedora modular sockets). Thin
+    // lighthouses mask these so they cannot pull qemu/libvirt.
     ("mde-shell-egui.service", 1),
+    ("virtqemud.socket", 1),
+    ("virtnetworkd.socket", 1),
+    ("virtstoraged.socket", 1),
+    ("podman.socket", 1),
+    ("mcnf-node-virt.service", 1),
 ];
 
 /// The pure role→unit-actions mapping.
@@ -255,7 +262,14 @@ mod tests {
             );
         }
         // Rank-1 Workstation units → masked (a lighthouse never runs them).
-        for u in ["mde-shell-egui.service"] {
+        for u in [
+            "mde-shell-egui.service",
+            "virtqemud.socket",
+            "virtnetworkd.socket",
+            "virtstoraged.socket",
+            "podman.socket",
+            "mcnf-node-virt.service",
+        ] {
             assert_eq!(
                 action_for(&p, u).action,
                 UnitAction::Mask,
@@ -290,6 +304,10 @@ mod tests {
         let workstation = units_for_role(Role::Workstation);
         assert!(workstation.contains(&"mde-shell-egui.service"));
         assert!(workstation.contains(&"mesh-status.timer"));
+        assert!(workstation.contains(&"virtqemud.socket"));
+        assert!(workstation.contains(&"podman.socket"));
+        assert!(workstation.contains(&"mcnf-node-virt.service"));
+        assert!(!lighthouse.contains(&"virtqemud.socket"));
     }
 
     #[test]
@@ -376,10 +394,49 @@ mod tests {
             "base RPM post-install must grant known non-root seat users the libvirt group so virsh qemu:///system works without a polkit agent"
         );
         assert!(
-            post_install.contains("/etc/sudoers.d/90-mm-nopasswd")
-                && post_install.contains("mm ALL=(ALL) NOPASSWD:ALL")
-                && post_install.contains("visudo -cf"),
-            "base RPM post-install must install the Dell/Seat 15 mm NOPASSWD drop-in so agents can sudo -n"
+            post_install.contains("/usr/libexec/mackesd/install-mm-nopasswd")
+                && post_install.contains("/usr/libexec/mackesd/prepare-node-virt")
+                && post_install.contains("mcnf-node-virt.service"),
+            "base RPM post-install must run the packaged sudoers + node-virt helpers"
+        );
+        assert!(
+            asset_exists(
+                base_assets,
+                "install-helpers/install-mm-nopasswd.sh",
+                "/usr/libexec/mackesd/install-mm-nopasswd",
+                "755",
+            ),
+            "base RPM must ship install-mm-nopasswd"
+        );
+        assert!(
+            asset_exists(
+                base_assets,
+                "install-helpers/prepare-node-virt.sh",
+                "/usr/libexec/mackesd/prepare-node-virt",
+                "755",
+            ),
+            "base RPM must ship prepare-node-virt"
+        );
+        assert!(
+            asset_exists(
+                base_assets,
+                "packaging/systemd/mcnf-node-virt.service",
+                "/usr/lib/systemd/system/mcnf-node-virt.service",
+                "644",
+            ),
+            "base RPM must ship mcnf-node-virt.service"
+        );
+        let target = include_str!("../../../../../packaging/systemd/mackesd.target");
+        assert!(
+            target.contains("After=") && target.contains("mcnf-node-virt.service"),
+            "mackesd.target must order after mcnf-node-virt.service when the workstation oneshot is enabled"
+        );
+        let virt_unit = include_str!("../../../../../packaging/systemd/mcnf-node-virt.service");
+        assert!(
+            virt_unit.contains("WantedBy=mackesd.target")
+                && virt_unit.contains("install-mm-nopasswd")
+                && virt_unit.contains("prepare-node-virt"),
+            "mcnf-node-virt.service must run the sudoers + virt helpers before compute"
         );
         assert!(
             post_install.contains("loginctl enable-linger \"$user\"")
@@ -453,6 +510,32 @@ mod tests {
         assert!(
             lighthouse.get("recommends").is_none(),
             "thin lighthouse RPM must not weak-pull optional media/fileshare stacks"
+        );
+        assert!(
+            asset_exists(
+                assets,
+                "install-helpers/install-mm-nopasswd.sh",
+                "/usr/libexec/mackesd/install-mm-nopasswd",
+                "755",
+            ),
+            "thin lighthouse RPM must still ship mm NOPASSWD sudoers"
+        );
+        assert!(
+            dest_absent(assets, "/usr/lib/systemd/system/mcnf-node-virt.service")
+                && dest_absent(assets, "/usr/libexec/mackesd/prepare-node-virt"),
+            "thin lighthouse RPM must not ship the workstation virt oneshot"
+        );
+        let lighthouse_post = lighthouse["post_install_script"]
+            .as_str()
+            .expect("thin lighthouse post install script");
+        assert!(
+            lighthouse_post.contains("/usr/libexec/mackesd/install-mm-nopasswd"),
+            "thin lighthouse post-install must write mm NOPASSWD sudoers"
+        );
+        assert!(
+            !lighthouse_post.contains("mcnf-node-virt.service")
+                && !lighthouse_post.contains("prepare-node-virt"),
+            "thin lighthouse post-install must not enable or run node-virt"
         );
     }
 
@@ -1046,11 +1129,12 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the current rank-1 Workstation unit.
+        // Lighthouse masks every rank-1 Workstation unit (DRM seat + virt stack).
+        let rank1 = ROLE_UNITS.iter().filter(|(_, rank)| *rank == 1).count();
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            1,
-            "lighthouse masks the rank-1 shell unit"
+            rank1,
+            "lighthouse masks every rank-1 workstation unit"
         );
     }
 

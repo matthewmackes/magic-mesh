@@ -608,6 +608,9 @@ assets = [
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-actions.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-data.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "install-helpers/install-mm-nopasswd.sh", dest = "/usr/libexec/mackesd/install-mm-nopasswd", mode = "755" },
+    { source = "install-helpers/prepare-node-virt.sh", dest = "/usr/libexec/mackesd/prepare-node-virt", mode = "755" },
+    { source = "packaging/systemd/mcnf-node-virt.service", dest = "/usr/lib/systemd/system/mcnf-node-virt.service", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-integrations.service.d/40-collaboration-identity.conf", mode = "644" },
     # Browser VM RDP login is rotated per serving seat and sealed by systemd.
     # The warning helper is the mandatory five-second pre-update operator notice.
@@ -897,7 +900,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
 # the grouped mackesd supervisor. Each process self-gates on the pinned role,
 # so enabling the target pre-enrollment is safe.
-systemctl enable mcnf-boot-status.service mcnf-lifecycle-firstboot.service mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mcnf-boot-status.service mcnf-lifecycle-firstboot.service mcnf-node-virt.service mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
 fi
@@ -1084,20 +1087,8 @@ set_gtk_icon_theme() {
 set_gtk_icon_theme /etc/gtk-3.0/settings.ini
 set_gtk_icon_theme /etc/gtk-4.0/settings.ini
 timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
-# Seat agents need the same passwordless sudo Dell/Seat 15 already ship as
-# /etc/sudoers.d/90-mm-nopasswd. Wheel still requires a password on Fedora.
-if id mm >/dev/null 2>&1 && command -v visudo >/dev/null 2>&1; then
-  mcnf_sudoers=/etc/sudoers.d/90-mm-nopasswd
-  if [ ! -e "$mcnf_sudoers" ]; then
-    mcnf_sudoers_tmp="$(mktemp)"
-    printf 'mm ALL=(ALL) NOPASSWD:ALL\n' > "$mcnf_sudoers_tmp" || :
-    chmod 0440 "$mcnf_sudoers_tmp" || :
-    if visudo -cf "$mcnf_sudoers_tmp" >/dev/null 2>&1; then
-      install -m 0440 -o root -g root "$mcnf_sudoers_tmp" "$mcnf_sudoers" || :
-    fi
-    rm -f "$mcnf_sudoers_tmp"
-  fi
-fi
+/usr/libexec/mackesd/install-mm-nopasswd >/dev/null 2>&1 || :
+/usr/libexec/mackesd/prepare-node-virt >/dev/null 2>&1 || :
 # RPM-UPGRADE-ACTIVATION — replacing an executable does not replace a running
 # process. Restart only already-active system authorities after package setup so
 # upgrades cannot leave the old shell or daemon mapped through a deleted inode;
@@ -1463,6 +1454,7 @@ assets = [
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-actions.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-data.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "install-helpers/install-mm-nopasswd.sh", dest = "/usr/libexec/mackesd/install-mm-nopasswd", mode = "755" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-integrations.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service", dest = "/usr/lib/systemd/system/mesh-health.service", mode = "644" },
     { source = "packaging/systemd/mesh-health.timer", dest = "/usr/lib/systemd/system/mesh-health.timer", mode = "644" },
@@ -1512,6 +1504,7 @@ rm -f /etc/systemd/system/mackesd.service \
 rmdir /etc/systemd/system/mackesd.service.d /usr/lib/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
 systemctl enable mcnf-boot-status.service mcnf-lifecycle-firstboot.service mackesd.target mcnf-cloud-arm-credential.service mcnf-collaboration-identity.service mcnf-mesh-secret-recipient.timer mcnf-private-log-retention.timer mcnf-private-application-history.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+/usr/libexec/mackesd/install-mm-nopasswd >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
 fi
@@ -1618,6 +1611,9 @@ assets = [
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-actions.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-data.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "install-helpers/install-mm-nopasswd.sh", dest = "/usr/libexec/mackesd/install-mm-nopasswd", mode = "755" },
+    { source = "install-helpers/prepare-node-virt.sh", dest = "/usr/libexec/mackesd/prepare-node-virt", mode = "755" },
+    { source = "packaging/systemd/mcnf-node-virt.service", dest = "/usr/lib/systemd/system/mcnf-node-virt.service", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-integrations.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
     { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },

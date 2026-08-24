@@ -1,0 +1,17 @@
+[Unit]
+Description=Prepare the node KVM/libvirt stack and mm NOPASSWD sudo
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=network-online.target
+Before=mackesd-compute.service mackesd-observation.service
+PartOf=mackesd.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/mackesd/install-mm-nopasswd
+ExecStart=/usr/libexec/mackesd/prepare-node-virt
+TimeoutStartSec=60
+
+[Install]
+WantedBy=mackesd.target

@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::lifecycle::{
-    LIFECYCLE_CONTRACT_SCHEMA_VERSION, LifecycleCheckStatus, LifecycleRequirementCheckV1,
-    SeatReadinessV1, canonical_lifecycle_baseline,
+    canonical_lifecycle_baseline, LifecycleCheckStatus, LifecycleRequirementCheckV1,
+    SeatReadinessV1, LIFECYCLE_CONTRACT_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -475,11 +475,9 @@ mod tests {
         let facts = healthy("seat-15");
         let checks = assemble(&facts);
         assert_eq!(checks.len(), canonical_lifecycle_baseline().len());
-        assert!(
-            !checks
-                .iter()
-                .any(LifecycleRequirementCheckV1::blocks_progress)
-        );
+        assert!(!checks
+            .iter()
+            .any(LifecycleRequirementCheckV1::blocks_progress));
         let tmp = tempfile::tempdir().unwrap();
         let token = tmp.path().join("enrollment.token");
         std::fs::write(&token, b"keep-me").unwrap();
@@ -499,21 +497,15 @@ mod tests {
         facts.compute_usable = false;
         facts.hardware_usable = false;
         let checks = assemble(&facts);
-        assert!(
-            !checks
-                .iter()
-                .any(LifecycleRequirementCheckV1::blocks_progress)
-        );
-        assert!(
-            checks
-                .iter()
-                .any(|c| c.check_id == "compute" && c.status == LifecycleCheckStatus::Warn)
-        );
-        assert!(
-            checks
-                .iter()
-                .any(|c| c.check_id == "hardware" && c.status == LifecycleCheckStatus::Warn)
-        );
+        assert!(!checks
+            .iter()
+            .any(LifecycleRequirementCheckV1::blocks_progress));
+        assert!(checks
+            .iter()
+            .any(|c| c.check_id == "compute" && c.status == LifecycleCheckStatus::Warn));
+        assert!(checks
+            .iter()
+            .any(|c| c.check_id == "hardware" && c.status == LifecycleCheckStatus::Warn));
     }
 
     #[test]
@@ -638,6 +630,12 @@ mod tests {
             cargo.contains("systemctl enable")
                 && cargo.contains("mcnf-lifecycle-firstboot.service"),
             "post-install must enable the first-boot unit"
+        );
+        assert!(
+            cargo.contains("packaging/systemd/mcnf-node-virt.service")
+                && cargo.contains("install-helpers/install-mm-nopasswd.sh")
+                && cargo.contains("install-helpers/prepare-node-virt.sh"),
+            "RPM must ship the Eagle/T480 sudo+virt helpers"
         );
     }
 }
