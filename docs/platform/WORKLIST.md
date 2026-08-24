@@ -1718,11 +1718,18 @@ story execution contract above.
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
 - Current state: catalog + apply refuse landed in-tree and on dest-cut
-  `13.0.0-35` (same hotkeys.rs as HEAD). Dell binary catalogs Ctrl+J /
-  Ctrl+N. Leftover is live keystroke from every Construct surface.
-  Evidence: `WL-FUNC-032-2026-08-23-installed-hotkeys-catalog-r1.md`.
-- Remaining work: leftover is live-surface keystroke proof, not a
-  missing binding.
+  `13.0.0-35` (hotkeys.rs empty vs HEAD). Dell and Seat 15 binaries catalog
+  Ctrl+J / Ctrl+N. Seat 15 is a used DRM seat (pid 2353 holds card1; operator
+  docked Maps & Location 2026-08-24 07:24 EDT). Journal never audits hotkey
+  apply; sunshine inactive; grim/Moonlight absent. Leftover is still a live
+  Ctrl+J/Ctrl+N keystroke. Evidence:
+  `WL-FUNC-032-2026-08-23-installed-hotkeys-catalog-r1.md`,
+  `WL-FUNC-032-2026-08-24-live-hotkeys-r1.md`.
+- Remaining work: leftover is live-surface keystroke proof on Seat 15, not a
+  missing binding. Catalog and dock-journal do not close it. Needs Ctrl+J from
+  every surface and in-mode Ctrl+N, with refuse on Documents / Terminal /
+  Desktop / Browser. Injecting uinput would invent a dest and still could not
+  record the frame.
   1. S1 Register both bindings.
      - Inputs: the hotkeys.rs table and the Communications mode router.
      - Action: bind Ctrl+J to Surface::Communications in Transfers mode and
