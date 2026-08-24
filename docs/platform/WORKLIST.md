@@ -10,9 +10,9 @@ tasks.
 - **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-23 authorized lifting the release chain that the
   2026-08-22 survey had kept Blocked. Leftovers: FUNC-023 leftover-3
-  enroll/offboard on Dell (laptop unpowered), REL-006 admission, then
-  official cut/sign/publish. Lighthouse overlay/etcd recovered 2026-08-24;
-  Surface collaboration-identity dest admitted.
+  enroll/offboard (Seat 15 done; Dell/Surface identity dests admitted,
+  leftover-3 not repeated), REL-006 admission, then official
+  cut/sign/publish. Lighthouse overlay/etcd recovered 2026-08-24.
   Do not invent a mesh-id or bearer. Do not flip `production_admitted`. Do
   not publish or freeze while those leftovers are open. Unpublished
   `13.0.0-35` is installed on Dell, Seat 15, and Surface.
@@ -419,12 +419,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover (1)/(2) dests under `/root/mcnf-private/`; leftover
-  (3) ran on Seat 15. 2026-08-24: LH1 overlay/etcd recovered; Surface
-  collaboration-identity dest admitted (`peer:SURFACE`, `7e3474eeb`); Dell
-  unpowered (EdgeOS `DELL-LAPTOP` mapping added). Evidence:
+  (3) ran on Seat 15. 2026-08-24: LH1 overlay/etcd recovered; Surface and
+  Dell collaboration-identity dests admitted (`peer:SURFACE` /
+  `peer:DELL-LAPTOP`, `7e3474eeb`). Evidence:
   `WL-FUNC-023-2026-08-24-lighthouse-overlay-recovered-r1.md`,
   `WL-FUNC-023-2026-08-24-surface-collab-dest-admitted-r1.md`,
-  `WL-FUNC-023-2026-08-24-dell-dhcp-wol-leftover-r1.md`.
+  `WL-FUNC-023-2026-08-24-dell-collab-dest-admitted-r1.md`.
   `production_admitted: false`.
 - Remaining work: S1-S18 Luna execute still listed. Current-tree
   `enroll --token-stdin` now uses fingerprint-pinned `join`
