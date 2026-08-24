@@ -9,8 +9,10 @@ tasks.
 
 - **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-23 authorized lifting the release chain that the
-  2026-08-22 survey had kept Blocked. Leftovers: FUNC-023 enroll/offboard,
-  REL-006 admission, then official cut/sign/publish.
+  2026-08-22 survey had kept Blocked. Leftovers: FUNC-023 leftover-3
+  enroll/offboard on Dell (laptop unpowered), REL-006 admission, then
+  official cut/sign/publish. Lighthouse overlay/etcd recovered 2026-08-24;
+  Surface collaboration-identity dest admitted.
   Do not invent a mesh-id or bearer. Do not flip `production_admitted`. Do
   not publish or freeze while those leftovers are open. Unpublished
   `13.0.0-35` is installed on Dell, Seat 15, and Surface.
@@ -419,11 +421,17 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Current state: leftover (1) bearer dest and leftover (2) dest-env child
   exist under `/root/mcnf-private/`. Leftover (3) ran on Seat 15: dest-signed
   `leave`, then `join` with DER enroll-endpoint pin. Overlay `10.42.0.5`
-  rematerialized; `nebula.service` is active. 2026-08-24: lighthouse
-  `104.236.118.177:4242` closed from control host; Seat 15 overlay ping to
-  `.1` and Surface `.7` fails; Surface handshake to LH times out. Evidence:
+  rematerialized; `nebula.service` is active. 2026-08-24: LH1 Nebula was
+  wedged (`/run` full + UDP Recv-Q); corrected-forward recovered overlay
+  and three-member etcd without replacing a droplet. Seat 15 and Surface
+  overlay-ping `.1`/`.2`/each other. Surface collaboration-identity dest
+  admitted (`peer:SURFACE`, revision `7e3474eeb`). Dell `172.20.146.225`
+  still unpowered; EdgeOS static mapping `DELL-LAPTOP` added; WoL did not
+  raise the host. Evidence:
   `WL-FUNC-023-2026-08-23-leftover3-offboard-reenroll-r1.md`,
-  `WL-FUNC-023-2026-08-24-lighthouse-handshake-down-r1.md`.
+  `WL-FUNC-023-2026-08-24-lighthouse-overlay-recovered-r1.md`,
+  `WL-FUNC-023-2026-08-24-surface-collab-dest-admitted-r1.md`,
+  `WL-FUNC-023-2026-08-24-dell-dhcp-wol-leftover-r1.md`.
   `production_admitted: false`.
 - Remaining work: S1-S18 Luna execute still listed. Current-tree
   `enroll --token-stdin` now uses fingerprint-pinned `join`
