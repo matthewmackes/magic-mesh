@@ -31,7 +31,8 @@
 //! * [`read_model`] — [`CollabReadModel`] and its projection structs, the
 //!   read-side shapes the surface renders.
 //! * [`media`] — WL-FUNC-024 bounded [`MediaSessionV1`] / [`MediaTrackKind`] /
-//!   [`MediaSessionStateV1`] / [`SipLegV1`] contracts for the live media plane.
+//!   [`MediaSessionStateV1`] / [`SipLegV1`] contracts plus typed admission for
+//!   [`CallMediaReadiness`] / [`CallMediaVerification`].
 //! * [`topics`] — the `action/collab/*`, `state/collab/*`, and
 //!   `collab/event/<space>/<actor>` topic helpers.
 //!
@@ -91,10 +92,13 @@ pub use event::CollabEventKind;
 pub use ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 pub use media::{
     media_answer_topic, media_offer_topic, media_session_topic, media_sfu_election_topic,
-    media_sip_leg_topic, MediaDescriptionV1, MediaFailureReasonV1, MediaSessionStateV1,
-    MediaSessionV1, MediaSessionV1DecodeError, MediaSessionV1ValidationError, MediaSignalingRoleV1,
-    MediaTrackKind, SfuElectionV1, SipLegDirectionV1, SipLegV1, SipLegV1DecodeError,
-    SipLegV1ValidationError, MAX_MEDIA_ACTOR_BYTES, MAX_MEDIA_DESCRIPTION_V1_JSON_BYTES,
+    media_sip_leg_topic, CallMediaBoardDecodeError, CallMediaBoardValidationError,
+    MediaDescriptionV1, MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1,
+    MediaSessionV1DecodeError, MediaSessionV1ValidationError, MediaSignalingRoleV1, MediaTrackKind,
+    SfuElectionV1, SipLegDirectionV1, SipLegV1, SipLegV1DecodeError, SipLegV1ValidationError,
+    MAX_CALL_MEDIA_DETAIL_BYTES, MAX_CALL_MEDIA_PARTICIPANTS, MAX_CALL_MEDIA_READINESS_JSON_BYTES,
+    MAX_CALL_MEDIA_SESSIONS, MAX_CALL_MEDIA_VERIFICATION_JSON_BYTES,
+    MAX_CALL_MEDIA_VERIFICATION_ROWS, MAX_MEDIA_ACTOR_BYTES, MAX_MEDIA_DESCRIPTION_V1_JSON_BYTES,
     MAX_MEDIA_RECONNECT_ATTEMPTS, MAX_MEDIA_SESSION_V1_JSON_BYTES, MAX_MEDIA_TRACKS,
     MAX_SFU_ELECTION_PARTICIPANTS, MAX_SFU_ELECTION_V1_JSON_BYTES, MAX_SIP_E164_DIGITS,
     MAX_SIP_LEG_V1_JSON_BYTES, MEDIA_SESSION_V1_SCHEMA_VERSION, MEDIA_STATE_PREFIX,

@@ -415,6 +415,7 @@ pub struct CallParticipantView {
 /// APIs: only non-ended calls where `local_actor` is already a connected
 /// participant are included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallMediaReadiness {
     /// The local actor this view was built for.
     pub local_actor: ActorId,
@@ -425,6 +426,7 @@ pub struct CallMediaReadiness {
 
 /// One active call that a future media adapter may evaluate or attempt to bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallMediaSession {
     /// The call id.
     pub call: CallId,
@@ -499,6 +501,7 @@ pub enum CallMediaAdapter {
 /// when a concrete adapter reports advancing frames/data for the session's
 /// declared requirements.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallMediaVerification {
     /// The local actor the consumed readiness board was built for.
     pub local_actor: ActorId,
@@ -508,6 +511,7 @@ pub struct CallMediaVerification {
 
 /// One media-verifier result for a candidate adapter on a call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallMediaVerificationRow {
     /// The call id.
     pub call: CallId,
@@ -546,6 +550,7 @@ pub enum CallMediaVerificationStatus {
 
 /// Counters from a concrete live-media verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CallMediaFrameEvidence {
     /// Advancing audio frames/packets observed.
     pub audio_frames: u64,

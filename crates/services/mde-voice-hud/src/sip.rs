@@ -353,9 +353,11 @@ pub fn plan_pstn_agent(accounts: Option<VoiceAccounts>) -> PstnAgentDrive {
     // A registrar-less P2P identity, or an account with no password, is not a
     // governed PSTN credential. Username-only + host would otherwise look
     // Ready and invite a fake connected-PSTN claim after REGISTER 401.
+    // Whitespace-only secrets are empty: FUNC-030 can persist a blank-looking
+    // password that is not a governed credential.
     if accounts.inbound.server_host.trim().is_empty()
         || accounts.inbound.username.trim().is_empty()
-        || accounts.inbound.password.is_empty()
+        || accounts.inbound.password.trim().is_empty()
     {
         return PstnAgentDrive::Unavailable {
             reason: ABSENT_PSTN_PROVIDER.to_string(),
@@ -492,15 +494,42 @@ impl SipAccount {
     ///
     /// [`load`](Self::load) is this with the outbound dropped, so existing
     /// single-account callers are unchanged.
+    ///
+    /// WL-FUNC-024 S4 honesty: a *present* workgroup `gateway.toml` always
+    /// wins. Parse failure or an unreadable file fail-closes to `None` rather
+    /// than silently falling through to a node-local `account.toml`. Only a
+    /// missing gateway file lets the local credential apply.
     #[must_use]
     pub fn load_accounts() -> Option<VoiceAccounts> {
-        if let Ok(text) = std::fs::read_to_string(Self::mesh_gateway_path()) {
-            if let Ok(accts) = Self::accounts_from_toml(&text) {
-                return Some(accts);
+        match std::fs::read_to_string(Self::mesh_gateway_path()) {
+            Ok(text) => Self::accounts_from_sources(Some(&text), None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let local = std::fs::read_to_string(Self::config_path()).ok();
+                Self::accounts_from_sources(None, local.as_deref())
+            }
+            Err(_) => {
+                // Present but unreadable (permission, I/O). Fail closed: do
+                // not silently use a node-local credential.
+                Self::accounts_from_sources(Some(""), None)
             }
         }
-        let text = std::fs::read_to_string(Self::config_path()).ok()?;
-        Self::accounts_from_toml(&text).ok()
+    }
+
+    /// Resolve the governed account from in-memory sources. Pure: no I/O.
+    ///
+    /// `gateway = Some(…)` means the workgroup file is present (even empty
+    /// or truncated). That source either parses or the result is `None` —
+    /// `local` is ignored. `gateway = None` (file absent) is the only path
+    /// that consults the node-local `account.toml` bytes.
+    #[must_use]
+    pub fn accounts_from_sources(
+        gateway: Option<&str>,
+        local: Option<&str>,
+    ) -> Option<VoiceAccounts> {
+        match gateway {
+            Some(text) => Self::accounts_from_toml(text).ok(),
+            None => local.and_then(|text| Self::accounts_from_toml(text).ok()),
+        }
     }
 
     /// VOIP-P2P — a registrar-less local identity for direct peer calls: no
@@ -3239,6 +3268,57 @@ mod tests {
             ),
             "empty credential must not look like a connected PSTN leg"
         );
+
+        let whitespace = SipAccount::accounts_from_toml(
+            "username = \"15551234567\"\npassword = \"   \"\nserver = \"sip.vitelity.net\"\n",
+        )
+        .unwrap();
+        let whitespace_drive = plan_pstn_agent(Some(whitespace));
+        assert_eq!(
+            whitespace_drive,
+            PstnAgentDrive::Unavailable {
+                reason: ABSENT_PSTN_PROVIDER.to_string()
+            }
+        );
+        assert!(!whitespace_drive.pstn_leg_available());
+    }
+
+    #[test]
+    fn present_mesh_gateway_never_falls_through_to_node_local_account() {
+        // FUNC-030 writes <workgroup>/voip/gateway.toml. A present file is the
+        // governed source even when it fails to parse — a node-local
+        // account.toml must not silently become the PSTN credential.
+        const GATEWAY: &str =
+            "username = \"gw-user\"\npassword = \"gw-secret\"\nserver = \"sip.gateway.example\"\n";
+        const LOCAL: &str =
+            "username = \"local-user\"\npassword = \"local-secret\"\nserver = \"sip.local.example\"\n";
+
+        let from_gateway = SipAccount::accounts_from_sources(Some(GATEWAY), Some(LOCAL))
+            .expect("valid gateway wins over local");
+        assert_eq!(from_gateway.inbound.username, "gw-user");
+        assert_eq!(from_gateway.inbound.server_host, "sip.gateway.example");
+
+        assert!(
+            SipAccount::accounts_from_sources(Some(""), Some(LOCAL)).is_none(),
+            "empty present gateway must fail closed, not use local"
+        );
+        assert!(
+            SipAccount::accounts_from_sources(Some("not = toml {{"), Some(LOCAL)).is_none(),
+            "malformed present gateway must fail closed, not use local"
+        );
+        assert!(
+            SipAccount::accounts_from_sources(
+                Some("username = \"\"\nserver = \"h\"\n"),
+                Some(LOCAL)
+            )
+            .is_none(),
+            "present gateway missing username must fail closed"
+        );
+
+        let from_local = SipAccount::accounts_from_sources(None, Some(LOCAL))
+            .expect("absent gateway may use local");
+        assert_eq!(from_local.inbound.username, "local-user");
+        assert!(SipAccount::accounts_from_sources(None, None).is_none());
     }
 
     #[test]

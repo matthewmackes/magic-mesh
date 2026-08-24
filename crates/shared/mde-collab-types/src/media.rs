@@ -2,14 +2,17 @@
 //!
 //! These types are the only media facts allowed on the Bus. Offer/answer,
 //! track kind, mute, and session readiness travel as [`MediaSessionV1`] /
-//! [`MediaDescriptionV1`] — never as untyped JSON bags. PSTN legs travel as
-//! [`SipLegV1`]. Mid-call honesty (peer drop, SFU loss, device unplug,
-//! permission revoke) is a [`MediaFailureReasonV1`] on the existing
-//! reconnecting/failed ladder — not a parallel schema. The crate is still
-//! pure: no I/O, no wall clock, no media stack. A
-//! [`MediaSessionStateV1::Connected`] value is intrinsically invalid unless
-//! advancing frames were observed, so a hostile publisher cannot claim a live
-//! call by omitting evidence.
+//! [`MediaDescriptionV1`] — never as untyped JSON bags. The collab-bus sidecar
+//! boards [`CallMediaReadiness`] / [`CallMediaVerification`] use the same
+//! bounded `from_json` admission so `state/collab/call-media-*` cannot carry a
+//! hostile bag. PSTN legs travel as [`SipLegV1`]. Mid-call honesty (peer drop,
+//! SFU loss, device unplug, permission revoke) is a [`MediaFailureReasonV1`]
+//! on the existing reconnecting/failed ladder — not a parallel schema. The
+//! crate is still pure: no I/O, no wall clock, no media stack. A
+//! [`MediaSessionStateV1::Connected`] or
+//! [`CallMediaVerificationStatus::LiveMediaVerified`] value is intrinsically
+//! invalid unless advancing frames were observed, so a hostile publisher
+//! cannot claim a live call by omitting evidence.
 
 use std::fmt;
 
@@ -17,8 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::clipboard_v2::reject_duplicate_json_keys;
 use crate::ids::CallId;
-use crate::read_model::CallMediaAdapter;
-use crate::value::sha256_hex;
+use crate::read_model::{
+    CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaReadiness,
+    CallMediaRequirement, CallMediaSession, CallMediaVerification, CallMediaVerificationRow,
+    CallMediaVerificationStatus,
+};
+use crate::value::{sha256_hex, CallKind};
 use crate::{ActorId, SpaceId};
 
 /// The only media-session schema currently admitted by this crate.
@@ -78,6 +85,18 @@ pub const MAX_SIP_LEG_V1_JSON_BYTES: usize = 8 * 1024;
 pub const MIN_SIP_E164_DIGITS: usize = 3;
 /// Maximum E.164 significant digits (ITU-T E.164 caps the number at 15).
 pub const MAX_SIP_E164_DIGITS: usize = 15;
+/// Maximum encoded JSON body accepted by [`CallMediaReadiness::from_json_bytes`].
+pub const MAX_CALL_MEDIA_READINESS_JSON_BYTES: usize = 256 * 1024;
+/// Maximum encoded JSON body accepted by [`CallMediaVerification::from_json_bytes`].
+pub const MAX_CALL_MEDIA_VERIFICATION_JSON_BYTES: usize = 256 * 1024;
+/// Maximum sessions retained on one readiness board.
+pub const MAX_CALL_MEDIA_SESSIONS: usize = 256;
+/// Maximum verification rows retained on one verification board.
+pub const MAX_CALL_MEDIA_VERIFICATION_ROWS: usize = 1024;
+/// Maximum participants named on one readiness session.
+pub const MAX_CALL_MEDIA_PARTICIPANTS: usize = 32;
+/// Maximum UTF-8 bytes in a verification-row detail string.
+pub const MAX_CALL_MEDIA_DETAIL_BYTES: usize = 512;
 
 /// One media track a session may offer. Video and screen are named so a later
 /// plane can attach them; S2 only carries audio.
@@ -1115,6 +1134,404 @@ fn validate_e164(value: &str) -> Result<(), SipLegV1ValidationError> {
     Ok(())
 }
 
+/// Why a collab-bus media board failed intrinsic validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallMediaBoardValidationError {
+    /// The session/call id was the nil sentinel.
+    NilSessionId,
+    /// A bounded value exceeded its maximum.
+    OutOfBounds {
+        /// Field that exceeded its bound.
+        field: &'static str,
+        /// Maximum admitted value.
+        max: u64,
+    },
+    /// A field failed shape or pairing admission.
+    InvalidField {
+        /// Field that failed.
+        field: &'static str,
+    },
+    /// A free-text or identity field carried a command, path, URL, or secret.
+    ForbiddenValue {
+        /// Field that contained the forbidden value.
+        field: &'static str,
+    },
+    /// `live_media_verified` was claimed without proven advancing frames.
+    VerifiedWithoutFrames,
+    /// An unproven/unavailable row claimed advancing-frame evidence.
+    UnavailableWithFrames,
+}
+
+impl fmt::Display for CallMediaBoardValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NilSessionId => formatter.write_str("call media board session id is nil"),
+            Self::OutOfBounds { field, max } => {
+                write!(formatter, "call media {field} exceeds bound {max}")
+            }
+            Self::InvalidField { field } => write!(formatter, "invalid call media field {field}"),
+            Self::ForbiddenValue { field } => {
+                write!(formatter, "forbidden call media value in {field}")
+            }
+            Self::VerifiedWithoutFrames => {
+                formatter.write_str("live_media_verified requires proven advancing frames")
+            }
+            Self::UnavailableWithFrames => {
+                formatter.write_str("unproven call media cannot claim advancing frames")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallMediaBoardValidationError {}
+
+/// Why a JSON collab-bus media board could not be decoded and admitted.
+#[derive(Debug)]
+pub enum CallMediaBoardDecodeError {
+    /// The encoded body was rejected before serde allocation.
+    BodyTooLarge {
+        /// Number of bytes supplied.
+        bytes: usize,
+        /// Maximum encoded body size.
+        max: usize,
+    },
+    /// The body was malformed JSON or had an unknown/duplicate wire field.
+    Json(serde_json::Error),
+    /// The body decoded but failed semantic validation.
+    Validation(CallMediaBoardValidationError),
+}
+
+impl fmt::Display for CallMediaBoardDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BodyTooLarge { bytes, max } => {
+                write!(
+                    formatter,
+                    "call media board body is {bytes} bytes; maximum is {max}"
+                )
+            }
+            Self::Json(error) => write!(formatter, "invalid call media board JSON: {error}"),
+            Self::Validation(error) => write!(formatter, "invalid call media board: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CallMediaBoardDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(error) => Some(error),
+            Self::BodyTooLarge { .. } | Self::Validation(_) => None,
+        }
+    }
+}
+
+impl CallMediaReadiness {
+    /// Decode and admit a bounded JSON readiness board.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for an oversized, malformed, unknown, duplicate,
+    /// or intrinsically invalid body.
+    pub fn from_json(body: &str) -> Result<Self, CallMediaBoardDecodeError> {
+        Self::from_json_bytes(body.as_bytes())
+    }
+
+    /// Decode and admit a bounded JSON byte body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for an oversized, malformed, unknown, duplicate,
+    /// or intrinsically invalid body.
+    pub fn from_json_bytes(body: &[u8]) -> Result<Self, CallMediaBoardDecodeError> {
+        if body.len() > MAX_CALL_MEDIA_READINESS_JSON_BYTES {
+            return Err(CallMediaBoardDecodeError::BodyTooLarge {
+                bytes: body.len(),
+                max: MAX_CALL_MEDIA_READINESS_JSON_BYTES,
+            });
+        }
+        reject_duplicate_json_keys(body).map_err(CallMediaBoardDecodeError::Json)?;
+        let board =
+            serde_json::from_slice::<Self>(body).map_err(CallMediaBoardDecodeError::Json)?;
+        board
+            .validate()
+            .map_err(CallMediaBoardDecodeError::Validation)?;
+        Ok(board)
+    }
+
+    /// Validate the intrinsic readiness contract.
+    ///
+    /// Empty `sessions` is honest absence, not a live call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field that fails admission.
+    pub fn validate(&self) -> Result<(), CallMediaBoardValidationError> {
+        validate_board_actor("local_actor", &self.local_actor)?;
+        if self.sessions.len() > MAX_CALL_MEDIA_SESSIONS {
+            return Err(CallMediaBoardValidationError::OutOfBounds {
+                field: "sessions",
+                max: MAX_CALL_MEDIA_SESSIONS as u64,
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for session in &self.sessions {
+            validate_readiness_session(&self.local_actor, session)?;
+            if !seen.insert(session.call) {
+                return Err(CallMediaBoardValidationError::InvalidField { field: "call" });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CallMediaVerification {
+    /// Decode and admit a bounded JSON verification board.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for an oversized, malformed, unknown, duplicate,
+    /// or intrinsically invalid body.
+    pub fn from_json(body: &str) -> Result<Self, CallMediaBoardDecodeError> {
+        Self::from_json_bytes(body.as_bytes())
+    }
+
+    /// Decode and admit a bounded JSON byte body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for an oversized, malformed, unknown, duplicate,
+    /// or intrinsically invalid body.
+    pub fn from_json_bytes(body: &[u8]) -> Result<Self, CallMediaBoardDecodeError> {
+        if body.len() > MAX_CALL_MEDIA_VERIFICATION_JSON_BYTES {
+            return Err(CallMediaBoardDecodeError::BodyTooLarge {
+                bytes: body.len(),
+                max: MAX_CALL_MEDIA_VERIFICATION_JSON_BYTES,
+            });
+        }
+        reject_duplicate_json_keys(body).map_err(CallMediaBoardDecodeError::Json)?;
+        let board =
+            serde_json::from_slice::<Self>(body).map_err(CallMediaBoardDecodeError::Json)?;
+        board
+            .validate()
+            .map_err(CallMediaBoardDecodeError::Validation)?;
+        Ok(board)
+    }
+
+    /// Validate the intrinsic verification contract, including the
+    /// verified-requires-frames honesty lock.
+    ///
+    /// Empty `rows` is honest absence, not a live call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field that fails admission.
+    pub fn validate(&self) -> Result<(), CallMediaBoardValidationError> {
+        validate_board_actor("local_actor", &self.local_actor)?;
+        if self.rows.len() > MAX_CALL_MEDIA_VERIFICATION_ROWS {
+            return Err(CallMediaBoardValidationError::OutOfBounds {
+                field: "rows",
+                max: MAX_CALL_MEDIA_VERIFICATION_ROWS as u64,
+            });
+        }
+        for (index, row) in self.rows.iter().enumerate() {
+            validate_verification_row(row)?;
+            if self.rows[..index]
+                .iter()
+                .any(|prior| prior.call == row.call && prior.adapter == row.adapter)
+            {
+                return Err(CallMediaBoardValidationError::InvalidField { field: "rows" });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_readiness_session(
+    local_actor: &ActorId,
+    session: &CallMediaSession,
+) -> Result<(), CallMediaBoardValidationError> {
+    if session.call.is_nil() {
+        return Err(CallMediaBoardValidationError::NilSessionId);
+    }
+    if session.space.is_nil() {
+        return Err(CallMediaBoardValidationError::InvalidField { field: "space" });
+    }
+    let (requirements, adapters) = kind_media_contract(session.kind);
+    if session.requirements != requirements {
+        return Err(CallMediaBoardValidationError::InvalidField {
+            field: "requirements",
+        });
+    }
+    if session.candidate_adapters.is_empty()
+        || session.candidate_adapters.len() > adapters.len()
+        || !session
+            .candidate_adapters
+            .iter()
+            .enumerate()
+            .all(|(index, candidate)| {
+                adapters.contains(candidate)
+                    && !session.candidate_adapters[..index].contains(candidate)
+            })
+    {
+        return Err(CallMediaBoardValidationError::InvalidField {
+            field: "candidate_adapters",
+        });
+    }
+    if session.connected_participants.is_empty()
+        || session.connected_participants.len() > MAX_CALL_MEDIA_PARTICIPANTS
+    {
+        return Err(CallMediaBoardValidationError::OutOfBounds {
+            field: "connected_participants",
+            max: MAX_CALL_MEDIA_PARTICIPANTS as u64,
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut local_count = 0usize;
+    for actor in &session.connected_participants {
+        validate_board_actor("connected_participants", actor)?;
+        if !seen.insert(actor.as_str()) {
+            return Err(CallMediaBoardValidationError::InvalidField {
+                field: "connected_participants",
+            });
+        }
+        if actor == local_actor {
+            local_count += 1;
+        }
+    }
+    let admission_matches = match session.admission {
+        CallMediaAdmission::AdapterReady => session.connected_participants.len() >= 2,
+        CallMediaAdmission::WaitingForConnectedPeer => session.connected_participants.len() == 1,
+    };
+    if local_count != 1 || !admission_matches {
+        return Err(CallMediaBoardValidationError::InvalidField { field: "admission" });
+    }
+    Ok(())
+}
+
+fn validate_verification_row(
+    row: &CallMediaVerificationRow,
+) -> Result<(), CallMediaBoardValidationError> {
+    if row.call.is_nil() {
+        return Err(CallMediaBoardValidationError::NilSessionId);
+    }
+    if row.space.is_nil() {
+        return Err(CallMediaBoardValidationError::InvalidField { field: "space" });
+    }
+    let (_, adapters) = kind_media_contract(row.kind);
+    if !adapters.contains(&row.adapter) {
+        return Err(CallMediaBoardValidationError::InvalidField { field: "adapter" });
+    }
+    if let Some(detail) = &row.detail {
+        if detail.len() > MAX_CALL_MEDIA_DETAIL_BYTES {
+            return Err(CallMediaBoardValidationError::OutOfBounds {
+                field: "detail",
+                max: MAX_CALL_MEDIA_DETAIL_BYTES as u64,
+            });
+        }
+        if looks_forbidden(detail)
+            || detail.bytes().any(|byte| byte.is_ascii_control())
+            || detail.contains('/')
+            || detail.contains('\\')
+        {
+            return Err(CallMediaBoardValidationError::ForbiddenValue { field: "detail" });
+        }
+    }
+    let satisfies = row
+        .evidence
+        .is_some_and(|evidence| evidence_satisfies_kind(row.kind, evidence));
+    match row.status {
+        CallMediaVerificationStatus::LiveMediaVerified => {
+            if row.detail.is_some() {
+                return Err(CallMediaBoardValidationError::InvalidField { field: "detail" });
+            }
+            if !satisfies {
+                return Err(CallMediaBoardValidationError::VerifiedWithoutFrames);
+            }
+        }
+        CallMediaVerificationStatus::MediaNotProven => {
+            if satisfies {
+                return Err(CallMediaBoardValidationError::InvalidField { field: "status" });
+            }
+        }
+        CallMediaVerificationStatus::WaitingForConnectedPeer
+        | CallMediaVerificationStatus::TransportUnavailable
+        | CallMediaVerificationStatus::ProviderUnavailable => {
+            if row.evidence.is_some() {
+                return Err(CallMediaBoardValidationError::UnavailableWithFrames);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn kind_media_contract(
+    kind: CallKind,
+) -> (&'static [CallMediaRequirement], &'static [CallMediaAdapter]) {
+    match kind {
+        CallKind::Audio => (
+            &[CallMediaRequirement::Microphone],
+            &[
+                CallMediaAdapter::WebRtcP2p,
+                CallMediaAdapter::LiveKitSfu,
+                CallMediaAdapter::SipGateway,
+            ],
+        ),
+        CallKind::Video => (
+            &[
+                CallMediaRequirement::Microphone,
+                CallMediaRequirement::Camera,
+            ],
+            &[CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu],
+        ),
+        CallKind::Screen => (
+            &[
+                CallMediaRequirement::Microphone,
+                CallMediaRequirement::ScreenCapture,
+            ],
+            &[CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu],
+        ),
+        CallKind::CoEdit => (
+            &[CallMediaRequirement::DocumentSync],
+            &[CallMediaAdapter::DocumentCollab],
+        ),
+        CallKind::RemoteDesktop => (
+            &[CallMediaRequirement::RemoteDesktopStream],
+            &[CallMediaAdapter::VdiRemoteDesktop],
+        ),
+    }
+}
+
+fn evidence_satisfies_kind(kind: CallKind, evidence: CallMediaFrameEvidence) -> bool {
+    match kind {
+        CallKind::Audio => evidence.audio_frames > 0,
+        CallKind::Video => evidence.audio_frames > 0 && evidence.video_frames > 0,
+        CallKind::Screen => evidence.audio_frames > 0 && evidence.screen_frames > 0,
+        CallKind::CoEdit => evidence.data_messages > 0,
+        CallKind::RemoteDesktop => evidence.screen_frames > 0,
+    }
+}
+
+fn validate_board_actor(
+    field: &'static str,
+    actor: &ActorId,
+) -> Result<(), CallMediaBoardValidationError> {
+    let value = actor.as_str();
+    if value.is_empty() || value.len() > MAX_MEDIA_ACTOR_BYTES {
+        return Err(CallMediaBoardValidationError::OutOfBounds {
+            field,
+            max: MAX_MEDIA_ACTOR_BYTES as u64,
+        });
+    }
+    if looks_forbidden(value)
+        || value.bytes().any(|byte| {
+            byte.is_ascii_control() || byte == b'/' || byte == b'\\' || byte.is_ascii_whitespace()
+        })
+    {
+        return Err(CallMediaBoardValidationError::ForbiddenValue { field });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,6 +2115,170 @@ mod tests {
                     ..
                 }
             ))
+        ));
+    }
+
+    fn sample_readiness() -> CallMediaReadiness {
+        CallMediaReadiness {
+            local_actor: ActorId::new("alice"),
+            sessions: vec![CallMediaSession {
+                call: CallId::new(),
+                space: SpaceId::new(),
+                kind: CallKind::Audio,
+                started_unix_ms: 1_700_000_000_000,
+                requirements: vec![CallMediaRequirement::Microphone],
+                candidate_adapters: vec![
+                    CallMediaAdapter::WebRtcP2p,
+                    CallMediaAdapter::LiveKitSfu,
+                    CallMediaAdapter::SipGateway,
+                ],
+                admission: CallMediaAdmission::AdapterReady,
+                connected_participants: vec![ActorId::new("alice"), ActorId::new("bob")],
+                local_muted: false,
+            }],
+        }
+    }
+
+    fn sample_verification() -> CallMediaVerification {
+        let readiness = sample_readiness();
+        let session = &readiness.sessions[0];
+        CallMediaVerification {
+            local_actor: ActorId::new("alice"),
+            rows: vec![CallMediaVerificationRow {
+                call: session.call,
+                space: session.space,
+                kind: CallKind::Audio,
+                adapter: CallMediaAdapter::WebRtcP2p,
+                status: CallMediaVerificationStatus::LiveMediaVerified,
+                evidence: Some(CallMediaFrameEvidence {
+                    audio_frames: 4,
+                    video_frames: 0,
+                    screen_frames: 0,
+                    data_messages: 0,
+                }),
+                detail: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn empty_collab_media_boards_admit_as_honest_absence() {
+        let readiness = CallMediaReadiness::from_json(
+            r#"{"local_actor":"Basement-Test-Workstation","sessions":[]}"#,
+        )
+        .expect("empty readiness is honest absence");
+        assert!(readiness.sessions.is_empty());
+        let verification = CallMediaVerification::from_json(
+            r#"{"local_actor":"Basement-Test-Workstation","rows":[]}"#,
+        )
+        .expect("empty verification is honest absence");
+        assert!(verification.rows.is_empty());
+    }
+
+    #[test]
+    fn readiness_and_verification_round_trip_through_typed_admission() {
+        let readiness = sample_readiness();
+        let decoded =
+            CallMediaReadiness::from_json(&serde_json::to_string(&readiness).expect("json"))
+                .expect("admit readiness");
+        assert_eq!(decoded, readiness);
+
+        let verification = sample_verification();
+        let decoded =
+            CallMediaVerification::from_json(&serde_json::to_string(&verification).expect("json"))
+                .expect("admit verification");
+        assert_eq!(decoded, verification);
+    }
+
+    #[test]
+    fn live_media_verified_without_frames_is_rejected_on_the_wire() {
+        let mut value = serde_json::to_value(sample_verification()).expect("value");
+        value["rows"][0]["evidence"]["audio_frames"] = json!(0);
+        assert!(matches!(
+            CallMediaVerification::from_json(&value.to_string()),
+            Err(CallMediaBoardDecodeError::Validation(
+                CallMediaBoardValidationError::VerifiedWithoutFrames
+            ))
+        ));
+        value = serde_json::to_value(sample_verification()).expect("value");
+        value["rows"][0]["evidence"] = serde_json::Value::Null;
+        assert!(matches!(
+            CallMediaVerification::from_json(&value.to_string()),
+            Err(CallMediaBoardDecodeError::Validation(
+                CallMediaBoardValidationError::VerifiedWithoutFrames
+            ))
+        ));
+    }
+
+    #[test]
+    fn transport_unavailable_cannot_claim_frame_evidence() {
+        let mut value = serde_json::to_value(sample_verification()).expect("value");
+        value["rows"][0]["status"] = json!("transport_unavailable");
+        assert!(matches!(
+            CallMediaVerification::from_json(&value.to_string()),
+            Err(CallMediaBoardDecodeError::Validation(
+                CallMediaBoardValidationError::UnavailableWithFrames
+            ))
+        ));
+    }
+
+    #[test]
+    fn hostile_collab_media_boards_fail_closed() {
+        let mut hostile = serde_json::to_value(sample_readiness()).expect("value");
+        hostile["sdp"] = json!("v=0\r\no=evil");
+        assert!(CallMediaReadiness::from_json(&hostile.to_string()).is_err());
+        let mut path = serde_json::to_value(sample_readiness()).expect("value");
+        path["path"] = json!("/etc/passwd");
+        assert!(CallMediaReadiness::from_json(&path.to_string()).is_err());
+        let mut secret = serde_json::to_value(sample_verification()).expect("value");
+        secret["password"] = json!("hunter2");
+        assert!(CallMediaVerification::from_json(&secret.to_string()).is_err());
+        let mut command = serde_json::to_value(sample_verification()).expect("value");
+        command["rows"][0]["detail"] = json!("rm -rf /");
+        assert!(CallMediaVerification::from_json(&command.to_string()).is_err());
+
+        let mut body = serde_json::to_string(&sample_readiness()).expect("json");
+        body.insert_str(1, "\"command\":\"rm\",\"command\":\"x\",");
+        assert!(CallMediaReadiness::from_json(&body).is_err());
+    }
+
+    #[test]
+    fn adapter_ready_without_a_connected_peer_is_rejected() {
+        let mut value = serde_json::to_value(sample_readiness()).expect("value");
+        value["sessions"][0]["connected_participants"] = json!(["alice"]);
+        assert!(matches!(
+            CallMediaReadiness::from_json(&value.to_string()),
+            Err(CallMediaBoardDecodeError::Validation(
+                CallMediaBoardValidationError::InvalidField { field: "admission" }
+            ))
+        ));
+    }
+
+    #[test]
+    fn video_kind_cannot_claim_audio_only_requirements() {
+        let mut value = serde_json::to_value(sample_readiness()).expect("value");
+        value["sessions"][0]["kind"] = json!("video");
+        assert!(matches!(
+            CallMediaReadiness::from_json(&value.to_string()),
+            Err(CallMediaBoardDecodeError::Validation(
+                CallMediaBoardValidationError::InvalidField {
+                    field: "requirements"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn oversized_collab_media_boards_are_rejected_before_decode() {
+        let readiness_body = vec![b' '; MAX_CALL_MEDIA_READINESS_JSON_BYTES + 1];
+        assert!(matches!(
+            CallMediaReadiness::from_json_bytes(&readiness_body),
+            Err(CallMediaBoardDecodeError::BodyTooLarge { .. })
+        ));
+        let verification_body = vec![b' '; MAX_CALL_MEDIA_VERIFICATION_JSON_BYTES + 1];
+        assert!(matches!(
+            CallMediaVerification::from_json_bytes(&verification_body),
+            Err(CallMediaBoardDecodeError::BodyTooLarge { .. })
         ));
     }
 }
