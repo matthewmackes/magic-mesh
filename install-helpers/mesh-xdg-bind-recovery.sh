@@ -28,6 +28,23 @@ directory_empty() {
     [ -z "$(/usr/bin/find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 }
 
+# Empty `.mde-vdi-clipboard-staging` is worker scratch, not operator data.
+# Relocate it out of the way so communal binds can proceed. Any other occupant
+# still fail-closes ("local data would be obscured").
+clear_empty_vdi_staging() {
+    local target="$1"
+    local staging="$target/.mde-vdi-clipboard-staging"
+    local others
+    [ -d "$staging" ] && [ ! -L "$staging" ] || return 0
+    directory_empty "$staging" || return 0
+    others="$(/usr/bin/find "$target" -mindepth 1 -maxdepth 1 ! -name '.mde-vdi-clipboard-staging' -print -quit 2>/dev/null)"
+    [ -z "$others" ] || return 0
+    /usr/bin/rmdir -- "$staging" || {
+        fail "could not remove empty VDI staging: $staging"
+        return 1
+    }
+}
+
 wait_exact_bind() {
     local source="$1" target="$2" attempt=0
     while [ "$attempt" -lt 5 ]; do
@@ -66,6 +83,7 @@ validate_desktop_homes() {
                 wait_exact_bind "$source" "$target" \
                     || { fail "existing mount is not the exact communal source: $target"; return 1; }
             elif [ -d "$target" ]; then
+                clear_empty_vdi_staging "$target" || return 1
                 directory_empty "$target" \
                     || { fail "local data would be obscured: $target"; return 1; }
             fi
@@ -107,6 +125,7 @@ main() {
                     || { fail "existing mount is not the exact communal source: $target"; return 1; }
                 continue
             fi
+            clear_empty_vdi_staging "$target" || return 1
             directory_empty "$target" \
                 || { fail "local data would be obscured: $target"; return 1; }
             # systemd-mount has no --bind option: on current systemd that token

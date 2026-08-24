@@ -2153,6 +2153,10 @@ const fn action_label(action: HealthAction) -> &'static str {
         HealthAction::RestartKdc => "Restart KDC provider",
         HealthAction::RestartShell => "Restart Construct shell",
         HealthAction::ExpandSeat15Root => "Expand seat 15 root to 30 GiB",
+        HealthAction::PublishOverlayIp => "Publish overlay IP",
+        HealthAction::SetupEtcdClient => "Configure etcd client",
+        HealthAction::RecoverXdgBinds => "Restore mesh Downloads binds",
+        HealthAction::RunLifecycleFirstboot => "Retry first-boot convergence",
     }
 }
 
@@ -2723,6 +2727,10 @@ mod tests {
             HealthAction::RestartKdc,
             HealthAction::RestartShell,
             HealthAction::ExpandSeat15Root,
+            HealthAction::PublishOverlayIp,
+            HealthAction::SetupEtcdClient,
+            HealthAction::RecoverXdgBinds,
+            HealthAction::RunLifecycleFirstboot,
         ] {
             assert!(!action_label(action).is_empty());
         }

@@ -58,3 +58,33 @@ fi
 [ ! -s "$ROOT/state/mounts" ]
 [ ! -e "$ROOT/mesh/Documents" ]
 echo 'PASS all-home preflight: hostile later target causes zero mount mutations'
+
+# Empty VDI clipboard staging is not operator data. Preflight must remove it
+# so communal Downloads can bind. Other local files still refuse.
+HOME_C="/home/mcnf-xdg-test-$$-c"
+cleanup_c() {
+    "${PRIVILEGE[@]}" rm -rf -- "$HOME_C"
+}
+trap 'cleanup; cleanup_c' EXIT
+"${PRIVILEGE[@]}" mkdir -p "$HOME_C"
+"${PRIVILEGE[@]}" chown "$(id -u):$(id -g)" "$HOME_C"
+cat >"$ROOT/passwd-c" <<EOF
+carol:x:1002:1002::${HOME_C}:/bin/bash
+EOF
+for name in Documents Downloads Music Pictures Videos; do
+    mkdir -p "$HOME_C/$name"
+done
+mkdir -p "$HOME_C/Downloads/.mde-vdi-clipboard-staging"
+: >"$ROOT/state/mounts-c"
+if "${PRIVILEGE[@]}" env MCNF_XDG_TEST_STATE="$ROOT/state" \
+    MCNF_XDG_PASSWD_FILE="$ROOT/passwd-c" \
+    MCNF_ROLE_FILE="$ROOT/role.toml" \
+    MCNF_XDG_MESH_HOME="$ROOT/mesh" \
+    MCNF_XDG_SYSTEMD_MOUNT="$ROOT/bin/systemd-mount" \
+    MCNF_XDG_MOUNTPOINT="$ROOT/bin/mountpoint" \
+    bash "$HELPER"; then
+    echo 'empty VDI staging unexpectedly produced a full restore without exact binds' >&2
+    exit 1
+fi
+[ ! -e "$HOME_C/Downloads/.mde-vdi-clipboard-staging" ]
+echo 'PASS empty VDI staging is removed before communal bind refusal'

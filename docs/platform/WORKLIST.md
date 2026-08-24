@@ -419,19 +419,14 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover (1)/(2) dests under `/root/mcnf-private/`; leftover
-  (3) ran on Seat 15. 2026-08-24: LH1 overlay/etcd recovered; Surface and
-  Dell identity dests admitted (`7e3474eeb`). Surface reboot: overlay-ip
-  and XDG binds restored; firstboot still Pending (grouped units vs
-  `mackesd.service` catalog, 66 pending tokens). Evidence:
-  `WL-FUNC-023-2026-08-24-surface-collab-dest-admitted-r1.md`,
-  `WL-FUNC-023-2026-08-24-dell-collab-dest-admitted-r1.md`,
-  `WL-FUNC-023-2026-08-24-surface-post-reboot-r1.md`.
+  (3) ran on Seat 15. 2026-08-24 fleet findings (dirty-upgrade vs onboard/heal)
+  and detailed Fix solutions:
+  `WL-FUNC-023-2026-08-24-turnkey-heal-nag-solutions-r1.md`. Identity dests on
+  Dell/Seat 15/Surface (`7e3474eeb`). Surface reboot leftover repaired.
   `production_admitted: false`.
-- Remaining work: S1-S18 Luna execute still listed. Current-tree
-  `enroll --token-stdin` now uses fingerprint-pinned `join`
-  (`WL-FUNC-023-2026-08-23-enroll-token-joins-r1.md`; farm
-  `nebula_enroll` 102/102). Installed 13.0.0-35 still has the retired
-  CSR stub. Do not flip `production_admitted`.
+- Remaining work: S1-S18. Fingerprint-pinned `join` is in-tree
+  (`WL-FUNC-023-2026-08-23-enroll-token-joins-r1.md`). Installed 13.0.0-35
+  still has the retired CSR stub. Do not flip `production_admitted`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -532,10 +527,12 @@ is a capacity incident (§10.0.3), not a silent retry.
       - Inputs: capsule/token, artifact, identity and authority inputs, packages,
         systemd, mesh, and shell readiness.
       - Action: stage, install, configure, enroll, activate, reboot when needed,
-        resume, and verify automatically.
+        resume, and verify automatically. Join writes etcd-endpoints, overlay-ip,
+        and the grouped plane; missing dests nag into ONBOARD.
       - Deliverable: zero-touch capsule and one-interaction token onboarding.
       - Validation: clean RPM, bootc, Kickstart/NoCloud, and USB fixture tests.
-      - Done when: no manual package, configuration, or systemctl work remains.
+      - Done when: a fresh install is turn-key; disabled or broken services nag
+        with one typed mackesd Fix; no SSH or manual systemctl remains.
   12. S12 Make upgrades turnkey.
       - Inputs: current state and workloads, selected artifact, migrations,
         authority inputs, power, disk, and network state.
@@ -549,8 +546,9 @@ is a capacity incident (§10.0.3), not a silent retry.
       - Inputs: Surface overlay, hardware probes, virtualization checks,
         scheduler capabilities, and bounded retry policy.
       - Action: attempt correction, then classify remaining hardware or
-        virtualization failures as `ReadyWithWarnings`.
-      - Deliverable: prominent warnings and truthful capability withdrawal.
+        virtualization failures as `ReadyWithWarnings`. Construct must pop a Health
+        nag with one automated typed Fix when a service is disabled or broken.
+      - Deliverable: prominent warnings, Health toasts, and truthful capability withdrawal.
       - Validation: failed KVM or Surface features remain visible and cannot
         receive incompatible workloads.
       - Done when: warning seats remain usable without claiming failed features.
@@ -587,6 +585,8 @@ is a capacity incident (§10.0.3), not a silent retry.
         systemd units, Kickstart, and bootc first boot.
       - Action: consume the canonical baseline, retain failed enrollment tokens,
         queue convergence, and remove ignored critical activation failures.
+        First-boot expects grouped `mackesd-*.service` (never its own oneshot or
+        a workstation etcd member).
       - Deliverable: consistent package, installer, role, doctor, and lifecycle
         behavior.
       - Validation: source scans and hostile package/first-boot fixtures.

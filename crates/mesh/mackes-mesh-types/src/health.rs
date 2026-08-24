@@ -1147,6 +1147,10 @@ pub enum HealthAction {
     RestartKdc,
     RestartShell,
     ExpandSeat15Root,
+    PublishOverlayIp,
+    SetupEtcdClient,
+    RecoverXdgBinds,
+    RunLifecycleFirstboot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

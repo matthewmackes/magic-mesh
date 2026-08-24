@@ -16,11 +16,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mackes_mesh_types::device_inventory::{self, DeviceInventory, DeviceStatus};
 use mackes_mesh_types::health::{
     action_result_topic, fold_snapshot_with_availability, node_health_topic, GradeFactors,
-    HealthAction, HealthActionOutcome, HealthActionRequest, HealthActionResult, HealthComponent,
-    HealthCondition, HealthEvidence, HealthRemediation, HealthScope, HealthSeverity,
-    NodeAvailabilityAssessment, NodeAvailabilityPolicy, NodeGrade, NodeHealthState,
-    RequirementClass, SystemMeshHealthSnapshot, ACTION_TOPIC, CRITICAL_NOTIFY_TOPIC,
-    HEALTH_SCHEMA_VERSION, MAX_NODE_HEALTH_CONDITIONS, SNAPSHOT_TOPIC,
+    GradeLetter, HealthAction, HealthActionOutcome, HealthActionRequest, HealthActionResult,
+    HealthComponent, HealthCondition, HealthEvidence, HealthKironAlert, HealthKironKind,
+    HealthRemediation, HealthScope, HealthSeverity, NodeAvailabilityAssessment,
+    NodeAvailabilityPolicy, NodeGrade, NodeHealthState, RequirementClass, SystemMeshHealthSnapshot,
+    ACTION_TOPIC, CRITICAL_NOTIFY_TOPIC, HEALTH_KIRON_SCHEMA_VERSION, HEALTH_SCHEMA_VERSION,
+    MAX_NODE_HEALTH_CONDITIONS, SNAPSHOT_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -61,6 +62,13 @@ const MAX_HEALTH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MESH_STATUS_PATH: &str = "/run/mde/mesh-status.json";
 const DEVICE_INVENTORY_VALIDITY_MS: u64 = 10 * 60 * 1_000;
 const AUDIO_PROOF_PATH: &str = "/var/lib/mackesd/health/audio-proof.json";
+const OVERLAY_IP_PATH: &str = "/var/lib/mackesd/nebula/overlay-ip";
+const COLLAB_IDENTITY_ADMISSION: &str = "/var/lib/mackesd/collaboration-identity-admission.json";
+const MM_DOWNLOADS: &str = "/home/mm/Downloads";
+const SETUP_ETCD: &str = "/usr/libexec/mackesd/setup-etcd";
+const HEALTH_TOAST_TOPIC: &str = "event/toast/show";
+const LIFECYCLE_FIRSTBOOT_UNIT: &str = "mcnf-lifecycle-firstboot.service";
+const XDG_BIND_RECOVERY_UNIT: &str = "mcnf-xdg-bind-recovery.service";
 // Audio discovery shells out through runuser and several user-session tools.
 // Keep the health contract fresh without repeating that fork-heavy probe on
 // every 10-second node-grade sample. A failed probe is cached too, preventing
@@ -189,6 +197,13 @@ struct HealthObservations {
     reachable_lighthouses: usize,
     firmware_refresh_failed: bool,
     device_inventory: Option<DeviceInventory>,
+    overlay_ip_published: bool,
+    live_overlay_ip: bool,
+    etcd_endpoints_present: bool,
+    firstboot_pending: bool,
+    xdg_downloads_bound: bool,
+    collab_identity_admitted: bool,
+    grouped_mackesd_installed: bool,
 }
 
 trait HealthSampler: Send {
@@ -408,6 +423,18 @@ impl HealthSampler for SystemSampler {
                 .status()
                 .is_ok_and(|status| status.success()),
             device_inventory: device_inventory::read_inventory(&self.workgroup_root, &self.host),
+            overlay_ip_published: overlay_ip_file_ready(),
+            live_overlay_ip: crate::voip_rtt::own_nebula_ip().is_some(),
+            etcd_endpoints_present: etcd_endpoints_ready(),
+            firstboot_pending: Path::new(crate::onboard::firstboot::DEFAULT_MARKER_DIR)
+                .join(crate::onboard::firstboot::FIRSTBOOT_PENDING)
+                .is_file(),
+            xdg_downloads_bound: self.role != "workstation" || xdg_downloads_bound(),
+            collab_identity_admitted: Path::new(COLLAB_IDENTITY_ADMISSION).is_file(),
+            grouped_mackesd_installed: Path::new(
+                crate::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE,
+            )
+            .is_file(),
         }
     }
 }
@@ -434,6 +461,32 @@ fn parse_df_used_pct(body: &str) -> Option<f32> {
         .trim_end_matches('%')
         .parse()
         .ok()
+}
+
+fn overlay_ip_file_ready() -> bool {
+    std::fs::read_to_string(OVERLAY_IP_PATH)
+        .ok()
+        .is_some_and(|body| !body.trim().is_empty())
+}
+
+fn etcd_endpoints_ready() -> bool {
+    std::fs::read_to_string(crate::substrate::etcd::ENDPOINTS_FILE)
+        .ok()
+        .is_some_and(|body| {
+            body.split(|character| character == ',' || character == '\n')
+                .any(|endpoint| !endpoint.trim().is_empty())
+        })
+}
+
+fn xdg_downloads_bound() -> bool {
+    let path = Path::new(MM_DOWNLOADS);
+    if !path.is_dir() {
+        return true;
+    }
+    Command::new("mountpoint")
+        .args(["-q", MM_DOWNLOADS])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -653,6 +706,90 @@ fn evaluate_conditions(
                 "Refresh current mesh reachability evidence.",
                 false,
             )],
+        ));
+    }
+    if observations.live_overlay_ip && !observations.overlay_ip_published {
+        conditions.push(condition(
+            host,
+            "overlay-ip-unpublished",
+            HealthComponent::Mesh,
+            "nebula-overlay-ip",
+            HealthSeverity::Critical,
+            "The overlay is up but overlay-ip is empty; sshd bind and heal consumers cannot proceed.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::PublishOverlayIp,
+                generation,
+                "Rewrite overlay-ip from the live nebula1 address.",
+                false,
+            )],
+        ));
+    }
+    if observations.role == "workstation" && !observations.etcd_endpoints_present {
+        conditions.push(condition(
+            host,
+            "etcd-endpoints-missing",
+            HealthComponent::System,
+            "etcd-client",
+            HealthSeverity::Critical,
+            "Workstation etcd client endpoints are missing; SecretStore and coordination stay down.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::SetupEtcdClient,
+                generation,
+                "Run packaged setup-etcd --client-only using the signed lighthouse roster.",
+                true,
+            )],
+        ));
+    }
+    if observations.firstboot_pending {
+        conditions.push(condition(
+            host,
+            "firstboot-pending",
+            HealthComponent::System,
+            "lifecycle-firstboot",
+            HealthSeverity::Warning,
+            "First-boot convergence is pending; Construct should not look Ready.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::RunLifecycleFirstboot,
+                generation,
+                "Retry mcnf-lifecycle-firstboot using the grouped mackesd plane.",
+                true,
+            )],
+        ));
+    }
+    if observations.role == "workstation" && !observations.xdg_downloads_bound {
+        conditions.push(condition(
+            host,
+            "xdg-binds-down",
+            HealthComponent::System,
+            "xdg-bind-recovery",
+            HealthSeverity::Warning,
+            "Communal mesh Downloads are not bound on this seat.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::RecoverXdgBinds,
+                generation,
+                "Clear empty VDI staging if that is the only occupant, then restore XDG binds.",
+                true,
+            )],
+        ));
+    }
+    if observations.grouped_mackesd_installed && !observations.collab_identity_admitted {
+        conditions.push(condition(
+            host,
+            "collab-identity-missing",
+            HealthComponent::System,
+            "collaboration-identity",
+            HealthSeverity::Warning,
+            "Collaboration identity is not admitted. Open Onboarding; do not copy another node's receipt.",
+            now_ms,
+            Vec::new(),
         ));
     }
     if let Some(used) = observations.resources.root_used_pct {
@@ -1552,6 +1689,31 @@ fn emit_critical(
         .map_err(|error| error.to_string())
 }
 
+fn emit_health_kiron(
+    persist: &mut Persist,
+    condition: &HealthCondition,
+    host: &str,
+    grade: GradeLetter,
+    snapshot_generation: u64,
+) -> Result<(), String> {
+    let alert = HealthKironAlert {
+        kind: HealthKironKind::HealthKiron,
+        schema_version: HEALTH_KIRON_SCHEMA_VERSION,
+        snapshot_generation,
+        condition_id: condition.id.clone(),
+        node: host.to_owned(),
+        device: None,
+        grade,
+        headline: condition.evidence.summary.clone(),
+        active_since_ms: condition.active_since_ms,
+        observed_at_ms: condition.last_observed_ms,
+    };
+    alert
+        .validate()
+        .map_err(|error| format!("health nag toast refused: {error}"))?;
+    emit_json(persist, HEALTH_TOAST_TOPIC, &alert)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionDecision {
     Apply,
@@ -1605,7 +1767,7 @@ fn authorize_action(
 
 fn unit_for_action(action: HealthAction) -> Option<&'static str> {
     match action {
-        HealthAction::RestartMackesd => Some("mackesd.service"),
+        HealthAction::RestartMackesd => None,
         HealthAction::RestartNebula => Some("nebula.service"),
         HealthAction::RestartSyncthing => Some("syncthing.service"),
         HealthAction::RestartMeshBus => Some("mesh-broker-setup.service"),
@@ -1622,6 +1784,9 @@ fn execute_action(
     source: &str,
     workgroup_root: &Path,
 ) -> Result<String, String> {
+    if action == HealthAction::RestartMackesd {
+        return restart_mackesd_plane();
+    }
     if let Some(unit) = unit_for_action(action) {
         let status = Command::new("systemctl")
             .args(["restart", unit])
@@ -1662,11 +1827,94 @@ fn execute_action(
             )
         }
         HealthAction::ExpandSeat15Root => expand_seat15_root(host),
+        HealthAction::PublishOverlayIp => publish_live_overlay_ip(),
+        HealthAction::SetupEtcdClient => setup_etcd_client(workgroup_root, host),
+        HealthAction::RecoverXdgBinds => run_checked(
+            "systemctl",
+            &["start", XDG_BIND_RECOVERY_UNIT],
+            "XDG bind recovery started",
+        ),
+        HealthAction::RunLifecycleFirstboot => run_checked(
+            "systemctl",
+            &["start", LIFECYCLE_FIRSTBOOT_UNIT],
+            "lifecycle first-boot retry started",
+        ),
         HealthAction::Acknowledge | HealthAction::SnoozeOneHour => {
             Ok("condition state updated".into())
         }
         _ => Err("action has no executor".into()),
     }
+}
+
+fn restart_mackesd_plane() -> Result<String, String> {
+    if Path::new(crate::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE).is_file() {
+        let mut restarted = Vec::new();
+        for unit in crate::onboard::role_provision::GROUPED_MACKESD_UNITS {
+            let status = Command::new("systemctl")
+                .args(["restart", unit])
+                .status()
+                .map_err(|error| error.to_string())?;
+            if !status.success() {
+                return Err(format!("restart of {unit} failed"));
+            }
+            restarted.push(unit);
+        }
+        return Ok(format!("restarted {}", restarted.join(",")));
+    }
+    let status = Command::new("systemctl")
+        .args(["restart", "mackesd.service"])
+        .status()
+        .map_err(|error| error.to_string())?;
+    status
+        .success()
+        .then(|| "restarted mackesd.service".into())
+        .ok_or_else(|| "restart of mackesd.service failed".into())
+}
+
+fn publish_live_overlay_ip() -> Result<String, String> {
+    let overlay_ip = crate::voip_rtt::own_nebula_ip()
+        .ok_or_else(|| "nebula1 has no live overlay address".to_string())?;
+    crate::workers::nebula_supervisor::publish_overlay_ip(Path::new(OVERLAY_IP_PATH), &overlay_ip)?;
+    Ok(format!("published overlay-ip {overlay_ip}"))
+}
+
+fn setup_etcd_client(workgroup_root: &Path, host: &str) -> Result<String, String> {
+    let peer = if host.starts_with("peer:") {
+        host.to_owned()
+    } else {
+        format!("peer:{host}")
+    };
+    let bundle = crate::ca::bundle::read_bundle(&crate::ca::bundle::bundle_path(
+        workgroup_root,
+        &peer,
+    ))
+    .map_err(|error| {
+        format!("signed lighthouse roster unavailable ({error}); open Onboarding instead of inventing anchors")
+    })?;
+    let mut anchors = Vec::new();
+    for lighthouse in &bundle.lighthouses {
+        let ip = lighthouse.overlay_ip.trim();
+        if ip.is_empty() {
+            continue;
+        }
+        if ip.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!(
+                "signed lighthouse roster has a non-IPv4 overlay address {ip}"
+            ));
+        }
+        anchors.push(ip.to_owned());
+    }
+    anchors.sort();
+    anchors.dedup();
+    if anchors.is_empty() {
+        return Err("signed lighthouse roster has no overlay anchors".into());
+    }
+    let csv = anchors.join(",");
+    run_checked(
+        SETUP_ETCD,
+        &["--client-only", "--anchors", &csv],
+        "etcd client endpoints written from the signed lighthouse roster",
+    )
 }
 
 fn restore_workstation_audio() -> Result<String, String> {
@@ -2337,12 +2585,15 @@ impl NodeGradeWorker {
                         || now.saturating_sub(*published_at_ms) >= HEALTH_PUBLICATION_HEARTBEAT_MS
                 })
                 || inject_snapshot_file_failure;
-        let previous_critical: BTreeSet<_> = previous
+        let previous_nags: BTreeSet<_> = previous
             .iter()
             .flat_map(|old| old.active_conditions.iter())
             .filter(|condition| {
                 condition.requirement == RequirementClass::Required
-                    && condition.severity == HealthSeverity::Critical
+                    && matches!(
+                        condition.severity,
+                        HealthSeverity::Critical | HealthSeverity::Warning
+                    )
             })
             .map(|condition| condition.id.as_str())
             .collect();
@@ -2416,11 +2667,25 @@ impl NodeGradeWorker {
             }
             for condition in &active {
                 if condition.requirement == RequirementClass::Required
-                    && condition.severity == HealthSeverity::Critical
-                    && !previous_critical.contains(condition.id.as_str())
+                    && matches!(
+                        condition.severity,
+                        HealthSeverity::Critical | HealthSeverity::Warning
+                    )
+                    && !previous_nags.contains(condition.id.as_str())
                 {
-                    if let Err(error) = emit_critical(bus, condition, &self.host) {
-                        tracing::warn!(error, "node_grade: critical notification deferred");
+                    if let Err(error) = emit_health_kiron(
+                        bus,
+                        condition,
+                        &self.host,
+                        state.grade.grade,
+                        snapshot.generation,
+                    ) {
+                        tracing::warn!(error, "node_grade: health nag toast deferred");
+                    }
+                    if condition.severity == HealthSeverity::Critical {
+                        if let Err(error) = emit_critical(bus, condition, &self.host) {
+                            tracing::warn!(error, "node_grade: critical notification deferred");
+                        }
                     }
                 }
             }
@@ -2836,6 +3101,13 @@ mod tests {
             overlay_up: true,
             reachable_lighthouses: 3,
             firmware_refresh_failed: false,
+            overlay_ip_published: true,
+            live_overlay_ip: true,
+            etcd_endpoints_present: true,
+            firstboot_pending: false,
+            xdg_downloads_bound: true,
+            collab_identity_admitted: true,
+            grouped_mackesd_installed: false,
             device_inventory: Some(DeviceInventory {
                 host: "node".into(),
                 published_at_ms: 100,
@@ -3194,6 +3466,71 @@ mod tests {
             evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100).is_empty()
         );
         assert_eq!(factors("node", &sample, 100).system, Some(100));
+    }
+
+    #[test]
+    fn live_overlay_without_published_ip_offers_publish_fix() {
+        let mut sample = observations("workstation");
+        sample.overlay_ip_published = false;
+        sample.live_overlay_ip = true;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        let condition = conditions
+            .iter()
+            .find(|condition| condition.id == "node:overlay-ip-unpublished")
+            .expect("unpublished overlay-ip must nag");
+        assert_eq!(condition.severity, HealthSeverity::Critical);
+        assert!(condition
+            .remediation
+            .iter()
+            .any(|action| action.action == HealthAction::PublishOverlayIp));
+    }
+
+    #[test]
+    fn workstation_missing_etcd_endpoints_offers_setup_fix() {
+        let mut sample = observations("workstation");
+        sample.etcd_endpoints_present = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:etcd-endpoints-missing"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::SetupEtcdClient)
+        }));
+        let lighthouse = observations("lighthouse");
+        assert!(
+            !evaluate_conditions("node", &lighthouse, &PressureWindow::default(), 1, 100)
+                .iter()
+                .any(|condition| condition.id.ends_with("etcd-endpoints-missing")),
+            "lighthouse etcd members are not the workstation client file"
+        );
+    }
+
+    #[test]
+    fn firstboot_pending_and_xdg_and_identity_nags_carry_typed_or_onboard_fixes() {
+        let mut sample = observations("workstation");
+        sample.firstboot_pending = true;
+        sample.xdg_downloads_bound = false;
+        sample.grouped_mackesd_installed = true;
+        sample.collab_identity_admitted = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:firstboot-pending"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::RunLifecycleFirstboot)
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:xdg-binds-down"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::RecoverXdgBinds)
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:collab-identity-missing" && condition.remediation.is_empty()
+        }));
     }
 
     #[test]

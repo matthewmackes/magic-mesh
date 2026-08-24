@@ -300,9 +300,29 @@ impl NebulaSupervisor {
     /// Replace any retained readiness publication with an empty, sealed value
     /// before this process claims that the local overlay is usable. Using the
     /// same atomic writer as publication preserves its no-symlink boundary.
+    ///
+    /// If `nebula1` already carries a live overlay address, do not wipe the
+    /// publish file: a later config-refresh refusal (relay pin mismatch) would
+    /// otherwise leave overlay-ip empty while the tunnel is up.
     fn invalidate_startup_overlay(&mut self) -> bool {
         if self.startup_overlay_invalidated {
             return true;
+        }
+        if let Some(live) = crate::voip_rtt::own_nebula_ip() {
+            match publish_overlay_ip(&self.overlay_ip_path, &live) {
+                Ok(()) => {
+                    self.startup_overlay_invalidated = true;
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %self.overlay_ip_path.display(),
+                        "nebula-supervisor: failed to republish live overlay-ip at startup; will retry"
+                    );
+                    return false;
+                }
+            }
         }
         match write_atomic(&self.overlay_ip_path, b"") {
             Ok(()) => {
@@ -379,6 +399,15 @@ impl NebulaSupervisor {
             );
         }
         if !relay_authority_is_trusted(&bundle, &self.relay_trust_authority_pin_path) {
+            if let Some(live) = crate::voip_rtt::own_nebula_ip() {
+                if let Err(error) = publish_overlay_ip(&self.overlay_ip_path, &live) {
+                    tracing::warn!(
+                        %error,
+                        path = %self.overlay_ip_path.display(),
+                        "nebula-supervisor: pin mismatch; failed to publish live overlay-ip"
+                    );
+                }
+            }
             return Err(
                 "replicated Nebula bundle relay trust authority does not match the local enrollment pin"
                     .into(),

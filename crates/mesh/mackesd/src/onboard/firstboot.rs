@@ -17,8 +17,14 @@ use mackes_mesh_types::lifecycle::{
 use sha2::{Digest, Sha256};
 
 use crate::lifecycle_authority::{LifecycleAuthority, LifecycleAuthorityError};
-use crate::onboard::role_provision::units_for_role;
+use crate::onboard::role_provision::{
+    units_for_role, GROUPED_MACKESD_CONTROL_UNIT_FILE, GROUPED_MACKESD_UNITS,
+};
 use mde_role::Role;
+
+/// First-boot must not require its own oneshot: the unit is `activating`
+/// while `gather_live` runs, so `systemctl is-active --quiet` can never pass.
+const FIRSTBOOT_SELF_UNIT: &str = "mcnf-lifecycle-firstboot.service";
 
 /// Marker written only after the canonical baseline has no blocking checks.
 pub const FIRSTBOOT_CONVERGED: &str = "firstboot-converged";
@@ -355,6 +361,34 @@ pub fn gather_live(target_id: &str, generation: u64, role: Role) -> FirstbootFac
     gather_live_in(target_id, generation, role, None)
 }
 
+/// Units first-boot requires to be active.
+///
+/// This is not a copy of [`units_for_role`]: that catalog still lists the
+/// enable/mask set (including this oneshot and, on every rank, `etcd.service`
+/// plus monolithic `mackesd.service`). First-boot facts must match the live
+/// plane: grouped `mackesd-*.service` when shipped, no self-check, and no
+/// workstation etcd member.
+#[must_use]
+pub fn runtime_expected_units(role: Role, grouped_control_unit_file_present: bool) -> Vec<String> {
+    let mut units: Vec<String> = units_for_role(role)
+        .into_iter()
+        .filter(|unit| *unit != FIRSTBOOT_SELF_UNIT)
+        .map(str::to_owned)
+        .collect();
+    if grouped_control_unit_file_present {
+        units.retain(|unit| unit != "mackesd.service");
+        for grouped in GROUPED_MACKESD_UNITS {
+            if !units.iter().any(|unit| unit == grouped) {
+                units.push((*grouped).to_owned());
+            }
+        }
+    }
+    if role == Role::Workstation {
+        units.retain(|unit| unit != "etcd.service");
+    }
+    units
+}
+
 /// Live seat facts, counting pending invite/enrollment bearers from the
 /// workgroup ledger when `workgroup_root` is present.
 #[must_use]
@@ -364,10 +398,8 @@ pub fn gather_live_in(
     role: Role,
     workgroup_root: Option<&Path>,
 ) -> FirstbootFacts {
-    let expected_units: Vec<String> = units_for_role(role)
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let expected_units =
+        runtime_expected_units(role, Path::new(GROUPED_MACKESD_CONTROL_UNIT_FILE).is_file());
     let active_units: Vec<String> = expected_units
         .iter()
         .filter(|unit| unit_is_active(unit))
@@ -611,6 +643,63 @@ mod tests {
         assert_eq!(
             std::fs::read(markers.join(FIRSTBOOT_PENDING)).unwrap(),
             b"queued\n"
+        );
+    }
+
+    #[test]
+    fn runtime_expected_units_never_require_the_firstboot_oneshot() {
+        for role in [Role::Lighthouse, Role::Workstation] {
+            for grouped in [false, true] {
+                let units = runtime_expected_units(role, grouped);
+                assert!(
+                    !units.iter().any(|unit| unit == FIRSTBOOT_SELF_UNIT),
+                    "{role:?} grouped={grouped} must not require the activating oneshot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_expected_units_use_grouped_plane_and_drop_workstation_etcd() {
+        let lighthouse = runtime_expected_units(Role::Lighthouse, false);
+        assert!(lighthouse.iter().any(|unit| unit == "mackesd.service"));
+        assert!(lighthouse.iter().any(|unit| unit == "etcd.service"));
+        assert!(!lighthouse
+            .iter()
+            .any(|unit| unit == "mackesd-control.service"));
+
+        let grouped_lh = runtime_expected_units(Role::Lighthouse, true);
+        assert!(!grouped_lh.iter().any(|unit| unit == "mackesd.service"));
+        assert!(grouped_lh.iter().any(|unit| unit == "etcd.service"));
+        for unit in GROUPED_MACKESD_UNITS {
+            assert!(
+                grouped_lh.iter().any(|active| active == unit),
+                "grouped lighthouse first-boot must require {unit}"
+            );
+        }
+
+        let workstation = runtime_expected_units(Role::Workstation, true);
+        assert!(!workstation.iter().any(|unit| unit == "mackesd.service"));
+        assert!(!workstation.iter().any(|unit| unit == "etcd.service"));
+        for unit in GROUPED_MACKESD_UNITS {
+            assert!(
+                workstation.iter().any(|active| active == unit),
+                "grouped workstation first-boot must require {unit}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_mackesd_plane_can_produce_ready_without_monolithic_unit() {
+        let mut facts = healthy("seat-15");
+        facts.expected_units = runtime_expected_units(Role::Workstation, true);
+        facts.active_units = facts.expected_units.clone();
+        facts.ui_applicable = true;
+        facts.ui_ready = true;
+        let checks = assemble(&facts);
+        assert!(
+            checks.iter().all(|check| !check.blocks_progress()),
+            "active grouped plane must not block first-boot: {checks:?}"
         );
     }
 

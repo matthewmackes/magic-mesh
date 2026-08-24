@@ -49,6 +49,23 @@ pub struct PlannedUnit {
 /// * **Rank 1 (Workstation only)** — the desktop adds the DRM-seat shell.
 ///   The base role owns the supported provisioning units; retired Browser
 ///   runtime setup is not part of the package or role contract.
+
+/// Grouped `mackesd` plane shipped by the current RPM. First-boot and health
+/// must expect these units on seats that no longer ship monolithic
+/// `mackesd.service`.
+pub const GROUPED_MACKESD_UNITS: [&str; 6] = [
+    "mackesd-control.service",
+    "mackesd-observation.service",
+    "mackesd-actions.service",
+    "mackesd-data.service",
+    "mackesd-compute.service",
+    "mackesd-integrations.service",
+];
+
+/// Unit file that proves the grouped plane is installed.
+pub const GROUPED_MACKESD_CONTROL_UNIT_FILE: &str =
+    "/usr/lib/systemd/system/mackesd-control.service";
+
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
