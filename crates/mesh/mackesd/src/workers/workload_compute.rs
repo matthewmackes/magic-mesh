@@ -4614,6 +4614,22 @@ impl Worker for WorkloadComputeWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         self.register_migration_executor();
+        match crate::kvm::ensure_default_storage_pool() {
+            Ok(crate::kvm::PoolPrepare::Defined) => {
+                tracing::info!(
+                    target: "mackesd::workload_compute",
+                    "defined the node-virt default libvirt storage pool"
+                );
+            }
+            Ok(crate::kvm::PoolPrepare::AlreadyPresent) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "mackesd::workload_compute",
+                    %error,
+                    "default libvirt storage pool is not ready"
+                );
+            }
+        }
         let mut ledger = WorkloadOperationLedger::open(&self.state_root)
             .map_err(|error| anyhow::anyhow!("open workload operation journal: {error}"))?;
         let outbox = ReplyOutbox::open(&self.state_root)

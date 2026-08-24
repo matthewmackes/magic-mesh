@@ -119,9 +119,132 @@ pub fn find_by_id(id: &str) -> Option<&'static KvmService> {
     KVM_SERVICES.iter().find(|s| s.id == id)
 }
 
+/// The `node-virt.yml` default dir pool. Guest disks live here.
+pub const DEFAULT_POOL_NAME: &str = "default";
+/// Host path backing [`DEFAULT_POOL_NAME`].
+pub const DEFAULT_POOL_TARGET: &str = "/var/lib/libvirt/images";
+/// Accepted existing pool names. Do not define `default` over these.
+pub const STORAGE_POOL_CANDIDATES: &[&str] = &["mde-vms", "default", "images"];
+
+/// Result of applying the `node-virt.yml` default-pool recipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolPrepare {
+    /// `virsh pool-info default` already succeeded.
+    AlreadyPresent,
+    /// Pool was defined, marked autostart, and started.
+    Defined,
+}
+
+/// One `virsh` invocation result consumed by [`prepare_default_storage_pool`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolCmd {
+    /// Process exit 0.
+    pub success: bool,
+    /// Combined stdout used to detect an inactive but defined pool.
+    pub stdout: String,
+    /// Combined stderr used to detect "Storage pool not found".
+    pub stderr: String,
+}
+
+impl PoolCmd {
+    /// True when libvirt reports the default pool is absent.
+    #[must_use]
+    pub fn not_found(&self) -> bool {
+        self.stderr.contains("Storage pool not found")
+            || self.stderr.contains("no storage pool")
+            || self.stderr.contains("failed to get pool")
+    }
+}
+
+/// Pure fold of the `node-virt.yml` default-pool recipe over an injectable
+/// `virsh` runner. Production wires [`ensure_default_storage_pool`].
+pub fn prepare_default_storage_pool<F>(mut run: F) -> Result<PoolPrepare, String>
+where
+    F: FnMut(&[&str]) -> Result<PoolCmd, String>,
+{
+    for name in STORAGE_POOL_CANDIDATES {
+        let info = run(&["--connect", "qemu:///system", "pool-info", name])?;
+        if info.success {
+            let _ = run(&["--connect", "qemu:///system", "pool-autostart", name]);
+            if info.stdout.contains("State:") && !info.stdout.contains("State:          running") {
+                let started = run(&["--connect", "qemu:///system", "pool-start", name])?;
+                if !started.success && !started.stderr.contains("already active") {
+                    return Err(started.stderr);
+                }
+            }
+            return Ok(PoolPrepare::AlreadyPresent);
+        }
+        if !info.not_found() {
+            return Err(if info.stderr.is_empty() {
+                format!("pool-info {name} failed without an authoritative not-found")
+            } else {
+                info.stderr
+            });
+        }
+    }
+    let defined = run(&[
+        "--connect",
+        "qemu:///system",
+        "pool-define-as",
+        DEFAULT_POOL_NAME,
+        "dir",
+        "--target",
+        DEFAULT_POOL_TARGET,
+    ])?;
+    if !defined.success {
+        return Err(defined.stderr);
+    }
+    let autostart = run(&[
+        "--connect",
+        "qemu:///system",
+        "pool-autostart",
+        DEFAULT_POOL_NAME,
+    ])?;
+    if !autostart.success && !autostart.stderr.contains("already") {
+        return Err(autostart.stderr);
+    }
+    let started = run(&[
+        "--connect",
+        "qemu:///system",
+        "pool-start",
+        DEFAULT_POOL_NAME,
+    ])?;
+    if !started.success && !started.stderr.contains("already active") {
+        return Err(started.stderr);
+    }
+    Ok(PoolPrepare::Defined)
+}
+
+/// Create `/var/lib/libvirt/images` and apply [`prepare_default_storage_pool`]
+/// through live `virsh`. Best-effort: callers log and continue.
+pub fn ensure_default_storage_pool() -> Result<PoolPrepare, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = std::path::Path::new(DEFAULT_POOL_TARGET);
+    std::fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    let mut permissions = std::fs::metadata(target)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    permissions.set_mode(0o711);
+    std::fs::set_permissions(target, permissions).map_err(|error| error.to_string())?;
+    prepare_default_storage_pool(|args| {
+        let output = std::process::Command::new("virsh")
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        Ok(PoolCmd {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{find_by_id, KVM_SERVICES};
+    use super::{
+        find_by_id, prepare_default_storage_pool, PoolCmd, PoolPrepare, DEFAULT_POOL_NAME,
+        DEFAULT_POOL_TARGET, KVM_SERVICES,
+    };
 
     #[test]
     fn catalog_lists_the_node_virt_service_set() {
@@ -198,5 +321,69 @@ mod tests {
         let s = find_by_id("podman").expect("podman is in the catalog");
         assert_eq!(s.unit, "podman.socket");
         assert!(find_by_id("not-a-real-service").is_none());
+    }
+
+    #[test]
+    fn prepare_defines_the_node_virt_default_dir_pool_when_missing() {
+        let mut calls = Vec::new();
+        let result = prepare_default_storage_pool(|args| {
+            calls.push(args.join(" "));
+            if args.contains(&"pool-info") {
+                Ok(PoolCmd {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "error: Storage pool not found: no storage pool with matching name 'default'"
+                        .into(),
+                })
+            } else {
+                Ok(PoolCmd {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        })
+        .expect("missing default pool is defined");
+        assert_eq!(result, PoolPrepare::Defined);
+        assert_eq!(
+            calls,
+            vec![
+                "--connect qemu:///system pool-info mde-vms".into(),
+                format!("--connect qemu:///system pool-info {DEFAULT_POOL_NAME}"),
+                "--connect qemu:///system pool-info images".into(),
+                format!(
+                    "--connect qemu:///system pool-define-as {DEFAULT_POOL_NAME} dir --target {DEFAULT_POOL_TARGET}"
+                ),
+                format!("--connect qemu:///system pool-autostart {DEFAULT_POOL_NAME}"),
+                format!("--connect qemu:///system pool-start {DEFAULT_POOL_NAME}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_leaves_an_existing_default_pool_in_place() {
+        let result = prepare_default_storage_pool(|args| {
+            assert!(args.contains(&"pool-info") || args.contains(&"pool-autostart"));
+            Ok(PoolCmd {
+                success: true,
+                stdout: "Name:           mde-vms\nState:          running\n".into(),
+                stderr: String::new(),
+            })
+        })
+        .expect("existing pool is reused");
+        assert_eq!(result, PoolPrepare::AlreadyPresent);
+    }
+
+    #[test]
+    fn prepare_refuses_ambiguous_pool_info_failure() {
+        let error = prepare_default_storage_pool(|_| {
+            Ok(PoolCmd {
+                success: false,
+                stdout: String::new(),
+                stderr: "error: authentication unavailable".into(),
+            })
+        })
+        .expect_err("polkit failure is not a missing pool");
+        assert!(error.contains("authentication unavailable"));
     }
 }

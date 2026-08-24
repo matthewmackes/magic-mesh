@@ -214,8 +214,28 @@ fn parse_resource(raw: &str) -> Option<ResourceFact> {
 }
 
 fn probe_resource(kind: &str) -> Option<ResourceFact> {
+    probe_named_resource(kind, "default")
+}
+
+/// Storage pools the provider accepts. `mde-vms` is the managed node-virt
+/// pool; `default` and `images` are the libvirt/dir compatibility names.
+const STORAGE_POOL_CANDIDATES: &[&str] = &["mde-vms", "default", "images"];
+
+fn probe_storage_pool() -> Option<ResourceFact> {
+    let mut best = None;
+    for name in STORAGE_POOL_CANDIDATES {
+        match probe_named_resource("pool-info", name) {
+            Some(ResourceFact::Active) => return Some(ResourceFact::Active),
+            Some(other) => best = Some(other),
+            None => {}
+        }
+    }
+    best
+}
+
+fn probe_named_resource(kind: &str, name: &str) -> Option<ResourceFact> {
     let mut command = Command::new("virsh");
-    command.args(["-c", "qemu:///system", kind, "default"]);
+    command.args(["-c", "qemu:///system", kind, name]);
     let output = crate::workers::proc::output_with_timeout(
         command,
         crate::workers::proc::DEFAULT_CMD_TIMEOUT,
@@ -234,9 +254,11 @@ fn probe_resource(kind: &str) -> Option<ResourceFact> {
     let text = String::from_utf8(output.stdout).ok()?;
     let state = text.lines().find_map(|line| {
         line.split_once(':').and_then(|(key, value)| {
-            (key.trim() == "Active").then_some(if value.trim() == "yes" {
+            let key = key.trim();
+            let value = value.trim();
+            (key == "Active" || key == "State").then_some(if value == "yes" || value == "running" {
                 "active"
-            } else if value.trim() == "no" {
+            } else if value == "no" || value == "inactive" {
                 "inactive"
             } else {
                 "malformed"
@@ -244,6 +266,35 @@ fn probe_resource(kind: &str) -> Option<ResourceFact> {
         })
     })?;
     parse_resource(state)
+}
+
+fn probe_unit_show(unit: &str) -> Option<UnitFact> {
+    let mut systemctl = Command::new("systemctl");
+    systemctl.args(["show", "--property=ActiveState,UnitFileState", unit]);
+    bounded_output(systemctl).as_deref().and_then(parse_unit)
+}
+
+/// Fold monolithic `libvirtd` and Fedora modular `virtqemud` facts. Any active
+/// candidate is enough; an enabled-but-down unit beats a disabled compatibility
+/// unit so a virtqemud host is not reported Disabled just because `libvirtd`
+/// stays masked.
+fn fold_libvirt_unit_facts(facts: impl IntoIterator<Item = Option<UnitFact>>) -> Option<UnitFact> {
+    let mut saw = false;
+    let mut best = UnitFact::Disabled;
+    for fact in facts.into_iter().flatten() {
+        saw = true;
+        match fact {
+            UnitFact::Active => return Some(UnitFact::Active),
+            UnitFact::Inactive => best = UnitFact::Inactive,
+            UnitFact::Disabled => {}
+        }
+    }
+    saw.then_some(best)
+}
+
+fn gather_libvirt_unit() -> Option<UnitFact> {
+    let service = crate::kvm::find_by_id("libvirtd")?;
+    fold_libvirt_unit_facts(service.probe_units().map(probe_unit_show))
 }
 
 fn gather_virtualization(node_id: &str, now_ms: u64) -> VirtualizationProviderSnapshot {
@@ -256,13 +307,7 @@ fn gather_virtualization(node_id: &str, now_ms: u64) -> VirtualizationProviderSn
         Err(_) => None,
     };
     let kernel_module = Some(std::path::Path::new("/sys/module/kvm").is_dir());
-    let mut systemctl = Command::new("systemctl");
-    systemctl.args([
-        "show",
-        "--property=ActiveState,UnitFileState",
-        "libvirtd.service",
-    ]);
-    let libvirt = bounded_output(systemctl).as_deref().and_then(parse_unit);
+    let libvirt = gather_libvirt_unit();
     let mut virsh = Command::new("virsh");
     virsh.args(["-c", "qemu:///system", "uri"]);
     let connection = bounded_output(virsh).and_then(|raw| match raw.trim() {
@@ -270,7 +315,7 @@ fn gather_virtualization(node_id: &str, now_ms: u64) -> VirtualizationProviderSn
         _ => None,
     });
     let network = probe_resource("net-info");
-    let pool = probe_resource("pool-info");
+    let pool = probe_storage_pool();
     let (readiness, reason) =
         classify_virtualization(device, kernel_module, libvirt, connection, network, pool);
     VirtualizationProviderSnapshot {
@@ -617,6 +662,24 @@ mod tests {
             Some(ResourceFact::Active),
         );
         assert_eq!(ready.0, VirtualizationReadiness::Ready);
+        assert_eq!(
+            fold_libvirt_unit_facts([
+                Some(UnitFact::Disabled),
+                Some(UnitFact::Active),
+                Some(UnitFact::Inactive),
+            ]),
+            Some(UnitFact::Active),
+            "Fedora virtqemud must satisfy the provider even when libvirtd is disabled"
+        );
+        assert_eq!(
+            fold_libvirt_unit_facts([Some(UnitFact::Disabled), Some(UnitFact::Inactive)]),
+            Some(UnitFact::Inactive)
+        );
+        assert_eq!(
+            fold_libvirt_unit_facts([Some(UnitFact::Disabled), None]),
+            Some(UnitFact::Disabled)
+        );
+        assert_eq!(fold_libvirt_unit_facts([None, None]), None);
         let disabled = classify_virtualization(
             Some(KvmDeviceFact::Missing),
             Some(false),

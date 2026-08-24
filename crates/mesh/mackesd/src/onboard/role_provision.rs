@@ -372,6 +372,10 @@ mod tests {
             "base RPM post-install must grant known non-root seat users the audio group so PipeWire can open /dev/snd on DRM seats without logind ACLs"
         );
         assert!(
+            post_install.contains("usermod -aG libvirt \"$user\""),
+            "base RPM post-install must grant known non-root seat users the libvirt group so virsh qemu:///system works without a polkit agent"
+        );
+        assert!(
             post_install.contains("loginctl enable-linger \"$user\"")
                 && post_install.contains("systemctl start \"user@$uid.service\""),
             "base RPM post-install must keep the primary seat PipeWire user manager boot-durable"

@@ -604,10 +604,10 @@ assets = [
     { source = "install-helpers/materialize-collaboration-identity.py", dest = "/usr/libexec/mackesd/materialize-collaboration-identity.py", mode = "755" },
     { source = "packaging/systemd/mcnf-collaboration-identity.service", dest = "/usr/lib/systemd/system/mcnf-collaboration-identity.service", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-control.service.d/40-collaboration-identity.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-observation.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-observation.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-actions.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-data.service.d/40-collaboration-identity.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-integrations.service.d/40-collaboration-identity.conf", mode = "644" },
     # Browser VM RDP login is rotated per serving seat and sealed by systemd.
     # The warning helper is the mandatory five-second pre-update operator notice.
@@ -1033,6 +1033,10 @@ if getent group audio >/dev/null 2>&1; then
   for user in mm mde; do
     if id "$user" >/dev/null 2>&1; then
       usermod -aG audio "$user" >/dev/null 2>&1 || :
+      # node-virt.yml — unprivileged virsh for the seat user.
+      if getent group libvirt >/dev/null 2>&1; then
+        usermod -aG libvirt "$user" >/dev/null 2>&1 || :
+      fi
       # The compositor-less root DRM shell consumes the primary seat user's
       # PipeWire policy graph. Keep that user manager and its runtime directory
       # boot-durable so VM/RDP audio does not depend on an interactive login.
@@ -1441,10 +1445,10 @@ assets = [
     { source = "install-helpers/materialize-collaboration-identity.py", dest = "/usr/libexec/mackesd/materialize-collaboration-identity.py", mode = "755" },
     { source = "packaging/systemd/mcnf-collaboration-identity.service", dest = "/usr/lib/systemd/system/mcnf-collaboration-identity.service", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-control.service.d/40-collaboration-identity.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-observation.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-observation.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-actions.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-data.service.d/40-collaboration-identity.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-integrations.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service", dest = "/usr/lib/systemd/system/mesh-health.service", mode = "644" },
     { source = "packaging/systemd/mesh-health.timer", dest = "/usr/lib/systemd/system/mesh-health.timer", mode = "644" },
@@ -1596,10 +1600,10 @@ assets = [
     { source = "install-helpers/materialize-collaboration-identity.py", dest = "/usr/libexec/mackesd/materialize-collaboration-identity.py", mode = "755" },
     { source = "packaging/systemd/mcnf-collaboration-identity.service", dest = "/usr/lib/systemd/system/mcnf-collaboration-identity.service", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-control.service.d/40-collaboration-identity.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-observation.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-observation.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-actions.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-data.service.d/40-collaboration-identity.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
+    { source = "packaging/systemd/mackesd-collaboration-identity-optional.conf", dest = "/usr/lib/systemd/system/mackesd-compute.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mackesd-collaboration-identity.conf", dest = "/usr/lib/systemd/system/mackesd-integrations.service.d/40-collaboration-identity.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
     { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },
