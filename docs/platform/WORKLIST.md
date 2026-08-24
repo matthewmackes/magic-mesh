@@ -1759,15 +1759,14 @@ story execution contract above.
   the tree builds and runs without them; the parity ledger's retire rows cite
   the deleting revision.
 - Current state: operator Q9 signoff landed 2026-08-22. Stack deleted; S1
-  live-negative 2026-08-20 and read-only reread 2026-08-22 (all three seats
-  inactive/not-found; no kamailio/rtpengine process; evidence
-  `WL-FUNC-033-2026-08-22-fleet-negative-reread-r1.md`). Ledger retire rows
-  cite deleting revisions. README telephony bullet names the softphone path
-  only. Leftover is still keep `own_nebula_ip` in lib `voip_rtt.rs`.
-  Keep lint `install-helpers/lint-func033-keep.sh` is in ci-gate
-  POLICY_LINTS and requires a live caller (`WL-FUNC-033-2026-08-22-keep-caller-lint-r1.md`).
-- Remaining work: leftover is still keep `own_nebula_ip` in lib
-  `voip_rtt.rs`. Then:
+  live-negative 2026-08-20 and reread 2026-08-22
+  (`WL-FUNC-033-2026-08-22-fleet-negative-reread-r1.md`). Keep lint
+  `install-helpers/lint-func033-keep.sh` PASS on 2026-08-24
+  (`WL-FUNC-033-2026-08-24-keep-lint-reread-r1.md`): `own_nebula_ip` kept
+  with callers; crates/packaging have no live PBX spawn. Standing keep
+  remains in ci-gate POLICY_LINTS.
+- Remaining work: archive this epic; keep lint stays as a POLICY_LINT.
+  Previously listed S1–S3:
 
   1. S1 Confirm no live seat runs the stack.
      - Inputs: fleet inventory and systemd unit states.
