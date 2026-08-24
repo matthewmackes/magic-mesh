@@ -64,6 +64,10 @@ Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 # so a shared `/run/mde-bus` client root cannot redirect Maps to tmpfs.
 Environment=MDE_MAPS_DIR=/var/lib/mde/maps
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Root DRM shell has no login HOME. Files folder-prefs and bookmarks resolve
+# through default_config_file() → XDG_CONFIG_HOME, else HOME/.config; without
+# this pin the stores are None and persist is a no-op (WL-FUNC-026/027).
+Environment=XDG_CONFIG_HOME=/root/.config
 # The shipped root DRM shell is the only production token minter. A provisioning
 # helper installs its LoadCredentialEncrypted drop-in only after host ciphertext
 # exists; without it every live action fails closed before publishing.

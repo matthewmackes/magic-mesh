@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **19 active epics:** 19 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-23 authorized lifting the release chain that the
   2026-08-22 survey had kept Blocked. Leftovers: FUNC-023 enroll/offboard,
   REL-006 admission, then official cut/sign/publish.
@@ -27,7 +27,7 @@ tasks.
   after input generation begins, invalidate the source-bound receipts and
   repeat input   admission; never solve the dependency by weakening source
   binding.
-- **Feature-completion lane (2026-08-19):** `WL-FUNC-024` through `WL-FUNC-033`
+- **Feature-completion lane (2026-08-19):** `WL-FUNC-024` through `WL-FUNC-032`
   close the remaining gap between implementation-complete and fit for purpose —
   the Communications parity-ledger rulings that never landed, the Calls media
   plane, and the operator-flagged legacy mesh-PBX retirement. They are
@@ -236,7 +236,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   Surface is approved for `13.0.0`; Android/Cuttlefish is deferred. WL-REL-006
   is parked (freeze / catalog refs / RPM secret). Coordinator leftover is
   FUNC-023 live enroll (unpublished `13.0.0-35` is installed; freeze still
-  waits on mint + enroll/offboard) and FUNC-033 keep `own_nebula_ip`.
+  waits on mint + enroll/offboard). `WL-FUNC-033` archived 2026-08-24.
   Operator 2026-08-23 authorized Remaining so the coordinator can run the
   chain; do not grind `cargo test --workspace` as filler. Evidence:
   `WL-REL-007-2026-08-22-coordinator-park-r1.md`. Exact acceptance is Dell,
@@ -391,7 +391,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   OpenTofu farm declarations, lifecycle components, release input producers,
   packaging, evidence collectors, and publication verifiers.
 - Dependencies: WL-FUNC-023 live enroll after an unpublished signed candidate;
-  WL-FUNC-033 keep `own_nebula_ip`; parked WL-REL-006 leftovers; then the
+  parked WL-REL-006 leftovers; then the
   remaining release chain in S1-S8 order. A failed gate reopens its owning
   story rather than requesting interactive resolution.
 - Acceptance criteria: one clean source produces exactly six signed roles;
@@ -418,11 +418,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover (1) bearer dest and leftover (2) dest-env child
   exist under `/root/mcnf-private/`. Leftover (3) ran on Seat 15: dest-signed
-  `leave`, then `join`
-  with DER enroll-endpoint pin. Overlay `10.42.0.5` rematerialized;
-  `nebula.service` is active. Confirmation dest
-  `lifecycle-confirmation-ed25519` `0600`. Evidence:
-  `WL-FUNC-023-2026-08-23-leftover3-offboard-reenroll-r1.md`.
+  `leave`, then `join` with DER enroll-endpoint pin. Overlay `10.42.0.5`
+  rematerialized; `nebula.service` is active. 2026-08-24: lighthouse
+  `104.236.118.177:4242` closed from control host; Seat 15 overlay ping to
+  `.1` and Surface `.7` fails; Surface handshake to LH times out. Evidence:
+  `WL-FUNC-023-2026-08-23-leftover3-offboard-reenroll-r1.md`,
+  `WL-FUNC-023-2026-08-24-lighthouse-handshake-down-r1.md`.
   `production_admitted: false`.
 - Remaining work: S1-S18 Luna execute still listed. Current-tree
   `enroll --token-stdin` now uses fingerprint-pinned `join`
@@ -1435,8 +1436,8 @@ story execution contract above.
   (identical SHA) and OPEN-hydrated at `surfaces`. No GUI click (no capture
   dest). Evidence: `WL-FUNC-026-2026-08-24-seat15-folder-prefs-r1.md`.
 - Remaining work: leftover is operator GUI view/sort/hidden then restart on a
-  current-revision seat (dest hydrate is not operator use). RPM unit still
-  omits `XDG_CONFIG_HOME`; Seat 15 has a local drop-in dest.
+  current-revision seat (dest hydrate is not operator use). Packaged DRM unit
+  now pins `XDG_CONFIG_HOME=/root/.config`; Seat 15 also has a local drop-in.
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
@@ -1479,8 +1480,8 @@ story execution contract above.
   and OPEN-hydrated at `surfaces`. No pin/navigate GUI (no capture dest).
   Evidence: `WL-FUNC-027-2026-08-24-seat15-bookmarks-r1.md`.
 - Remaining work: leftover is operator pin then restart/navigate on a
-  current-revision seat (dest hydrate is not operator use). RPM unit still
-  omits `XDG_CONFIG_HOME`; Seat 15 has a local drop-in dest.
+  current-revision seat (dest hydrate is not operator use). Packaged DRM unit
+  now pins `XDG_CONFIG_HOME=/root/.config`; Seat 15 also has a local drop-in.
   1. S1 Add the bookmark store and sidebar section.
      - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
        Places render path.
@@ -1758,66 +1759,3 @@ story execution contract above.
   @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger
   (build-new:reserve-transfer-hotkeys).
-
-### WL-FUNC-033 - Retire the legacy mesh-PBX stack and dead parity rows
-
-- Status: Remaining
-- Priority: P2
-- Complexity: Large
-- Problem: the operator-confirmed-dead Kamailio/RTPengine mesh-PBX stack and
-  several orphaned modules still ship and spawn, carrying config writers, a
-  worker, a CLI verb, and systemd units that the pure-Rust softphone and
-  Communications Calls never touch.
-- Required outcome: the retired stack and dead rows are deleted in one sweep;
-  the tree builds and runs without them; the parity ledger's retire rows cite
-  the deleting revision.
-- Current state: operator Q9 signoff landed 2026-08-22. Stack deleted; S1
-  live-negative 2026-08-20 and reread 2026-08-22
-  (`WL-FUNC-033-2026-08-22-fleet-negative-reread-r1.md`). Keep lint
-  `install-helpers/lint-func033-keep.sh` PASS on 2026-08-24
-  (`WL-FUNC-033-2026-08-24-keep-lint-reread-r1.md`): `own_nebula_ip` kept
-  with callers; crates/packaging have no live PBX spawn. Standing keep
-  remains in ci-gate POLICY_LINTS.
-- Remaining work: archive this epic; keep lint stays as a POLICY_LINT.
-  Previously listed S1–S3:
-
-  1. S1 Confirm no live seat runs the stack.
-     - Inputs: fleet inventory and systemd unit states.
-     - Action: verify no enrolled seat runs kamailio-mde or rtpengine-mde for
-       real SIP before deletion (the ledger's pre-deploy check).
-     - Deliverable: a recorded fleet-wide negative.
-     - Validation: any positive finding parks this epic again.
-     - Done when: the check is evidence-cited.
-  2. S2 Delete the mesh-PBX stack.
-     - Inputs: the S1 evidence.
-     - Action: remove the crate, voice modules, worker, CLI verb, and units;
-       drop workspace membership and packaging references.
-     - Deliverable: a tree with no Kamailio/RTPengine path.
-     - Validation: build, clippy, and the full farm gate pass; no spawn site
-       or seed topic references the deleted pieces.
-     - Done when: greps for the deleted modules return only archive and
-       ledger references.
-  3. S3 Delete the orphaned and never-wired rows.
-     - Inputs: ledger Q10, Q13, Q29, and Q33 retire rulings.
-     - Action: remove roster.rs and resolve.rs, and the dead View arms with
-       their list() branches and responders (keeping fleet-files, files-inbox,
-       and file-ops). SendToEntry is Toolbar + ContextMenu only. Keep
-       `own_nebula_ip` in lib `voip_rtt.rs`.
-     - Deliverable: no orphan module remains.
-     - Validation: the full farm gate passes; the retained responders'
-       contract tests stay green.
-     - Done when: the parity ledger's retire rows cite the deleting
-       revision (landed). Leftover is `own_nebula_ip` (keep).
-- Scope: deletion only; no replacement security or policy surface.
-- Relevant files/components: the paths named in Current state plus packaging
-  and systemd references.
-- Dependencies: Q9 signed 2026-08-22; re-confirm the 2026-08-20 fleet-negative
-  before deleting remaining voip_rtt spawn sites.
-- Acceptance criteria: the workspace builds and gates green without the
-  deleted stack; no live reference remains; the ledger cites the revision.
-- Verification method: focused mackesd farm gate plus module-reference greps
-  recorded in evidence. @farm:{cargo test -p mackesd}
-  @leftover:{keep}
-- Origin or merged source IDs: WL-FUNC-011 parity ledger Q9, Q10, Q13, Q29,
-  and Q33 retire rulings.
-

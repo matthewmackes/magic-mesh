@@ -446,8 +446,9 @@ mod tests {
         let seat_unit = include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service");
         assert!(
             seat_unit.contains("Environment=XDG_RUNTIME_DIR=/run/user/1000")
+                && seat_unit.contains("Environment=XDG_CONFIG_HOME=/root/.config")
                 && seat_unit.contains("Wants=user@1000.service"),
-            "the root DRM shell must connect to the persistent primary seat PipeWire graph"
+            "the root DRM shell must connect to the persistent primary seat PipeWire graph and pin Files persist"
         );
         assert!(
             post_install.contains("/etc/systemd/system/mde-shell.service")
