@@ -204,6 +204,7 @@ struct HealthObservations {
     xdg_downloads_bound: bool,
     collab_identity_admitted: bool,
     grouped_mackesd_installed: bool,
+    node_virt_active: bool,
 }
 
 trait HealthSampler: Send {
@@ -435,6 +436,11 @@ impl HealthSampler for SystemSampler {
                 crate::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE,
             )
             .is_file(),
+            node_virt_active: self.role != "workstation"
+                || Command::new("systemctl")
+                    .args(["is-active", "--quiet", "mcnf-node-virt.service"])
+                    .status()
+                    .is_ok_and(|status| status.success()),
         }
     }
 }
@@ -789,7 +795,31 @@ fn evaluate_conditions(
             HealthSeverity::Warning,
             "Collaboration identity is not admitted. Open Onboarding; do not copy another node's receipt.",
             now_ms,
-            Vec::new(),
+            vec![remediation(
+                host,
+                HealthAction::OpenOnboarding,
+                generation,
+                "Open Onboarding and Offboarding to admit this node's signed identity receipt.",
+                true,
+            )],
+        ));
+    }
+    if observations.role == "workstation" && !observations.node_virt_active {
+        conditions.push(condition(
+            host,
+            "node-virt-inactive",
+            HealthComponent::System,
+            "mcnf-node-virt",
+            HealthSeverity::Warning,
+            "The node virt stack is not active; Browser VM cannot start.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::StartNodeVirt,
+                generation,
+                "Enable and start mcnf-node-virt so KVM/libvirt and mm sudo are prepared.",
+                true,
+            )],
         ));
     }
     if let Some(used) = observations.resources.root_used_pct {
@@ -1838,6 +1868,15 @@ fn execute_action(
             "systemctl",
             &["start", LIFECYCLE_FIRSTBOOT_UNIT],
             "lifecycle first-boot retry started",
+        ),
+        HealthAction::StartNodeVirt => run_checked(
+            "systemctl",
+            &["enable", "--now", "mcnf-node-virt.service"],
+            "node virt stack enabled and started",
+        ),
+        HealthAction::OpenOnboarding => Err(
+            "collaboration identity requires Construct Onboarding; the shell launches magic-setup"
+                .into(),
         ),
         HealthAction::Acknowledge | HealthAction::SnoozeOneHour => {
             Ok("condition state updated".into())
@@ -3108,6 +3147,7 @@ mod tests {
             xdg_downloads_bound: true,
             collab_identity_admitted: true,
             grouped_mackesd_installed: false,
+            node_virt_active: true,
             device_inventory: Some(DeviceInventory {
                 host: "node".into(),
                 published_at_ms: 100,
@@ -3529,7 +3569,20 @@ mod tests {
                     .any(|action| action.action == HealthAction::RecoverXdgBinds)
         }));
         assert!(conditions.iter().any(|condition| {
-            condition.id == "node:collab-identity-missing" && condition.remediation.is_empty()
+            condition.id == "node:collab-identity-missing"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::OpenOnboarding)
+        }));
+        sample.node_virt_active = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(conditions.iter().any(|condition| {
+            condition.id == "node:node-virt-inactive"
+                && condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::StartNodeVirt)
         }));
     }
 

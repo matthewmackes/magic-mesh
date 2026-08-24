@@ -120,6 +120,22 @@ pub fn units_for_role(role: Role) -> Vec<&'static str> {
         .collect()
 }
 
+/// Units `join` / `found` must enable after network enrollment.
+///
+/// When the RPM ships the grouped plane, never enable the retired monolithic
+/// `mackesd.service`. Thin lighthouses without that unit file still enable it.
+#[must_use]
+pub fn control_plane_enable_units(grouped_control_unit_file_present: bool) -> Vec<&'static str> {
+    let mut units = Vec::new();
+    if grouped_control_unit_file_present {
+        units.extend(GROUPED_MACKESD_UNITS);
+    } else {
+        units.push("mackesd.service");
+    }
+    units.push("mesh-health.timer");
+    units
+}
+
 /// Injectable seam over the two systemd operations, so [`apply`] is testable
 /// without a live systemd. Production wires [`SystemctlUnits`]; tests pass a fake.
 ///
@@ -325,6 +341,23 @@ mod tests {
         assert!(workstation.contains(&"podman.socket"));
         assert!(workstation.contains(&"mcnf-node-virt.service"));
         assert!(!lighthouse.contains(&"virtqemud.socket"));
+    }
+
+    #[test]
+    fn control_plane_enable_units_follow_the_grouped_rpm() {
+        assert_eq!(
+            control_plane_enable_units(false),
+            vec!["mackesd.service", "mesh-health.timer"]
+        );
+        let grouped = control_plane_enable_units(true);
+        assert!(!grouped.contains(&"mackesd.service"));
+        for unit in GROUPED_MACKESD_UNITS {
+            assert!(
+                grouped.contains(&unit),
+                "grouped join/found must enable {unit}"
+            );
+        }
+        assert_eq!(grouped.last().copied(), Some("mesh-health.timer"));
     }
 
     #[test]

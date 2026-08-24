@@ -203,8 +203,13 @@ fn run_inner(
     // SETUP-7 — capture the founding facts for idempotent re-convergence.
     emit_site_yml_best_effort(parsed.as_str(), mesh_id, vec![report.overlay_ip.clone()]);
 
-    enable_now_service("mackesd.service");
-    enable_now_service("mesh-health.timer");
+    let grouped = std::path::Path::new(
+        mackesd_core::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE,
+    )
+    .is_file();
+    for unit in mackesd_core::onboard::role_provision::control_plane_enable_units(grouped) {
+        enable_now_service(unit);
+    }
 
     println!(
         "mesh `{}` founded — lighthouse {} ({})",

@@ -1,6 +1,8 @@
 //! Centered System and Mesh Health modal.
 
+use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2013,8 +2015,42 @@ fn publish_action_for_ui(
     action: HealthAction,
     confirmed: bool,
 ) {
+    if action == HealthAction::OpenOnboarding {
+        let outcome =
+            match authorize_modal_action(snapshot, condition, node, action, confirmed, now_ms()) {
+                Err(error) => ActionPublishOutcome::Failed(error),
+                Ok(_) => match launch_onboarding() {
+                    Ok(()) => {
+                        chrome.health_pending_action = None;
+                        return;
+                    }
+                    Err(_) => ActionPublishOutcome::Failed(ActionPublishFailure::PersistWrite),
+                },
+            };
+        apply_action_outcome(ctx, chrome, confirmed, outcome);
+        return;
+    }
     let outcome = publish_action(snapshot, condition, node, action, confirmed);
     apply_action_outcome(ctx, chrome, confirmed, outcome);
+}
+
+fn launch_onboarding() -> Result<(), String> {
+    let path = Path::new("/usr/bin/magic-setup");
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err("onboarding executable is missing or unsafe".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err("onboarding executable is not runnable".into());
+        }
+    }
+    Command::new(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn publish_action(
@@ -2157,6 +2193,8 @@ const fn action_label(action: HealthAction) -> &'static str {
         HealthAction::SetupEtcdClient => "Configure etcd client",
         HealthAction::RecoverXdgBinds => "Restore mesh Downloads binds",
         HealthAction::RunLifecycleFirstboot => "Retry first-boot convergence",
+        HealthAction::OpenOnboarding => "Open Onboarding",
+        HealthAction::StartNodeVirt => "Start node virt stack",
     }
 }
 
@@ -2731,6 +2769,8 @@ mod tests {
             HealthAction::SetupEtcdClient,
             HealthAction::RecoverXdgBinds,
             HealthAction::RunLifecycleFirstboot,
+            HealthAction::OpenOnboarding,
+            HealthAction::StartNodeVirt,
         ] {
             assert!(!action_label(action).is_empty());
         }

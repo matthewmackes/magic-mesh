@@ -1151,6 +1151,8 @@ pub enum HealthAction {
     SetupEtcdClient,
     RecoverXdgBinds,
     RunLifecycleFirstboot,
+    OpenOnboarding,
+    StartNodeVirt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

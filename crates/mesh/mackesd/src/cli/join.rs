@@ -410,6 +410,7 @@ fn finish_network_enrollment<R, E>(
     bundle: &mackesd_core::ca::bundle::NebulaBundle,
     runner: &R,
     mut enable_service: E,
+    grouped_mackesd: bool,
 ) -> anyhow::Result<Option<WorkstationSetupState>>
 where
     R: SetupCommandRunner,
@@ -419,12 +420,15 @@ where
     // the control daemon and health watchdog before optional role-specific
     // helpers so a helper failure cannot strand a signed node without its
     // essential recovery services.
-    enable_service("mackesd.service");
-    enable_service("mesh-health.timer");
+    for unit in mackesd_core::onboard::role_provision::control_plane_enable_units(grouped_mackesd) {
+        enable_service(unit);
+    }
 
     if role != mde_role::Role::Workstation {
         return Ok(None);
     }
+
+    enable_service("mcnf-node-virt.service");
 
     setup_workstation_substrate(bundle, runner)
         .map(Some)
@@ -708,6 +712,10 @@ fn run_inner(
         &bundle,
         &SystemSetupCommandRunner,
         enable_now_service,
+        std::path::Path::new(
+            mackesd_core::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE,
+        )
+        .is_file(),
     )?;
 
     println!(
@@ -813,7 +821,7 @@ fn lighthouse_join_etcd(bundle: &mackesd_core::ca::bundle::NebulaBundle, self_na
 /// warning until the operator provisions it by hand per the unit
 /// comment).
 fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
-    use mackesd_core::ca::backup_provision::{ProvisionOutcome, provision};
+    use mackesd_core::ca::backup_provision::{provision, ProvisionOutcome};
     match provision(role) {
         Ok(ProvisionOutcome::Provisioned { sealed_bytes }) => {
             // Log presence/length only — NEVER the passphrase value.
@@ -923,6 +931,7 @@ mod tests {
             &bundle(&[("peer:lh1", "10.42.0.1")]),
             &runner,
             |service| services.push(service.to_string()),
+            false,
         )
         .expect("Lighthouse finalization");
         assert_eq!(state, None);
@@ -981,6 +990,7 @@ mod tests {
             &bundle(&[("peer:lh1", "10.42.0.1")]),
             &runner,
             |service| services.push(service.to_string()),
+            false,
         )
         .expect_err("required etcd setup fails")
         .to_string();
@@ -989,7 +999,8 @@ mod tests {
             services,
             vec![
                 "mackesd.service".to_string(),
-                "mesh-health.timer".to_string()
+                "mesh-health.timer".to_string(),
+                "mcnf-node-virt.service".to_string(),
             ]
         );
         assert_eq!(runner.invocations.borrow().len(), 1);
@@ -1005,6 +1016,39 @@ mod tests {
         assert!(
             !error.contains("mesh:"),
             "diagnostic exposed a token shape: {error}"
+        );
+    }
+
+    #[test]
+    fn grouped_workstation_enables_the_shipped_mackesd_plane_and_virt() {
+        let runner = FakeRunner::new(vec![Ok(()), Ok(())]);
+        let mut services = Vec::new();
+        let state = finish_network_enrollment(
+            mde_role::Role::Workstation,
+            &bundle(&[("peer:lh1", "10.42.0.1")]),
+            &runner,
+            |service| services.push(service.to_string()),
+            true,
+        )
+        .expect("grouped workstation finalization")
+        .expect("workstation setup state");
+        assert_eq!(state, WorkstationSetupState::Ready);
+        assert_eq!(
+            services,
+            vec![
+                "mackesd-control.service".to_string(),
+                "mackesd-observation.service".to_string(),
+                "mackesd-actions.service".to_string(),
+                "mackesd-data.service".to_string(),
+                "mackesd-compute.service".to_string(),
+                "mackesd-integrations.service".to_string(),
+                "mesh-health.timer".to_string(),
+                "mcnf-node-virt.service".to_string(),
+            ]
+        );
+        assert!(
+            !services.iter().any(|unit| unit == "mackesd.service"),
+            "grouped join must not enable the retired monolithic unit"
         );
     }
 
