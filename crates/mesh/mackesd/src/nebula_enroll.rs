@@ -166,6 +166,13 @@ pub fn parse_join_token(raw: &str) -> Option<JoinToken> {
     })
 }
 
+/// True when `enroll --token-stdin` must use the fingerprint-pinned
+/// `join` path. The replicated-file CSR path is retired.
+#[must_use]
+pub fn token_uses_join_path(raw: &str) -> bool {
+    parse_join_token(raw).is_some_and(|token| token.fp.is_some())
+}
+
 fn is_mesh_id_url_safe(s: &str) -> bool {
     s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -1152,6 +1159,9 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         assert_eq!(tok.fp.as_deref(), Some(fp.as_str()));
         // encode() reproduces the `?fp=` suffix verbatim.
         assert_eq!(tok.encode(), raw);
+        assert!(token_uses_join_path(&raw));
+        assert!(!token_uses_join_path("mesh:mesh-001@10.0.0.5:4242#bearer"));
+        assert!(!token_uses_join_path("not a token"));
     }
 
     #[test]

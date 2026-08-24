@@ -28,7 +28,7 @@ pub fn run(
         } else {
             token
         };
-        let display = name.unwrap_or_else(|| {
+        let display = name.clone().unwrap_or_else(|| {
             std::env::var("HOSTNAME").unwrap_or_else(|_| {
                 {
                     let mut hostname = std::process::Command::new("hostname");
@@ -78,39 +78,20 @@ pub fn run(
                 }
             }
             (None, Some(tok)) => {
-                // NF-3.6.a — v2.5 Nebula join-token flow.
-                let workgroup_root =
-                    workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
-                let node_id = default_node_id();
-                eprintln!(
-                    "mackesd enroll: publishing CSR + waiting up to {} s \
-                         for the lighthouse to sign…",
-                    mackesd_core::nebula_enroll::ENROLL_WAIT_TIMEOUT.as_secs(),
-                );
-                match mackesd_core::nebula_enroll::enroll_with_token(
-                    &workgroup_root,
-                    &node_id,
-                    &display,
-                    &tok,
-                ) {
-                    Ok(outcome) => {
-                        println!(
-                            "enrolled into mesh '{}' as {} (overlay {}) after {} s.",
-                            outcome.mesh_id,
-                            node_id,
-                            outcome.overlay_ip,
-                            outcome.waited.as_secs(),
-                        );
-                        eprintln!(
-                            "nebula_supervisor will materialize /etc/nebula/ \
-                                 from the bundle on its next reconcile tick."
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("mackesd enroll: {e}");
-                        std::process::exit(2);
-                    }
+                let _ = display;
+                // Leftover-3: installed `enroll --token-stdin` must take the
+                // same fingerprint-pinned join path. The CSR publish path is
+                // retired and cannot authenticate cert or trust-pin delivery.
+                if mackesd_core::nebula_enroll::token_uses_join_path(&tok) {
+                    eprintln!("mackesd enroll: join-token carries a TLS pin — using join");
+                    return crate::cli::join::run(Some(tok), None, name, workgroup_root);
                 }
+                eprintln!(
+                    "mackesd enroll: replicated-file enrollment is retired; \
+                     use a join token with a TLS fingerprint \
+                     (mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>)"
+                );
+                std::process::exit(2);
             }
         }
     }

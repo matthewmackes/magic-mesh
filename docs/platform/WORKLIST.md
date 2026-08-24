@@ -424,9 +424,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `lifecycle-confirmation-ed25519` `0600`. Evidence:
   `WL-FUNC-023-2026-08-23-leftover3-offboard-reenroll-r1.md`.
   `production_admitted: false`.
-- Remaining work: S1-S18 Luna execute still listed. Installed
-  `enroll --token-stdin` is the retired CSR path; live leftover (3) used
-  current-tree `join`. Do not flip `production_admitted`.
+- Remaining work: S1-S18 Luna execute still listed. Current-tree
+  `enroll --token-stdin` now uses fingerprint-pinned `join`
+  (`WL-FUNC-023-2026-08-23-enroll-token-joins-r1.md`; farm
+  `nebula_enroll` 102/102). Installed 13.0.0-35 still has the retired
+  CSR stub. Do not flip `production_admitted`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -1352,15 +1354,19 @@ story execution contract above.
 - Required outcome: every lock-1 operation is reachable from the Files menubar
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
-- Current state: S1-S3 surface wiring is in-tree. Q26: Files stays its own OS
-  surface. Read-only 2026-08-23: no Files persist files on Dell, Seat 15, or
-  Surface; seats run unpublished `magic-mesh-13.0.0-35`. Leftover is live
-  mesh-tree and archive-queue evidence. Evidence:
-  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is live seat Files (local/mesh + archive-queue).
-  Farm fixture mesh-path + zip/tar.gz extract is
+- Current state: S1-S3 surface wiring is in-tree and in installed `7e3474ee`
+  (`13.0.0-35`). Q26: Files stays its own OS surface. Read-only 2026-08-23:
+  Construct running on Dell, Seat 15, and Surface; no Files persist, no
+  `/run/user/*/mde-mesh`, no `state/mesh-mount` topics, no archive-queue
+  persist. Seat 15 has no data-group `mesh_mount`. Fixtures do not close.
+  Evidence: `WL-FUNC-025-2026-08-23-live-seat-files-archive-r1.md`.
+- Remaining work: leftover is live seat Files (local/mesh + archive-queue) on
+  a current-revision seat. Installed `13.0.0-35` matches current-tree
+  menubar/view/dialogs; farm fixture mesh-path + zip/tar.gz extract is
   `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md` (`208/208`
-  `mde-files-egui`). Fixtures do not close the live leftover.
+  `mde-files-egui`). Live probe is
+  `WL-FUNC-025-2026-08-23-live-seat-files-archive-r1.md`. Fixtures do not
+  close the live leftover.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
@@ -1503,12 +1509,18 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: Dell `mm` add of `leftover-028` succeeded after a 1777 inbox
-  (no sudo on add). Store shows `last_result=done` and `next_run_ms`. Worker
-  `ensure_operator_inbox` now creates that inbox on start. Evidence:
-  `WL-FUNC-028-2026-08-23-live-sync-pair-next-run-r1.md`.
-- Remaining work: leftover is live Construct Transfers on a seat. In-tree
-  editor now matches the CLI producer
+- Current state: Dell leftover-028 still in store (`last_result=done`,
+  `next_run_ms`, `peer_reachable=true`). dest-cut `13.0.0-35` Construct is
+  running and ships the Transfers editor plus inbox drain. Honest gap: no
+  live GUI paint/click (no graphical seat/capture dest); dest-cut editor is
+  not CLI-parity (in-tree `43459f809` is). Worker Bus notify recorded the
+  leftover-028 rsync `done`. Evidence:
+  `WL-FUNC-028-2026-08-23-live-construct-transfers-gap-r1.md`.
+- Remaining work: leftover is live Construct Transfers paint/click on a
+  current-revision seat. dest-cut `13.0.0-35` ships the editor but is not
+  CLI-parity and has no graphical seat/capture dest
+  (`WL-FUNC-028-2026-08-23-live-construct-transfers-gap-r1.md`). In-tree
+  editor matches CLI
   (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`; farm
   `181/181` `mde-collab-egui`). Inbox unit passed on `.196`.
   1. S1 Add the CLI producer.
@@ -1701,12 +1713,12 @@ story execution contract above.
 - Required outcome: Ctrl+J opens Communications Transfers from any Construct
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
-- Current state: catalog + apply refuse landed. Leftover is live-surface
-  proof from every Construct surface. Seats run unpublished
-  `magic-mesh-13.0.0-35`. Evidence:
-  `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is live-surface proof from every Construct
-  surface, not a missing binding.
+- Current state: catalog + apply refuse landed in-tree and on dest-cut
+  `13.0.0-35` (same hotkeys.rs as HEAD). Dell binary catalogs Ctrl+J /
+  Ctrl+N. Leftover is live keystroke from every Construct surface.
+  Evidence: `WL-FUNC-032-2026-08-23-installed-hotkeys-catalog-r1.md`.
+- Remaining work: leftover is live-surface keystroke proof, not a
+  missing binding.
   1. S1 Register both bindings.
      - Inputs: the hotkeys.rs table and the Communications mode router.
      - Action: bind Ctrl+J to Surface::Communications in Transfers mode and
