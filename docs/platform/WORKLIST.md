@@ -1520,20 +1520,21 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: Dell leftover-028 still in store (`last_result=done`,
-  `next_run_ms`, `peer_reachable=true`). dest-cut `13.0.0-35` Construct is
-  running and ships the Transfers editor plus inbox drain. Honest gap: no
-  live GUI paint/click (no graphical seat/capture dest); dest-cut editor is
-  not CLI-parity (in-tree `43459f809` is). Worker Bus notify recorded the
-  leftover-028 rsync `done`. Evidence:
-  `WL-FUNC-028-2026-08-23-live-construct-transfers-gap-r1.md`.
-- Remaining work: leftover is live Construct Transfers paint/click on a
-  current-revision seat. dest-cut `13.0.0-35` ships the editor but is not
-  CLI-parity and has no graphical seat/capture dest
-  (`WL-FUNC-028-2026-08-23-live-construct-transfers-gap-r1.md`). In-tree
-  editor matches CLI
-  (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`; farm
-  `181/181` `mde-collab-egui`). Inbox unit passed on `.196`.
+- Current state: Seat 15 dest-cut `13.0.0-35` (`7e3474eeb`) Construct pid
+  `476582` holds DRM and ships the Transfers editor (`No sync pairs saved.`,
+  dest-cut `malformed pair id`). CLI `sync-pair add|remove|list` present;
+  `list --json` is `[]`; inbox absent (`/var/lib/mde/transfers` `root:root`
+  `0755`). Worker heartbeat `running`; `event/notify/transfers` count 0. No
+  grim/Moonlight; Sunshine binary present with no unit/process. leftover-028
+  remains Dell-only. Evidence: `WL-FUNC-028-2026-08-24-live-transfers-r1.md`.
+- Remaining work: leftover is still live Construct Transfers paint/click on a
+  current-revision seat. Seat 15 is a used DRM Construct with Keychron/MS116
+  input but no capture dest and an empty store (Dell leftover-028 is not
+  here). dest-cut editor is not CLI-parity; in-tree `43459f809` matches CLI
+  (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`; farm `181/181`
+  `mde-collab-egui`). Seat 15 probe:
+  `WL-FUNC-028-2026-08-24-live-transfers-r1.md`. Creating an inbox, adding a
+  pair, starting Sunshine, or injecting Ctrl+J would invent dests.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
@@ -1629,12 +1630,16 @@ story execution contract above.
 - Required outcome: Communications Activity owns gateway configuration; the
   responder and gateway.toml contract stay unchanged; the existing workgroup
   gateway.toml migrates in place.
-- Current state: gateway form / in-place hydrate landed. Read-only 2026-08-22:
-  no `gateway.toml` on Dell, Seat 15, or Surface. Seats now run unpublished
-  `magic-mesh-13.0.0-35`. Leftover is live Bus + migrated workgroup toml.
-  Evidence: `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
-- Remaining work: leftover is live Bus + migrated workgroup toml, not a
-  missing GUI publisher.
+- Current state: gateway form / in-place hydrate landed. 2026-08-24 16:25Z:
+  no `gateway.toml` and no `/mnt/mesh-storage/voip/` on Seat 15 or Surface.
+  Seat 15 `mackesd-actions` thread `voip-bus-responder` is up; Surface
+  actions/control/data/integrations stay inactive. No
+  `action/voip/{set,get,clear}-gateway` spool. Unpublished `13.0.0-35`.
+  Leftover is live Bus + migrated toml.
+  Evidence: `WL-FUNC-030-2026-08-24-live-gateway-r1.md`.
+- Remaining work: leftover is live Bus set/get/clear plus a migrated
+  workgroup `gateway.toml`, not a missing GUI publisher. No credentials
+  were invented; no set-gateway was published.
   1. S1 Gateway section in Activity.
      - Inputs: the three verb bodies and redaction contract in ipc/voip.rs.
      - Action: a bounded gateway form (host, port, credentials) publishing
