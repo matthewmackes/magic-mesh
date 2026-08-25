@@ -71,6 +71,8 @@ const DEVICE_INVENTORY_VALIDITY_MS: u64 = 10 * 60 * 1_000;
 const AUDIO_PROOF_PATH: &str = "/var/lib/mackesd/health/audio-proof.json";
 const OVERLAY_IP_PATH: &str = "/var/lib/mackesd/nebula/overlay-ip";
 const COLLAB_IDENTITY_ADMISSION: &str = "/var/lib/mackesd/collaboration-identity-admission.json";
+const ACTIVE_NEBULA_HOST_CERT: &str = "/etc/nebula/identity/current/host.crt";
+const LEGACY_NEBULA_HOST_CERT: &str = "/etc/nebula/host.crt";
 const MM_DOWNLOADS: &str = "/home/mm/Downloads";
 const SETUP_ETCD: &str = "/usr/libexec/mackesd/setup-etcd";
 const HEALTH_TOAST_TOPIC: &str = "event/toast/show";
@@ -214,6 +216,7 @@ struct HealthObservations {
     device_inventory: Option<DeviceInventory>,
     overlay_ip_published: bool,
     live_overlay_ip: bool,
+    nebula_host_cert_present: bool,
     etcd_endpoints_present: bool,
     firstboot_pending: bool,
     xdg_downloads_bound: bool,
@@ -446,12 +449,13 @@ impl HealthSampler for SystemSampler {
             device_inventory: device_inventory::read_inventory(&self.workgroup_root, &self.host),
             overlay_ip_published: overlay_ip_file_ready(),
             live_overlay_ip: crate::voip_rtt::own_nebula_ip().is_some(),
+            nebula_host_cert_present: live_nebula_host_cert_present(),
             etcd_endpoints_present: etcd_endpoints_ready(),
             firstboot_pending: Path::new(crate::onboard::firstboot::DEFAULT_MARKER_DIR)
                 .join(crate::onboard::firstboot::FIRSTBOOT_PENDING)
                 .is_file(),
             xdg_downloads_bound: self.role != "workstation" || xdg_downloads_bound(),
-            collab_identity_admitted: Path::new(COLLAB_IDENTITY_ADMISSION).is_file(),
+            collab_identity_admitted: collab_identity_matches_installed(),
             grouped_mackesd_installed: Path::new(
                 crate::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE,
             )
@@ -467,8 +471,7 @@ impl HealthSampler for SystemSampler {
             browser_vm_defined: self.role != "workstation"
                 || Path::new(BROWSER_VM_DOMAIN).is_file(),
             browser_vm_running: self.role != "workstation" || Path::new(BROWSER_VM_PID).is_file(),
-            mesh_storage_present: self.role != "workstation"
-                || Path::new(MESH_STORAGE_PATH).is_dir(),
+            mesh_storage_present: self.role != "workstation" || mesh_storage_mounted(),
         }
     }
 }
@@ -501,6 +504,38 @@ fn overlay_ip_file_ready() -> bool {
     std::fs::read_to_string(OVERLAY_IP_PATH)
         .ok()
         .is_some_and(|body| !body.trim().is_empty())
+}
+
+fn live_nebula_host_cert_present() -> bool {
+    Path::new(ACTIVE_NEBULA_HOST_CERT).is_file() || Path::new(LEGACY_NEBULA_HOST_CERT).is_file()
+}
+
+fn collab_identity_matches_installed() -> bool {
+    std::fs::read(COLLAB_IDENTITY_ADMISSION)
+        .ok()
+        .is_some_and(|body| {
+            collab_identity_matches_body(&body, mde_theme::brand::build::info().git_hash)
+        })
+}
+
+fn collab_identity_matches_body(body: &[u8], expected_revision: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("source_revision")
+                .and_then(|revision| revision.as_str())
+                .map(|revision| revision == expected_revision)
+        })
+        .unwrap_or(false)
+}
+
+fn mesh_storage_mounted() -> bool {
+    Path::new(MESH_STORAGE_PATH).is_dir()
+        && Command::new("mountpoint")
+            .args(["-q", MESH_STORAGE_PATH])
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 fn etcd_endpoints_ready() -> bool {
@@ -681,6 +716,9 @@ fn evaluate_conditions(
         ));
     }
     for service in required_services(&observations.role, &observations.assigned_capabilities) {
+        if observations.grouped_mackesd_installed && matches!(service, "mackesd" | "dns" | "kdc") {
+            continue;
+        }
         if observations.services.get(service) != Some(&true) {
             let action = restart_action(service).into_iter().map(|action| {
                 remediation(
@@ -757,6 +795,27 @@ fn evaluate_conditions(
                 generation,
                 "Rewrite overlay-ip from the live nebula1 address.",
                 false,
+            )],
+        ));
+    }
+    if observations.role == "workstation"
+        && (!observations.nebula_host_cert_present
+            || (!observations.live_overlay_ip && !observations.overlay_ip_published))
+    {
+        conditions.push(condition(
+            host,
+            "overlay-identity-missing",
+            HealthComponent::Mesh,
+            "nebula-host-cert",
+            HealthSeverity::Critical,
+            "This seat has no live overlay identity; enroll through Onboarding. Do not rewrite overlay-ip without nebula1.",
+            now_ms,
+            vec![remediation(
+                host,
+                HealthAction::OpenOnboarding,
+                generation,
+                "Open Onboarding to enroll this seat and write host cert, overlay-ip, and grouped plane.",
+                true,
             )],
         ));
     }
@@ -915,13 +974,13 @@ fn evaluate_conditions(
             HealthComponent::System,
             "syncthing-folder",
             HealthSeverity::Critical,
-            "Governed file-plane path /mnt/mesh-storage is missing; Syncthing cannot share workgroup files.",
+            "Governed file-plane path /mnt/mesh-storage is not mounted; Syncthing cannot share workgroup files.",
             now_ms,
             vec![remediation(
                 host,
-                HealthAction::SetupSyncthing,
+                HealthAction::OpenOnboarding,
                 generation,
-                "Run packaged setup-syncthing --listen <live overlay IP>; the helper is idempotent.",
+                "Open Onboarding; /mnt/mesh-storage must already be a bind or block mount. Do not invent that dest.",
                 true,
             )],
         ));
@@ -3328,6 +3387,7 @@ mod tests {
             firmware_refresh_failed: false,
             overlay_ip_published: true,
             live_overlay_ip: true,
+            nebula_host_cert_present: true,
             etcd_endpoints_present: true,
             firstboot_pending: false,
             xdg_downloads_bound: true,
@@ -3714,6 +3774,69 @@ mod tests {
             .remediation
             .iter()
             .any(|action| action.action == HealthAction::PublishOverlayIp));
+        assert!(
+            !conditions
+                .iter()
+                .any(|condition| condition.id == "node:overlay-identity-missing"),
+            "live nebula1 still uses PublishOverlayIp, not Onboarding"
+        );
+    }
+
+    #[test]
+    fn missing_host_cert_or_empty_overlay_offers_onboarding_not_publish() {
+        let mut sample = observations("workstation");
+        sample.overlay_ip_published = false;
+        sample.live_overlay_ip = false;
+        sample.nebula_host_cert_present = false;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        let condition = conditions
+            .iter()
+            .find(|condition| condition.id == "node:overlay-identity-missing")
+            .expect("empty overlay without live nebula1 must nag Onboarding");
+        assert_eq!(condition.severity, HealthSeverity::Critical);
+        assert!(condition
+            .remediation
+            .iter()
+            .any(|action| action.action == HealthAction::OpenOnboarding));
+        assert!(
+            !conditions.iter().any(|condition| {
+                condition
+                    .remediation
+                    .iter()
+                    .any(|action| action.action == HealthAction::PublishOverlayIp)
+            }),
+            "PublishOverlayIp requires a live nebula1 address"
+        );
+    }
+
+    #[test]
+    fn grouped_plane_does_not_nag_monolithic_mackesd() {
+        let mut sample = observations("workstation");
+        sample.grouped_mackesd_installed = true;
+        sample.services.insert("mackesd".into(), false);
+        sample.services.insert("dns".into(), false);
+        sample.services.insert("kdc".into(), false);
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(
+            !conditions.iter().any(|condition| {
+                condition.id.ends_with("required-service-mackesd")
+                    || condition.id.ends_with("required-service-dns")
+                    || condition.id.ends_with("required-service-kdc")
+            }),
+            "grouped mackesd-control must not offer Restart mackesd.service"
+        );
+    }
+
+    #[test]
+    fn collab_identity_file_must_match_installed_revision() {
+        assert!(!collab_identity_matches_body(
+            br#"{"source_revision":"7e3474eeb"}"#,
+            "4071ed295"
+        ));
+        assert!(collab_identity_matches_body(
+            br#"{"source_revision":"4071ed295"}"#,
+            "4071ed295"
+        ));
     }
 
     #[test]
@@ -3828,7 +3951,7 @@ mod tests {
                 && condition
                     .remediation
                     .iter()
-                    .any(|action| action.action == HealthAction::SetupSyncthing)
+                    .any(|action| action.action == HealthAction::OpenOnboarding)
         }));
 
         let lighthouse = observations("lighthouse");

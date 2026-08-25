@@ -3,13 +3,16 @@
 # plane that replaces the LizardFS QNM-Shared *file* mount. Boot-durable +
 # idempotent.
 #
-# /mnt/mesh-storage becomes a PLAIN directory (no FUSE) that Syncthing replicates
-# full-mesh, so every existing reader (apps aggregator, compute/probe inventory,
-# fleet revisions/acks, tags, favorites, alert-mirror) keeps its paths and Just
-# Works. Overlay-only: global/relay/local discovery OFF, NAT OFF, telemetry OFF;
-# peers are wired by static device IDs from the etcd `/mesh/syncthing/<host>`
-# registry (closes the discovery loop without any public discovery — lock #11).
-# Conflicts/deletes land in `.stversions` (trash-can versioning, lock #4).
+# /mnt/mesh-storage is a dedicated bind or block mount (still no FUSE) that
+# Syncthing replicates full-mesh. An empty directory on the root LV is not a
+# healthy file plane — preflight uses `mountpoint -q` (same fail-closed check
+# as XDG Downloads in node_grade) and refuses to claim the folder ready until
+# a real mount is present. This helper does not invent dests or create that
+# mount. Overlay-only: global/relay/local discovery OFF, NAT OFF, telemetry
+# OFF; peers are wired by static device IDs from the etcd
+# `/mesh/syncthing/<host>` registry (closes the discovery loop without any
+# public discovery — lock #11). Conflicts/deletes land in `.stversions`
+# (trash-can versioning, lock #4).
 #
 # Options:
 #   --listen <ip>     this node's OVERLAY ip for the GUI/listen bind
@@ -18,6 +21,7 @@
 #   --folder <dir>    the shared folder (default /mnt/mesh-storage)
 #   --home <dir>      syncthing config/home (default /var/lib/mcnf-syncthing)
 #   --folder-id <id>  shared folder id (default mcnf-mesh)
+#   --self-test       prove non-mount dirs fail closed (temp fixtures only)
 #
 # Publishes this node's device ID to etcd `/mesh/syncthing/<host>` and wires
 # every peer device found there (best-effort — skipped if etcdctl/endpoints are
@@ -28,6 +32,70 @@ LISTEN=""; FOLDER=/mnt/mesh-storage; HOME_DIR=/var/lib/mcnf-syncthing; FOLDER_ID
 ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
 SYSTEMD_DIR="${MCNF_SYSTEMD_DIR:-/etc/systemd/system}"
 
+log() { echo "==> $*"; }
+
+# Fail closed: a directory on the root LV (even if empty and writable) is not
+# a healthy Syncthing file plane. node_grade uses the same `mountpoint -q`
+# check for Workstation XDG Downloads. Missing `mountpoint` is also a failure.
+require_mesh_folder_mount() {
+  local folder="$1"
+  if [ -d "$folder" ] && mountpoint -q "$folder"; then
+    return 0
+  fi
+  echo "setup-syncthing: file-plane path $folder is not a mountpoint; an empty directory is not a healthy Syncthing plane (needs a bind or real mount)" >&2
+  exit 1
+}
+
+self_test() {
+  local not_a_mount missing fake_mount
+  MCNF_SETUP_SYNCTHING_ST_TMP="$(mktemp -d /tmp/mcnf-setup-syncthing-st.XXXXXX)"
+  cleanup_self_test() {
+    case "${MCNF_SETUP_SYNCTHING_ST_TMP:-}" in
+      /tmp/mcnf-setup-syncthing-st.*) rm -rf -- "$MCNF_SETUP_SYNCTHING_ST_TMP" ;;
+    esac
+  }
+  trap cleanup_self_test EXIT
+  not_a_mount="$MCNF_SETUP_SYNCTHING_ST_TMP/not-a-mount"
+  missing="$MCNF_SETUP_SYNCTHING_ST_TMP/missing"
+  fake_mount="$MCNF_SETUP_SYNCTHING_ST_TMP/fake-mount"
+  mkdir -p "$not_a_mount" "$fake_mount"
+
+  if ( require_mesh_folder_mount "$not_a_mount" ) 2>/dev/null; then
+    echo "setup-syncthing: --self-test expected a non-mount directory to fail closed" >&2
+    exit 1
+  fi
+  if ( require_mesh_folder_mount "$missing" ) 2>/dev/null; then
+    echo "setup-syncthing: --self-test expected a missing path to fail closed" >&2
+    exit 1
+  fi
+
+  mkdir -p "$MCNF_SETUP_SYNCTHING_ST_TMP/bin"
+  cat > "$MCNF_SETUP_SYNCTHING_ST_TMP/bin/mountpoint" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] || exit 2
+[ -d "${2:-}" ] || exit 1
+exit 0
+SH
+  chmod +x "$MCNF_SETUP_SYNCTHING_ST_TMP/bin/mountpoint"
+  PATH="$MCNF_SETUP_SYNCTHING_ST_TMP/bin:$PATH" require_mesh_folder_mount "$fake_mount"
+
+  grep -Fq 'mountpoint -q' "$0" || {
+    echo "setup-syncthing: --self-test expected mountpoint -q preflight" >&2
+    exit 1
+  }
+  if grep -Eq 'mkdir -p "\$HOME_DIR" "\$FOLDER"' "$0"; then
+    echo "setup-syncthing: --self-test found mkdir of the folder before the mount check" >&2
+    exit 1
+  fi
+  echo "setup-syncthing: self-test passed"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  [ "$#" -eq 1 ] || { echo "usage: $0 --self-test" >&2; exit 2; }
+  self_test
+  exit 0
+fi
+
 while [ $# -gt 0 ]; do case "$1" in
   --listen) LISTEN="$2"; shift 2;;
   --folder) FOLDER="$2"; shift 2;;
@@ -35,8 +103,6 @@ while [ $# -gt 0 ]; do case "$1" in
   --folder-id) FOLDER_ID="$2"; shift 2;;
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
-
-log() { echo "==> $*"; }
 
 detect_overlay() {
   ip -o -4 addr show 2>/dev/null \
@@ -46,6 +112,10 @@ LISTEN="${LISTEN:-$(detect_overlay)}"
 LISTEN="${LISTEN:-127.0.0.1}"
 HOST="$(hostname -s)"
 
+# Preflight before any package/config work: do not treat a non-mount
+# directory as a healthy file plane, and do not mkdir one into existence.
+require_mesh_folder_mount "$FOLDER"
+
 # ---- syncthing binary (BIRTHRIGHT: Fedora repos carry syncthing) ----------
 if ! command -v syncthing >/dev/null 2>&1; then
   log "installing syncthing"
@@ -53,7 +123,7 @@ if ! command -v syncthing >/dev/null 2>&1; then
     echo "syncthing not installed and dnf install failed" >&2; exit 1; }
 fi
 
-mkdir -p "$HOME_DIR" "$FOLDER"
+mkdir -p "$HOME_DIR"
 
 # ---- mint cert + device id + a default config (idempotent) ----------------
 if [ ! -f "$HOME_DIR/config.xml" ]; then

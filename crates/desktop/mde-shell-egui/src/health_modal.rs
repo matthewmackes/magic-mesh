@@ -970,7 +970,7 @@ fn condition_card(
             {
                 ui.colored_label(
                     Style::SUPPORT_WARNING,
-                    "Confirm this guided action after reviewing its expected impact.",
+                    action_confirmation_copy(action.action),
                 );
                 ui.horizontal(|ui| {
                     if ui
@@ -2200,6 +2200,25 @@ const fn action_label(action: HealthAction) -> &'static str {
     }
 }
 
+/// Confirmation warning shown after a CONFIRM-gated Fix is armed.
+/// Open Onboarding covers both identity-receipt leftover and overlay-identity
+/// leftover (missing host cert / empty overlay-ip without live nebula1). It is
+/// never the live-overlay publish path.
+const fn action_confirmation_copy(action: HealthAction) -> &'static str {
+    match action {
+        HealthAction::OpenOnboarding => {
+            "Confirm Open Onboarding. Use it for a missing host cert or empty overlay-ip leftover, and to admit a signed identity receipt. Do not invent a dest."
+        }
+        HealthAction::PublishOverlayIp => {
+            "Confirm rewrite of overlay-ip from the live nebula1 address. This is not the Fix when the host cert is missing."
+        }
+        HealthAction::RestartMackesd => {
+            "Confirm Restart mackesd after reviewing its expected impact."
+        }
+        _ => "Confirm this guided action after reviewing its expected impact.",
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2778,6 +2797,80 @@ mod tests {
         ] {
             assert!(!action_label(action).is_empty());
         }
+    }
+
+    #[test]
+    fn open_onboarding_label_and_confirmation_cover_overlay_identity_leftover() {
+        let label = action_label(HealthAction::OpenOnboarding);
+        assert!(!label.is_empty());
+        assert_eq!(label, "Open Onboarding");
+        assert_eq!(
+            action_label(HealthAction::PublishOverlayIp),
+            "Publish overlay IP"
+        );
+        assert_ne!(label, action_label(HealthAction::PublishOverlayIp));
+
+        let copy = action_confirmation_copy(HealthAction::OpenOnboarding);
+        let lowered = copy.to_ascii_lowercase();
+        assert!(
+            lowered.contains("onboarding"),
+            "copy must name onboarding: {copy}"
+        );
+        assert!(
+            !lowered.contains("publish overlay ip"),
+            "Open Onboarding confirmation must not be the live overlay publish path: {copy}"
+        );
+        assert!(
+            lowered.contains("host cert") && lowered.contains("overlay-ip"),
+            "copy must describe overlay-identity leftover: {copy}"
+        );
+        assert!(
+            lowered.contains("identity receipt"),
+            "copy must still describe identity leftover: {copy}"
+        );
+        assert!(
+            lowered.contains("do not invent a dest"),
+            "copy must refuse dest minting: {copy}"
+        );
+        assert!(action_confirmation_copy(HealthAction::RestartMackesd)
+            .to_ascii_lowercase()
+            .contains("restart mackesd"));
+    }
+
+    #[test]
+    fn restart_mackesd_stays_confirmation_gated_when_descriptor_requires_it() {
+        let mut snapshot = fixture_snapshot(true, true);
+        snapshot.active_conditions[0].remediation[0].action = HealthAction::RestartMackesd;
+        snapshot.active_conditions[0].remediation[0].confirmation_required = true;
+        let condition = &snapshot.active_conditions[0];
+        let HealthScope::Node { node } = &condition.scope else {
+            panic!("fixture condition must be node-scoped")
+        };
+        let root = tempfile::tempdir().expect("restart confirmation Bus fixture");
+        Persist::open(root.path().to_path_buf()).expect("initialize Bus fixture");
+        assert_eq!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                condition,
+                node,
+                HealthAction::RestartMackesd,
+                false,
+            ),
+            ActionPublishOutcome::Failed(ActionPublishFailure::ConfirmationRequired),
+            "Restart mackesd must keep the CONFIRM gate when the typed descriptor requires it"
+        );
+        assert!(matches!(
+            publish_action_to(
+                Some(root.path().to_path_buf()),
+                &snapshot,
+                condition,
+                node,
+                HealthAction::RestartMackesd,
+                true,
+            ),
+            ActionPublishOutcome::Published(_)
+        ));
     }
 
     #[test]

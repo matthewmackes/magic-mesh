@@ -143,6 +143,19 @@ printf 'dnf must not be called by this test\n' >&2
 exit 64
 SH
 
+cat > "$MOCK_BIN/mountpoint" <<'SH'
+#!/usr/bin/env bash
+case "${TEST_MOUNTPOINT_MODE:-mounted}" in
+    mounted)
+        [ "${1:-}" = "-q" ] || exit 2
+        [ -n "${2:-}" ] || exit 1
+        exit 0
+        ;;
+    not-a-mount) exit 1 ;;
+    *) exit 64 ;;
+esac
+SH
+
 chmod +x "$MOCK_BIN"/*
 export PATH="$MOCK_BIN:$PATH"
 
@@ -216,7 +229,7 @@ run_setup_case() {
     local home="$case_root/home"
     local systemd="$case_root/systemd"
     local calls="$case_root/calls.log"
-    mkdir -p "$home" "$systemd"
+    mkdir -p "$home" "$systemd" "$case_root/mesh"
     : > "$calls"
     write_stale_config "$home/config.xml"
     TEST_CALL_LOG="$calls" TEST_ETCD_MODE="$mode" \
@@ -233,6 +246,45 @@ run_setup_case() {
 }
 
 printf 'https://10.42.0.1:2379\n' > "$TEST_ROOT/endpoints"
+
+run_setup_non_mount_fails() {
+    local case_root="$TEST_ROOT/setup-non-mount"
+    local home="$case_root/home"
+    local folder="$case_root/mesh"
+    local systemd="$case_root/systemd"
+    local calls="$case_root/calls.log"
+    mkdir -p "$home" "$folder" "$systemd"
+    : > "$calls"
+    write_stale_config "$home/config.xml"
+    if TEST_CALL_LOG="$calls" TEST_ETCD_MODE=authoritative TEST_MOUNTPOINT_MODE=not-a-mount \
+    TEST_GLOBAL_DEVICES_FILE="$case_root/unused-global" \
+    TEST_FOLDER_DEVICES_FILE="$case_root/unused-folder" \
+    TEST_SYSTEM_FILE="$case_root/unused-system" \
+    TEST_CONNECTIONS_FILE="$case_root/unused-connections" \
+    MCNF_ETCD_ENDPOINTS_FILE="$TEST_ROOT/endpoints" \
+    MCNF_SYSTEMD_DIR="$systemd" \
+        "$SETUP" --listen 10.42.0.5 --home "$home" \
+        --folder "$folder" --folder-id mcnf-mesh \
+        >"$case_root/stdout" 2>"$case_root/stderr"; then
+        printf 'setup-syncthing treated a non-mount directory as a healthy file plane\n' >&2
+        sed -n '1,$p' "$case_root/stdout" >&2
+        sed -n '1,$p' "$case_root/stderr" >&2
+        exit 1
+    fi
+    grep -q 'is not a mountpoint' "$case_root/stderr"
+    if grep -q 'done — folder' "$case_root/stdout"; then
+        printf 'setup-syncthing claimed the folder ready despite a non-mount directory\n' >&2
+        exit 1
+    fi
+    if grep -qE 'systemctl |dnf |syncthing generate' "$calls"; then
+        printf 'setup-syncthing continued past a failed mount preflight\n' >&2
+        sed -n '1,$p' "$calls" >&2
+        exit 1
+    fi
+}
+
+run_setup_non_mount_fails
+printf 'ok: non-mount directory fails closed and is not claimed ready\n'
 run_setup_case authoritative
 run_setup_case offline
 run_setup_case empty

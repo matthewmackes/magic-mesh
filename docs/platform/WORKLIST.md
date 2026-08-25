@@ -418,15 +418,15 @@ is a capacity incident (§10.0.3), not a silent retry.
   identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: leftover (1)/(2) dests under `/root/mcnf-private/`; leftover
-  (3) ran on Seat 15. 2026-08-24 fleet findings (dirty-upgrade vs onboard/heal)
-  and detailed Fix solutions:
-  `WL-FUNC-023-2026-08-24-turnkey-heal-nag-solutions-r1.md`. Identity dests on
-  Dell/Seat 15/Surface (`7e3474eeb`). Surface reboot leftover repaired.
-  `production_admitted: false`.
-- Remaining work: S1-S18. Fingerprint-pinned `join` is in-tree
-  (`WL-FUNC-023-2026-08-23-enroll-token-joins-r1.md`). Installed 13.0.0-35
-  still has the retired CSR stub. Do not flip `production_admitted`.
+- Current state: leftover dests under `/root/mcnf-private/`. Solutions:
+  `WL-FUNC-023-2026-08-24-turnkey-heal-nag-solutions-r1.md`. Dest-cut
+  `4071ed295` on Seat 15/Surface/Dell. Overlay-ip empty, host cert absent
+  on Seat 15 and Dell. Source now nags `overlay-identity-missing` with
+  OpenOnboarding and skips grouped `Restart mackesd`; farm node_grade
+  39/39 on `.130`/2. Live Fix still needs dest-cut of this heal.
+  `production_admitted: false`. Evidence: overlay-identity-health-nag-r1.
+- Remaining work: S1-S18. Live Construct overlay Fix after dest-cut of
+  this source. Do not flip `production_admitted`. Do not confirm `Restart mackesd`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -1262,15 +1262,13 @@ story execution contract above.
   LiveKit SFU with P2P failover, and PSTN legs terminate through the LiveKit
   SIP gateway reusing the mde-voice-hud softphone, with all media state owned
   by typed mackesd verbs and never by the renderer.
-- Current state: In-tree S1–S4/S6 planes remain. S4 fail-closes empty-password
-  PSTN (`WL-FUNC-024-2026-08-23-voice-hud-s4-pstn-drive-r1.md`; farm `64/64`
-  `mde-voice-hud`). Seat 15 2026-08-24 16:25Z: unpublished `13.0.0-35` /
-  `7e3474ee`; data-group `collab` running (gen 311) hosts the media planes.
-  Journal: SIP provider not activated (no governed account). Empty
-  `call-media-readiness`/`verification`; no `state/calls/media`; no LiveKit
-  process or `livekit-server`; no chirp fixture; no `gateway.toml`. ALSA +
-  PipeWire analog-stereo present; no `/dev/video*`. Evidence:
-  `WL-FUNC-024-2026-08-24-live-media-r1.md`.
+- Current state: In-tree S1–S4/S6 planes remain. Surface 2026-08-25 10:51Z dest-cut
+  `13.0.0-35`/`4071ed295`, overlay `10.42.0.7`. `collab` did not spawn: identity
+  receipt `source_revision` is still `7e3474eeb` (stale vs installed SHA). No
+  `state/calls/media`; no LiveKit; no `gateway.toml`. ALSA+PipeWire and
+  `/dev/video*` present; packed Calls literals in Construct. Two-seat audio not
+  run (Seat 15/Dell out of this unit). Evidence:
+  `WL-FUNC-024-2026-08-25-surface-live-media-r1.md`.
 - Remaining work: leftover is live two-seat audio (objective chirp/tone
   correlation), group SFU, and PSTN after a current-revision unpublished
   candidate is installed. Worker census and empty readiness are not a call.
@@ -1368,21 +1366,17 @@ story execution contract above.
 - Required outcome: every lock-1 operation is reachable from the Files menubar
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
-- Current state: S1-S3 wiring is in-tree and in installed `7e3474ee`
-  (`13.0.0-35`). Q26: Files stays its own OS surface. Seat 15 2026-08-24
-  15:47Z: `mackesd-data` active; `mesh_mount` worker running since 15:34:29Z
-  (heartbeat `running`, `peer:Basement-Test-Workstation`, generation 168).
-  No `state/mesh-mount` topics, no `/run/user/*/mde-mesh`, no Files persist,
-  no archive-queue persist. Construct has in-process `mde-files-opqueue`.
-  No FileOps CLI; SSH cannot run POSIX ops. Dell unreachable. Fixtures do
-  not close. Evidence:
-  `WL-FUNC-025-2026-08-24-seat15-mesh-mount-r1.md`.
+- Current state: dest-cut `4071ed295` (`13.0.0-35`) on Surface
+  `172.20.146.79` `peer:SURFACE`. Construct pid `1290917` holds card1
+  `2736x1824`; unit pins `XDG_CONFIG_HOME=/root/.config`. kmsgrab acquired
+  XR30 X-tiled (`-f null` 0); PNG/VAAPI failed. No GUI click. `mesh_mount`
+  census `running` gen 645; no lock-11 mount, no persist, no FileOps CLI.
+  Evidence: `WL-FUNC-025-2026-08-25-surface-files-posix-r1.md`.
 - Remaining work: leftover is live seat Files (local/mesh + archive-queue)
-  on a current-revision seat. Worker census is not a mount or POSIX op.
-  Installed `13.0.0-35` matches current-tree menubar/view/dialogs. Farm
-  fixture: `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md` (`208/208`
-  `mde-files-egui`). Live Seat 15:
-  `WL-FUNC-025-2026-08-24-seat15-mesh-mount-r1.md`. Fixtures do not close.
+  on a current-revision seat. Worker census and kmsgrab acquire are not a
+  POSIX op. dest-cut matches current-tree menubar/view/dialogs. Farm
+  fixture: `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md`. Surface:
+  `WL-FUNC-025-2026-08-25-surface-files-posix-r1.md`. Fixtures do not close.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
@@ -1438,15 +1432,15 @@ story execution contract above.
   but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
 - Required outcome: per-folder view mode, sort order, and show-hidden survive
   a shell restart.
-- Current state: persist path is in-tree. Seat 15 dest 2026-08-24: root DRM
-  shell had no `HOME`/`XDG_CONFIG_HOME` so `default_config_file()` was `None`.
-  After red `AI-GENERATED-ALERT` + 5s, drop-in `XDG_CONFIG_HOME=/root/.config`
-  plus bounded `/root/.config/mcnf/files-folder-prefs.json` survived restart
-  (identical SHA) and OPEN-hydrated at `surfaces`. No GUI click (no capture
-  dest). Evidence: `WL-FUNC-026-2026-08-24-seat15-folder-prefs-r1.md`.
+- Current state: persist path is in-tree. Surface dest-cut `4071ed295`
+  packaged unit pins `XDG_CONFIG_HOME=/root/.config` (HOME unset; no
+  Seat-15-style drop-in). `/root/.config/mcnf/` absent; no
+  `files-folder-prefs.json`. kmsgrab frame unread as PNG. No dest JSON, no
+  GUI view/sort/hidden. Evidence:
+  `WL-FUNC-026-2026-08-25-surface-folder-prefs-r1.md`.
 - Remaining work: leftover is operator GUI view/sort/hidden then restart on a
-  current-revision seat (dest hydrate is not operator use). Packaged DRM unit
-  now pins `XDG_CONFIG_HOME=/root/.config`; Seat 15 also has a local drop-in.
+  current-revision seat (dest hydrate is not operator use). Packaged dest-cut
+  unit pins `XDG_CONFIG_HOME`; Surface has the pin and no persist file.
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
@@ -1483,14 +1477,14 @@ story execution contract above.
   never built.
 - Required outcome: operators pin, rename, reorder, and remove their own
   Places entries, persisted across restarts.
-- Current state: bookmark store is in-tree. Seat 15 dest 2026-08-24: same
-  `XDG_CONFIG_HOME=/root/.config` drop-in; bounded
-  `/root/.config/mcnf/files-bookmarks.json` survived restart (identical SHA)
-  and OPEN-hydrated at `surfaces`. No pin/navigate GUI (no capture dest).
-  Evidence: `WL-FUNC-027-2026-08-24-seat15-bookmarks-r1.md`.
+- Current state: bookmark store is in-tree. Surface dest-cut `4071ed295`
+  packaged unit pins `XDG_CONFIG_HOME=/root/.config`. `/root/.config/mcnf/`
+  absent; no `files-bookmarks.json`. kmsgrab frame unread as PNG. No dest
+  JSON, no pin/navigate GUI. Evidence:
+  `WL-FUNC-027-2026-08-25-surface-bookmarks-r1.md`.
 - Remaining work: leftover is operator pin then restart/navigate on a
-  current-revision seat (dest hydrate is not operator use). Packaged DRM unit
-  now pins `XDG_CONFIG_HOME=/root/.config`; Seat 15 also has a local drop-in.
+  current-revision seat (dest hydrate is not operator use). Packaged dest-cut
+  unit pins `XDG_CONFIG_HOME`; Surface has the pin and no persist file.
   1. S1 Add the bookmark store and sidebar section.
      - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
        Places render path.
@@ -1529,13 +1523,12 @@ story execution contract above.
 - Required outcome: operators create, edit, list, and remove recurring sync
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
-- Current state: Seat 15 dest-cut `13.0.0-35` (`7e3474eeb`) Construct pid
-  `476582` holds DRM and ships the Transfers editor (`No sync pairs saved.`,
-  dest-cut `malformed pair id`). CLI `sync-pair add|remove|list` present;
-  `list --json` is `[]`; inbox absent (`/var/lib/mde/transfers` `root:root`
-  `0755`). Worker heartbeat `running`; `event/notify/transfers` count 0. No
-  grim/Moonlight; Sunshine binary present with no unit/process. leftover-028
-  remains Dell-only. Evidence: `WL-FUNC-028-2026-08-24-live-transfers-r1.md`.
+- Current state: Surface dest-cut `4071ed295` (`13.0.0-35`) pid `1290917`
+  holds eDP-1. CLI-parity editor packed (`invalid sync pair id`). `list
+  --json` is `[]`; inbox `1777` empty. Worker `running`. Ctrl+J/N on held
+  SONiX `event3` changed kmsgrab hashes; XR30 labels unread. No pair added.
+  CLI refuse proved. Dell leftover-028 not here. Evidence:
+  `WL-FUNC-028-2026-08-25-surface-transfers-r1.md`.
 - Remaining work: leftover is still live Construct Transfers paint/click on a
   current-revision seat. Seat 15 is a used DRM Construct with Keychron/MS116
   input but no capture dest and an empty store (Dell leftover-028 is not
@@ -1591,10 +1584,11 @@ story execution contract above.
 - Required outcome: Communications Activity carries the fleet voice-admin
   panel publishing the existing action/voice verbs and rendering the
   state/voice topics.
-- Current state: Fleet voice-admin + `hydrate_voice` landed. Leftover is live
-  Vitelity. Survey 2026-08-22 allows seat+Vitelity mutation on the unpublished
-  signed candidate; Dell, Seat 15, and Surface run `magic-mesh-13.0.0-35`.
-  Evidence: `WL-FUNC-028-2026-08-23-installed-sync-pair-cli-r1.md`.
+- Current state: Surface dest-cut `4071ed295` packed Fleet voice panel.
+  `voice_provision` worker `running` on `peer:SURFACE`; no `state/voice/*`
+  rows (honest empty, no master key). Provision not clicked. Vitelity
+  dest-operator stays parked. Evidence:
+  `WL-FUNC-029-2026-08-25-surface-voice-admin-r1.md`.
 - Remaining work: leftover is live Vitelity on a current-revision seat, not a
   missing Activity section.
   1. S1 Panel over the existing verbs.
@@ -1639,13 +1633,11 @@ story execution contract above.
 - Required outcome: Communications Activity owns gateway configuration; the
   responder and gateway.toml contract stay unchanged; the existing workgroup
   gateway.toml migrates in place.
-- Current state: gateway form / in-place hydrate landed. 2026-08-24 16:25Z:
-  no `gateway.toml` and no `/mnt/mesh-storage/voip/` on Seat 15 or Surface.
-  Seat 15 `mackesd-actions` thread `voip-bus-responder` is up; Surface
-  actions/control/data/integrations stay inactive. No
-  `action/voip/{set,get,clear}-gateway` spool. Unpublished `13.0.0-35`.
-  Leftover is live Bus + migrated toml.
-  Evidence: `WL-FUNC-030-2026-08-24-live-gateway-r1.md`.
+- Current state: Surface dest-cut `4071ed295`; voip responder up. Live
+  `get-gateway` returned `{"present":false}` (no password). No
+  `gateway.toml`; no set/clear. Form packed (`SIP gateway`, `No SIP gateway
+  configured`). Activity paint unread. Evidence:
+  `WL-FUNC-030-2026-08-25-surface-gateway-r1.md`.
 - Remaining work: leftover is live Bus set/get/clear plus a migrated
   workgroup `gateway.toml`, not a missing GUI publisher. No credentials
   were invented; no set-gateway was published.
@@ -1687,10 +1679,11 @@ story execution contract above.
   document to a space, participants join with view/edit permission and
   follow-mode, and the session lifecycle is visible and closable by its
   owner.
-- Current state: show() mounts live_document_share_session(); sibling pub+wire
-  landed. Leftover is live two-seat co-edit. Dell, Seat 15, and Surface run
-  unpublished `magic-mesh-13.0.0-35`. Evidence:
-  `WL-FUNC-024-2026-08-22-live-leftover-park-r1.md`.
+- Current state: show() mounts live_document_share_session(); Phase-3c markers
+  gone. Surface 2026-08-25 dest-cut `4071ed295` packs Share/Join/Close, but
+  `collab` did not spawn (identity receipt still `7e3474eeb`). No document-session
+  topics. Two-seat co-edit not run (Seat 15/Dell out of this unit). Evidence:
+  `WL-FUNC-031-2026-08-25-surface-coedit-r1.md`.
 - Remaining work: leftover is live two-seat co-edit evidence only, not a
   missing mount wire.
   1. S1 Share-session lifecycle UI.
@@ -1738,14 +1731,15 @@ story execution contract above.
 - Required outcome: Ctrl+J opens Communications Transfers from any Construct
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
-- Current state: catalog + apply refuse landed in-tree and on dest-cut
-  `13.0.0-35` (hotkeys.rs empty vs HEAD). Dell and Seat 15 binaries catalog
-  Ctrl+J / Ctrl+N. Seat 15 is a used DRM seat (pid 2353 holds card1; operator
-  docked Maps & Location 2026-08-24 07:24 EDT). Journal never audits hotkey
-  apply; sunshine inactive; grim/Moonlight absent. Leftover is still a live
-  Ctrl+J/Ctrl+N keystroke. Evidence:
+- Current state: source complete. Catalog + apply refuse are in-tree and on
+  dest-cut `4071ed295` (NEVRA `13.0.0-35`; hotkeys.rs empty vs HEAD). This
+  agent did not SSH Seat 15 or Dell (used DRM). Health Fix click (FUNC-023)
+  had no frame and did not press Ctrl+J/Ctrl+N; leftover remains a live
+  keystroke on a used seat. Catalog, dock-journal, dest-cut, and Health Fix
+  do not close S1. No uinput; no invented dest. Evidence:
   `WL-FUNC-032-2026-08-23-installed-hotkeys-catalog-r1.md`,
-  `WL-FUNC-032-2026-08-24-live-hotkeys-r1.md`.
+  `WL-FUNC-032-2026-08-24-live-hotkeys-r1.md`,
+  `WL-FUNC-032-2026-08-25-live-keystroke-after-health-fix-r1.md`.
 - Remaining work: leftover is live-surface keystroke proof on Seat 15, not a
   missing binding. Catalog and dock-journal do not close it. Needs Ctrl+J from
   every surface and in-mode Ctrl+N, with refuse on Documents / Terminal /

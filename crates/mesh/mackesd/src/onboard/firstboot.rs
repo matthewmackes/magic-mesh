@@ -33,6 +33,15 @@ pub const FIRSTBOOT_PENDING: &str = "pending-convergence";
 /// Production marker directory. Tests inject another path.
 pub const DEFAULT_MARKER_DIR: &str = "/var/lib/mackesd/lifecycle";
 
+/// Production Nebula config root. Dest-cut seats store the host cert under
+/// `identity/current/`; older seats keep a flat `host.crt`. First-boot must
+/// see the same two paths telemetry and nebula_supervisor already use.
+const NEBULA_CONFIG_ROOT: &str = "/etc/nebula";
+/// Dest-cut identity layout relative to [`NEBULA_CONFIG_ROOT`].
+const ACTIVE_NEBULA_HOST_CERT_REL: &str = "identity/current/host.crt";
+/// Legacy flat layout relative to [`NEBULA_CONFIG_ROOT`].
+const LEGACY_NEBULA_HOST_CERT_REL: &str = "host.crt";
+
 /// Observed first-boot facts. Production gathers these from the seat; tests
 /// plant missing units, packages, and identity without touching systemd.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,7 +427,7 @@ pub fn gather_live_in(
         expected_units,
         active_units,
         configuration_present: Path::new("/var/lib/mde/role.toml").is_file(),
-        mesh_identity_present: Path::new("/etc/nebula/host.crt").is_file(),
+        mesh_identity_present: mesh_identity_present_under(Path::new(NEBULA_CONFIG_ROOT)),
         compute_usable: Path::new("/dev/kvm").exists(),
         ui_applicable,
         ui_ready: !ui_applicable || unit_is_active("mde-shell-egui.service"),
@@ -427,6 +436,15 @@ pub fn gather_live_in(
             .map(crate::onboard::invite::count_pending)
             .unwrap_or(0),
     }
+}
+
+/// True when either dest-cut `identity/current/host.crt` or legacy `host.crt`
+/// is a regular file under `nebula_root`. Tests inject a temp root so coverage
+/// does not require a live `/etc/nebula`.
+#[must_use]
+pub fn mesh_identity_present_under(nebula_root: &Path) -> bool {
+    nebula_root.join(ACTIVE_NEBULA_HOST_CERT_REL).is_file()
+        || nebula_root.join(LEGACY_NEBULA_HOST_CERT_REL).is_file()
 }
 
 fn unit_is_active(unit: &str) -> bool {
@@ -700,6 +718,40 @@ mod tests {
         assert!(
             checks.iter().all(|check| !check.blocks_progress()),
             "active grouped plane must not block first-boot: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn mesh_identity_present_under_accepts_either_host_cert_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(
+            !mesh_identity_present_under(root),
+            "neither dest-cut nor legacy host.crt must report absent"
+        );
+
+        std::fs::write(root.join(LEGACY_NEBULA_HOST_CERT_REL), b"legacy").unwrap();
+        assert!(
+            mesh_identity_present_under(root),
+            "legacy /etc/nebula/host.crt must count as enrolled"
+        );
+
+        std::fs::remove_file(root.join(LEGACY_NEBULA_HOST_CERT_REL)).unwrap();
+        assert!(
+            !mesh_identity_present_under(root),
+            "removing the legacy cert must return to absent"
+        );
+
+        let current = root.join("identity/current");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("host.crt"), b"dest-cut").unwrap();
+        assert!(
+            mesh_identity_present_under(root),
+            "dest-cut identity/current/host.crt must count as enrolled"
+        );
+        assert!(
+            !root.join(LEGACY_NEBULA_HOST_CERT_REL).exists(),
+            "identity/current-only case must not plant a legacy host.crt"
         );
     }
 
