@@ -9,9 +9,9 @@ tasks.
 
 - **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-23 authorized lifting the release chain that the
-  2026-08-22 survey had kept Blocked. Leftovers: FUNC-023 leftover-3
-  enroll/offboard (Seat 15 done; Dell/Surface identity dests admitted,
-  leftover-3 not repeated), REL-006 admission, then official
+  2026-08-22 survey had kept Blocked.   Leftovers: FUNC-023 leftover-3 overlay live on Seat 15 (`10.42.0.5`)
+  and Dell (`10.42.0.4`); dest-gated arming/Browser VM/collab SHA remain.
+  REL-006 admission, then official
   cut/sign/publish. Lighthouse overlay/etcd recovered 2026-08-24.
   Do not invent a mesh-id or bearer. Do not flip `production_admitted`. Do
   not publish or freeze while those leftovers are open. Unpublished
@@ -420,13 +420,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   verification/correction, offboarding, reset, and recommissioning.
 - Current state: leftover dests under `/root/mcnf-private/`. Solutions:
   `WL-FUNC-023-2026-08-24-turnkey-heal-nag-solutions-r1.md`. Dest-cut
-  `4071ed295` on Seat 15/Surface/Dell. Overlay-ip empty, host cert absent
-  on Seat 15 and Dell. Source now nags `overlay-identity-missing` with
-  OpenOnboarding and skips grouped `Restart mackesd`; farm node_grade
-  39/39 on `.130`/2. Live Fix still needs dest-cut of this heal.
-  `production_admitted: false`. Evidence: overlay-identity-health-nag-r1.
-- Remaining work: S1-S18. Live Construct overlay Fix after dest-cut of
-  this source. Do not flip `production_admitted`. Do not confirm `Restart mackesd`.
+  `4071ed295` on Seat 15/Surface/Dell. Live overlay-ip + host cert + LH1
+  ping on Seat 15 (`10.42.0.5`) and Dell (`10.42.0.4`). Seat 15 firstboot
+  converged and XDG Downloads mounted. `production_admitted: false`.
+  Evidence: `WL-FUNC-023-2026-08-25-seat15-dell-live-fix-r1.md`.
+- Remaining work: S1-S18. Dest-gated arming/Browser VM/collab SHA. Do not
+  flip `production_admitted`. Do not confirm `Restart mackesd`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
