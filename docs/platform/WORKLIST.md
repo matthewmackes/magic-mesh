@@ -9,13 +9,12 @@ tasks.
 
 - **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-23 authorized lifting the release chain that the
-  2026-08-22 survey had kept Blocked.   Leftovers: FUNC-023 leftover-3 overlay live on Seat 15 (`10.42.0.5`)
-  and Dell (`10.42.0.4`); dest-gated arming/Browser VM/collab SHA remain.
-  REL-006 admission, then official
-  cut/sign/publish. Lighthouse overlay/etcd recovered 2026-08-24.
-  Do not invent a mesh-id or bearer. Do not flip `production_admitted`. Do
-  not publish or freeze while those leftovers are open. Unpublished
-  `13.0.0-35` is installed on Dell, Seat 15, and Surface.
+  2026-08-22 survey had kept Blocked. Leftovers: dest-cut `bc14a22d7` on
+  Seat 15/Dell/Surface and LH1–LH3; dest-gated arming/Browser VM/collab SHA
+  remain. REL-006 admission, then official cut/sign/publish. Do not invent
+  a mesh-id or bearer. Do not flip `production_admitted`. Do not publish
+  or freeze while those leftovers are open. Unpublished `13.0.0-35` /
+  lighthouse `13.0.0-11` (`bc14a22d7`) is installed on the dest-cut set.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -418,12 +417,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   identity, etcd, credential, compute, and grouped-service prerequisites.
 - Required outcome: create one local-first ONBOARD & OFFBOARDING interface backed by one resumable mackesd authority for local or fleet onboarding, upgrade,
   verification/correction, offboarding, reset, and recommissioning.
-- Current state: leftover dests under `/root/mcnf-private/`. Solutions:
-  `WL-FUNC-023-2026-08-24-turnkey-heal-nag-solutions-r1.md`. Dest-cut
-  `4071ed295` on Seat 15/Surface/Dell. Live overlay-ip + host cert + LH1
-  ping on Seat 15 (`10.42.0.5`) and Dell (`10.42.0.4`). Seat 15 firstboot
-  converged and XDG Downloads mounted. `production_admitted: false`.
-  Evidence: `WL-FUNC-023-2026-08-25-seat15-dell-live-fix-r1.md`.
+- Current state: leftover dests under `/root/mcnf-private/`. Dest-cut
+  `bc14a22d7` (`13.0.0-35` / LH `13.0.0-11`) on Seat 15/Surface/Dell and
+  LH1–LH3. Overlay-ip + host cert + nebula kept. LH `mackesd-control`
+  blocked on missing collab receipt. `production_admitted: false`.
+  Evidence: `WL-FUNC-023-2026-08-25-destcut-bc14a22d7-r1.md`.
 - Remaining work: S1-S18. Dest-gated arming/Browser VM/collab SHA. Do not
   flip `production_admitted`. Do not confirm `Restart mackesd`.
   1. S1 Define the canonical lifecycle and readiness model.
@@ -1152,17 +1150,13 @@ is a capacity incident (§10.0.3), not a silent retry.
   Seat 15, and Surface, prove the three-lighthouse topology, then verify the
   same bytes after WL-REL-005 publication. Eagle and T480 remain non-gating
   inspection/deployment-wave seats.
-- Current state: unpublished workstation RPM `13.0.0-35` is on Dell, Seat 15,
-  Surface, Eagle, and T480. Compute/observation run after identity `Wants=`
-  (`WL-TEST-002-2026-08-23-vm-support-hosts-r1.md`,
-  `WL-TEST-002-2026-08-24-eagle-t480-sudo-vm-r1.md`,
-  `WL-TEST-002-2026-08-24-node-virt-packaged-r1.md`). Eagle/T480 now match
-  Dell/Seat 15 `90-mm-nopasswd` and mesh-key SSH. RPM now ships
-  `install-mm-nopasswd` + `prepare-node-virt` (`mcnf-node-virt.service`).
-  Installed `mackesd` still publishes provider `unknown` until that package
-  is on a seat. Leftover is that package plus S6. Operator 2026-08-23
-  authorized Remaining; do not treat this install as six-role qualification.
-  Sealed Vitelity/SIP still required for S3. No feature waiver.
+- Current state: dest-cut `bc14a22d7` workstation `13.0.0-35` on Dell,
+  Seat 15, Surface; lighthouse `13.0.0-11` on LH1–LH3. Eagle/T480 remain
+  non-gating prior dest-cut. Compute/observation run after identity
+  `Wants=`. Collab receipt SHA dest-gated. Leftover is S6 + providers.
+  Operator 2026-08-23 authorized Remaining; not six-role qualification.
+  Sealed Vitelity/SIP still required for S3. No feature waiver. Evidence:
+  `WL-FUNC-023-2026-08-25-destcut-bc14a22d7-r1.md`.
 - Remaining work:
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
