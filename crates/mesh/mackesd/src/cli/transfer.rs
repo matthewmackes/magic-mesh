@@ -115,6 +115,12 @@ fn run_with_store(cmd: TransferCmd, store_root: &std::path::Path) -> anyhow::Res
                 destination,
                 bwlimit,
             } => {
+                // Trim before validate/slug so CLI add matches the Transfers
+                // editor (identical inbox payloads, not just worker normalize).
+                let source = source.trim().to_string();
+                let destination = destination.trim().to_string();
+                let bwlimit = trim_optional(bwlimit);
+                let id = trim_optional(id);
                 let every_secs = parse_interval_secs(&interval)?;
                 validate_sync_pair_input(id.as_deref(), &source, &destination, bwlimit.as_deref())?;
                 let id = match id {
@@ -162,28 +168,11 @@ fn run_with_store(cmd: TransferCmd, store_root: &std::path::Path) -> anyhow::Res
                 let pairs = store.load_all();
                 if json {
                     println!("{}", serde_json::to_string_pretty(&pairs)?);
-                } else if pairs.is_empty() {
-                    println!("no sync pairs saved");
                 } else {
-                    println!("{:<24} {:<10} {:<12} SOURCE -> DEST", "ID", "EVERY", "LAST");
-                    for p in &pairs {
-                        let last = p
-                            .last_fired_ms
-                            .map_or_else(|| "never".to_owned(), |ms| ms.to_string());
-                        let bw = p
-                            .policy
-                            .bwlimit
-                            .as_deref()
-                            .map_or_else(String::new, |b| format!(" bwlimit={b}"));
-                        println!(
-                            "{:<24} {:<10} {:<12} {} -> {}{bw}",
-                            p.id,
-                            format!("{}s", p.every_secs),
-                            last,
-                            p.source,
-                            p.dest
-                        );
-                    }
+                    println!(
+                        "{}",
+                        format_sync_pair_list(&pairs, wall_now_ms()).trim_end()
+                    );
                 }
             }
         },
@@ -307,6 +296,118 @@ fn slug_pair_id(source: &str, dest: &str) -> String {
     } else {
         slug.to_owned()
     }
+}
+
+fn trim_optional(raw: Option<String>) -> Option<String> {
+    raw.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Compact interval copy shared with Communications Transfers (`15m`, not `900s`).
+fn format_interval_draft(every_secs: u64) -> String {
+    if every_secs > 0 && every_secs.is_multiple_of(86_400) {
+        format!("{}d", every_secs / 86_400)
+    } else if every_secs > 0 && every_secs.is_multiple_of(3600) {
+        format!("{}h", every_secs / 3600)
+    } else if every_secs > 0 && every_secs.is_multiple_of(60) {
+        format!("{}m", every_secs / 60)
+    } else {
+        format!("{every_secs}s")
+    }
+}
+
+/// Worker next-run copy. Same strings as the Transfers editor row.
+fn format_next_run(now_unix_ms: u64, next_run_unix_ms: Option<u64>) -> String {
+    match next_run_unix_ms {
+        None => "next-run pending".to_owned(),
+        Some(ts) if ts <= now_unix_ms => "due now".to_owned(),
+        Some(ts) => {
+            let until = relative_until(now_unix_ms, ts);
+            if until == "now" {
+                "due soon".to_owned()
+            } else {
+                format!("next in {until}")
+            }
+        }
+    }
+}
+
+/// Worker last-result copy. Same strings as the Transfers editor row.
+fn format_last_result(last: Option<&str>) -> String {
+    match last {
+        Some(result) if !result.is_empty() => format!("last: {result}"),
+        _ => "never run".to_owned(),
+    }
+}
+
+/// Future duration using the same buckets as Communications `relative_age`.
+fn relative_until(now_ms: u64, then_ms: u64) -> String {
+    let secs = then_ms.saturating_sub(now_ms) / 1_000;
+    if secs < 45 {
+        return "now".to_owned();
+    }
+    let mins = secs / 60;
+    if mins < 1 {
+        return "1m".to_owned();
+    }
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
+}
+
+fn format_sync_pair_row(pair: &mackesd_core::workers::transfers::SyncPair, now_ms: u64) -> String {
+    let mut extras = String::new();
+    if pair.peer_reachable == Some(false) {
+        extras.push_str(" unreachable");
+    }
+    if let Some(limit) = pair.policy.bwlimit.as_deref() {
+        extras.push_str(&format!(" bwlimit={limit}"));
+    }
+    format!(
+        "{:<24} {:<8} {:<16} {:<16} {} -> {}{extras}",
+        pair.id,
+        format_interval_draft(pair.every_secs),
+        format_next_run(now_ms, pair.next_run_ms),
+        format_last_result(pair.last_result.as_deref()),
+        pair.source,
+        pair.dest
+    )
+}
+
+fn format_sync_pair_list(
+    pairs: &[mackesd_core::workers::transfers::SyncPair],
+    now_ms: u64,
+) -> String {
+    if pairs.is_empty() {
+        return "no sync pairs saved\n".to_owned();
+    }
+    let mut out = format!(
+        "{:<24} {:<8} {:<16} {:<16} SOURCE -> DEST\n",
+        "ID", "EVERY", "NEXT", "LAST"
+    );
+    for pair in pairs {
+        out.push_str(&format_sync_pair_row(pair, now_ms));
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -481,5 +582,109 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn sync_pair_add_without_id_slugs_like_the_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::Add {
+                    id: None,
+                    interval: "15m".into(),
+                    source: "/src".into(),
+                    destination: "/dst".into(),
+                    bwlimit: None,
+                },
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let verbs = take_verbs(tmp.path());
+        assert_eq!(verbs.len(), 1);
+        match &verbs[0] {
+            TransferVerb::SaveSyncPair(pair) => {
+                assert_eq!(pair.id, slug_pair_id("/src", "/dst"));
+                assert_eq!(pair.source, "/src");
+                assert_eq!(pair.dest, "/dst");
+                assert_eq!(pair.every_secs, 900);
+            }
+            other => panic!("expected SaveSyncPair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pair_add_trims_id_source_dest_and_bwlimit_like_the_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_with_store(
+            TransferCmd::SyncPair {
+                cmd: SyncPairCmd::Add {
+                    id: Some("  docs  ".into()),
+                    interval: "15m".into(),
+                    source: " /src ".into(),
+                    destination: " /dst ".into(),
+                    bwlimit: Some("  2m  ".into()),
+                },
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let verbs = take_verbs(tmp.path());
+        assert_eq!(verbs.len(), 1);
+        match &verbs[0] {
+            TransferVerb::SaveSyncPair(pair) => {
+                assert_eq!(pair.id, "docs");
+                assert_eq!(pair.source, "/src");
+                assert_eq!(pair.dest, "/dst");
+                assert_eq!(pair.policy.bwlimit.as_deref(), Some("2m"));
+            }
+            other => panic!("expected SaveSyncPair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pair_list_mirrors_gui_next_run_last_result_and_unreachable() {
+        let mut pair = SyncPair::new("docs", "/src", "/dst", 900, TransferPolicy::default());
+        pair.policy.bwlimit = Some("2m".into());
+        pair.next_run_ms = Some(1_000_000 + 60_000);
+        pair.last_result = Some("done".into());
+        pair.peer_reachable = Some(false);
+        let table = format_sync_pair_list(std::slice::from_ref(&pair), 1_000_000);
+        assert!(
+            table.contains("NEXT") && table.contains("LAST"),
+            "human list must name the worker columns the GUI paints: {table}"
+        );
+        assert!(
+            table.contains("15m"),
+            "every-secs must use the GUI compact interval, not raw seconds: {table}"
+        );
+        assert!(
+            table.contains("next in 1m"),
+            "next-run must use the GUI relative copy, not last_fired_ms: {table}"
+        );
+        assert!(
+            table.contains("last: done"),
+            "last-result must come from the worker field the GUI paints: {table}"
+        );
+        assert!(
+            table.contains("unreachable"),
+            "unreachable peers must stay visible like the GUI row: {table}"
+        );
+        assert!(
+            table.contains("bwlimit=2m"),
+            "bwlimit must still suffix the row: {table}"
+        );
+        assert!(
+            !table.contains("never") || table.contains("never run"),
+            "LAST must not be the old last_fired_ms epoch column: {table}"
+        );
+
+        let unpublished = SyncPair::new("fresh", "/a", "/b", 60, TransferPolicy::default());
+        let empty_facts = format_sync_pair_list(std::slice::from_ref(&unpublished), 1_000);
+        assert!(
+            empty_facts.contains("next-run pending") && empty_facts.contains("never run"),
+            "unpublished worker facts must use the GUI pending/never-run copy: {empty_facts}"
+        );
+        assert_eq!(format_sync_pair_list(&[], 0).trim(), "no sync pairs saved");
     }
 }

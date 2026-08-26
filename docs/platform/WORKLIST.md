@@ -1517,19 +1517,23 @@ story execution contract above.
   pairs from the CLI and from Communications Transfers; execution stays on
   the existing worker.
 - Current state: Surface dest-cut `4071ed295` (`13.0.0-35`) pid `1290917`
-  holds eDP-1. CLI-parity editor packed (`invalid sync pair id`). `list
-  --json` is `[]`; inbox `1777` empty. Worker `running`. Ctrl+J/N on held
-  SONiX `event3` changed kmsgrab hashes; XR30 labels unread. No pair added.
-  CLI refuse proved. Dell leftover-028 not here. Evidence:
-  `WL-FUNC-028-2026-08-25-surface-transfers-r1.md`.
+  holds eDP-1. In-tree CLI `list` now mirrors GUI next-run/last-result/
+  unreachable and `add` trims like the editor. CLI-parity editor packed
+  (`invalid sync pair id`). `list --json` is `[]`; inbox `1777` empty.
+  Worker `running`. Ctrl+J/N on held SONiX `event3` changed kmsgrab
+  hashes; XR30 labels unread. No pair added. CLI refuse proved. Dell
+  leftover-028 not here. Evidence:
+  `WL-FUNC-028-2026-08-25-surface-transfers-r1.md`;
+  `WL-FUNC-028-2026-08-26-cli-gui-list-parity-r1.md`.
 - Remaining work: leftover is still live Construct Transfers paint/click on a
-  current-revision seat. Seat 15 is a used DRM Construct with Keychron/MS116
-  input but no capture dest and an empty store (Dell leftover-028 is not
-  here). dest-cut editor is not CLI-parity; in-tree `43459f809` matches CLI
-  (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`; farm `181/181`
-  `mde-collab-egui`). Seat 15 probe:
-  `WL-FUNC-028-2026-08-24-live-transfers-r1.md`. Creating an inbox, adding a
-  pair, starting Sunshine, or injecting Ctrl+J would invent dests.
+  current-revision seat. Source CLI/GUI producer parity (add/remove/list +
+  editor refuse/trim/next-run copy) is in-tree; do not occupy Surface/Dell/
+  Seat 15. Seat 15 is a used DRM Construct with Keychron/MS116 input but no
+  capture dest and an empty store (Dell leftover-028 is not here). dest-cut
+  editor is not CLI-parity; in-tree `43459f809` plus list/trim fold matches
+  CLI (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`). Creating
+  an inbox, adding a pair, starting Sunshine, or injecting Ctrl+J would
+  invent dests.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the

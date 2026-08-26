@@ -1018,7 +1018,10 @@ const fn method_label(method: TransferMethod) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_interval_secs, SyncPairCommand, SyncPairView};
+    use super::{
+        format_interval_draft, format_last_result, format_next_run, parse_interval_secs,
+        slug_pair_id, SyncPairCommand, SyncPairView,
+    };
     use crate::CommunicationsSurface;
 
     fn projected_pair(id: &str) -> SyncPairView {
@@ -1148,5 +1151,96 @@ mod tests {
             }),
             "remove must keep the CLI queued-next-tick notice"
         );
+    }
+
+    #[test]
+    fn editor_save_refuses_match_cli_and_trims_like_cli() {
+        let mut surface = CommunicationsSurface::new();
+
+        surface.save_sync_pair_draft_for_test("../escape", "15m", "/src", "/dst", None);
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("invalid sync pair id") && n.contains("../escape")),
+            "invalid id must refuse with the CLI text"
+        );
+        assert!(
+            surface.editor_open_for_test(),
+            "refused save must keep the editor open"
+        );
+
+        surface.save_sync_pair_draft_for_test("docs", "15m", "", "/dst", None);
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("non-empty source")),
+            "empty source must refuse with the CLI text"
+        );
+
+        surface.save_sync_pair_draft_for_test("docs", "15m", "/src\0", "/dst", None);
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("NUL bytes")),
+            "NUL source must refuse with the CLI text"
+        );
+
+        surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "/dst", Some("1m;rm"));
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("bwlimit") && n.contains("1m;rm")),
+            "hostile bwlimit must refuse with the CLI text"
+        );
+
+        surface.save_sync_pair_draft_for_test("", "15m", "/src", "/dst", None);
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Save {
+                id: slug_pair_id("/src", "/dst"),
+                source: "/src".into(),
+                dest: "/dst".into(),
+                every_secs: 900,
+                bwlimit: None,
+            }]
+        );
+
+        let mut surface = CommunicationsSurface::new();
+        surface.save_sync_pair_draft_for_test(
+            "  docs  ",
+            "15m",
+            " /src ",
+            " /dst ",
+            Some("  2m  "),
+        );
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Save {
+                id: "docs".into(),
+                source: "/src".into(),
+                dest: "/dst".into(),
+                every_secs: 900,
+                bwlimit: Some("2m".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn next_run_last_result_copy_matches_cli_list() {
+        assert_eq!(format_next_run(1_000, None), "next-run pending");
+        assert_eq!(format_next_run(1_000_000, Some(500_000)), "due now");
+        assert_eq!(
+            format_next_run(1_000_000, Some(1_000_000 + 60_000)),
+            "next in 1m"
+        );
+        assert_eq!(format_last_result(None), "never run");
+        assert_eq!(format_last_result(Some("")), "never run");
+        assert_eq!(format_last_result(Some("done")), "last: done");
+        assert_eq!(format_interval_draft(900), "15m");
+        assert_eq!(slug_pair_id("/src", "/dst"), "src--dst");
     }
 }
