@@ -54,9 +54,9 @@ use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
-    ActorId, CallId, CallKind, CallParticipantState, CallParticipantView, CallView, CollabCommand,
-    MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaTrackKind, SipLegV1,
-    SpaceDirectory, SpaceId, SpaceKind,
+    ActorId, CallId, CallKind, CallMediaReadiness, CallMediaVerification, CallParticipantState,
+    CallParticipantView, CallView, CollabCommand, MediaFailureReasonV1, MediaSessionStateV1,
+    MediaSessionV1, MediaTrackKind, SipLegV1, SpaceDirectory, SpaceId, SpaceKind,
 };
 
 use crate::frame::call_kind_label;
@@ -167,6 +167,12 @@ pub(crate) struct CallMediaPrefs {
     /// Empty until a mount folds `state/calls/media/<session>/sip`. This never
     /// invents a bridged PSTN or a LiveKit session.
     pub(crate) sip_legs: Vec<SipLegV1>,
+    /// Sidecar `state/collab/call-media-readiness` board. AdapterReady is never
+    /// a live mute/DTMF bind; mute still requires [`MediaSessionV1`].
+    pub(crate) readiness: Option<CallMediaReadiness>,
+    /// Sidecar `state/collab/call-media-verification` board. LiveMediaVerified
+    /// is worker-owned frame proof and still does not emit mute/DTMF.
+    pub(crate) verification: Option<CallMediaVerification>,
 }
 
 impl Default for CallMediaPrefs {
@@ -179,6 +185,8 @@ impl Default for CallMediaPrefs {
             screen_sharing: false,
             sessions: Vec::new(),
             sip_legs: Vec::new(),
+            readiness: None,
+            verification: None,
         }
     }
 }
@@ -481,7 +489,14 @@ impl CommunicationsSurface {
             .count();
 
         mde_egui::card().show(ui, |ui| {
-            call_card_header(ui, directory, now_unix_ms, call, connected);
+            call_card_header(
+                ui,
+                directory,
+                now_unix_ms,
+                call,
+                connected,
+                self.call_media.session_for(call.call),
+            );
             for p in &call.participants {
                 call_roster_row(ui, me, p);
             }
@@ -682,11 +697,12 @@ impl CommunicationsSurface {
         sink.emit(CollabCommand::HangUpCall { call });
     }
 
-    /// Emit [`SetCallMuted`](CollabCommand::SetCallMuted) for the live audio
-    /// sender owned by the mackesd P2P media worker. Callers that have a session
-    /// option must go through [`Self::set_call_muted_with_session`].
+    /// Emit [`SetCallMuted`](CollabCommand::SetCallMuted) only when a published
+    /// [`MediaSessionV1`] for `call` binds a live mute sender. No session is
+    /// fail-closed — never a recorded-intent signaling emit.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_call_muted(&self, sink: &mut CommandSink, call: CallId, muted: bool) {
-        sink.emit(CollabCommand::SetCallMuted { call, muted });
+        self.set_call_muted_with_session(sink, call, muted, self.call_media.session_for(call));
     }
 
     /// Session-aware mute: emit only when a published [`MediaSessionV1`] for
@@ -699,15 +715,16 @@ impl CommunicationsSurface {
         session: Option<&MediaSessionV1>,
     ) {
         if live_audio_effect(session, LiveAudioKind::Mute).can_emit() {
-            self.set_call_muted(sink, call, muted);
+            sink.emit(CollabCommand::SetCallMuted { call, muted });
         }
     }
 
-    /// Emit [`SendDtmf`](CollabCommand::SendDtmf) for the live audio sender
-    /// owned by the mackesd P2P media worker. Callers that have a session
-    /// option must go through [`Self::send_dtmf_with_session`].
+    /// Emit [`SendDtmf`](CollabCommand::SendDtmf) only when a published
+    /// [`MediaSessionV1`] for `call` binds a live DTMF sender. No session is
+    /// fail-closed — never a recorded-intent signaling emit.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send_dtmf(&self, sink: &mut CommandSink, call: CallId, digit: char) {
-        sink.emit(CollabCommand::SendDtmf { call, digit });
+        self.send_dtmf_with_session(sink, call, digit, self.call_media.session_for(call));
     }
 
     /// Session-aware DTMF: emit only when a published [`MediaSessionV1`] for
@@ -720,7 +737,7 @@ impl CommunicationsSurface {
         session: Option<&MediaSessionV1>,
     ) {
         if live_audio_effect(session, LiveAudioKind::Dtmf).can_emit() {
-            self.send_dtmf(sink, call, digit);
+            sink.emit(CollabCommand::SendDtmf { call, digit });
         }
     }
 
@@ -749,41 +766,52 @@ impl CommunicationsSurface {
         self.call_media.sip_legs = retained;
     }
 
-    /// Reconcile outgoing camera/screen bits with the converged call projection
-    /// and any published media session. Device preferences remain seat-level
-    /// labels. When a session is present, the bits mirror offered live tracks;
-    /// otherwise they only survive while this seat has a connected signaling leg.
+    /// Bind the collab-bus readiness board. [`CallMediaReadiness::claims_live_media`]
+    /// is always false — AdapterReady never becomes a mute/DTMF sender.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_call_media_readiness(&mut self, board: Option<CallMediaReadiness>) {
+        self.call_media.readiness = board;
+    }
+
+    /// Bind the collab-bus verification board. LiveMediaVerified is not a mute
+    /// bind; mute/DTMF still require [`MediaSessionV1`] on `state/calls/media/`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_call_media_verification(&mut self, board: Option<CallMediaVerification>) {
+        self.call_media.verification = board;
+    }
+
+    /// Reconcile outgoing camera/screen bits from a published [`MediaSessionV1`]
+    /// only. Signaling `CallParticipantState::Connected` without that document
+    /// is not live media — recorded intent is cleared, never kept.
     pub(crate) fn reconcile_media_intent(&mut self, calls: &[CallView], me: &ActorId) {
-        let connected = calls.iter().any(|call| {
-            call.participants.iter().any(|participant| {
+        let session = calls.iter().find_map(|call| {
+            let local_connected = call.participants.iter().any(|participant| {
                 &participant.actor == me && participant.state == CallParticipantState::Connected
-            })
-        });
-        if !connected {
-            self.call_media.camera_on = false;
-            self.call_media.screen_sharing = false;
-            return;
-        }
-        let (camera_on, screen_sharing) = {
-            let session = calls.iter().find_map(|call| {
-                let local_connected = call.participants.iter().any(|participant| {
-                    &participant.actor == me && participant.state == CallParticipantState::Connected
-                });
-                if local_connected {
-                    self.call_media.session_for(call.call)
-                } else {
-                    None
-                }
             });
-            match session {
-                Some(session) => (
-                    outgoing_track_effect(Some(session), MediaTrackKind::Video)
-                        == OutgoingTrackEffect::Attached,
-                    outgoing_track_effect(Some(session), MediaTrackKind::Screen)
-                        == OutgoingTrackEffect::Attached,
-                ),
-                None => return,
+            if local_connected {
+                self.call_media.session_for(call.call)
+            } else {
+                None
             }
+        });
+        let sidecar_claims_live = self
+            .call_media
+            .readiness
+            .as_ref()
+            .is_some_and(CallMediaReadiness::claims_live_media)
+            || self
+                .call_media
+                .verification
+                .as_ref()
+                .is_some_and(CallMediaVerification::claims_live_media);
+        let (camera_on, screen_sharing) = match session {
+            Some(session) if !sidecar_claims_live || session.claims_live_media() => (
+                outgoing_track_effect(Some(session), MediaTrackKind::Video)
+                    == OutgoingTrackEffect::Attached,
+                outgoing_track_effect(Some(session), MediaTrackKind::Screen)
+                    == OutgoingTrackEffect::Attached,
+            ),
+            Some(_) | None => (false, false),
         };
         self.call_media.camera_on = camera_on;
         self.call_media.screen_sharing = screen_sharing;
@@ -985,21 +1013,10 @@ pub(crate) fn live_audio_effect(
         return LiveAudioEffect::Unavailable;
     };
     let bound = match kind {
-        LiveAudioKind::Mute => session.audio_bound,
-        LiveAudioKind::Dtmf => session.dtmf_bound,
+        LiveAudioKind::Mute => session.binds_live_mute(),
+        LiveAudioKind::Dtmf => session.binds_live_dtmf(),
     };
-    if bound
-        && !matches!(
-            session.state,
-            MediaSessionStateV1::Failed { .. }
-                | MediaSessionStateV1::DeviceAbsent {
-                    track: MediaTrackKind::Audio
-                }
-                | MediaSessionStateV1::PermissionDenied {
-                    track: MediaTrackKind::Audio
-                }
-        )
-    {
+    if bound {
         LiveAudioEffect::Live
     } else {
         LiveAudioEffect::Unavailable
@@ -1103,7 +1120,7 @@ pub(crate) fn outgoing_track_effect(
     let Some(session) = session else {
         return OutgoingTrackEffect::Unavailable;
     };
-    if session.offered_tracks.contains(&track) && session.state.claims_live_media() {
+    if session.offered_live_track(track) {
         OutgoingTrackEffect::Attached
     } else {
         OutgoingTrackEffect::Unavailable
@@ -1198,13 +1215,16 @@ fn device_row_reason(session: Option<&MediaSessionV1>) -> &'static str {
 }
 
 /// The call card's header row: the kind glyph + label, the per-space (or direct)
-/// context, the call's age, and the connected count.
+/// context, the call's age, and an honest connected/media count. Signaling
+/// `CallParticipantState::Connected` without a live [`MediaSessionV1`] is
+/// "in call · media unavailable", never a fake media-connected state.
 fn call_card_header(
     ui: &mut egui::Ui,
     directory: &SpaceDirectory,
     now_unix_ms: i64,
     call: &CallView,
     connected: usize,
+    session: Option<&MediaSessionV1>,
 ) {
     let (space_name, direct) = space_context(directory, call.space);
     ui.horizontal(|ui| {
@@ -1229,11 +1249,24 @@ fn call_card_header(
                 .color(Style::TEXT_DIM),
         );
         ui.label(
-            egui::RichText::new(format!("· {connected} connected"))
+            egui::RichText::new(call_roster_media_label(connected, session))
                 .small()
                 .color(Style::TEXT_DIM),
         );
     });
+}
+
+/// Honest roster media suffix. Live frames → "connected"; everything else names
+/// the missing media plane instead of implying audio is flowing.
+#[must_use]
+fn call_roster_media_label(connected: usize, session: Option<&MediaSessionV1>) -> String {
+    match session {
+        Some(session) if session.claims_live_media() => format!("· {connected} connected"),
+        Some(session) if matches!(session.state, MediaSessionStateV1::Negotiating) => {
+            format!("· {connected} in call · media negotiating")
+        }
+        Some(_) | None => format!("· {connected} in call · media unavailable"),
+    }
 }
 
 /// One participant roster row: the state glyph + name (marking the local seat) +
@@ -1426,18 +1459,20 @@ pub(crate) fn sip_leg_live_failure(leg: Option<&SipLegV1>) -> MediaFailureReason
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_display_text, call_start_enabled, call_start_hint, consume_voice_accounts,
-        device_row_reason, live_audio_effect, live_audio_unavailable_reason,
-        media_failure_unavailable_label, outgoing_track_effect, outgoing_track_unavailable_reason,
-        sip_leg_live_failure, CallDevice, CallsPstnDrive, LiveAudioEffect, LiveAudioKind,
-        OutgoingTrackEffect,
+        bounded_display_text, call_roster_media_label, call_start_enabled, call_start_hint,
+        consume_voice_accounts, device_row_reason, live_audio_effect,
+        live_audio_unavailable_reason, media_failure_unavailable_label, outgoing_track_effect,
+        outgoing_track_unavailable_reason, sip_leg_live_failure, CallDevice, CallsPstnDrive,
+        LiveAudioEffect, LiveAudioKind, OutgoingTrackEffect,
     };
     use crate::{
         ActivityAdminSnapshot, CommandSink, CommunicationsSurface, GatewayReadout,
         VoiceSharedOutbound,
     };
     use mde_collab_types::{
-        ActorClock, ActorId, CallId, CallKind, CallMediaAdapter, CollabCommand, MediaDescriptionV1,
+        ActorClock, ActorId, CallId, CallKind, CallMediaAdapter, CallMediaAdmission,
+        CallMediaReadiness, CallMediaRequirement, CallMediaSession, CallMediaVerification,
+        CallParticipantState, CallParticipantView, CallView, CollabCommand, MediaDescriptionV1,
         MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1,
         MediaTrackKind, SipLegDirectionV1, SipLegV1, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
         SpaceSummary,
@@ -1793,6 +1828,151 @@ mod tests {
         assert_eq!(
             live_audio_unavailable_reason(published.as_ref(), LiveAudioKind::Dtmf),
             transport
+        );
+    }
+
+    #[test]
+    fn unguarded_mute_and_dtmf_fail_closed_without_published_session() {
+        let call = CallId::new();
+        let surface = CommunicationsSurface::new();
+        let mut sink = CommandSink::new();
+        surface.set_call_muted(&mut sink, call, true);
+        surface.send_dtmf(&mut sink, call, '5');
+        assert!(
+            sink.is_empty(),
+            "set_call_muted/send_dtmf must not emit recorded intent without MediaSessionV1"
+        );
+    }
+
+    #[test]
+    fn negotiating_session_does_not_bind_mute_dtmf_or_camera() {
+        let call = CallId::new();
+        let negotiating = plane_session(
+            call,
+            MediaSessionStateV1::Negotiating,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video],
+            false,
+            true,
+            true,
+            0,
+            false,
+        );
+        assert_eq!(
+            live_audio_effect(Some(&negotiating), LiveAudioKind::Mute),
+            LiveAudioEffect::Unavailable
+        );
+        assert_eq!(
+            live_audio_effect(Some(&negotiating), LiveAudioKind::Dtmf),
+            LiveAudioEffect::Unavailable
+        );
+        assert_eq!(
+            outgoing_track_effect(Some(&negotiating), MediaTrackKind::Video),
+            OutgoingTrackEffect::Unavailable
+        );
+        let mut surface = CommunicationsSurface::new();
+        surface.apply_media_sessions(vec![negotiating]);
+        let mut sink = CommandSink::new();
+        surface.set_call_muted(&mut sink, call, true);
+        surface.send_dtmf(&mut sink, call, '1');
+        assert!(
+            sink.is_empty(),
+            "Negotiating must not emit mute/DTMF as if media were flowing"
+        );
+    }
+
+    #[test]
+    fn signaling_connected_without_media_session_clears_recorded_camera_screen() {
+        let space = SpaceId::new();
+        let call = CallId::new();
+        let me = ActorId::new("eagle");
+        let calls = vec![CallView {
+            call,
+            space,
+            kind: CallKind::Audio,
+            started_unix_ms: 1_950_000,
+            participants: vec![CallParticipantView {
+                actor: me.clone(),
+                state: CallParticipantState::Connected,
+                muted: false,
+            }],
+        }];
+        let mut surface = CommunicationsSurface::new();
+        surface.call_media.camera_on = true;
+        surface.call_media.screen_sharing = true;
+        surface.reconcile_media_intent(&calls, &me);
+        assert!(
+            !surface.call_media.camera_on && !surface.call_media.screen_sharing,
+            "CallParticipantState::Connected must not keep recorded camera/screen intent"
+        );
+        assert_eq!(
+            call_roster_media_label(1, None),
+            "· 1 in call · media unavailable"
+        );
+
+        let live_video = plane_session(
+            call,
+            MediaSessionStateV1::Connected,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video],
+            false,
+            true,
+            true,
+            4,
+            true,
+        );
+        surface.apply_media_sessions(vec![live_video.clone()]);
+        surface.reconcile_media_intent(&calls, &me);
+        assert!(
+            surface.call_media.camera_on && !surface.call_media.screen_sharing,
+            "camera_on follows offered live video on MediaSessionV1, never recorded intent"
+        );
+        assert_eq!(
+            call_roster_media_label(1, Some(&live_video)),
+            "· 1 connected"
+        );
+    }
+
+    #[test]
+    fn adapter_ready_readiness_does_not_enable_mute_or_dtmf() {
+        let call = CallId::new();
+        let space = SpaceId::new();
+        let board = CallMediaReadiness {
+            local_actor: ActorId::new("eagle"),
+            sessions: vec![CallMediaSession {
+                call,
+                space,
+                kind: CallKind::Audio,
+                started_unix_ms: 1,
+                requirements: vec![CallMediaRequirement::Microphone],
+                candidate_adapters: vec![CallMediaAdapter::WebRtcP2p],
+                admission: CallMediaAdmission::AdapterReady,
+                connected_participants: vec![ActorId::new("eagle"), ActorId::new("falcon")],
+                local_muted: false,
+            }],
+        };
+        assert!(
+            !board.claims_live_media(),
+            "AdapterReady is signed-state admission, not live media"
+        );
+        let mut surface = CommunicationsSurface::new();
+        surface.apply_call_media_readiness(Some(board));
+        surface.apply_call_media_verification(Some(CallMediaVerification {
+            local_actor: ActorId::new("eagle"),
+            rows: vec![],
+        }));
+        assert!(
+            surface
+                .call_media
+                .verification
+                .as_ref()
+                .is_some_and(|board| !board.claims_live_media()),
+            "empty verification is honest absence, not live mute"
+        );
+        let mut sink = CommandSink::new();
+        surface.set_call_muted(&mut sink, call, true);
+        surface.send_dtmf(&mut sink, call, '9');
+        assert!(
+            sink.is_empty(),
+            "call-media-readiness must not substitute for MediaSessionV1 mute/DTMF"
         );
     }
 

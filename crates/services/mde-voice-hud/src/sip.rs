@@ -326,13 +326,22 @@ impl PstnAgentDrive {
     }
 
     /// Pre-flight PSTN visibility. An absent provider is never
-    /// [`RegistrationState::Registered`].
+    /// [`RegistrationState::Registered`]. A Ready plan is Registering, never
+    /// a live PSTN media claim.
     #[must_use]
     pub fn visible_pstn_state(&self) -> RegistrationState {
         match self {
             Self::Unavailable { reason } => RegistrationState::Failed(reason.clone()),
             Self::Ready { .. } => RegistrationState::Registering,
         }
+    }
+
+    /// Ready means a governed provider can be driven. It is never live PSTN
+    /// media: this crate does not invent a connected SIP dialog from a plan.
+    #[must_use]
+    pub const fn claims_live_pstn(&self) -> bool {
+        let _ = self;
+        false
     }
 }
 
@@ -3137,6 +3146,7 @@ mod tests {
             }
         );
         assert!(!absent.pstn_leg_available());
+        assert!(!absent.claims_live_pstn());
         assert!(
             !matches!(
                 absent.visible_pstn_state(),
@@ -3171,6 +3181,10 @@ mod tests {
         )
         .unwrap();
         let first = plan_pstn_agent(Some(flat));
+        assert!(
+            !first.claims_live_pstn(),
+            "Ready is driveable, not live PSTN"
+        );
         let PstnAgentDrive::Ready {
             accounts: lifted,
             lifted_legacy,

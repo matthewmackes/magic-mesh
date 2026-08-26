@@ -3863,23 +3863,19 @@ fn hang_up_emits_hang_up_call() {
 }
 
 #[test]
-fn mute_toggle_emits_set_call_muted() {
+fn mute_toggle_fails_closed_without_published_media_session() {
     let call = CallId::new();
     let surface = CommunicationsSurface::new();
     let mut sink = CommandSink::new();
     surface.set_call_muted(&mut sink, call, true);
     assert!(
-        matches!(
-            sink.queued().first(),
-            Some(CollabCommand::SetCallMuted { call: c, muted: true }) if *c == call
-        ),
-        "the mute control must emit SetCallMuted"
+        sink.is_empty(),
+        "SetCallMuted must not emit as recorded intent without a published MediaSessionV1"
     );
 }
 
 #[test]
-fn dtmf_keypad_emits_send_dtmf() {
-    // Opening the in-call keypad is a per-view intent; a press emits SendDtmf.
+fn dtmf_keypad_fails_closed_without_published_media_session() {
     let call = CallId::new();
     let mut surface = CommunicationsSurface::new();
     surface.open_dtmf_pad(call);
@@ -3891,16 +3887,13 @@ fn dtmf_keypad_emits_send_dtmf() {
     let mut sink = CommandSink::new();
     surface.send_dtmf(&mut sink, call, '5');
     assert!(
-        matches!(
-            sink.queued().first(),
-            Some(CollabCommand::SendDtmf { call: c, digit: '5' }) if *c == call
-        ),
-        "a DTMF keypad press must emit SendDtmf"
+        sink.is_empty(),
+        "SendDtmf must not emit as recorded intent without a published MediaSessionV1"
     );
 }
 
 #[test]
-fn calls_media_intent_tracks_a_connected_local_leg() {
+fn calls_media_intent_does_not_survive_on_signaling_connected_without_session() {
     let space = SpaceId::new();
     let call = CallId::new();
     let me = ActorId::new("eagle");
@@ -3910,14 +3903,14 @@ fn calls_media_intent_tracks_a_connected_local_leg() {
 
     surface.reconcile_media_intent(&calls_fixture(space, call).call_state().active, &me);
     assert!(
-        surface.call_media.camera_on && surface.call_media.screen_sharing,
-        "recorded outgoing-media intent must survive while the local leg is connected"
+        !surface.call_media.camera_on && !surface.call_media.screen_sharing,
+        "signaling CallState::Connected must not keep recorded camera/screen intent without MediaSessionV1"
     );
 
     surface.reconcile_media_intent(&[], &me);
     assert!(
         !surface.call_media.camera_on && !surface.call_media.screen_sharing,
-        "recorded outgoing-media intent must clear after the local leg disappears"
+        "outgoing-media bits stay cleared after the local leg disappears"
     );
 }
 

@@ -786,6 +786,35 @@ impl MediaSessionV1 {
         media_session_topic(self.session)
     }
 
+    /// Whether this document claims live media. Delegates to
+    /// [`MediaSessionStateV1::claims_live_media`] so a caller cannot treat
+    /// signaling `CallParticipantState::Connected` as frames.
+    #[must_use]
+    pub const fn claims_live_media(&self) -> bool {
+        self.state.claims_live_media()
+    }
+
+    /// Mute may act only when live frames were observed and the audio sender
+    /// is bound. A published session in negotiating/reconnecting/failed is not
+    /// a live mute path.
+    #[must_use]
+    pub const fn binds_live_mute(&self) -> bool {
+        self.claims_live_media() && self.audio_bound
+    }
+
+    /// DTMF may act only when live frames were observed and the DTMF sender
+    /// is bound. No session, or a session without that bind, is fail-closed.
+    #[must_use]
+    pub const fn binds_live_dtmf(&self) -> bool {
+        self.claims_live_media() && self.dtmf_bound
+    }
+
+    /// Whether this session offered `track` on a live connected leg.
+    #[must_use]
+    pub fn offered_live_track(&self, track: MediaTrackKind) -> bool {
+        self.claims_live_media() && self.offered_tracks.contains(&track)
+    }
+
     /// Decode and admit a bounded JSON session body.
     ///
     /// # Errors
@@ -1226,6 +1255,14 @@ impl std::error::Error for CallMediaBoardDecodeError {
 }
 
 impl CallMediaReadiness {
+    /// Sidecar readiness is never live media. [`CallMediaAdmission::AdapterReady`]
+    /// is signed-state admission for a worker attempt, not frames, mute, or DTMF.
+    #[must_use]
+    pub const fn claims_live_media(&self) -> bool {
+        let _ = self;
+        false
+    }
+
     /// Decode and admit a bounded JSON readiness board.
     ///
     /// # Errors
@@ -1285,6 +1322,14 @@ impl CallMediaReadiness {
 }
 
 impl CallMediaVerification {
+    /// Whether any admitted row proved advancing frames. This board still does
+    /// not bind mute/DTMF; those require [`MediaSessionV1::binds_live_mute`] /
+    /// [`MediaSessionV1::binds_live_dtmf`] on `state/calls/media/<session>`.
+    #[must_use]
+    pub fn claims_live_media(&self) -> bool {
+        self.rows.iter().any(|row| row.status.claims_live_media())
+    }
+
     /// Decode and admit a bounded JSON verification board.
     ///
     /// # Errors
@@ -1613,7 +1658,31 @@ mod tests {
         let decoded = MediaSessionV1::from_json(&body).expect("admit");
         assert_eq!(decoded, session);
         assert!(decoded.state.claims_live_media());
+        assert!(decoded.claims_live_media());
+        assert!(decoded.binds_live_mute());
+        assert!(decoded.binds_live_dtmf());
+        assert!(decoded.offered_live_track(MediaTrackKind::Audio));
+        assert!(!decoded.offered_live_track(MediaTrackKind::Video));
         assert_eq!(decoded.topic(), media_session_topic(session.session));
+    }
+
+    #[test]
+    fn negotiating_and_reconnecting_do_not_bind_mute_or_dtmf() {
+        let mut negotiating = sample_session();
+        negotiating.state = MediaSessionStateV1::Negotiating;
+        negotiating.frames_observed = 0;
+        negotiating
+            .validate()
+            .expect("negotiating with binds is valid");
+        assert!(!negotiating.claims_live_media());
+        assert!(!negotiating.binds_live_mute());
+        assert!(!negotiating.binds_live_dtmf());
+        assert!(!negotiating.offered_live_track(MediaTrackKind::Audio));
+
+        let reconnecting = unavailable(MediaSessionStateV1::Reconnecting { attempt: 1 });
+        assert!(!reconnecting.claims_live_media());
+        assert!(!reconnecting.binds_live_mute());
+        assert!(!reconnecting.binds_live_dtmf());
     }
 
     #[test]
@@ -2168,11 +2237,18 @@ mod tests {
         )
         .expect("empty readiness is honest absence");
         assert!(readiness.sessions.is_empty());
+        assert!(
+            !readiness.claims_live_media(),
+            "empty readiness is honest absence, not a live call"
+        );
+        assert!(!CallMediaAdmission::AdapterReady.claims_live_media());
+        assert!(!CallMediaAdmission::WaitingForConnectedPeer.claims_live_media());
         let verification = CallMediaVerification::from_json(
             r#"{"local_actor":"Basement-Test-Workstation","rows":[]}"#,
         )
         .expect("empty verification is honest absence");
         assert!(verification.rows.is_empty());
+        assert!(!verification.claims_live_media());
     }
 
     #[test]
@@ -2188,6 +2264,19 @@ mod tests {
             CallMediaVerification::from_json(&serde_json::to_string(&verification).expect("json"))
                 .expect("admit verification");
         assert_eq!(decoded, verification);
+        assert!(
+            !readiness.claims_live_media(),
+            "AdapterReady readiness must not claim live media"
+        );
+        assert!(
+            verification.claims_live_media(),
+            "admitted LiveMediaVerified with frames may claim live media on the sidecar board"
+        );
+        assert!(CallMediaVerificationStatus::LiveMediaVerified.claims_live_media());
+        assert!(!CallMediaVerificationStatus::TransportUnavailable.claims_live_media());
+        assert!(!CallMediaVerificationStatus::ProviderUnavailable.claims_live_media());
+        assert!(!CallMediaVerificationStatus::MediaNotProven.claims_live_media());
+        assert!(!CallMediaVerificationStatus::WaitingForConnectedPeer.claims_live_media());
     }
 
     #[test]

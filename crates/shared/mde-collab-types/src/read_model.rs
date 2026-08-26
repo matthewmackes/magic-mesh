@@ -460,6 +460,16 @@ pub enum CallMediaAdmission {
     WaitingForConnectedPeer,
 }
 
+impl CallMediaAdmission {
+    /// Signed-state admission is never live media. [`Self::AdapterReady`] means
+    /// a worker may *attempt* a bind; it is not frames, mute, or DTMF.
+    #[must_use]
+    pub const fn claims_live_media(self) -> bool {
+        let _ = self;
+        false
+    }
+}
+
 /// Local capability/device requirements implied by a call kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -546,6 +556,15 @@ pub enum CallMediaVerificationStatus {
     MediaNotProven,
     /// A verifier proved advancing frames/data for the call requirements.
     LiveMediaVerified,
+}
+
+impl CallMediaVerificationStatus {
+    /// Only [`Self::LiveMediaVerified`] is live media. Every other status is an
+    /// honest unproven or unavailable row — never mute, DTMF, or a connected call.
+    #[must_use]
+    pub const fn claims_live_media(self) -> bool {
+        matches!(self, Self::LiveMediaVerified)
+    }
 }
 
 /// Counters from a concrete live-media verifier.
