@@ -735,6 +735,17 @@ struct ReloadWatch {
     next_poll: f64,
 }
 
+/// The primary caret/selection as collab [`crate::CursorPos`] (char indices).
+fn view_cursor_pos(view: &EditorView) -> crate::CursorPos {
+    let head = view.cursor();
+    let anchor = match view.selection() {
+        Some(range) if range.start == head => range.end,
+        Some(range) => range.start,
+        None => head,
+    };
+    crate::CursorPos { anchor, head }
+}
+
 impl EditorSurface {
     /// Whether a document is currently open (the focused pane has an active tab)
     /// — the surface is showing the editor, not the empty state.
@@ -763,8 +774,13 @@ impl EditorSurface {
     /// tab. Documents-mode share-session catch-up and the external-write
     /// three-way merge use this so a live [`crate::CollabSession`] can stay
     /// attached on the collab side.
+    ///
+    /// The primary caret/selection is kept (clamped to the new length). Jumping
+    /// to the end would clobber an in-flight co-edit caret on every remote
+    /// apply; follow-mode then re-lands through [`Self::apply_follow_update`].
     pub fn replace_text(&mut self, text: &str) {
         if let Some(doc) = self.doc_mut() {
+            let cursor = view_cursor_pos(&doc.view);
             let len = doc.buffer.len_chars();
             if len > 0 {
                 doc.buffer.remove(0..len);
@@ -772,10 +788,45 @@ impl EditorSurface {
             if !text.is_empty() {
                 doc.buffer.insert(0, text);
             }
-            let caret = doc.buffer.len_chars();
-            doc.view.place_cursor(&doc.buffer, caret);
+            let new_len = doc.buffer.len_chars();
+            doc.view.place_selection(
+                &doc.buffer,
+                cursor.anchor.min(new_len),
+                cursor.head.min(new_len),
+            );
         } else {
             self.open_text(text);
+        }
+    }
+
+    /// The focused view's caret/selection in collab char indices, or `None`
+    /// when no document is open. Documents-mode share-session pumps this into
+    /// [`crate::CollabSession::set_cursor`] so follow-mode has a real cursor.
+    #[must_use]
+    pub fn current_cursor(&self) -> Option<crate::CursorPos> {
+        self.doc().map(|doc| view_cursor_pos(&doc.view))
+    }
+
+    /// A caret-line viewport for collab presence. The widget does not store a
+    /// painted scroll span off-frame, so this is the leader's caret line — the
+    /// honest fallback a follower tracks until a live paint reports more.
+    #[must_use]
+    pub fn current_viewport(&self) -> Option<crate::Viewport> {
+        let doc = self.doc()?;
+        let line = doc
+            .buffer
+            .char_to_line(doc.view.cursor().min(doc.buffer.len_chars()));
+        Some(crate::Viewport {
+            first_line: line,
+            last_line: line,
+        })
+    }
+
+    /// Place a single caret at char index `idx` (clamped). Documents-mode
+    /// tests and follow catch-up use this so presence is not stuck at 0.
+    pub fn place_cursor(&mut self, idx: usize) {
+        if let Some(doc) = self.doc_mut() {
+            doc.view.place_cursor(&doc.buffer, idx);
         }
     }
 

@@ -149,6 +149,33 @@ fn opening_a_document_renders_the_widget() {
     assert!(!surface.is_open(), "close returns to the empty state");
 }
 
+#[test]
+fn replace_text_preserves_caret_instead_of_jumping_to_end() {
+    let mut surface = real_editor();
+    surface.open_text("hello world");
+    surface.place_cursor(5);
+    surface.replace_text("hello there world");
+    assert_eq!(
+        surface.current_cursor(),
+        Some(crate::CursorPos::caret(5)),
+        "a CRDT/external apply must not jump the caret to the end"
+    );
+    assert_eq!(surface.current_text().as_deref(), Some("hello there world"));
+}
+
+#[test]
+fn replace_text_clamps_caret_when_the_buffer_shrinks() {
+    let mut surface = real_editor();
+    surface.open_text("hello world");
+    surface.place_cursor(11);
+    surface.replace_text("hi");
+    assert_eq!(
+        surface.current_cursor(),
+        Some(crate::CursorPos::caret(2)),
+        "a shortened apply must clamp, not drop, the caret"
+    );
+}
+
 /// EDITOR-10 — the integrated terminal dock is reachable through the real
 /// `editor_panel` path: the Ctrl+Backtick chord toggles it on, it spawns a real PTY
 /// in the open project root, the panel mounts + paints with it shown, and the

@@ -675,6 +675,8 @@ impl DocumentsState {
         if let Some(text) = editor.current_text() {
             mirror_local_text_into_session(&mut live.session, &text);
         }
+        live.session.set_cursor(editor.current_cursor());
+        live.session.set_viewport(editor.current_viewport());
         live.session.flush(share_transport);
         live.session.publish_presence(share_transport);
         let watch_host = if !live.expected_host.is_empty() {
@@ -1470,6 +1472,19 @@ impl CommunicationsSurface {
         self.documents.editor.replace_text(text);
     }
 
+    /// Test seam: the Document editor's collab caret/selection.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn document_editor_cursor(&self) -> Option<mde_editor_egui::CursorPos> {
+        self.documents.editor.current_cursor()
+    }
+
+    /// Test seam: place the Document editor caret without typing.
+    #[cfg(test)]
+    pub(crate) fn set_document_editor_cursor(&mut self, idx: usize) {
+        self.documents.editor.place_cursor(idx);
+    }
+
     /// Test seam: run the external-write merge against the current `document_body`.
     #[cfg(test)]
     pub(crate) fn apply_external_document_body(&mut self, data: &dyn CollabData) {
@@ -2107,32 +2122,13 @@ mod tests {
         document: mde_collab_types::DocumentId,
         participants: &[&str],
     ) -> crate::fixture::FixtureData {
-        use crate::fixture::{space_summary, FixtureData};
-        use mde_collab_types::{ActorId, DocumentSession, DocumentSessions, SpaceKind, SpaceRole};
-
-        FixtureData::new(me, 1_000)
-            .with_space(space_summary(
-                space,
-                SpaceKind::Project,
-                "Docs",
-                SpaceRole::Member,
-                0,
-                participants.len() as u32,
-                1_000,
-            ))
-            .with_document_sessions(
-                space,
-                DocumentSessions {
-                    sessions: vec![DocumentSession {
-                        document,
-                        space,
-                        title: "Runbook".to_owned(),
-                        participants: participants.iter().map(|id| ActorId::new(*id)).collect(),
-                        call: None,
-                    }],
-                },
-            )
-            .with_document_body(document, "# Runbook\n")
+        crate::fixture::FixtureData::document_share(
+            me,
+            space,
+            document,
+            participants,
+            "# Runbook\n",
+        )
     }
 
     #[test]
@@ -2468,6 +2464,139 @@ mod tests {
         assert!(
             guest.live_document_share_session().is_none(),
             "owner Close must detach the follower's attached session"
+        );
+    }
+
+    #[test]
+    fn two_seats_co_edit_without_clobbering_and_follow_replays_the_host_caret() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
+        let guest_data = share_fixture("falcon", space, document, &["eagle", "falcon"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share(&guest_data, space, document));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+
+        guest.set_document_editor_cursor(2);
+        host.set_document_editor_text("# Runbook\nhost\n");
+        for _ in 0..6 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            guest.document_editor_text().as_deref(),
+            Some("# Runbook\nhost\n"),
+            "guest must receive the host line"
+        );
+        assert_eq!(
+            guest.document_editor_cursor(),
+            Some(mde_editor_egui::CursorPos::caret(2)),
+            "applying a remote CRDT snapshot must not jump the guest caret to the end"
+        );
+
+        guest.set_document_editor_text("# Runbook\nhost\nguest\n");
+        for _ in 0..6 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            host.document_editor_text().as_deref(),
+            Some("# Runbook\nhost\nguest\n"),
+            "host must receive the guest line"
+        );
+        assert_eq!(
+            host.document_editor_text().as_deref(),
+            guest.document_editor_text().as_deref(),
+            "two seats must converge after sequential co-edits"
+        );
+
+        host.set_document_editor_cursor(4);
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert!(
+            !guest.follow_share_peer("osprey"),
+            "follow of a peer not in the roster must refuse"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("not in the share roster")),
+            "unknown-peer follow must refuse honestly, got {:?}",
+            guest.document_notice()
+        );
+        assert!(guest.follow_share_peer("eagle"));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            guest.document_editor_cursor(),
+            Some(mde_editor_egui::CursorPos::caret(4)),
+            "follow must replay the host caret onto the guest editor"
+        );
+    }
+
+    #[test]
+    fn concurrent_suffix_edits_from_a_shared_base_keep_both_lines() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
+        let guest_data = share_fixture("falcon", space, document, &["eagle", "falcon"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share(&guest_data, space, document));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+
+        host.set_document_editor_text("# Runbook\nhost\n");
+        guest.set_document_editor_text("# Runbook\nguest\n");
+        for _ in 0..8 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        let host_text = host.document_editor_text().expect("host buffer");
+        let guest_text = guest.document_editor_text().expect("guest buffer");
+        assert_eq!(
+            host_text, guest_text,
+            "concurrent suffix inserts must converge"
+        );
+        assert!(
+            host_text.contains("host") && host_text.contains("guest"),
+            "neither seat's line may be silently dropped, got {host_text:?}"
         );
     }
 }

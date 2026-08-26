@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use mde_collab_types::{
     ActivityEntry, ActivityFeed, ActorClock, ActorId, AlertInbox, CallKind, CallParticipantState,
     CallParticipantView, CallState, CallView, ChannelTasks, ClipboardLane, ConversationTimeline,
-    DeliveryState, DiscordBridgeBoard, DocumentId, DocumentSessions, EventId, FileReferences,
-    MediaSessionV1, MessagePins, MessageView, SavedMessages, SpaceDirectory, SpaceId, SpaceKind,
-    SpaceRole, SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
+    DeliveryState, DiscordBridgeBoard, DocumentId, DocumentSession, DocumentSessions, EventId,
+    FileReferences, MediaSessionV1, MessagePins, MessageView, SavedMessages, SpaceDirectory,
+    SpaceId, SpaceKind, SpaceRole, SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -186,6 +186,42 @@ impl FixtureData {
     pub fn with_document_body(mut self, document: DocumentId, body: impl Into<String>) -> Self {
         self.document_bodies.insert(document, body.into());
         self
+    }
+
+    /// One space, one live document session row, and a resolved Markdown body.
+    /// Two-seat share/join/follow/close tests build both seats from this so
+    /// membership and the picker row are real, never faked.
+    #[must_use]
+    pub fn document_share(
+        me: &str,
+        space: SpaceId,
+        document: DocumentId,
+        participants: &[&str],
+        body: &str,
+    ) -> Self {
+        Self::new(me, 1_000)
+            .with_space(space_summary(
+                space,
+                SpaceKind::Project,
+                "Docs",
+                SpaceRole::Member,
+                0,
+                participants.len() as u32,
+                1_000,
+            ))
+            .with_document_sessions(
+                space,
+                DocumentSessions {
+                    sessions: vec![DocumentSession {
+                        document,
+                        space,
+                        title: "Runbook".to_owned(),
+                        participants: participants.iter().map(|id| ActorId::new(*id)).collect(),
+                        call: None,
+                    }],
+                },
+            )
+            .with_document_body(document, body)
     }
 
     /// Set the Discord bridge status board. Tests use this to exercise the
