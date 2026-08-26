@@ -11,14 +11,20 @@
 //!
 //! Verbs (args in the request body):
 //!   * `set-gateway`   — body `{"host","port"?,"username","password"?,
-//!     "display_name"?,"expires"?}`; writes gateway.toml. Empty `host` clears it.
-//!   * `get-gateway`   — no body; reply `{"present":bool, ...fields}` for the panel.
+//!     "display_name"?,"expires"?}`; writes gateway.toml. Empty `host` clears a
+//!     present gateway; a second empty-host clear refuses. Malformed hosts
+//!     (scheme, path, whitespace, embedded port) refuse before any write.
+//!   * `get-gateway`   — no body; reply `{"present":bool, ...fields}` for the
+//!     panel. The stored password is never in the reply (`password` is `""`;
+//!     `password_set` reports whether a secret is stored).
 //!   * `clear-gateway` — an authenticated JSON envelope (payload ignored);
-//!     removes gateway.toml (reverts every node to P2P).
+//!     removes gateway.toml (reverts every node to P2P). A clear when already
+//!     absent, or a replayed armed token, refuses.
 //!
 //! The password travels only over the per-node tmpfs Bus + lands in a 0600 file;
-//! it is never passed on a command line (absent from `ps`). At-rest age-encryption
-//! on QNM-Shared is a noted hardening follow-on (no age helper exists yet).
+//! it is never passed on a command line (absent from `ps`) and never rendered
+//! in a Bus reply or `Debug`. At-rest age-encryption on QNM-Shared is a noted
+//! hardening follow-on (no age helper exists yet).
 
 #![cfg(feature = "async-services")]
 
@@ -80,7 +86,7 @@ pub fn gateway_path(workgroup_root: &Path) -> PathBuf {
 
 /// On-disk gateway record — identical fields to the voice agent's `AccountFile`
 /// so `mde-voice-hud` parses it with no translation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct GatewayFile {
     username: String,
     #[serde(default)]
@@ -91,6 +97,25 @@ struct GatewayFile {
     display_name: String,
     #[serde(default = "default_expires")]
     expires: u32,
+}
+
+impl std::fmt::Debug for GatewayFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayFile")
+            .field("username", &self.username)
+            .field(
+                "password",
+                if self.password.is_empty() {
+                    &""
+                } else {
+                    &"<redacted>"
+                },
+            )
+            .field("server", &self.server)
+            .field("display_name", &self.display_name)
+            .field("expires", &self.expires)
+            .finish()
+    }
 }
 
 fn default_expires() -> u32 {
@@ -117,10 +142,14 @@ pub fn build_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> Str
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            // Empty host = clear (revert the mesh to P2P).
+            // Empty host = clear a *present* gateway (revert the mesh to P2P).
+            // A second empty-host clear is a replay and refuses; Activity treats
+            // empty host as malformed at the UI, so this shortcut is daemon-only.
             if host.is_empty() {
-                let _ = std::fs::remove_file(&path);
-                return json!({ "ok": true, "cleared": true }).to_string();
+                return clear_gateway(&path, "set-gateway");
+            }
+            if !is_valid_gateway_host(&host) {
+                return err("set-gateway: malformed host".into());
             }
             let username = req
                 .get("username")
@@ -194,10 +223,7 @@ pub fn build_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> Str
             }
             None => json!({ "present": false }).to_string(),
         },
-        "clear-gateway" => {
-            let _ = std::fs::remove_file(&path);
-            json!({ "ok": true }).to_string()
-        }
+        "clear-gateway" => clear_gateway(&path, "clear-gateway"),
         other => err(format!("voip: unknown verb {other}")),
     }
 }
@@ -271,6 +297,85 @@ fn build_bus_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> Str
         return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
     }
     build_reply(svc, verb, Some(&handler_body))
+}
+
+/// Remove a present `gateway.toml`. Absent file is a replayed clear and refuses.
+fn clear_gateway(path: &Path, verb: &str) -> String {
+    if !path.exists() {
+        return json!({ "error": format!("{verb}: gateway is already cleared") }).to_string();
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if verb == "set-gateway" {
+                json!({ "ok": true, "cleared": true }).to_string()
+            } else {
+                json!({ "ok": true }).to_string()
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            json!({ "error": format!("{verb}: gateway is already cleared") }).to_string()
+        }
+        Err(e) => json!({ "error": format!("{verb}: {e}") }).to_string(),
+    }
+}
+
+/// Registrar host: IPv4 or DNS label, no scheme, path, port, or whitespace.
+/// Mirrors `mde-collab-egui` `is_valid_gateway_host` so a Bus caller cannot
+/// bypass the Activity refuse by posting `set-gateway` directly.
+fn is_valid_gateway_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if host.contains("://")
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('@')
+        || host.contains(' ')
+        || host.contains(':')
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+    {
+        return false;
+    }
+    if is_ipv4_host(host) {
+        return true;
+    }
+    host.split('.').all(is_dns_label)
+}
+
+fn is_ipv4_host(host: &str) -> bool {
+    let mut count = 0usize;
+    for part in host.split('.') {
+        count += 1;
+        if count > 4 {
+            return false;
+        }
+        if part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if part.len() > 1 && part.starts_with('0') {
+            return false;
+        }
+        if part.parse::<u8>().is_err() {
+            return false;
+        }
+    }
+    count == 4
+}
+
+fn is_dns_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
 }
 
 /// Write the gateway file atomically with 0600 perms (the password is in it).
@@ -525,6 +630,8 @@ mod tests {
         );
         let written = std::fs::read_to_string(gateway_path(tmp.path())).unwrap();
         assert!(written.contains("server = \"pbx.example.com:5062\""));
+        assert_no_secret(&first, "s3cret");
+        assert_no_secret(&replay, "s3cret");
 
         let clear_unsigned = json!({ "schema_version": 1 }).to_string();
         let clear_context = MutationContext {
@@ -542,5 +649,169 @@ mod tests {
         let cleared = build_bus_reply(&svc, "clear-gateway", Some(&clear_armed));
         assert!(cleared.contains("\"ok\":true"), "{cleared}");
         assert!(!gateway_path(tmp.path()).exists());
+        let replay_clear = build_bus_reply(&svc, "clear-gateway", Some(&clear_armed));
+        assert!(
+            replay_clear.contains("already used"),
+            "replayed armed clear must refuse: {replay_clear}"
+        );
+        assert_no_secret(&cleared, "s3cret");
+        assert_no_secret(&replay_clear, "s3cret");
+    }
+
+    #[test]
+    fn malformed_hosts_refuse_before_gateway_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = VoipService::new(tmp.path());
+        let _ = build_reply(
+            &svc,
+            "set-gateway",
+            Some(
+                &json!({"host":"pbx.example.com","username":"alice","password":"s3cret"})
+                    .to_string(),
+            ),
+        );
+        let before = std::fs::read_to_string(gateway_path(tmp.path())).unwrap();
+
+        for host in [
+            "http://pbx.example.com",
+            "pbx.example.com/sip",
+            "not a host",
+            "pbx.example.com:5062",
+            "alice@pbx.example.com",
+            ".pbx.example.com",
+            "pbx.example.com.",
+            "pbx..example.com",
+        ] {
+            let body = json!({
+                "host": host,
+                "username": "alice",
+                "password": "s3cret"
+            })
+            .to_string();
+            let reply = build_reply(&svc, "set-gateway", Some(&body));
+            assert!(
+                reply.contains("malformed host"),
+                "host {host:?} must refuse: {reply}"
+            );
+            assert_no_secret(&reply, "s3cret");
+        }
+
+        let after = std::fs::read_to_string(gateway_path(tmp.path())).unwrap();
+        assert_eq!(
+            before, after,
+            "malformed host must not rewrite gateway.toml"
+        );
+    }
+
+    #[test]
+    fn replayed_clears_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = VoipService::new(tmp.path());
+        let path = gateway_path(tmp.path());
+
+        let absent_clear = build_reply(&svc, "clear-gateway", Some("{}"));
+        assert!(
+            absent_clear.contains("already cleared"),
+            "clear of an absent gateway must refuse: {absent_clear}"
+        );
+        assert!(!path.exists());
+
+        let empty_host_absent =
+            build_reply(&svc, "set-gateway", Some(&json!({"host":""}).to_string()));
+        assert!(
+            empty_host_absent.contains("already cleared"),
+            "empty-host clear of an absent gateway must refuse: {empty_host_absent}"
+        );
+
+        let set = build_reply(
+            &svc,
+            "set-gateway",
+            Some(
+                &json!({
+                    "host": "pbx.example.com",
+                    "username": "alice",
+                    "password": "s3cret"
+                })
+                .to_string(),
+            ),
+        );
+        assert!(set.contains("\"ok\":true"), "{set}");
+        assert!(path.exists());
+
+        let first = build_reply(&svc, "clear-gateway", Some("{}"));
+        assert!(first.contains("\"ok\":true"), "{first}");
+        assert!(!path.exists());
+
+        let second = build_reply(&svc, "clear-gateway", Some("{}"));
+        assert!(
+            second.contains("already cleared"),
+            "second clear must refuse: {second}"
+        );
+        assert_no_secret(&first, "s3cret");
+        assert_no_secret(&second, "s3cret");
+        assert_no_secret(&absent_clear, "s3cret");
+    }
+
+    #[test]
+    fn password_never_renders_in_replies_or_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = VoipService::new(tmp.path());
+        let secret = "s3cret-never-render";
+        let set = build_reply(
+            &svc,
+            "set-gateway",
+            Some(
+                &json!({
+                    "host": "pbx.example.com",
+                    "port": 5062,
+                    "username": "alice",
+                    "password": secret,
+                    "display_name": "Alice"
+                })
+                .to_string(),
+            ),
+        );
+        assert!(set.contains("\"ok\":true"), "{set}");
+        assert_no_secret(&set, secret);
+
+        let get = build_reply(&svc, "get-gateway", None);
+        assert_no_secret(&get, secret);
+        let v: serde_json::Value = serde_json::from_str(&get).unwrap();
+        assert_eq!(v["password"], "");
+        assert_eq!(v["password_set"], true);
+
+        let stored = read_gateway(&gateway_path(tmp.path())).expect("gateway present");
+        assert_eq!(stored.password, secret);
+        let debug = format!("{stored:?}");
+        assert!(
+            !debug.contains(secret),
+            "GatewayFile Debug leaked the password: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "{debug}");
+
+        let clear = build_reply(&svc, "clear-gateway", Some("{}"));
+        assert!(clear.contains("\"ok\":true"), "{clear}");
+        assert_no_secret(&clear, secret);
+        let get_absent = build_reply(&svc, "get-gateway", None);
+        assert_no_secret(&get_absent, secret);
+        assert!(!get_absent.contains("\"password\""), "{get_absent}");
+    }
+
+    /// Replies must never carry the stored/posted secret, including a present
+    /// `password` JSON field (that field is allowed only as `""`).
+    fn assert_no_secret(reply: &str, secret: &str) {
+        assert!(
+            !reply.contains(secret),
+            "reply leaked the gateway password: {reply}"
+        );
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(reply) {
+            if let Some(password) = value.get("password") {
+                assert_eq!(
+                    password.as_str(),
+                    Some(""),
+                    "password field must be empty: {reply}"
+                );
+            }
+        }
     }
 }
