@@ -1425,15 +1425,18 @@ story execution contract above.
   but `FolderPrefs` is an in-memory `HashMap` lost on every restart.
 - Required outcome: per-folder view mode, sort order, and show-hidden survive
   a shell restart.
-- Current state: persist path is in-tree. Surface dest-cut `4071ed295`
-  packaged unit pins `XDG_CONFIG_HOME=/root/.config` (HOME unset; no
-  Seat-15-style drop-in). `/root/.config/mcnf/` absent; no
-  `files-folder-prefs.json`. kmsgrab frame unread as PNG. No dest JSON, no
-  GUI view/sort/hidden. Evidence:
-  `WL-FUNC-026-2026-08-25-surface-folder-prefs-r1.md`.
-- Remaining work: leftover is operator GUI view/sort/hidden then restart on a
-  current-revision seat (dest hydrate is not operator use). Packaged dest-cut
-  unit pins `XDG_CONFIG_HOME`; Surface has the pin and no persist file.
+- Current state: persist path is in-tree. Dell dest-cut `bc14a22d7`
+  packaged unit pins `XDG_CONFIG_HOME=/root/.config` (HOME unset). Live
+  pid environ has the pin; expected store
+  `/root/.config/mcnf/files-folder-prefs.json`. `/root/.config/mcnf/`
+  absent; no persist file. Production Files is Mesh Teams references
+  (`files_panel` not mounted). No dest JSON, no FileBrowser
+  view/sort/hidden write. Evidence:
+  `WL-FUNC-026-2026-08-26-dell-folder-prefs-r1.md`.
+- Remaining work: leftover is operator FileBrowser view/sort/hidden then
+  persist write on a current-revision seat (dest hydrate is not operator
+  use). Dell has the XDG pin and no persist file. Production Construct
+  does not mount `files_panel` (Files aliases Communications).
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
