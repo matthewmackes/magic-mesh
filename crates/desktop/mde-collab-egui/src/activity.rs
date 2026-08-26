@@ -2363,15 +2363,12 @@ fn apply_voice_did_route(
     if !has_provisioned_voice_account(nodes) {
         return refuse_unprovisioned_voice(form);
     }
+    // Empty node identity is an unknown node, but invalid DIDs must refuse
+    // first so the operator sees the DID problem rather than a missing node.
     let target = if unroute {
         None
     } else {
-        let target = form.route_node.trim();
-        if target.is_empty() {
-            form.notice = Some(VoiceAdminRefuse::UnknownNode.label().to_owned());
-            return VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::UnknownNode);
-        }
-        Some(target)
+        Some(form.route_node.trim())
     };
     let pending = sink.pending_did_routes();
     match validate_did_route(&form.did, target, dids, nodes, &pending) {
@@ -2446,6 +2443,10 @@ fn apply_voice_cutover(
     cutover: Option<&VoiceCutoverStatus>,
     sink: &mut VoiceAdminSink,
 ) -> VoiceAdminFormOutcome {
+    if !has_provisioned_voice_account(nodes) {
+        form.confirm_cutover = false;
+        return refuse_unprovisioned_voice(form);
+    }
     if !form.confirm_cutover {
         form.confirm_cutover = true;
         return VoiceAdminFormOutcome::ArmedCutover;
@@ -3416,6 +3417,171 @@ mod tests {
                 node_id: Some("peer:otter".to_owned()),
             }
         );
+        let trimmed = validate_did_route(" 15551234567 ", Some("peer:eagle"), &dids, &nodes, &[])
+            .expect("whitespace DID must trim at the verb boundary");
+        assert_eq!(
+            trimmed,
+            VoiceAdminCommand::DidRoute {
+                did: "15551234567".to_owned(),
+                node_id: Some("peer:eagle".to_owned()),
+            }
+        );
+        assert_eq!(
+            validate_did_route("15551234567", Some("peer:eagle"), &dids, &nodes, &pending)
+                .expect("same DID pending toward the same node is not a conflict"),
+            VoiceAdminCommand::DidRoute {
+                did: "15551234567".to_owned(),
+                node_id: Some("peer:eagle".to_owned()),
+            }
+        );
+        let twins = vec![
+            provisioned_node("peer:east", "eagle", "east"),
+            provisioned_node("peer:west", "eagle", "west"),
+        ];
+        assert_eq!(
+            validate_did_route("15551234567", Some("eagle"), &dids, &twins, &[]).unwrap_err(),
+            VoiceAdminRefuse::UnknownNode
+        );
+    }
+
+    #[test]
+    fn apply_voice_admin_refuses_invalid_dids_unknown_nodes_and_conflicts() {
+        let nodes = vec![
+            provisioned_node("peer:eagle", "eagle", "eagle"),
+            provisioned_node("peer:otter", "otter", "otter"),
+        ];
+        let dids = vec![inventory("15551234567", Some("eagle"))];
+
+        let mut form = VoiceAdminFormState::draft(
+            "not-a-did",
+            "peer:eagle",
+            "peer:eagle",
+            0,
+            "",
+            "15551234567",
+            "main",
+        );
+        let mut sink = VoiceAdminSink::new();
+        assert_eq!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                None,
+                &mut sink,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::InvalidDid)
+        );
+        assert_eq!(
+            form.notice.as_deref(),
+            Some(VoiceAdminRefuse::InvalidDid.label())
+        );
+
+        form.did = "15551234567".to_owned();
+        form.route_node.clear();
+        assert_eq!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                None,
+                &mut sink,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::UnknownNode)
+        );
+
+        form.did = "not-a-did".to_owned();
+        form.route_node.clear();
+        assert_eq!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                None,
+                &mut sink,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::InvalidDid),
+            "invalid DID must refuse before an empty node identity"
+        );
+
+        form.did = "15551234567".to_owned();
+        form.route_node = "peer:ghost".to_owned();
+        assert_eq!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                None,
+                &mut sink,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::UnknownNode)
+        );
+        assert!(
+            sink.is_empty(),
+            "refused DID/node must not queue a voice verb: {:?}",
+            sink.drain()
+        );
+
+        form.route_node = "peer:eagle".to_owned();
+        assert!(matches!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                None,
+                &mut sink,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            VoiceAdminFormOutcome::Published(VoiceAdminCommand::DidRoute { .. })
+        ));
+        form.route_node = "peer:otter".to_owned();
+        assert_eq!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                None,
+                &mut sink,
+                VoiceAdminFormIntent::DidRoute,
+            ),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::ConflictingRoute)
+        );
+        assert_eq!(
+            form.notice.as_deref(),
+            Some(VoiceAdminRefuse::ConflictingRoute.label())
+        );
+        let queued = sink.drain();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0],
+            VoiceAdminCommand::DidRoute {
+                did: "15551234567".to_owned(),
+                node_id: Some("peer:eagle".to_owned()),
+            }
+        );
+
+        let mixed = vec![
+            provisioned_node("peer:eagle", "eagle", "eagle"),
+            VoiceNodeProjection {
+                node_id: "peer:otter".to_owned(),
+                hostname: "otter".to_owned(),
+                username: "otter".to_owned(),
+                sip_uri: "otter@sip.vitelity.net".to_owned(),
+                reg_state: VoiceRegState::Provisioning,
+                routed_dids: Vec::new(),
+                failover: None,
+                updated_at_s: 1_700_000_000,
+            },
+        ];
+        assert!(has_provisioned_voice_account(&mixed));
+        assert_eq!(
+            validate_did_route("15551234567", Some("peer:otter"), &dids, &mixed, &[]).unwrap_err(),
+            VoiceAdminRefuse::NoProvisionedAccount
+        );
     }
 
     #[test]
@@ -3945,6 +4111,14 @@ mod tests {
                 "No cutover status projected.",
             ]
         );
+        assert_eq!(
+            voice_unprovisioned_headline(&[]),
+            "No provisioned voice account"
+        );
+        assert_eq!(
+            voice_unprovisioned_detail(&[]),
+            "DID routing, failover, shared-outbound, and cutover stay empty until a node has a sub-account."
+        );
 
         let mut empty_form = VoiceAdminFormState::draft(
             "15551234567",
@@ -3970,11 +4144,13 @@ mod tests {
             }
             other => panic!("empty projections must still publish provision, got {other:?}"),
         }
+        empty_form.confirm_cutover = true;
         for intent in [
             VoiceAdminFormIntent::DidRoute,
             VoiceAdminFormIntent::Unroute,
             VoiceAdminFormIntent::Failover,
             VoiceAdminFormIntent::SharedConfig,
+            VoiceAdminFormIntent::Cutover,
         ] {
             assert_eq!(
                 apply_voice_admin(&mut empty_form, &[], &[], None, &mut sink, intent),
@@ -3982,6 +4158,10 @@ mod tests {
                 "{intent:?} must refuse honestly when state/voice projections are empty"
             );
         }
+        assert!(
+            !empty_form.confirm_cutover,
+            "unprovisioned cutover must not stay armed"
+        );
         let drained = sink.drain();
         assert_eq!(drained.len(), 1);
         assert!(matches!(drained[0], VoiceAdminCommand::Provision));
