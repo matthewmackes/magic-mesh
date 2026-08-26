@@ -45,6 +45,7 @@ use mde_files::opqueue::{Progress, Resolution};
 use mde_files::search::TypeFilter;
 use mde_files::{ArchiveFormat, LiveFileOps};
 
+use crate::bookmarks::{self, PlacesUserIntent};
 use crate::dialogs::{Perm, PermClass};
 use crate::mesh_mount::{MountPhase, MountView};
 use crate::model::{
@@ -824,9 +825,18 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         Action::CancelExtractTo => browser.cancel_extract_to(),
         Action::OpenSymlink(p) => browser.open_symlink(p),
         Action::OpenHardLink(p) => browser.open_hard_link(p),
-        Action::PinFocused(p) => browser.pin_focused(p),
-        Action::UnpinBookmark(i) => browser.unpin_bookmark(i),
-        Action::ReorderBookmark(i, delta) => browser.reorder_bookmark(i, delta),
+        Action::PinFocused(p) => {
+            browser.pin_focused(p);
+            browser.flush_persisted();
+        }
+        Action::UnpinBookmark(i) => {
+            browser.unpin_bookmark(i);
+            browser.flush_persisted();
+        }
+        Action::ReorderBookmark(i, delta) => {
+            browser.reorder_bookmark(i, delta);
+            browser.flush_persisted();
+        }
         Action::RenameBookmark(i) => browser.open_rename_bookmark(i),
         Action::OpenRename(p) => browser.open_rename(p),
         Action::SetNameDialogInput(name) => browser.set_name_dialog_input(name),
@@ -3897,17 +3907,17 @@ const fn places_pin_action(pane: usize) -> Action {
     Action::PinFocused(pane)
 }
 
-/// WL-FUNC-027 — every Places user-section intent (pin / rename / reorder /
-/// remove) as the sidebar header and bookmark context raise them. [`apply`]
-/// maps each onto the matching [`FileBrowser`] bookmark method.
+/// WL-FUNC-027 — map the dedicated Places user-section intents onto view
+/// [`Action`]s. Persist/validation live in [`crate::bookmarks`]; [`apply`]
+/// still mutates the session [`FileBrowser`] so the sidebar and dialogs share
+/// one list.
 fn places_user_section_actions(pane: usize, idx: usize) -> [Action; 5] {
-    [
-        places_pin_action(pane),
-        Action::RenameBookmark(idx),
-        Action::ReorderBookmark(idx, -1),
-        Action::ReorderBookmark(idx, 1),
-        Action::UnpinBookmark(idx),
-    ]
+    bookmarks::user_section_intents(pane, idx).map(|intent| match intent {
+        PlacesUserIntent::PinCurrent { pane } => Action::PinFocused(pane),
+        PlacesUserIntent::Rename { index } => Action::RenameBookmark(index),
+        PlacesUserIntent::Reorder { index, delta } => Action::ReorderBookmark(index, delta),
+        PlacesUserIntent::Remove { index } => Action::UnpinBookmark(index),
+    })
 }
 
 fn places_user_section_menu(
@@ -3946,14 +3956,11 @@ fn places_user_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Act
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if files_action_button(
-                ui,
-                "Pin",
-                FilesActionTone::Quiet,
-                "Pin the current folder to Places",
-            )
-            .clicked()
-            {
+            let tip = format!(
+                "Pin the current folder to Places (at most {} pins)",
+                bookmarks::CAP
+            );
+            if files_action_button(ui, "Pin", FilesActionTone::Quiet, &tip).clicked() {
                 actions.push(places_pin_action(active));
             }
         });
@@ -3961,14 +3968,15 @@ fn places_user_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Act
 
     let count = b.bookmarks().len();
     if count == 0 {
-        muted_note(ui, "Pin a folder to keep it here.");
+        muted_note(ui, bookmarks::EMPTY_HINT);
     }
     for (idx, bookmark) in b.bookmarks().iter().enumerate() {
+        let label = bookmarks::sanitize_label(&bookmark.label, &bookmark.path);
         let here = matches!(
             b.active_tab().location(),
             Location::Local(p) if p.as_str() == bookmark.path
         );
-        let resp = local_place_row(ui, IconId::FileFolder, bookmark.label.as_str(), here);
+        let resp = local_place_row(ui, IconId::FileFolder, label.as_str(), here);
         if resp.clicked() {
             actions.push(Action::Navigate(
                 active,
@@ -5216,6 +5224,16 @@ mod tests {
         apply(&ctx, &mut b, Action::UnpinBookmark(1));
         assert_eq!(b.bookmarks().len(), 1);
         assert_eq!(b.bookmarks()[0].label, "Projects");
+
+        b.flush_persisted();
+        let persisted = crate::bookmarks::BookmarkStore::open(store.path());
+        assert_eq!(
+            persisted.bookmarks().len(),
+            1,
+            "dedicated store loads the session JSON"
+        );
+        assert_eq!(persisted.bookmarks()[0].label, "Projects");
+        assert_eq!(persisted.bookmarks()[0].path, b.bookmarks()[0].path);
 
         mount(&mut b);
     }

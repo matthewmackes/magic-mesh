@@ -24,6 +24,7 @@
 // other clippy lint (incl. the substantive pedantic ones) stays on.
 #![allow(clippy::missing_const_for_fn)]
 
+pub mod bookmarks;
 pub mod chat_bridge;
 pub mod dialogs;
 pub mod menubar;
